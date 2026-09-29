@@ -5,6 +5,8 @@ param(
     [string]$ZludaRoot,
     [string]$PackageRoot,
     [string]$OutputDirectory,
+    [string]$NgxCore = $env:D4R_NGX_CORE,
+    [string]$DlssDll = $env:D4R_DLSS_DLL,
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )
@@ -39,7 +41,9 @@ $originalHip = $env:HIP_PATH
 $originalDiag = $env:D4R_DIAG_DIR
 $originalLog = $env:ZLUDA_LOG_DIR
 $originalCuda = $env:ZLUDA_CUDA_LIB
+$originalNvapi = $env:D4R_NVAPI_BACKEND
 $exitStatus = 1
+$ngxRuntimeDirectory = $null
 $summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
 function Quote-Argument([string]$Value) {
     # All generated paths are absolute file/directory paths, with no trailing backslash.
@@ -86,10 +90,18 @@ try {
     $env:D4R_DIAG_DIR = $OutputDirectory
     $env:ZLUDA_LOG_DIR = Join-Path $OutputDirectory 'zluda-trace'
     $env:ZLUDA_CUDA_LIB = Join-Path $ZludaRoot 'nvcuda.dll'
+    $env:D4R_NVAPI_BACKEND = Join-Path $ZludaRoot 'nvapi64.dll'
     $comgr = Join-Path $HipRoot 'bin/amd_comgr_3.dll'
     if (!(Test-Path -LiteralPath $comgr)) { $comgr = Join-Path $HipRoot 'bin/amd_comgr.dll' }
     $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
         (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'))
+    if ($NgxCore -or $DlssDll) {
+        if (!$NgxCore -or !$DlssDll) { throw 'Supply both -NgxCore and -DlssDll absolute paths.' }
+        if (![IO.Path]::IsPathRooted($NgxCore) -or ![IO.Path]::IsPathRooted($DlssDll)) {
+            throw 'NVIDIA DLL paths must be absolute.'
+        }
+        $files += @($NgxCore, $DlssDll)
+    }
     $summary.files = @($files | ForEach-Object {
         if (!(Test-Path -LiteralPath $_)) { throw "Required file missing: $_" }
         $file = Get-Item -LiteralPath $_
@@ -132,12 +144,46 @@ try {
                     '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', '32') | Out-Null
             }
             if ($mapOk -and $interopOk) { $exitStatus = 0 }
+            if ($exitStatus -eq 0 -and $NgxCore) {
+                # The driver Init ABI searches the executable directory. Keep the
+                # supplied binaries in a private temporary runtime, outside dist/ZIP.
+                $ngxRuntimeDirectory = Join-Path ([IO.Path]::GetTempPath()) ('d4r-ngx-' + [Guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $ngxRuntimeDirectory | Out-Null
+                $ngxExe = Join-Path $ngxRuntimeDirectory 'd4r_ngx_cuda_init_probe.exe'
+                $localCore = Join-Path $ngxRuntimeDirectory '_nvngx.dll'
+                $localDlss = Join-Path $ngxRuntimeDirectory 'nvngx_dlss.dll'
+                Copy-Item -LiteralPath (Join-Path $bin 'd4r_ngx_cuda_init_probe.exe') -Destination $ngxExe
+                Copy-Item -LiteralPath $NgxCore -Destination $localCore
+                Copy-Item -LiteralPath $DlssDll -Destination $localDlss
+                $ngxArguments = @('--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'),
+                    '--ngx-core', $localCore, '--dlss-dll', $localDlss,
+                    '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'))
+                $ngxOk = Invoke-Probe 'ngx-init' $ngxExe $ngxArguments
+                if (!$ngxOk) {
+                    $exitStatus = 1
+                    if (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll')) {
+                        Invoke-Probe 'ngx-init-trace' $ngxExe @(
+                            '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'trace/nvcuda.dll'),
+                            '--ngx-core', $localCore, '--dlss-dll', $localDlss,
+                            '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll')) | Out-Null
+                    }
+                }
+            }
         }
     }
 } catch {
     $summary.error = $_.Exception.Message
     Write-Warning $summary.error
 } finally {
+    if ($ngxRuntimeDirectory -and (Test-Path -LiteralPath $ngxRuntimeDirectory)) {
+        $resolvedRuntime = [IO.Path]::GetFullPath($ngxRuntimeDirectory)
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (!$resolvedRuntime.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($resolvedRuntime) -notmatch '^d4r-ngx-[0-9a-f]{32}$') {
+            throw 'Refusing to remove a path outside the private NGX temporary runtime.'
+        }
+        Remove-Item -LiteralPath $resolvedRuntime -Recurse -Force
+    }
     $summary.passed = $exitStatus -eq 0
     $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
     $env:PATH = $originalPath
@@ -145,6 +191,7 @@ try {
     $env:D4R_DIAG_DIR = $originalDiag
     $env:ZLUDA_LOG_DIR = $originalLog
     $env:ZLUDA_CUDA_LIB = $originalCuda
+    $env:D4R_NVAPI_BACKEND = $originalNvapi
     $archive = "$OutputDirectory.zip"
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath $archive -Force
     Write-Host "Diagnostic bundle: $archive"

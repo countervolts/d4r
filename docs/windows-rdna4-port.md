@@ -6,8 +6,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 
 ## Milestone and gates
 
-Current milestone: M1/M2 and M4 passed on the physical RX 9070 XT with the
-isolated TheRock profile. Next: NGX initialization and validated gfx12 WMMA.
+Current milestone: M1/M2/M4 passed; NGX init + DLSS CUDA capability discovery
+passed with the user's DLLs. Next: validated gfx12 WMMA and native K kernels.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -15,7 +15,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M0: branch, audit, Windows build and diagnostics | Initial implementation complete |
 | M1: native HIP gfx1201 allocation, kernel, CPU verification | PASS, 32 iterations + guard verification |
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
-| M3: Windows NGX initialization and simple DLSS path | Pending |
+| M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | Pending |
 | M6: K layers, full transformer and image validation | Pending |
@@ -148,6 +148,43 @@ the 64-cycle map lifetime test and the 32-cycle synchronized texture round trip.
 The runner automatically isolates resource/import/stream lifetimes on failure.
 Do not declare stable SDK 7.2 acceptable for the leak-free fast path.
 
+## Windows NGX initialization
+
+`tools/windows/ngx_cuda_init_probe.cpp` retains the physical HIP/PCI device
+check, initializes a ZLUDA primary context, loads the user-supplied DLLs,
+discovers DLSS CUDA capability and tests the existing MSVC parameter accessor.
+This does not create/evaluate a DLSS feature or assert transformer correctness.
+
+The supplied driver `_nvngx.dll` 32.0.16.1714 uses the **driver/snippet**
+three-argument `NVSDK_NGX_CUDA_Init(appId, dataPath, sdkVersion)` ABI. The
+four-argument SDK client interface used by the upstream shim passes a pointer
+as the version and returns `0xBAD0000C` (OutOfDate) for this binary. The two
+interfaces are distinguished in NVIDIA's public `nvsdk_ngx.h` by
+`NGX_SNIPPET_BUILD`. The Windows backend must keep this distinction. The probe
+has explicit `--ngx-abi driver` (default) / `sdk`; it does not guess and retry.
+
+Upstream Windows ZLUDA NVAPI lacks physical GPU enumeration, architecture and
+logical GPU/LUID functions used by NGX. The compatibility target
+`nvapi-compat/nvapi64.dll` implements those **public NVAPI** APIs through HIP;
+unknown queries are logged and forwarded to the supplied ZLUDA NVAPI backend.
+It validates version/size and includes `NV_LOGICAL_GPU_DATA_V1.reserved[8]`
+(568-byte x64 ABI). Concurrent initialization is synchronized. The AD102/AD100
+identity is explicitly a CUDA/NGX network profile matching d4r's sm_89 kernels;
+physical detection and native compilation remain gfx1201. It is currently a
+probe backend, not a complete game-wide NVAPI replacement. A separate
+`nvapi-trace` build forwards every response unchanged for diagnosis.
+
+Driver init's default feature search needs the DLSS DLL next to the executable.
+The runner creates a unique private `%TEMP%/d4r-ngx-<GUID>` directory containing
+the probe and copies of the two supplied DLLs. Paths and original hashes/versions
+are logged; the directory is removed after the subprocess ends. Neither DLL is
+placed in dist/, git, or the diagnostics ZIP. No private NVAPI function is
+invented and no NVIDIA binary is patched.
+
+References: [NGX API signatures](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx.h),
+[public NVAPI ABI](https://github.com/NVIDIA/nvapi/blob/main/nvapi.h),
+[public NVAPI interface IDs](https://github.com/NVIDIA/nvapi/blob/main/nvapi_interface.h).
+
 ## Authoritative references
 
 * [AMD HIP SDK Windows support matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html)
@@ -185,6 +222,16 @@ powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfi
 This builds into `build/windows-rdna4-therock` and installs into
 `dist/windows-rdna4-therock`. The stable profile stays available for reproducing
 the runtime bug. It is expected to return failure at the lifetime gate.
+
+One command adds the local NGX initialization gate after the five hardware gates:
+
+```powershell
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "C:/Users/Administrator/d4r/_nvngx.dll" -DlssDll "C:/Users/Administrator/d4r/nvngx_dlss.dll"
+```
+
+Success requires all six tests and `PASS NGX_INIT ... sr_available=1`;
+`transformer_executed=0` is explicit. On NGX failure, CUDA trace and NVAPI query
+logs are collected automatically. NVIDIA DLLs remain local test inputs.
 
 The build accepts `-HipRoot`, `-ZludaRoot`, `-ToolchainRoot`, `-BuildDirectory`
 and `-InstallDirectory`. MSVC users can invoke CMake from a Developer Shell
@@ -241,6 +288,12 @@ stable runtime mapped-view bug; the fix is the runtime ownership correction.
 
 Local proprietary inputs supplied by the user: `nvngx_dlss.dll` 310.9.1.0,
 `_nvngx.dll` 32.0.16.1714. Neither is packaged or tracked.
+
+2026-09-29 NGX initialization: PASS on gfx1201 with those two DLLs and the native
+NVAPI topology backend. SR Available=1, FeatureInitResult=0x1, NeedsUpdatedDriver=0,
+MSVC parameter roundtrip Width=640, checked parameter/context/NGX cleanup.
+Local logs: `test-results/ngx-init-private-runtime.zip`. This is only the first
+part of M3; feature execution, K/M correctness and the Windows shim remain open.
 
 Audit found an upstream validation blocker: `swin_model.py` imports
 `model_enc3`, which is absent from the repository. M reference validation needs

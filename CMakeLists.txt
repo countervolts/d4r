@@ -21,7 +21,7 @@ add_custom_command(OUTPUT "${probe_object}"
     -o "${probe_object}"
   DEPENDS tools/windows/probe_kernel.hip VERBATIM)
 add_custom_target(d4r_probe_code_object ALL DEPENDS "${probe_object}")
-foreach(probe hip_gfx1201_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe)
+foreach(probe hip_gfx1201_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
   target_include_directories(d4r_${probe} PRIVATE "${D4R_HIP_ROOT}/include")
@@ -37,6 +37,39 @@ foreach(probe hip_gfx1201_probe cuda_driver_probe d3d12_hip_interop_probe hip_st
   endif()
   install(TARGETS d4r_${probe} RUNTIME DESTINATION bin)
 endforeach()
+if(MSVC)
+  target_sources(d4r_ngx_cuda_init_probe PRIVATE tools/d4r_ngx_param_msvc.cpp tools/d4r_ngx_param_host.cpp)
+else()
+  find_program(D4R_CLANG_CL NAMES clang-cl.exe PATHS "${D4R_HIP_ROOT}/bin" "${D4R_HIP_ROOT}/lib/llvm/bin" NO_DEFAULT_PATH REQUIRED)
+  set(ngx_parameter_object "${CMAKE_CURRENT_BINARY_DIR}/ngx_parameter_msvc.obj")
+  add_custom_command(OUTPUT "${ngx_parameter_object}"
+    COMMAND "${D4R_CLANG_CL}" /c /O2 /Zl /GS- /GR- /EHs-c-
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/d4r_ngx_param_msvc.cpp" "/Fo${ngx_parameter_object}"
+    DEPENDS tools/d4r_ngx_param_msvc.cpp VERBATIM)
+  set_source_files_properties("${ngx_parameter_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  target_sources(d4r_ngx_cuda_init_probe PRIVATE "${ngx_parameter_object}" tools/d4r_ngx_param_host.cpp)
+endif()
+add_library(d4r_nvapi_trace SHARED tools/windows/nvapi_trace.cpp)
+set_target_properties(d4r_nvapi_trace PROPERTIES PREFIX "" OUTPUT_NAME "nvapi64"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/nvapi-trace"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/nvapi-trace")
+target_compile_definitions(d4r_nvapi_trace PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(d4r_nvapi_trace PRIVATE version dbghelp)
+if(MINGW)
+  target_link_options(d4r_nvapi_trace PRIVATE -static)
+endif()
+install(TARGETS d4r_nvapi_trace RUNTIME DESTINATION nvapi-trace)
+add_library(d4r_nvapi_compat SHARED tools/windows/nvapi_trace.cpp)
+set_target_properties(d4r_nvapi_compat PROPERTIES PREFIX "" OUTPUT_NAME "nvapi64"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/nvapi-compat"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/nvapi-compat")
+target_compile_definitions(d4r_nvapi_compat PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__ D4R_NVAPI_COMPAT)
+target_include_directories(d4r_nvapi_compat PRIVATE "${D4R_HIP_ROOT}/include")
+target_link_libraries(d4r_nvapi_compat PRIVATE version dbghelp)
+if(MINGW)
+  target_link_options(d4r_nvapi_compat PRIVATE -static)
+endif()
+install(TARGETS d4r_nvapi_compat RUNTIME DESTINATION nvapi-compat)
 target_link_libraries(d4r_d3d12_hip_interop_probe PRIVATE d3d12 dxgi dxguid)
 add_dependencies(d4r_hip_gfx1201_probe d4r_probe_code_object)
 install(FILES "${probe_object}" DESTINATION bin)
