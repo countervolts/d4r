@@ -1,0 +1,25 @@
+From: d4r Windows port
+Subject: [PATCH] Backport AMD external-memory view ownership fix to ROCm 7.2
+
+Upstream fix: ROCm/clr 529f6b1641de436dafbb095d5438b0fbf773765d
+(ROCm/rocm-systems #3528). Already present in current upstream.
+The constructor owns reference 1. MemObjMap does not retain the view;
+hipFree removes the entry and releases reference 1. The extra retain
+leaks the view and its parent imported allocation.
+
+Hardware regression: d4r_d3d12_hip_interop_probe --interop-mode map
+--iterations 64. Windows SDK 7.2.60201 leaks one HANDLE / 256 KiB each
+cycle; tested TheRock 10.2.0a20260929 (HIP 7.17.26386) stays bounded.
+This patch is for rebuilding old runtime sources, never binary patching.
+
+diff --git a/hipamd/src/hip_memory.cpp b/hipamd/src/hip_memory.cpp
+--- a/hipamd/src/hip_memory.cpp
++++ b/hipamd/src/hip_memory.cpp
+@@ -179,7 +179,6 @@ hipError_t hipExternalMemoryGetMappedBuffer(void** devPtr, hipExternalMemory_t extMem,
+   // Map the device memory to the user pointer
+   *devPtr = reinterpret_cast<void*>(devMem->virtualAddress());
+   amd::MemObjMap::AddMemObj(*devPtr, view);
+-  view->retain();
+ 
+   HIP_RETURN(hipSuccess);
+ }

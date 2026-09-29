@@ -84,6 +84,8 @@ inline void start()
 }
 struct Args {
     std::string hip_root, cuda_dll, module, context = "primary";
+    std::string stream_lifetime = "persistent";
+    std::string interop_mode = "roundtrip";
     unsigned iterations = 32;
     int device = -1;
     Args(int argc, char** argv) {
@@ -95,6 +97,8 @@ struct Args {
             else if (key == "--cuda-dll") cuda_dll = value;
             else if (key == "--module") module = value;
             else if (key == "--context") context = value;
+            else if (key == "--stream-lifetime") stream_lifetime = value;
+            else if (key == "--interop-mode") interop_mode = value;
             else if (key == "--iterations") {
                 size_t end = 0;
                 iterations = static_cast<unsigned>(std::stoul(value, &end));

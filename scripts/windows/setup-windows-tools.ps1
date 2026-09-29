@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable')
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $localTools = Join-Path $repo '.tools'
@@ -14,7 +14,10 @@ function Get-VerifiedArchive([string]$Url, [string]$Name, [string]$Hash, [string
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $Hash) {
         throw "SHA256 mismatch: $archive (remove this download and retry)"
     }
-    Expand-Archive -LiteralPath $archive -DestinationPath $Destination -Force
+    if ([IO.Path]::GetExtension($archive) -eq '.whl') {
+        python -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' $archive $Destination
+        if ($LASTEXITCODE) { throw "Wheel extraction exit=$LASTEXITCODE" }
+    } else { Expand-Archive -LiteralPath $archive -DestinationPath $Destination -Force }
     if (!(Test-Path -LiteralPath $Marker)) { throw "Archive layout changed: $Marker" }
 }
 Get-VerifiedArchive 'https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-x86_64.zip' `
@@ -23,6 +26,13 @@ Get-VerifiedArchive 'https://github.com/mstorsjo/llvm-mingw/releases/download/20
 Get-VerifiedArchive 'https://github.com/vosen/ZLUDA/releases/download/v7-preview.11/zluda-windows-ee2f25a.zip' `
     'zluda.zip' '7788c1ed43385e62f0cc5f4d1aead24c92b671c02f1d685f63182540dea16d74' (Join-Path $localTools 'zluda') `
     (Join-Path $localTools 'zluda/zluda/nvcuda.dll')
+if ($RuntimeProfile -eq 'therock') {
+    Get-VerifiedArchive 'https://nightly.repo.amd.com/rocm/core/whl-next/rocm-sdk-core/rocm_sdk_core-10.2.0a20260929-py3-none-win_amd64.whl' `
+        'rocm_sdk_core-10.2.0a20260929-py3-none-win_amd64.whl' `
+        '9623b97ca511eaa176905075a504393eca6fde594222af10b55e4fb1edfe5a25' `
+        (Join-Path $localTools 'therock-10.2.0a20260929') `
+        (Join-Path $localTools 'therock-10.2.0a20260929/_rocm_sdk_core/bin/amdhip64_7.dll')
+}
 if (!(Test-Path (Join-Path $localTools 'python/cmake/data/bin/cmake.exe')) -or
     !(Test-Path (Join-Path $localTools 'python/bin/ninja.exe'))) {
     python -m pip install --target (Join-Path $localTools 'python') cmake==3.31.6 ninja==1.11.1.4

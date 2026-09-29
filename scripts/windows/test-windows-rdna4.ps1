@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$HipRoot = $env:HIP_PATH,
+    [ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable',
     [string]$ZludaRoot,
     [string]$PackageRoot,
     [string]$OutputDirectory,
@@ -8,6 +9,15 @@ param(
     [int]$TimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
+if ($RuntimeProfile -eq 'therock') {
+    $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+    # Works both from scripts/windows and the installed dist/<profile> directory.
+    if (!$PSBoundParameters.ContainsKey('HipRoot')) { $HipRoot = Join-Path $repoRoot '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
+    if (!$PackageRoot) {
+        if (Test-Path (Join-Path $PSScriptRoot 'bin/d4r_hip_gfx1201_probe.exe')) { $PackageRoot = $PSScriptRoot }
+        else { $PackageRoot = Join-Path $repoRoot 'dist/windows-rdna4-therock' }
+    }
+}
 if (!$PackageRoot) {
     if (Test-Path (Join-Path $PSScriptRoot 'bin/d4r_hip_gfx1201_probe.exe')) { $PackageRoot = $PSScriptRoot }
     else { $PackageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../dist/windows-rdna4-diagnostics')) }
@@ -30,7 +40,7 @@ $originalDiag = $env:D4R_DIAG_DIR
 $originalLog = $env:ZLUDA_LOG_DIR
 $originalCuda = $env:ZLUDA_CUDA_LIB
 $exitStatus = 1
-$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
+$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
 function Quote-Argument([string]$Value) {
     # All generated paths are absolute file/directory paths, with no trailing backslash.
     if ($Value.Contains('"')) { throw 'Double quotes are not allowed in arguments' }
@@ -76,7 +86,9 @@ try {
     $env:D4R_DIAG_DIR = $OutputDirectory
     $env:ZLUDA_LOG_DIR = Join-Path $OutputDirectory 'zluda-trace'
     $env:ZLUDA_CUDA_LIB = Join-Path $ZludaRoot 'nvcuda.dll'
-    $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), (Join-Path $HipRoot 'bin/amd_comgr_3.dll'),
+    $comgr = Join-Path $HipRoot 'bin/amd_comgr_3.dll'
+    if (!(Test-Path -LiteralPath $comgr)) { $comgr = Join-Path $HipRoot 'bin/amd_comgr.dll' }
+    $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
         (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'))
     $summary.files = @($files | ForEach-Object {
         if (!(Test-Path -LiteralPath $_)) { throw "Required file missing: $_" }
@@ -100,14 +112,27 @@ try {
                 '--context', $context, '--iterations', "$Iterations")
             $cudaOk = $cudaOk -and $ok
             # On failure collect the upstream trace automatically if available.
-            if (!$ok -and (Test-Path (Join-Path $ZludaRoot 'zluda.exe'))) {
-                Invoke-Probe "cuda-$context-trace" (Join-Path $ZludaRoot 'zluda.exe') @(
-                    '--zluda-trace', '--', (Join-Path $bin 'd4r_cuda_driver_probe.exe'),
-                    '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'),
+            if (!$ok -and (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll'))) {
+                Invoke-Probe "cuda-$context-trace" (Join-Path $bin 'd4r_cuda_driver_probe.exe') @(
+                    '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'trace/nvcuda.dll'),
                     '--context', $context, '--iterations', '1') | Out-Null
             }
         }
-        if ($cudaOk) { $exitStatus = 0 }
+        if ($cudaOk) {
+            $mapOk = Invoke-Probe 'interop-map-lifetime' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
+                '--hip-root', $HipRoot, '--interop-mode', 'map', '--iterations', '64')
+            $interopOk = Invoke-Probe 'interop-roundtrip' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
+                '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', "$Iterations")
+            if (!$mapOk -or !$interopOk) {
+                foreach ($mode in @('resource', 'import')) {
+                    Invoke-Probe "interop-$mode-lifetime" (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
+                        '--hip-root', $HipRoot, '--interop-mode', $mode, '--iterations', '32') | Out-Null
+                }
+                Invoke-Probe 'hip-stream-lifetime' (Join-Path $bin 'd4r_hip_stream_lifecycle_probe.exe') @(
+                    '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', '32') | Out-Null
+            }
+            if ($mapOk -and $interopOk) { $exitStatus = 0 }
+        }
     }
 } catch {
     $summary.error = $_.Exception.Message

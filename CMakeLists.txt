@@ -12,7 +12,7 @@ endif()
 if(NOT EXISTS "${D4R_HIP_ROOT}/include/hip/hip_runtime_api.h")
   message(FATAL_ERROR "Set D4R_HIP_ROOT to a Windows HIP SDK (headers and bin/clang++.exe required)")
 endif()
-find_program(D4R_HIP_CLANG NAMES clang++.exe PATHS "${D4R_HIP_ROOT}/bin" NO_DEFAULT_PATH REQUIRED)
+find_program(D4R_HIP_CLANG NAMES clang++.exe PATHS "${D4R_HIP_ROOT}/bin" "${D4R_HIP_ROOT}/lib/llvm/bin" NO_DEFAULT_PATH REQUIRED)
 set(probe_object "${CMAKE_CURRENT_BINARY_DIR}/probe_gfx1201.hsaco")
 add_custom_command(OUTPUT "${probe_object}"
   COMMAND "${D4R_HIP_CLANG}" -x hip --offload-arch=gfx1201
@@ -21,7 +21,7 @@ add_custom_command(OUTPUT "${probe_object}"
     -o "${probe_object}"
   DEPENDS tools/windows/probe_kernel.hip VERBATIM)
 add_custom_target(d4r_probe_code_object ALL DEPENDS "${probe_object}")
-foreach(probe hip_gfx1201_probe cuda_driver_probe)
+foreach(probe hip_gfx1201_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
   target_include_directories(d4r_${probe} PRIVATE "${D4R_HIP_ROOT}/include")
@@ -37,6 +37,7 @@ foreach(probe hip_gfx1201_probe cuda_driver_probe)
   endif()
   install(TARGETS d4r_${probe} RUNTIME DESTINATION bin)
 endforeach()
+target_link_libraries(d4r_d3d12_hip_interop_probe PRIVATE d3d12 dxgi dxguid)
 add_dependencies(d4r_hip_gfx1201_probe d4r_probe_code_object)
 install(FILES "${probe_object}" DESTINATION bin)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
@@ -45,6 +46,12 @@ include(CTest)
 add_test(NAME hip_gfx1201 COMMAND d4r_hip_gfx1201_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}")
 set_tests_properties(hip_gfx1201 PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201")
+add_test(NAME d3d12_hip_interop COMMAND d4r_d3d12_hip_interop_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}" --iterations 32)
+set_tests_properties(d3d12_hip_interop PROPERTIES TIMEOUT 120 LABELS "hardware;interop")
+add_test(NAME d3d12_hip_map_lifetime COMMAND d4r_d3d12_hip_interop_probe
+  --hip-root "${D4R_HIP_ROOT}" --interop-mode map --iterations 64)
+set_tests_properties(d3d12_hip_map_lifetime PROPERTIES TIMEOUT 120 LABELS "hardware;interop;lifetime")
 set(D4R_ZLUDA_ROOT "" CACHE PATH "Local Windows ZLUDA directory (nvcuda.dll)")
 if(EXISTS "${D4R_ZLUDA_ROOT}/nvcuda.dll")
   foreach(context primary created)

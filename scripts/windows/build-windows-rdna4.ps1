@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$HipRoot = $env:HIP_PATH,
+    [ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable',
     [string]$ZludaRoot,
     [string]$ToolchainRoot,
     [string]$BuildDirectory,
@@ -8,6 +9,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+if ($RuntimeProfile -eq 'therock') {
+    if (!$PSBoundParameters.ContainsKey('HipRoot')) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
+    if (!$BuildDirectory) { $BuildDirectory = Join-Path $repo 'build/windows-rdna4-therock' }
+    if (!$InstallDirectory) { $InstallDirectory = Join-Path $repo 'dist/windows-rdna4-therock' }
+}
 if (!$HipRoot) { $HipRoot = 'C:\Program Files\AMD\ROCm\7.2' }
 if (!$BuildDirectory) { $BuildDirectory = Join-Path $repo 'build/windows-rdna4' }
 if (!$InstallDirectory) { $InstallDirectory = Join-Path $repo 'dist/windows-rdna4-diagnostics' }

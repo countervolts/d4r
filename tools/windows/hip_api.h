@@ -27,6 +27,9 @@ struct HipApi {
     D4R_HIP_FUNCTION(hipModuleGetFunction);
     D4R_HIP_FUNCTION(hipModuleLaunchKernel);
     D4R_HIP_FUNCTION(hipDeviceSynchronize);
+    D4R_HIP_FUNCTION(hipStreamCreateWithFlags);
+    D4R_HIP_FUNCTION(hipStreamSynchronize);
+    D4R_HIP_FUNCTION(hipStreamDestroy);
 #undef D4R_HIP_FUNCTION
     explicit HipApi(const std::string& root) :
         search(std::filesystem::path(wide(root)) / L"bin"),

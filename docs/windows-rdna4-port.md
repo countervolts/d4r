@@ -6,8 +6,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 
 ## Milestone and gates
 
-Current milestone: M1/M2 passed on the physical RX 9070 XT; next: independent
-Windows D3D12/HIP interop and validated gfx12 WMMA, before NGX integration.
+Current milestone: M1/M2 and M4 passed on the physical RX 9070 XT with the
+isolated TheRock profile. Next: NGX initialization and validated gfx12 WMMA.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -16,7 +16,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M1: native HIP gfx1201 allocation, kernel, CPU verification | PASS, 32 iterations + guard verification |
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
 | M3: Windows NGX initialization and simple DLSS path | Pending |
-| M4: D3D12 / HIP external memory and fence round trip | Pending |
+| M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | Pending |
 | M6: K layers, full transformer and image validation | Pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
@@ -36,6 +36,10 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
   LLVM commit `590b9320a5be90e40268759c6203c01fde121e68`.
 * Keep stable SDK and TheRock installations separate. Select one directory per
   build and test run; never mix headers, import libraries, runtime or COMGR.
+* Tested isolated TheRock core: `10.2.0a20260929`, HIP `7.17.26386`, commit
+  `0ad5f73253`; wheel SHA256
+  `9623b97ca511eaa176905075a504393eca6fde594222af10b55e4fb1edfe5a25`.
+  No machine-wide runtime replacement is performed.
 * CMake 3.31.6, Ninja 1.11.1 (Python package 1.11.1.4).
 * Windows host toolchain: LLVM-MinGW `20260922`, UCRT x64, SHA256
   `e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666`.
@@ -125,6 +129,25 @@ NT HANDLE ownership must be explicit; Win32 import is not fd ownership transfer.
 Test repeated create/destroy cycles as upstream noted a mapped-buffer leak on
 Linux ROCm. CPU verification copies are allowed in tests, never in the fast path.
 
+Implemented independent test: DXGI LUID matches HIP, an R32_UINT texture is
+copied to a shared DEFAULT-heap linear buffer in VRAM, HIP maps that D3D12
+resource, checks every input element and XORs it, D3D12 copies it back to the
+texture and finally to a readback buffer solely for test verification. Shared
+D3D12 fence values sequence both queues within the same iteration. There is no
+CPU data copy between the APIs; native tiled texture import is not yet tested.
+The future shim needs GPU texture/linear conversion or validated direct arrays.
+The caller closes its original NT HANDLEs after HIP releases imports.
+
+Stable HIP SDK `7.2.60201` fails mapped-buffer lifetime testing. `resource` and
+`import` modes are stable, but `map` leaks one HANDLE and 262144 bytes per cycle.
+The runtime's extra `view->retain()` is the cause; AMD removed it in
+[CLR commit 529f6b1](https://github.com/ROCm/clr/commit/529f6b1641de436dafbb095d5438b0fbf773765d).
+The source backport is retained at `patches/rocm/0001-external-memory-view-ownership.patch`.
+No pointer/refcount or DLL binary hacks are used. Current TheRock passes both
+the 64-cycle map lifetime test and the 32-cycle synchronized texture round trip.
+The runner automatically isolates resource/import/stream lifetimes on failure.
+Do not declare stable SDK 7.2 acceptable for the leak-free fast path.
+
 ## Authoritative references
 
 * [AMD HIP SDK Windows support matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html)
@@ -151,6 +174,18 @@ powershell -NoProfile -File scripts/windows/build-windows-rdna4.ps1
 powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1
 ```
 
+For the currently validated external-memory runtime, use the separate profile:
+
+```powershell
+powershell -NoProfile -File scripts/windows/setup-windows-tools.ps1 -RuntimeProfile therock
+powershell -NoProfile -File scripts/windows/build-windows-rdna4.ps1 -RuntimeProfile therock
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock
+```
+
+This builds into `build/windows-rdna4-therock` and installs into
+`dist/windows-rdna4-therock`. The stable profile stays available for reproducing
+the runtime bug. It is expected to return failure at the lifetime gate.
+
 The build accepts `-HipRoot`, `-ZludaRoot`, `-ToolchainRoot`, `-BuildDirectory`
 and `-InstallDirectory`. MSVC users can invoke CMake from a Developer Shell
 without the portable MinGW compiler. Equivalent direct build:
@@ -165,11 +200,13 @@ cmake --install build/windows-rdna4 --prefix dist/windows-rdna4-diagnostics
 The one-command diagnostic runner is also installed at
 `dist/windows-rdna4-diagnostics/test-windows-rdna4.ps1`. It requires the selected
 HIP SDK and ZLUDA directory; the developer setup auto-discovers local defaults.
-Success: exit 0, all three tests passed in `summary.json`, `PASS HIP` and
-`PASS CUDA` in stdout. Failure: send the **single printed ZIP path**; it contains
+Success: exit 0, all five tests passed in `summary.json`, `PASS HIP`, `PASS CUDA`,
+`PASS INTEROP_LIFETIME` and `PASS INTEROP` in stdout. Failure: send the **single printed ZIP path**; it contains
 stdout/stderr, timeout/exception exit code, DLL paths/versions/hashes, driver/OS
 inventory and a minidump for an unhandled exception. Upstream trace is attempted
-automatically on CUDA failure when `zluda.exe` is available.
+automatically on CUDA failure when `trace/nvcuda.dll` is available. The trace
+DLL forwards to the real DLL through `ZLUDA_CUDA_LIB`; explicit loading no
+longer bypasses the trace by accidentally passing the real DLL to the launcher.
 
 The HIP module compiler uses the selected SDK, fixed `--offload-arch=gfx1201`,
 wave32 and no host/device library dependency. Host code uses the installed HIP
@@ -194,6 +231,14 @@ all context/module/memory teardown calls successful. ZLUDA binary SHA256
 `51dd32dc116a6c14c7a4bf5acf620bba0546ca7ec5f8a6e2148dd68f1714b165`.
 Logs: local `test-results/m1-m2.zip`; ignored by git.
 
+2026-09-29 M4: TheRock profile passed all HIP/PTX checks plus D3D12/HIP round
+trip (32 iterations, 16384 elements each), exact integer output and GPU fence
+synchronization. Map lifetime: 64 import/map/free/destroy cycles, HANDLE count
+267 after both warmup and the last cycle, free VRAM 16926011392 bytes throughout
+the measured steady state. Full interop cycle HANDLE count also stays constant
+after warmup; stream teardown lowers it. Recreating streams did not resolve the
+stable runtime mapped-view bug; the fix is the runtime ownership correction.
+
 Local proprietary inputs supplied by the user: `nvngx_dlss.dll` 310.9.1.0,
 `_nvngx.dll` 32.0.16.1714. Neither is packaged or tracked.
 
@@ -206,4 +251,4 @@ launching the MinGW child compiler, so branch/commit/build require scoped tool
 approval in this managed environment. HIP_PATH ends in a backslash; build script
 normalizes it before PowerShell 5 argument quoting. Test runner uses .NET Process
 to retain reliable exit codes and concurrently drain both diagnostic streams.
-No K/M/DLSS/OptiScaler support is claimed by this first milestone.
+No K/M/DLSS/OptiScaler support is claimed by these diagnostic milestones.
