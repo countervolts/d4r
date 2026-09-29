@@ -7,8 +7,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 ## Milestone and gates
 
 Current milestone: M1/M2/M4/M5 passed; NGX init + DLSS CUDA capability discovery
-passed with the user's DLLs. The first K `enc1` code object compiles and loads;
-its prep/transformer have not yet been executed or checked against replay.
+passed with the user's DLLs. M6 is in progress: the first K `enc1` prep and
+transformer run on gfx1201 and pass a synthetic nonzero numpy reference check.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -19,7 +19,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter, 16 cases, max abs/relative error 0 |
-| M6: K layers, full transformer and image validation | Pending |
+| M6: K layers, full transformer and image validation | Partial: `enc1` executes, nonzero fixture matches reference; other layers/full network pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
 | M9: OptiScaler integration, profiling, installation | Pending |
@@ -42,6 +42,9 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
   `9623b97ca511eaa176905075a504393eca6fde594222af10b55e4fb1edfe5a25`.
   No machine-wide runtime replacement is performed.
 * CMake 3.31.6, Ninja 1.11.1 (Python package 1.11.1.4).
+* Synthetic K numerical reference: Python 3.11 and local NumPy `2.4.6`
+  ([PyPI release](https://pypi.org/project/numpy/2.4.6/)); installed only
+  into `.tools/python/vendor` by setup, outside the game runtime.
 * Windows host toolchain: LLVM-MinGW `20260922`, UCRT x64, SHA256
   `e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666`.
   This is a portable fallback on this machine, where MSVC is not installed.
@@ -136,9 +139,14 @@ compiler uses `kernels/common/hip_device_minimal.h`, exposing only public
 Clang AMDGPU work-item/grid/barrier builtins and HIP-compatible qualifiers;
 the ordinary Linux HIP include path remains. CMake builds `enc1` for gfx1201
 into `experimental/k/` and verifies that HIP loads both prep and transformer
-entry points. This is a **compile/load smoke test**, not K layer correctness or
-DLSS execution. The code object must stay out of ZLUDA's native override path
-until numerical K replay validation passes.
+entry points. The `k_module_probe` now launches prep and transformer. The
+identity fixture verifies all 4096 full-resolution and 1024 merged FP16 values
+bitwise. A second fixture enables nonzero V projections, position-only
+attention, Wo, MLP/GELU and patch merge; it checks finite values and a patch
+identity, then saves all inputs/outputs for `k_enc1_validate.py`. That script
+runs the existing `pwin_model.py` and measures max absolute/relative error and
+PSNR. The code object remains in `experimental/k/`, outside ZLUDA's override
+path, until the other K layers and real captured weights/activations pass.
 
 ## External interop blockers
 
@@ -245,14 +253,16 @@ This builds into `build/windows-rdna4-therock` and installs into
 `dist/windows-rdna4-therock`. The stable profile stays available for reproducing
 the runtime bug. It is expected to return failure at the lifetime gate.
 
-One command adds the local NGX initialization gate after the seven hardware gates:
+One command adds the local NGX initialization gate after eight diagnostics:
 
 ```powershell
 powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "C:/Users/Administrator/d4r/_nvngx.dll" -DlssDll "C:/Users/Administrator/d4r/nvngx_dlss.dll"
 ```
 
-Success requires all eight tests and `PASS NGX_INIT ... sr_available=1`;
-`transformer_executed=0` is explicit. On NGX failure, CUDA trace and NVAPI query
+Success requires all nine tests, including `PASS K_REFERENCE` and
+`PASS NGX_INIT ... sr_available=1`. The NGX probe still reports
+`transformer_executed=0`: the standalone K launch has not been integrated into
+DLSS. On NGX failure, CUDA trace and NVAPI query
 logs are collected automatically. NVIDIA DLLs remain local test inputs.
 
 The build accepts `-HipRoot`, `-ZludaRoot`, `-ToolchainRoot`, `-BuildDirectory`
@@ -324,10 +334,32 @@ stable mapped-view lifetime bug still excludes its interop fast path.
 WMMA raw and legacy-layout adapter each match the scalar reference exactly
 over 16 changing input matrices, with both one-step and two-step accumulation.
 The `enc1` K module is built and loaded on gfx1201, with functions resolved;
-`transformer_executed=0` is explicit in the module probe. Neither K nor M
-transformer correctness is claimed yet. The same K source also compiles for
+`transformer_executed=0` was explicit in the module probe at that milestone.
+The same K source also compiles for
 `gfx1101` through the unchanged gfx11 builtin branch (compile-only regression;
 no RDNA3 GPU is present in this Windows machine).
+
+2026-09-29 M6 first kernel: `enc1` runs on the RX 9070 XT with zero and nonzero
+synthetic weights. The nonzero fixture exercises V, position-only attention,
+Wo, MLP/GELU and patch merge. Compared with `pwin_model.py`, full output
+max absolute error `0.000244140625`, PSNR `98.21 dB`; merged output max
+absolute error `0.000244140625`, PSNR `97.63 dB`. No NaN/Inf, all 4096 full
+and 1024 merged elements written, 3886 full elements changed. TheRock
+diagnostic bundle `test-results/m6-k-enc1-final.zip` has 9/9 gates PASS;
+CTest has 7/7 PASS.
+Reference dependency: pinned local NumPy `2.4.6` on Python 3.11, installed by
+`setup-windows-tools.ps1` into `.tools/python/vendor` (not the game runtime).
+This is a synthetic one-layer check, not proof of complete K or DLSS output.
+
+Stable HIP SDK 7.2 compiler caveat: its `-O2` code object for `enc1` produces
+NaN already on the identity fixture (first element `0xfe00` instead of
+`0xbc00`). Its `-O1` object also miscomputes the identity fixture; `-O0`
+passes but is unsuitable for the fast path. Cross-testing isolates the problem
+to the stable compiler/code object: the stable-built `-O2` object fails under
+TheRock runtime, while the TheRock-built `-O2` object passes under stable HIP
+runtime. The independent WMMA probe passes under both compilers. Until a
+smaller compiler reproducer or source-level workaround is found, use the
+TheRock compiler for native K and the TheRock runtime for leak-free interop.
 
 Audit found an upstream validation blocker: `swin_model.py` imports
 `model_enc3`, which is absent from the repository. M reference validation needs

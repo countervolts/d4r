@@ -38,4 +38,9 @@ if (!(Test-Path (Join-Path $localTools 'python/cmake/data/bin/cmake.exe')) -or
     python -m pip install --target (Join-Path $localTools 'python') cmake==3.31.6 ninja==1.11.1.4
     if ($LASTEXITCODE) { throw "pip install exit=$LASTEXITCODE" }
 }
+if (!(Test-Path (Join-Path $localTools 'python/vendor/numpy/__init__.py'))) {
+    python -m pip install --disable-pip-version-check --only-binary=:all: `
+        --target (Join-Path $localTools 'python/vendor') numpy==2.4.6
+    if ($LASTEXITCODE) { throw "NumPy reference install exit=$LASTEXITCODE" }
+}
 Write-Host 'Tools ready. Run scripts/windows/build-windows-rdna4.ps1.'

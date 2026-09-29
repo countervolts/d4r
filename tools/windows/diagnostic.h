@@ -89,6 +89,7 @@ struct Args {
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
+    std::string fixture_dir;
     unsigned iterations = 32;
     int device = -1;
     Args(int argc, char** argv) {
@@ -106,6 +107,7 @@ struct Args {
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;
             else if (key == "--ngx-abi") ngx_abi = value;
+            else if (key == "--fixture-dir") fixture_dir = value;
             else if (key == "--iterations") {
                 size_t end = 0;
                 iterations = static_cast<unsigned>(std::stoul(value, &end));

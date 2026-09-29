@@ -99,6 +99,8 @@ install(FILES "${probe_object}" DESTINATION bin)
 install(FILES "${wmma_object}" DESTINATION bin)
 install(FILES "${k_enc1_object}" DESTINATION experimental/k)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
+install(FILES tools/windows/k_enc1_validate.py DESTINATION .)
+install(FILES kernels/tools/pwin_model.py DESTINATION reference)
 install(FILES docs/windows-rdna4-port.md DESTINATION docs)
 include(CTest)
 add_test(NAME hip_gfx1201 COMMAND d4r_hip_gfx1201_probe
@@ -107,9 +109,9 @@ set_tests_properties(hip_gfx1201 PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201"
 add_test(NAME gfx12_wmma COMMAND d4r_gfx12_wmma_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${wmma_object}" --iterations 16)
 set_tests_properties(gfx12_wmma PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;wmma")
-add_test(NAME k_enc1_module COMMAND d4r_k_module_probe
+add_test(NAME k_enc1_execution COMMAND d4r_k_module_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${k_enc1_object}")
-set_tests_properties(k_enc1_module PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;k_compile")
+set_tests_properties(k_enc1_execution PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;k_execution")
 add_test(NAME d3d12_hip_interop COMMAND d4r_d3d12_hip_interop_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}" --iterations 32)
 set_tests_properties(d3d12_hip_interop PROPERTIES TIMEOUT 120 LABELS "hardware;interop")

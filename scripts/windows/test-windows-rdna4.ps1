@@ -11,8 +11,8 @@ param(
     [int]$TimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($RuntimeProfile -eq 'therock') {
-    $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
     # Works both from scripts/windows and the installed dist/<profile> directory.
     if (!$PSBoundParameters.ContainsKey('HipRoot')) { $HipRoot = Join-Path $repoRoot '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
     if (!$PackageRoot) {
@@ -42,6 +42,7 @@ $originalDiag = $env:D4R_DIAG_DIR
 $originalLog = $env:ZLUDA_LOG_DIR
 $originalCuda = $env:ZLUDA_CUDA_LIB
 $originalNvapi = $env:D4R_NVAPI_BACKEND
+$originalPythonPath = $env:PYTHONPATH
 $exitStatus = 1
 $ngxRuntimeDirectory = $null
 $summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
@@ -91,6 +92,10 @@ try {
     $env:ZLUDA_LOG_DIR = Join-Path $OutputDirectory 'zluda-trace'
     $env:ZLUDA_CUDA_LIB = Join-Path $ZludaRoot 'nvcuda.dll'
     $env:D4R_NVAPI_BACKEND = Join-Path $ZludaRoot 'nvapi64.dll'
+    $localPythonVendor = Join-Path $repoRoot '.tools/python/vendor'
+    if (Test-Path (Join-Path $localPythonVendor 'numpy/__init__.py')) {
+        $env:PYTHONPATH = "$localPythonVendor;$originalPythonPath"
+    }
     $comgr = Join-Path $HipRoot 'bin/amd_comgr_3.dll'
     if (!(Test-Path -LiteralPath $comgr)) { $comgr = Join-Path $HipRoot 'bin/amd_comgr.dll' }
     $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
@@ -122,9 +127,16 @@ try {
         $wmmaOk = Invoke-Probe 'gfx12-wmma' (Join-Path $bin 'd4r_gfx12_wmma_probe.exe') @(
             '--hip-root', $HipRoot, '--module', (Join-Path $bin 'wmma_gfx1201.hsaco'), '--iterations', "$Iterations")
         if (!$wmmaOk) { throw 'gfx12 WMMA layout validation failed; refusing to mark K/M readiness.' }
-        $kModuleOk = Invoke-Probe 'k-enc1-module' (Join-Path $bin 'd4r_k_module_probe.exe') @(
-            '--hip-root', $HipRoot, '--module', (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'))
-        if (!$kModuleOk) { throw 'K enc1 module cannot load on gfx1201; transformer execution remains untested.' }
+        $kFixture = Join-Path $OutputDirectory 'k-enc1-fixture'
+        $kModuleOk = Invoke-Probe 'k-enc1-gpu' (Join-Path $bin 'd4r_k_module_probe.exe') @(
+            '--hip-root', $HipRoot, '--module', (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'),
+            '--fixture-dir', $kFixture, '--iterations', "$Iterations")
+        if (!$kModuleOk) { throw 'K enc1 GPU execution failed; see the k-enc1-gpu logs.' }
+        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+        if (!$pythonCommand) { throw 'Python 3.11+ with NumPy 2.4.6 is needed for the K reference check; run setup-windows-tools.ps1.' }
+        $kReferenceOk = Invoke-Probe 'k-enc1-reference' $pythonCommand.Source @(
+            (Join-Path $PackageRoot 'k_enc1_validate.py'), '--fixture-dir', $kFixture)
+        if (!$kReferenceOk) { throw 'K enc1 output differs from pwin_model.py; see the k-enc1-reference logs.' }
         $cudaOk = $true
         foreach ($context in @('primary', 'created')) {
             $ok = Invoke-Probe "cuda-$context" (Join-Path $bin 'd4r_cuda_driver_probe.exe') @(
@@ -200,6 +212,7 @@ try {
     $env:ZLUDA_LOG_DIR = $originalLog
     $env:ZLUDA_CUDA_LIB = $originalCuda
     $env:D4R_NVAPI_BACKEND = $originalNvapi
+    $env:PYTHONPATH = $originalPythonPath
     $archive = "$OutputDirectory.zip"
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath $archive -Force
     Write-Host "Diagnostic bundle: $archive"
