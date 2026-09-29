@@ -21,7 +21,28 @@ add_custom_command(OUTPUT "${probe_object}"
     -o "${probe_object}"
   DEPENDS tools/windows/probe_kernel.hip VERBATIM)
 add_custom_target(d4r_probe_code_object ALL DEPENDS "${probe_object}")
-foreach(probe hip_gfx1201_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe)
+set(wmma_object "${CMAKE_CURRENT_BINARY_DIR}/wmma_gfx1201.hsaco")
+add_custom_command(OUTPUT "${wmma_object}"
+  COMMAND "${D4R_HIP_CLANG}" -x hip --offload-arch=gfx1201
+    --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
+    -nogpuinc -nogpulib -O2 "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/wmma_gfx1201.hip"
+    -o "${wmma_object}"
+  DEPENDS tools/windows/wmma_gfx1201.hip kernels/common/wmma_backend.h VERBATIM)
+add_custom_target(d4r_wmma_code_object ALL DEPENDS "${wmma_object}")
+# Compile-only K port smoke test. This object is intentionally not installed as
+# a native override until its transformer outputs pass the K reference/replay.
+set(k_enc1_object "${CMAKE_CURRENT_BINARY_DIR}/dltss_pwin_enc1_layer_gfx1201.hsaco")
+add_custom_command(OUTPUT "${k_enc1_object}"
+  COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
+    --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
+    -nogpuinc -nogpulib -O2 -DD4R_DEVICE_ONLY_MINIMAL
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/k/dltss_pwin_enc1_layer.hip"
+    -o "${k_enc1_object}"
+  DEPENDS kernels/k/dltss_pwin_enc1_layer.hip kernels/k/pwin_layer.h
+    kernels/k/pwin_common.h kernels/common/wmma_backend.h
+    kernels/common/hip_device_minimal.h VERBATIM)
+add_custom_target(d4r_k_gfx1201_compile ALL DEPENDS "${k_enc1_object}")
+foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
   target_include_directories(d4r_${probe} PRIVATE "${D4R_HIP_ROOT}/include")
@@ -72,13 +93,23 @@ endif()
 install(TARGETS d4r_nvapi_compat RUNTIME DESTINATION nvapi-compat)
 target_link_libraries(d4r_d3d12_hip_interop_probe PRIVATE d3d12 dxgi dxguid)
 add_dependencies(d4r_hip_gfx1201_probe d4r_probe_code_object)
+add_dependencies(d4r_gfx12_wmma_probe d4r_wmma_code_object)
+add_dependencies(d4r_k_module_probe d4r_k_gfx1201_compile)
 install(FILES "${probe_object}" DESTINATION bin)
+install(FILES "${wmma_object}" DESTINATION bin)
+install(FILES "${k_enc1_object}" DESTINATION experimental/k)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
 install(FILES docs/windows-rdna4-port.md DESTINATION docs)
 include(CTest)
 add_test(NAME hip_gfx1201 COMMAND d4r_hip_gfx1201_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}")
 set_tests_properties(hip_gfx1201 PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201")
+add_test(NAME gfx12_wmma COMMAND d4r_gfx12_wmma_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "${wmma_object}" --iterations 16)
+set_tests_properties(gfx12_wmma PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;wmma")
+add_test(NAME k_enc1_module COMMAND d4r_k_module_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "${k_enc1_object}")
+set_tests_properties(k_enc1_module PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;k_compile")
 add_test(NAME d3d12_hip_interop COMMAND d4r_d3d12_hip_interop_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}" --iterations 32)
 set_tests_properties(d3d12_hip_interop PROPERTIES TIMEOUT 120 LABELS "hardware;interop")

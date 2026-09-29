@@ -6,8 +6,9 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 
 ## Milestone and gates
 
-Current milestone: M1/M2/M4 passed; NGX init + DLSS CUDA capability discovery
-passed with the user's DLLs. Next: validated gfx12 WMMA and native K kernels.
+Current milestone: M1/M2/M4/M5 passed; NGX init + DLSS CUDA capability discovery
+passed with the user's DLLs. The first K `enc1` code object compiles and loads;
+its prep/transformer have not yet been executed or checked against replay.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -17,7 +18,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
 | M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
-| M5: independently validated gfx12 WMMA backend | Pending |
+| M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter, 16 cases, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | Pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
@@ -117,6 +118,27 @@ The backend must explicitly convert operands **and** accumulator distribution,
 or update all dependent loads/stores and intermediate fragments together.
 Start with FP16 / FP32 accumulate. M native FP8 is a later measured optimization.
 Compile success is not proof of lane layout or numerical correctness.
+
+`kernels/common/wmma_backend.h` now preserves the gfx11 call and maps d4r's
+16-half operand / even-odd accumulator contract to gfx12's 8-half operand /
+contiguous accumulator contract. The gfx12 mapping uses an unconditional
+wave32 half-exchange for every source fragment element before selection.
+Performing the exchange only on lanes selected by a group-dependent branch
+returned channel 9 in place of channel 1 on this card: the opposite half of
+the wave was inactive at that instruction. This was caught by the CPU reference.
+`tools/windows/wmma_gfx1201.hip` tests raw gfx12 WMMA, the adapter, the
+half-exchange and lane ID with nonzero accumulator and one/two K16 steps.
+Both stable HIP 7.2 and TheRock 10.2 produced exact 16x16 outputs across 16
+different inputs; max absolute and relative errors were both zero.
+
+`kernels/k/pwin_common.h` now calls the tested adapter. The Windows device-only
+compiler uses `kernels/common/hip_device_minimal.h`, exposing only public
+Clang AMDGPU work-item/grid/barrier builtins and HIP-compatible qualifiers;
+the ordinary Linux HIP include path remains. CMake builds `enc1` for gfx1201
+into `experimental/k/` and verifies that HIP loads both prep and transformer
+entry points. This is a **compile/load smoke test**, not K layer correctness or
+DLSS execution. The code object must stay out of ZLUDA's native override path
+until numerical K replay validation passes.
 
 ## External interop blockers
 
@@ -223,13 +245,13 @@ This builds into `build/windows-rdna4-therock` and installs into
 `dist/windows-rdna4-therock`. The stable profile stays available for reproducing
 the runtime bug. It is expected to return failure at the lifetime gate.
 
-One command adds the local NGX initialization gate after the five hardware gates:
+One command adds the local NGX initialization gate after the seven hardware gates:
 
 ```powershell
 powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "C:/Users/Administrator/d4r/_nvngx.dll" -DlssDll "C:/Users/Administrator/d4r/nvngx_dlss.dll"
 ```
 
-Success requires all six tests and `PASS NGX_INIT ... sr_available=1`;
+Success requires all eight tests and `PASS NGX_INIT ... sr_available=1`;
 `transformer_executed=0` is explicit. On NGX failure, CUDA trace and NVAPI query
 logs are collected automatically. NVIDIA DLLs remain local test inputs.
 
@@ -295,6 +317,18 @@ MSVC parameter roundtrip Width=640, checked parameter/context/NGX cleanup.
 Local logs: `test-results/ngx-init-private-runtime.zip`. This is only the first
 part of M3; feature execution, K/M correctness and the Windows shim remain open.
 
+2026-09-29 M5: TheRock full diagnostic run including user-provided NGX DLLs:
+8/8 gates PASS (`test-results/m5-k-module.zip`). CTest: 7/7 PASS. Stable HIP 7.2:
+5/5 non-interop gates PASS (HIP, gfx12 WMMA, K module load, both CUDA contexts);
+stable mapped-view lifetime bug still excludes its interop fast path.
+WMMA raw and legacy-layout adapter each match the scalar reference exactly
+over 16 changing input matrices, with both one-step and two-step accumulation.
+The `enc1` K module is built and loaded on gfx1201, with functions resolved;
+`transformer_executed=0` is explicit in the module probe. Neither K nor M
+transformer correctness is claimed yet. The same K source also compiles for
+`gfx1101` through the unchanged gfx11 builtin branch (compile-only regression;
+no RDNA3 GPU is present in this Windows machine).
+
 Audit found an upstream validation blocker: `swin_model.py` imports
 `model_enc3`, which is absent from the repository. M reference validation needs
 that dependency restored or an independently checked replacement.
@@ -304,4 +338,4 @@ launching the MinGW child compiler, so branch/commit/build require scoped tool
 approval in this managed environment. HIP_PATH ends in a backslash; build script
 normalizes it before PowerShell 5 argument quoting. Test runner uses .NET Process
 to retain reliable exit codes and concurrently drain both diagnostic streams.
-No K/M/DLSS/OptiScaler support is claimed by these diagnostic milestones.
+No end-to-end K/M/DLSS/OptiScaler support is claimed by these diagnostic milestones.

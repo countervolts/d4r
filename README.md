@@ -7,7 +7,9 @@ d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in W
 It is an experiment. It has been tested on one GPU in a handful of games, it depends on unreleased patches to ZLUDA and vkd3d-proton.
 
 **Windows / RDNA4 development:** the `windows-rdna4` branch adds native Windows
-gfx1201 HIP/ZLUDA diagnostics, validated D3D12/HIP interop and an NGX init probe.
+gfx1201 HIP/ZLUDA diagnostics, validated D3D12/HIP interop, an NGX init probe,
+and a CPU-checked gfx12 WMMA backend. An experimental K `enc1` kernel compiles
+and loads but has not passed transformer-output validation.
 Build commands, hardware results and remaining
 porting gates are in [docs/windows-rdna4-port.md](docs/windows-rdna4-port.md).
 This branch does not yet provide a Windows DLSS runtime.

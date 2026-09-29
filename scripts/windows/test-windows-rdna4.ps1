@@ -94,7 +94,9 @@ try {
     $comgr = Join-Path $HipRoot 'bin/amd_comgr_3.dll'
     if (!(Test-Path -LiteralPath $comgr)) { $comgr = Join-Path $HipRoot 'bin/amd_comgr.dll' }
     $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
-        (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'))
+        (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'),
+        (Join-Path $PackageRoot 'bin/wmma_gfx1201.hsaco'),
+        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'))
     if ($NgxCore -or $DlssDll) {
         if (!$NgxCore -or !$DlssDll) { throw 'Supply both -NgxCore and -DlssDll absolute paths.' }
         if (![IO.Path]::IsPathRooted($NgxCore) -or ![IO.Path]::IsPathRooted($DlssDll)) {
@@ -117,6 +119,12 @@ try {
     $hipOk = Invoke-Probe 'hip' (Join-Path $bin 'd4r_hip_gfx1201_probe.exe') @(
         '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', "$Iterations")
     if ($hipOk) {
+        $wmmaOk = Invoke-Probe 'gfx12-wmma' (Join-Path $bin 'd4r_gfx12_wmma_probe.exe') @(
+            '--hip-root', $HipRoot, '--module', (Join-Path $bin 'wmma_gfx1201.hsaco'), '--iterations', "$Iterations")
+        if (!$wmmaOk) { throw 'gfx12 WMMA layout validation failed; refusing to mark K/M readiness.' }
+        $kModuleOk = Invoke-Probe 'k-enc1-module' (Join-Path $bin 'd4r_k_module_probe.exe') @(
+            '--hip-root', $HipRoot, '--module', (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'))
+        if (!$kModuleOk) { throw 'K enc1 module cannot load on gfx1201; transformer execution remains untested.' }
         $cudaOk = $true
         foreach ($context in @('primary', 'created')) {
             $ok = Invoke-Probe "cuda-$context" (Join-Path $bin 'd4r_cuda_driver_probe.exe') @(

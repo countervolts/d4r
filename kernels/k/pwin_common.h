@@ -6,7 +6,11 @@
 // and the activations as the B operand (lane l: token l & 15, 16 K values). The f32 result then has
 // lane l = token l & 15 and VGPR i = output channel 2i + (l >> 4) of the 16-channel tile ("D^T").
 #pragma once
+#ifdef D4R_DEVICE_ONLY_MINIMAL
+#include "../common/hip_device_minimal.h"
+#else
 #include <hip/hip_runtime.h>
+#endif
 #include <stdint.h>
 
 #pragma clang fp contract(off)
@@ -17,6 +21,7 @@ typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8v __attribute__((ext_vector_type(8)));
 typedef uint32_t u8v __attribute__((ext_vector_type(8)));
 typedef uint32_t u4v __attribute__((ext_vector_type(4)));
+#include "../common/wmma_backend.h"
 
 __device__ __forceinline__ uint32_t lane_id()
 {
@@ -25,7 +30,7 @@ __device__ __forceinline__ uint32_t lane_id()
 
 __device__ __forceinline__ f8v wmma(u8v a, u8v b, f8v c)
 {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), c);
+    return d4r_wmma_legacy_layout(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), c);
 }
 
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)
