@@ -10,8 +10,11 @@ Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
 requested E path passes with the user's DLLs. All 11 K layers now pass synthetic
 and real-weight NumPy/PTX replay checks; native K Evaluate produces four finite
 frames on Windows. M now passes all five synthetic and real-weight layers against
-NumPy and independent PTX, and four native CUDA frames. D3D12 integration remains
-in progress; the fully translated M comparison currently exceeds its JIT timeout.
+NumPy and independent PTX, and four native CUDA frames. The standalone D3D12
+harness now produces four K and four M frames using imported VRAM and shared
+fences, with bit-exact RGB agreement against the corresponding CUDA harnesses.
+Game command-list/queue integration remains in progress. The fully translated M
+comparison is being rerun with the correct WMMA options and a writable JIT cache.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -19,12 +22,12 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M0: branch, audit, Windows build and diagnostics | Initial implementation complete |
 | M1: native HIP gfx1201 allocation, kernel, CPU verification | PASS, 32 iterations + guard verification |
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
-| M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; four finite synthetic frames; K/M pending |
+| M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; E, K and M CUDA harnesses execute |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | CUDA harness PASS: 11 real-weight layers, native launches for all layers, four finite frames, 81.85–92.91 dB versus translated K; D3D12 integration pending |
 | M7: M FP16-equivalent baseline and full transformer | CUDA harness PASS: 5 real-weight layers exactly match NumPy/PTX, 4 finite frames, 40 native Swin launches; D3D12 and full translated M comparison pending |
-| M8: standalone Windows D3D12 NGX harness | Pending |
+| M8: standalone Windows D3D12 NGX harness | PASS at explicit submitted queue boundaries: K/M, four frames each, no shim CPU image copies, bit-exact RGB against CUDA harness |
 | M9: OptiScaler integration, profiling, installation | Pending |
 
 ## Source baseline (checked 2026-09-29)
@@ -166,14 +169,18 @@ Reproduce the layer gates:
 & scripts/windows/test-m-replay.ps1
 & scripts/windows/stage-native-m.ps1 -DlssDll "$PWD/nvngx_dlss.dll"
 $env:D4R_ZLUDA_NATIVE_DIR="$PWD/build/native-m-gfx1201"
-$env:D4R_WMMA='1'; $env:D4R_FP8_WMMA='1'; $env:D4R_FP8_NATIVE='0'
+$env:D4R_ZLUDA_WMMA='1'; $env:D4R_ZLUDA_WMMA_FP8='1'; $env:D4R_ZLUDA_WMMA_FP8_NATIVE='0'
 & scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxOnly -NgxMode evaluate -Preset 13 -Iterations 4 -RequireNativeNetwork -NgxCore "$PWD/_nvngx.dll" -DlssDll "$PWD/nvngx_dlss.dll"
 ```
 
-The fully translated M feature creation currently exceeds 600 seconds; its
-automatic trace localises this to loading the transformer modules. Native M
-does not have this JIT delay. A completed translated image comparison is not
-claimed. The user selected Silent Hill 2 at
+Earlier translated M attempts used incorrect environment names and an
+unwritable default JIT cache. The runner now defaults to the actual
+`D4R_ZLUDA_WMMA`, `D4R_ZLUDA_WMMA_FP8`, `D4R_ZLUDA_WMMA_FP8_NATIVE` options
+(1, 1, 0), records them, and restores the caller's environment. Patch 0012 adds
+absolute `ZLUDA_CACHE_DIR` and reports directory/open failures. The diagnostic
+default is `build/zluda-cache-windows`; five Rust cache tests and all eleven
+patches applied to the pinned clean upstream pass. A completed translated M
+image comparison is not yet claimed. The user selected Silent Hill 2 at
 `D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe`
 for the later game gate. No game files have been changed yet.
 
@@ -185,6 +192,49 @@ submitted. Closing/submitting the current list immediately inside Evaluate
 is insufficient for a general game integration. The next backend gate is a
 D3D12 harness with explicit queue boundaries; command-list/queue integration
 must be validated before the game gate.
+
+### Native D3D12 harness milestone (2026-09-30)
+
+The new `d4r_nvngx.dll` has a Windows backend independent of the Wine shim.
+`d3d12_external.h` owns Win32 handles, shared DEFAULT buffers, HIP mappings and
+the D3D12 fence/semaphore timeline. Canonical color/output RGBA16F, motion RG16F,
+and depth/exposure R32F remain in VRAM. Texture-to-buffer copies, CUDA array
+transfers and output copies execute on the GPU. Harness initialization uploads
+synthetic inputs; final readback is confined to its verifier/output exporter.
+
+The first complete attempt exposed a synchronization race: waiting on a HIP
+external semaphore on its nonblocking stream and synchronizing that stream did
+not reliably establish completion for work subsequently submitted through other
+CUDA streams. Samples read back by the diagnostic could hide the race. The
+baseline additionally waits for the producer's actual D3D12 fence event before
+CUDA submission. It waits for completion, without transferring image data or
+using another frame. `cuCtxSynchronize` covers NGX's internal streams, followed
+by HIP fence signaling and a D3D12 queue wait before copying the output texture.
+Reducing these host completion waits is a later profiling/ordering task.
+
+Private results: `test-results/d3d12-k-direct-fence.zip` and
+`test-results/d3d12-m-direct-fence.zip`, four finite, nonconstant frames each,
+44 native K and 40 native M launches. Every RGB value agrees bit-for-bit with
+`ngx-k-native-verified` / `ngx-m-bounded-capture`: max absolute/relative error 0,
+PSNR infinite. CTest: 10/10 PASS including a five-plane D3D12-to-CUDA array
+roundtrip and pitched CUDA device/array copies with padding sentinels.
+
+Build/package: `dist/windows-rdna4-d3d12`. Reproduce K (use preset 13 and the
+staged `native-m-gfx1201` directory for M):
+
+```powershell
+$env:D4R_ZLUDA_NATIVE_DIR="$PWD/build/native-k-gfx1201"
+& scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -PackageRoot "$PWD/dist/windows-rdna4-d3d12" -NgxOnly -NgxMode d3d12 -Preset 11 -Iterations 4 -RequireNativeNetwork -NgxCore "$PWD/_nvngx.dll" -DlssDll "$PWD/nvngx_dlss.dll"
+```
+
+The runner places the shim beside the two private NVIDIA DLLs in an owned
+temporary directory, matching NGX's caller-relative feature lookup. They are
+never installed into the public package. `D4R_INTEROP_VERIFY` explicitly enables
+extra CPU diagnostics and changes the logged copy flag; keep it unset for the
+normal path. The open-command-list game export still rejects execution until
+submission ordering is implemented. The explicit harness export requires that
+all preceding producers have already been submitted. Other texture formats,
+dynamic resolution and real-game resource-state tracking remain unvalidated.
 
 ### K real-weight native Evaluate and correctness baseline
 

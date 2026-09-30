@@ -38,10 +38,30 @@ int main(int argc, char** argv) {
                 image.upload(input.data());
                 image.download(output.data());
                 if (input != output) throw std::runtime_error("CUDA array storage roundtrip mismatch");
+                const size_t rowBytes = 17 * channels * sizeof(uint16_t), pitch = (rowBytes + 255) & ~size_t(255);
+                CUdeviceptr devicePixels = 0;
+                cuda.check(cuda.cuMemAlloc_v2(&devicePixels, pitch * 9), "cuMemAlloc_v2(pitched image regression)");
+                struct PixelsCleanup { CudaApi& cuda; CUdeviceptr pointer; ~PixelsCleanup() { (void)cuda.cuMemFree_v2(pointer); } } pixelsCleanup{cuda, devicePixels};
+                std::vector<uint8_t> padded(pitch * 9, 0xcd);
+                for (unsigned y = 0; y < 9; ++y) std::memcpy(padded.data() + y * pitch, input.data() + y * 17 * channels, rowBytes);
+                cuda.check(cuda.cuMemcpyHtoD_v2(devicePixels, padded.data(), padded.size()), "cuMemcpyHtoD_v2(pitched pattern)");
+                image.upload_device(devicePixels, pitch);
+                image.download(output.data());
+                if (input != output) throw std::runtime_error("CUDA device-to-array pitched copy mismatch");
+                std::fill(padded.begin(), padded.end(), 0xee);
+                cuda.check(cuda.cuMemcpyHtoD_v2(devicePixels, padded.data(), padded.size()), "cuMemcpyHtoD_v2(output sentinel)");
+                image.download_device(devicePixels, pitch);
+                cuda.check(cuda.cuMemcpyDtoH_v2(padded.data(), devicePixels, padded.size()), "cuMemcpyDtoH_v2(device array output)");
+                for (unsigned y = 0; y < 9; ++y) {
+                    if (std::memcmp(padded.data() + y * pitch, input.data() + y * 17 * channels, rowBytes))
+                        throw std::runtime_error("CUDA array-to-device pitched copy mismatch");
+                    if (!std::all_of(padded.begin() + y * pitch + rowBytes, padded.begin() + (y + 1) * pitch, [](uint8_t value) { return value == 0xee; }))
+                        throw std::runtime_error("CUDA array-to-device copy overwrote pitch padding");
+                }
             }
         }
         cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize");
-        std::printf("PASS CUDA_IMAGES architecture=gfx1201 iterations=%u descriptor_and_storage=1\n", args.iterations);
+        std::printf("PASS CUDA_IMAGES architecture=gfx1201 iterations=%u descriptor_and_storage=1 pitched_device_copies=1\n", args.iterations);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL CUDA_IMAGES %s\n", e.what());

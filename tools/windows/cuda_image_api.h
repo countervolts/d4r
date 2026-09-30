@@ -131,5 +131,21 @@ public:
         copy.widthBytes = rowBytes_; copy.height = height_;
         api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(diagnostic array to host)");
     }
+    void upload_device(CUdeviceptr source, size_t pitch) {
+        if (pitch < rowBytes_) throw std::runtime_error("Device input pitch is smaller than its row");
+        Copy2D copy{};
+        copy.srcType = 2; copy.srcDevice = source; copy.srcPitch = pitch;
+        copy.dstType = 3; copy.dstArray = array_;
+        copy.widthBytes = rowBytes_; copy.height = height_;
+        api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(external VRAM to array)");
+    }
+    void download_device(CUdeviceptr destination, size_t pitch) {
+        if (pitch < rowBytes_) throw std::runtime_error("Device output pitch is smaller than its row");
+        Copy2D copy{};
+        copy.srcType = 3; copy.srcArray = array_;
+        copy.dstType = 2; copy.dstDevice = destination; copy.dstPitch = pitch;
+        copy.widthBytes = rowBytes_; copy.height = height_;
+        api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(array to external VRAM)");
+    }
 };
 }

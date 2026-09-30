@@ -7,7 +7,7 @@ param(
     [string]$OutputDirectory,
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,
-    [ValidateSet('init', 'evaluate')][string]$NgxMode = 'init',
+    [ValidateSet('init', 'evaluate', 'd3d12')][string]$NgxMode = 'init',
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
     [switch]$NgxOnly,
     [switch]$Trace,
@@ -51,6 +51,11 @@ $originalCuda = $env:ZLUDA_CUDA_LIB
 $originalNvapi = $env:D4R_NVAPI_BACKEND
 $originalPythonPath = $env:PYTHONPATH
 $originalVerbose = $env:D4R_ZLUDA_VERBOSE
+$originalCache = $env:ZLUDA_CACHE_DIR
+$originalCodegen = @{}
+foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE')) {
+    $originalCodegen[$setting] = [Environment]::GetEnvironmentVariable($setting,'Process')
+}
 $exitStatus = 1
 $ngxRuntimeDirectory = $null
 $summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
@@ -96,9 +101,19 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
     return $pass
 }
 try {
+    if (!$env:ZLUDA_CACHE_DIR) { $env:ZLUDA_CACHE_DIR = Join-Path $repoRoot 'build/zluda-cache-windows' }
+    $summary.zludaCacheDirectory = $env:ZLUDA_CACHE_DIR
+    foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE')) {
+        if ($null -eq $originalCodegen[$setting]) {
+            [Environment]::SetEnvironmentVariable($setting, $(if ($setting -eq 'D4R_ZLUDA_WMMA_FP8_NATIVE') { '0' } else { '1' }), 'Process')
+        }
+    }
+    $summary.codegen = @{}
+    foreach ($setting in $originalCodegen.Keys) { $summary.codegen[$setting] = [Environment]::GetEnvironmentVariable($setting,'Process') }
+    Write-Host "ZLUDA codegen: WMMA=$env:D4R_ZLUDA_WMMA FP8 widening=$env:D4R_ZLUDA_WMMA_FP8 native FP8=$env:D4R_ZLUDA_WMMA_FP8_NATIVE"
     if ($NgxOnly -and (!$NgxCore -or !$DlssDll)) { throw '-NgxOnly requires both locally supplied NVIDIA DLL paths.' }
     if ($RequireNativeNetwork) {
-        if ($NgxMode -ne 'evaluate' -or $Preset -notin @(11,13) -or !$env:D4R_ZLUDA_NATIVE_DIR) {
+        if ($NgxMode -notin @('evaluate','d3d12') -or $Preset -notin @(11,13) -or !$env:D4R_ZLUDA_NATIVE_DIR) {
             throw '-RequireNativeNetwork requires K/M Evaluate and D4R_ZLUDA_NATIVE_DIR.'
         }
         $env:D4R_ZLUDA_VERBOSE = '1'
@@ -209,7 +224,8 @@ try {
                 $ngxExe = Join-Path $ngxRuntimeDirectory 'd4r_ngx_cuda_init_probe.exe'
                 $localCore = Join-Path $ngxRuntimeDirectory '_nvngx.dll'
                 $localDlss = Join-Path $ngxRuntimeDirectory 'nvngx_dlss.dll'
-                Copy-Item -LiteralPath (Join-Path $bin 'd4r_ngx_cuda_init_probe.exe') -Destination $ngxExe
+                $probeName = if ($NgxMode -eq 'd3d12') { 'd4r_d3d12_dlss_probe.exe' } else { 'd4r_ngx_cuda_init_probe.exe' }
+                Copy-Item -LiteralPath (Join-Path $bin $probeName) -Destination $ngxExe
                 Copy-Item -LiteralPath $NgxCore -Destination $localCore
                 Copy-Item -LiteralPath $DlssDll -Destination $localDlss
                 $selectedCuda = if ($Trace) { Join-Path $ZludaRoot 'trace/nvcuda.dll' } else { Join-Path $ZludaRoot 'nvcuda.dll' }
@@ -219,7 +235,15 @@ try {
                     '--ngx-core', $localCore, '--dlss-dll', $localDlss,
                     '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
                     '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', "$Iterations")
-                $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } else { 'ngx-init' }
+                if ($NgxMode -eq 'd3d12') {
+                    # The driver NGX core resolves feature DLLs relative to its
+                    # caller module as well as the executable. Keep the shim
+                    # alongside the private user-supplied DLLs for this test.
+                    $localShim = Join-Path $ngxRuntimeDirectory 'd4r_nvngx.dll'
+                    Copy-Item -LiteralPath (Join-Path $bin 'd4r_nvngx.dll') -Destination $localShim
+                    $ngxArguments += @('--module', $localShim)
+                }
+                $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } elseif ($NgxMode -eq 'd3d12') { "d3d12-evaluate-preset-$Preset" } else { 'ngx-init' }
                 $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments
                 if ($ngxOk -and $RequireNativeNetwork) {
                     $hits = @()
@@ -238,12 +262,14 @@ try {
                 }
                 if (!$ngxOk) {
                     $exitStatus = 1
-                    if (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll')) {
-                        Invoke-Probe "$ngxName-trace" $ngxExe @(
+                    if (!$Trace -and (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll'))) {
+                        $traceArguments = @(
                             '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'trace/nvcuda.dll'),
                             '--ngx-core', $localCore, '--dlss-dll', $localDlss,
                             '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
-                            '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', '1') | Out-Null
+                            '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', '1')
+                        if ($NgxMode -eq 'd3d12') { $traceArguments += @('--module', $localShim) }
+                        Invoke-Probe "$ngxName-trace" $ngxExe $traceArguments | Out-Null
                     }
                 }
             }
@@ -272,6 +298,8 @@ try {
     $env:D4R_NVAPI_BACKEND = $originalNvapi
     $env:PYTHONPATH = $originalPythonPath
     $env:D4R_ZLUDA_VERBOSE = $originalVerbose
+    $env:ZLUDA_CACHE_DIR = $originalCache
+    foreach ($setting in $originalCodegen.Keys) { [Environment]::SetEnvironmentVariable($setting, $originalCodegen[$setting], 'Process') }
     $archive = "$OutputDirectory.zip"
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath $archive -Force
     Write-Host "Diagnostic bundle: $archive"

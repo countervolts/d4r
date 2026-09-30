@@ -1,0 +1,65 @@
+﻿diff --git a/zluda_cache/src/lib.rs b/zluda_cache/src/lib.rs
+index acd262e..c3ac1be 100644
+--- a/zluda_cache/src/lib.rs
++++ b/zluda_cache/src/lib.rs
+@@ -22,18 +22,36 @@ pub struct ModuleCache(SqliteConnection);
+ 
+ impl ModuleCache {
+     pub fn create_cache_dir_and_get_path() -> Option<String> {
+-        let mut cache_dir = dirs::cache_dir()?;
+-        cache_dir.extend(["zluda", "ComputeCache"]);
++        let override_dir = std::env::var_os("ZLUDA_CACHE_DIR");
++        let cache_dir = match override_dir {
++            Some(path) => {
++                let path = std::path::PathBuf::from(path);
++                if !path.is_absolute() {
++                    eprintln!("[zluda-cache] ZLUDA_CACHE_DIR must be absolute; cache disabled");
++                    return None;
++                }
++                path
++            }
++            None => dirs::cache_dir()?.join("zluda").join("ComputeCache"),
++        };
++        Self::cache_path(&cache_dir)
++    }
++
++    fn cache_path(cache_dir: &std::path::Path) -> Option<String> {
+         // We ensure that the cache directory exists
+-        std::fs::create_dir_all(&cache_dir).ok()?;
++        if let Err(error) = std::fs::create_dir_all(cache_dir) {
++            eprintln!("[zluda-cache] cannot create {}: {error}; cache disabled", cache_dir.display());
++            return None;
++        }
+         // No need to create the file, it will be created by SQLite on first access
+         // zluda.db might be in use by older versions of ZLUDA
+-        cache_dir.push("zluda2.db");
+-        Some(cache_dir.to_string_lossy().into())
++        Some(cache_dir.join("zluda2.db").to_string_lossy().into())
+     }
+ 
+     pub fn open(file_path: &str) -> Option<Self> {
+-        let mut conn = SqliteConnection::establish(file_path).ok()?;
++        let mut conn = SqliteConnection::establish(file_path).map_err(|error| {
++            eprintln!("[zluda-cache] cannot open {file_path}: {error}; cache disabled");
++        }).ok()?;
+         conn.batch_execute("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+             .ok()?;
+         conn.run_pending_migrations(MIGRATIONS).ok()?;
+@@ -86,6 +104,17 @@ mod tests {
+     use arrayvec::ArrayString;
+     use diesel::prelude::*;
+ 
++    #[test]
++    fn explicit_directory_creates_persistent_database() {
++        let directory = std::env::temp_dir().join(format!("zluda-cache-test-{}-{}", std::process::id(), ModuleCache::time_now()));
++        let path = ModuleCache::cache_path(&directory).unwrap();
++        assert_eq!(std::path::Path::new(&path), directory.join("zluda2.db"));
++        let cache = ModuleCache::open(&path).unwrap();
++        drop(cache);
++        assert!(std::path::Path::new(&path).is_file());
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++
+     #[derive(Queryable, Selectable)]
+     #[diesel(table_name = crate::schema::modules)]
+     #[diesel(check_for_backend(diesel::sqlite::Sqlite))]

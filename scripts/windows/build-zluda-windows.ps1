@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [int]$Jobs = 4)
+param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [switch]$CacheTestsOnly, [int]$Jobs = 4)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$SourceRoot) { $SourceRoot = Join-Path $repo 'external/ZLUDA' }
@@ -33,6 +33,14 @@ Push-Location $SourceRoot
 try {
     $cargo = Join-Path $rust 'bin/cargo.exe'
     if (!(Test-Path $cargo)) { throw 'Run setup-rust-toolchain.ps1 first.' }
+    if ($CacheTestsOnly) {
+        $ErrorActionPreference = 'Continue'
+        & $cargo test --locked --release --target x86_64-pc-windows-gnu -p zluda_cache `
+            2>&1 | Tee-Object (Join-Path $target 'cache-tests.log')
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE) { throw "ZLUDA cache regression tests failed ($LASTEXITCODE)" }
+        return
+    }
     if ($FetchOnly) {
         $ErrorActionPreference = 'Continue'
         & $cargo fetch --locked --target x86_64-pc-windows-gnu 2>&1 | Tee-Object (Join-Path $target 'fetch.log')
