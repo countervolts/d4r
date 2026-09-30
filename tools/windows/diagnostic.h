@@ -116,6 +116,7 @@ struct Args {
     std::string ngx_mode = "init";
     unsigned preset = 11;
     std::string fixture_dir;
+    std::string output_dir;
     std::string kernel_name = "enc1";
     unsigned iterations = 32;
     int device = -1;
@@ -142,6 +143,7 @@ struct Args {
                     throw std::runtime_error("preset must be 5 (E), 11 (K) or 13 (M)");
             }
             else if (key == "--fixture-dir") fixture_dir = value;
+            else if (key == "--output-dir") output_dir = value;
             else if (key == "--kernel-name") kernel_name = value;
             else if (key == "--iterations") {
                 size_t end = 0;

@@ -25,6 +25,7 @@ struct HipApi {
     D4R_HIP_FUNCTION(hipModuleLoad);
     D4R_HIP_FUNCTION(hipModuleUnload);
     D4R_HIP_FUNCTION(hipModuleGetFunction);
+    D4R_HIP_FUNCTION(hipModuleGetGlobal);
     D4R_HIP_FUNCTION(hipModuleLaunchKernel);
     D4R_HIP_FUNCTION(hipDeviceSynchronize);
     D4R_HIP_FUNCTION(hipStreamCreateWithFlags);

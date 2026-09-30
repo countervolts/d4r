@@ -7,8 +7,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 ## Milestone and gates
 
 Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
-requested E path passes with the user's DLLs. M6 is in progress: K `enc1` and `enc2` prep and
-transformers run on gfx1201 and pass synthetic nonzero numpy reference checks.
+requested E path passes with the user's DLLs. M6 is in progress: all 11 K layers
+run on gfx1201 and pass synthetic nonzero NumPy reference checks.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -19,7 +19,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; four finite synthetic frames; K/M pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
-| M6: K layers, full transformer and image validation | Partial: `enc1`/`enc2` execute and match nonzero references; other layers/full network pending |
+| M6: K layers, full transformer and image validation | All 11 synthetic layer replays PASS; real weights, full network and K image validation pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
 | M9: OptiScaler integration, profiling, installation | Pending |
@@ -95,7 +95,7 @@ Windows CMake compiles all **11 K + 5 M** source modules with gfx1201 wave32,
 `-O3` and each source's upstream `d4r-build-flags` (including `-mcumode`). Both
 stable HIP 7.2 and isolated TheRock build successfully. The objects install to
 `experimental/k` and `experimental/m`, outside the ZLUDA override directory.
-Only `enc1`/`enc2` currently have GPU layer correctness checks.
+All 11 K layers now have GPU synthetic replay/reference checks (results below).
 
 2026-09-30 integration results on RX 9070 XT, Windows 11:
 
@@ -116,12 +116,52 @@ fix/TheRock; passing K does not resolve that leak. Build logs remain under each
 `build/windows-rdna4*` directory; stable GPU logs/fixtures remain under
 `test-results/upstream-stable-*-gpu.log` and `test-results/upstream-rdna4-stable`.
 
-Next gate: validate the remaining K layers against references/captures, then
-build the d4r-patched Windows ZLUDA and implement same-frame Windows NGX Evaluate
+Next gate: validate K against real DLSS captures with the built Windows ZLUDA,
+then implement same-frame Windows NGX Evaluate
 with explicit D3D12 queue submission ownership. Full K precedes M and native
 FP8/performance work. No complete DLSS or OptiScaler game result is claimed.
 
 ## Native Windows ZLUDA build and Evaluate work (2026-09-30)
+
+### All K layers: native Windows synthetic replay (2026-09-30)
+
+`native_replay_probe` reads upstream `manifest.txt`/`args.bin`/`alloc-N.bin`,
+relocates allocation pointers, runs the module's prep and main kernels, and
+saves GPU allocations for the existing `pwin_check`/`pwin_model` references.
+No NVIDIA DLL, PTX or weights are needed for these synthetic fixtures.
+Each fixture enables nonzero projections, attention, MLP and the layer's
+embedding/merge/head operations; it covers one 8x8 window with sparse weights.
+It does not replace validation with real network weights, multiple windows,
+shifted borders, textures or complete DLSS output.
+
+Run from the repository:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-k-replay.ps1
+```
+
+Hardware result: `test-results/k-all-layers-synthetic.zip`, **11/11 PASS**,
+32 native launches per layer, all output elements finite. The acceptance limit
+is max absolute error <= 0.001 and PSNR >= 60 dB; relative error uses a 0.001
+denominator floor. Validation stops on the first mismatch.
+
+| Layer | Max absolute error | Max relative error | PSNR (dB) |
+| --- | --- | --- | --- |
+| enc0 | 0.00048828125 | 0.0011682243 | 88.75 |
+| enc1 | 0 | 0 | exact |
+| enc2 | 0.0000305175781 | 0.0009319664 | 114.40 |
+| enc3 | 0 | 0 | exact |
+| enc4 | 0 | 0 | exact |
+| dec5 | 0 | 0 | exact |
+| dec4 | 0 | 0 | exact |
+| dec3 | 0 | 0 | exact |
+| dec2 | 0.0000305175781 | 0.0008741259 | 111.42 |
+| dec1 | 0.00048828125 | 0.0011086475 | 99.33 |
+| dec0 | 0.000122070312 | 0.0133333333 | 100.84 |
+
+The next K gate is capture/reference validation with actual DLSS weights and
+proof of native transformer launches during Evaluate. Native overrides must
+check the originating PTX identity before replacing a function.
 
 The local fork now builds natively under Windows, including d4r patches
 `0002`–`0007`. New `0008-native-windows-build.patch` preserves MSVC/Linux builds
