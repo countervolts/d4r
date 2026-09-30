@@ -101,7 +101,8 @@ try {
     $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
         (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'),
         (Join-Path $PackageRoot 'bin/wmma_gfx1201.hsaco'),
-        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'))
+        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'),
+        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc2_layer_gfx1201.hsaco'))
     if ($NgxCore -or $DlssDll) {
         if (!$NgxCore -or !$DlssDll) { throw 'Supply both -NgxCore and -DlssDll absolute paths.' }
         if (![IO.Path]::IsPathRooted($NgxCore) -or ![IO.Path]::IsPathRooted($DlssDll)) {
@@ -127,16 +128,19 @@ try {
         $wmmaOk = Invoke-Probe 'gfx12-wmma' (Join-Path $bin 'd4r_gfx12_wmma_probe.exe') @(
             '--hip-root', $HipRoot, '--module', (Join-Path $bin 'wmma_gfx1201.hsaco'), '--iterations', "$Iterations")
         if (!$wmmaOk) { throw 'gfx12 WMMA layout validation failed; refusing to mark K/M readiness.' }
-        $kFixture = Join-Path $OutputDirectory 'k-enc1-fixture'
-        $kModuleOk = Invoke-Probe 'k-enc1-gpu' (Join-Path $bin 'd4r_k_module_probe.exe') @(
-            '--hip-root', $HipRoot, '--module', (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'),
-            '--fixture-dir', $kFixture, '--iterations', "$Iterations")
-        if (!$kModuleOk) { throw 'K enc1 GPU execution failed; see the k-enc1-gpu logs.' }
         $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-        if (!$pythonCommand) { throw 'Python 3.11+ with NumPy 2.4.6 is needed for the K reference check; run setup-windows-tools.ps1.' }
-        $kReferenceOk = Invoke-Probe 'k-enc1-reference' $pythonCommand.Source @(
-            (Join-Path $PackageRoot 'k_enc1_validate.py'), '--fixture-dir', $kFixture)
-        if (!$kReferenceOk) { throw 'K enc1 output differs from pwin_model.py; see the k-enc1-reference logs.' }
+        if (!$pythonCommand) { throw 'Python 3.11+ with NumPy 2.4.6 is needed for K reference checks; run setup-windows-tools.ps1.' }
+        foreach ($layer in @('enc1', 'enc2')) {
+            $kFixture = Join-Path $OutputDirectory "k-$layer-fixture"
+            $kModuleOk = Invoke-Probe "k-$layer-gpu" (Join-Path $bin 'd4r_k_module_probe.exe') @(
+                '--hip-root', $HipRoot,
+                '--module', (Join-Path $PackageRoot "experimental/k/dltss_pwin_${layer}_layer_gfx1201.hsaco"),
+                '--kernel-name', $layer, '--fixture-dir', $kFixture, '--iterations', "$Iterations")
+            if (!$kModuleOk) { throw "K $layer GPU execution failed; see the k-$layer-gpu logs." }
+            $kReferenceOk = Invoke-Probe "k-$layer-reference" $pythonCommand.Source @(
+                (Join-Path $PackageRoot 'k_layer_validate.py'), '--kernel-name', $layer, '--fixture-dir', $kFixture)
+            if (!$kReferenceOk) { throw "K $layer output differs from pwin_model.py; see the k-$layer-reference logs." }
+        }
         $cudaOk = $true
         foreach ($context in @('primary', 'created')) {
             $ok = Invoke-Probe "cuda-$context" (Join-Path $bin 'd4r_cuda_driver_probe.exe') @(

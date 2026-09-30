@@ -43,24 +43,29 @@ int main(int argc, char** argv)
         HipApi hip(args.hip_root);
         hipDeviceProp_t properties{};
         hip.select_gfx1201(args.device, properties);
+        if (args.kernel_name != "enc1" && args.kernel_name != "enc2")
+            throw std::runtime_error("--kernel-name must be enc1 or enc2");
+        const bool enc2 = args.kernel_name == "enc2";
+        const std::string entry = "dltss_pwin_" + args.kernel_name + "_layer";
         hipModule_t module = nullptr;
-        hip.check(hip.hipModuleLoad(&module, args.module.c_str()), "hipModuleLoad(K enc1)");
+        hip.check(hip.hipModuleLoad(&module, args.module.c_str()), "hipModuleLoad(K)");
         struct Cleanup {
             HipApi& hip; hipModule_t module;
             ~Cleanup() { if (module) (void)hip.hipModuleUnload(module); }
         } cleanup{hip, module};
         hipFunction_t prep = nullptr, transformer = nullptr;
-        hip.check(hip.hipModuleGetFunction(&prep, module, "dltss_pwin_enc1_layer_prep"), "K enc1 prep");
-        hip.check(hip.hipModuleGetFunction(&transformer, module, "dltss_pwin_enc1_layer"), "K enc1 transformer");
+        hip.check(hip.hipModuleGetFunction(&prep, module, (entry + "_prep").c_str()), "K prep");
+        hip.check(hip.hipModuleGetFunction(&transformer, module, entry.c_str()), "K transformer");
         if (!prep || !transformer) throw std::runtime_error("Null K entry point");
 
         // Identity fixture: all projection, MLP and patch-merge weights are zero.
         // G1/G2 are one. The full transformer must return its input through its
         // residual path and the merged output must be zero. Every stage launches.
         constexpr size_t full_elements = 8u * 8u * 64u;
-        constexpr size_t merged_elements = 4u * 4u * 64u;
-        constexpr size_t weight_bytes = 149504u;
-        constexpr size_t prep_items = 256u * 16u + 1024u;
+        const size_t output_channels = enc2 ? 96u : 64u;
+        const size_t merged_elements = 4u * 4u * output_channels;
+        const size_t weight_bytes = enc2 ? 166080u : 149504u;
+        const size_t prep_items = (enc2 ? 288u : 256u) * 16u + 1024u;
         std::vector<uint8_t> weights(weight_bytes, 0);
         auto set_half = [&](size_t byte, uint16_t bits) {
             weights.at(byte) = static_cast<uint8_t>(bits);
@@ -119,8 +124,8 @@ int main(int argc, char** argv)
                     return 5;
                 }
         }
-        std::printf("PASS K_IDENTITY architecture=gfx1201 iterations=%u full_elements=%zu merged_elements=%zu transformer_executed=1 nonzero_weights=0\n",
-            args.iterations, full_elements, merged_elements);
+        std::printf("PASS K_IDENTITY architecture=gfx1201 kernel=%s iterations=%u full_elements=%zu merged_elements=%zu transformer_executed=1 nonzero_weights=0\n",
+            args.kernel_name.c_str(), args.iterations, full_elements, merged_elements);
 
         // Exercise nonzero V projection, position-only attention and Wo GEMMs.
         // The generated data is saved for comparison with pwin_model.py.
@@ -135,6 +140,12 @@ int main(int argc, char** argv)
         constexpr size_t qkv = 128u, head = 12288u, bias = 24704u, wo = 41216u;
         constexpr size_t w1 = 49664u, w2 = 82944u, pm = 115712u;
         for (unsigned k = 0; k < 32u; ++k) {
+            if (enc2) {
+                set_matrix(qkv, k, k, 1024u);                           // head 0 Q
+                set_matrix(qkv + 2048u, k, k, 1024u);                   // head 0 K
+                set_matrix(qkv + head + 2048u * 3u, k, k, 1024u);      // head 1 Q
+                set_matrix(qkv + head + 2048u * 4u, k, k, 1024u);      // head 1 K
+            }
             set_matrix(qkv + 2048u * 2u, k, k, 1024u);                   // head 0 V <- input 0:32
             set_matrix(qkv + head + 2048u * 5u, k, k, 1024u);          // head 1 V <- input 32:64
             set_matrix(wo, k, k, 1024u);                               // head 0 Wo -> output 0:32
@@ -181,9 +192,10 @@ int main(int argc, char** argv)
         for (unsigned mt = 0; mt < 16u; ++mt) {
             const unsigned my = mt >> 2, mx = mt & 3u;
             const size_t full_base = (8u * (2u * my) + 2u * mx) * 64u;
-            for (unsigned channel = 0; channel < 64u; ++channel) {
-                const size_t i = mt * 64u + channel;
-                if (merged[i] != full[full_base + channel])
+            for (unsigned channel = 0; channel < output_channels; ++channel) {
+                const size_t i = mt * output_channels + channel;
+                const uint16_t expected = channel < 64u ? full[full_base + channel] : 0u;
+                if (merged[i] != expected)
                     throw std::runtime_error("K patch merge identity mismatch at " + std::to_string(i));
             }
         }
@@ -201,8 +213,8 @@ int main(int argc, char** argv)
             save("full.bin", full.data(), full.size() * sizeof(uint16_t));
             save("merged.bin", merged.data(), merged.size() * sizeof(uint16_t));
         }
-        std::printf("PASS K_NONZERO architecture=gfx1201 changed_elements=%zu full_elements=%zu merged_elements=%zu fixture_saved=%d numerical_reference_pending=1\n",
-            changed, full.size(), merged.size(), !args.fixture_dir.empty());
+        std::printf("PASS K_NONZERO architecture=gfx1201 kernel=%s changed_elements=%zu full_elements=%zu merged_elements=%zu fixture_saved=%d numerical_reference_pending=1\n",
+            args.kernel_name.c_str(), changed, full.size(), merged.size(), !args.fixture_dir.empty());
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL K_MODULE %s\n", error.what());

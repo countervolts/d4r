@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a real gfx1201 K enc1 launch with the existing numpy K reference."""
+"""Compare real gfx1201 K enc1/enc2 launches with the existing numpy reference."""
 import argparse
 import math
 import pathlib
@@ -57,21 +57,24 @@ def compare(name, actual, expected):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--kernel-name", choices=("enc1", "enc2"), default="enc1")
     args = parser.parse_args()
     folder = args.fixture_dir
     params = SyntheticParams(folder)
+    output_channels = 96 if args.kernel_name == "enc2" else 64
     reference_full, reference_merged = pwin_encoder(
-        params, 0, 0, H=2, C=64, COUT=64, posattn=True)
+        params, 0, 0, H=2, C=64, COUT=output_channels,
+        posattn=args.kernel_name == "enc1")
     actual_full = np.fromfile(folder / "full.bin", np.float16).reshape(64, 64)
-    actual_merged = np.fromfile(folder / "merged.bin", np.float16).reshape(16, 64)
+    actual_merged = np.fromfile(folder / "merged.bin", np.float16).reshape(16, output_channels)
     full_abs, full_psnr = compare("full", actual_full, reference_full)
     merged_abs, merged_psnr = compare("merged", actual_merged, reference_merged)
     # Initial acceptance for the synthetic nonzero FP16 fixture. Tighten this
     # after each K stage has been compared on captured DLSS weights/activations.
     if full_abs > 0.001 or full_psnr < 60.0 or merged_abs > 0.001 or merged_psnr < 60.0:
-        raise RuntimeError("K enc1 numerical mismatch against pwin_model.py")
-    print("PASS K_REFERENCE architecture=gfx1201 kernel=enc1 nonzero_weights=1 "
-          "transformer_executed=1 nan_inf=0")
+        raise RuntimeError(f"K {args.kernel_name} numerical mismatch against pwin_model.py")
+    print(f"PASS K_REFERENCE architecture=gfx1201 kernel={args.kernel_name} "
+          "nonzero_weights=1 transformer_executed=1 nan_inf=0")
 
 
 if __name__ == "__main__":

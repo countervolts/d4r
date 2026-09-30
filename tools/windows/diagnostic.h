@@ -90,6 +90,7 @@ struct Args {
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
     std::string fixture_dir;
+    std::string kernel_name = "enc1";
     unsigned iterations = 32;
     int device = -1;
     Args(int argc, char** argv) {
@@ -108,6 +109,7 @@ struct Args {
             else if (key == "--nvapi-dll") nvapi_dll = value;
             else if (key == "--ngx-abi") ngx_abi = value;
             else if (key == "--fixture-dir") fixture_dir = value;
+            else if (key == "--kernel-name") kernel_name = value;
             else if (key == "--iterations") {
                 size_t end = 0;
                 iterations = static_cast<unsigned>(std::stoul(value, &end));

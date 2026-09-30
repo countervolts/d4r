@@ -8,8 +8,8 @@ It is an experiment. It has been tested on one GPU in a handful of games, it dep
 
 **Windows / RDNA4 development:** the `windows-rdna4` branch adds native Windows
 gfx1201 HIP/ZLUDA diagnostics, validated D3D12/HIP interop, an NGX init probe,
-and a CPU-checked gfx12 WMMA backend. The first K `enc1` kernel executes on
-gfx1201 and matches the existing numpy model on a synthetic nonzero fixture.
+and a CPU-checked gfx12 WMMA backend. K `enc1` and `enc2` execute on
+gfx1201 and match the existing numpy model on synthetic nonzero fixtures.
 The remaining K/M kernels and Windows game runtime are still in progress.
 Build commands, hardware results and remaining
 porting gates are in [docs/windows-rdna4-port.md](docs/windows-rdna4-port.md).

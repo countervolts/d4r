@@ -7,8 +7,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 ## Milestone and gates
 
 Current milestone: M1/M2/M4/M5 passed; NGX init + DLSS CUDA capability discovery
-passed with the user's DLLs. M6 is in progress: the first K `enc1` prep and
-transformer run on gfx1201 and pass a synthetic nonzero numpy reference check.
+passed with the user's DLLs. M6 is in progress: K `enc1` and `enc2` prep and
+transformers run on gfx1201 and pass synthetic nonzero numpy reference checks.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -19,7 +19,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter, 16 cases, max abs/relative error 0 |
-| M6: K layers, full transformer and image validation | Partial: `enc1` executes, nonzero fixture matches reference; other layers/full network pending |
+| M6: K layers, full transformer and image validation | Partial: `enc1`/`enc2` execute and match nonzero references; other layers/full network pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
 | M9: OptiScaler integration, profiling, installation | Pending |
@@ -137,13 +137,13 @@ different inputs; max absolute and relative errors were both zero.
 `kernels/k/pwin_common.h` now calls the tested adapter. The Windows device-only
 compiler uses `kernels/common/hip_device_minimal.h`, exposing only public
 Clang AMDGPU work-item/grid/barrier builtins and HIP-compatible qualifiers;
-the ordinary Linux HIP include path remains. CMake builds `enc1` for gfx1201
+the ordinary Linux HIP include path remains. CMake builds `enc1`/`enc2` for gfx1201
 into `experimental/k/` and verifies that HIP loads both prep and transformer
 entry points. The `k_module_probe` now launches prep and transformer. The
 identity fixture verifies all 4096 full-resolution and 1024 merged FP16 values
 bitwise. A second fixture enables nonzero V projections, position-only
 attention, Wo, MLP/GELU and patch merge; it checks finite values and a patch
-identity, then saves all inputs/outputs for `k_enc1_validate.py`. That script
+identity, then saves all inputs/outputs for `k_layer_validate.py`. That script
 runs the existing `pwin_model.py` and measures max absolute/relative error and
 PSNR. The code object remains in `experimental/k/`, outside ZLUDA's override
 path, until the other K layers and real captured weights/activations pass.
@@ -259,7 +259,7 @@ One command adds the local NGX initialization gate after eight diagnostics:
 powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "C:/Users/Administrator/d4r/_nvngx.dll" -DlssDll "C:/Users/Administrator/d4r/nvngx_dlss.dll"
 ```
 
-Success requires all nine tests, including `PASS K_REFERENCE` and
+Success with the two local NGX DLLs requires all eleven tests, including both `PASS K_REFERENCE` checks and
 `PASS NGX_INIT ... sr_available=1`. The NGX probe still reports
 `transformer_executed=0`: the standalone K launch has not been integrated into
 DLSS. On NGX failure, CUDA trace and NVAPI query
@@ -279,7 +279,7 @@ cmake --install build/windows-rdna4 --prefix dist/windows-rdna4-diagnostics
 The one-command diagnostic runner is also installed at
 `dist/windows-rdna4-diagnostics/test-windows-rdna4.ps1`. It requires the selected
 HIP SDK and ZLUDA directory; the developer setup auto-discovers local defaults.
-Success: exit 0, all five tests passed in `summary.json`, `PASS HIP`, `PASS CUDA`,
+Success: exit 0, every selected test passed in `summary.json`, `PASS HIP`, `PASS CUDA`,
 `PASS INTEROP_LIFETIME` and `PASS INTEROP` in stdout. Failure: send the **single printed ZIP path**; it contains
 stdout/stderr, timeout/exception exit code, DLL paths/versions/hashes, driver/OS
 inventory and a minidump for an unhandled exception. Upstream trace is attempted
@@ -350,6 +350,16 @@ CTest has 7/7 PASS.
 Reference dependency: pinned local NumPy `2.4.6` on Python 3.11, installed by
 `setup-windows-tools.ps1` into `.tools/python/vendor` (not the game runtime).
 This is a synthetic one-layer check, not proof of complete K or DLSS output.
+
+2026-09-29 M6 second kernel: `enc2` exercises nonzero Q/K/V, learned attention
+and softmax, Wo, MLP/GELU and patch merge on gfx1201. Full output max absolute
+error `3.81469727e-06`, max relative error `0.00166893` (denominator floor
+`1e-3`), PSNR `130.39 dB`; merged output max absolute error `3.81469727e-06`,
+PSNR `132.49 dB`. All 4096 full and 1536 merged elements written, no NaN/Inf.
+Both layers pass 32 identity iterations and the nonzero numpy reference.
+Bundle `test-results/m6-k-enc2-final.zip`: 11/11 gates PASS. CTest: 8/8 PASS.
+The generic probe/reference runner selects `--kernel-name enc1|enc2`; both
+objects remain under `experimental/k` and are not used as DLSS overrides yet.
 
 Stable HIP SDK 7.2 compiler caveat: its `-O2` code object for `enc1` produces
 NaN already on the identity fixture (first element `0xfe00` instead of

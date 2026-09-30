@@ -29,19 +29,24 @@ add_custom_command(OUTPUT "${wmma_object}"
     -o "${wmma_object}"
   DEPENDS tools/windows/wmma_gfx1201.hip kernels/common/wmma_backend.h VERBATIM)
 add_custom_target(d4r_wmma_code_object ALL DEPENDS "${wmma_object}")
-# Compile-only K port smoke test. This object is intentionally not installed as
-# a native override until its transformer outputs pass the K reference/replay.
-set(k_enc1_object "${CMAKE_CURRENT_BINARY_DIR}/dltss_pwin_enc1_layer_gfx1201.hsaco")
-add_custom_command(OUTPUT "${k_enc1_object}"
-  COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
-    --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
-    -nogpuinc -nogpulib -O2 -DD4R_DEVICE_ONLY_MINIMAL
-    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/k/dltss_pwin_enc1_layer.hip"
-    -o "${k_enc1_object}"
-  DEPENDS kernels/k/dltss_pwin_enc1_layer.hip kernels/k/pwin_layer.h
-    kernels/k/pwin_common.h kernels/common/wmma_backend.h
-    kernels/common/hip_device_minimal.h VERBATIM)
-add_custom_target(d4r_k_gfx1201_compile ALL DEPENDS "${k_enc1_object}")
+# These K objects stay in experimental/k, outside the ZLUDA native override
+# directory, until each layer and then the complete network pass replay.
+set(k_objects)
+foreach(layer enc1 enc2)
+  set(k_object "${CMAKE_CURRENT_BINARY_DIR}/dltss_pwin_${layer}_layer_gfx1201.hsaco")
+  add_custom_command(OUTPUT "${k_object}"
+    COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
+      --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
+      -nogpuinc -nogpulib -O2 -DD4R_DEVICE_ONLY_MINIMAL
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/k/dltss_pwin_${layer}_layer.hip"
+      -o "${k_object}"
+    DEPENDS kernels/k/dltss_pwin_${layer}_layer.hip kernels/k/pwin_layer.h
+      kernels/k/pwin_common.h kernels/common/wmma_backend.h
+      kernels/common/hip_device_minimal.h VERBATIM)
+  list(APPEND k_objects "${k_object}")
+  install(FILES "${k_object}" DESTINATION experimental/k)
+endforeach()
+add_custom_target(d4r_k_gfx1201_compile ALL DEPENDS ${k_objects})
 foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
@@ -97,9 +102,8 @@ add_dependencies(d4r_gfx12_wmma_probe d4r_wmma_code_object)
 add_dependencies(d4r_k_module_probe d4r_k_gfx1201_compile)
 install(FILES "${probe_object}" DESTINATION bin)
 install(FILES "${wmma_object}" DESTINATION bin)
-install(FILES "${k_enc1_object}" DESTINATION experimental/k)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
-install(FILES tools/windows/k_enc1_validate.py DESTINATION .)
+install(FILES tools/windows/k_layer_validate.py DESTINATION .)
 install(FILES kernels/tools/pwin_model.py DESTINATION reference)
 install(FILES docs/windows-rdna4-port.md DESTINATION docs)
 include(CTest)
@@ -109,9 +113,13 @@ set_tests_properties(hip_gfx1201 PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201"
 add_test(NAME gfx12_wmma COMMAND d4r_gfx12_wmma_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${wmma_object}" --iterations 16)
 set_tests_properties(gfx12_wmma PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;wmma")
-add_test(NAME k_enc1_execution COMMAND d4r_k_module_probe
-  --hip-root "${D4R_HIP_ROOT}" --module "${k_enc1_object}")
-set_tests_properties(k_enc1_execution PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;k_execution")
+foreach(layer enc1 enc2)
+  add_test(NAME k_${layer}_execution COMMAND d4r_k_module_probe
+    --hip-root "${D4R_HIP_ROOT}"
+    --module "${CMAKE_CURRENT_BINARY_DIR}/dltss_pwin_${layer}_layer_gfx1201.hsaco"
+    --kernel-name ${layer})
+  set_tests_properties(k_${layer}_execution PROPERTIES TIMEOUT 90 LABELS "hardware;gfx1201;k_execution")
+endforeach()
 add_test(NAME d3d12_hip_interop COMMAND d4r_d3d12_hip_interop_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${probe_object}" --iterations 32)
 set_tests_properties(d3d12_hip_interop PROPERTIES TIMEOUT 120 LABELS "hardware;interop")
