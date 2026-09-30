@@ -13,7 +13,10 @@ frames on Windows. M now passes all five synthetic and real-weight layers agains
 NumPy and independent PTX, and four native CUDA frames. The standalone D3D12
 harness now produces four K and four M frames using imported VRAM and shared
 fences, with bit-exact RGB agreement against the corresponding CUDA harnesses.
-Game command-list/queue integration remains in progress. A full temporal M scan
+Game integration remains in progress. The ordinary NGX D3D12 Evaluate API now
+records a boundary in an open command list; a native queue interception backend
+executes prefix, CUDA evaluation, then suffix in the same submitted frame.
+A full temporal M scan
 found rare attention P/V accumulation mismatches that the earlier twelve-block
 sampling missed. `SWIN_EXACT_PV` fixes the native baseline; ZLUDA patch `0013`
 adds the corresponding opt-in f16 reference accumulation. All spatial blocks in
@@ -31,7 +34,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
-| M8: standalone Windows D3D12 NGX harness | PASS at explicit submitted queue boundaries: K/M, four frames each, no shim CPU image copies, bit-exact RGB against CUDA harness |
+| M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
 | M9: OptiScaler integration, profiling, installation | Pending |
 
 ## M temporal precision regression (2026-09-30)
@@ -92,6 +95,57 @@ python tools/windows/m_temporal_validate.py --capture-dir test-results/ngx-m-exa
 The game selected for the next integration test is Silent Hill 2 at
 `D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe`.
 No game files have been modified at this milestone.
+
+## Open D3D12 command lists (2026-09-30)
+
+The backend intercepts documented D3D12 COM methods using pinned open-source
+[MinHook 1.3.4](https://github.com/TsudaKageyu/minhook/releases/tag/v1.3.4), commit
+`c3fcafdc10146beb5919319d0683e44e3c30d537`. No NVIDIA instructions, proprietary
+DLL contents or private driver interfaces are patched. The typed forwarding
+code is generated from public SDK CommandList0..7 declarations. The additional
+CommandList8..10 declarations were audited in Microsoft's current public
+DirectX-Headers, `adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4`; coverage of those
+newer methods is the next implementation step.
+
+At NGX Evaluate, the caller's resource references and typed parameter values are
+copied into an owned snapshot. The recorded prefix is closed. Subsequent calls
+on the same logical object are forwarded into a fresh native suffix list with
+its own allocator. State-setting calls are replayed with deep copies of host
+arrays and retained COM references. Open PIX events are closed in the prefix
+and reopened in the suffix. At ExecuteCommandLists, preceding lists in the
+caller's batch execute first, followed by the prefix, actual CUDA evaluation
+and output copy, then the suffix and following lists. All work completes in the
+same frame. Completion waits currently stall the host; they do not age frames.
+
+The callback module remains loaded while public D3D12 method interceptions are
+installed. Original command-list pointers in the routing map are weak; final
+Release removes metadata, suffixes, allocators and queued feature references.
+This avoids a reference cycle that would keep every command list alive.
+Failure at queue submission is logged and prevents submitting the consumer
+suffix. No previous-frame fallback is substituted.
+
+`d3d12-command-foundation` passes 32 iterations with no NVIDIA binaries. Each
+batch contains A, B and C. A produces shader inputs, B dispatches before a
+boundary, the callback verifies that prefix and replaces inputs on the GPU,
+the suffix dispatches without rebinding root state, and C reads the result.
+All values match; a temporary root-constant array may change after recording;
+live recording metadata returns to zero after every iteration.
+
+`d3d12-m-command-list.zip` passes four ordinary NGX EvaluateFeature frames with
+forty native M launches. RGB is bit-exact to the earlier explicit boundary
+harness. The initial producer remains unsubmitted until the same queue batch,
+and the caller's Color/Reset parameters are deliberately changed after
+Evaluate returns, testing snapshot ownership. `d3d12-k-command-list.zip` also
+passes four finite frames and all forty-four native K launches; all four RGB
+frames are bit-exact against `d3d12-k-final`. Complete CTest: 12/12 PASS
+(`d3d12-command-final-ctest.log`).
+
+Enable this backend with `D4R_D3D12_COMMAND_BACKEND=1`; the diagnostic runner
+sets it through `-CommandListBackend`. Before game testing, remaining gates are
+newer command methods, indirect-state reconstruction, enhanced barrier layouts,
+actual game texture formats and interaction with OptiScaler's own state hooks.
+Closed lists, active render/query scopes, GPU predication and unknown indirect
+state are currently explicitly rejected instead of guessing their semantics.
 
 ## Source baseline (checked 2026-09-29)
 

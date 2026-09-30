@@ -44,6 +44,8 @@ API unsigned NVSDK_NGX_D3D12_Init_Ext(unsigned long long app, const wchar_t* dat
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
         if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, app, data, sdk);
+        if (const char* backend = std::getenv("D4R_D3D12_COMMAND_BACKEND"); backend && std::string(backend) == "1")
+            d4r::win::commands::install(device);
         return 1u;
     });
 }
@@ -84,10 +86,33 @@ API unsigned d4r_D3D12_EvaluateAtBoundary(ID3D12CommandQueue* queue, Handle* han
       auto it = features.find(handle); if (it == features.end() || !p) return invalid; feature = it->second; }
     return call([&] { feature->evaluate_boundary(queue, p); return 1u; });
 }
-API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList*, const Handle*, void*, void*) {
-    // Explicitly refuse an unsubmitted game list until queue integration exists.
-    std::fprintf(stderr, "D4R_WINDOWS_FAILURE command-list queue backend pending; no frame-age fallback\n");
-    return failure;
+API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, const Handle* handle, void* p, void*) {
+    std::shared_ptr<d4r::win::Feature> feature;
+    { std::lock_guard<std::mutex> lock(apiMutex);
+      auto it = features.find(const_cast<Handle*>(handle));
+      if (it == features.end() || !p || !list) return invalid; feature = it->second; }
+    return call([&] {
+        struct Snapshot {
+            void* parameters = d4r_ngx_parameters_create();
+            std::vector<d4r::win::ComPtr<ID3D12Resource>> resources;
+            ~Snapshot() { if (parameters) d4r_ngx_parameters_destroy(parameters); }
+        };
+        auto snapshot = std::make_shared<Snapshot>();
+        if (!snapshot->parameters) return failure;
+        d4r::ngx::copy_create(p, snapshot->parameters); d4r::ngx::copy_frame(p, snapshot->parameters);
+        const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
+        const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
+        for (unsigned i = 0; i < 5; ++i) {
+            ID3D12Resource* resource = nullptr; (void)d4r_ngx_get_d3d12_resource(p, names[i], &resource);
+            snapshot->resources.emplace_back(resource);
+            d4r_ngx_set_d3d12_resource(snapshot->parameters, names[i], resource);
+            const auto state = d4r::win::commands::resource_state(list, resource, D3D12_RESOURCE_STATES(
+                d4r::ngx::uint_value(p, states[i], i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
+            d4r_ngx_set_uint(snapshot->parameters, states[i], unsigned(state));
+        }
+        d4r::win::commands::record_boundary(list, [feature, snapshot](ID3D12CommandQueue* queue) { feature->evaluate_boundary(queue, snapshot->parameters); });
+        return 1u;
+    });
 }
 API unsigned NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList* list, const Handle* handle, void* p, void* callback) {
     return NVSDK_NGX_D3D12_EvaluateFeature(list, handle, p, callback);
@@ -109,3 +134,14 @@ API unsigned NVSDK_NGX_D3D12_Shutdown() {
     });
 }
 API unsigned NVSDK_NGX_D3D12_Shutdown1(ID3D12Device*) { return NVSDK_NGX_D3D12_Shutdown(); }
+
+// Public diagnostics exercise queue/list integration without NVIDIA binaries.
+API unsigned d4r_D3D12_InstallCommandBackend(ID3D12Device* device) {
+    return call([&] { d4r::win::commands::install(device); return 1u; });
+}
+using DiagnosticBoundary = void(WINAPI*)(ID3D12CommandQueue*, void*);
+API unsigned d4r_D3D12_RecordDiagnosticBoundary(ID3D12GraphicsCommandList* list, DiagnosticBoundary callback, void* context) {
+    if (!callback) return invalid;
+    return call([&] { d4r::win::commands::record_boundary(list, [=](ID3D12CommandQueue* queue) { callback(queue, context); }); return 1u; });
+}
+API unsigned long long d4r_D3D12_LiveRecordings() { return d4r::win::commands::live_recordings(); }

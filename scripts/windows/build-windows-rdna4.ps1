@@ -35,6 +35,15 @@ if (!(Test-Path $cmake) -or !(Test-Path $ninja)) {
     throw 'CMake >=3.24 and Ninja required. See docs/windows-rdna4-port.md for local tool setup.'
 }
 New-Item -ItemType Directory -Force $BuildDirectory | Out-Null
+$minhook = Join-Path $repo 'external/MinHook'
+if (!(Test-Path (Join-Path $minhook 'include/MinHook.h'))) {
+    & git clone --depth 1 --branch v1.3.4 https://github.com/TsudaKageyu/minhook.git $minhook
+    if ($LASTEXITCODE) { throw 'MinHook 1.3.4 source download failed.' }
+}
+$minhookCommit = (& git -C $minhook rev-parse HEAD).Trim()
+if ($minhookCommit -ne 'c3fcafdc10146beb5919319d0683e44e3c30d537') {
+    throw "Expected audited MinHook 1.3.4 source, found $minhookCommit"
+}
 $originalPath = $env:PATH
 try {
     $configure = @('--fresh', '-S', $repo, '-B', $BuildDirectory, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
@@ -44,6 +53,7 @@ try {
         if (!(Test-Path $compiler)) { throw "Compiler missing: $compiler" }
         $env:PATH = "$(Join-Path $ToolchainRoot 'bin');$originalPath"
         $configure += "-DCMAKE_CXX_COMPILER=$compiler"
+        $configure += "-DCMAKE_C_COMPILER=$(Join-Path $ToolchainRoot 'bin/x86_64-w64-mingw32-clang.exe')"
     }
     if ($ZludaRoot) { $configure += "-DD4R_ZLUDA_ROOT=$ZludaRoot" }
     $ErrorActionPreference = 'Continue'

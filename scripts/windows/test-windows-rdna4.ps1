@@ -12,6 +12,7 @@ param(
     [switch]$NgxOnly,
     [switch]$Trace,
     [switch]$RequireNativeNetwork,
+    [switch]$CommandListBackend,
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )
@@ -210,6 +211,9 @@ try {
         if ($cudaOk) {
             $mapOk = $interopOk = $true
             if (!$NgxOnly) {
+            $commandOk = Invoke-Probe 'd3d12-command-backend' (Join-Path $bin 'd4r_d3d12_command_probe.exe') @(
+                '--hip-root', $HipRoot, '--module', (Join-Path $bin 'd4r_nvngx.dll'), '--iterations', "$Iterations")
+            if (!$commandOk) { throw 'D3D12 command-list order/state/lifetime validation failed.' }
             $mapOk = Invoke-Probe 'interop-map-lifetime' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
                 '--hip-root', $HipRoot, '--interop-mode', 'map', '--iterations', '64')
             $interopOk = Invoke-Probe 'interop-roundtrip' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
@@ -250,6 +254,7 @@ try {
                     $localShim = Join-Path $ngxRuntimeDirectory 'd4r_nvngx.dll'
                     Copy-Item -LiteralPath (Join-Path $bin 'd4r_nvngx.dll') -Destination $localShim
                     $ngxArguments += @('--module', $localShim)
+                    if ($CommandListBackend) { $ngxArguments += @('--interop-mode', 'command-list') }
                 }
                 $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } elseif ($NgxMode -eq 'd3d12') { "d3d12-evaluate-preset-$Preset" } else { 'ngx-init' }
                 $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments

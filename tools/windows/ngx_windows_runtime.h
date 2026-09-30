@@ -2,6 +2,7 @@
 #include "d3d12_external.h"
 #include "cuda_image_api.h"
 #include "ngx_parameters.h"
+#include "d3d12_command_hooks.h"
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -160,6 +161,7 @@ public:
     // Explicit harness boundary: all earlier producers must already be queued.
     // The forthcoming command-list backend calls the same stages at queue submit.
     void evaluate_boundary(ID3D12CommandQueue* queue, void* parameters) {
+        commands::InternalScope internal;
         std::lock_guard<std::mutex> lock(rt_->mutex);
         if (!queue) throw std::runtime_error("Null D3D12 queue");
         if (queue_ && queue_.Get() != queue) throw std::runtime_error("A feature cannot switch queues without an explicit drain");

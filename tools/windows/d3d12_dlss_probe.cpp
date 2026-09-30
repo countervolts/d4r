@@ -16,6 +16,8 @@ int main(int argc, char** argv) {
         if (!diagDir && args.interop_mode != "images") throw std::runtime_error("Set D4R_DIAG_DIR");
         const std::filesystem::path directory(diagDir ? wide(diagDir) : std::filesystem::current_path().wstring());
         std::filesystem::create_directories(directory);
+        const bool commandBackend = args.interop_mode == "command-list";
+        if (commandBackend && _putenv_s("D4R_D3D12_COMMAND_BACKEND", "1")) throw std::runtime_error("Cannot enable command backend");
         for (const auto& pair : {std::make_pair("D4R_HIP_ROOT", args.hip_root),
              std::make_pair("D4R_NVCUDA_DLL", args.cuda_dll), std::make_pair("D4R_NVAPI_DLL", args.nvapi_dll),
              std::make_pair("D4R_NGX_CORE", args.ngx_core), std::make_pair("D4R_DLSS_DLL", args.dlss_dll)})
@@ -93,7 +95,7 @@ int main(int argc, char** argv) {
                 i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         dx(list->Close(), "Close(synthetic producers)"); ID3D12CommandList* producer[] = {list.Get()};
-        queue->ExecuteCommandLists(1, producer); drain();
+        if (!commandBackend) { queue->ExecuteCommandLists(1, producer); drain(); }
         if (args.interop_mode == "images") {
             CudaApi cuda(args.cuda_dll); cuda.check(cuda.cuInit(0), "cuInit(image interop)");
             CUdevice ordinal = 0; CUcontext context = nullptr;
@@ -164,17 +166,43 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < 5; ++i) d4r_ngx_set_d3d12_resource(parameters, names[i], textures[i].image.Get());
         d4r_ngx_set_int(parameters, "Disable.Watermark", 1);
         auto readback = make_buffer(device.Get(), textures[3].bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComPtr<ID3D12GraphicsCommandList> predecessor;
+        ComPtr<ID3D12CommandAllocator> predecessorAllocator;
+        if (commandBackend) {
+            // Keep initial synthetic producers unsubmitted until the first
+            // batch, before the list which contains the NGX evaluation.
+            predecessor = list; predecessorAllocator = allocator;
+            dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.ReleaseAndGetAddressOf())), "Create game-style allocator");
+            dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                IID_PPV_ARGS(list.ReleaseAndGetAddressOf())), "Create game-style command list");
+            dx(list->Close(), "Close initial game-style list");
+        }
         for (unsigned frame = 0; frame < args.iterations; ++frame) {
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
-            check(shim.symbol<Evaluate>("d4r_D3D12_EvaluateAtBoundary")(queue.Get(), handle, parameters), "D3D12 same-frame Evaluate");
-            dx(allocator->Reset(), "Reset(harness allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(harness list)");
+            if (commandBackend) {
+                dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
+                using RecordedEvaluate = unsigned(*)(ID3D12GraphicsCommandList*, void*, void*, void*);
+                check(shim.symbol<RecordedEvaluate>("NVSDK_NGX_D3D12_EvaluateFeature")(list.Get(), handle, parameters, nullptr), "D3D12 recorded same-frame Evaluate");
+                // The caller may reuse/mutate its parameter object as soon as
+                // Evaluate returns. The queued snapshot must remain immutable.
+                d4r_ngx_set_d3d12_resource(parameters, "Color", nullptr);
+                d4r_ngx_set_int(parameters, "Reset", 0);
+            } else {
+                check(shim.symbol<Evaluate>("d4r_D3D12_EvaluateAtBoundary")(queue.Get(), handle, parameters), "D3D12 same-frame Evaluate");
+                dx(allocator->Reset(), "Reset(harness allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(harness list)");
+            }
             transition(list.Get(), textures[3].image.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
             src.pResource = textures[3].image.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = textures[3].footprint;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             transition(list.Get(), textures[3].image.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            dx(list->Close(), "Close(verification)"); ID3D12CommandList* verify[] = {list.Get()}; queue->ExecuteCommandLists(1, verify); drain();
+            dx(list->Close(), "Close(verification)");
+            if (commandBackend && frame == 0) {
+                ID3D12CommandList* batch[] = {predecessor.Get(), list.Get()}; queue->ExecuteCommandLists(2, batch);
+            } else { ID3D12CommandList* verify[] = {list.Get()}; queue->ExecuteCommandLists(1, verify); }
+            drain();
+            if (commandBackend) d4r_ngx_set_d3d12_resource(parameters, "Color", textures[0].image.Get());
             void* raw = nullptr; D3D12_RANGE range{0, size_t(textures[3].bytes)};
             dx(readback->Map(0, &range, &raw), "Map(verification only)");
             std::vector<uint16_t> pixels(size_t(outWidth) * outHeight * 4);
@@ -193,7 +221,8 @@ int main(int argc, char** argv) {
             if (variance < 1e-6) throw std::runtime_error("D3D12 output lost the synthetic pattern");
         }
         loaded_modules();
-        std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 queue_integration=explicit_harness\n", args.preset, args.iterations);
+        std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 queue_integration=%s\n",
+            args.preset, args.iterations, commandBackend ? "recorded_command_list" : "explicit_harness");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "FAIL D3D12_DLSS %s\n", error.what()); loaded_modules(); return 4; }
 }
