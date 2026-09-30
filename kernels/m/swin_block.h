@@ -718,7 +718,16 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 if (MX < 0 || MX >= W2 || MY < 0 || MY >= H2)
                     continue;
                 p.p48[((size_t)((ch >> 5) * H2 + MY) * W2 + MX) * 32 + (ch & 31)] =
-                    (uint8_t)enc8(y[j].get(i));
+                    (uint8_t)enc8(
+#ifdef SWIN_EXACT
+                        // The audited 310.9 patch-merge path bounds the f16
+                        // result to +/- 2*pi before e4m3 quantisation.
+                        __builtin_elementwise_max(__builtin_elementwise_min(y[j].get(i), (half_t)6.283185307179586f),
+                                                  (half_t)-6.283185307179586f)
+#else
+                        y[j].get(i)
+#endif
+                    );
             }
         }
     }

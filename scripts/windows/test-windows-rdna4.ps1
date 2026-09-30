@@ -98,8 +98,8 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
 try {
     if ($NgxOnly -and (!$NgxCore -or !$DlssDll)) { throw '-NgxOnly requires both locally supplied NVIDIA DLL paths.' }
     if ($RequireNativeNetwork) {
-        if ($NgxMode -ne 'evaluate' -or $Preset -ne 11 -or !$env:D4R_ZLUDA_NATIVE_DIR) {
-            throw '-RequireNativeNetwork currently requires K Evaluate and D4R_ZLUDA_NATIVE_DIR.'
+        if ($NgxMode -ne 'evaluate' -or $Preset -notin @(11,13) -or !$env:D4R_ZLUDA_NATIVE_DIR) {
+            throw '-RequireNativeNetwork requires K/M Evaluate and D4R_ZLUDA_NATIVE_DIR.'
         }
         $env:D4R_ZLUDA_VERBOSE = '1'
     }
@@ -223,15 +223,18 @@ try {
                 $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments
                 if ($ngxOk -and $RequireNativeNetwork) {
                     $hits = @()
-                    foreach ($layer in @('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2','dec1','dec0')) {
-                        $pattern = '\[d4r-launch\] kernel="dltss_pwin_' + $layer + '_layer" backend=native'
+                    $nativeLayers = if ($Preset -eq 11) { @('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2','dec1','dec0') }
+                                    else { @('enc1','enc2','enc3_tube','dec2','dec1') }
+                    foreach ($layer in $nativeLayers) {
+                        $name = if ($Preset -eq 11) { "dltss_pwin_${layer}_layer" } else { "rrlite_${layer}_4x4" }
+                        $pattern = '\[d4r-launch\] kernel="' + $name + '" backend=native'
                         $count = @(Select-String -LiteralPath (Join-Path $OutputDirectory "$ngxName.stderr.log") -Pattern $pattern).Count
                         $hits += @{layer=$layer; nativeLaunches=$count; expectedFrames=$Iterations}
                         if ($count -lt $Iterations) { $ngxOk=$false }
                     }
                     $summary.nativeTransformer = $hits
                     $summary.nativeTransformerPassed = $ngxOk
-                    Write-Host "Native K transformer launches validated=$ngxOk"
+                    Write-Host "Native preset $Preset transformer launches validated=$ngxOk"
                 }
                 if (!$ngxOk) {
                     $exitStatus = 1

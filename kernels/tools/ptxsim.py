@@ -96,7 +96,8 @@ def split_args(s):
 
 
 def parse_kernel(path, name):
-    src = open(path).read()
+    with open(path) as file:
+        src = file.read()
     i = src.index('.entry ' + name + '(')
     j = src.find('\n.visible', i + 10)
     j = len(src) if j < 0 else j
@@ -340,12 +341,11 @@ class Block:
         steps = 0
         while pc < len(stmts):
             st = stmts[pc]
-            for l in st.labels:
-                if l in pending:
-                    active |= pending.pop(l)
+            if pc in pending:
+                active |= pending.pop(pc)
             if not active.any():
-                # jump to the nearest label someone waits at
-                targets = sorted(self.labels[l] for l in pending)
+                # Reconverge at either a forward target or a loop fallthrough.
+                targets = sorted(pending)
                 if not targets:
                     break
                 pc = targets[0]
@@ -365,10 +365,16 @@ class Block:
                     if not taking.any():
                         pc += 1
                         continue
-                    raise NotImplementedError('divergent backward branch at ' + st.text)
+                    # Lanes finishing a loop wait at its fallthrough while the
+                    # other lanes execute their remaining iterations. Their
+                    # registers and memory writes stay masked until reconvergence.
+                    pending[pc + 1] = pending.get(pc + 1, np.zeros(self.T, bool)) | (active & ~taking)
+                    active = taking.copy()
+                    pc = target
+                    continue
                 active = active & ~taking
                 if taking.any():
-                    pending[st.args[0]] = pending.get(st.args[0], np.zeros(self.T, bool)) | taking
+                    pending[target] = pending.get(target, np.zeros(self.T, bool)) | taking
                 pc += 1
                 continue
             if mask.any() or st.op.startswith(('mma', 'shfl', 'movmatrix', 'bar')):

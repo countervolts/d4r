@@ -9,7 +9,9 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
 requested E path passes with the user's DLLs. All 11 K layers now pass synthetic
 and real-weight NumPy/PTX replay checks; native K Evaluate produces four finite
-frames on Windows. D3D12 shim integration and M remain in progress.
+frames on Windows. M now passes all five synthetic and real-weight layers against
+NumPy and independent PTX, and four native CUDA frames. D3D12 integration remains
+in progress; the fully translated M comparison currently exceeds its JIT timeout.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -21,7 +23,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | CUDA harness PASS: 11 real-weight layers, native launches for all layers, four finite frames, 81.85–92.91 dB versus translated K; D3D12 integration pending |
-| M7: M FP16-equivalent baseline and full transformer | Pending |
+| M7: M FP16-equivalent baseline and full transformer | CUDA harness PASS: 5 real-weight layers exactly match NumPy/PTX, 4 finite frames, 40 native Swin launches; D3D12 and full translated M comparison pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
 | M9: OptiScaler integration, profiling, installation | Pending |
 
@@ -123,6 +125,66 @@ with explicit D3D12 queue submission ownership. Full K precedes M and native
 FP8/performance work. No complete DLSS or OptiScaler game result is claimed.
 
 ## Native Windows ZLUDA build and Evaluate work (2026-09-30)
+
+### M strict FP16 baseline and independent reference (2026-09-30)
+
+`D4R_M_FP16_BASELINE=ON` is the Windows CMake default and defines `SWIN_EXACT`.
+Activations retain e4m3 requantisation; matrix accumulation rounds to f16 after
+each K32 step. Gfx1201 WMMA widens FP8 operands to FP16. Native FP8 is disabled
+until this baseline also passes the D3D12 harness.
+
+All five `rrlite_{enc1,enc2,enc3_tube,dec2,dec1}_4x4` modules pass 32 iterations
+on public synthetic 16x16 fixtures, including nonzero Q/V/WO/MLP weights,
+decoder expansion/skip and patch merge. Every stored e4m3 code exactly matches
+the NumPy model; max absolute and relative error are zero. The fixture's patch
+merge deliberately uses large weights to exercise its output bound.
+
+An independent CPU PTX check exposed an upstream omission: DLSS 310.9's patch
+merge clamps f16 results to +/- f16(2*pi), before e4m3 rounding. Without this
+bound, real `enc2` merge outputs reached +/-9 or 10 where the PTX stored +/-6.5.
+The correction is limited to `SWIN_EXACT`; upstream fast arithmetic stays
+unchanged. The Windows model enables the same audited bound explicitly; the
+legacy Linux oracle remains the default. Both implementations now agree with
+the independent PTX interpreter, rather than merely agreeing with each other.
+
+`0011-audited-k-m-windows-replay.patch` adds exact M capture ABI sizes (56/88
+bytes) and restricts K captures to the eleven audited names. The public CPU PTX
+interpreter now handles divergent finite backward loops by suspending completed
+lanes at the loop fallthrough. `tools/windows/test_ptx_reference.py` verifies
+lane-specific loop counts and reconvergence with a public synthetic program.
+
+With the user's 310.9 DLL, `test-results/ngx-m-bounded-capture.zip` passes four
+frames with native counts enc1=4, enc2=4, enc3_tube=24, dec2=4, dec1=4. No NaN/Inf
+or missing transformer is accepted. `test-results/m-real-final-dual-reference`
+passes 12 NumPy blocks and two independent CPU PTX blocks per layer; all sampled
+codes agree exactly (max abs/relative error 0, PSNR infinite). Capture files,
+weights and extracted PTX remain private and must not be redistributed.
+
+Reproduce the layer gates:
+
+```powershell
+& scripts/windows/test-m-replay.ps1
+& scripts/windows/stage-native-m.ps1 -DlssDll "$PWD/nvngx_dlss.dll"
+$env:D4R_ZLUDA_NATIVE_DIR="$PWD/build/native-m-gfx1201"
+$env:D4R_WMMA='1'; $env:D4R_FP8_WMMA='1'; $env:D4R_FP8_NATIVE='0'
+& scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxOnly -NgxMode evaluate -Preset 13 -Iterations 4 -RequireNativeNetwork -NgxCore "$PWD/_nvngx.dll" -DlssDll "$PWD/nvngx_dlss.dll"
+```
+
+The fully translated M feature creation currently exceeds 600 seconds; its
+automatic trace localises this to loading the transformer modules. Native M
+does not have this JIT delay. A completed translated image comparison is not
+claimed. The user selected Silent Hill 2 at
+`D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe`
+for the later game gate. No game files have been changed yet.
+
+OptiScaler upstream inspected at `45a2001303ddff632e279f77aef85ceede5832cb`,
+2026-09-30. Its DLSS backend forwards an open command list into Evaluate;
+its swapchain hooks retain the game queue. A correct same-frame Windows path
+must preserve submission order when earlier command lists have not yet been
+submitted. Closing/submitting the current list immediately inside Evaluate
+is insufficient for a general game integration. The next backend gate is a
+D3D12 harness with explicit queue boundaries; command-list/queue integration
+must be validated before the game gate.
 
 ### K real-weight native Evaluate and correctness baseline
 
