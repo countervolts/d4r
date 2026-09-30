@@ -5,6 +5,20 @@
 //   CIN  patch-expand input channels (0 = none): decoder input = f16(q8(expand(low-res CIN)) + skip)
 #pragma once
 #include "swin_common.h"
+#ifdef D4R_SWIN_DIAGNOSTICS
+extern "C" {
+__device__ int d4r_swin_debug_block[2] = {0, 4};
+__device__ half_t d4r_swin_debug_values[4 * 64 * 128];
+}
+template <int C, int AST> __device__ __forceinline__ void swin_snapshot(
+    const half_t* activation, int stage, int bx, int by, int tid, bool pair_order) {
+    if (bx == d4r_swin_debug_block[0] && by == d4r_swin_debug_block[1] && tid < 64)
+        for (int c = 0; c < C; ++c)
+            d4r_swin_debug_values[(stage * 64 + tid) * 128 + c] =
+                activation[tid * AST + (pair_order ? gperm(c) : apos(c))];
+    __syncthreads();
+}
+#endif
 
 // Immediate lane masks need only a compile-time integer, not the host C++
 // standard library (which is absent from device-only Windows HIP builds).
@@ -79,7 +93,12 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     static_assert(NW % NH == 0 && NW / NH <= 4, "waves per head");
     constexpr int NPL = L::NPL, NT = L::NT, INNER = L::INNER;
     constexpr int AST = (C > INNER ? C : INNER) + 8;
-    constexpr int GST = 40, QST = 40, PST = 24;
+    constexpr int GST = 40, PST = 24;
+#ifdef SWIN_EXACT_PV
+    constexpr int QST = 56;
+#else
+    constexpr int QST = 40;
+#endif
 #ifndef SWIN_MLP_R
 #define SWIN_MLP_R(NW) ((NW) / 2)
 #endif
@@ -294,6 +313,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     __syncthreads();
 
     // ------------------------------------------------ stage 2: Q/V projection + attention (wave = head)
+#ifdef D4R_SWIN_DIAGNOSTICS
+    swin_snapshot<C, AST>(A, 0, bx, by, tid, false);
+#endif
     {
         constexpr int MW = 4 / (NW / NH); // windows per wave
         const int h = NW == NH ? wv : wv % NH, m0 = NW == NH ? 0 : MW * (wv / NH);
@@ -400,6 +422,13 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 Qs[mrow(2 * k + 1) * PST + l16] = pw[1];
             }
             wave_sync();
+#ifdef SWIN_EXACT_PV
+            half_t* Vs = Qs + 16 * PST;
+            for (int nt = 0; nt < 2; ++nt)
+                for (int i = 0; i < 8; ++i)
+                    Vs[mrow(i) * 32 + 16 * nt + l16] = vp[m][nt][i / 2][i & 1];
+            wave_sync();
+#endif
             const sop pa = lds16(Qs + l16 * PST);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
@@ -422,7 +451,19 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 }
                 const h16 vb = __builtin_bit_cast(h16, vw);
 #endif
-                const f8v o = wmma(pa, vb, splat(0.0f));
+                f8v o = wmma(pa, vb, splat(0.0f));
+#ifdef SWIN_EXACT_PV
+                // FP16 P/V products need more than 24 significant bits in a
+                // cancellation-heavy dot. An f32 WMMA can round to the wrong
+                // FP16 neighbour at a midpoint, then flip the FP8 output code.
+                // This baseline sums the 16 FP16 products before one FP16 round.
+                for (int i = 0; i < 8; ++i) {
+                    double dot = 0.0;
+                    for (int k = 0; k < 16; ++k)
+                        dot += (double)Qs[mrow(i) * PST + k] * (double)Vs[k * 32 + 16 * nt + l16];
+                    o[i] = (float)(half_t)dot;
+                }
+#endif
                 const int ocol = apos(32 * h + ginv(16 * nt + l16));
 #pragma unroll
                 for (int i = 0; i < 8; i += 2)
@@ -438,6 +479,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     __syncthreads();
 
     // ------------------------------------------------ stage 3: output projection + residual
+#ifdef D4R_SWIN_DIAGNOSTICS
+    swin_snapshot<INNER, AST>(A, 3, bx, by, tid, false);
+#endif
 #pragma unroll
     for (int kc = 0; kc < NH; ++kc)
     {
@@ -471,6 +515,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     if (tid < 64)
     {
         // the row as 128-bit LDS loads: element 8 j + c of n8 tile j
+#ifdef D4R_SWIN_DIAGNOSTICS
+        if (bx == d4r_swin_debug_block[0] && by == d4r_swin_debug_block[1])
+            for (int c = 0; c < C; ++c)
+                d4r_swin_debug_values[(64 + tid) * 128 + c] = A[tid * AST + gperm(c)];
+#endif
         h8 row[L::NT8];
 #pragma unroll
         for (int j = 0; j < L::NT8; ++j)
@@ -529,6 +578,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     __syncthreads();
 
     // ------------------------------------------------ stage 4: MLP, R chunks per round
+#ifdef D4R_SWIN_DIAGNOSTICS
+    swin_snapshot<C, AST>(A, 2, bx, by, tid, false);
+#endif
     {
         constexpr int WPC = NW / R, MPW = 4 / WPC; // waves per chunk, fc1 m tiles per wave
         const int cw = wv / WPC, mb = MPW * (wv % WPC);

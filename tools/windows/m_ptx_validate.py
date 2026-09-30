@@ -18,7 +18,10 @@ def validate(args):
         raise RuntimeError('Capture kernel does not match requested M layer')
     native = {i: np.fromfile(args.native_dir / f'alloc-{i}.bin', np.uint8) for i in parameters.allocs}
     candidates = []
-    for bx, by in blocks(parameters.grid, 12):
+    coordinates = args.block or blocks(parameters.grid, args.candidate_blocks)
+    for bx, by in coordinates:
+        if not (0 <= bx < parameters.grid[0] and 0 <= by < parameters.grid[1]):
+            raise RuntimeError(f'Block {bx},{by} is outside the capture grid')
         model = model_block(parameters, args.layer, bx, by)
         expected, actual = stored(parameters, args.layer, bx, by, native, model)
         difference = float(np.abs(expected - actual).max())
@@ -52,8 +55,12 @@ if __name__ == '__main__':
     parser.add_argument('--dlss-dll', type=pathlib.Path, required=True)
     parser.add_argument('--output-dir', type=pathlib.Path, required=True)
     parser.add_argument('--blocks', type=int, default=2)
+    parser.add_argument('--candidate-blocks', type=int, default=12,
+                        help='NumPy scan size used to choose the worst blocks for independent PTX')
+    parser.add_argument('--block', type=lambda value: tuple(map(int, value.split(','))),
+                        action='append', help='Explicit x,y regression block (repeatable)')
     args = parser.parse_args()
-    if args.blocks < 1:
+    if args.blocks < 1 or args.candidate_blocks < 1:
         parser.error('--blocks must be positive')
     try:
         validate(args)

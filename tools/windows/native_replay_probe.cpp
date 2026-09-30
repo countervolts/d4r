@@ -82,6 +82,14 @@ int main(int argc, char** argv) {
         hipModule_t module = nullptr;
         hip.check(hip.hipModuleLoad(&module, args.module.c_str()), "hipModuleLoad(replay gfx1201)");
         struct Cleanup { HipApi& hip; hipModule_t module; ~Cleanup() { (void)hip.hipModuleUnload(module); } } cleanup{hip, module};
+        if (const char* debugBlock = std::getenv("D4R_SWIN_DEBUG_BLOCK")) {
+            int coordinates[2]{};
+            if (std::sscanf(debugBlock, "%d,%d", &coordinates[0], &coordinates[1]) != 2) throw std::runtime_error("D4R_SWIN_DEBUG_BLOCK must be x,y");
+            hipDeviceptr_t address = nullptr; size_t size = 0;
+            hip.check(hip.hipModuleGetGlobal(&address, &size, module, "d4r_swin_debug_block"), "Find Swin diagnostic block");
+            if (size != sizeof(coordinates)) throw std::runtime_error("Swin diagnostic coordinates ABI");
+            hip.check(hip.hipMemcpy(address, coordinates, size, hipMemcpyHostToDevice), "Set Swin diagnostic block");
+        }
         auto scalar = [&](const char* name, unsigned fallback) {
             hipDeviceptr_t address = nullptr; size_t size = 0;
             if (hip.hipModuleGetGlobal(&address, &size, module, name) != hipSuccess) return fallback;
@@ -108,6 +116,15 @@ int main(int argc, char** argv) {
                 nullptr, launchArguments, nullptr), "hipModuleLaunchKernel(replay)");
         hip.check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize(replay)");
         std::filesystem::create_directories(output);
+        if (std::getenv("D4R_SWIN_DEBUG_BLOCK")) {
+            hipDeviceptr_t address = nullptr; size_t size = 0;
+            hip.check(hip.hipModuleGetGlobal(&address, &size, module, "d4r_swin_debug_values"), "Find Swin diagnostic stages");
+            std::vector<uint8_t> bytes(size);
+            hip.check(hip.hipMemcpy(bytes.data(), address, size, hipMemcpyDeviceToHost), "Download Swin diagnostic stages");
+            std::ofstream file(output / "swin-stages.f16", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            if (!file) throw std::runtime_error("Cannot save Swin diagnostic stages");
+        }
         for (const auto& allocation : allocations) {
             std::vector<uint8_t> bytes(allocation->size);
             hip.check(hip.hipMemcpy(bytes.data(), allocation->device, bytes.size(), hipMemcpyDeviceToHost), "hipMemcpy(replay result)");

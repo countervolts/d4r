@@ -142,7 +142,7 @@ def metrics(expected, actual, label):
     return maximum, peak, psnr, steps
 
 
-def validate(layer, directory, output, block_count, real_capture):
+def validate(layer, directory, output, block_count, real_capture, exact=False):
     parameters = me.Params(str(directory))
     if parameters.kernel != f'rrlite_{layer}_4x4':
         raise RuntimeError('Replay kernel does not match requested M layer')
@@ -151,7 +151,7 @@ def validate(layer, directory, output, block_count, real_capture):
              for bx, by in blocks(parameters.grid, block_count)]
     expected, actual = (np.concatenate(values) for values in zip(*pairs))
     maximum, peak, psnr, steps = metrics(expected, actual, f'M_REPLAY_REFERENCE kernel={layer}')
-    if (not real_capture and maximum != 0) or (real_capture and (steps.max() > 1 or psnr < 50)):
+    if ((exact or not real_capture) and maximum != 0) or (real_capture and (steps.max() > 1 or psnr < 50)):
         raise RuntimeError(f'M mismatch: exact synthetic / <=1 FP8 step and >=50 dB real gate; peak={peak}')
     print(f'PASS M_REPLAY_REFERENCE kernel={layer} blocks={len(pairs)} architecture=gfx1201 nan_inf=0')
 
@@ -165,6 +165,7 @@ if __name__ == '__main__':
     parser.add_argument('--size', type=int, choices=[8, 16, 24, 32], default=16)
     parser.add_argument('--blocks', type=int, default=12)
     parser.add_argument('--real-capture', action='store_true')
+    parser.add_argument('--exact', action='store_true', help='Require every stored real FP8 value to match')
     args = parser.parse_args()
     try:
         if args.mode == 'generate':
@@ -172,7 +173,7 @@ if __name__ == '__main__':
         else:
             if not args.output_dir or args.blocks < 1:
                 parser.error('validate requires --output-dir and positive --blocks')
-            validate(args.layer, args.fixture_dir, args.output_dir, args.blocks, args.real_capture)
+            validate(args.layer, args.fixture_dir, args.output_dir, args.blocks, args.real_capture, args.exact)
     except Exception as error:
         print(f'FAIL M_REPLAY {error}', file=sys.stderr)
         raise SystemExit(5)

@@ -13,8 +13,12 @@ frames on Windows. M now passes all five synthetic and real-weight layers agains
 NumPy and independent PTX, and four native CUDA frames. The standalone D3D12
 harness now produces four K and four M frames using imported VRAM and shared
 fences, with bit-exact RGB agreement against the corresponding CUDA harnesses.
-Game command-list/queue integration remains in progress. The fully translated M
-comparison is being rerun with the correct WMMA options and a writable JIT cache.
+Game command-list/queue integration remains in progress. A full temporal M scan
+found rare attention P/V accumulation mismatches that the earlier twelve-block
+sampling missed. `SWIN_EXACT_PV` fixes the native baseline; ZLUDA patch `0013`
+adds the corresponding opt-in f16 reference accumulation. All spatial blocks in
+40 actual native M launches now exactly match NumPy. Four complete native M RGB
+frames exactly match fully translated M with the corrected reference option.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -25,10 +29,69 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; E, K and M CUDA harnesses execute |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
-| M6: K layers, full transformer and image validation | CUDA harness PASS: 11 real-weight layers, native launches for all layers, four finite frames, 81.85–92.91 dB versus translated K; D3D12 integration pending |
-| M7: M FP16-equivalent baseline and full transformer | CUDA harness PASS: 5 real-weight layers exactly match NumPy/PTX, 4 finite frames, 40 native Swin launches; D3D12 and full translated M comparison pending |
+| M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
+| M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS at explicit submitted queue boundaries: K/M, four frames each, no shim CPU image copies, bit-exact RGB against CUDA harness |
 | M9: OptiScaler integration, profiling, installation | Pending |
+
+## M temporal precision regression (2026-09-30)
+
+The earlier finite-frame and sampled-layer results did not cover every spatial
+block. The second enc1 launch has a cancellation-sensitive P/V dot in block
+`0,4`: the old native f32 WMMA route differed by up to 21 e4m3 code steps.
+NumPy and the independent PTX interpreter agree exactly on that block.
+`SWIN_EXACT_PV` stores each wave's sixteen P rows and V rows in LDS, sums sixteen
+f16 products in f64, rounds directly to f16, then applies the existing e4m3
+quantisation. Other GEMMs retain the gfx12 WMMA layout and FP16 widening.
+The flag is enabled by `D4R_M_FP16_BASELINE`; upstream fast/Linux defaults are
+preserved when that flag is absent. Intermediate snapshots are compiled only
+with `D4R_SWIN_DIAGNOSTICS`; they are absent from packaged kernels.
+
+The translated reference also differed: first frame, fourth enc3_tube launch,
+block `0,0`, thirty stored codes, maximum fifteen e4m3 steps. Its inputs match
+the corrected native launch exactly. Patch `0013` adds
+`D4R_ZLUDA_WMMA_F16_REFERENCE=1` for gfx12 f16-accumulator MMA helpers, retaining
+the established fragment gathers, pair fusion and conversions. It uses f64
+sums and integer f16 RNE encoding, including subnormal bits. FP8 GEMMs continue
+using the existing native WMMA widening. The default upstream helper behavior
+remains available with this option unset or zero. Windows diagnostics select
+the reference option by default. All d4r codegen options enter the JIT cache key.
+
+This is a match to the independent mathematical NumPy/PTX baseline. NVIDIA's
+[PTX floating-point MMA specification](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma)
+leaves accumulation order, rounding and subnormal handling unspecified; these
+checks do not establish bit-exact agreement with NVIDIA hardware.
+
+Recorded results on the RX 9070 XT / TheRock runtime:
+
+* Public `cuda_mma_probe`: 512 synthetic matrix cases, 65,536 f16 outputs,
+  zero differing bits with reference accumulation. The old fast WMMA route
+  differs in 23,308 outputs on the same cancellation/subnormal stress fixture.
+* `m-native-exact-pv-temporal-reference`: all spatial blocks of 40 actual native
+  launches, every stored e4m3 value identical to NumPy, max abs/relative error 0.
+* `m-exact-pv-enc1-regression-ptx`: original problem block `0,4`, independent
+  PTX versus native and versus NumPy both max absolute/relative error 0.
+* `m-exact-pv-complete-f16-reference.log`: four complete RGB frames against
+  corrected fully translated M, max absolute/relative error 0, PSNR infinite.
+* `m-translated-f16-temporal-reference`: all blocks of all forty translated
+  M launches exactly match NumPy; no sampled-window exemption.
+* `m-temporal-final-ctest.log`: 11/11 native Windows hardware tests PASS.
+  Pinned fresh-source application of all twelve ZLUDA patches PASS.
+* `d3d12-m-exact-pv-final.zip`: four finite frames, forty native launches,
+  no shim CPU image copies, frame age zero. This remains the explicit queue
+  boundary harness; open game command-list support is the next gate.
+
+All captures, extracted PTX and real weights remain in ignored private result
+directories. To repeat the full temporal scan without editing sources:
+
+```powershell
+$env:PYTHONPATH="$PWD/.tools/python/vendor"
+python tools/windows/m_temporal_validate.py --capture-dir test-results/ngx-m-exact-pv-capture/captures --output-dir test-results/m-temporal-reference --exact
+```
+
+The game selected for the next integration test is Silent Hill 2 at
+`D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe`.
+No game files have been modified at this milestone.
 
 ## Source baseline (checked 2026-09-29)
 

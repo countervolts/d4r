@@ -16,7 +16,7 @@ foreach ($layer in @('enc1','enc2','enc3_tube','dec2','dec1')) {
 }
 & python (Join-Path $repo 'kernels/tools/kernel_manifest.py') $OutputDirectory $DlssDll
 if ($LASTEXITCODE) { throw "Native manifest generation failed ($LASTEXITCODE)" }
-@{architecture='gfx1201'; family='M'; numerics='SWIN_EXACT; FP16 widening; native FP8 disabled';
+@{architecture='gfx1201'; family='M'; numerics='SWIN_EXACT; SWIN_EXACT_PV; FP16 widening; native FP8 disabled';
     dlssSha256=(Get-FileHash -LiteralPath $DlssDll -Algorithm SHA256).Hash;
     validation='synthetic layers passed; actual DLSS capture/reference validation required';
     modules=@(Get-ChildItem -LiteralPath $OutputDirectory -Filter '*.hsaco' | Get-FileHash -Algorithm SHA256)} |

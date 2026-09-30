@@ -53,7 +53,7 @@ $originalPythonPath = $env:PYTHONPATH
 $originalVerbose = $env:D4R_ZLUDA_VERBOSE
 $originalCache = $env:ZLUDA_CACHE_DIR
 $originalCodegen = @{}
-foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE')) {
+foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE','D4R_ZLUDA_WMMA_F16_REFERENCE')) {
     $originalCodegen[$setting] = [Environment]::GetEnvironmentVariable($setting,'Process')
 }
 $exitStatus = 1
@@ -103,14 +103,14 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
 try {
     if (!$env:ZLUDA_CACHE_DIR) { $env:ZLUDA_CACHE_DIR = Join-Path $repoRoot 'build/zluda-cache-windows' }
     $summary.zludaCacheDirectory = $env:ZLUDA_CACHE_DIR
-    foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE')) {
+    foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE','D4R_ZLUDA_WMMA_F16_REFERENCE')) {
         if ($null -eq $originalCodegen[$setting]) {
             [Environment]::SetEnvironmentVariable($setting, $(if ($setting -eq 'D4R_ZLUDA_WMMA_FP8_NATIVE') { '0' } else { '1' }), 'Process')
         }
     }
     $summary.codegen = @{}
     foreach ($setting in $originalCodegen.Keys) { $summary.codegen[$setting] = [Environment]::GetEnvironmentVariable($setting,'Process') }
-    Write-Host "ZLUDA codegen: WMMA=$env:D4R_ZLUDA_WMMA FP8 widening=$env:D4R_ZLUDA_WMMA_FP8 native FP8=$env:D4R_ZLUDA_WMMA_FP8_NATIVE"
+    Write-Host "ZLUDA codegen: WMMA=$env:D4R_ZLUDA_WMMA FP8 widening=$env:D4R_ZLUDA_WMMA_FP8 native FP8=$env:D4R_ZLUDA_WMMA_FP8_NATIVE f16 reference=$env:D4R_ZLUDA_WMMA_F16_REFERENCE"
     if ($NgxOnly -and (!$NgxCore -or !$DlssDll)) { throw '-NgxOnly requires both locally supplied NVIDIA DLL paths.' }
     if ($RequireNativeNetwork) {
         if ($NgxMode -notin @('evaluate','d3d12') -or $Preset -notin @(11,13) -or !$env:D4R_ZLUDA_NATIVE_DIR) {
@@ -197,6 +197,14 @@ try {
         if ($cudaOk -and ($NgxMode -eq 'evaluate' -or (Test-Path (Join-Path $ZludaRoot 'build-info.json')))) {
             $cudaOk = Invoke-Probe 'cuda-images' (Join-Path $bin 'd4r_cuda_image_probe.exe') @(
                 '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'), '--iterations', "$Iterations")
+            if ($cudaOk) {
+                $previousF16 = $env:D4R_ZLUDA_WMMA_F16_REFERENCE
+                try {
+                    $env:D4R_ZLUDA_WMMA_F16_REFERENCE = '1'
+                    $cudaOk = Invoke-Probe 'cuda-f16-mma-reference' (Join-Path $bin 'd4r_cuda_mma_probe.exe') @(
+                        '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'))
+                } finally { $env:D4R_ZLUDA_WMMA_F16_REFERENCE = $previousF16 }
+            }
         }
         }
         if ($cudaOk) {
