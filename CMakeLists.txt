@@ -27,26 +27,38 @@ add_custom_command(OUTPUT "${wmma_object}"
     --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
     -nogpuinc -nogpulib -O2 "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/wmma_gfx1201.hip"
     -o "${wmma_object}"
-  DEPENDS tools/windows/wmma_gfx1201.hip kernels/common/wmma_backend.h VERBATIM)
+  DEPENDS tools/windows/wmma_gfx1201.hip kernels/common/wmma_backend.h
+    kernels/common/wmma_layout.h VERBATIM)
 add_custom_target(d4r_wmma_code_object ALL DEPENDS "${wmma_object}")
-# These K objects stay in experimental/k, outside the ZLUDA native override
+# K/M objects stay in experimental/, outside the ZLUDA native override
 # directory, until each layer and then the complete network pass replay.
-set(k_objects)
-foreach(layer enc1 enc2)
-  set(k_object "${CMAKE_CURRENT_BINARY_DIR}/dltss_pwin_${layer}_layer_gfx1201.hsaco")
-  add_custom_command(OUTPUT "${k_object}"
-    COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
-      --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
-      -nogpuinc -nogpulib -O2 -DD4R_DEVICE_ONLY_MINIMAL
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/k/dltss_pwin_${layer}_layer.hip"
-      -o "${k_object}"
-    DEPENDS kernels/k/dltss_pwin_${layer}_layer.hip kernels/k/pwin_layer.h
-      kernels/k/pwin_common.h kernels/common/wmma_backend.h
-      kernels/common/hip_device_minimal.h VERBATIM)
-  list(APPEND k_objects "${k_object}")
-  install(FILES "${k_object}" DESTINATION experimental/k)
+# M uses the existing FP16 widening baseline; native FP8 is not enabled here.
+set(native_objects)
+foreach(family k m)
+  file(GLOB native_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${family}/*.hip")
+  file(GLOB native_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${family}/*.h")
+  foreach(source IN LISTS native_sources)
+    get_filename_component(kernel_name "${source}" NAME_WE)
+    set(native_object "${CMAKE_CURRENT_BINARY_DIR}/${kernel_name}_gfx1201.hsaco")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
+    file(READ "${source}" kernel_source)
+    string(REGEX MATCH "// d4r-build-flags: ([^\r\n]+)" flags_line "${kernel_source}")
+    set(native_flags)
+    if(flags_line)
+      separate_arguments(native_flags NATIVE_COMMAND "${CMAKE_MATCH_1}")
+    endif()
+    add_custom_command(OUTPUT "${native_object}"
+      COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
+        --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
+        -nogpuinc -nogpulib -O3 -DD4R_DEVICE_ONLY_MINIMAL ${native_flags}
+        "${source}" -o "${native_object}"
+      DEPENDS "${source}" ${native_headers} kernels/common/wmma_layout.h
+        kernels/common/hip_device_minimal.h VERBATIM)
+    list(APPEND native_objects "${native_object}")
+    install(FILES "${native_object}" DESTINATION "experimental/${family}")
+  endforeach()
 endforeach()
-add_custom_target(d4r_k_gfx1201_compile ALL DEPENDS ${k_objects})
+add_custom_target(d4r_native_gfx1201_compile ALL DEPENDS ${native_objects})
 foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe cuda_driver_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
@@ -99,7 +111,7 @@ install(TARGETS d4r_nvapi_compat RUNTIME DESTINATION nvapi-compat)
 target_link_libraries(d4r_d3d12_hip_interop_probe PRIVATE d3d12 dxgi dxguid)
 add_dependencies(d4r_hip_gfx1201_probe d4r_probe_code_object)
 add_dependencies(d4r_gfx12_wmma_probe d4r_wmma_code_object)
-add_dependencies(d4r_k_module_probe d4r_k_gfx1201_compile)
+add_dependencies(d4r_k_module_probe d4r_native_gfx1201_compile)
 install(FILES "${probe_object}" DESTINATION bin)
 install(FILES "${wmma_object}" DESTINATION bin)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)

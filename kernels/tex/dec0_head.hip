@@ -6,8 +6,14 @@
 
 // weights as WMMA A images: index ((p * 2 + c) * 2 + h) * 16 + n16 for channel pair p (16p..16p+15),
 // k32 chunk c (input plane), k16 half h
+#if D4R_WMMA_LAYOUT == 12
+__attribute__((device)) kslot g_dec0_w16[8 * 2 * 2 * 16];
+#else
 __attribute__((device)) u8v g_dec0_w16[8 * 2 * 2 * 16];
+#endif
 DEV __attribute__((used)) uint32_t d4r_prep_blocks = 4;
+// the prep reads only prm.w (offset 0): the hook skips it while that pointer repeats
+DEV __attribute__((used)) uint32_t d4r_prep_key_at = 0 + 1;
 
 struct Dec0Params
 {
@@ -27,7 +33,11 @@ KERNEL __attribute__((amdgpu_flat_work_group_size(128, 128))) void rrlite_dec0_4
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         d[j] = *(const uint32_t*)(w + 512 * (2 * p + c) + 16 * (4 * g + j) + 4 * (2 * second + h));
+#if D4R_WMMA_LAYOUT == 12
+    g_dec0_w16[idx] = kslot_from16(d);
+#else
     g_dec0_w16[idx] = operand16(d);
+#endif
 }
 
 __attribute__((device)) static inline uint32_t mirror_clamp(int32_t v, uint32_t full, uint32_t half)
@@ -47,6 +57,58 @@ DEV void d4r_dec0_head(uint32_t smem, uint64_t wp, uint64_t inp, uint32_t dimx, 
     const uint32_t Y = mirror_clamp(oy / 2 + (int32_t)(m >> 2), dimy, H2);
     const uint32_t Xc = mirror_clamp(ox / 2 + (int32_t)(m & 3), dimx, W2);
     const uint32_t* in = (const uint32_t*)inp + rowstride * Y + 8 * Xc;
+#if D4R_WMMA_LAYOUT == 12
+    kop X[2][2];
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+            X[c][h] = kop_from8(*(const uint2_t*)(in + plane * c + 4 * h + 2 * hf));
+
+    // E[p]: e4m3 codes of channels 16p + 8hf .. 16p + 8hf + 7
+    uint32_t E[8][2];
+#pragma unroll
+    for (int p = 0; p < 8; ++p)
+    {
+        f8v cf;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            cf[i] = (float)*(const half_t*)(w + 8192 + 2 * (16 * p + i + 8 * hf));
+        half_t acc[8];
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+        {
+            const int slot = ((p * 2 + c) * 2) * 16 + m;
+            cf = k32_e4m3(cf, kop_image(g_dec0_w16, slot), X[c][0], kop_image(g_dec0_w16, slot + 16), X[c][1]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                acc[i] = (half_t)cf[i];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                cf[i] = (float)acc[i];
+        }
+        uint32_t codes[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            codes[k] = e4m3x2(pack2(acc[2 * k], acc[2 * k + 1]));
+        E[p][0] = codes[0] | (codes[1] << 16);
+        E[p][1] = codes[2] | (codes[3] << 16);
+    }
+
+    // staging (layout as below): this lane holds tiles 4G + hf and 4G + 2 + hf (channels 16p + 8hf ..), so it
+    // writes H = hf itself
+    const uint32_t base = 1024 * hf + 32 * (m & 3) + 256 * (m >> 2);
+    const uint32_t goff[4] = {0, 16, 128, 144};
+#pragma unroll
+    for (int G = 0; G < 4; ++G)
+    {
+        const uint32_t* p0 = E[2 * G];
+        const uint32_t* p1 = E[2 * G + 1];
+        u4v words = {__builtin_amdgcn_perm(p1[0], p0[0], 0x05040100u), __builtin_amdgcn_perm(p1[0], p0[0], 0x07060302u),
+                     __builtin_amdgcn_perm(p1[1], p0[1], 0x05040100u), __builtin_amdgcn_perm(p1[1], p0[1], 0x07060302u)};
+        *(__attribute__((address_space(3))) u4v*)(s + base + goff[G]) = words;
+    }
+#else
     u8v X[2][2];
 #pragma unroll
     for (int c = 0; c < 2; ++c)
@@ -109,4 +171,5 @@ DEV void d4r_dec0_head(uint32_t smem, uint64_t wp, uint64_t inp, uint32_t dimx, 
                      __builtin_amdgcn_perm(b23, a23, 0x05040100u), __builtin_amdgcn_perm(b23, a23, 0x07060302u)};
         *(__attribute__((address_space(3))) u4v*)(s + base + goff[G]) = words;
     }
+#endif
 }

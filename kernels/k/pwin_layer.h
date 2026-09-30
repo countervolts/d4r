@@ -72,14 +72,10 @@ __device__ __forceinline__ half_t wload(const uint8_t* w, int byte)
     return *(const half_t*)(w + byte);
 }
 
-// channels 16 nt + 2i + hf (i = 0..7) of an f16 vector at byte offset `byte` (16 nt already added)
-__device__ __forceinline__ void dvec8(const uint8_t* w, int byte, uint32_t hf, half_t out[8])
+// channels 16 nt + wm_acc_row(i) (i = 0..7) of an f16 vector at byte offset `byte` (16 nt already added)
+__device__ __forceinline__ void dvec8(const uint8_t* w, int byte, half_t out[8])
 {
-    const u4v a = *(const u4v*)(w + byte), b = *(const u4v*)(w + byte + 16);
-    const u8v v = (u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]};
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-        out[i] = hf ? hi16(v[i]) : lo16(v[i]);
+    wm_acc_vec_load((const half_t*)(w + byte), out);
 }
 
 __device__ __forceinline__ u8v img_tile(const uint8_t* w, int src, int n)
@@ -131,7 +127,7 @@ template <class L> __device__ void pwin_prep_at(const PwinParams& p, u8v* img, u
 #pragma unroll
     for (int i = 0; i < 8; ++i)
     {
-        const int key = 16 * kt + 2 * i + (lane >> 4), r = q & 15, c = key & 15;
+        const int key = 16 * kt + wm_acc_row_h(i, lane >> 4), r = q & 15, c = key & 15;
         const int off = 512 * (4 * kt + qt) + 64 * (r & 7) + 16 * ((c & 7) >> 1) + 2 * (c & 1) + 4 * (r >> 3) + 8 * (c >> 3);
         v[i] = wload(w, L::BIAS + 8192 * h + off);
     }
@@ -209,6 +205,45 @@ __device__ uint64_t g_stamp[16384][16];
 __device__ float g_dbg[12][64][160];
 #define DBG_ON (blockIdx.x == DBX && blockIdx.y == DBY)
 #endif
+// Softmax row sum over the 64 keys of this lane's query: this lane's 32 accumulator rows (summed into rs as
+// the scores are computed), plus the other half's. The layout shim (gfx12 layout on gfx11) instead redoes the
+// sum in gfx11's order (keys 16 kt + 2 i + h, then the other parity), which the f32 result depends on, so
+// that its output stays bit-identical to the gfx11 build.
+#ifdef D4R_WMMA_SHIM
+constexpr bool kShimRowSum = true;
+#else
+constexpr bool kShimRowSum = false;
+#endif
+__device__ __forceinline__ float row_sum_total(float rs, const half_t (&e)[4][8])
+{
+    if constexpr (!kShimRowSum)
+        return rs + __builtin_bit_cast(float, other_half(__builtin_bit_cast(uint32_t, rs)));
+    // this lane: keys 16 kt + 8 h + j; the other half: keys 16 kt + 8 (1 - h) + j
+    const bool hf = wm_half() != 0;
+    float s[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt)
+    {
+        half_t lo[8], hi[8];
+#pragma unroll
+        for (int j = 0; j < 8; j += 2)
+        {
+            const uint32_t own = pack2(e[kt][j], e[kt][j + 1]), other = other_half(own);
+            const uint32_t l = hf ? other : own, u = hf ? own : other;
+            lo[j] = lo16(l), lo[j + 1] = hi16(l), hi[j] = lo16(u), hi[j + 1] = hi16(u);
+        }
+#pragma unroll
+        for (int par = 0; par < 2; ++par)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+            {
+                const int key = 2 * i + par;
+                s[par] += (float)(key < 8 ? lo[key] : hi[key - 8]);
+            }
+    }
+    return s[0] + s[1];
+}
+
 // The Swin core for one window: x0 rows of this wave's 16 tokens are in act (f16, C per token).
 // On return act holds the block output y. hb: normalised input rows; K/V of one head at a time in kl/vt.
 template <class L>
@@ -265,7 +300,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 
     half_t vv_[8];
 
-    dvec8(w, L::BO + 32 * nt, hf, vv_);
+    dvec8(w, L::BO + 32 * nt, vv_);
 
 #pragma unroll
 
@@ -277,7 +312,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
     for (int h = 0; h < H; ++h)
     {
         // position-only attention: V^T A operands straight from D = h1 Wv (lane = dim, 16 keys per tile)
-        u8v vtop[2][4];
+        op_t vtop[2][4];
         if constexpr (L::POS)
         {
             // each wave computes the V^T operands of its own key tile; shared through LDS, one slot per head
@@ -287,28 +322,26 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
             {
                 f8v d = splat8(0.0f);
                 for (int ks = 0; ks < KT; ++ks)
-                    d = mma16(lds_row16(&hb[16 * wv + m][16 * ks]), img[(L::T_QKV + ((h * 3 + 2) * KT + ks) * 2 + nt) * 16 + m], d);
-                const u8v vo = operand_from_f8(d);
-                if (!hf)
-                    vsh[h][nt][wv][m] = vo;
+                    d = mma16(op_lds(&hb[16 * wv + m][16 * ks]), op_img(img, (L::T_QKV + ((h * 3 + 2) * KT + ks) * 2 + nt) * 16 + m), d);
+                op_img_store(&vsh[h][nt][0][0], wv * 16 + m, operand_from_f8(d));
             }
             block_sync();
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt)
-                    vtop[nt][kt] = vsh[h][nt][kt][m];
+                    vtop[nt][kt] = op_img(&vsh[h][nt][0][0], kt * 16 + m);
         }
-        u8v pop[4];
+        op_t pop[4];
         if constexpr (L::POS)
         {
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt)
-                pop[kt] = ((const u8v*)bias)[((h * 4 + wv) * 4 + kt) * 16 + m];
+                pop[kt] = op_img((const u8v*)bias, ((h * 4 + wv) * 4 + kt) * 16 + m);
         }
         else
         {
-        u8v qop[2];
+        op_t qop[2];
         // six independent chains (Q, K, V x 2 n-tiles), each over kt in order
         f8v dq[6];
 #pragma unroll
@@ -316,10 +349,10 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
             dq[u] = splat8(0.0f);
         for (int kt = 0; kt < KT; ++kt)
         {
-            const u8v row = lds_row16(hrow + 16 * kt);
+            const op_t row = op_lds(hrow + 16 * kt);
 #pragma unroll
             for (int u = 0; u < 6; ++u)
-                dq[u] = mma16(img[(L::T_QKV + ((h * 3 + (u >> 1)) * KT + kt) * 2 + (u & 1)) * 16 + m], row, dq[u]);
+                dq[u] = mma16(op_img(img, (L::T_QKV + ((h * 3 + (u >> 1)) * KT + kt) * 2 + (u & 1)) * 16 + m), row, dq[u]);
         }
 #pragma unroll
         for (int j = 0; j < 3; ++j)
@@ -331,15 +364,13 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
                     qop[nt] = operand_from_f8(d);
                 else if (j == 1)
                 {
-                    const u8v kop = operand_from_f8(d);
-                    if (!hf)
-                        store_row16(&kl[16 * wv + m][16 * nt], kop);
+                    op_store(&kl[16 * wv + m][16 * nt], operand_from_f8(d));
                 }
                 else
                 {
 #pragma unroll
                     for (int i = 0; i < 8; ++i)
-                        vt[16 * nt + 2 * i + hf][16 * wv + m] = (half_t)d[i];
+                        vt[16 * nt + wm_acc_row(i)][16 * wv + m] = (half_t)d[i];
                 }
             }
         block_sync();
@@ -358,15 +389,16 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
             }
 #pragma unroll
             for (int ds = 0; ds < 2; ++ds)
-                d = mma16(lds_row16(&kl[16 * kt + m][16 * ds]), qop[ds], d);
+                d = mma16(op_lds(&kl[16 * kt + m][16 * ds]), qop[ds], d);
 #pragma unroll
             for (int i = 0; i < 8; ++i)
             {
                 e[kt][i] = softmax_e((half_t)d[i]);
-                rs += (float)e[kt][i];
+                if constexpr (!kShimRowSum)
+                    rs += (float)e[kt][i];
             }
         }
-        rs += __builtin_bit_cast(float, other_half(__builtin_bit_cast(uint32_t, rs)));
+        rs = row_sum_total(rs, e);
         const half_t rc = (half_t)__builtin_amdgcn_rcpf((float)(half_t)rs);
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt)
@@ -378,7 +410,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
             pop[kt] = operand_from_dt(pv);
         }
         }
-        u8v oop[2];
+        op_t oop[2];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
         {
@@ -389,20 +421,20 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
                 if constexpr (L::POS)
                     d = mma16(vtop[nt][kt], pop[kt], d);
                 else
-                    d = mma16(lds_row16(&vt[16 * nt + m][16 * kt]), pop[kt], d);
+                    d = mma16(op_lds(&vt[16 * nt + m][16 * kt]), pop[kt], d);
             }
             oop[nt] = operand_from_f8(d);
 #ifdef PWIN_DBG
             if (DBG_ON)
                 for (int i = 0; i < 8; ++i)
-                    g_dbg[2 + h][16 * wv + m][16 * nt + 2 * i + hf] = (float)(half_t)d[i];
+                    g_dbg[2 + h][16 * wv + m][16 * nt + wm_acc_row(i)] = (float)(half_t)d[i];
 #endif
         }
 #pragma unroll
         for (int nt = 0; nt < KT; ++nt)
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks)
-                acc[nt] = mma16(img[(L::T_WO + (2 * h + ks) * KT + nt) * 16 + m], oop[ks], acc[nt]);
+                acc[nt] = mma16(op_img(img, (L::T_WO + (2 * h + ks) * KT + nt) * 16 + m), oop[ks], acc[nt]);
         if constexpr (!L::POS)
             block_sync(); // kl / vt are reused by the next head
     }
@@ -411,34 +443,32 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
     if (DBG_ON)
         for (int nt = 0; nt < KT; ++nt)
             for (int i = 0; i < 8; ++i)
-                g_dbg[1][16 * wv + m][16 * nt + 2 * i + hf] = acc[nt][i];
+                g_dbg[1][16 * wv + m][16 * nt + wm_acc_row(i)] = acc[nt][i];
 #endif
     STAMP(3);
     // ---- residual; MLP init acc = x1 + b2, MLP input m = x1 * g2 (-> hb)
 #pragma unroll
     for (int nt = 0; nt < KT; ++nt)
     {
-        const u8v xv = lds_row16(arow + 16 * nt);
+        const op_t xv = op_lds(arow + 16 * nt);
         half_t mv[8], g2[8], b2[8];
-        dvec8(w, L::G2 + 32 * nt, hf, g2);
-        dvec8(w, L::B2 + 32 * nt, hf, b2);
+        dvec8(w, L::G2 + 32 * nt, g2);
+        dvec8(w, L::B2 + 32 * nt, b2);
 #pragma unroll
         for (int i = 0; i < 8; ++i)
         {
-            const half_t x1 = (half_t)acc[nt][i] + op_get(xv, 2 * i + hf);
+            const half_t x1 = (half_t)acc[nt][i] + wm_op_acc_elem(xv, i);
             mv[i] = x1 * g2[i];
             acc[nt][i] = (float)(half_t)(x1 + b2[i]);
         }
-        const u8v mo = operand_from_dt(mv);
-        if (!hf)
-            store_row16(hrow + 16 * nt, mo);
+        op_store(hrow + 16 * nt, operand_from_dt(mv));
     }
     __builtin_amdgcn_wave_barrier();
 
     // ---- MLP: C/8 chunks of 32 hidden
     for (int c = 0; c < L::NMLP; ++c)
     {
-        u8v gop[2];
+        op_t gop[2];
 #pragma unroll
         for (int hn = 0; hn < 2; ++hn)
         {
@@ -447,7 +477,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 
     half_t vv_[8];
 
-    dvec8(w, L::B1 + 64 * c + 32 * hn, hf, vv_);
+    dvec8(w, L::B1 + 64 * c + 32 * hn, vv_);
 
 #pragma unroll
 
@@ -457,7 +487,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 
 }
             for (int kt = 0; kt < KT; ++kt)
-                d = mma16(img[(L::T_W1 + (c * KT + kt) * 2 + hn) * 16 + m], lds_row16(hrow + 16 * kt), d);
+                d = mma16(op_img(img, (L::T_W1 + (c * KT + kt) * 2 + hn) * 16 + m), op_lds(hrow + 16 * kt), d);
             half_t g[8];
             gelu8(d, g);
             gop[hn] = operand_from_dt(g);
@@ -466,16 +496,14 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         for (int nt = 0; nt < KT; ++nt)
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks)
-                acc[nt] = mma16(img[(L::T_W2 + (c * 2 + ks) * KT + nt) * 16 + m], gop[ks], acc[nt]);
+                acc[nt] = mma16(op_img(img, (L::T_W2 + (c * 2 + ks) * KT + nt) * 16 + m), gop[ks], acc[nt]);
     }
     STAMP(4);
     // y -> act (rows of this wave)
 #pragma unroll
     for (int nt = 0; nt < KT; ++nt)
     {
-        const u8v yo = operand_from_f8(acc[nt]);
-        if (!hf)
-            store_row16(arow + 16 * nt, yo);
+        op_store(arow + 16 * nt, operand_from_f8(acc[nt]));
     }
     __builtin_amdgcn_wave_barrier();
 }
@@ -530,31 +558,29 @@ __device__ void pwin_encoder(const PwinParams& p0, const u8v* __restrict__ img, 
         if constexpr (L::CIN != 0)
         {
             const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * L::CIN;
-            u8v xe[L::KE];
+            op_t xe[L::KE];
 #pragma unroll
             for (int ks = 0; ks < L::KE; ++ks)
-                xe[ks] = gload_row16(xin + 16 * ks);
+                xe[ks] = op_gload(xin + 16 * ks);
 #pragma unroll
             for (int nt = 0; nt < C / 16; ++nt)
             {
                 f8v d;
                 {
                     half_t vv_[8];
-                    dvec8(p0.w, 32 * nt, hf, vv_);
+                    dvec8(p0.w, 32 * nt, vv_);
 #pragma unroll
                     for (int i = 0; i < 8; ++i)
                         d[i] = (float)vv_[i];
                 }
 #pragma unroll
                 for (int ks = 0; ks < L::KE; ++ks)
-                    d = mma16(img[(L::T_EMB + ks * (C / 16) + nt) * 16 + m], xe[ks], d);
+                    d = mma16(op_img(img, (L::T_EMB + ks * (C / 16) + nt) * 16 + m), xe[ks], d);
                 half_t xo[8];
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                     xo[i] = hmax((half_t)d[i], (half_t)0.0f);
-                const u8v xv = operand_from_dt(xo);
-                if (!hf)
-                    store_row16(&act[tok][16 * nt], xv);
+                op_store(&act[tok][16 * nt], operand_from_dt(xo));
             }
         }
         else
@@ -592,7 +618,7 @@ __device__ void pwin_encoder(const PwinParams& p0, const u8v* __restrict__ img, 
 
     half_t vv_[8];
 
-    dvec8(w, L::PMB + 32 * vt, hf, vv_);
+    dvec8(w, L::PMB + 32 * vt, vv_);
 
 #pragma unroll
 
@@ -606,18 +632,11 @@ __device__ void pwin_encoder(const PwinParams& p0, const u8v* __restrict__ img, 
         {
             const int sub = ks / L::KT, dy = sub >> 1, dx = sub & 1;
             const int src = 8 * (2 * my + dy) + 2 * mx + dx;
-            d = mma16(img[(L::T_PM + ks * L::PMT + vt) * 16 + m], lds_row16(&act[src][16 * (ks % L::KT)]), d);
+            d = mma16(op_img(img, (L::T_PM + ks * L::PMT + vt) * 16 + m), op_lds(&act[src][16 * (ks % L::KT)]), d);
         }
-        const u8v mo = operand_from_f8(d);
         // allocated column 16 vt + c belongs to original warp g, local column 16 u + c
         const int g = vt / (L::NPA / 16), u = vt % (L::NPA / 16), valid = L::NPW - 16 * u;
-        half_t* dst = mout + L::NPW * g + 16 * u;
-        if (!hf && minb)
-        {
-            gstore16(dst, (u4v){mo[0], mo[1], mo[2], mo[3]});
-            if (valid >= 16)
-                gstore16(dst + 8, (u4v){mo[4], mo[5], mo[6], mo[7]});
-        }
+        op_gstore(mout + L::NPW * g + 16 * u, operand_from_f8(d), minb, valid);
     }
 }
 
@@ -749,7 +768,7 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
 
     half_t vv_[8];
 
-    dvec8(p.w, L::EXPB + 32 * gnt, hf, vv_);
+    dvec8(p.w, L::EXPB + 32 * gnt, vv_);
 
 #pragma unroll
 
@@ -759,15 +778,13 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
 
 }
             for (int ks = 0; ks < L::KL; ++ks)
-                d = mma16(img[(L::T_EXP + ks * L::EXPN + gnt) * 16 + m], gload_row16(xl + 16 * ks), d);
-            const u8v sv = gload_row16(sk + 16 * nt);
+                d = mma16(op_img(img, (L::T_EXP + ks * L::EXPN + gnt) * 16 + m), op_gload(xl + 16 * ks), d);
+            const op_t sv = op_gload(sk + 16 * nt);
             half_t xo[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                xo[i] = (half_t)d[i] + op_get(sv, 2 * i + hf);
-            const u8v xv = operand_from_dt(xo);
-            if (!hf)
-                store_row16(&act[t][16 * nt], xv);
+                xo[i] = (half_t)d[i] + wm_op_acc_elem(sv, i);
+            op_store(&act[t][16 * nt], operand_from_dt(xo));
         }
     }
     block_sync();
@@ -788,7 +805,7 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
 
     half_t vv_[8];
 
-    dvec8(q.w, L::HB + 32 * nt, hf, vv_);
+    dvec8(q.w, L::HB + 32 * nt, vv_);
 
 #pragma unroll
 
@@ -799,15 +816,8 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
 }
 #pragma unroll
             for (int kt = 0; kt < L::KT; ++kt)
-                d = mma16(img[(L::T_HEAD + kt * (L::NOUTA / 16) + nt) * 16 + m], lds_row16(&act[tok][16 * kt]), d);
-            const u8v ho = operand_from_f8(d);
-            const int valid = L::NOUT - 16 * nt;
-            if (!hf && inb)
-            {
-                gstore16(hout + 16 * nt, (u4v){ho[0], ho[1], ho[2], ho[3]});
-                if (valid >= 16)
-                    gstore16(hout + 16 * nt + 8, (u4v){ho[4], ho[5], ho[6], ho[7]});
-            }
+                d = mma16(op_img(img, (L::T_HEAD + kt * (L::NOUTA / 16) + nt) * 16 + m), op_lds(&act[tok][16 * kt]), d);
+            op_gstore(hout + 16 * nt, operand_from_f8(d), inb, L::NOUT - 16 * nt);
         }
     }
     else if (inb)

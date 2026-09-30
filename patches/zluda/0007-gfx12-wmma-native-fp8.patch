@@ -1,0 +1,551 @@
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -113,9 +113,57 @@
+     *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_PARAM_PROVENANCE").map_or(true, |value| value.trim() != "0"))
+ }
+ 
+-fn wmma_rewrite_enabled(gcn_arch: &str) -> bool {
+-    // The helpers assume RDNA3's wave32 WMMA register layout.
+-    wmma_rewrite_requested() && gcn_arch.starts_with("gfx11")
++/// D4R_ZLUDA_WMMA_FP8_NATIVE=1: on gfx12 (RDNA4), e4m3 MMAs use the native FP8 WMMA instead of widening
++/// to f16. Ignored on every other GPU (gfx11 has no FP8 WMMA).
++pub fn wmma_fp8_native_requested() -> bool {
++    static VALUE: OnceLock<bool> = OnceLock::new();
++    *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_WMMA_FP8_NATIVE").map_or(false, |value| value.trim() == "1"))
++}
++
++/// The WMMA register layout family of a GPU: 11 (RDNA3) or 12 (RDNA4); the MMA helpers exist for these.
++/// D4R_ZLUDA_WMMA_LAYOUT=12 on gfx11 is for tests only: it takes the gfx12 helper names, which then must
++/// come from a helper library built with D4R_WMMA12_SHIM (gfx12 data movement, gfx11 WMMAs).
++fn wmma_family(gcn_arch: &str) -> Option<u32> {
++    let family = if gcn_arch.starts_with("gfx11") {
++        11
++    } else if gcn_arch.starts_with("gfx12") {
++        12
++    } else {
++        return None;
++    };
++    if family == 11 && std::env::var("D4R_ZLUDA_WMMA_LAYOUT").map_or(false, |value| value.trim() == "12") {
++        return Some(12);
++    }
++    Some(family)
++}
++
++/// Whether e4m3 MMAs compiled for this GPU use native FP8 WMMA (the setting only acts on gfx12).
++pub fn wmma_fp8_native_effective(gcn_arch: &str) -> bool {
++    wmma_rewrite_flags(gcn_arch).map_or(false, |flags| flags & 4 != 0)
++}
++
++/// Flags for LLVMZludaRewriteMmaF16Wmma, or None to keep the dot-product fallback (logged once when the
++/// rewrite was requested but this GPU has no WMMA lowering).
++fn wmma_rewrite_flags(gcn_arch: &str) -> Option<u32> {
++    if !wmma_rewrite_requested() {
++        return None;
++    }
++    let Some(family) = wmma_family(gcn_arch) else {
++        static LOGGED: OnceLock<()> = OnceLock::new();
++        LOGGED.get_or_init(|| {
++            eprintln!("[ZLUDA] D4R_ZLUDA_WMMA: no WMMA lowering for {gcn_arch}; MMAs use the dot-product fallback")
++        });
++        return None;
++    };
++    let mut flags = if wmma_fp8_rewrite_requested() { 1 } else { 0 };
++    if family == 12 {
++        flags |= 2;
++        // native FP8 needs gfx12 hardware; the layout shim on gfx11 takes it only for tests (D4R_WMMA12_SHIM)
++        if flags & 1 != 0 && wmma_fp8_native_requested() {
++            flags |= 4;
++        }
++    }
++    Some(flags)
+ }
+ 
+ pub fn compile(
+@@ -139,8 +187,7 @@
+ 
+     // wmma.mma m16n16k16 always becomes m16n8k16 MMAs (there is no helper for it).
+     unsafe { crate::ffi::LLVMZludaSplitWmmaM16n16k16(main.get()) };
+-    if wmma_rewrite_enabled(gcn_arch) {
+-        let flags = if wmma_fp8_rewrite_requested() { 1 } else { 0 };
++    if let Some(flags) = wmma_rewrite_flags(gcn_arch) {
+         unsafe { crate::ffi::LLVMZludaRewriteMmaF16Wmma(main.get(), flags) };
+     }
+     linked.link(main)?;
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -968,6 +968,9 @@
+ }
+ 
+ // Flags bit 0: also lower m16n8k32 e4m3 MMAs (D4R_ZLUDA_WMMA_FP8=1).
++// Flags bit 1: gfx12 (RDNA4) WMMA layout: the d4r_wmma12_* helpers.
++// Flags bit 2 (with bit 1): e4m3 MMAs on native FP8 WMMA: the d4r_wmma12f8_* e4m3 helpers.
++// The helper sets share one contract (see zluda_ptx_impl.cpp), so only their names change here.
+ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+     Module *M = unwrap(ModuleRef);
+@@ -990,33 +993,39 @@
+     Type *V8 = FixedVectorType::get(I32, 8);
+     AttributeList Attributes = AttributeList::get(Context, AttributeList::FunctionIndex,
+                                                   AttrBuilder(Context, Reference->getAttributes().getFnAttrs()));
++    // arch-specific helpers (operand gathers, WMMAs), e4m3 MMAs, e4m3 fragment widening; the conversions
++    // between NVIDIA fragments, the transposed layout and f32 shadows are shared
++    const bool Gfx12 = (Flags & 2) != 0, NativeFp8 = Gfx12 && (Flags & 4) != 0;
++    const std::string Arch = Gfx12 ? "__zluda_ptx_impl_d4r_wmma12_" : "__zluda_ptx_impl_d4r_wmma_";
++    const std::string E4m3 = NativeFp8 ? "__zluda_ptx_impl_d4r_wmma12f8_" : Arch;
++    const std::string Widen = NativeFp8 ? E4m3 : "__zluda_ptx_impl_d4r_wmma_";
+     Helpers H;
+-    H.AFromB = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_a_from_b", Attributes, V8, V2);
+-    H.BFromA = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_b_from_a", Attributes, V8, V4);
+-    H.Mma = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_f16", Attributes, V2, V8, V8, V2);
++    H.AFromB = M->getOrInsertFunction((Arch + "t_a_from_b").c_str(), Attributes, V8, V2);
++    H.BFromA = M->getOrInsertFunction((Arch + "t_b_from_a").c_str(), Attributes, V8, V4);
++    H.Mma = M->getOrInsertFunction((Arch + "t_mma_f16").c_str(), Attributes, V2, V8, V8, V2);
+     H.FromNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_nv", Attributes, V2, V2);
+     H.ToNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_to_nv", Attributes, V2, V2);
+-    H.AFromBPair = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_a_from_b_pair", Attributes, V8, V2, V2);
+-    H.MmaPair = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_f16_pair", Attributes, V4, V8, V8, V2, V2);
++    H.AFromBPair = M->getOrInsertFunction((Arch + "t_a_from_b_pair").c_str(), Attributes, V8, V2, V2);
++    H.MmaPair = M->getOrInsertFunction((Arch + "t_mma_f16_pair").c_str(), Attributes, V4, V8, V8, V2, V2);
+     {
+         Type *F = Type::getFloatTy(Context);
+         Type *V4F = FixedVectorType::get(F, 4);
+         Type *V8F = FixedVectorType::get(F, 8);
+         H.SFromT = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_from_t", Attributes, V4F, V2, F);
+         H.TFromS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_s", Attributes, V2, V4F, F);
+-        H.MmaS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_f16", Attributes, V4F, V8, V8, V4F, F, F);
+-        H.MmaPairS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_f16_pair", Attributes, V8F, V8, V8, V4F, V4F, F, F);
+-        H.MmaE4m3S = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_e4m3", Attributes, V4F, V8, V8, V8, V8, V4F);
++        H.MmaS = M->getOrInsertFunction((Arch + "s_mma_f16").c_str(), Attributes, V4F, V8, V8, V4F, F, F);
++        H.MmaPairS = M->getOrInsertFunction((Arch + "s_mma_f16_pair").c_str(), Attributes, V8F, V8, V8, V4F, V4F, F, F);
++        H.MmaE4m3S = M->getOrInsertFunction((E4m3 + "s_mma_e4m3").c_str(), Attributes, V4F, V8, V8, V8, V8, V4F);
+         H.MmaE4m3PairS =
+-            M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_e4m3_pair", Attributes, V8F, V8, V8, V8, V8, V4F, V4F);
++            M->getOrInsertFunction((E4m3 + "s_mma_e4m3_pair").c_str(), Attributes, V8F, V8, V8, V8, V8, V4F, V4F);
+     }
+     if (MmaE4m3 != nullptr)
+     {
+-        H.E4m3AToF16 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_e4m3_a_to_f16", Attributes, V8, V4);
+-        H.E4m3BToF16 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_e4m3_b_to_f16", Attributes, V4, V2);
+-        H.MmaE4m3 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_e4m3", Attributes, V2, V8, V8, V8, V8, V2);
++        H.E4m3AToF16 = M->getOrInsertFunction((Widen + "e4m3_a_to_f16").c_str(), Attributes, V8, V4);
++        H.E4m3BToF16 = M->getOrInsertFunction((Widen + "e4m3_b_to_f16").c_str(), Attributes, V4, V2);
++        H.MmaE4m3 = M->getOrInsertFunction((E4m3 + "t_mma_e4m3").c_str(), Attributes, V2, V8, V8, V8, V8, V2);
+         H.MmaE4m3Pair =
+-            M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_e4m3_pair", Attributes, V4, V8, V8, V8, V8, V2, V2);
++            M->getOrInsertFunction((E4m3 + "t_mma_e4m3_pair").c_str(), Attributes, V4, V8, V8, V8, V8, V2, V2);
+     }
+     unsigned Rewritten = 0;
+     for (Function &F : *M)
+--- a/ptx/examples/d4r_emit.rs
++++ b/ptx/examples/d4r_emit.rs
+@@ -1,9 +1,13 @@
+ use std::{env, fs, path::PathBuf};
+ use ptx_parser::parse_module_checked;
+ 
++// usage: d4r_emit PTX OUT_DIR [GPU_ARCH]: translates and compiles a PTX module offline (no GPU needed) for
++// GPU_ARCH (default gfx1101), with the same D4R_ZLUDA_* code-generation switches as the runtime, and writes
++// the IR stages, asm.s and module.hsaco to OUT_DIR
+ fn main() {
+     let input = env::args().nth(1).expect("PTX path");
+     let outdir = PathBuf::from(env::args().nth(2).unwrap_or_else(|| "/tmp/d4r-autoexposure-emitted".into()));
++    let arch = env::args().nth(3).unwrap_or_else(|| "gfx1101".into());
+     fs::create_dir_all(&outdir).expect("create output directory");
+     let bytes = fs::read(&input).expect("read PTX");
+     let text = std::str::from_utf8(&bytes).expect("PTX UTF-8").trim_end_matches('\0');
+@@ -18,13 +22,14 @@
+             "opt.ll" => "opt.ll",
+             "asm" => "asm.s",
+             "o" => "object.o",
++            "elf" => "linked.elf", // the code object compile() returns (written again as module.hsaco)
+             other => panic!("unexpected stage: {other}"),
+         };
+         fs::write(outdir.join(filename), data).expect("write compiler stage");
+     };
+     let elf = llvm_zluda::compile(
+         &module.context,
+-        "gfx1101",
++        &arch,
+         module.llvm_ir,
+         linked_helpers,
+         module.attributes_ir,
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -1696,6 +1696,349 @@
+     }
+ }
+ 
++// gfx12 (RDNA4) lowering of the same MMAs (LLVMZludaRewriteMmaF16Wmma with the gfx12 flag: helpers
++// d4r_wmma12_*, and d4r_wmma12f8_* for the e4m3 ones with native FP8 WMMA). The contract is the gfx11 one
++// above: NVIDIA fragments in, the transposed accumulator layout (lane l holds D[l % 16][2v + l / 16] as two
++// f16x2 words, or four floats for the f32 shadows), so the rewrite only switches helper names.
++//
++// A gfx12 WMMA operand holds 8 of the 16 K values per lane: half h = lane / 16 its own 8 (4 dwords, returned
++// in the low half of a wmma_uint8). With A' = B^T and B' = A^T as above, dword j of half h holds the k-pair of
++// NVIDIA thread t = 2h + (j >> 1): the low pair (k 2t, 2t + 1) for even j, the high pair (k 2t + 8, 2t + 9)
++// for odd j. Then every lane of a gather reads the same source register (4 bpermutes per operand; B' also
++// needs a DPP swap per dword for rows 8..15). For e4m3 fragments the same slots hold, after the widening
++// above, e4m3 k 8h .. 8h + 7 in order.
++// The result D' has VGPR i = row n = i + 8h (columns m = lane % 16): unpaired, rows 0..7 are the h = 0 lanes
++// and the h = 1 lanes are padding; paired (A' rows 8..15 = B1^T), D1 is in the h = 1 lanes. Converting from
++// and to the transposed layout takes 2 permlanex16 each way (4 for f32 shadows).
++//
++// D4R_WMMA12_SHIM (tests only): these helpers compiled for gfx11, every gfx12 WMMA done by the gfx11 one on
++// operands rebuilt in the gfx11 helpers' K order (and for e4m3 with the same scaled widening), so the results
++// are bit-identical to the gfx11 helpers and the gfx12 data movement can be checked on RDNA3.
++typedef _Float16 wmma_half8 __attribute__((ext_vector_type(8)));
++typedef uint32_t wmma_uint4 __attribute__((ext_vector_type(4)));
++typedef int wmma_int2 __attribute__((ext_vector_type(2)));
++#ifndef D4R_WMMA12_SHIM
++__device__ wmma_float8 __zluda_wmma12_f32_16x16x16_f16(wmma_half8 a, wmma_half8 b, wmma_float8 c) __asm("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16");
++__device__ wmma_float8 __zluda_wmma12_f32_16x16x16_fp8_fp8(wmma_int2 a, wmma_int2 b, wmma_float8 c) __asm("llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8.v8f32.v2i32");
++#endif
++
++__device__ static uint32_t wmma12_half()
++{
++    return wmma_lane() / 16;
++}
++
++__device__ static uint32_t wmma12_other_half(uint32_t value)
++{
++    return uint32_t(__builtin_amdgcn_permlanex16(int(value), int(value), 0x76543210, 0xfedcba98, false, false));
++}
++
++__device__ static float wmma12_other_half_f(float value)
++{
++    return std::bit_cast<float>(wmma12_other_half(std::bit_cast<uint32_t>(value)));
++}
++
++// dword j of an operand gathered from two candidate registers: rows r < 8 take `low` from lane 4r + t, rows
++// r >= 8 take `high` from lane 4(r - 8) + t (t = 2h + (j >> 1)). The source lane is in the first half-wave,
++// while t differs between the two destination half-waves, so the two candidates must be gathered independently.
++__device__ static uint32_t wmma12_gather2(uint32_t low, uint32_t high, uint32_t j)
++{
++    const uint32_t row = wmma_lane() % 16;
++    const uint32_t t = (j >> 1) + 2 * wmma12_half();
++    const uint32_t lo = wmma_from_lane(row * 4 + t, low);
++    const uint32_t hi = wmma_from_lane((row % 8) * 4 + t, high);
++    return row < 8 ? lo : hi;
++}
++
++__device__ static wmma_uint4 wmma12_low4(wmma_uint8 v)
++{
++    return {v[0], v[1], v[2], v[3]};
++}
++
++// f32 D' = A' B' + C' (f16 operands in the slot order above)
++__device__ static wmma_float8 wmma12_f16(wmma_uint8 a, wmma_uint8 b, wmma_float8 c)
++{
++#ifndef D4R_WMMA12_SHIM
++    return __zluda_wmma12_f32_16x16x16_f16(std::bit_cast<wmma_half8>(wmma12_low4(a)), std::bit_cast<wmma_half8>(wmma12_low4(b)), c);
++#else
++    // gfx11 operand dword p (K 2p, 2p + 1 in the gfx11 helpers' order) is gfx12 dword jp of half hp
++    const bool high = wmma12_half() != 0;
++    wmma_uint8 a11, b11;
++    for (uint32_t p = 0; p < 8; p++)
++    {
++        const uint32_t hp = (p & 3) >> 1, jp = 2 * (p & 1) + (p >> 2);
++        const uint32_t ao = wmma12_other_half(a[jp]), bo = wmma12_other_half(b[jp]);
++        a11[p] = (hp != 0) == high ? a[jp] : ao;
++        b11[p] = (hp != 0) == high ? b[jp] : bo;
++    }
++    // accumulators: gfx12 VGPR i = row i + 8h, gfx11 VGPR i = row 2i + h
++    wmma_float8 co, c11;
++    for (uint32_t i = 0; i < 8; i++)
++        co[i] = wmma12_other_half_f(c[i]);
++    for (uint32_t i = 0; i < 8; i++)
++        c11[i] = high ? (i < 4 ? co[2 * i + 1] : c[2 * i - 7]) : (i < 4 ? c[2 * i] : co[2 * i - 8]);
++    wmma_float8 d11 = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a11), std::bit_cast<wmma_half16>(b11), c11);
++    wmma_float8 dout, d;
++    for (uint32_t i = 0; i < 8; i++)
++        dout[i] = wmma12_other_half_f(d11[i]);
++    for (uint32_t i = 0; i < 8; i++)
++        d[i] = high ? ((i & 1) ? d11[(i >> 1) + 4] : dout[(i >> 1) + 4]) : ((i & 1) ? dout[i >> 1] : d11[i >> 1]);
++    return d;
++#endif
++}
++
++// f32 D' = A' B' + C' for operands whose dwords hold two e4m3 bytes in their low 16 bits (the d4r_wmma12f8
++// e4m3 "widening" below keeps the bytes): true e4m3 values, no scaling
++__device__ static wmma_float8 wmma12_e4m3(wmma_uint8 a, wmma_uint8 b, wmma_float8 c)
++{
++    const wmma_int2 a8 = {int(__builtin_amdgcn_perm(a[1], a[0], 0x05040100u)), int(__builtin_amdgcn_perm(a[3], a[2], 0x05040100u))};
++    const wmma_int2 b8 = {int(__builtin_amdgcn_perm(b[1], b[0], 0x05040100u)), int(__builtin_amdgcn_perm(b[3], b[2], 0x05040100u))};
++#ifndef D4R_WMMA12_SHIM
++    return __zluda_wmma12_f32_16x16x16_fp8_fp8(a8, b8, c);
++#else
++    // the gfx11 helpers' scaled widening (value * 2^-8 per operand, C * 2^-16): exact powers of two
++    auto widen = [](wmma_int2 q) {
++        auto lo = e4m3x4_to_scaled_f16x2x2(uint32_t(q.x)), hi = e4m3x4_to_scaled_f16x2x2(uint32_t(q.y));
++        return wmma_uint8{lo.x, lo.y, hi.x, hi.y, 0u, 0u, 0u, 0u};
++    };
++    return wmma12_f16(widen(a8), widen(b8), c * 0x1p-16f) * 0x1p16f;
++#endif
++}
++
++// transposed f16 accumulator(s) <-> D' / C'
++__device__ static wmma_float8 wmma12_c_from_t(uint2::Native_vec_ c_t)
++{
++    // lane h = 0 needs rows 0..7: its own rows 0, 2, 4, 6 and the other half's 1, 3, 5, 7 (h = 1 lanes: padding)
++    const uint32_t o0 = wmma12_other_half(c_t.x), o1 = wmma12_other_half(c_t.y);
++    f16x2 e01 = std::bit_cast<f16x2>(c_t.x), e23 = std::bit_cast<f16x2>(c_t.y);
++    f16x2 d01 = std::bit_cast<f16x2>(o0), d23 = std::bit_cast<f16x2>(o1);
++    return {float(e01.x), float(d01.x), float(e01.y), float(d01.y), float(e23.x), float(d23.x), float(e23.y), float(d23.y)};
++}
++
++__device__ static wmma_float8 wmma12_c_from_t_pair(uint2::Native_vec_ c0_t, uint2::Native_vec_ c1_t)
++{
++    // h = 0: C0 rows 0..7 (own even, other odd); h = 1: C1 rows 0..7 (other even, own odd)
++    const bool high = wmma12_half() != 0;
++    const uint2::Native_vec_ own = high ? c1_t : c0_t, send = high ? c0_t : c1_t;
++    const uint32_t r0 = wmma12_other_half(send.x), r1 = wmma12_other_half(send.y);
++    f16x2 o01 = std::bit_cast<f16x2>(own.x), o23 = std::bit_cast<f16x2>(own.y);
++    f16x2 p01 = std::bit_cast<f16x2>(r0), p23 = std::bit_cast<f16x2>(r1);
++    f16x2 e01 = high ? p01 : o01, e23 = high ? p23 : o23, d01 = high ? o01 : p01, d23 = high ? o23 : p23;
++    return {float(e01.x), float(d01.x), float(e01.y), float(d01.y), float(e23.x), float(d23.x), float(e23.y), float(d23.y)};
++}
++
++__device__ static void wmma12_rows_f16(wmma_float8 d, uint2::Native_vec_ &even, uint2::Native_vec_ &odd)
++{
++    f16x2 e01{static_cast<f16>(d[0]), static_cast<f16>(d[2])}, e23{static_cast<f16>(d[4]), static_cast<f16>(d[6])};
++    f16x2 o01{static_cast<f16>(d[1]), static_cast<f16>(d[3])}, o23{static_cast<f16>(d[5]), static_cast<f16>(d[7])};
++    even = {std::bit_cast<uint32_t>(e01), std::bit_cast<uint32_t>(e23)};
++    odd = {std::bit_cast<uint32_t>(o01), std::bit_cast<uint32_t>(o23)};
++}
++
++__device__ static uint2::Native_vec_ wmma12_t_from_d(wmma_float8 d)
++{
++    // h = 0 keeps rows 0, 2, 4, 6; h = 1 takes rows 1, 3, 5, 7 from the other half
++    uint2::Native_vec_ even, odd;
++    wmma12_rows_f16(d, even, odd);
++    const uint2::Native_vec_ other = {wmma12_other_half(odd.x), wmma12_other_half(odd.y)};
++    return wmma12_half() != 0 ? other : even;
++}
++
++__device__ static uint4::Native_vec_ wmma12_t_from_d_pair(wmma_float8 d)
++{
++    // h = 0 holds D0 rows 0..7, h = 1 D1 rows 0..7; lane h wants rows 2v + h of both
++    const bool high = wmma12_half() != 0;
++    uint2::Native_vec_ even, odd;
++    wmma12_rows_f16(d, even, odd);
++    const uint2::Native_vec_ send = high ? even : odd;
++    const uint2::Native_vec_ recv = {wmma12_other_half(send.x), wmma12_other_half(send.y)};
++    return high ? uint4::Native_vec_{recv.x, recv.y, odd.x, odd.y} : uint4::Native_vec_{even.x, even.y, recv.x, recv.y};
++}
++
++// the same for f32 shadows (element v = row 2v + h)
++__device__ static wmma_float8 wmma12_c_from_s(wmma_float4 c)
++{
++    wmma_float4 o;
++    for (uint32_t v = 0; v < 4; v++)
++        o[v] = wmma12_other_half_f(c[v]);
++    return {c[0], o[0], c[1], o[1], c[2], o[2], c[3], o[3]};
++}
++
++__device__ static wmma_float8 wmma12_c_from_s_pair(wmma_float4 c0, wmma_float4 c1)
++{
++    const bool high = wmma12_half() != 0;
++    wmma_float8 r;
++    for (uint32_t v = 0; v < 4; v++)
++    {
++        const float own = high ? c1[v] : c0[v], recv = wmma12_other_half_f(high ? c0[v] : c1[v]);
++        r[2 * v] = high ? recv : own;
++        r[2 * v + 1] = high ? own : recv;
++    }
++    return r;
++}
++
++__device__ static wmma_float4 wmma12_s_from_d(wmma_float8 d)
++{
++    const bool high = wmma12_half() != 0;
++    wmma_float4 r;
++    for (uint32_t v = 0; v < 4; v++)
++    {
++        const float odd = wmma12_other_half_f(d[2 * v + 1]);
++        r[v] = high ? odd : d[2 * v];
++    }
++    return r;
++}
++
++__device__ static wmma_float8 wmma12_s_from_d_pair(wmma_float8 d)
++{
++    const bool high = wmma12_half() != 0;
++    wmma_float8 r;
++    for (uint32_t v = 0; v < 4; v++)
++    {
++        const float recv = wmma12_other_half_f(high ? d[2 * v] : d[2 * v + 1]);
++        r[v] = high ? recv : d[2 * v];
++        r[4 + v] = high ? d[2 * v + 1] : recv;
++    }
++    return r;
++}
++
++extern "C"
++{
++    wmma_uint8 FUNC(d4r_wmma12_t_a_from_b)(uint2::Native_vec_ b)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        uint32_t n = wmma_lane() % 16;
++        wmma_uint8 result = {};
++        for (uint32_t j = 0; j < 4; j++)
++        {
++            uint32_t value = wmma_from_lane((n % 8) * 4 + (j >> 1) + 2 * wmma12_half(), (j & 1) ? b.y : b.x);
++            result[j] = n < 8 ? value : 0u;
++        }
++        return result;
++    }
++
++    wmma_uint8 FUNC(d4r_wmma12_t_b_from_a)(uint4::Native_vec_ a)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        wmma_uint8 result = {};
++        for (uint32_t j = 0; j < 4; j++)
++            result[j] = wmma12_gather2((j & 1) ? a.z : a.x, (j & 1) ? a.w : a.y, j);
++        return result;
++    }
++
++    wmma_uint8 FUNC(d4r_wmma12_t_a_from_b_pair)(uint2::Native_vec_ b0, uint2::Native_vec_ b1)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        wmma_uint8 result = {};
++        for (uint32_t j = 0; j < 4; j++)
++            result[j] = wmma12_gather2((j & 1) ? b0.y : b0.x, (j & 1) ? b1.y : b1.x, j);
++        return result;
++    }
++
++    uint2::Native_vec_ FUNC(d4r_wmma12_t_mma_f16)(wmma_uint8 a_t, wmma_uint8 b_t, uint2::Native_vec_ c_t)
++    {
++        return wmma12_t_from_d(wmma12_f16(a_t, b_t, wmma12_c_from_t(c_t)));
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12_t_mma_f16_pair)(wmma_uint8 a_t, wmma_uint8 b_t, uint2::Native_vec_ c0_t, uint2::Native_vec_ c1_t)
++    {
++        return wmma12_t_from_d_pair(wmma12_f16(a_t, b_t, wmma12_c_from_t_pair(c0_t, c1_t)));
++    }
++
++    wmma_float4 FUNC(d4r_wmma12_s_mma_f16)(wmma_uint8 a_t, wmma_uint8 b_t, wmma_float4 c, float up, float down)
++    {
++        return wmma12_s_from_d(wmma12_f16(a_t, b_t, wmma12_c_from_s(c * up))) * down;
++    }
++
++    wmma_float8 FUNC(d4r_wmma12_s_mma_f16_pair)(wmma_uint8 a_t, wmma_uint8 b_t, wmma_float4 c0, wmma_float4 c1, float up,
++                                                float down)
++    {
++        return wmma12_s_from_d_pair(wmma12_f16(a_t, b_t, wmma12_c_from_s_pair(c0 * up, c1 * up))) * down;
++    }
++
++    // e4m3 with the f16 widening (d4r_wmma_e4m3_a_to_f16 / b_to_f16 above): two chained f16 WMMAs in the
++    // 2^-16 scaled domain, like the gfx11 helpers
++    uint2::Native_vec_ FUNC(d4r_wmma12_t_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                   wmma_uint8 b_t_high, uint2::Native_vec_ c_t)
++    {
++        wmma_float8 c = wmma12_c_from_t(c_t) * 0x1p-16f;
++        c = wmma12_f16(a_t_high, b_t_high, wmma12_f16(a_t_low, b_t_low, c));
++        return wmma12_t_from_d(c * 0x1p16f);
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12_t_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                        wmma_uint8 b_t_high, uint2::Native_vec_ c0_t,
++                                                        uint2::Native_vec_ c1_t)
++    {
++        wmma_float8 c = wmma12_c_from_t_pair(c0_t, c1_t) * 0x1p-16f;
++        c = wmma12_f16(a_t_high, b_t_high, wmma12_f16(a_t_low, b_t_low, c));
++        return wmma12_t_from_d_pair(c * 0x1p16f);
++    }
++
++    wmma_float4 FUNC(d4r_wmma12_s_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                            wmma_uint8 b_t_high, wmma_float4 c)
++    {
++        return wmma12_s_from_d(wmma12_f16(a_t_high, b_t_high, wmma12_f16(a_t_low, b_t_low, wmma12_c_from_s(c))));
++    }
++
++    wmma_float8 FUNC(d4r_wmma12_s_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                 wmma_uint8 b_t_high, wmma_float4 c0, wmma_float4 c1)
++    {
++        return wmma12_s_from_d_pair(
++            wmma12_f16(a_t_high, b_t_high, wmma12_f16(a_t_low, b_t_low, wmma12_c_from_s_pair(c0, c1))));
++    }
++
++    // Native FP8 (d4r_wmma12f8_*, D4R_ZLUDA_WMMA_FP8_NATIVE): the "widening" keeps the e4m3 bytes, two per
++    // dword in the low 16 bits and in the same slots the f16 widening fills, so the f16 gathers above move them;
++    // the MMA packs this half's 8 bytes (e4m3 k 8h .. 8h + 7 in order) into the FP8 operand. OCP e4m3 (gfx12)
++    // is NVIDIA's e4m3, so the bytes need no conversion. Shadows keep the 2^-16 scaled domain of the e4m3
++    // functions (exact power-of-two rescaling around the WMMA).
++    __device__ static uint2::Native_vec_ e4m3x4_split(uint32_t packed)
++    {
++        return {__builtin_amdgcn_perm(0u, packed, 0x0c0c0100u), __builtin_amdgcn_perm(0u, packed, 0x0c0c0302u)};
++    }
++
++    wmma_uint8 FUNC(d4r_wmma12f8_e4m3_a_to_f16)(uint4::Native_vec_ a)
++    {
++        auto x = e4m3x4_split(a.x), y = e4m3x4_split(a.y), z = e4m3x4_split(a.z), w = e4m3x4_split(a.w);
++        return {x.x, y.x, x.y, y.y, z.x, w.x, z.y, w.y};
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_e4m3_b_to_f16)(uint2::Native_vec_ b)
++    {
++        auto x = e4m3x4_split(b.x), y = e4m3x4_split(b.y);
++        return {x.x, x.y, y.x, y.y};
++    }
++
++    uint2::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                     wmma_uint8 b_t_high, uint2::Native_vec_ c_t)
++    {
++        return wmma12_t_from_d(wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_t(c_t))));
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                          wmma_uint8 b_t_high, uint2::Native_vec_ c0_t,
++                                                          uint2::Native_vec_ c1_t)
++    {
++        return wmma12_t_from_d_pair(
++            wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_t_pair(c0_t, c1_t))));
++    }
++
++    wmma_float4 FUNC(d4r_wmma12f8_s_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                              wmma_uint8 b_t_high, wmma_float4 c)
++    {
++        wmma_float8 d = wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_s(c * 0x1p16f)));
++        return wmma12_s_from_d(d) * 0x1p-16f;
++    }
++
++    wmma_float8 FUNC(d4r_wmma12f8_s_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                   wmma_uint8 b_t_high, wmma_float4 c0, wmma_float4 c1)
++    {
++        wmma_float8 d = wmma12_e4m3(a_t_high, b_t_high,
++                                    wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_s_pair(c0 * 0x1p16f, c1 * 0x1p16f)));
++        return wmma12_s_from_d_pair(d) * 0x1p-16f;
++    }
++}
++
+ template <typename T, typename A, typename B, int BOffset, typename OcklFunc>
+ __device__ T dp2a_impl(T a, T b, T c, OcklFunc ockl_func)
+ {
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -356,6 +356,7 @@
+         wmma: llvm_zluda::compile::wmma_rewrite_requested(),
+         wmma_fp8: llvm_zluda::compile::wmma_fp8_rewrite_requested(),
+         param_provenance: llvm_zluda::compile::param_provenance_enabled(),
++        wmma_fp8_native: llvm_zluda::compile::wmma_fp8_native_effective(gcn_arch),
+     };
+     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
+         (Some(text), Some(p)) => (|| {
+@@ -397,6 +398,10 @@
+     wmma: bool,
+     wmma_fp8: bool,
+     param_provenance: bool,
++    // d4r: native FP8 WMMA where it takes effect (gfx12); absent from the key everywhere else, so the setting
++    // (d4r.ini NativeFp8) never forces a recompile on GPUs that ignore it
++    #[serde(skip_serializing_if = "std::ops::Not::not")]
++    wmma_fp8_native: bool,
+ }
+ 
+ fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
+@@ -430,6 +435,7 @@
+                     && !matches!(
+                         key.as_str(),
+                         "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA"
++                            | "D4R_ZLUDA_WMMA_FP8_NATIVE" // keyed by effect (ExtraCacheAttributes)
+                     )
+             })
+             .map(|(key, value)| format!("{key}={}", value.trim()))

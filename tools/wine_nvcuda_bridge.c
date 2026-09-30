@@ -389,11 +389,21 @@ static void native_cleanup(void)
         remove_directory(native_served);
 }
 
-/* The first GPU's gfx target from the KFD topology ("gfx1101"), "" when unknown. */
+/* The gfx target ("gfx1101") of the GPU DLSS runs on, "" when unknown: D4R_GPU_ARCH if set, else the KFD
+   topology's GPU with the most SIMDs. With an integrated and a discrete GPU (Ryzen 7000/9000 desktops) the
+   first KFD GPU node can be the integrated one, whose kernels would not match the discrete GPU. */
 static void gpu_architecture(char* out, size_t size)
 {
     out[0] = '\0';
-    for (int node = 0; node < 16 && out[0] == '\0'; ++node)
+    const char* forced = getenv("D4R_GPU_ARCH");
+    if (forced != NULL && strncmp(forced, "gfx", 3) == 0)
+    {
+        snprintf(out, size, "%s", forced);
+        return;
+    }
+    unsigned long best_simds = 0;
+    int gpus = 0;
+    for (int node = 0; node < 16; ++node)
     {
         char path[128];
         snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/properties", node);
@@ -408,9 +418,17 @@ static void gpu_architecture(char* out, size_t size)
             sscanf(line, "gfx_target_version %lu", &target);
         }
         fclose(properties);
-        if (simds != 0 && target != 0)
+        if (simds == 0 || target == 0)
+            continue;
+        ++gpus;
+        if (simds > best_simds)
+        {
+            best_simds = simds;
             snprintf(out, size, "gfx%lu%lu%lx", target / 10000, (target / 100) % 100, target % 100);
+        }
     }
+    if (gpus > 1)
+        tracef("native kernels: %d GPUs; using the one with the most SIMDs (%s); D4R_GPU_ARCH overrides", gpus, out);
 }
 
 static void prepare_native_kernels(const char* cache_home)
@@ -421,9 +439,22 @@ static void prepare_native_kernels(const char* cache_home)
     /* a release directory holds one manifest and set of code objects per GPU target */
     char architecture[32], source[1024], path[1200];
     gpu_architecture(architecture, sizeof(architecture));
-    snprintf(source, sizeof(source), "%s/%s", configured, architecture);
-    snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-    FILE* manifest = architecture[0] != '\0' ? fopen(path, "r") : NULL;
+    FILE* manifest = NULL;
+    /* RDNA4 with native FP8 WMMA (D4R_ZLUDA_WMMA_FP8_NATIVE=1, d4r.ini NativeFp8): the <target>-fp8 variant,
+       whose kernels match ZLUDA's FP8 lowering; no other GPU has such a directory */
+    const char* fp8 = getenv("D4R_ZLUDA_WMMA_FP8_NATIVE");
+    if (fp8 != NULL && strcmp(fp8, "1") == 0 && strncmp(architecture, "gfx12", 5) == 0)
+    {
+        snprintf(source, sizeof(source), "%s/%s-fp8", configured, architecture);
+        snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
+        manifest = fopen(path, "r");
+    }
+    if (manifest == NULL)
+    {
+        snprintf(source, sizeof(source), "%s/%s", configured, architecture);
+        snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
+        manifest = architecture[0] != '\0' ? fopen(path, "r") : NULL;
+    }
     if (manifest == NULL)
     {
         snprintf(source, sizeof(source), "%s", configured);
@@ -679,7 +710,7 @@ static void verify_native_kernels(const void* image)
     pthread_mutex_unlock(&native_lock);
 }
 
-/* DLSS's output kernels (hiluma_engine_output_*): NGX looks up every variant, then launches the one
+/* DLSS's output kernels (hiluma_engine_output_*, rrlite_downsample_kernel_*): NGX looks up every variant, then launches the one
    matching the feature's flags. The shim's direct output relies on stores that only d4r's native
    output kernel makes, so it asks whether the last output kernel launched was native (a file in
    D4R_ZLUDA_NATIVE_DIR, which is the verified per-process directory in a portable install). */
@@ -694,7 +725,9 @@ static int last_output_native = -1;
 
 static void note_function_lookup(CUfunction function, const char* name)
 {
-    if (name == NULL || strncmp(name, "hiluma_engine_output", 20) != 0)
+    /* DLSS 4 writes its result with hiluma_engine_output_*, DLSS 4.5 (rrlite) with its final
+       rrlite_downsample_kernel_* (the post kernel works at a larger internal resolution) */
+    if (name == NULL || (strncmp(name, "hiluma_engine_output", 20) != 0 && strncmp(name, "rrlite_downsample_kernel", 24) != 0))
         return;
     const char* directory = getenv("D4R_ZLUDA_NATIVE_DIR");
     int native = 0;

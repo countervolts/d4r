@@ -37,11 +37,13 @@ int main(int argc, char** argv)
             HipApi& hip; hipModule_t module;
             ~ModuleCleanup() { if (module) (void)hip.hipModuleUnload(module); }
         } cleanup{hip, module};
-        hipFunction_t raw_kernel = nullptr, adapter_kernel = nullptr, swap_kernel = nullptr;
+        hipFunction_t raw_kernel = nullptr, adapter_kernel = nullptr, upstream_kernel = nullptr, swap_kernel = nullptr;
         hip.check(hip.hipModuleGetFunction(&raw_kernel, module, "d4r_wmma_gfx1201"),
             "hipModuleGetFunction(WMMA)");
         hip.check(hip.hipModuleGetFunction(&adapter_kernel, module, "d4r_wmma_legacy_contract"),
             "hipModuleGetFunction(WMMA adapter)");
+        hip.check(hip.hipModuleGetFunction(&upstream_kernel, module, "d4r_wmma_upstream_contract"),
+            "hipModuleGetFunction(WMMA upstream)");
         hip.check(hip.hipModuleGetFunction(&swap_kernel, module, "d4r_wmma_swap_test"),
             "hipModuleGetFunction(WMMA swap)");
         constexpr size_t elements = 16u * 16u;
@@ -86,11 +88,13 @@ int main(int argc, char** argv)
             void* output_arg = dout.pointer;
             unsigned steps_arg = steps;
             void* params[] = {&a_arg, &b_arg, &c_arg, &output_arg, &steps_arg};
-            for (unsigned mode = 0; mode < 2u; ++mode) {
+            const hipFunction_t kernels[] = {raw_kernel, adapter_kernel, upstream_kernel};
+            const char* modes[] = {"raw", "legacy_adapter", "upstream_layout"};
+            for (unsigned mode = 0; mode < 3u; ++mode) {
             output.fill(std::numeric_limits<float>::quiet_NaN());
             hip.check(hip.hipMemcpy(dout.pointer, output.data(), sizeof(output), hipMemcpyHostToDevice), "hipMemcpy(output sentinel)");
-            hip.check(hip.hipModuleLaunchKernel(mode ? adapter_kernel : raw_kernel, 1, 1, 1, 32, 1, 1, 0, nullptr,
-                params, nullptr), mode ? "hipModuleLaunchKernel(WMMA adapter)" : "hipModuleLaunchKernel(WMMA raw)");
+            hip.check(hip.hipModuleLaunchKernel(kernels[mode], 1, 1, 1, 32, 1, 1, 0, nullptr,
+                params, nullptr), modes[mode]);
             hip.check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize(WMMA)");
             hip.check(hip.hipMemcpy(output.data(), dout.pointer, sizeof(output), hipMemcpyDeviceToHost), "hipMemcpy(output)");
             for (unsigned row = 0; row < 16u; ++row) {
@@ -107,7 +111,7 @@ int main(int argc, char** argv)
                     const float relative = absolute / std::max(1.0f, std::fabs(expected));
                     if (!std::isfinite(got) || absolute > 0.0001f) {
                         std::fprintf(stderr, "FAIL WMMA mode=%s iteration=%u row=%u col=%u steps=%u expected=%.9g actual=%.9g abs=%.9g\n",
-                            mode ? "adapter" : "raw", iteration, row, col, steps, expected, got, absolute);
+                            modes[mode], iteration, row, col, steps, expected, got, absolute);
                         return 5;
                     }
                     max_absolute_error = std::max(max_absolute_error, absolute);
@@ -116,7 +120,7 @@ int main(int argc, char** argv)
             }
             }
         }
-        std::printf("PASS GFX12_WMMA architecture=gfx1201 modes=raw,legacy_adapter iterations=%u max_abs=%.9g max_rel=%.9g\n",
+        std::printf("PASS GFX12_WMMA architecture=gfx1201 modes=raw,legacy_adapter,upstream_layout iterations=%u max_abs=%.9g max_rel=%.9g\n",
             args.iterations, max_absolute_error, max_relative_error);
         return 0;
     } catch (const std::exception& error) {

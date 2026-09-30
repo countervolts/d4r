@@ -1,6 +1,6 @@
 # Native kernels
 
-The native kernels are RDNA3 (gfx11) code objects that ZLUDA runs in place of specific DLSS kernels. Each one has the same name, launch shape and parameter block as the PTX kernel it replaces, and reads the same buffers, including the network weights inside NVIDIA's DLL. No weights or NVIDIA code are stored here.
+The native kernels are RDNA3 (gfx11) and RDNA4 (gfx12) code objects that ZLUDA runs in place of specific DLSS kernels. Each one has the same name, launch shape and parameter block as the PTX kernel it replaces, and reads the same buffers, including the network weights inside NVIDIA's DLL. No weights or NVIDIA code are stored here.
 
 ## The override hook (patches/zluda/0004)
 
@@ -10,7 +10,9 @@ With `D4R_ZLUDA_NATIVE_DIR=DIR`, whenever NGX loads a PTX module and asks for ke
 |---|---|
 | `NAME_prep` kernel | launched first on the same stream, with the same parameters (typically re-lays out weights) |
 | `u32 d4r_prep_blocks` | grid size of the prep kernel (128 threads per block) |
-| `u32 d4r_prep_key_offset` | byte offset of a u64 in the parameter block; the prep is skipped while that value (the weights pointer) repeats |
+| `u32 d4r_prep_key_offset` | byte offset of a u64 in the parameter block; the prep is skipped while that value (the weights pointer) repeats (0 = no key) |
+| `u32 d4r_prep_key_at` | the same as offset + 1, so a key at offset 0 can be named (M's layers keep their weights pointer there) |
+| `u32 d4r_prep_key_slots` | N > 0: the kernel keeps one prepared image per key for up to N keys, so the prep runs once per weight set (the six enc3 tube blocks); keys beyond N share an overflow image and are prepared on every launch |
 | `u32 d4r_block_z` | replaces the launch's block z dimension (more waves per window) |
 | `u32 d4r_grid_x` | replaces the grid (persistent kernels) |
 
@@ -19,7 +21,7 @@ Kernels without a file in `DIR` are compiled from PTX as usual, so a partial set
 **Release directories.** A directory that holds `d4r-kernels.txt` (or `<gfx target>/d4r-kernels.txt`) is checked before use:
 - `kernels/tools/kernel_manifest.py DIR nvngx_dlss.dll...` writes the manifest. For each `NAME.hsaco` it records the FNV-1a 64 hash of the PTX module that defines `.entry NAME`, taken from each DLL given.
 - The CUDA bridge serves a kernel only after NGX has loaded a module with one of the listed hashes.
-- It picks the target folder from the GPU's KFD topology entry.
+- It picks the KFD GPU with the most SIMDs, then selects that GPU's target folder. `D4R_GPU_ARCH` overrides the choice. On gfx12, `D4R_ZLUDA_WMMA_FP8_NATIVE=1` selects the `<arch>-fp8` folder.
 
 The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PTX of every replaced kernel is identical in those two versions.
 
@@ -34,8 +36,20 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
 - **Weights:** prep kernels expand the weights into WMMA operand images once.
 
 **DLSS 4.5, preset M (`kernels/m`, `rrlite_*`).**
-- **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands.
+- **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands, once per weight set.
 - **Template:** `swin_block.h` covers encoders, the tube-shaped enc3 and decoders.
+- **Output encoding:** the FP8 output is encoded two values at a time with packed 16-bit operations (`enc8x2`, exhaustively equal to the scalar encoder), and the 2×2 patch merge reads the rounded f16 values the codes decode to, from a row layout without LDS bank conflicts, instead of decoding the bytes again in every wave.
+- **Weight loads:** enc1 forms each weight tile's address in scalar registers (`SWIN_SCALAR_BLOAD`); the 8-wave layers are faster without it.
+
+## RDNA4
+
+`kernels/common/wmma_layout.h` selects the WMMA operand and accumulator layout. gfx12 uses eight f16 values per lane in each K half; the accumulator rows are `i + 8·half`. The gfx11 path retains its original layout. `D4R_WMMA_LAYOUT=12` on gfx11 is a test shim: it exercises gfx12 indexing but executes gfx11 WMMA, so its replay output can be compared byte for byte with the existing gfx11 build.
+
+The gfx12 M variant can use native e4m3 FP8 WMMA with `D4R_NATIVE_FP8=1`. Its activations are requantized to e4m3 at operand load, and its prepared weights remain bytes. The matching ZLUDA and texture-tail variant uses `D4R_ZLUDA_WMMA_FP8_NATIVE=1` / `D4R_TEX_FP8=1`; the release bridge chooses the `-fp8` kernel folder. `NativeFp8` in d4r.ini controls that choice and defaults to on. The f16 widening path remains available.
+
+The gfx11 refactor and gfx12-layout shim matched the recorded gfx11 replays and 88-frame K/M harness images byte for byte on the RX 7700 XT. rocjitsu gfx1201 replay comparisons put the native K layers within 96–109 dB PSNR of gfx11, and M differed in 0.001–0.3% of e4m3 bytes. These are emulator results, not RDNA4 hardware results. rocjitsu's FP8 arithmetic is not hardware-checked; bit-exactness, speed and driver stability on an RDNA4 GPU remain unverified.
+
+For ZLUDA-compiled code, compare rocjitsu runs with other rocjitsu runs: the emulator does not reproduce the denormal-flush mode of those code objects, so a GPU byte comparison is not a valid arithmetic check. Captures with texture or surface objects must not be sent to the replay tools; the standalone `tail_check.hip` and the full D3D12 harness cover those tails.
 
 **Texture kernels (`kernels/tex`).**
 - **The problem:** some DLSS kernels are mostly texture sampling and scalar maths that ZLUDA already compiles well, apart from a few slow parts.
@@ -43,8 +57,10 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
   - surface stores become calls into `tex_common.h`;
   - the `roundf` idiom that forces ZLUDA into strict-FP mode is rewritten exactly;
   - for M's enc0 and dec0, a range of the kernel is replaced by a native tail or head.
-- **Build:** ZLUDA compiles the edited PTX with the HIP bitcode linked in (`D4R_ZLUDA_EXTRA_BC`), and the resulting code object is saved.
-- **Output redirect:** the K output kernel (`hiluma_engine_output_*`) can also write its result straight into the shim's output buffer instead of a CUDA array. See `D4R_SHIM_OUTPUT_DIRECT` in [architecture.md](architecture.md).
+- **Build:** ZLUDA's `d4r_emit` compiles the edited PTX for `D4R_GPU_ARCH` with the HIP bitcode linked in (`D4R_ZLUDA_EXTRA_BC`), and the resulting code object is saved. This is an offline per-target build.
+- **Every flag combination:** DLSS picks kernel variants by the game's settings (motion vectors at render or display resolution, HDR or LDR input, inverted or regular depth, ...). `kernels/build.sh` builds all of them: 24 K output kernels, 8 M post, 4 M downsample and 4 M enc0 kernels. enc0's native tail is spliced into each variant at its own line, with the registers read off the variant's PTX (`make_ptx.py` checks that the code after the cut matches the reference variant line for line).
+- **Wave64:** kernels without MMAs can be compiled as wave64 (`D4R_ZLUDA_WAVE64=1`, ZLUDA patch 0006): each wave runs two CUDA warps, and RDNA3 issues FP32 work for all 64 lanes at once. The post and K output kernels are built this way (post 0.89 → 0.77 ms), with bit-identical results.
+- **Output redirect:** the kernel that writes a preset's result can write it straight into the shim's output buffer instead of a CUDA array: `hiluma_engine_output_*` for K, `rrlite_downsample_kernel_*` for M (M's post kernel works at 3840×2160; the downsample produces the output). See `D4R_SHIM_OUTPUT_DIRECT` in [architecture.md](architecture.md).
 
 ## Numerics
 
@@ -61,7 +77,7 @@ kernels/build.sh tex        # texture kernels (needs D4R_DLSS_DLL and D4R_ZLUDA_
 kernels/build.sh all DIR    # everything into DIR (default kernels/out/native)
 ```
 
-`D4R_GPU_ARCH` selects the target (default gfx1101). All kernels need gfx11 WMMA.
+`D4R_GPU_ARCH` selects one target for this standalone build (default gfx1101). The release script builds the network layers for gfx1100–gfx1103 and gfx1200–gfx1201 by default and puts each set in its own directory. The network kernels need gfx11 or gfx12 WMMA. Texture-kernel builds use `D4R_ZLUDA_EMIT` to generate code objects for the selected target without that GPU. Set `D4R_NATIVE_FP8=1` on gfx12 for the matching FP8 M and texture variants.
 
 ## Validating a kernel
 
@@ -72,23 +88,25 @@ kernels/build.sh all DIR    # everything into DIR (default kernels/out/native)
    PREP_GRID=<d4r_prep_blocks> dump_runner NAME.hsaco NAME <capture> <out> 30
    ```
 
-   It runs the prep and main kernels, saves every buffer after the first launch, and times 30 launches.
+   It runs the prep and main kernels, saves every buffer after the first launch, and times 30 launches. The replay tool refuses captures with texture or surface objects; use the full harness for those kernels.
 3. **Compare against a reference.** `kernels/tools/pwin_model.py` (K) and `swin_model.py` (M) are numpy models of the layers, written stage by stage against `ptxsim.py`, a small vectorised PTX interpreter that runs NVIDIA's kernels on the CPU. A bit-exact variant should match the model within f16 rounding; after any change, compare the new build's buffers with the previous build's.
 4. **Check the whole pipeline.** Replay captured frames through the harness with both kernel sets and compare the outputs with `kernels/tools/psnr.py`. `D4R_CUDA_KERNEL_PROFILE=1` makes the bridge time every kernel; `kernels/tools/kprof.py` summarises the log per frame.
 
 ## Per-kernel cost
 
-GPU time per frame at Quality (1705×960 → 2560×1440, RX 7700 XT), from `D4R_CUDA_KERNEL_PROFILE`:
+Median GPU time per frame at Quality (1706×960 → 2560×1440, RX 7700 XT), from `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness (flags as in Townfall; frames 21–40). The profiler's per-launch events add a little to every kernel, so totals are slightly above the in-game cost. "Before" is release 0.1.1.
 
-| DLSS 4 (K) | ms | DLSS 4.5 (M) | ms |
-|---|---|---|---|
-| hiluma output (texture kernel) | 0.82 | enc3 tube (6 launches) | 1.42 |
-| dec0 | 0.30 | enc1 | 1.27 |
-| enc0 | 0.28 | dec1 | 1.18 |
-| dec1 | 0.24 | enc2 | 0.79 |
-| hiluma input (ZLUDA) | 0.24 | post (texture kernel) | 0.77 |
-| enc1 | 0.21 | dec2 | 0.69 |
-| enc2, dec2 | 0.10 each | enc0 (texture kernel) | 0.60 |
-| enc3, dec3, enc4, dec4, dec5 | 0.05–0.08 each | dec0 (texture kernel) | 0.46 |
-| NGX exposure and misc | 0.1 | downsample, NGX misc | 0.36 |
-| **total** | **2.8** | **total** | **7.5** |
+| DLSS 4 (K) | before | now | DLSS 4.5 (M) | before | now |
+|---|---|---|---|---|---|
+| hiluma output (texture kernel) | 0.92 | 0.89 | enc3 tube (6 launches) | 1.62 | 1.57 |
+| dec0 | 0.33 | 0.32 | enc1 | 1.41 | 1.27 |
+| enc0 | 0.31 | 0.31 | dec1 | 1.44 | 1.43 |
+| dec1 | 0.26 | 0.26 | enc2 | 0.87 | 0.77 |
+| hiluma input (ZLUDA) | 0.25 | 0.24 | post (texture kernel) | 0.88 | 0.77 |
+| enc1 | 0.23 | 0.22 | dec2 | 0.84 | 0.82 |
+| enc2, dec2 | 0.12, 0.10 | 0.12, 0.10 | enc0 (texture kernel) | 0.64 | 0.63 |
+| enc3, dec3, enc4, dec4, dec5 | 0.07–0.09 each | 0.07–0.09 each | dec0 (texture kernel) | 0.64 | 0.63 |
+| NGX exposure and misc | 0.1 | 0.1 | downsample, NGX misc | 0.32 | 0.33 |
+| **total** | **3.10** | **2.97** | **total** | **9.04** | **8.23** |
+
+Runs of the same build vary by about ±3% per kernel. M additionally skips its output copy now (direct output through the downsample kernel), which is not a kernel and not in the table. Games whose flags differ from Townfall's (motion vectors at render resolution, LDR input, regular depth) gain more: those kernel variants used to run as plain ZLUDA compiles (K 3.6–4.6 ms → 2.8–3.0 ms, M −0.5 to −0.7 ms per frame).

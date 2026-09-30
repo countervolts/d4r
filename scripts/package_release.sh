@@ -13,7 +13,8 @@
 #   D4R_ROCM_DIR     ROCm with clang, for the kernels                       default /opt/rocm
 #   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
 #                                                                           default ~/.cache/d4r-rocm-runtime
-#   D4R_GPU_ARCHS    GPU targets to build kernels for                       default gfx1101
+#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201
+#                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
 #   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
 #   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
@@ -21,7 +22,9 @@
 # The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
-#   D4R_BUNDLE_TEX   directory with the texture-kernel code objects (kernels/build.sh tex), for gfx1101
+#   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
+#                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
+#                    older builds
 # D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
 set -euo pipefail
 
@@ -37,7 +40,7 @@ ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
 VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
-ARCHS="${D4R_GPU_ARCHS:-gfx1101}"
+ARCHS="${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
 : "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
 : "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
 for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
@@ -108,16 +111,35 @@ else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
 IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
+# one folder per target; RDNA4 targets also get <target>-fp8 (native FP8 WMMA, d4r.ini NativeFp8), which the
+# bridge serves instead when that setting is on
+folders=()
 for arch in $ARCHS; do
-  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$arch" >/dev/null
-  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$arch" >/dev/null
-  rm -f "$STAGE/d4r/kernels/$arch"/*.resolution.txt  # empty LTO notes from clang's -save-temps
-  if [[ "$VARIANT" == full && "$arch" == gfx1101 ]]; then
-    for f in "$D4R_BUNDLE_TEX"/*.hsaco; do  # texture kernels only; the layers above are built from source
-      [[ -e "$STAGE/d4r/kernels/$arch/$(basename "$f")" ]] || cp "$f" "$STAGE/d4r/kernels/$arch/"
-    done
+  folders+=("$arch")
+  [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
+done
+for folder in "${folders[@]}"; do
+  arch="${folder%-fp8}"
+  fp8=0
+  [[ "$folder" == *-fp8 ]] && fp8=1
+  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
+  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
+  rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt  # empty LTO notes from clang's -save-temps
+  if [[ "$VARIANT" == full ]]; then
+    tex_dir=""
+    if [[ -d "$D4R_BUNDLE_TEX/$folder" ]]; then
+      tex_dir="$D4R_BUNDLE_TEX/$folder"
+    elif [[ "$folder" == gfx1101 ]]; then
+      tex_dir="$D4R_BUNDLE_TEX"  # older, flat gfx1101 texture-kernel builds
+    fi
+    if [[ -n "$tex_dir" ]]; then
+      for f in "$tex_dir"/*.hsaco; do  # texture kernels only; the layers above are built from source
+        [[ -f "$f" ]] || continue
+        [[ -e "$STAGE/d4r/kernels/$folder/$(basename "$f")" ]] || cp "$f" "$STAGE/d4r/kernels/$folder/"
+      done
+    fi
   fi
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$arch" "${DLLS[@]}"
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
 done
 
 # licenses and sources

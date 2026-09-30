@@ -18,7 +18,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
 | M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
-| M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter, 16 cases, max abs/relative error 0 |
+| M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | Partial: `enc1`/`enc2` execute and match nonzero references; other layers/full network pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
@@ -49,6 +49,77 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
   `e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666`.
   This is a portable fallback on this machine, where MSVC is not installed.
   The device compiler remains the selected AMD HIP clang.
+
+## Upstream RDNA4 update (checked 2026-09-30)
+
+Fetched and integrated upstream main commit
+[`dbef4b24f4bc974725c3b2bc74ca442a694b901d`](https://github.com/countervolts/d4r/commit/dbef4b24f4bc974725c3b2bc74ca442a694b901d),
+"Add RDNA4 (gfx12) support and a 0.1.2 optimization round" (2026-09-30 UTC).
+It changes 42 files and supplies real per-target fragment layouts rather than
+renaming gfx11 builtins. Before the merge, an isolated archive was compiled
+and its `enc1`/`enc2` objects were checked on this RX 9070 XT against our fixtures.
+
+* `kernels/common/wmma_layout.h` separates gfx11/gfx12 operands, accumulator
+  rows, weight/activation loading, packing and reconstruction. K, M and native
+  texture tails use it. The gfx11 implementation and layout12 test shim remain.
+* M has an optional native e4m3 FP8 variant, with matching ZLUDA/texture lowering
+  and kernel directory selection. **Windows CMake keeps FP16 widening as the
+  baseline; it does not enable native FP8.** M arithmetic on this GPU remains
+  unvalidated until K and its full DLSS integration are correct.
+* New ZLUDA patches `0006`/`0007` add k8 WMMA, prep slots, wave64 for MMA-free
+  kernels, gfx12 helpers and FP8 selection/cache identity. These patches are
+  present in our branch but have not been built or validated in Windows ZLUDA.
+  Our current integer PTX test uses the unpatched `v7-preview.11` binary.
+* Upstream restored `kernels/tools/model_enc3.py`, resolving the missing M
+  reference dependency found in the initial audit. New check/replay utilities
+  cover K/M and texture tails. Texture artifacts still require local DLL/PTX
+  extraction and a patched `d4r_emit`; they are not built by Windows CMake yet.
+* There is still no native Windows runtime backend in this update. GPU selection
+  still reads KFD topology; Wine, Linux shared descriptors and vkd3d-proton
+  command-list splitting remain in the upstream path.
+
+Upstream explicitly reports gfx1201 **emulator** checks and gfx1200 compile-only
+coverage; it does not claim actual RDNA4 hardware verification
+([native-kernel validation notes](https://github.com/countervolts/d4r/blob/dbef4b24f4bc974725c3b2bc74ca442a694b901d/docs/native-kernels.md)).
+The hardware results below apply only to the named Windows probes and synthetic
+layers, not to the complete network or the upstream FP8 implementation.
+
+Local integration retains the Windows probes, NGX ABI correction, NVAPI topology
+and D3D12/HIP interop. K now uses upstream's native gfx12 layout directly; the
+legacy adapter remains only for its independent diagnostic regression. M gains
+the same minimal device-header path as K. Its lane-mask constants no longer
+require a host `<type_traits>` installation. Public HIP `uint2`/`uint4` storage
+alignment and qualifiers are reproduced by the device-only header.
+
+Windows CMake compiles all **11 K + 5 M** source modules with gfx1201 wave32,
+`-O3` and each source's upstream `d4r-build-flags` (including `-mcumode`). Both
+stable HIP 7.2 and isolated TheRock build successfully. The objects install to
+`experimental/k` and `experimental/m`, outside the ZLUDA override directory.
+Only `enc1`/`enc2` currently have GPU layer correctness checks.
+
+2026-09-30 integration results on RX 9070 XT, Windows 11:
+
+| Check | Result |
+| --- | --- |
+| TheRock diagnostic runner with the two local NVIDIA DLLs | 11/11 PASS; `test-results/upstream-rdna4-merged.zip` |
+| TheRock CTest, including D3D12/HIP external memory/fences | 8/8 PASS |
+| WMMA raw, legacy adapter and upstream native layout/packing | 32 cases, one/two K16 steps, nonzero C; max abs/relative error 0 |
+| Upstream K enc1 full / merged reference | Max abs `0.000244140625`; PSNR `98.21 / 97.63 dB`; no NaN/Inf |
+| Upstream K enc2 full / merged reference | Max abs `3.81469727e-06`; PSNR `130.39 / 132.49 dB`; no NaN/Inf |
+| Stable HIP 7.2 non-interop CTest | 6/6 PASS |
+| Stable-built K enc1/enc2 with stable runtime | 32 identity iterations each + both nonzero references PASS, same errors as TheRock |
+
+The previously failing stable compiler/legacy-layout K path is superseded by
+the native upstream layout: these two current layer fixtures pass under stable
+HIP 7.2. Stable external-memory mapped-view ownership still requires the runtime
+fix/TheRock; passing K does not resolve that leak. Build logs remain under each
+`build/windows-rdna4*` directory; stable GPU logs/fixtures remain under
+`test-results/upstream-stable-*-gpu.log` and `test-results/upstream-rdna4-stable`.
+
+Next gate: validate the remaining K layers against references/captures, then
+build the d4r-patched Windows ZLUDA and implement same-frame Windows NGX Evaluate
+with explicit D3D12 queue submission ownership. Full K precedes M and native
+FP8/performance work. No complete DLSS or OptiScaler game result is claimed.
 
 ## Architecture and platform boundaries
 
@@ -122,31 +193,35 @@ or update all dependent loads/stores and intermediate fragments together.
 Start with FP16 / FP32 accumulate. M native FP8 is a later measured optimization.
 Compile success is not proof of lane layout or numerical correctness.
 
-`kernels/common/wmma_backend.h` now preserves the gfx11 call and maps d4r's
+The initial `kernels/common/wmma_backend.h` adapter preserves the gfx11 call and maps d4r's
 16-half operand / even-odd accumulator contract to gfx12's 8-half operand /
 contiguous accumulator contract. The gfx12 mapping uses an unconditional
 wave32 half-exchange for every source fragment element before selection.
 Performing the exchange only on lanes selected by a group-dependent branch
 returned channel 9 in place of channel 1 on this card: the opposite half of
 the wave was inactive at that instruction. This was caught by the CPU reference.
-`tools/windows/wmma_gfx1201.hip` tests raw gfx12 WMMA, the adapter, the
-half-exchange and lane ID with nonzero accumulator and one/two K16 steps.
+`tools/windows/wmma_gfx1201.hip` tests raw gfx12 WMMA, the adapter, upstream's
+native layout/operand packing, the half-exchange and lane ID with nonzero
+accumulator and one/two K16 steps.
 Both stable HIP 7.2 and TheRock 10.2 produced exact 16x16 outputs across 16
 different inputs; max absolute and relative errors were both zero.
 
-`kernels/k/pwin_common.h` now calls the tested adapter. The Windows device-only
+After the upstream merge, `kernels/k/pwin_common.h` calls the native
+`wmma_layout.h` implementation; it no longer converts around every MMA with
+the legacy adapter. The Windows device-only
 compiler uses `kernels/common/hip_device_minimal.h`, exposing only public
 Clang AMDGPU work-item/grid/barrier builtins and HIP-compatible qualifiers;
-the ordinary Linux HIP include path remains. CMake builds `enc1`/`enc2` for gfx1201
-into `experimental/k/` and verifies that HIP loads both prep and transformer
-entry points. The `k_module_probe` now launches prep and transformer. The
-identity fixture verifies all 4096 full-resolution and 1024 merged FP16 values
+the ordinary Linux HIP include path remains. CMake builds every K/M module for
+gfx1201 into `experimental/`. The `k_module_probe` resolves and launches prep
+and transformer for `enc1`/`enc2`. The
+identity fixture verifies all 4096 full-resolution and 1024/1536 merged FP16 values
 bitwise. A second fixture enables nonzero V projections, position-only
 attention, Wo, MLP/GELU and patch merge; it checks finite values and a patch
 identity, then saves all inputs/outputs for `k_layer_validate.py`. That script
 runs the existing `pwin_model.py` and measures max absolute/relative error and
 PSNR. The code object remains in `experimental/k/`, outside ZLUDA's override
 path, until the other K layers and real captured weights/activations pass.
+The enc2 fixture additionally enables learned Q/K attention and softmax.
 
 ## External interop blockers
 
@@ -361,19 +436,21 @@ Bundle `test-results/m6-k-enc2-final.zip`: 11/11 gates PASS. CTest: 8/8 PASS.
 The generic probe/reference runner selects `--kernel-name enc1|enc2`; both
 objects remain under `experimental/k` and are not used as DLSS overrides yet.
 
-Stable HIP SDK 7.2 compiler caveat: its `-O2` code object for `enc1` produces
+Historical stable HIP SDK 7.2 compiler caveat (pre-upstream legacy adapter):
+its `-O2` code object for `enc1` produces
 NaN already on the identity fixture (first element `0xfe00` instead of
 `0xbc00`). Its `-O1` object also miscomputes the identity fixture; `-O0`
 passes but is unsuitable for the fast path. Cross-testing isolates the problem
 to the stable compiler/code object: the stable-built `-O2` object fails under
 TheRock runtime, while the TheRock-built `-O2` object passes under stable HIP
-runtime. The independent WMMA probe passes under both compilers. Until a
-smaller compiler reproducer or source-level workaround is found, use the
-TheRock compiler for native K and the TheRock runtime for leak-free interop.
+runtime. The independent WMMA probe passes under both compilers. That legacy
+path required the TheRock compiler for native K. The 2026-09-30 native-layout merge
+supersedes this failing path: current enc1/enc2 fixtures pass with stable's
+`-O3` objects too. Keep TheRock runtime for leak-free interop.
 
-Audit found an upstream validation blocker: `swin_model.py` imports
-`model_enc3`, which is absent from the repository. M reference validation needs
-that dependency restored or an independently checked replacement.
+The initial audit found an upstream validation blocker: `swin_model.py` imported
+absent `model_enc3`. Upstream commit `dbef4b2` restores this file; the missing
+dependency is resolved, while real GPU M reference validation is still pending.
 
 Environment-specific issues resolved: sandbox disallows writes to `.git` and
 launching the MinGW child compiler, so branch/commit/build require scoped tool

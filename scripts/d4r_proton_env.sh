@@ -22,8 +22,8 @@ export D4R_ZLUDA_LIBCUDA="$D4R_ZLUDA_DIR/libcuda.so"
 # most 256-thread blocks, as CUDA itself allows 255 registers for them; the
 # default 1024 bound caps gfx11 waves at 96 VGPRs and makes them spill.
 export D4R_ZLUDA_IMPLICIT_MAX_BLOCK="${D4R_ZLUDA_IMPLICIT_MAX_BLOCK:-256}"
-# f16 tensor-core MMAs (DLSS's convolutions) run on gfx11 WMMA instead of a
-# dot-product fallback (patches/zluda/0003); 0 selects the fallback.
+# f16 tensor-core MMAs (DLSS's convolutions) run on gfx11/gfx12 WMMA instead of a
+# dot-product fallback (patches/zluda/0003 and 0007); 0 selects the fallback.
 export D4R_ZLUDA_WMMA="${D4R_ZLUDA_WMMA:-1}"
 # DLSS frames in flight. The presented upscaled image is this many game frames
 # old at most: 3 = highest frame rate (Townfall ~86 fps, age 2-3), 2 = age 2

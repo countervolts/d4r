@@ -129,6 +129,9 @@ def main(argv):
         value = flag("Kernels", key)
         if value is not None:
             env[var] = "1" if value else "0"
+    # RDNA4's native FP8 WMMA (on unless set off; ZLUDA and the bridge ignore it on other GPUs)
+    value = flag("Kernels", "NativeFp8")
+    env["D4R_ZLUDA_WMMA_FP8_NATIVE"] = "0" if value is False else "1"
     value = get("Kernels", "ImplicitMaxBlock")
     if value:
         env["D4R_ZLUDA_IMPLICIT_MAX_BLOCK"] = value

@@ -3,6 +3,10 @@
 // only plain clang builtins are used (compiled with -nogpuinc -nogpulib).
 #pragma once
 #include <stdint.h>
+#include "../common/wmma_layout.h"
+#if defined(D4R_TEX_FP8) && D4R_WMMA_LAYOUT != 12 && defined(__HIP_DEVICE_COMPILE__)
+#error "D4R_TEX_FP8 needs the gfx12 WMMA layout"
+#endif
 
 #pragma clang fp contract(off)
 
@@ -64,6 +68,75 @@ __attribute__((device)) static inline f8v wmma(u8v a, u8v b, f8v c)
 {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), c);
 }
+
+// ---------------------------------------------------------------- gfx12 m16n8k32 e4m3 steps
+// On gfx12 the GEMM tails do a k32 step as ZLUDA's gfx12 lowering of NVIDIA's m16n8k32 e4m3 MMA does, so they
+// stay bit-identical to ZLUDA's compile of the kernel they replace: a lane's k16 operand holds this half's
+// e4m3 k 8h .. 8h + 7 (ZLUDA's gfx12 slot order), either widened as above with C * 2^-16 inside the f32
+// WMMAs (d4r_wmma12_*), or with D4R_TEX_FP8 (ZLUDA's D4R_ZLUDA_WMMA_FP8_NATIVE) as the bytes of a native FP8
+// WMMA with no scaling (d4r_wmma12f8_*). (The gfx11 tails use operand16 and wmma above.)
+#if D4R_WMMA_LAYOUT == 12
+// 8 e4m3 bytes (k in order) widened to value * 2^-8 f16 pairs, k in order
+__attribute__((device)) static inline u4v widen8(uint2_t d)
+{
+    uint32_t a0, a1, b0, b1;
+    e4m3x4_scaled(d.x, a0, a1);
+    e4m3x4_scaled(d.y, b0, b1);
+    return (u4v){a0, a1, b0, b1};
+}
+#ifdef D4R_TEX_FP8
+typedef uint2_t kop;
+typedef u4v kslot; // weight image slot: the 16 e4m3 bytes of one k16 operand row
+__attribute__((device)) static inline kop kop_from8(uint2_t d)
+{
+    return d;
+}
+__attribute__((device)) static inline kslot kslot_from16(u4v d)
+{
+    return d;
+}
+#else
+typedef u4v kop;
+typedef u8v kslot; // weight image slot: the 16 widened values of one k16 operand row, k in order
+__attribute__((device)) static inline kop kop_from8(uint2_t d)
+{
+    return widen8(d);
+}
+__attribute__((device)) static inline kslot kslot_from16(u4v d)
+{
+    const u4v lo = widen8((uint2_t){d[0], d[1]}), hi = widen8((uint2_t){d[2], d[3]});
+    return (u8v){lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+}
+#endif
+// this half's k16 operand from 16 consecutive e4m3 bytes of NVIDIA's k order
+__attribute__((device)) static inline kop kop_from16(u4v d)
+{
+    return kop_from8(lane_id() >= 16 ? (uint2_t){d[2], d[3]} : (uint2_t){d[0], d[1]});
+}
+// this half's operand from slot idx of a weight image
+__attribute__((device)) static inline kop kop_image(const kslot* img, int idx)
+{
+    return ((const kop*)img)[2 * idx + (lane_id() >> 4)];
+}
+// f32 C (true scale) + one k32 step
+__attribute__((device)) static inline f8v k32_e4m3(f8v c, const kop& a0, const kop& b0, const kop& a1, const kop& b1)
+{
+#if defined(D4R_TEX_FP8) && defined(__GFX12__)
+    typedef int i2v __attribute__((ext_vector_type(2)));
+    c = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(__builtin_bit_cast(i2v, a0), __builtin_bit_cast(i2v, b0), c);
+    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(__builtin_bit_cast(i2v, a1), __builtin_bit_cast(i2v, b1), c);
+#elif defined(D4R_TEX_FP8)
+    // layout shim, like ZLUDA's: each FP8 WMMA as the scaled widening (exact powers of two)
+    c = wm_mma_zluda(widen8(a0), widen8(b0), c * 0x1p-16f) * 0x1p16f;
+    return wm_mma_zluda(widen8(a1), widen8(b1), c * 0x1p-16f) * 0x1p16f;
+#else
+    c = c * 0x1p-16f;
+    c = wm_mma_zluda(a0, b0, c);
+    c = wm_mma_zluda(a1, b1, c);
+    return c * 0x1p16f;
+#endif
+}
+#endif
 
 // ZLUDA's f16x2_to_e4m3x2_satfinite_bits: RNE satfinite e4m3 of both halves, low half -> low byte.
 __attribute__((device)) static inline uint32_t e4m3x2(uint32_t bits)

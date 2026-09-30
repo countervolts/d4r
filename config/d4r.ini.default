@@ -36,7 +36,7 @@ Model = K
 FrameAge = 0
 
 [Kernels]
-; Native RDNA3 kernels for the DLSS 4 and 4.5 network layers (replace ZLUDA's translated code).
+; Native RDNA3 / RDNA4 kernels for the DLSS 4 and 4.5 network layers (replace ZLUDA's translated code).
 ;   fast  = native kernels with relaxed numerics (visually identical to exact, ~15% faster)
 ;   exact = native kernels that reproduce NVIDIA's FP8/f16 rounding bit for bit
 ;   off   = ZLUDA-translated kernels only
@@ -44,6 +44,9 @@ FrameAge = 0
 NativeKernels = off
 ; FP8 tensor-core emulation on RDNA3 WMMA (much faster than the scalar path).
 Fp8Wmma = true
+; RDNA4 only: FP8 MMAs on the native FP8 WMMA (and the -fp8 native kernel variants); off widens FP8 to f16 as
+; on RDNA3. Ignored on other GPUs. (D4R_ZLUDA_WMMA_FP8_NATIVE)
+NativeFp8 = true
 ; Drop per-instruction flush-to-zero mode switches in ZLUDA-compiled kernels
 ; (only values below ~1e-38 differ; a little faster).
 IgnoreDenormals = true

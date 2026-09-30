@@ -4,7 +4,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 
 | Component | Tested version |
 |---|---|
-| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002`, `0003`, `0004`, `0005` in that order |
+| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0007` in order |
 | vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
@@ -17,10 +17,11 @@ git clone https://github.com/vosen/ZLUDA zluda && cd zluda
 git checkout ee2f25a
 git submodule update --init --recursive
 git lfs pull
-for p in 0002 0003 0004 0005; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
+for p in 0002 0003 0004 0005 0006 0007; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
 # rebuild the device helpers the patches changed (ptx/lib/zluda_ptx_impl*.bc)
 ZLUDA_SOURCE_ROOT=$PWD ROCM_ROOT=/opt/rocm /path/to/d4r/scripts/build_zluda_ptx_helpers.sh
 LIBRARY_PATH=/opt/rocm/lib cargo build --release -p zluda
+LIBRARY_PATH=/opt/rocm/lib cargo build --release -p ptx --example d4r_emit
 mkdir -p ~/.cache/d4r-zluda-current
 cp target/release/libnvcuda.so ~/.cache/d4r-zluda-current/
 ln -sf libnvcuda.so ~/.cache/d4r-zluda-current/libcuda.so
@@ -34,6 +35,10 @@ What the patches add:
 - **0003**: an implicit 256-thread launch bound for kernels without PTX bounds (removes massive register spilling, `D4R_ZLUDA_IMPLICIT_MAX_BLOCK`) and f16 tensor-core MMA on RDNA3 WMMA (`D4R_ZLUDA_WMMA`).
 - **0004**: the native kernel override hook (`D4R_ZLUDA_NATIVE_DIR`, see [native-kernels.md](native-kernels.md)), FP8 MMA on WMMA (`D4R_ZLUDA_WMMA_FP8`), optional elision of per-instruction denormal mode switches (`D4R_ZLUDA_IGNORE_DENORMAL`), inlined image helpers, and linking extra bitcode into a PTX module (`D4R_ZLUDA_EXTRA_BC`, used by the texture-kernel build).
 - **0005**: a null texture object (CUDA handle 0) reads as zeros, as on NVIDIA GPUs, instead of faulting the GPU. DLSS samples absent optional inputs that way in some configurations (low-resolution motion vectors without HDR, as in Ghost of Tsushima).
+- **0006**: `m16n8k8` f16 MMAs (DLSS 3 CNN, presets E/F) on RDNA3 WMMA like the k16 ones (`D4R_ZLUDA_WMMA_K8=0` disables it); weight-image slots for native prep kernels (`d4r_prep_key_at`, `d4r_prep_key_slots`); and wave64 compilation for offline texture-kernel builds (`D4R_ZLUDA_WAVE64=1`, with wave64 builds of the helper bitcode). `scripts/build_zluda_ptx_helpers.sh` now writes the `_w64` helper variants too.
+- **0007**: gfx12 WMMA layout lowering, optional native e4m3 FP8 WMMA (`D4R_ZLUDA_WMMA_FP8_NATIVE=1`), and an architecture argument for `d4r_emit`. `D4R_ZLUDA_WMMA_LAYOUT=12` on gfx11 is a validation shim, not a release setting.
+
+When linking on a system with ROCm libraries outside the default search path, include their library directory in `LIBRARY_PATH`. The build also needs the appropriate ROCm link libraries. `CARGO_BUILD_JOBS=8` caps parallel Rust compilation if memory is limited.
 
 ## 2. vkd3d-proton
 
@@ -65,11 +70,11 @@ This stages the shim, the bridge, the NGX core and the DLSS feature library in `
 ```sh
 D4R_ROCM_DIR=/opt/rocm \
 D4R_DLSS_DLL=/path/to/nvngx_dlss.dll \
-D4R_ZLUDA_BUILD=~/.cache/d4r-zluda-current \
+D4R_ZLUDA_EMIT=/path/to/zluda/target/release/examples/d4r_emit \
 kernels/build.sh all kernels/out/native
 ```
 
-`kernels/out/native` then holds one code object per replaced DLSS kernel; set `NativeKernelDirFast` in d4r.ini (or `D4R_ZLUDA_NATIVE_DIR`) to it. `kernels/build.sh k` or `m` builds only the network layers and needs neither the DLL nor ZLUDA. The texture kernels (`tex`) extract PTX from your DLL into `kernels/extracted/`; that directory and the build output are git-ignored and must not be redistributed.
+`kernels/out/native` then holds one code object per replaced DLSS kernel; set `NativeKernelDirFast` in d4r.ini (or `D4R_ZLUDA_NATIVE_DIR`) to it. `kernels/build.sh k` or `m` builds only the network layers and needs neither the DLL nor ZLUDA. The texture kernels (`tex`) extract PTX from your DLL into `kernels/extracted/` and compile it offline for `D4R_GPU_ARCH` through `D4R_ZLUDA_EMIT`; that directory and the build output are git-ignored and must not be redistributed. On gfx12, build a second variant with `D4R_NATIVE_FP8=1` and place it in an `<arch>-fp8` folder.
 
 ## 6. Configure and play
 
@@ -93,13 +98,15 @@ scripts/package_release.sh            # -> dist/d4r-<version>.zip
 ```
 
 The script:
-- builds the shim, the bridge and the network-layer kernels;
+- builds the shim, the bridge and the network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`;
-- adds NVIDIA's two DLLs and the texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`);
+- adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`);
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
 The NVIDIA files are not covered by d4r's license; redistributing them is up to whoever publishes the zip. `D4R_BUNDLE_NVIDIA=0` builds `d4r-<version>-nonvidia.zip` without them and without the texture kernels. [architecture.md](architecture.md#portable-installs-the-release-zip) describes how the installed files work together.
+
+`D4R_BUNDLE_TEX` accepts the older flat directory for gfx1101, or a directory with per-target subdirectories (`gfx1100/`–`gfx1103/`, `gfx1200/`, `gfx1201/`, plus `gfx1200-fp8/` and `gfx1201-fp8/`). Build each texture set with `D4R_GPU_ARCH` and `D4R_ZLUDA_EMIT`; the `-fp8` sets also need `D4R_NATIVE_FP8=1`. `d4r_emit` targets those GPUs offline. Missing texture kernels fall back to ZLUDA on that target; the network-layer kernels are still included. Only the RX 7700 XT has been tested on real hardware.
 
 ## Checks
 

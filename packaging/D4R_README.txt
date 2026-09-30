@@ -1,10 +1,10 @@
-d4r @VERSION@: NVIDIA DLSS on AMD Radeon RDNA3 under Linux and Proton
+d4r @VERSION@: NVIDIA DLSS on AMD Radeon RDNA3 and RDNA4 under Linux and Proton
 =====================================================================
 
-d4r runs NVIDIA's own DLSS Super Resolution (DLSS 4 by default) on AMD Radeon RX 7000 GPUs in
+d4r runs NVIDIA's own DLSS Super Resolution (DLSS 4 by default) on AMD Radeon RDNA3 and RDNA4 GPUs in
 DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS calls and hands them to
 d4r. d4r then runs NVIDIA's DLSS on the Radeon through ZLUDA, with the heaviest parts replaced by
-kernels written for RDNA3.
+kernels written for RDNA3 and RDNA4.
 
 This is an early release, tested on one GPU (Radeon RX 7700 XT) in about a dozen DirectX 12 games.
 SUPPORTED_GAMES.md in the source repository lists them, with per-game setup notes. Expect problems
@@ -13,9 +13,11 @@ in other games.
 
 What you need
 -------------
-- An AMD Radeon RX 7000 series GPU (RDNA3). The fast kernels are built for gfx1101 (RX 7700 XT,
-  RX 7800 XT, RX 7700). Other RDNA3 cards run DLSS without them: DLSS 3 (E) at full speed,
-  DLSS 4.5 (M) at about half speed, and DLSS 4 (K) without its transformer (worse image).
+- An AMD RDNA3 or RDNA4 GPU. This build includes native DLSS 4 and 4.5 network kernels for
+  gfx1100–gfx1103 and gfx1200–gfx1201 unless the builder selected fewer targets. Only the RX 7700 XT
+  (gfx1101) has been tested on a real GPU. gfx1201 has emulator testing; gfx1200 has compile testing
+  only. Neither establishes RDNA4 runtime support, performance or driver stability. Texture-kernel
+  optimisations are included only for targets supplied by the builder.
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
@@ -58,6 +60,9 @@ Settings
 --------
 - d4r/d4r.ini: d4r's settings for this game. The main one is the DLSS model:
   K (DLSS 4, default), E (DLSS 3 CNN, a little faster) or M (DLSS 4.5, slowest).
+- On RDNA4, [Kernels] NativeFp8 is on by default. It selects native FP8 WMMA and the matching
+  gfx12-fp8 kernel folder; set it to false to use f16 widening. The FP8 path has not been tested
+  on a real RDNA4 GPU.
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
 

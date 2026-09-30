@@ -11,6 +11,28 @@ from pathlib import Path
 # PTX extracted from nvngx_dlss.dll by kernels/tools/extract_dlss_ptx.py (kernels/build.sh does this)
 PTX_DIR = Path(os.environ.get("D4R_DLSS_PTX_DIR", Path(__file__).resolve().parent.parent / "extracted" / "ptx"))
 
+ENC0_TAIL = """{{
+	.param .b32 q0;
+	st.param.b32 [q0+0], {smem};
+	.param .b64 q1;
+	st.param.b64 [q1+0], {w};
+	.param .b64 q2;
+	st.param.b64 [q2+0], {out};
+	.param .b32 q3;
+	st.param.b32 [q3+0], {dimx};
+	.param .b32 q4;
+	st.param.b32 [q4+0], {dimy};
+	.param .b32 q5;
+	st.param.b32 [q5+0], {ox};
+	.param .b32 q6;
+	st.param.b32 [q6+0], {oy};
+	call.uni d4r_enc0_tail, (q0, q1, q2, q3, q4, q5, q6);
+}}
+ret;
+
+}}
+"""
+
 KERNELS = {
     # enc0: cut after the bar.warp.sync that ends the smem staging of the GEMM A operand
     "rrlite_enc0_4x4_mvhi_hdr_folded": dict(
@@ -25,27 +47,7 @@ KERNELS = {
 )
 ;
 """,
-        tail="""{
-	.param .b32 q0;
-	st.param.b32 [q0+0], %r259;
-	.param .b64 q1;
-	st.param.b64 [q1+0], %rd106;
-	.param .b64 q2;
-	st.param.b64 [q2+0], %rd78;
-	.param .b32 q3;
-	st.param.b32 [q3+0], %r1066;
-	.param .b32 q4;
-	st.param.b32 [q4+0], %r1067;
-	.param .b32 q5;
-	st.param.b32 [q5+0], %r1230;
-	.param .b32 q6;
-	st.param.b32 [q6+0], %r1233;
-	call.uni d4r_enc0_tail, (q0, q1, q2, q3, q4, q5, q6);
-}
-ret;
-
-}
-""",
+        tail=ENC0_TAIL.format(smem="%r259", w="%rd106", out="%rd78", dimx="%r1066", dimy="%r1067", ox="%r1230", oy="%r1233"),
     ),
     # dec0: the GEMM (from the B fragment loads to the e4m3 staging stores) becomes a native call; the
     # A loads before it are left dead. %r560 (shared base) is the only register of the range used later.
@@ -206,12 +208,83 @@ def replace_rz_round(lines):
     return out, n
 
 
+ENC0_REF = "rrlite_enc0_4x4_mvhi_hdr_folded"
+# the other flag combinations of the kernels whose only native part is the surface-store rewrite
+SUST_ONLY_RE = re.compile(r"^(hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)(_max)?_v[12]_rel|"
+                          r"rrlite_post_3_[12]_mv(hi|lo)_(hdr|ldr)_folded|rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr))$")
+ENC0_RE = re.compile(r"^rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)_folded$")
+
+
+def read_lines(path):
+    return path.read_text().replace("\r\n", "\n").split("\n")
+
+
+def enc0_registers(lines):
+    """Cut line (1-based) and the tail call's registers of an enc0 variant. The code after the third
+    bar.warp.sync is the same GEMM in every flag combination, only register numbers differ: the shared
+    base and weights pointer are read off by aligning that block with the reference variant; the output
+    pointer and grid size are the kernel's loads of parameters +40 and +8; the block offsets are the two
+    values halved (shr 31 / add) by the epilogue."""
+    syncs = [i for i, l in enumerate(lines) if l.strip() == "bar.warp.sync -1;"]
+    if len(syncs) != 3:
+        sys.exit(f"enc0: expected 3 bar.warp.sync, found {len(syncs)}")
+    cut = syncs[2] + 1
+    before, after = lines[:cut], lines[cut:]
+    out = [m.group(1) for m in (re.match(r"^ld\.param\.u64 (%rd\d+), \[%rd\d+\+40\];$", l.strip()) for l in before) if m]
+    dims = [m.groups() for m in (re.match(r"^ld\.param\.v2\.u32 \{(%r\d+), (%r\d+)\}, \[%rd\d+\+8\];$", l.strip()) for l in before) if m]
+    halves = []
+    for a, b in zip(after, after[1:]):
+        m = re.match(r"^shr\.u32 (%r\d+), (%r\d+), 31;$", a.strip())
+        if m and re.match(rf"^add\.s32 %r\d+, {re.escape(m.group(2))}, {re.escape(m.group(1))};$", b.strip()):
+            halves.append(m.group(2))
+    if len(out) != 1 or len(dims) != 1 or len(halves) < 2:
+        sys.exit(f"enc0: parameter loads or epilogue not found ({out}, {dims}, {halves[:2]})")
+    return cut, dict(out=out[0], dimx=dims[0][0], dimy=dims[0][1], oy=halves[0], ox=halves[1])
+
+
+REG_RE = re.compile(r"%(?:rd|rs|r|fd|f|p)\d+")
+
+
+def enc0_variant(name):
+    ref = read_lines(module_file(ENC0_REF, KERNELS[ENC0_REF]))
+    path = module_file(name, {"file": ""})
+    lines = read_lines(path)
+    rcut, rregs = enc0_registers(ref)
+    k = KERNELS[ENC0_REF]
+    known = dict(smem="%r259", w="%rd106", out="%rd78", dimx="%r1066", dimy="%r1067", ox="%r1230", oy="%r1233")
+    if rcut != k["cut_after"] or any(rregs[key] != known[key] for key in rregs):
+        sys.exit(f"enc0: the register search does not reproduce {ENC0_REF} ({rcut}, {rregs})")
+    cut, regs = enc0_registers(lines)
+    # align the GEMM block (up to the reference's first closing brace) and map registers
+    n = next(i for i, l in enumerate(ref[rcut:]) if l.startswith("}"))
+    mapping = {}
+    for a, b in zip(ref[rcut:rcut + n], lines[cut:cut + n]):
+        if REG_RE.sub("R", a) != REG_RE.sub("R", b):
+            sys.exit(f"enc0: {name} differs from {ENC0_REF} after the cut: {a!r} / {b!r}")
+        for x, y in zip(REG_RE.findall(a), REG_RE.findall(b)):
+            if mapping.setdefault(x, y) != y:
+                sys.exit(f"enc0: inconsistent register mapping {x} -> {mapping[x]} / {y}")
+    regs.update(smem=mapping[known["smem"]], w=mapping[known["w"]])
+    return dict(file=path.name, cut_after=cut, cut_check="bar.warp.sync -1;", sust=True, extern=k["extern"],
+                tail=ENC0_TAIL.format(**regs))
+
+
+def kernel_spec(name):
+    if name in KERNELS:
+        return KERNELS[name]
+    if ENC0_RE.match(name):
+        return enc0_variant(name)
+    if SUST_ONLY_RE.match(name):
+        return dict(file="", sust=True, extern="", rz_round=name.startswith("hiluma_engine_output"))
+    sys.exit(f"make_ptx: no recipe for {name}")
+
+
 def module_file(name, k):
     """The extracted PTX module that defines NAME: the 310.7 file number, else any module that does
     (other DLSS versions number their modules differently)."""
     entry = re.compile(rf"\.entry\s+{re.escape(name)}\s*\(")
     known = PTX_DIR / k["file"]
-    if known.exists() and entry.search(known.read_text()):
+    if k["file"] and known.is_file() and entry.search(known.read_text()):
         return known
     for path in sorted(PTX_DIR.glob("*.ptx")):
         if entry.search(path.read_text()):
@@ -221,8 +294,8 @@ def module_file(name, k):
 
 def main():
     name, out = sys.argv[1], Path(sys.argv[2])
-    k = KERNELS[name]
-    lines = module_file(name, k).read_text().replace("\r\n", "\n").split("\n")
+    k = kernel_spec(name)
+    lines = read_lines(module_file(name, k))
     if "cut_after" in k:
         cut = k["cut_after"]
         if lines[cut - 1].strip() != k["cut_check"]:

@@ -1,5 +1,7 @@
 # Performance
 
+All frame rates and kernel timings on this page were measured on an RX 7700 XT (gfx1101). RDNA4 (gfx1200/gfx1201) has compile and emulator validation only; no RDNA4 frame rate, latency, or kernel timing has been measured. Native FP8 may change both arithmetic and cost, so the gfx11 results cannot be projected to it.
+
 ## Method
 
 - **Hardware and settings:** Radeon RX 7700 XT (RDNA3, 54 CUs), Ryzen 9 5900XT, Linux 6.18. SILENT HILL Townfall at 2560×1440 output.
@@ -8,17 +10,19 @@
 - **Pairing:** runs are compared back-to-back in one session, because repeated runs of an identical setup vary by about 1%.
 - **Screen recording:** it costs a few fps, so recorded videos show slightly lower numbers than the table.
 - **Latency:** all DLSS numbers are same-frame (frame age 0). Every frame shows its own DLSS result, as with a native upscaler.
-- **Other upscaler modes:** Balanced, Performance and Ultra Performance use OptiScaler's render-ratio override (1.72, 2.0, 3.0) on top of the game's Quality mode.
+- **Upscaler modes:** every mode uses OptiScaler's render-ratio override (1.5, 1.72, 2.0, 3.0), so the result does not depend on the DLSS mode chosen in the game.
 
 ## Results
 
-| Mode (render resolution) | DLSS 3 CNN (E) | DLSS 4 (K) | DLSS 4.5 (M) | FSR 4 |
+| Mode (render resolution) | DLSS 3 CNN (E) | DLSS 4 (K) | DLSS 4.5 (M) | FSR 4\* |
 |---|---|---|---|---|
-| Quality (1705×960) | **72.4** | 69.4 | 51.5 | 76.0 |
-| Balanced (1488×837) | **80.5** | 76.6 | 59.6 | 84.5 |
-| Performance (1280×720) | **87.8** | 84.0 | 69.9 | 94.0 |
-| Ultra Performance (853×480) | 88.9 | **94.5** | 90.3 | 107.3 |
+| Quality (1705×960) | **71.7** | 67.9 | 49.3 | 76.0 |
+| Balanced (1488×837) | **80.8** | 75.9 | 58.0 | 84.5 |
+| Performance (1280×720) | **89.7** | 84.1 | 69.0 | 94.0 |
+| Ultra Performance (853×480) | 89.1 | **95.5** | 92.2 | 107.3 |
 | Native 2560×1440, no upscaling (TSR at 100%) | | 49.1 | | |
+
+\* FSR 4 and the native row are from 2026-09-27; the DLSS columns from 2026-09-29, when the machine ran about 2–4% slower overall (release 0.1.1 at Quality that day: E 71.2, K 67.9, M 48.4 fps, against 72.4, 69.4 and 51.5 two days earlier). The render resolution of every mode is set with OptiScaler's ratio override for whichever DLSS mode the game is set to (ratios 1.5, 1.72, 2.0 and 3.0).
 
 DLSS 4's cost is almost constant across modes (about 2.8 ms of GPU time per frame). Its network runs on a grid set by the output resolution, not the render resolution, so the gap to FSR 4 widens as the render resolution drops. The CNN gets more expensive at the 3× ratio, so K is the better choice at Ultra Performance.
 

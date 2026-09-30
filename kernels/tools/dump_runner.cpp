@@ -44,7 +44,18 @@ int main(int argc, char** argv)
     hipFunction_t prep = nullptr;
     if (hipModuleGetFunction(&prep, mod, (std::string(argv[2]) + "_prep").c_str()) != hipSuccess)
         prep = nullptr;
-    const unsigned prepGrid = getenv("PREP_GRID") ? atoi(getenv("PREP_GRID")) : 88;
+    // the prep grid: PREP_GRID, else the module's d4r_prep_blocks (what the ZLUDA hook launches), else 88
+    unsigned prepGrid = 88;
+    {
+        hipDeviceptr_t pb;
+        size_t pbs = 0;
+        uint32_t v = 0;
+        if (hipModuleGetGlobal(&pb, &pbs, mod, "d4r_prep_blocks") == hipSuccess && pbs == 4 &&
+            hipMemcpyDtoH(&v, pb, 4) == hipSuccess && v != 0)
+            prepGrid = v;
+    }
+    if (getenv("PREP_GRID"))
+        prepGrid = atoi(getenv("PREP_GRID"));
 
     std::vector<char> args = read_file(dump + "/args.bin");
     std::ifstream man(dump + "/manifest.txt");
@@ -58,6 +69,13 @@ int main(int argc, char** argv)
         std::istringstream s(line);
         std::string kind;
         s >> kind;
+        if (kind == "texture" || kind == "surface")
+        {
+            // texture/surface object handles in the arguments would point at nothing here: the kernel faults
+            fprintf(stderr, "%s: the dump uses texture or surface objects, which dump_runner cannot recreate\n",
+                    dump.c_str());
+            return 3;
+        }
         if (kind == "launch")
             s >> grid[0] >> grid[1] >> grid[2] >> block[0] >> block[1] >> block[2] >> shared;
         else if (kind == "alloc")

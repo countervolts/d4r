@@ -535,6 +535,8 @@ static void load_portable_config()
         portable_set_unix("D4R_ZLUDA_NATIVE_DIR", g_portable.unixDir + "/kernels");
     portable_set_unix("D4R_ZLUDA_WMMA", ini_flag(ini, "kernels", "Wmma", 1) ? "1" : "0");
     portable_set_unix("D4R_ZLUDA_WMMA_FP8", ini_flag(ini, "kernels", "Fp8Wmma", 1) ? "1" : "0");
+    // RDNA4's native FP8 WMMA; ZLUDA and the bridge ignore it on other GPUs
+    portable_set_unix("D4R_ZLUDA_WMMA_FP8_NATIVE", ini_flag(ini, "kernels", "NativeFp8", 1) ? "1" : "0");
     portable_set_unix("D4R_ZLUDA_IGNORE_DENORMAL", ini_flag(ini, "kernels", "IgnoreDenormals", 1) ? "1" : "0");
     const std::string maxBlock = ini_value(ini, "kernels", "ImplicitMaxBlock");
     portable_set_unix("D4R_ZLUDA_IMPLICIT_MAX_BLOCK", maxBlock.empty() ? "256" : maxBlock);
@@ -3774,6 +3776,12 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                               g.cu.setArrayRedirect(feature->output.array, target, static_cast<uint32_t>(rowBytes)) == 0;
         if (!redirect && feature->outputRedirected)
             g.cu.setArrayRedirect(feature->output.array, 0, 0);
+        static bool logged = false;
+        if (redirect && !logged)
+        {
+            logf("frame %u: direct output (the native output kernel writes the shared buffer; no array copy)", frame);
+            logged = true;
+        }
         feature->outputRedirected = redirect;
     }
     const int eventStartResult = timing.enabled && feature->profileEventsReady
@@ -4250,11 +4258,12 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
             preset = value;
     }
     feature->preset = presets[1];
-    // Direct output needs the native output kernel of the preset in use (verified: K = 11; M's result is
-    // not written through the redirected stores). Only a forced preset qualifies.
+    // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
+    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced
+    // preset qualifies.
     if (!forced.empty())
     {
-        char allowed[128] = "11";
+        char allowed[128] = "11,13";
         if (const std::string list = env_string("D4R_SHIM_OUTPUT_DIRECT_PRESETS"); !list.empty())
             snprintf(allowed, sizeof(allowed), "%s", list.c_str());
         for (char* token = strtok(allowed, ","); token != nullptr; token = strtok(nullptr, ","))
