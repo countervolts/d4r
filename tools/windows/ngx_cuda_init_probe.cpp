@@ -1,5 +1,6 @@
 #include "hip_api.h"
 #include "cuda_api.h"
+#include "ngx_cuda_evaluate.h"
 
 // Same NGX C ABI and freestanding MSVC parameter accessors as the upstream shim.
 // NVIDIA SDK headers and proprietary binaries are not build dependencies.
@@ -110,6 +111,9 @@ int main(int argc, char** argv)
         unsigned roundtrip = 0;
         check(d4r_ngx_get_uint(parameters, "Width", &roundtrip), "MSVC parameter ABI roundtrip");
         if (roundtrip != 640) throw std::runtime_error("NGX parameter ABI mismatch");
+        if (args.ngx_mode == "evaluate")
+            run_synthetic_dlss(cuda, core, parameters, args.preset, args.iterations, data_path);
+        else if (args.ngx_mode != "init") throw std::runtime_error("--ngx-mode must be init or evaluate");
         check(destroy(parameters), "DestroyParameters(allocated)"); parameters = nullptr;
         check(destroy(caps), "DestroyParameters(capabilities)"); caps = nullptr;
         loaded_modules();

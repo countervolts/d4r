@@ -1,0 +1,124 @@
+Implement the CUDA texture resource descriptor query required by NGX Evaluate.
+Regression: tools/windows/cuda_image_probe.cpp in the d4r Windows port.
+
+diff --git a/zluda/src/lib.rs b/zluda/src/lib.rs
+--- a/zluda/src/lib.rs
++++ b/zluda/src/lib.rs
+@@ -67,12 +67,14 @@
+ cuda_macros::cuda_function_declarations!(
+     unimplemented,
+     implemented
+         <= [
+             cuArray3DCreate_v2,
++            cuArray3DGetDescriptor_v2,
+             cuArrayCreate_v2,
+             cuArrayDestroy,
++            cuArrayGetDescriptor_v2,
+             cuCtxCreate_v2,
+             cuCtxCreate_v4,
+             cuCtxDestroy_v2,
+             cuCtxGetApiVersion,
+             cuCtxGetCurrent,
+@@ -203,10 +205,11 @@
+             cuSurfObjectCreate,
+             cuSurfObjectDestroy,
+             cuSurfObjectGetResourceDesc,
+             cuTexObjectCreate,
+             cuTexObjectDestroy,
++            cuTexObjectGetResourceDesc,
+             cuTexRefSetAddress_v2,
+             cuTexRefSetAddressMode,
+             cuTexRefSetArray,
+             cuTexRefSetFilterMode,
+             cuTexRefSetFlags,
+diff --git a/zluda/src/impl/tex.rs b/zluda/src/impl/tex.rs
+--- a/zluda/src/impl/tex.rs
++++ b/zluda/src/impl/tex.rs
+@@ -1,19 +1,58 @@
+ use crate::r#impl::hipfix;
+ use hip_runtime_sys::*;
++use std::collections::HashMap;
++use std::sync::{Mutex, OnceLock};
++
++fn object_resources() -> &'static Mutex<HashMap<usize, Vec<u8>>> {
++    static RESOURCES: OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = OnceLock::new();
++    RESOURCES.get_or_init(|| Mutex::new(HashMap::new()))
++}
+ 
+ pub(crate) unsafe fn object_create(
+     p_tex_object: *mut hipTextureObject_t,
+     p_res_desc: *const HIP_RESOURCE_DESC,
+     p_tex_desc: *const HIP_TEXTURE_DESC,
+     p_res_view_desc: *const HIP_RESOURCE_VIEW_DESC,
+ ) -> hipError_t {
+-    hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)
++    let output = p_tex_object.as_mut().ok_or(hipErrorCode_t::InvalidValue)?;
++    let descriptor = p_res_desc.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
++    hipTexObjectCreate(output, descriptor, p_tex_desc, p_res_view_desc)?;
++    let bytes = std::slice::from_raw_parts(p_res_desc.cast::<u8>(), std::mem::size_of::<HIP_RESOURCE_DESC>()).to_vec();
++    match object_resources().lock() {
++        Ok(mut resources) => {
++            resources.insert(*output as usize, bytes);
++            Ok(())
++        }
++        Err(_) => {
++            let _ = hipDestroyTextureObject(*output);
++            *output = std::ptr::null_mut();
++            Err(hipErrorCode_t::Unknown)
++        }
++    }
+ }
+ 
+ pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_t {
+-    hipDestroyTextureObject(tex_object)
++    let mut resources = object_resources().lock().map_err(|_| hipErrorCode_t::Unknown)?;
++    if !resources.contains_key(&(tex_object as usize)) { return Err(hipErrorCode_t::InvalidValue); }
++    hipDestroyTextureObject(tex_object)?;
++    resources.remove(&(tex_object as usize));
++    Ok(())
++}
++
++pub(crate) unsafe fn object_get_resource_desc(
++    descriptor: &mut HIP_RESOURCE_DESC,
++    tex_object: hipTextureObject_t,
++) -> hipError_t {
++    // NGX probes surface handles as textures before trying the surface API.
++    // Passing that foreign handle to HIP dereferences invalid host metadata.
++    // Return a CUDA error for unknown handles and preserve the complete CUDA
++    // descriptor (HIP's query leaves the flags/reserved bytes unspecified).
++    let resources = object_resources().lock().map_err(|_| hipErrorCode_t::Unknown)?;
++    let bytes = resources.get(&(tex_object as usize)).ok_or(hipErrorCode_t::InvalidValue)?;
++    std::ptr::copy_nonoverlapping(bytes.as_ptr(), (descriptor as *mut HIP_RESOURCE_DESC).cast::<u8>(), bytes.len());
++    Ok(())
+ }
+ 
+ pub(crate) unsafe fn ref_set_array(
+     texref: *mut textureReference,
+     array: hipArray_t,
+diff --git a/zluda/src/impl/array.rs b/zluda/src/impl/array.rs
+--- a/zluda/src/impl/array.rs
++++ b/zluda/src/impl/array.rs
+@@ -70,5 +70,23 @@
+     handle: *mut hipArray_t,
+     desc: *const HIP_ARRAY3D_DESCRIPTOR,
+ ) -> hipError_t {
+     hipArray3DCreate(handle, desc)
+ }
++
++pub(crate) unsafe fn get_descriptor_v2(
++    output: &mut HIP_ARRAY_DESCRIPTOR,
++    array: hipArray_t,
++) -> hipError_t {
++    hipArrayGetDescriptor(output, array)?;
++    if let Some(format) = original_format(array)? {
++        output.Format = hipArray_Format(format);
++    }
++    Ok(())
++}
++
++pub(crate) unsafe fn _3d_get_descriptor_v2(
++    output: &mut HIP_ARRAY3D_DESCRIPTOR,
++    array: hipArray_t,
++) -> hipError_t {
++    hipArray3DGetDescriptor(output, array)
++}

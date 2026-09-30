@@ -7,6 +7,9 @@ param(
     [string]$OutputDirectory,
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,
+    [ValidateSet('init', 'evaluate')][string]$NgxMode = 'init',
+    [ValidateSet(5, 11, 13)][int]$Preset = 11,
+    [switch]$NgxOnly,
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )
@@ -28,8 +31,10 @@ $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 if (!$HipRoot) { $HipRoot = 'C:\Program Files\AMD\ROCm\7.2' }
 $HipRoot = [IO.Path]::GetFullPath($HipRoot)
 if (!$ZludaRoot) {
+    $builtZluda = Join-Path $repoRoot 'dist/zluda-windows-native'
     $localZluda = [IO.Path]::GetFullPath((Join-Path $PackageRoot '../../.tools/zluda/zluda'))
-    if (Test-Path (Join-Path $localZluda 'nvcuda.dll')) { $ZludaRoot = $localZluda }
+    if (Test-Path (Join-Path $builtZluda 'build-info.json')) { $ZludaRoot = $builtZluda }
+    elseif (Test-Path (Join-Path $localZluda 'nvcuda.dll')) { $ZludaRoot = $localZluda }
     else { throw 'Pass -ZludaRoot with the directory containing the Windows ZLUDA nvcuda.dll.' }
 }
 $ZludaRoot = [IO.Path]::GetFullPath($ZludaRoot)
@@ -84,6 +89,8 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
     return $pass
 }
 try {
+    if ($NgxOnly -and (!$NgxCore -or !$DlssDll)) { throw '-NgxOnly requires both locally supplied NVIDIA DLL paths.' }
+    $summary.foundationDiagnosticsPerformed = !$NgxOnly
     if ($Iterations -lt 1 -or $Iterations -gt 10000) { throw 'Iterations must be 1..10000' }
     if ($TimeoutSeconds -lt 1) { throw 'TimeoutSeconds must be positive' }
     $env:HIP_PATH = $HipRoot
@@ -122,9 +129,12 @@ try {
         $summary.os = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
     } catch { $summary.inventoryError = $_.Exception.Message }
     $bin = Join-Path $PackageRoot 'bin'
-    $hipOk = Invoke-Probe 'hip' (Join-Path $bin 'd4r_hip_gfx1201_probe.exe') @(
+    $hipOk = $true
+    if (!$NgxOnly) { $hipOk = Invoke-Probe 'hip' (Join-Path $bin 'd4r_hip_gfx1201_probe.exe') @(
         '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', "$Iterations")
+    }
     if ($hipOk) {
+        if (!$NgxOnly) {
         $wmmaOk = Invoke-Probe 'gfx12-wmma' (Join-Path $bin 'd4r_gfx12_wmma_probe.exe') @(
             '--hip-root', $HipRoot, '--module', (Join-Path $bin 'wmma_gfx1201.hsaco'), '--iterations', "$Iterations")
         if (!$wmmaOk) { throw 'gfx12 WMMA layout validation failed; refusing to mark K/M readiness.' }
@@ -141,7 +151,9 @@ try {
                 (Join-Path $PackageRoot 'k_layer_validate.py'), '--kernel-name', $layer, '--fixture-dir', $kFixture)
             if (!$kReferenceOk) { throw "K $layer output differs from pwin_model.py; see the k-$layer-reference logs." }
         }
+        }
         $cudaOk = $true
+        if (!$NgxOnly) {
         foreach ($context in @('primary', 'created')) {
             $ok = Invoke-Probe "cuda-$context" (Join-Path $bin 'd4r_cuda_driver_probe.exe') @(
                 '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'),
@@ -154,7 +166,14 @@ try {
                     '--context', $context, '--iterations', '1') | Out-Null
             }
         }
+        if ($cudaOk -and ($NgxMode -eq 'evaluate' -or (Test-Path (Join-Path $ZludaRoot 'build-info.json')))) {
+            $cudaOk = Invoke-Probe 'cuda-images' (Join-Path $bin 'd4r_cuda_image_probe.exe') @(
+                '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'), '--iterations', "$Iterations")
+        }
+        }
         if ($cudaOk) {
+            $mapOk = $interopOk = $true
+            if (!$NgxOnly) {
             $mapOk = Invoke-Probe 'interop-map-lifetime' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
                 '--hip-root', $HipRoot, '--interop-mode', 'map', '--iterations', '64')
             $interopOk = Invoke-Probe 'interop-roundtrip' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
@@ -166,6 +185,7 @@ try {
                 }
                 Invoke-Probe 'hip-stream-lifetime' (Join-Path $bin 'd4r_hip_stream_lifecycle_probe.exe') @(
                     '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', '32') | Out-Null
+            }
             }
             if ($mapOk -and $interopOk) { $exitStatus = 0 }
             if ($exitStatus -eq 0 -and $NgxCore) {
@@ -181,15 +201,18 @@ try {
                 Copy-Item -LiteralPath $DlssDll -Destination $localDlss
                 $ngxArguments = @('--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'),
                     '--ngx-core', $localCore, '--dlss-dll', $localDlss,
-                    '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'))
-                $ngxOk = Invoke-Probe 'ngx-init' $ngxExe $ngxArguments
+                    '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
+                    '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', "$Iterations")
+                $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } else { 'ngx-init' }
+                $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments
                 if (!$ngxOk) {
                     $exitStatus = 1
                     if (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll')) {
-                        Invoke-Probe 'ngx-init-trace' $ngxExe @(
+                        Invoke-Probe "$ngxName-trace" $ngxExe @(
                             '--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'trace/nvcuda.dll'),
                             '--ngx-core', $localCore, '--dlss-dll', $localDlss,
-                            '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll')) | Out-Null
+                            '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
+                            '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', '1') | Out-Null
                     }
                 }
             }

@@ -6,8 +6,8 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 
 ## Milestone and gates
 
-Current milestone: M1/M2/M4/M5 passed; NGX init + DLSS CUDA capability discovery
-passed with the user's DLLs. M6 is in progress: K `enc1` and `enc2` prep and
+Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
+requested E path passes with the user's DLLs. M6 is in progress: K `enc1` and `enc2` prep and
 transformers run on gfx1201 and pass synthetic nonzero numpy reference checks.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
@@ -16,7 +16,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M0: branch, audit, Windows build and diagnostics | Initial implementation complete |
 | M1: native HIP gfx1201 allocation, kernel, CPU verification | PASS, 32 iterations + guard verification |
 | M2: Windows ZLUDA integer PTX, primary and created contexts | PASS, 32 iterations each + guard verification |
-| M3: Windows NGX initialization and simple DLSS path | Init + SR capabilities PASS; Evaluate/transformer pending |
+| M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; four finite synthetic frames; K/M pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
 | M6: K layers, full transformer and image validation | Partial: `enc1`/`enc2` execute and match nonzero references; other layers/full network pending |
@@ -68,8 +68,8 @@ and its `enc1`/`enc2` objects were checked on this RX 9070 XT against our fixtur
   unvalidated until K and its full DLSS integration are correct.
 * New ZLUDA patches `0006`/`0007` add k8 WMMA, prep slots, wave64 for MMA-free
   kernels, gfx12 helpers and FP8 selection/cache identity. These patches are
-  present in our branch but have not been built or validated in Windows ZLUDA.
-  Our current integer PTX test uses the unpatched `v7-preview.11` binary.
+  now built into native Windows ZLUDA. Integer PTX and resource descriptor
+  tests pass on hardware; complete K/M lowering remains to be validated.
 * Upstream restored `kernels/tools/model_enc3.py`, resolving the missing M
   reference dependency found in the initial audit. New check/replay utilities
   cover K/M and texture tails. Texture artifacts still require local DLL/PTX
@@ -120,6 +120,95 @@ Next gate: validate the remaining K layers against references/captures, then
 build the d4r-patched Windows ZLUDA and implement same-frame Windows NGX Evaluate
 with explicit D3D12 queue submission ownership. Full K precedes M and native
 FP8/performance work. No complete DLSS or OptiScaler game result is claimed.
+
+## Native Windows ZLUDA build and Evaluate work (2026-09-30)
+
+The local fork now builds natively under Windows, including d4r patches
+`0002`–`0007`. New `0008-native-windows-build.patch` preserves MSVC/Linux builds
+and adds LLVM-MinGW support: prebuilt LLVM selection, GNU delay-load flags,
+Windows LLVM system-library propagation, configurable HiGHS C++ library,
+public OCKL assertion reporting, and optional TaskDialog lookup. It does not
+modify NVIDIA binaries. The SDK's `long` shuffle overloads need an LLP64 fix
+in a private header mirror; `build-zluda-helpers.ps1` applies it without touching
+the installed HIP SDK. Helper bitcode is rebuilt in all four wave/FP variants.
+
+Pinned additional build dependencies:
+
+* Portable official Rust/Cargo `1.98.1`, `x86_64-pc-windows-gnu`, release
+  `2026-09-03`. `setup-rust-toolchain.ps1` verifies SHA256 of rustc, Cargo,
+  rust-std and rust-mingw archives and installs only under `.tools`.
+* ZLUDA LLVM submodule `ff4dc1f7c9e1c64d4d69e40f4ed30c2280a96dfd`,
+  `llvm-config` reports `22.0.0git`. AMDGPU/LLVM/LLD are built with LLVM-MinGW
+  `20260922`; no Linux build host or runtime is used.
+* HiGHS submodule `364c83a51e44ba6c27def9c8fc1a49b1daf5ad5c`.
+* The LLVM IR helper producer is stable HIP 7.2/LLVM 21. The final target is
+  selected by the translator from HIP `gfx1201`; generic helper generation
+  strips its temporary target attributes, as the existing Linux builder does.
+* `dist/zluda-windows-native` contains the built CUDA/NVAPI/trace DLLs,
+  `d4r_emit.exe`, local open-source libc++/libunwind DLLs and build hashes.
+  This directory contains no NVIDIA DLLs, extracted PTX or weights.
+
+Build sequence after preparing the pinned ZLUDA source/submodules:
+
+```powershell
+powershell -NoProfile -File scripts/windows/setup-rust-toolchain.ps1
+powershell -NoProfile -File scripts/windows/prepare-zluda-source.ps1
+powershell -NoProfile -File scripts/windows/build-zluda-llvm.ps1
+powershell -NoProfile -File scripts/windows/build-zluda-helpers.ps1
+powershell -NoProfile -File scripts/windows/build-zluda-windows.ps1
+```
+
+`prepare-zluda-source.ps1` refuses to reapply patches over a modified checkout.
+For an already prepared checkout, rebuild only the affected components.
+Configure/fetch/build logs remain under `build/zluda-*`.
+
+The NGX probe now accepts `--ngx-mode evaluate`, `--preset 5|11|13` and a frame
+count. Its synthetic CUDA-array path is a **debug harness** with host uploads
+and final readback, not the game's fast path. It initializes output to NaN,
+checks all RGBA components for finite values, checks RGB variance and saves
+unmodified `.rgba16f` plus BMP previews. A successful Evaluate alone is logged
+as `network_validation=pending`. The diagnostic exception handler also saves
+first-chance fault details/minidumps before NGX's own final filter takes over.
+
+The first stock-ZLUDA E test failed during CreateFeature (`0xc0000005`);
+trace recorded missing `cuda_histogram_kernel`/`cuda_dldn_engine_histogram_kernel`
+with unrecognized `tex.base.2d.v4.f32.s32`. This is a captured failure, not a
+successful DLSS result. Bundle: `test-results/ngx-evaluate-e-stock.zip`.
+The first custom build then exposed missing libc++ deployment and an eager
+Common Controls v6 import; both are corrected. `0009-resource-descriptor-queries`
+implements texture and 2D/3D array queries. Texture descriptors are tracked
+from creation and removed on destruction: probing a surface as a texture
+returns an API error instead of dereferencing HIP host metadata. This also
+preserves CUDA flags/reserved bytes, which HIP's query does not fully initialize.
+
+Hardware evidence with the patched runtime:
+
+* Full runner `native-zluda-descriptors-milestone`: **12/12 PASS**, with 32 PTX
+  iterations per context, 32 CUDA image iterations and unchanged HIP/K/interop
+  checks. Package/default DLL selection prefers the locally built runtime.
+* `cuda-images-kind.stdout.log`: 32 iterations of 1/2/4-channel arrays,
+  texture/surface descriptor and storage round trips, plus wrong-kind errors.
+* `ngx-evaluate-e-kindfix`: requested preset E Create/Evaluate **PASS** for one synthetic
+  frame, finite RGBA, nonconstant output saved in the private result bundle.
+  This establishes the first native Windows DLSS CUDA execution path. K/M
+  transformer validation and D3D12 game integration are still pending.
+* `ngx-evaluate-e-four-frames`: four consecutive finite synthetic frames,
+  reset only on frame 0, saved RGBA16F/BMP outputs. CTest after self-contained
+  CUDA dependency lookup: **9/9 PASS**. Fresh pinned-source application of all
+  eight patches passes `check-zluda-patches.ps1`.
+* First-chance capture successfully saved two minidumps for the preceding
+  surface-as-texture HIP crash; `ngx-evaluate-e-arraydesc.zip` preserves it.
+
+Example focused diagnostic (after the full foundational checks), using the
+user's local DLLs:
+
+```powershell
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxOnly -NgxMode evaluate -Preset 5 -Iterations 4 -NgxCore C:\Users\Administrator\d4r\_nvngx.dll -DlssDll C:\Users\Administrator\d4r\nvngx_dlss.dll
+```
+
+`-NgxOnly` is for iterative NGX debugging; its summary explicitly says that
+foundational checks were skipped. Private trace bundles can contain extracted
+NVIDIA PTX/weights and must not be included in public release packages.
 
 ## Architecture and platform boundaries
 

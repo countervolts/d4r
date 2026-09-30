@@ -57,6 +57,18 @@ inline LONG WINAPI unhandled(EXCEPTION_POINTERS* info)
 {
     std::fprintf(stderr, "EXCEPTION code=0x%08lx address=%p\n",
         info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        info->ExceptionRecord->NumberParameters >= 2)
+        std::fprintf(stderr, "EXCEPTION_ACCESS operation=%llu target=0x%llx\n",
+            static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[0]),
+            static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[1]));
+    std::fprintf(stderr, "CONTEXT rip=0x%llx rsp=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx\n",
+        static_cast<unsigned long long>(info->ContextRecord->Rip),
+        static_cast<unsigned long long>(info->ContextRecord->Rsp),
+        static_cast<unsigned long long>(info->ContextRecord->Rcx),
+        static_cast<unsigned long long>(info->ContextRecord->Rdx),
+        static_cast<unsigned long long>(info->ContextRecord->R8),
+        static_cast<unsigned long long>(info->ContextRecord->R9));
     loaded_modules();
     wchar_t directory[32768]{};
     const DWORD n = GetEnvironmentVariableW(L"D4R_DIAG_DIR", directory, 32768);
@@ -74,12 +86,24 @@ inline LONG WINAPI unhandled(EXCEPTION_POINTERS* info)
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
+inline LONG WINAPI first_chance(EXCEPTION_POINTERS* info)
+{
+    // NGX installs its own final exception filter. Capture a diagnostic dump
+    // before that filter can replace ours; do not swallow or retry the fault.
+    const auto code = info->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+        static LONG captured = 0;
+        if (InterlockedCompareExchange(&captured, 1, 0) == 0) (void)unhandled(info);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 inline void start()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     SetUnhandledExceptionFilter(unhandled);
+    AddVectoredExceptionHandler(1, first_chance);
     std::printf("d4r native Windows diagnostic x64 pid=%lu\n", GetCurrentProcessId());
 }
 struct Args {
@@ -89,6 +113,8 @@ struct Args {
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
+    std::string ngx_mode = "init";
+    unsigned preset = 11;
     std::string fixture_dir;
     std::string kernel_name = "enc1";
     unsigned iterations = 32;
@@ -108,6 +134,13 @@ struct Args {
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;
             else if (key == "--ngx-abi") ngx_abi = value;
+            else if (key == "--ngx-mode") ngx_mode = value;
+            else if (key == "--preset") {
+                size_t end = 0;
+                preset = static_cast<unsigned>(std::stoul(value, &end));
+                if (end != value.size() || (preset != 5 && preset != 11 && preset != 13))
+                    throw std::runtime_error("preset must be 5 (E), 11 (K) or 13 (M)");
+            }
             else if (key == "--fixture-dir") fixture_dir = value;
             else if (key == "--kernel-name") kernel_name = value;
             else if (key == "--iterations") {

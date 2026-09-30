@@ -7,6 +7,7 @@ using CUcontext = void*;
 using CUmodule = void*;
 using CUfunction = void*;
 struct CudaApi {
+    d4r::diag::SearchDirectory search;
     d4r::diag::Library library;
 #define D4R_CU(name, ret, ...) using name##_fn = ret(WINAPI*)(__VA_ARGS__); name##_fn name = library.symbol<name##_fn>(#name)
     D4R_CU(cuInit, int, unsigned);
@@ -33,7 +34,9 @@ struct CudaApi {
     D4R_CU(cuGetErrorName, int, int, const char**);
     D4R_CU(cuGetErrorString, int, int, const char**);
 #undef D4R_CU
-    explicit CudaApi(const std::string& path) : library(d4r::diag::wide(path)) {}
+    explicit CudaApi(const std::string& path) :
+        search(std::filesystem::path(d4r::diag::wide(path)).parent_path()),
+        library(d4r::diag::wide(path)) {}
     void check(int result, const char* call) {
         const char* name = "unknown", *message = "unknown";
         if (result) { cuGetErrorName(result, &name); cuGetErrorString(result, &message); }
