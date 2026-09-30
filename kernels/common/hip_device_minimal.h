@@ -35,5 +35,9 @@ __device__ __forceinline__ d4r_device_dim3 d4r_grid_dim() {
 #define blockIdx d4r_block_idx()
 #define gridDim d4r_grid_dim()
 __device__ __attribute__((convergent, always_inline)) inline void __syncthreads() {
+    // Match HIP __work_group_barrier: execution rendezvous alone does not
+    // publish LDS stores or prevent loads moving across the barrier.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
     __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
 }

@@ -30,12 +30,55 @@ __device__ __forceinline__ uint32_t lane_id()
 
 typedef wm_op op_t; // WMMA operand: u8v (gfx11) or u4v (gfx12)
 
+// The CUDA fragment reduction rounds products and every tree node to f16.
+// A float sum of the squared halves changes rsqrt and can amplify differences
+// through attention. The strict baseline preserves its channel grouping.
+template <int C>
+__device__ __forceinline__ half_t l2_sum(const half_t* row)
+{
+#ifdef D4R_K_FP16_BASELINE
+    static_assert(C % 32 == 0 && C <= 160, "audited K channel counts");
+    hv2 partial[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+    {
+        hv2 halves[2];
+#pragma unroll
+        for (int parity = 0; parity < 2; ++parity)
+        {
+            hv2 pairs[C / 32];
+#pragma unroll
+            for (int group = 0; group < C / 32; ++group)
+            {
+                const hv2 a = *(const hv2*)(row + 2 * t + 8 * parity + 32 * group);
+                const hv2 b = *(const hv2*)(row + 2 * t + 8 * parity + 32 * group + 16);
+                pairs[group] = (a * a) + (b * b);
+            }
+            hv2 value = pairs[0];
+            if constexpr (C >= 64) value = value + pairs[1];
+            if constexpr (C == 96) value = value + pairs[2];
+            if constexpr (C >= 128) value = value + (pairs[2] + pairs[3]);
+            if constexpr (C == 160) value = value + pairs[4];
+            halves[parity] = value;
+        }
+        partial[t] = halves[0] + halves[1];
+    }
+    const hv2 sum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+    return sum[0] + sum[1];
+#else
+    float sum = 0;
+#pragma unroll
+    for (int c = 0; c < C; ++c) sum += (float)(half_t)(row[c] * row[c]);
+    return (half_t)sum;
+#endif
+}
+
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)
 // PWIN_F32ACC: keep the accumulator in f32 through the chain (rounded to f16 where the values are used)
 __device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
 {
     f8v d = wm_mma(a, b, c);
-#ifndef PWIN_F32ACC
+#if !defined(PWIN_F32ACC) || defined(D4R_K_FP16_BASELINE)
 #pragma unroll
     for (int i = 0; i < 8; ++i)
         d[i] = (float)(half_t)d[i];

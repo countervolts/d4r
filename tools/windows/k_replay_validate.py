@@ -18,7 +18,8 @@ if not (REFERENCE / 'pwin_check.py').exists():
     REFERENCE = ROOT / 'kernels/tools'
 sys.path.insert(0, str(REFERENCE))
 import pwin_model as pm
-from pwin_check import LAYERS, model_window, Outputs, stored
+pm.NORM_FRAGMENT_ORDER = True
+from pwin_check import LAYERS, model_window, Outputs, stored, windows
 
 
 def generate(layer, directory):
@@ -113,10 +114,14 @@ def generate(layer, directory):
     print(f'PASS K_FIXTURE kernel={layer} weights={weight_bytes} public_synthetic=1')
 
 
-def validate(layer, directory, output):
+def validate(layer, directory, output, window_count=1, real_capture=False):
     dump = pm.Dump(str(directory))
-    model, extra = model_window(dump, layer, 0, 0)
-    expected, actual = stored(dump, Outputs(dump, str(output)), layer, 0, 0, model, extra)
+    outputs = Outputs(dump, str(output))
+    pairs = []
+    for bx, by in windows(dump.grid, window_count):
+        model, extra = model_window(dump, layer, bx, by)
+        pairs.append(stored(dump, outputs, layer, bx, by, model, extra))
+    expected, actual = (np.concatenate(values) for values in zip(*pairs))
     if not np.isfinite(expected).all() or not np.isfinite(actual).all():
         raise RuntimeError('K replay contains NaN/Inf or unwritten output')
     difference = np.abs(actual.astype(np.float64) - expected.astype(np.float64))
@@ -127,7 +132,11 @@ def validate(layer, directory, output):
     psnr = math.inf if not rms else 20 * math.log10(peak / rms)
     print(f'K_REPLAY_REFERENCE kernel={layer} elements={actual.size} max_abs={maximum:.9g} '
           f'max_rel={relative:.9g} rms={rms:.9g} psnr_db={psnr:.6g}')
-    if maximum > .001 or psnr < 60:
+    # Bound ISA approximate reciprocal/rsqrt and matrix accumulation differences;
+    # require the independent PTX reference gate for every real-weight layer.
+    absolute_limit = max(.001, .005 * peak) if real_capture else .001
+    print(f'K_REPLAY_LIMIT windows={len(pairs)} max_abs_limit={absolute_limit:.9g} min_psnr_db=60 real_capture={int(real_capture)}')
+    if maximum > absolute_limit or psnr < 60:
         worst = int(difference.argmax())
         raise RuntimeError(f'K mismatch at {worst}: reference={expected[worst]}, gpu={actual[worst]}')
     print(f'PASS K_REPLAY_REFERENCE kernel={layer} architecture=gfx1201 nan_inf=0')
@@ -139,6 +148,8 @@ if __name__ == '__main__':
     parser.add_argument('--layer', choices=list(LAYERS), required=True)
     parser.add_argument('--fixture-dir', type=pathlib.Path, required=True)
     parser.add_argument('--output-dir', type=pathlib.Path)
+    parser.add_argument('--windows', type=int, default=1)
+    parser.add_argument('--real-capture', action='store_true')
     args = parser.parse_args()
     try:
         if args.mode == 'generate':
@@ -146,7 +157,9 @@ if __name__ == '__main__':
         else:
             if not args.output_dir:
                 parser.error('validate requires --output-dir')
-            validate(args.layer, args.fixture_dir, args.output_dir)
+            if args.windows < 1:
+                parser.error('--windows must be positive')
+            validate(args.layer, args.fixture_dir, args.output_dir, args.windows, args.real_capture)
     except Exception as error:
         print(f'FAIL K_REPLAY {error}', file=sys.stderr)
         raise SystemExit(5)

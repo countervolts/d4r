@@ -19,18 +19,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
     {
         const half_t* arow = act[16 * (wv * MT + mi) + m];
         half_t* hrow = hb[16 * (wv * MT + mi) + m];
-        float ss = 0.0f;
-#pragma unroll
-        for (int kt = 0; kt < KT; ++kt)
-        {
-            const u8v xv = lds_row16(arow + 16 * kt);
-#pragma unroll
-            for (int c = 0; c < 16; ++c)
-            {
-                const half_t v = op_get(xv, c);
-                ss += (float)(half_t)(v * v);
-            }
-        }
+        const half_t ss = l2_sum<C>(arow);
         const half_t r16 = (half_t)__builtin_amdgcn_rsqf((float)(half_t)ss);
         for (int kt = (int)hf; kt < KT; kt += 2)
         {

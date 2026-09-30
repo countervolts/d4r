@@ -1,0 +1,440 @@
+Subject: [PATCH] Guard and own native overrides; capture K replay on Windows
+
+Native replacements require the upstream PTX identity manifest. Preserve native
+module/image ownership, bypass redundant JIT for completely replaced modules,
+include the loaded Windows DLL fingerprint in cache identity, and expose opt-in
+private real-weight replay captures with explicit native/translated launch logs.
+
+diff --git a/zluda/src/impl/d4r_replay.rs b/zluda/src/impl/d4r_replay.rs
+new file mode 100644
+index 0000000..875b2e3
+--- /dev/null
++++ b/zluda/src/impl/d4r_replay.rs
+@@ -0,0 +1,109 @@
++//! Opt-in, synchronous diagnostic captures. Never enabled in the game fast path.
++//! Captures can contain proprietary network weights; keep them out of releases.
++use hip_runtime_sys::*;
++use std::{collections::HashMap, ffi::{c_void, CStr}, fs, path::PathBuf, sync::{Mutex, OnceLock}};
++
++struct Config { directory: PathBuf, filter: String, limit: u32 }
++static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
++static COUNTS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
++
++pub(crate) struct Capture { directory: PathBuf, allocations: Vec<(usize, usize)> }
++
++fn io_error(error: impl std::fmt::Display) -> hipErrorCode_t {
++    eprintln!("[d4r-replay] capture failed: {error}");
++    hipErrorCode_t::r#Unknown
++}
++
++impl Capture {
++    fn save(&self, destination: &std::path::Path) -> hipError_t {
++        fs::create_dir_all(destination).map_err(io_error)?;
++        for (id, &(base, size)) in self.allocations.iter().enumerate() {
++            let mut bytes = vec![0u8; size];
++            unsafe { hipMemcpyDtoH(bytes.as_mut_ptr().cast(), hipDeviceptr_t(base as *mut c_void), size) }?;
++            fs::write(destination.join(format!("alloc-{id}.bin")), bytes).map_err(io_error)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn finish(self, stream: hipStream_t) -> hipError_t {
++        unsafe { hipStreamSynchronize(stream) }?;
++        self.save(&self.directory.join("gpu-output"))?;
++        eprintln!("[d4r-replay] complete path={}", self.directory.display());
++        Ok(())
++    }
++}
++
++pub(crate) unsafe fn begin(
++    name: &CStr, stream: hipStream_t, parameters: *mut *mut c_void,
++    extra: *mut *mut c_void, launch: [u32; 7],
++) -> Result<Option<Capture>, hipErrorCode_t> {
++    let Some(config) = CONFIG.get_or_init(|| std::env::var_os("D4R_CUDA_REPLAY_DUMP_DIR").map(|directory| Config {
++        directory: directory.into(),
++        filter: std::env::var("D4R_CUDA_REPLAY_DUMP_FILTER").unwrap_or_default(),
++        limit: std::env::var("D4R_CUDA_REPLAY_DUMP_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1),
++    })) else { return Ok(None) };
++    let name = name.to_str().map_err(io_error)?;
++    // Only the audited, single 176-byte K argument ABI is captured here.
++    if !name.starts_with("dltss_pwin_") || !name.ends_with("_layer") || !name.contains(&config.filter) {
++        return Ok(None);
++    }
++    let mut block = std::ptr::null::<u8>();
++    let mut bytes = None;
++    if !extra.is_null() {
++        for i in (0..6).step_by(2) {
++            match *extra.add(i) as usize {
++                1 => block = (*extra.add(i + 1)).cast(),
++                2 => bytes = Some(*(*extra.add(i + 1) as *const usize)),
++                0 => break,
++                _ => return Err(hipErrorCode_t::r#InvalidValue),
++            }
++        }
++    } else if !parameters.is_null() {
++        block = (*parameters).cast();
++        bytes = Some(176);
++    }
++    if block.is_null() || bytes != Some(176) {
++        return Err(io_error(format!("unexpected K parameter ABI for {name}: {bytes:?}")));
++    }
++    let sequence = {
++        let mut counts = COUNTS.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(io_error)?;
++        let count = counts.entry(name.to_owned()).or_default();
++        if *count >= config.limit { return Ok(None); }
++        *count += 1;
++        *count
++    };
++    hipStreamSynchronize(stream)?;
++    let arguments = std::slice::from_raw_parts(block, 176);
++    let directory = config.directory.join(format!("replay-{sequence:06}-{name}"));
++    fs::create_dir_all(&directory).map_err(io_error)?;
++    fs::write(directory.join("args.bin"), arguments).map_err(io_error)?;
++    let mut manifest = format!("kernel {name}\nlaunch {} {} {} {} {} {} {}\nargs 176\n",
++        launch[0], launch[1], launch[2], launch[3], launch[4], launch[5], launch[6]);
++    let mut allocations = Vec::<(usize, usize)>::new();
++    for offset in (0..176).step_by(8) {
++        let pointer = u64::from_le_bytes(arguments[offset..offset + 8].try_into().unwrap()) as usize;
++        if pointer == 0 { continue; }
++        let mut base = hipDeviceptr_t(std::ptr::null_mut());
++        let mut size = 0;
++        if hipMemGetAddressRange(&mut base, &mut size, hipDeviceptr_t(pointer as *mut c_void)).is_err() { continue; }
++        let base = base.0 as usize;
++        if pointer < base || pointer - base >= size { continue; }
++        if size > 512 * 1024 * 1024 { return Err(io_error("allocation exceeds diagnostic 512 MiB limit")); }
++        let id = match allocations.iter().position(|&(b, _)| b == base) {
++            Some(id) => id,
++            None => {
++                let id = allocations.len();
++                allocations.push((base, size));
++                manifest.push_str(&format!("alloc {id} 0x{base:x} {size}\n"));
++                id
++            }
++        };
++        manifest.push_str(&format!("pointer {offset} {id} {}\n", pointer - base));
++    }
++    if allocations.is_empty() { return Err(io_error("no K allocation pointers resolved")); }
++    fs::write(directory.join("manifest.txt"), manifest).map_err(io_error)?;
++    let capture = Capture { directory, allocations };
++    capture.save(&capture.directory)?;
++    eprintln!("[d4r-replay] begin kernel={name} allocations={} path={}", capture.allocations.len(), capture.directory.display());
++    Ok(Some(capture))
++}
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index 033d9a0..7a7470a 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -7,6 +7,8 @@ use hip_runtime_sys::*;
+ use std::mem;
+ 
+ pub(crate) struct Function {
++    pub(crate) name: std::ffi::CString,
++    pub(crate) native_owner: Option<super::module::NativeModule>,
+     pub(crate) base: hipFunction_t,
+     pub(crate) sm_version: u32,
+     pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
+@@ -144,6 +146,8 @@ pub(crate) fn launch_kernel(
+         }
+         translated_extra_storage.as_mut_ptr()
+     };
++    let replay = unsafe { super::d4r_replay::begin(&f.name, stream, kernel_params, extra,
++        [grid_dim_x, grid_dim_y, grid_dim_z, block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes]) }?;
+     // the parameter block: kernel_params[0] (a single struct parameter) or the extra buffer
+     let prep_key = if let (Some(_), Some(key_offset)) = (f.prep, f.prep_key) {
+         let mut block: *const u8 = std::ptr::null();
+@@ -206,7 +210,11 @@ pub(crate) fn launch_kernel(
+     }
+     let block_dim_z = if f.block_z != 0 { f.block_z } else { block_dim_z };
+     let (grid_dim_x, grid_dim_y, grid_dim_z) = if f.grid_x != 0 { (f.grid_x, 1, 1) } else { (grid_dim_x, grid_dim_y, grid_dim_z) };
+-    unsafe {
++    if std::env::var_os("D4R_ZLUDA_VERBOSE").is_some() {
++        eprintln!("[d4r-launch] kernel={:?} backend={} grid={grid_dim_x},{grid_dim_y},{grid_dim_z} block={block_dim_x},{block_dim_y},{block_dim_z}",
++            f.name, if f.native_owner.is_some() { "native" } else { "translated" });
++    }
++    let result = unsafe {
+         hipModuleLaunchKernel(
+             f.base,
+             grid_dim_x,
+@@ -220,7 +228,10 @@ pub(crate) fn launch_kernel(
+             kernel_params,
+             extra_for_hip,
+         )
+-    }
++    };
++    result?;
++    if let Some(replay) = replay { replay.finish(stream)?; }
++    Ok(())
+ }
+ 
+ pub(crate) unsafe fn set_attribute(
+diff --git a/zluda/src/impl/library.rs b/zluda/src/impl/library.rs
+index 98be33e..1319792 100644
+--- a/zluda/src/impl/library.rs
++++ b/zluda/src/impl/library.rs
+@@ -21,8 +21,8 @@ impl Library {
+         let module_lock = self.modules.get(device).ok_or(CUerror::INVALID_DEVICE)?;
+         *module_lock.get_or_init(|| match self.data {
+             LibraryData::Lazy(lib) => {
+-                let (module, sm_version, meta32) = module::load_hip_module(lib)?;
+-                Ok(Module::new(module, sm_version, meta32).wrap())
++                let (module, sm_version, meta32, ptx_hash, native_image) = module::load_hip_module(lib)?;
++                Ok(Module::new(module, sm_version, meta32, ptx_hash, native_image).wrap())
+             }
+             LibraryData::Eager(()) => Err(CUerror::NOT_SUPPORTED),
+         })
+diff --git a/zluda/src/impl/mod.rs b/zluda/src/impl/mod.rs
+index 5329d32..14e0aee 100644
+--- a/zluda/src/impl/mod.rs
++++ b/zluda/src/impl/mod.rs
+@@ -5,6 +5,7 @@ pub(super) mod array;
+ pub(super) mod context;
+ pub(super) mod device;
+ pub(super) mod driver;
++pub(super) mod d4r_replay;
+ pub(super) mod event;
+ pub(super) mod function;
+ pub(super) mod graph;
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 9f72f2f..5a79368 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -19,6 +19,8 @@ pub(crate) struct Module {
+     pub(crate) base: hipModule_t,
+     pub(crate) sm_version: u32,
+     pub(crate) bit32: Option<Metadata32Bit>,
++    ptx_hash: Option<u64>,
++    _native_base_image: Option<Vec<u8>>,
+     mutable: Mutex<ModuleMutable>,
+ }
+ 
+@@ -33,12 +35,14 @@ impl ModuleMutable {
+         sm_version: u32,
+         name: CString,
+         explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
++        ptx_hash: Option<u64>,
+     ) -> Result<&Function, CUerror> {
+         Ok(match self.functions.entry(name) {
+             hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+             hash_map::Entry::Vacant(entry) => {
+-                let (func_handle, prep, block_z, grid_x, prep_key, prep_slots) = match native_override(entry.key()) {
+-                    Some(native) => native,
++                let mut native_owner = None;
++                let (func_handle, prep, block_z, grid_x, prep_key, prep_slots) = match native_override(entry.key(), ptx_hash) {
++                    Some((native, owner)) => { native_owner = Some(owner); native },
+                     None => {
+                         let mut func_handle = unsafe { std::mem::zeroed() };
+                         unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
+@@ -46,6 +50,8 @@ impl ModuleMutable {
+                     }
+                 };
+                 let func = Box::new(Function {
++                    name: entry.key().clone(),
++                    native_owner,
+                     base: func_handle,
+                     sm_version,
+                     explicit_args_size_align,
+@@ -69,19 +75,48 @@ impl ModuleMutable {
+ /// same stream with `d4r_prep_blocks` (a u32 global in the code object) blocks of 128 threads.
+ /// An optional u32 global `d4r_block_z` replaces the launch's block z dimension, and `d4r_grid_x`
+ /// (persistent kernels, which derive the original grid from their parameters) the grid.
++pub(crate) struct NativeModule {
++    module: hipModule_t,
++    _image: Vec<u8>,
++}
++
++impl Drop for NativeModule {
++    fn drop(&mut self) {
++        if self.module.0.is_null() { return; }
++        if let Err(error) = unsafe { hipModuleUnload(self.module) } {
++            eprintln!("[d4r-native] unload failed: {error:?}");
++        }
++    }
++}
++
+ fn native_override(
+     name: &CStr,
+-) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, Option<u32>, u32)> {
++    ptx_hash: Option<u64>,
++) -> Option<((hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, Option<u32>, u32), NativeModule)> {
+     let dir = std::env::var_os("D4R_ZLUDA_NATIVE_DIR")?;
++    let manifest = std::path::Path::new(&dir).join("d4r-kernels.txt");
++    let allowed = fs::read_to_string(&manifest).ok().is_some_and(|text| text.lines().any(|line| {
++        let mut fields = line.split_whitespace();
++        fields.next() == name.to_str().ok()
++            && fields.next().and_then(|s| u64::from_str_radix(s, 16).ok()) == ptx_hash
++            && ptx_hash.is_some()
++    }));
++    if !allowed {
++        eprintln!("[d4r-native] miss kernel={name:?} reason=ptx_identity hash={ptx_hash:016x?} fallback=translated");
++        return None;
++    }
+     let path = std::path::Path::new(&dir).join(format!("{}.hsaco", name.to_str().ok()?));
+-    let image = fs::read(&path).ok()?;
+-    // HIP may reference the image after loading; the override lives for the whole process.
+-    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
++    let image = match fs::read(&path) {
++        Ok(image) => image,
++        Err(error) => { eprintln!("[d4r-native] miss kernel={name:?} reason=object_missing error={error} fallback=translated"); return None; }
++    };
+     let mut native_module = unsafe { mem::zeroed() };
+     if unsafe { hipModuleLoadData(&mut native_module, image.as_ptr().cast()) }.is_err() {
+         eprintln!("[d4r-native] failed to load {}", path.display());
+         return None;
+     }
++    // Keep the image and module owned by the CUfunction; release at module unload.
++    let owner = NativeModule { module: native_module, _image: image };
+     let mut func = unsafe { mem::zeroed() };
+     if unsafe { hipModuleGetFunction(&mut func, native_module, name.as_ptr()) }.is_err() {
+         eprintln!("[d4r-native] {} has no kernel {:?}", path.display(), name);
+@@ -138,7 +173,7 @@ fn native_override(
+         prep_key,
+         prep_slots
+     );
+-    Some((func, prep, block_z, grid_x, prep_key, prep_slots))
++    Some(((func, prep, block_z, grid_x, prep_key, prep_slots), owner))
+ }
+ 
+ impl ZludaObject for Module {
+@@ -229,7 +264,7 @@ pub(crate) struct Global32Bit {
+ }
+ 
+ impl Module {
+-    pub(crate) fn new(base: hipModule_t, sm_version: u32, bit32: Option<Metadata32Bit>) -> Self {
++    pub(crate) fn new(base: hipModule_t, sm_version: u32, bit32: Option<Metadata32Bit>, ptx_hash: Option<u64>, native_base_image: Option<Vec<u8>>) -> Self {
+         Self {
+             base,
+             sm_version,
+@@ -237,6 +272,8 @@ impl Module {
+                 functions: FxHashMap::default(),
+             }),
+             bit32,
++            ptx_hash,
++            _native_base_image: native_base_image,
+         }
+     }
+ 
+@@ -248,7 +285,7 @@ impl Module {
+                 .map(Vec::clone)
+         });
+         mutable
+-            .get_function(self.base, self.sm_version, name.to_owned(), explicit_args)
++            .get_function(self.base, self.sm_version, name.to_owned(), explicit_args, self.ptx_hash)
+             .map(|f| unsafe { (f as *const Function).as_ref().unwrap() })
+     }
+ }
+@@ -256,7 +293,7 @@ impl Module {
+ fn get_best_ptx_and_compile(
+     global_state: &GlobalState,
+     image: CodeLibraryRef<'_>,
+-) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
++) -> Result<(hipModule_t, u32, Option<Metadata32Bit>, Option<u64>, Option<Vec<u8>>), CUerror> {
+     let mut ptx_modules = Vec::new();
+     unsafe {
+         CodeLibraryRef::iterate_modules(image, |_, module| match module {
+@@ -280,7 +317,7 @@ fn get_best_ptx_and_compile(
+         let dump_dir = std::path::PathBuf::from(dump_dir);
+         let _ = fs::create_dir_all(&dump_dir);
+         for (index, source) in ptx_modules.iter().enumerate() {
+-            let stem = format!("module-{index:04}");
++            let stem = format!("module-{:016x}-{index:04}", ptx_identity(source));
+             let _ = fs::write(dump_dir.join(format!("{stem}.ptx")), source.as_bytes());
+             let diagnostic = match ptx_parser::parse_module_checked(source.as_ref()) {
+                 Ok(ast) => format!(
+@@ -345,6 +382,32 @@ fn get_best_ptx_and_compile(
+             )
+         }
+     };
++    let ptx_hash = text.map(|source| ptx_identity(source));
++    // A fully replaced, single-entry module needs no translated binary. LDS
++    // declarations belong to the replaced kernel; exported globals do not.
++    let only_kernel_and_lds = module.directives.iter().all(|directive| match directive {
++        ptx_parser::Directive::Method(_, method) => method.func_directive.name.is_kernel(),
++        ptx_parser::Directive::Variable(_, variable) => matches!(variable.info.state_space, ptx_parser::StateSpace::Shared),
++    });
++    let entries: Vec<_> = module.directives.iter().filter_map(|directive| match directive {
++        ptx_parser::Directive::Method(_, method) => Some(method), _ => None,
++    }).collect();
++    if module.address_size == 64 && only_kernel_and_lds && entries.len() == 1 {
++        let method = entries[0];
++        {
++            if method.func_directive.name.is_kernel() {
++                if let Ok(name) = CString::new(method.func_directive.name.text()) {
++                    if let Some((_, mut owner)) = native_override(&name, ptx_hash) {
++                        let base = owner.module;
++                        owner.module = hipModule_t(std::ptr::null_mut());
++                        let image = mem::take(&mut owner._image);
++                        eprintln!("[d4r-native] module_direct kernel={name:?} translated_jit=skipped");
++                        return Ok((base, module.sm_version, None, ptx_hash, Some(image)));
++                    }
++                }
++            }
++        }
++    }
+     // TODO: get this information on initialization
+     let hip_properties = get_hip_properties()?;
+     let gcn_arch = get_gcn_arch(&hip_properties)?;
+@@ -372,7 +435,12 @@ fn get_best_ptx_and_compile(
+         .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))?;
+     let mut hip_module = unsafe { mem::zeroed() };
+     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
+-    Ok((hip_module, sm_version, zluda32))
++    Ok((hip_module, sm_version, zluda32, ptx_hash, None))
++}
++
++fn ptx_identity(text: &str) -> u64 {
++    text.trim_end_matches('\0').bytes().fold(0xcbf29ce484222325u64, |hash, byte|
++        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+ }
+ 
+ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
+@@ -384,7 +452,7 @@ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
+ 
+ pub(crate) fn load_hip_module(
+     library: CodeLibraryRef,
+-) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
++) -> Result<(hipModule_t, u32, Option<Metadata32Bit>, Option<u64>, Option<Vec<u8>>), CUerror> {
+     let global_state = driver::global_state()?;
+     get_best_ptx_and_compile(global_state, library)
+ }
+@@ -434,7 +502,7 @@ fn zluda_build_version() -> &'static str {
+                 key.starts_with("D4R_ZLUDA_")
+                     && !matches!(
+                         key.as_str(),
+-                        "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA"
++                        "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA" | "D4R_ZLUDA_VERBOSE"
+                             | "D4R_ZLUDA_WMMA_FP8_NATIVE" // keyed by effect (ExtraCacheAttributes)
+                     )
+             })
+@@ -469,7 +537,10 @@ fn loaded_library_fingerprint() -> Option<String> {
+ 
+ #[cfg(windows)]
+ fn loaded_library_fingerprint() -> Option<String> {
+-    None
++    let path = zluda_windows::get_module_path_for_function(zluda_build_version as *const () as usize)?;
++    let metadata = fs::metadata(path).ok()?;
++    let timestamp = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
++    Some(format!("{:x}.{:x}.{:x}", metadata.len(), timestamp.as_secs(), timestamp.subsec_nanos()))
+ }
+ 
+ fn get_cache_key<'a, 'b>(
+@@ -577,16 +648,16 @@ pub(crate) fn load(module: &mut CUmodule, fname: &CStr) -> CUresult {
+     image.push(0);
+     let library = unsafe { CodeLibraryRef::try_load(image.as_ptr() as *const std::ffi::c_void) }
+         .map_err(|_| CUerror::NO_BINARY_FOR_GPU)?;
+-    let (hip_module, sm_version, meta32) = load_hip_module(library)?;
+-    *module = Module::new(hip_module, sm_version, meta32).wrap();
++    let (hip_module, sm_version, meta32, ptx_hash, native_image) = load_hip_module(library)?;
++    *module = Module::new(hip_module, sm_version, meta32, ptx_hash, native_image).wrap();
+     Ok(())
+ }
+ 
+ pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
+     let library =
+         unsafe { CodeLibraryRef::try_load(image) }.map_err(|_| CUerror::NO_BINARY_FOR_GPU)?;
+-    let (hip_module, sm_version, meta32) = load_hip_module(library)?;
+-    *module = Module::new(hip_module, sm_version, meta32).wrap();
++    let (hip_module, sm_version, meta32, ptx_hash, native_image) = load_hip_module(library)?;
++    *module = Module::new(hip_module, sm_version, meta32, ptx_hash, native_image).wrap();
+     Ok(())
+ }
+ 

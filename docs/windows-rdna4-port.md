@@ -7,8 +7,9 @@ This is a work log for an implementation in progress, not a claim of DLSS suppor
 ## Milestone and gates
 
 Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
-requested E path passes with the user's DLLs. M6 is in progress: all 11 K layers
-run on gfx1201 and pass synthetic nonzero NumPy reference checks.
+requested E path passes with the user's DLLs. All 11 K layers now pass synthetic
+and real-weight NumPy/PTX replay checks; native K Evaluate produces four finite
+frames on Windows. D3D12 shim integration and M remain in progress.
 Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 
 | Gate | Status |
@@ -19,7 +20,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M3: Windows NGX initialization and simple DLSS path | Init, SR capabilities, Create/Evaluate PASS; four finite synthetic frames; K/M pending |
 | M4: D3D12 / HIP external memory and fence round trip | PASS with TheRock; stable 7.2 has mapped-view leak |
 | M5: independently validated gfx12 WMMA backend | PASS: raw + legacy adapter + upstream layout, max abs/relative error 0 |
-| M6: K layers, full transformer and image validation | All 11 synthetic layer replays PASS; real weights, full network and K image validation pending |
+| M6: K layers, full transformer and image validation | CUDA harness PASS: 11 real-weight layers, native launches for all layers, four finite frames, 81.85–92.91 dB versus translated K; D3D12 integration pending |
 | M7: M FP16-equivalent baseline and full transformer | Pending |
 | M8: standalone Windows D3D12 NGX harness | Pending |
 | M9: OptiScaler integration, profiling, installation | Pending |
@@ -122,6 +123,75 @@ with explicit D3D12 queue submission ownership. Full K precedes M and native
 FP8/performance work. No complete DLSS or OptiScaler game result is claimed.
 
 ## Native Windows ZLUDA build and Evaluate work (2026-09-30)
+
+### K real-weight native Evaluate and correctness baseline
+
+The locally supplied DLSS 310.9.1.0 selects all eleven `dltss_pwin_*` functions
+with preset 11 (K). `0010-native-identity-replay-windows-cache.patch` adds:
+
+* FNV-1a PTX identity checking against upstream `d4r-kernels.txt`, with an
+  explicit native miss/translated fallback log. A mismatched version cannot
+  receive an override by function name alone.
+* Owned native modules/images, released with their CUDA function/module, and
+  direct native loading for fully replaced single-entry modules with only LDS
+  declarations. Modules with exported globals or other functions retain JIT.
+* Windows loaded-DLL size/mtime in the translator cache identity. Rebuilding
+  an uncommitted translator no longer reuses its older cached code.
+* Opt-in native Windows K replay capture, before and after a launch, using
+  HIP allocation range queries. Captures are synchronous diagnostics, can
+  contain proprietary weights, and are never enabled in the game fast path.
+  `D4R_ZLUDA_VERBOSE=1` logs actual native/translated launches.
+
+The Windows minimal `__syncthreads` previously omitted HIP's release/acquire
+memory fences. Real, multi-window captures exposed nondeterministic LDS data
+and intermediate NaNs, despite the one-window synthetic tests passing. The
+shim now matches public HIP barrier semantics. Those earlier captures are
+invalid for correctness claims.
+
+Windows K defaults to `D4R_K_FP16_BASELINE=ON`: every K16 accumulator step and
+the L2 reduction tree round to FP16. The norm grouping was independently
+recovered and checked with the existing CPU PTX interpreter for C=32/64/96/128/160.
+The reference model supports `NORM_FRAGMENT_ORDER=True`; its legacy default
+remains unchanged. The original float norm approximation itself differed from
+PTX by 0.13965 on one real decoder window, so it cannot serve as a bit-exact
+oracle. Strict references and the independent PTX gate are both required.
+
+Validated on RX 9070 XT with isolated TheRock:
+
+* `test-results/k-strict-synthetic-final.zip`: 11/11, 32 launches per layer,
+  **max absolute and relative error 0** with strict references.
+* `test-results/k-real-strict-dual-reference`: all eleven real-weight layers
+  pass. Up to 12 NumPy windows/layer, plus the two worst NumPy difference
+  windows checked independently through PTX. NumPy PSNR 75.40–103.98 dB;
+  PTX PSNR 67.11–122.39 dB, all selected output elements finite. Max relative
+  error is reported with a 0.001 denominator floor; near-zero values can have
+  a large relative error. Gates require PSNR >=60 dB and max absolute error
+  <=max(0.001, 0.005*reference peak).
+* `test-results/ngx-k-strict-norm-final.zip`: four K frames, all 44 native
+  transformer launches logged, no NaN/Inf or unwritten output.
+* Complete-frame comparison with translated WMMA K: PSNR 92.91, 81.85, 84.45,
+  86.10 dB, max absolute error 0.01514. Differences are localized: at most
+  21 RGB elements exceed 0.002, and at most 0.00294% exceed 1% of peak.
+  These are approximate numerical results, not bit-exact NVIDIA hardware
+  verification. The frame gate requires >=60 dB, max <=2.5% of peak, and
+  no more than 0.01% of RGB elements above 1% of peak. An initial stricter
+  1% single-element gate failed on these isolated temporal differences;
+  the observed metrics and current bounds are recorded explicitly.
+* `test-results/native-identity-final`: wrong hash rejects the override and
+  runs translated PTX correctly; matching hash executes 32 native launches.
+* CTest 9/9 and fresh-source application of all nine ZLUDA patches PASS.
+
+Reproduce the actual K layer gate without editing sources:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-k-captures.ps1 `
+  -CaptureDirectory C:\Users\Administrator\d4r\test-results\ngx-k-fp16-fenced-capture\replay `
+  -DlssDll C:\Users\Administrator\d4r\nvngx_dlss.dll
+```
+
+This is CUDA NGX validation with synthetic image inputs and actual local DLSS
+weights. It does not claim a completed Windows D3D12 shim, OptiScaler game test,
+dynamic scene validation, or M support. These are the next gates.
 
 ### All K layers: native Windows synthetic replay (2026-09-30)
 

@@ -66,6 +66,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $release 'zluda_trace.dll') -Destination (Join-Path $InstallRoot 'trace/nvcuda.dll') -Force
     Copy-Item -LiteralPath (Join-Path $release 'examples/d4r_emit.exe') -Destination $InstallRoot -Force
     @{base='ee2f25a180099fa42f36b2346732e1f2470a03ad'; target='x86_64-pc-windows-gnu';
+        sourceCommit=(& git rev-parse HEAD); workingTreeDirty=[bool](& git status --porcelain);
         rust='1.98.1'; llvm=(& (Join-Path $LlvmBuildRoot 'bin/llvm-config.exe') --version);
         files=@(Get-ChildItem -LiteralPath $InstallRoot -Filter '*.dll' | Get-FileHash -Algorithm SHA256)} |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallRoot 'build-info.json') -Encoding UTF8

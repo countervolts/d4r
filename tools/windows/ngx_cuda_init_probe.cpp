@@ -121,7 +121,7 @@ int main(int argc, char** argv)
         cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize");
         cuda.check(cuda.cuCtxSetCurrent(nullptr), "cuCtxSetCurrent(NULL)");
         cuda.check(cuda.cuDevicePrimaryCtxRelease_v2(device), "cuDevicePrimaryCtxRelease_v2"); context = nullptr;
-        std::printf("PASS NGX_INIT architecture=gfx1201 sr_available=1 transformer_executed=0\n");
+        std::printf("PASS NGX_INIT architecture=gfx1201 sr_available=1 transformer_validation=pending\n");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL NGX_INIT %s\n", e.what());

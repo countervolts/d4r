@@ -10,6 +10,8 @@ param(
     [ValidateSet('init', 'evaluate')][string]$NgxMode = 'init',
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
     [switch]$NgxOnly,
+    [switch]$Trace,
+    [switch]$RequireNativeNetwork,
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )
@@ -48,6 +50,7 @@ $originalLog = $env:ZLUDA_LOG_DIR
 $originalCuda = $env:ZLUDA_CUDA_LIB
 $originalNvapi = $env:D4R_NVAPI_BACKEND
 $originalPythonPath = $env:PYTHONPATH
+$originalVerbose = $env:D4R_ZLUDA_VERBOSE
 $exitStatus = 1
 $ngxRuntimeDirectory = $null
 $summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
@@ -72,13 +75,17 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
     $process.StartInfo = $info
     if (!$process.Start()) { throw "Process start failed: $Exe" }
     # Consume both streams concurrently; a verbose JIT trace must not block its child.
-    $outTask = $process.StandardOutput.ReadToEndAsync()
-    $errTask = $process.StandardError.ReadToEndAsync()
+    $outFile = [IO.File]::Open($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $errFile = [IO.File]::Open($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $outTask = $process.StandardOutput.BaseStream.CopyToAsync($outFile)
+    $errTask = $process.StandardError.BaseStream.CopyToAsync($errFile)
     $finished = $process.WaitForExit($TimeoutSeconds * 1000)
     if (!$finished) { $process.Kill(); $process.WaitForExit() }
     $code = $process.ExitCode
-    [IO.File]::WriteAllText($stdout, $outTask.GetAwaiter().GetResult())
-    [IO.File]::WriteAllText($stderr, $errTask.GetAwaiter().GetResult())
+    try {
+        $null = $outTask.GetAwaiter().GetResult()
+        $null = $errTask.GetAwaiter().GetResult()
+    } finally { $outFile.Dispose(); $errFile.Dispose() }
     $process.Dispose()
     $codeHex = if ($null -eq $code) { 'unknown' } else {
         '0x{0:x8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$code), 0)
@@ -90,6 +97,12 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
 }
 try {
     if ($NgxOnly -and (!$NgxCore -or !$DlssDll)) { throw '-NgxOnly requires both locally supplied NVIDIA DLL paths.' }
+    if ($RequireNativeNetwork) {
+        if ($NgxMode -ne 'evaluate' -or $Preset -ne 11 -or !$env:D4R_ZLUDA_NATIVE_DIR) {
+            throw '-RequireNativeNetwork currently requires K Evaluate and D4R_ZLUDA_NATIVE_DIR.'
+        }
+        $env:D4R_ZLUDA_VERBOSE = '1'
+    }
     $summary.foundationDiagnosticsPerformed = !$NgxOnly
     if ($Iterations -lt 1 -or $Iterations -gt 10000) { throw 'Iterations must be 1..10000' }
     if ($TimeoutSeconds -lt 1) { throw 'TimeoutSeconds must be positive' }
@@ -199,12 +212,27 @@ try {
                 Copy-Item -LiteralPath (Join-Path $bin 'd4r_ngx_cuda_init_probe.exe') -Destination $ngxExe
                 Copy-Item -LiteralPath $NgxCore -Destination $localCore
                 Copy-Item -LiteralPath $DlssDll -Destination $localDlss
-                $ngxArguments = @('--hip-root', $HipRoot, '--cuda-dll', (Join-Path $ZludaRoot 'nvcuda.dll'),
+                $selectedCuda = if ($Trace) { Join-Path $ZludaRoot 'trace/nvcuda.dll' } else { Join-Path $ZludaRoot 'nvcuda.dll' }
+                if (!(Test-Path -LiteralPath $selectedCuda)) { throw "CUDA runtime missing: $selectedCuda" }
+                $summary.traceRequested = [bool]$Trace
+                $ngxArguments = @('--hip-root', $HipRoot, '--cuda-dll', $selectedCuda,
                     '--ngx-core', $localCore, '--dlss-dll', $localDlss,
                     '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
                     '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', "$Iterations")
                 $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } else { 'ngx-init' }
                 $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments
+                if ($ngxOk -and $RequireNativeNetwork) {
+                    $hits = @()
+                    foreach ($layer in @('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2','dec1','dec0')) {
+                        $pattern = '\[d4r-launch\] kernel="dltss_pwin_' + $layer + '_layer" backend=native'
+                        $count = @(Select-String -LiteralPath (Join-Path $OutputDirectory "$ngxName.stderr.log") -Pattern $pattern).Count
+                        $hits += @{layer=$layer; nativeLaunches=$count; expectedFrames=$Iterations}
+                        if ($count -lt $Iterations) { $ngxOk=$false }
+                    }
+                    $summary.nativeTransformer = $hits
+                    $summary.nativeTransformerPassed = $ngxOk
+                    Write-Host "Native K transformer launches validated=$ngxOk"
+                }
                 if (!$ngxOk) {
                     $exitStatus = 1
                     if (Test-Path (Join-Path $ZludaRoot 'trace/nvcuda.dll')) {
@@ -240,6 +268,7 @@ try {
     $env:ZLUDA_CUDA_LIB = $originalCuda
     $env:D4R_NVAPI_BACKEND = $originalNvapi
     $env:PYTHONPATH = $originalPythonPath
+    $env:D4R_ZLUDA_VERBOSE = $originalVerbose
     $archive = "$OutputDirectory.zip"
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath $archive -Force
     Write-Host "Diagnostic bundle: $archive"

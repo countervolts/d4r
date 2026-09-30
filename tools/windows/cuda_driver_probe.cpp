@@ -38,6 +38,9 @@ int main(int argc, char** argv)
     start();
     try {
         Args args(argc, argv);
+        uint64_t identity = 0xcbf29ce484222325ull;
+        for (const char* c = ptx; *c; ++c) identity = (identity ^ uint8_t(*c)) * 0x100000001b3ull;
+        std::printf("PTX_IDENTITY kernel=d4r_ptx_pattern fnv1a64=%016llx\n", static_cast<unsigned long long>(identity));
         if (args.cuda_dll.empty()) throw std::runtime_error("--cuda-dll is required (absolute ZLUDA nvcuda.dll path)");
         if (args.context != "primary" && args.context != "created") throw std::runtime_error("context must be primary or created");
         // Require the real HIP architecture, then match the CUDA device by PCI identity.
