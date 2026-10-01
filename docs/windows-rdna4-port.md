@@ -9,6 +9,23 @@ validation coverage are recorded below. Performance remains in progress.
 
 ## Milestone and gates
 
+Performance diagnostics (2026-10-01): the separate ZLUDA `b0161a4` runtime
+passes 32 PTX launches in each context and all four native K/M frames with
+bit-exact RGB against their controls. All thirteen exported patches (0002
+through 0014) apply to the pinned fresh base. The full Windows build and all
+16 CTest gates pass. Actual K profiling completes 2345 frames with zero backend
+errors. Replacing PowerShell's line-oriented stdout/stderr collection with
+concurrent raw byte copies removes substantial diagnostic backpressure:
+mean Evaluate host time drops from 25.715 to 3.350 ms despite per-kernel HIP
+event synchronization. Native/translated GPU times, scope and limitations are
+in [windows-performance.md](windows-performance.md). Quiet successful API
+logging is separately selectable via `D4R_QUIET_API=1`; error checks stay active.
+
+An additional K game run (`silent-hill2-k-output-stages.zip`) completes 1688
+frames / 18568 native launches / 1688 GPU output scans, all finite, with no
+backend failure or previous-frame output. The user confirms visible imagery
+after the depth-plane fix; low FPS is the current investigation.
+
 Actual K rendering: `silent-hill2-k-depth-plane.zip` completes **1794 DLSS
 frames / 19734 native K launches / zero d4r failures** at 753x424 -> 1280x720
 with the game's depth-inverted HDR path and DXGI-19 depth plane. The captured

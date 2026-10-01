@@ -8,6 +8,8 @@ param(
     [string]$DiagnosticResolution,
     [string]$CacheDirectory = $env:ZLUDA_CACHE_DIR,
     [switch]$ValidateOutput,
+    [switch]$ProfileStages,
+    [switch]$VerboseRuntime,
     [string[]]$GameArguments = @('-dx12','-windowed','-ResX=1280','-ResY=720'),
     [string]$OutputDirectory
 )
@@ -108,7 +110,7 @@ RestoreGraphicSignature=false
 ExtendedStateRestore=false
 [Log]
 LogToFile=true
-LogLevel=0
+LogLevel=$(if ($VerboseRuntime) { 0 } else { 2 })
 [Menu]
 DisableSplash=true
 "@
@@ -129,11 +131,18 @@ $settings = @{
     D4R_FORMAT_MODULE=(GamePath 'd4r/pixel_convert_gfx1201.hsaco');
     D4R_ZLUDA_NATIVE_DIR=(GamePath 'd4r/native'); D4R_D3D12_COMMAND_BACKEND='1'; D4R_ZLUDA_VERBOSE='1';
     D4R_ZLUDA_WMMA='1'; D4R_ZLUDA_WMMA_FP8='1'; D4R_ZLUDA_WMMA_FP8_NATIVE='0'; D4R_ZLUDA_WMMA_F16_REFERENCE='1';
+    # Do not inherit relaxation flags from unrelated experiments. Unset and
+    # false have the same numerical effect; unset reuses the validated cache.
+    D4R_ZLUDA_IGNORE_DENORMAL=$null; D4R_ZLUDA_FAST_MATH=$null;
+    D4R_ZLUDA_WMMA_F32ACC=$null; D4R_ZLUDA_WAVE64=$null;
+    D4R_QUIET_API=$(if ($VerboseRuntime) { $null } else { '1' });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
 $old = @{}; $process = $null; $originalSettings = @()
+$outFile = $null; $errFile = $null; $outTask = $null; $errTask = $null
 if ($ValidateOutput) { $settings['D4R_VALIDATE_OUTPUT']='1' }
+if ($ProfileStages) { $settings['D4R_PROFILE_STAGES']='1' }
 try {
     if ($DiagnosticResolution) {
         if ([IO.Path]::GetFileName($GameExe) -ne 'SHProto-Win64-Shipping.exe' -or $DiagnosticResolution -notmatch '^([0-9]{3,4})x([0-9]{3,4})$') { throw 'DiagnosticResolution currently supports Silent Hill 2 only; use e.g. 1280x720.' }
@@ -168,14 +177,28 @@ try {
         ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'environment.json') -Encoding UTF8
     function Quote([string]$value) { if ($value.Contains('"')) { throw 'A command argument contains an unsupported quote.' }; return '"' + $value + '"' }
     $arguments = @('--output-directory', (Quote $OutputDirectory), '--', (Quote $GameExe)) + @($GameArguments | ForEach-Object { Quote $_ })
-    $process = Start-Process -FilePath (GamePath 'd4r/d4r_debug_launcher.exe') -ArgumentList $arguments -WorkingDirectory $game -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $OutputDirectory 'd4r.stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'd4r.stderr.log')
+    # Drain raw bytes concurrently. PowerShell's line-oriented redirection can
+    # throttle a verbose game and distort the very timings we are collecting.
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = GamePath 'd4r/d4r_debug_launcher.exe'
+    $info.Arguments = $arguments -join ' '
+    $info.WorkingDirectory = $game
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
+    if (!$process.Start()) { throw 'Game debugger launch failed.' }
+    $outFile = [IO.File]::Open((Join-Path $OutputDirectory 'd4r.stdout.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $errFile = [IO.File]::Open((Join-Path $OutputDirectory 'd4r.stderr.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $outTask = $process.StandardOutput.BaseStream.CopyToAsync($outFile)
+    $errTask = $process.StandardError.BaseStream.CopyToAsync($errFile)
     Write-Host "Game diagnostic started (preset $Preset). Logs: $OutputDirectory"
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while (!$process.WaitForExit(1000)) {
         if ($RunSeconds -gt 0 -and $timer.Elapsed.TotalSeconds -ge $RunSeconds) { $process.Kill(); $process.WaitForExit(); break }
     }
     $process.WaitForExit()
+    [void]$outTask.GetAwaiter().GetResult(); [void]$errTask.GetAwaiter().GetResult()
+    $outFile.Dispose(); $outFile = $null; $errFile.Dispose(); $errFile = $null
     foreach ($file in Get-ChildItem -LiteralPath $game -Filter 'OptiScaler*.log' -File) { Copy-Item -LiteralPath $file.FullName -Destination $OutputDirectory -Force }
     $stderr = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stderr.log') -Raw
     $stdout = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stdout.log') -Raw
@@ -201,6 +224,10 @@ try {
     Write-Host "Game diagnostic bundle: $OutputDirectory.zip"
 } finally {
     if ($process -and !$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+    if ($outTask) { try { [void]$outTask.GetAwaiter().GetResult() } catch {} }
+    if ($errTask) { try { [void]$errTask.GetAwaiter().GetResult() } catch {} }
+    if ($outFile) { $outFile.Dispose() }; if ($errFile) { $errFile.Dispose() }
+    if ($process) { $process.Dispose() }
     foreach ($key in $old.Keys) { [Environment]::SetEnvironmentVariable($key,$old[$key],'Process') }
     foreach ($entry in $originalSettings) { Copy-Item -LiteralPath $entry.saved -Destination $entry.path -Force }
 }

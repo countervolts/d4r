@@ -46,6 +46,18 @@ the GPU before returning it to D3D12. Only two diagnostic counters (8 bytes)
 are read by the CPU; image data remains in VRAM. Validation failures are
 reported explicitly. Disable this diagnostic when measuring production speed.
 
+`-ProfileStages` records CPU completion time for seven interop/NGX stages.
+The runner drains stdout/stderr concurrently as raw bytes; the earlier
+line-oriented PowerShell collector imposed large per-frame delays. The optional
+ZLUDA kernel profiler is for diagnostics only. Measurements and reproduction
+commands are in [windows-performance.md](windows-performance.md).
+
+Ordinary runs use OptiScaler info logging and suppress successful HIP/CUDA API
+messages. Errors, GPU identity, imports, frame records and native/translated
+kernel launches remain logged. `-VerboseRuntime` enables all API and frontend
+trace messages when investigating a failure. Numerical relaxation flags are
+cleared in the child process; FP16 rounding and subnormals stay enabled.
+
 Original files are backed up before replacement. Restore with:
 
 ```powershell

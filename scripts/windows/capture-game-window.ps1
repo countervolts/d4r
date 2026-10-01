@@ -15,6 +15,7 @@ public static class D4RWindowCapture {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 }
 '@
@@ -39,6 +40,9 @@ $callback = [D4RWindowCapture+Callback]{ param($window,$data)
 $windows | Select-Object handle,title,visible,area | Format-Table
 $chosen = $windows | Where-Object { $_.visible -and $_.area -gt 4096 } | Sort-Object area -Descending | Select-Object -First 1
 if (!$chosen) { throw "No visible game window for PID $GameProcessId" }
+if ([D4RWindowCapture]::GetForegroundWindow() -ne $chosen.handle) {
+    throw 'Game window is not foreground; capture refused to avoid including unrelated overlapping windows.'
+}
 $rect = $chosen.rect
 $bitmap = [Drawing.Bitmap]::new($rect.Right-$rect.Left,$rect.Bottom-$rect.Top)
 $graphics = [Drawing.Graphics]::FromImage($bitmap)

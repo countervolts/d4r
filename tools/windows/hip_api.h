@@ -4,6 +4,7 @@
 
 namespace d4r::diag {
 struct HipApi {
+    bool verbose = true; // Probes log every call; the game can suppress successful API calls.
     SearchDirectory search;
     Library library;
 #define D4R_HIP_FUNCTION(name) decltype(&::name) name = library.symbol<decltype(&::name)>(#name)
@@ -36,7 +37,7 @@ struct HipApi {
         search(std::filesystem::path(wide(root)) / L"bin"),
         library(std::filesystem::path(wide(root)) / L"bin" / L"amdhip64_7.dll") {}
     void check(hipError_t result, const char* call) const {
-        std::printf("HIP %s -> %d (%s)\n", call, static_cast<int>(result), hipGetErrorName(result));
+        if (verbose || result != hipSuccess) std::printf("HIP %s -> %d (%s)\n", call, static_cast<int>(result), hipGetErrorName(result));
         if (result != hipSuccess) throw std::runtime_error(std::string(call) + ": " + hipGetErrorString(result));
     }
     int select_gfx1201(int requested, hipDeviceProp_t& selected) const {

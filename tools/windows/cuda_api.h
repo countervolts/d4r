@@ -7,6 +7,7 @@ using CUcontext = void*;
 using CUmodule = void*;
 using CUfunction = void*;
 struct CudaApi {
+    bool verbose = true;
     d4r::diag::SearchDirectory search;
     d4r::diag::Library library;
 #define D4R_CU(name, ret, ...) using name##_fn = ret(WINAPI*)(__VA_ARGS__); name##_fn name = library.symbol<name##_fn>(#name)
@@ -41,7 +42,7 @@ struct CudaApi {
         const char* name = "unknown", *message = "unknown";
         if (result) { cuGetErrorName(result, &name); cuGetErrorString(result, &message); }
         else name = "CUDA_SUCCESS";
-        std::printf("CUDA %s -> %d (%s)\n", call, result, name ? name : "unknown");
+        if (verbose || result) std::printf("CUDA %s -> %d (%s)\n", call, result, name ? name : "unknown");
         if (result) throw std::runtime_error(std::string(call) + ": " + (message ? message : "unknown"));
     }
 };

@@ -154,7 +154,7 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
             d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Enhanced").c_str(), state.enhanced);
             d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Layout").c_str(), unsigned(state.layout));
             d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Access").c_str(), unsigned(state.access));
-            std::printf("D4R_RESOURCE_ACCESS plane=%s enhanced=%u legacy=0x%x layout=%u access=0x%x\n",
+            if (!std::getenv("D4R_QUIET_API")) std::printf("D4R_RESOURCE_ACCESS plane=%s enhanced=%u legacy=0x%x layout=%u access=0x%x\n",
                 names[i], state.enhanced, unsigned(state.legacy), unsigned(state.layout), unsigned(state.access));
         }
         d4r::win::commands::record_boundary(list, [feature, snapshot](ID3D12CommandQueue* queue) {
@@ -168,7 +168,7 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
                 d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Enhanced").c_str(), resolved.enhanced);
                 d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Layout").c_str(), unsigned(resolved.layout));
                 d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Access").c_str(), unsigned(resolved.access));
-                std::printf("D4R_INHERITED_ACCESS plane=%s tracked=%u enhanced=%u layout=%u legacy=0x%x\n",
+                if (!std::getenv("D4R_QUIET_API")) std::printf("D4R_INHERITED_ACCESS plane=%s tracked=%u enhanced=%u layout=%u legacy=0x%x\n",
                     names[i], !resolved.inherited, resolved.enhanced, unsigned(resolved.layout), unsigned(resolved.legacy));
             }
             feature->evaluate_boundary(queue, snapshot->parameters);

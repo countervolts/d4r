@@ -17,7 +17,7 @@ inline std::string env_path(const char* name) {
     return value;
 }
 inline void ngx_check(unsigned result, const char* operation) {
-    std::printf("D4R_NGX %s result=0x%08x\n", operation, result);
+    if (result != 1 || !std::getenv("D4R_QUIET_API")) std::printf("D4R_NGX %s result=0x%08x\n", operation, result);
     if (result != 1) throw std::runtime_error(std::string(operation) + " NGX=" + std::to_string(result));
 }
 inline ResourceAccess ngx_resource_access(void* parameters, const char* name, D3D12_RESOURCE_STATES fallback) {
@@ -82,6 +82,7 @@ struct Runtime {
         try {
             hipDeviceProp_t props{};
             hip.select_gfx1201(-1, props);
+            hip.verbose = cuda.verbose = !std::getenv("D4R_QUIET_API");
             const auto luid = adapter_luid(d3d);
             if (std::memcmp(&luid, props.luid, sizeof(luid))) throw std::runtime_error("D3D12/HIP LUID mismatch");
             cuda.check(cuda.cuInit(0), "cuInit(Windows runtime)");
@@ -289,8 +290,18 @@ private:
     }
     void execute_cuda(ID3D12CommandQueue* queue) {
         const auto begin = std::chrono::steady_clock::now();
+        auto stage = begin;
+        const bool profileStages = std::getenv("D4R_PROFILE_STAGES") != nullptr;
+        auto mark = [&](const char* name) {
+            if (!profileStages) return;
+            const auto now = std::chrono::steady_clock::now();
+            std::printf("D4R_STAGE name=%s cpu_ms=%.6f\n", name,
+                std::chrono::duration<double, std::milli>(now - stage).count());
+            stage = std::chrono::steady_clock::now();
+        };
         rt_->timeline->wait_input(queue);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Interop input producer completion");
+        mark("input_fence_wait");
         for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
             auto& plane = planes_[i];
             void* data = plane.shared->mapped; uint64_t pitch = plane.shared->footprint.Footprint.RowPitch;
@@ -301,6 +312,7 @@ private:
             }
             plane.image->upload_device(reinterpret_cast<uintptr_t>(data), pitch);
         }
+        mark("input_conversion_array_upload");
         if (std::getenv("D4R_INTEROP_VERIFY")) {
             for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
                 uint32_t sample[8]{};
@@ -315,13 +327,16 @@ private:
             }
         }
         ngx_check(rt_->evaluate(handle_, parameters_, nullptr), "CUDA EvaluateFeature");
+        mark("ngx_evaluate_host");
         // NGX can use internal nonblocking streams. The default stream alone
         // does not establish completion of those streams.
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "NGX all-stream completion");
+        mark("ngx_all_stream_completion");
         auto& output = planes_[3];
         output.image->download_device(reinterpret_cast<uintptr_t>(output.canonical ? output.canonical->data : output.shared->mapped),
             output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM output completion");
+        mark("output_array_download");
         if (std::getenv("D4R_VALIDATE_OUTPUT")) {
             if (!rt_->pixels) rt_->pixels = std::make_unique<PixelProgram>(rt_->hip, pixel_module_path());
             const auto counts = rt_->pixels->validate(output.canonical ? output.canonical->data : output.shared->mapped,
@@ -329,9 +344,11 @@ private:
             std::printf("D4R_OUTPUT_VALIDATION elements=%llu nan=%u inf=%u diagnostics_cpu_bytes=8\n", output.desc.Width * output.desc.Height * 4, counts[0], counts[1]);
             if (counts[0] || counts[1]) throw std::runtime_error("DLSS output contains NaN/Inf");
         }
+        mark("output_diagnostic");
         if (output.canonical) rt_->pixels->convert(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
             output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height, output.spec.storage, 3);
         rt_->timeline->signal_output(queue);
+        mark("output_conversion_fence_signal");
         std::printf("D4R_FRAME cpu_frame_copies=%u frame_age=0 interop_ngx_ms=%.3f\n", std::getenv("D4R_INTEROP_VERIFY") ? 1u : 0u,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
     }

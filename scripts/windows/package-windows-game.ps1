@@ -49,6 +49,7 @@ Stage (Join-Path $repo 'scripts/windows/windows-game.ps1') 'windows-game.ps1'
 Stage (Join-Path $repo 'scripts/windows/capture-game-window.ps1') 'capture-game-window.ps1'
 Stage (Join-Path $repo 'scripts/windows/send-game-key.ps1') 'send-game-key.ps1'
 Stage (Join-Path $repo 'docs/windows-game.md') 'README.md'
+Stage (Join-Path $repo 'docs/windows-performance.md') 'windows-performance.md'
 Stage (Join-Path $repo 'LICENSE') 'licenses/d4r.txt'
 Stage (Join-Path $OptiScalerRoot 'GPL-3.0.txt') 'licenses/OptiScaler.txt'
 Stage (Join-Path $repo 'external/ZLUDA/LICENSE-MIT') 'licenses/ZLUDA-MIT.txt'
@@ -62,8 +63,9 @@ foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/zluda') 
 $metadata = [ordered]@{
     architecture='gfx1201'; nativeKernels=16; dlssSha256='3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983';
     d4rCommit=(& git -C $repo rev-parse HEAD).Trim();
+    d4rWorkingTreeDirty=[bool](& git -C $repo status --porcelain);
     optiScaler=(Get-Content -LiteralPath (Join-Path $OptiScalerRoot 'build-info.json') -Raw | ConvertFrom-Json);
-    zludaCommit=(& git -C (Join-Path $repo 'external/ZLUDA') rev-parse HEAD).Trim();
+    zludaBuild=(Get-Content -LiteralPath (Join-Path $ZludaRoot 'build-info.json') -Raw | ConvertFrom-Json);
     hipRuntime='TheRock 10.2.0a20260929 / HIP 7.17.26386';
     files=@($stagedFiles | ForEach-Object { Get-Item -LiteralPath (Join-Path $PackageRoot $_) } | ForEach-Object {
         @{path=$_.FullName.Substring($PackageRoot.Length+1); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash; version=$_.VersionInfo.FileVersion}
