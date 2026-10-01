@@ -221,6 +221,7 @@ struct CudaApi
     int(WINAPI* ctxSynchronize)() = nullptr;
     int(WINAPI* eventCreate)(CudaEvent*, unsigned int) = nullptr;
     int(WINAPI* eventRecord)(CudaEvent, void*) = nullptr;
+    int(WINAPI* eventSynchronize)(CudaEvent) = nullptr;
     int(WINAPI* eventElapsedTime)(float*, CudaEvent, CudaEvent) = nullptr;
     int(WINAPI* eventDestroy)(CudaEvent) = nullptr;
     // Optional: overlapped staging (see async_copies()).
@@ -528,6 +529,8 @@ static void load_portable_config()
 
     // Native kernels: d4r\kernels, each used only when DLSS's PTX for it matches (see the bridge).
     const std::string native = ascii_lower(ini_value(ini, "kernels", "NativeKernels"));
+    // The bridge selects accuracy variants and enforces their compiler/sync policy before cuInit.
+    portable_set_unix("D4R_PREFER_ACCURACY", ini_flag(ini, "kernels", "PreferAccuracy", 0) ? "1" : "0");
     const bool nativeOn = native.empty() || native == "on" || native == "true" || native == "1" || native == "fast";
     if (!nativeOn && native != "off" && native != "false" && native != "0")
         g_portable.notes.push_back("d4r.ini: [Kernels] NativeKernels must be on or off, not '" + native + "'");
@@ -654,6 +657,16 @@ using ProfileClock = std::chrono::steady_clock;
 static double profile_ms(ProfileClock::time_point start, ProfileClock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static double profile_thread_cpu_ms()
+{
+    FILETIME created = {}, exited = {}, kernel = {}, user = {};
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+        return -1.0;
+    const uint64_t kernelTicks = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+    const uint64_t userTicks = (static_cast<uint64_t>(user.dwHighDateTime) << 32) | user.dwLowDateTime;
+    return static_cast<double>(kernelTicks + userTicks) / 10000.0;
 }
 
 // --- CUDA worker thread --------------------------------------------------------
@@ -1292,14 +1305,18 @@ static bool load_libraries()
         g.cu.outputKernelNative = nullptr;
     if (!load_export(g.cuda, "d4rRegisterLinearTexture", g.cu.registerLinearTexture))
         g.cu.registerLinearTexture = nullptr;
-    if (profile_enabled())
+    if (profile_enabled() || env_uint("D4R_SHIM_BLOCKING_SYNC", 0) != 0)
     {
-        const bool events = load_export(g.cuda, "cuEventCreate", g.cu.eventCreate) &&
-                            load_export(g.cuda, "cuEventRecord", g.cu.eventRecord) &&
-                            load_export(g.cuda, "cuEventElapsedTime", g.cu.eventElapsedTime) &&
-                            load_export(g.cuda, "cuEventDestroy", g.cu.eventDestroy);
-        if (!events)
+        const bool create = load_export(g.cuda, "cuEventCreate", g.cu.eventCreate);
+        const bool record = load_export(g.cuda, "cuEventRecord", g.cu.eventRecord);
+        const bool wait = env_uint("D4R_SHIM_BLOCKING_SYNC", 0) != 0
+                              ? load_export(g.cuda, "d4rEventSynchronize", g.cu.eventSynchronize) : true;
+        const bool destroy = load_export(g.cuda, "cuEventDestroy", g.cu.eventDestroy);
+        const bool elapsed = profile_enabled() ? load_export(g.cuda, "cuEventElapsedTime", g.cu.eventElapsedTime) : true;
+        if (profile_enabled() && !(create && record && destroy && elapsed))
             logf("D4R_PROFILE: CUDA event timing unavailable; CPU stage timings remain enabled");
+        if (env_uint("D4R_SHIM_BLOCKING_SYNC", 0) != 0 && !(create && record && wait && destroy))
+            logf("blocking output wait unavailable; using context sync");
     }
     logf("loaded NGX core %ls and nvcuda.dll: %s", corePath, ok ? "all exports present" : "exports missing");
     return ok;
@@ -1484,6 +1501,9 @@ struct FrameTiming
     double download = 0, outputConvert = 0;
     double prep = 0, worker = 0, workerWait = 0, finishWait = 0, markerWait = 0;
     double ngxHost = 0, ctxSync = 0, gpuEval = -1;
+    bool gpuEventsRecorded = false;
+    double outputSyncWall = 0, outputSyncCpu = -1;
+    bool outputSyncBlocking = false;
     double h2dTotal = 0, d2hIssue = 0, d2hWait = 0;
     ProfileClock::time_point prepStart, workerQueued, finishQueued;
     size_t queueDepth = 0;
@@ -1536,6 +1556,7 @@ struct Feature
     int quality = 0, flags = 0;
     unsigned int preset = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
+    CudaEvent outputReadyEvent = nullptr;
     bool profileEventsReady = false;
 
     CudaImage color, depth, motion, exposure, output;
@@ -1590,6 +1611,7 @@ struct Feature
     ID3D12Resource* marker = nullptr;
     volatile uint32_t* markerValue = nullptr;
     uint32_t frame = 0;
+    uint32_t rejectedFormatCount = 0; // game thread; rate-limits format diagnostics
     std::atomic<int> latestOutput{-1};
     std::atomic<uint32_t> completedFrames{0};
     uint32_t evaluatedFrames = 0; // worker only
@@ -3613,7 +3635,40 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     copy.Height = feature->output.height;
     int result = rowBytes * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
     if (result == 0)
-        result = g.cu.ctxSynchronize();
+    {
+        const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
+        const double cpuStart = timing.enabled ? profile_thread_cpu_ms() : -1.0;
+        if (feature->outputReadyEvent != nullptr)
+        {
+            const int recordResult = g.cu.eventRecord(feature->outputReadyEvent, nullptr);
+            const int waitResult = recordResult == 0 ? g.cu.eventSynchronize(feature->outputReadyEvent) : recordResult;
+            if (waitResult == 0)
+                timing.outputSyncBlocking = true;
+            else
+            {
+                logf("frame %u: blocking output wait failed (record %d, wait %d); using context sync", frame,
+                     recordResult, waitResult);
+                result = g.cu.ctxSynchronize();
+                g.cu.eventDestroy(feature->outputReadyEvent);
+                feature->outputReadyEvent = nullptr;
+            }
+        }
+        else
+            result = g.cu.ctxSynchronize();
+        if (timing.enabled)
+        {
+            timing.outputSyncWall = profile_ms(syncStart, ProfileClock::now());
+            const double cpuEnd = profile_thread_cpu_ms();
+            if (cpuStart >= 0.0 && cpuEnd >= 0.0)
+                timing.outputSyncCpu = std::max(0.0, cpuEnd - cpuStart);
+        }
+    }
+    if (result == 0 && timing.gpuEventsRecorded)
+    {
+        float gpuEvalMs = -1.0f;
+        if (g.cu.eventElapsedTime(&gpuEvalMs, feature->profileStart, feature->profileEnd) == 0)
+            timing.gpuEval = gpuEvalMs;
+    }
     if (result != 0)
     {
         logf("frame %u: VRAM output copy failed: %d", frame, result);
@@ -3802,8 +3857,9 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     static const bool evalSync = env_uint("D4R_SHIM_EVAL_SYNC", 1) != 0;
     const int syncResult = params.vram && !evalSync ? 0 : g.cu.ctxSynchronize();
     const auto evaluated = ProfileClock::now();
+    const bool gpuEventsRecorded = eventStartResult == 0 && eventEndResult == 0;
     float gpuEvalMs = -1.0f;
-    if (eventStartResult == 0 && eventEndResult == 0 && syncResult == 0 &&
+    if (gpuEventsRecorded && syncResult == 0 && (!params.vram || evalSync) &&
         g.cu.eventElapsedTime(&gpuEvalMs, feature->profileStart, feature->profileEnd) != 0)
         gpuEvalMs = -1.0f;
     if (params.vram && !gpuWait)
@@ -3825,6 +3881,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         timing.ngxHost = profile_ms(evalStart, evalReturned);
         timing.ctxSync = profile_ms(syncStart, evaluated);
         timing.gpuEval = gpuEvalMs;
+        timing.gpuEventsRecorded = gpuEventsRecorded && params.vram && !evalSync;
     }
     if (params.vram)
     {
@@ -3988,7 +4045,8 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
              "d3d_input_record=%.3f d3d_output_record=%.3f game_call=%.3f "
              "color_convert=%.3f depth_convert=%.3f motion_convert=%.3f exposure_convert=%.3f "
              "color_h2d=%.3f depth_h2d=%.3f motion_h2d=%.3f exposure_h2d=%.3f "
-             "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f d2h=%.3f output_convert=%.3f "
+             "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f output_sync_wall=%.3f "
+             "output_sync_cpu=%.3f output_sync_blocking=%d d2h=%.3f output_convert=%.3f "
              "h2d_total=%.3f d2h_issue=%.3f d2h_wait=%.3f "
              "prep=%.3f worker_wait=%.3f worker=%.3f finish_wait=%.3f finish=%.3f pipeline=%.3f "
              "throughput_interval=%.3f presented=%u age=%d",
@@ -4001,7 +4059,8 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
              timing.inputRecord, timing.outputRecord, timing.gameCall,
              timing.convert[0], timing.convert[1], timing.convert[2], timing.convert[3],
              timing.upload[0], timing.upload[1], timing.upload[2], timing.upload[3],
-             timing.ngxHost, timing.ctxSync, timing.gpuEval, timing.download, timing.outputConvert,
+             timing.ngxHost, timing.ctxSync, timing.gpuEval, timing.outputSyncWall, timing.outputSyncCpu,
+             timing.outputSyncBlocking, timing.download, timing.outputConvert,
              timing.h2dTotal, timing.d2hIssue, timing.d2hWait,
              timing.prep, timing.workerWait, timing.worker, timing.finishWait, profile_ms(start, finished),
              profile_ms(timing.prepStart, finished), interval,
@@ -4296,6 +4355,22 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         else
             feature->scratch = 0;
         const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature->cudaHandle);
+        if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 0) != 0 &&
+            g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
+            g.cu.eventSynchronize != nullptr && g.cu.eventDestroy != nullptr)
+        {
+            // All VRAM-path input waits, NGX kernels and output copies use the null stream.
+            // A blocking event yields the CPU while the GPU finishes that stream.
+            constexpr unsigned int kBlockingSyncNoTiming = 0x1u | 0x2u;
+            const int eventResult = g.cu.eventCreate(&feature->outputReadyEvent, kBlockingSyncNoTiming);
+            if (eventResult != 0)
+            {
+                logf("blocking output wait unavailable (cuEventCreate %d); using context sync", eventResult);
+                feature->outputReadyEvent = nullptr;
+            }
+            else
+                logf("blocking output wait enabled for this feature");
+        }
         if (created == NGX_SUCCESS && profile_enabled() && g.cu.eventCreate != nullptr &&
             g.cu.eventRecord != nullptr && g.cu.eventElapsedTime != nullptr && g.cu.eventDestroy != nullptr)
         {
@@ -4396,11 +4471,23 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
              colorDesc.Width, colorDesc.Height, colorDesc.Format, depthDesc.Width, depthDesc.Height, depthDesc.Format,
              motionDesc.Width, motionDesc.Height, motionDesc.Format, outputDesc.Width, outputDesc.Height,
              outputDesc.Format, exposure);
-    if (!supported_input(Plane::Color, colorDesc.Format) || !supported_input(Plane::Depth, depthDesc.Format) ||
-        !supported_input(Plane::Motion, motionDesc.Format) || !supported_output(outputDesc.Format))
+    const bool colorSupported = supported_input(Plane::Color, colorDesc.Format);
+    const bool depthSupported = supported_input(Plane::Depth, depthDesc.Format);
+    const bool motionSupported = supported_input(Plane::Motion, motionDesc.Format);
+    const bool outputSupported = supported_output(outputDesc.Format);
+    if (!colorSupported || !depthSupported || !motionSupported || !outputSupported)
     {
-        if (frame <= 3)
-            logf("evaluate frame %u: unsupported format", frame);
+        // Log the first failures even if they occur well after startup, then periodically.
+        const uint32_t rejected = ++feature->rejectedFormatCount;
+        if (rejected <= 3 || rejected % 120 == 0)
+            logf("evaluate feature %u frame %u: unsupported format (rejection %u): "
+                 "color %llux%u fmt=%d%s, depth %llux%u fmt=%d%s, "
+                 "mv %llux%u fmt=%d%s, output %llux%u fmt=%d%s",
+                 feature->handle.Id, frame, rejected,
+                 colorDesc.Width, colorDesc.Height, colorDesc.Format, colorSupported ? "" : " (unsupported)",
+                 depthDesc.Width, depthDesc.Height, depthDesc.Format, depthSupported ? "" : " (unsupported)",
+                 motionDesc.Width, motionDesc.Height, motionDesc.Format, motionSupported ? "" : " (unsupported)",
+                 outputDesc.Width, outputDesc.Height, outputDesc.Format, outputSupported ? "" : " (unsupported)");
         return NGX_FAIL_UNSUPPORTED_FORMAT;
     }
     if (exposure != nullptr)
@@ -4710,6 +4797,8 @@ static void release_feature(Feature* feature)
             g.cu.eventDestroy(feature->profileStart);
         if (feature->profileEnd != nullptr)
             g.cu.eventDestroy(feature->profileEnd);
+        if (feature->outputReadyEvent != nullptr)
+            g.cu.eventDestroy(feature->outputReadyEvent);
         if (feature->scratch != 0)
             g.cu.memFree(feature->scratch);
         for (CudaDevicePtr buffer : feature->planeLinear)

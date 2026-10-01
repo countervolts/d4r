@@ -28,6 +28,7 @@ mkdir -p "$WORK_ROOT"
 SOURCE="$ZLUDA_SOURCE_ROOT/ptx/lib/zluda_ptx_impl.cpp"
 PTX_LIB="$ZLUDA_SOURCE_ROOT/ptx/lib"
 COMMON_FLAGS=(-DHIP_ENABLE_WARP_SYNC_BUILTINS -std=c++20 -Xclang -fdenormal-fp-math=dynamic
+  --rocm-path="$ROCM_ROOT" -I"$ROCM_ROOT/include"
   -Wall -Wextra -Wsign-compare -Wconversion -x hip "$SOURCE" -nogpulib -O3
   -mno-wavefrontsize64 --offload-device-only --offload-arch=gfx1030 -emit-llvm -c
   -Xclang -mlink-bitcode-file -Xclang "$OCML" "${EXTRA_FLAGS[@]}")

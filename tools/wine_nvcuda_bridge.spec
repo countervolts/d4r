@@ -92,6 +92,7 @@
 @ stdcall d4rReleaseVulkanMemory(ptr) d4rReleaseVulkanMemory
 @ stdcall d4rMemcpy2DAsync(ptr ptr) d4rMemcpy2DAsync
 @ stdcall d4rCtxSynchronize() d4rCtxSynchronize
+@ stdcall d4rEventSynchronize(ptr) d4rEventSynchronize
 @ stdcall d4rStreamWaitValue32(int64 long) d4rStreamWaitValue32
 @ stdcall d4rWriteValue32(int64 long) d4rWriteValue32
 @ stdcall d4rSetArrayRedirect(ptr int64 long) d4rSetArrayRedirect

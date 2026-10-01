@@ -4,13 +4,13 @@ d4r @VERSION@: where every file in this release comes from
 Built from source by d4r (Apache License 2.0, d4r/licenses/d4r-LICENSE.txt):
   d4r/nvngx.dll          NGX shim            tools/d4r_nvngx_shim.cpp in the d4r repository
   d4r/nvcuda.dll         Wine CUDA bridge    tools/wine_nvcuda_bridge.c
-  d4r/kernels/           native RDNA3 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
+  d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
                          (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
   d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
 
 Third-party software, unmodified or patched by d4r:
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
-                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0005 applied.
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0007 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).
                          Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
   d3d12.dll, d3d12core.dll

@@ -27,6 +27,13 @@ cp target/release/libnvcuda.so ~/.cache/d4r-zluda-current/
 ln -sf libnvcuda.so ~/.cache/d4r-zluda-current/libcuda.so
 ```
 
+Build the release ZLUDA library on a system or in a container with GLIBC 2.41 or older. A binary
+linked on a newer system can require newer GLIBC symbols even when the ZLUDA source does not need new
+GLIBC features. Before packaging, check it with
+`scripts/check_glibc_compat.sh 2.41 /path/to/libnvcuda.so`. The release packager runs the same
+check on ZLUDA, the Wine CUDA bridge, and every bundled ROCm library. Test the rebuilt library
+with the D3D12 harness and in a game before publishing a release.
+
 The launcher looks for ZLUDA in `D4R_ZLUDA_DIR` (default `~/.cache/d4r-zluda-current`, or `ZludaDir` in d4r.ini).
 
 What the patches add:
@@ -76,6 +83,8 @@ kernels/build.sh all kernels/out/native
 
 `kernels/out/native` then holds one code object per replaced DLSS kernel; set `NativeKernelDirFast` in d4r.ini (or `D4R_ZLUDA_NATIVE_DIR`) to it. `kernels/build.sh k` or `m` builds only the network layers and needs neither the DLL nor ZLUDA. The texture kernels (`tex`) extract PTX from your DLL into `kernels/extracted/` and compile it offline for `D4R_GPU_ARCH` through `D4R_ZLUDA_EMIT`; that directory and the build output are git-ignored and must not be redistributed. On gfx12, build a second variant with `D4R_NATIVE_FP8=1` and place it in an `<arch>-fp8` folder.
 
+To add the accuracy option to a developer set, repeat the build with `D4R_PREFER_ACCURACY=1` and output `kernels/out/native/accuracy` (multi-target builds: `kernels/accuracy/<arch>` and `<arch>-fp8`). Use a separate empty directory; successfully built accuracy sets receive `d4r-accuracy.txt`. Enable `[Kernels] PreferAccuracy = true` and restart. The option defaults to false and never substitutes the fast set when accuracy binaries are absent.
+
 ## 6. Configure and play
 
 The first launch copies `config/d4r.ini.default` to `~/.config/d4r/d4r.ini`. Set the `[Launch]` paths (Proton, the game's compatdata prefix and the game executable), the `[Paths]` above, and the model in `[DLSS]`, then run:
@@ -94,17 +103,41 @@ D4R_OPTISCALER=/path/to/OptiScaler_0.9.4.7z \
 D4R_DLSS_DLLS=/path/to/310.7/nvngx_dlss.dll:/path/to/310.9/nvngx_dlss.dll \
 D4R_BUNDLE_DLSS=/path/to/nvngx_dlss.dll D4R_BUNDLE_NGX=/path/to/_nvngx.dll D4R_BUNDLE_TEX=kernels/out/native \
 D4R_ZLUDA_DIR=~/.cache/d4r-zluda-current D4R_VKD3D_DIR=~/.cache/d4r-vkd3d-d4r D4R_ROCM_DIR=/opt/rocm \
+D4R_ZLUDA_EMIT=/path/to/zluda/target/release/examples/d4r_emit \
 scripts/package_release.sh            # -> dist/d4r-<version>.zip
 ```
 
 The script:
-- builds the shim, the bridge and the network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
+- builds the shim, the bridge and both fast and accuracy network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`;
-- adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`);
+- adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
 The NVIDIA files are not covered by d4r's license; redistributing them is up to whoever publishes the zip. `D4R_BUNDLE_NVIDIA=0` builds `d4r-<version>-nonvidia.zip` without them and without the texture kernels. [architecture.md](architecture.md#portable-installs-the-release-zip) describes how the installed files work together.
+
+### GLIBC 2.41 release builds
+
+Build the pinned environment with:
+
+```sh
+docker build -f packaging/build/Dockerfile.glibc241 -t d4r-build:glibc241 packaging/build
+```
+
+Inside that image, `scripts/build_release_glibc241.sh` rebuilds the GPU device helpers, ZLUDA and its LLVM, `d4r_emit`, the NGX shim, Wine CUDA bridge, patched vkd3d-proton, and performance/accuracy texture sets for every release target. Packaging then builds both network sets, checks all bundled Linux libraries against 2.41, and records the toolchain in `d4r/source/BUILD_INFO.txt`.
+
+Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/opt/rocm`, and an official Rust toolchain (1.98.0 used for 0.1.3) at `/opt/rust`, with `/opt/rust/bin` on `PATH`. Keep toolchain and third-party runtime inputs read-only. Supply the normal package inputs listed above and these build settings:
+
+| Variable | Input |
+|---|---|
+| `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
+| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0007` applied |
+| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patch `0001` applied |
+| `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
+| `D4R_ROCM_DIR` | `/opt/rocm` |
+| `D4R_ROCM_LINK_STUBS` | optional directory for additional ROCm link libraries |
+
+Run `bash scripts/build_release_glibc241.sh` inside the container. The script checks that the build system actually reports `glibc 2.41`, rejects external source-cache checkouts, builds with the locked Cargo dependencies offline, and runs the configuration tests before packaging. The ZIP and checksum go in `$D4R_RELEASE_BUILD_ROOT/dist/`; logs and `toolchain.txt` remain in the build directory. AMD's bundled ROCm runtime, OptiScaler and NVIDIA's libraries remain supplied binaries; the Linux ABI check covers the bundled ROCm libraries too.
 
 `D4R_BUNDLE_TEX` accepts the older flat directory for gfx1101, or a directory with per-target subdirectories (`gfx1100/`–`gfx1103/`, `gfx1200/`, `gfx1201/`, plus `gfx1200-fp8/` and `gfx1201-fp8/`). Build each texture set with `D4R_GPU_ARCH` and `D4R_ZLUDA_EMIT`; the `-fp8` sets also need `D4R_NATIVE_FP8=1`. `d4r_emit` targets those GPUs offline. Missing texture kernels fall back to ZLUDA on that target; the network-layer kernels are still included. Only the RX 7700 XT has been tested on real hardware.
 

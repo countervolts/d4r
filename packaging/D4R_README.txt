@@ -58,6 +58,12 @@ compiled. They are cached in ~/.cache/d4r, so later starts are quick.
 
 Settings
 --------
+- In d4r/d4r.ini, [Kernels] PreferAccuracy = true prioritizes fidelity over performance for every
+  native kernel and the translated fallback. It selects separately built accuracy kernels, restores
+  intermediate FP8 quantization and per-MMA f16 rounding, preserves denormal handling, and keeps
+  NGX's synchronization calls. It defaults to false. Restart the game after changing it; the first
+  start may compile a separate cache. Missing accuracy variants use translated kernels, never the
+  fast native set. The mode aims to match NVIDIA's output, but 1:1 RTX image quality is not proven.
 - d4r/d4r.ini: d4r's settings for this game. The main one is the DLSS model:
   K (DLSS 4, default), E (DLSS 3 CNN, a little faster) or M (DLSS 4.5, slowest).
 - On RDNA4, [Kernels] NativeFp8 is on by default. It selects native FP8 WMMA and the matching

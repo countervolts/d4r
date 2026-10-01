@@ -14,7 +14,7 @@
 // Kernels that ZLUDA compiles in strict-FP mode (constrained intrinsics) cannot take inlined FP code from
 // here (the AMDGPU backend fails on some constrained operations): build them with -DD4R_SUST_OUTLINE,
 // which keeps the FP bodies of the surface stores in noinline leaf functions (no calls, no stack).
-#ifdef D4R_SUST_OUTLINE
+#if defined(D4R_SUST_OUTLINE) || defined(D4R_ACCURACY)
 #define FP_BODY __attribute__((device, noinline)) static
 #else
 #define FP_BODY __attribute__((device, always_inline)) static inline

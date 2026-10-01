@@ -75,6 +75,7 @@ def main(argv):
         return
 
     env = {}
+    env["D4R_PREFER_ACCURACY"] = "1" if flag("Kernels", "PreferAccuracy") else "0"
 
     model = get("DLSS", "Model")
     if model is not None:

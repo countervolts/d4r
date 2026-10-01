@@ -11,12 +11,14 @@ D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 R="${D4R_ROCM_DIR:-/opt/rocm}"
 ARCH="${D4R_GPU_ARCH:-gfx1101}"
 FP8="${D4R_TEX_FP8:-0}"
+ACCURACY="${D4R_PREFER_ACCURACY:-0}"
 LLVM="$R/lib/llvm/bin"
 B="$(mktemp -d)"
 trap 'rm -rf "$B"' EXIT
 # D4R_TEX_CFLAGS: extra flags for SRC.hip (tests, e.g. -DD4R_WMMA_LAYOUT=12 for the gfx12-layout shim on gfx11)
 read -r -a FLAGS <<< "${D4R_TEX_CFLAGS:-}"
 [[ "$FP8" == 1 ]] && FLAGS+=(-DD4R_TEX_FP8)
+[[ "$ACCURACY" == 1 ]] && FLAGS+=(-DD4R_ACCURACY)
 # SRC.hip -> bitcode without target attributes, so ZLUDA's own target settings apply after linking
 "$LLVM/clang++" -x hip -std=c++20 -nogpuinc -nogpulib -O3 -mno-wavefrontsize64 --offload-device-only \
     --offload-arch="$ARCH" -fgpu-rdc -emit-llvm -c -Xclang -fdenormal-fp-math=dynamic -DD4R_KERNEL_NAME="$K" \
@@ -24,10 +26,12 @@ read -r -a FLAGS <<< "${D4R_TEX_CFLAGS:-}"
 "$LLVM/llvm-dis" "$B/raw.bc" -o "$B/raw.ll"
 sed -E -e '/@llvm.used/d' -e '/wchar_size/d' -e '/llvm.module.flags/d' -e '/__hip_cuid/d' -e 's/optnone//g' \
     -e "s/\"target-cpu\"=\"$ARCH\"//g" -e 's/"target-features"="[^"]+"//g' "$B/raw.ll" | "$LLVM/llvm-as" -o "$B/extra.bc" -
-python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
+D4R_PREFER_ACCURACY="$ACCURACY" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
 # the code-generation switches of the runtime (d4r.ini [Kernels]), which ZLUDA's module cache keys on
 env LD_LIBRARY_PATH="$R/lib" D4R_ZLUDA_EXTRA_BC="$B/extra.bc" D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 \
-    D4R_ZLUDA_WMMA_FP8_NATIVE="$FP8" D4R_ZLUDA_IGNORE_DENORMAL=1 D4R_ZLUDA_IMPLICIT_MAX_BLOCK=256 \
-    D4R_ZLUDA_WAVE64="${D4R_ZLUDA_WAVE64:-0}" "$D4R_ZLUDA_EMIT" "$B/$K.ptx" "$B/dump" "$ARCH" >/dev/null
+    D4R_ZLUDA_WMMA_FP8_NATIVE="$FP8" D4R_ZLUDA_IGNORE_DENORMAL="$((1 - ACCURACY))" \
+    D4R_ZLUDA_WMMA_F32ACC=0 D4R_ZLUDA_FAST_MATH=0 D4R_ZLUDA_IMPLICIT_MAX_BLOCK=256 \
+    D4R_ZLUDA_WAVE64="$([[ "$ACCURACY" == 1 ]] && echo 0 || echo "${D4R_ZLUDA_WAVE64:-0}")" \
+    "$D4R_ZLUDA_EMIT" "$B/$K.ptx" "$B/dump" "$ARCH" >/dev/null
 cp "$B/dump/module.hsaco" "$OUT/$K.hsaco"
 printf '%-52s %s\n' "$K" "$(grep -E '^\s+\.(vgpr_count|private_segment_fixed_size|wavefront_size):' "$B/dump/asm.s" | tr -s ' ' | paste -sd' ')"

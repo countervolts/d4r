@@ -1225,9 +1225,10 @@ index e6f22a6..4256ae5 100644
      Kernel(SpirvWord),
  }
  
-+// d4r: D4R_ZLUDA_IGNORE_DENORMAL=1 drops per-instruction denormal (.ftz) requirements, so a kernel
-+// keeps one denormal mode instead of switching it around ftz instructions (differences only for
-+// values below ~1e-38). Not part of the JIT cache key: use a fresh cache when toggling it.
++// d4r: D4R_ZLUDA_IGNORE_DENORMAL=1 drops only FP32 denormal (.ftz) requirements to avoid mode switches.
++// Keep FP16/FP64 requirements: flushing FP16 values below 2^-14 corrupts K's output and can make its
++// translated attention layers non-finite. The runtime fingerprints code-generation switches in the
++// JIT cache key; native texture code objects must also be rebuilt after changing this policy.
 +fn ignore_denormal_modes() -> bool {
 +    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_IGNORE_DENORMAL").map_or(false, |v| v.trim() == "1"))
@@ -1237,7 +1238,6 @@ index e6f22a6..4256ae5 100644
 +    let mut modes = get_modes_inner(inst);
 +    if ignore_denormal_modes() {
 +        modes.denormal_f32 = None;
-+        modes.denormal_f16f64 = None;
 +    }
 +    // d4r: D4R_ZLUDA_DEBUG_MODES=1 prints instructions that need a non-default rounding mode
 +    if std::env::var("D4R_ZLUDA_DEBUG_MODES").map_or(false, |v| v == "1") {

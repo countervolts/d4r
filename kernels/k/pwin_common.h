@@ -14,6 +14,9 @@
 #endif
 #include <stdint.h>
 #include "../common/wmma_layout.h"
+#if defined(D4R_ACCURACY) && defined(PWIN_F32ACC)
+#undef PWIN_F32ACC
+#endif
 #pragma clang fp contract(off)
 
 typedef _Float16 half_t;
