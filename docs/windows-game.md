@@ -3,8 +3,8 @@
 Validated hardware: Windows 11 x64 / Radeon RX 9070 XT / gfx1201. Native K and
 M transformer kernels pass standalone D3D12 + OptiScaler checks. Silent Hill 2
 K now renders real menu frames and M renders a saved gameplay level with
-GPU NaN/Inf checks. Resolution coverage and performance are still being
-validated. This is a local
+GPU NaN/Inf checks. K also passes 3840x2160 output and M passes 1920x1080.
+Further performance work is in progress. This is a local
 development package; no NVIDIA proprietary DLL is included.
 
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
@@ -29,8 +29,10 @@ Use `-Preset 13` for M. The validated manifest requires DLSS 310.9.1 with the
 recorded SHA256; other feature DLLs require regenerating and validating the
 native manifest. Select an upscaler supported by OptiScaler in the game.
 The script installs `dxgi.dll`, an explicit DLSS configuration and a private
-`d4r` runtime directory, and captures stdout/stderr, an external debugger log,
-crash dump, loaded DLL paths, driver information and OptiScaler logs. A local
+`d4r` runtime directory, and captures stdout/stderr, exit code, loaded DLL paths,
+driver information and OptiScaler logs. Ordinary runs use a process job without
+an attached debugger. Add `-CaptureExceptions` to capture exception events and
+minidumps when reproducing a crash. A local
 ZIP bundle is printed at exit. `-RunSeconds 120` bounds a diagnostic run;
 the normal default allows you to play until you close the game.
 
@@ -46,7 +48,11 @@ the GPU before returning it to D3D12. Only two diagnostic counters (8 bytes)
 are read by the CPU; image data remains in VRAM. Validation failures are
 reported explicitly. Disable this diagnostic when measuring production speed.
 
-`-ProfileStages` records CPU completion time for seven interop/NGX stages.
+`-ProfileStages` records CPU completion time for seven interop/NGX stages,
+command-list split/replay, submitted state publication and suffix completion.
+The recording interval measures NGX calls on the recording thread, not Present.
+`-ProfileKernels` enables synchronizing HIP-event kernel profiling and changes
+frame scheduling; use it separately from a production FPS measurement.
 The runner drains stdout/stderr concurrently as raw bytes; the earlier
 line-oriented PowerShell collector imposed large per-frame delays. The optional
 ZLUDA kernel profiler is for diagnostics only. Measurements and reproduction
@@ -57,6 +63,15 @@ messages. Errors, GPU identity, imports, frame records and native/translated
 kernel launches remain logged. `-VerboseRuntime` enables all API and frontend
 trace messages when investigating a failure. Numerical relaxation flags are
 cleared in the child process; FP16 rounding and subnormals stay enabled.
+
+The optional K output-store optimization is built locally from your NVIDIA DLL
+with `build-native-texture.ps1` and checked by `test-native-texture.ps1`;
+commands and measurements are in [windows-performance.md](windows-performance.md).
+Add `-LocalTextureKernels "C:\Users\Administrator\d4r\build\private-textures-gfx1201"`
+to the game command to install it. The object/manifest hashes and DLSS identity
+must match validation. These generated objects contain NVIDIA code, remain
+private, and are excluded from the distributable package. Ordinary launches
+inherit the game's resolution/window settings; the default argument is `-dx12`.
 
 Original files are backed up before replacement. Restore with:
 

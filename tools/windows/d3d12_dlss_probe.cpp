@@ -73,7 +73,9 @@ int main(int argc, char** argv) {
         ComPtr<ID3D12GraphicsCommandList> list;
         dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf())), "CreateCommandAllocator");
         dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf())), "CreateCommandList");
-        constexpr unsigned width = 256, height = 144, outWidth = 512, outHeight = 288;
+        const unsigned outWidth = args.output_width, outHeight = args.output_height;
+        const unsigned width = outWidth / 2, height = outHeight / 2;
+        std::printf("D3D12_NGX_DIMENSIONS input=%ux%u output=%ux%u\n", width, height, outWidth, outHeight);
         struct Texture { ComPtr<ID3D12Resource> image, upload; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes; } textures[5];
         for (unsigned i = 0; i < 5; ++i) {
             auto& texture = textures[i];
@@ -230,7 +232,8 @@ int main(int argc, char** argv) {
         for (const auto& pair : {std::make_pair("Width", width), std::make_pair("Height", height),
              std::make_pair("OutWidth", outWidth), std::make_pair("OutHeight", outHeight),
              std::make_pair("CreationNodeMask", 1u), std::make_pair("VisibilityNodeMask", 1u)}) d4r_ngx_set_uint(parameters, pair.first, pair.second);
-        d4r_ngx_set_int(parameters, "PerfQualityValue", 2); d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", 0);
+        d4r_ngx_set_int(parameters, "PerfQualityValue", 2); d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", args.ngx_create_flags);
+        std::printf("D3D12_NGX_CREATE_FLAGS value=%u\n", args.ngx_create_flags);
         for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
              "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"}) d4r_ngx_set_uint(parameters, name, args.preset);
         void* handle = nullptr;

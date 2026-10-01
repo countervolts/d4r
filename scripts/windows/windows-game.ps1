@@ -7,10 +7,13 @@ param(
     [int]$RunSeconds = 0,
     [string]$DiagnosticResolution,
     [string]$CacheDirectory = $env:ZLUDA_CACHE_DIR,
+    [string]$LocalTextureKernels,
     [switch]$ValidateOutput,
     [switch]$ProfileStages,
+    [switch]$ProfileKernels,
     [switch]$VerboseRuntime,
-    [string[]]$GameArguments = @('-dx12','-windowed','-ResX=1280','-ResY=720'),
+    [switch]$CaptureExceptions,
+    [string[]]$GameArguments = @('-dx12'),
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
@@ -56,13 +59,40 @@ foreach ($file in $metadata.files) {
     if ((Get-FileHash -LiteralPath (Join-Path $package $file.path) -Algorithm SHA256).Hash -ne $file.sha256) { throw "Package file changed; rebuild package: $($file.path)" }
 }
 if ((Get-FileHash -LiteralPath $DlssDll -Algorithm SHA256).Hash -ne $metadata.dlssSha256) { throw 'DLSS DLL does not match the validated 310.9.1 native manifest. Rebuild and validate native manifests for this DLL first.' }
+$textureFiles=@(); $textureManifest=@()
+if ($LocalTextureKernels) {
+    $LocalTextureKernels=(Get-Item -LiteralPath $LocalTextureKernels -ErrorAction Stop).FullName
+    $validation=Get-Content -LiteralPath (Join-Path $LocalTextureKernels 'validation.json') -Raw | ConvertFrom-Json
+    if (!$validation.passed -or !$validation.strictRgb -or $validation.architecture -ne 'gfx1201' -or
+        $validation.source.dlssSha256 -ne $metadata.dlssSha256 -or !$validation.source.accuracy) {
+        throw 'Local texture kernels must pass test-native-texture.ps1 with the exact packaged DLSS identity.'
+    }
+    foreach ($object in $validation.source.objects.PSObject.Properties) {
+        if ($object.Name -notin @('hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel.hsaco','hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel.hsaco')) {
+            throw "Unvalidated local texture variant: $($object.Name)"
+        }
+        $path=Join-Path $LocalTextureKernels $object.Name
+        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $object.Value) { throw 'Local texture object changed after validation.' }
+        $textureFiles+=Get-Item -LiteralPath $path
+    }
+    if ($textureFiles.Count -ne 2) { throw 'Expected both validated local K output variants.' }
+    # Use the manifest covered by validation, rather than a mutable extra file.
+    foreach ($line in Get-Content -LiteralPath (Join-Path $LocalTextureKernels 'd4r-kernels.txt')) {
+        if (!$line.Trim() -or $line.StartsWith('#')) { continue }
+        if ($line -notmatch '^([A-Za-z0-9_]+) ([0-9a-f]{16})$' -or ($Matches[1]+'.hsaco') -notin @($textureFiles.Name)) { throw 'Invalid local texture manifest.' }
+        $textureManifest+=$line
+    }
+    if ($textureManifest.Count -ne 2) { throw 'Expected two local texture manifest identities.' }
+    if ((Get-FileHash -LiteralPath (Join-Path $LocalTextureKernels 'd4r-kernels.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $validation.manifestSha256) { throw 'Local texture manifest changed after validation.' }
+}
 $manifest = if (Test-Path -LiteralPath $manifestPath) { Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{game=$GameExe; files=@()} }
 if ($manifest.game -ne $GameExe) { throw 'Backup manifest belongs to another executable.' }
 if (!(Test-Path -LiteralPath $manifestPath) -and (Test-Path -LiteralPath (GamePath 'd4r'))) { throw 'An existing d4r directory has no installation manifest; preserved.' }
 New-Item -ItemType Directory -Force $backup | Out-Null
 function InstallFile([string]$source, [string]$relative) {
+    $relative=$relative.Replace('/','\')
     $path = GamePath $relative
-    $entry = @($manifest.files | Where-Object path -eq $relative) | Select-Object -First 1
+    $entry = @($manifest.files | Where-Object { $_.path.Replace('/','\') -eq $relative }) | Select-Object -First 1
     if ($entry) {
         if ((Test-Path -LiteralPath $path) -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.installedHash) { throw "Installed file changed; preserved: $path" }
     } else {
@@ -82,6 +112,13 @@ function InstallFile([string]$source, [string]$relative) {
 }
 InstallFile (Join-Path $package 'OptiScaler.dll') 'dxgi.dll'
 foreach ($file in Get-ChildItem -LiteralPath (Join-Path $package 'd4r') -Recurse -File) { InstallFile $file.FullName $file.FullName.Substring($package.Length+1) }
+if ($LocalTextureKernels) {
+    foreach ($file in $textureFiles) { InstallFile $file.FullName ('d4r/native/' + $file.Name) }
+    $combinedManifest=Join-Path $backup 'generated-native-manifest.txt'
+    @(Get-Content -LiteralPath (Join-Path $package 'd4r/native/d4r-kernels.txt')) + $textureManifest |
+        Set-Content -LiteralPath $combinedManifest -Encoding ASCII
+    InstallFile $combinedManifest 'd4r/native/d4r-kernels.txt'
+}
 # Private local test copies only; these are never added to the public package.
 InstallFile $NgxCore 'd4r/vendor/_nvngx.dll'
 InstallFile $DlssDll 'd4r/vendor/nvngx_dlss.dll'
@@ -136,13 +173,14 @@ $settings = @{
     D4R_ZLUDA_IGNORE_DENORMAL=$null; D4R_ZLUDA_FAST_MATH=$null;
     D4R_ZLUDA_WMMA_F32ACC=$null; D4R_ZLUDA_WAVE64=$null;
     D4R_QUIET_API=$(if ($VerboseRuntime) { $null } else { '1' });
+    D4R_VALIDATE_OUTPUT=$(if ($ValidateOutput) { '1' } else { $null });
+    D4R_PROFILE_STAGES=$(if ($ProfileStages) { '1' } else { $null });
+    D4R_ZLUDA_PROFILE=$(if ($ProfileKernels) { '1' } else { $null });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
 $old = @{}; $process = $null; $originalSettings = @()
 $outFile = $null; $errFile = $null; $outTask = $null; $errTask = $null
-if ($ValidateOutput) { $settings['D4R_VALIDATE_OUTPUT']='1' }
-if ($ProfileStages) { $settings['D4R_PROFILE_STAGES']='1' }
 try {
     if ($DiagnosticResolution) {
         if ([IO.Path]::GetFileName($GameExe) -ne 'SHProto-Win64-Shipping.exe' -or $DiagnosticResolution -notmatch '^([0-9]{3,4})x([0-9]{3,4})$') { throw 'DiagnosticResolution currently supports Silent Hill 2 only; use e.g. 1280x720.' }
@@ -173,10 +211,12 @@ try {
         Write-Host "Temporary diagnostic resolution: $DiagnosticResolution; original settings restore at exit."
     }
     foreach ($key in $settings.Keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key,'Process'); [Environment]::SetEnvironmentVariable($key,$settings[$key],'Process') }
-    @{preset=$Preset; game=$GameExe; package=$metadata; driver=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate); arguments=$GameArguments} |
+    @{preset=$Preset; game=$GameExe; package=$metadata; attachedDebugger=[bool]$CaptureExceptions; driver=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate); arguments=$GameArguments} |
         ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'environment.json') -Encoding UTF8
     function Quote([string]$value) { if ($value.Contains('"')) { throw 'A command argument contains an unsupported quote.' }; return '"' + $value + '"' }
-    $arguments = @('--output-directory', (Quote $OutputDirectory), '--', (Quote $GameExe)) + @($GameArguments | ForEach-Object { Quote $_ })
+    $arguments = @('--output-directory', (Quote $OutputDirectory))
+    if (!$CaptureExceptions) { $arguments += '--no-debug' }
+    $arguments += @('--', (Quote $GameExe)) + @($GameArguments | ForEach-Object { Quote $_ })
     # Drain raw bytes concurrently. PowerShell's line-oriented redirection can
     # throttle a verbose game and distort the very timings we are collecting.
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -186,7 +226,7 @@ try {
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
-    if (!$process.Start()) { throw 'Game debugger launch failed.' }
+    if (!$process.Start()) { throw 'Game diagnostic launch failed.' }
     $outFile = [IO.File]::Open((Join-Path $OutputDirectory 'd4r.stdout.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     $errFile = [IO.File]::Open((Join-Path $OutputDirectory 'd4r.stderr.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     $outTask = $process.StandardOutput.BaseStream.CopyToAsync($outFile)

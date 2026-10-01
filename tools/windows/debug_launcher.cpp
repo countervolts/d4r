@@ -2,6 +2,7 @@
 #include "diagnostic.h"
 #include <map>
 #include <fstream>
+#include <tlhelp32.h>
 
 namespace {
 std::wstring quote(const std::wstring& value) {
@@ -31,14 +32,16 @@ uint32_t module_size(HANDLE process, uintptr_t base) {
 }
 int main(int argc, char** argv) {
     try {
-        if (argc < 5 || std::strcmp(argv[1], "--output-directory") || std::strcmp(argv[3], "--"))
-            throw std::runtime_error("Usage: d4r_debug_launcher --output-directory PATH -- EXE [arguments]");
+        const bool debug = argc < 4 || std::strcmp(argv[3], "--no-debug");
+        const int separator = debug ? 3 : 4;
+        if (argc <= separator + 1 || std::strcmp(argv[1], "--output-directory") || std::strcmp(argv[separator], "--"))
+            throw std::runtime_error("Usage: d4r_debug_launcher --output-directory PATH [--no-debug] -- EXE [arguments]");
         const std::filesystem::path directory(d4r::diag::wide(argv[2]));
         std::filesystem::create_directories(directory);
         std::ofstream log(directory / L"debugger.log", std::ios::app);
-        const auto executable = d4r::diag::wide(argv[4]);
+        const auto executable = d4r::diag::wide(argv[separator + 1]);
         std::wstring command;
-        for (int i = 4; i < argc; ++i) { if (i > 4) command += L' '; command += quote(d4r::diag::wide(argv[i])); }
+        for (int i = separator + 1; i < argc; ++i) { if (i > separator + 1) command += L' '; command += quote(d4r::diag::wide(argv[i])); }
         STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION child{};
         startup.dwFlags = STARTF_USESTDHANDLES;
         startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
@@ -50,11 +53,38 @@ int main(int argc, char** argv) {
         if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
             throw std::runtime_error("Cannot create diagnostic process lifetime job");
         if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
-            DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child))
+            (debug ? DEBUG_ONLY_THIS_PROCESS : 0) | CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child))
             throw std::runtime_error("CreateProcess debugger error=" + std::to_string(GetLastError()));
         if (!AssignProcessToJobObject(job, child.hProcess)) {
             TerminateProcess(child.hProcess, 1); CloseHandle(job);
             throw std::runtime_error("AssignProcessToJobObject debugger failed");
+        }
+        log << "LAUNCH pid=" << child.dwProcessId << " attached_debugger=" << debug << std::endl;
+        if (ResumeThread(child.hThread) == DWORD(-1)) {
+            CloseHandle(job); throw std::runtime_error("Cannot resume diagnostic child");
+        }
+        if (!debug) {
+            // Retain bounded process ownership and raw inherited output without
+            // debugger stops on DLL/thread/exception/debug-string events.
+            std::map<uintptr_t, Module> inventory;
+            while (WaitForSingleObject(child.hProcess, 1000) == WAIT_TIMEOUT) {
+                HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, child.dwProcessId);
+                if (snapshot == INVALID_HANDLE_VALUE) continue;
+                MODULEENTRY32W module{sizeof(module)};
+                if (Module32FirstW(snapshot, &module)) do {
+                    const auto base = reinterpret_cast<uintptr_t>(module.modBaseAddr);
+                    if (inventory.count(base)) continue;
+                    inventory[base] = {d4r::diag::utf8(module.szExePath), module.modBaseSize};
+                    log << "LOAD base=0x" << std::hex << base << " size=0x" << module.modBaseSize
+                        << " path=" << inventory[base].path << '\n';
+                } while (Module32NextW(snapshot, &module));
+                CloseHandle(snapshot); log.flush();
+            }
+            DWORD result = 1;
+            GetExitCodeProcess(child.hProcess, &result);
+            log << "EXIT code=0x" << std::hex << result << std::endl;
+            CloseHandle(child.hThread); CloseHandle(child.hProcess); CloseHandle(job);
+            return static_cast<int>(result);
         }
         std::map<uintptr_t, Module> modules;
         bool initialBreakpoint = true, dumped = false; DWORD exitCode = 1;
@@ -73,7 +103,17 @@ int main(int argc, char** argv) {
             }
         };
         DEBUG_EVENT event{};
+        uint64_t debugEvents = 0, debugStrings = 0, exceptions = 0;
+        ULONGLONG lastSample = GetTickCount64();
         while (WaitForDebugEvent(&event, INFINITE)) {
+            ++debugEvents;
+            if (event.dwDebugEventCode == OUTPUT_DEBUG_STRING_EVENT) ++debugStrings;
+            if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) ++exceptions;
+            const auto now = GetTickCount64();
+            if (now - lastSample >= 5000) {
+                log << "DEBUG_EVENTS events=" << std::dec << debugEvents << " debug_strings=" << debugStrings << " exceptions=" << exceptions << std::endl;
+                lastSample = now;
+            }
             DWORD disposition = DBG_CONTINUE;
             if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
                 add_module(event.u.CreateProcessInfo.lpBaseOfImage, event.u.CreateProcessInfo.hFile);

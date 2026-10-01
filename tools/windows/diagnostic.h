@@ -125,6 +125,8 @@ struct Args {
     std::string ngx_frontend = "d4r";
     std::string ngx_mode = "init";
     unsigned preset = 11;
+    unsigned ngx_create_flags = 0;
+    unsigned output_width = 512, output_height = 288;
     std::string fixture_dir;
     std::string output_dir;
     std::string kernel_name = "enc1";
@@ -159,6 +161,22 @@ struct Args {
                 ngx_frontend = value;
             }
             else if (key == "--ngx-mode") ngx_mode = value;
+            else if (key == "--ngx-create-flags") {
+                size_t end = 0;
+                ngx_create_flags = static_cast<unsigned>(std::stoul(value, &end));
+                if (end != value.size() || (ngx_create_flags != 0 && ngx_create_flags != 11))
+                    throw std::runtime_error("ngx-create-flags must be 0 or 11 (HDR, low-resolution MV, inverted depth)");
+            }
+            else if (key == "--ngx-output-resolution") {
+                const auto separator = value.find('x');
+                if (separator == std::string::npos) throw std::runtime_error("Output resolution must be WIDTHxHEIGHT");
+                size_t wend = 0, hend = 0;
+                output_width = static_cast<unsigned>(std::stoul(value.substr(0, separator), &wend));
+                output_height = static_cast<unsigned>(std::stoul(value.substr(separator + 1), &hend));
+                if (wend != separator || hend != value.size() - separator - 1 || output_width < 128 || output_width > 4096 ||
+                    output_height < 128 || output_height > 2160 || output_width % 2 || output_height % 2)
+                    throw std::runtime_error("Output resolution must be even and within 128x128..4096x2160");
+            }
             else if (key == "--preset") {
                 size_t end = 0;
                 preset = static_cast<unsigned>(std::stoul(value, &end));

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 namespace d4r::win::commands {
 namespace {
@@ -13,6 +14,9 @@ thread_local bool internal = false;
 std::mutex map_mutex, installation_mutex, error_mutex;
 std::string last_error;
 bool installed = false;
+using Clock = std::chrono::steady_clock;
+bool profile_commands() { static const bool enabled = std::getenv("D4R_PROFILE_STAGES") != nullptr; return enabled; }
+double milliseconds(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); }
 struct Event { UINT metadata; std::vector<uint8_t> data; };
 using State = std::function<void(ID3D12GraphicsCommandList*)>;
 struct TrackedResource {
@@ -385,6 +389,8 @@ void complete(ID3D12CommandQueue* queue) {
 }
 void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
     if (internal) { original_execute(queue, count, lists); return; }
+    const auto submitStart = Clock::now();
+    double publishMs = 0, boundaryMs = 0, drainMs = 0;
     std::vector<std::shared_ptr<Recording>> owners;
     std::vector<ID3D12CommandList*> pending;
     std::vector<ResourceStates> pending_states;
@@ -394,7 +400,9 @@ void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D1
             original_execute(queue, UINT(pending.size()), pending.data());
             // Publish in the actual submitted order, never while recording.
             // The callback's external fence waits for these producers on GPU.
+            const auto publishStart = Clock::now();
             for (const auto& states : pending_states) publish_states(states);
+            publishMs += milliseconds(publishStart);
             pending.clear(); pending_states.clear();
         }
     };
@@ -416,13 +424,19 @@ void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D1
             owners.push_back(recording); boundaries = true;
             for (const auto& segment : recording->segments) {
                 pending.push_back(segment.list); pending_states.push_back(segment.resource_states); flush();
+                const auto boundaryStart = Clock::now();
                 segment.boundary(queue);
+                boundaryMs += milliseconds(boundaryStart);
             }
             pending.push_back(recording->current.Get());
             pending_states.push_back(recording->resource_states);
         }
         flush();
-        if (boundaries) complete(queue);
+        if (boundaries) {
+            const auto drainStart = Clock::now(); complete(queue); drainMs = milliseconds(drainStart);
+            if (profile_commands()) std::printf("D4R_COMMAND_SUBMIT total_ms=%.3f boundary_ms=%.3f publish_ms=%.3f suffix_drain_ms=%.3f\n",
+                milliseconds(submitStart), boundaryMs, publishMs, drainMs);
+        }
     } catch (const std::exception& failure) {
         { std::lock_guard<std::mutex> lock(error_mutex); last_error = failure.what(); }
         std::fprintf(stderr, "D4R_D3D12_SUBMIT_FAILURE %s\n", failure.what());
@@ -510,6 +524,7 @@ void install(ID3D12Device* device) {
     }
 }
 void record_boundary(ID3D12GraphicsCommandList* list, Boundary callback) {
+    const auto recordStart = Clock::now();
     if (!installed || !list || !callback) throw std::runtime_error("D3D12 command backend is not initialized");
     if (!error().empty()) throw std::runtime_error(error());
     if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) throw std::runtime_error("DLSS requires a direct command list");
@@ -527,7 +542,9 @@ void record_boundary(ID3D12GraphicsCommandList* list, Boundary callback) {
     ComPtr<ID3D12CommandAllocator> nextAllocator; ComPtr<ID3D12GraphicsCommandList> next;
     dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(nextAllocator.GetAddressOf())), "Suffix allocator");
     dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, nextAllocator.Get(), nullptr, IID_PPV_ARGS(next.GetAddressOf())), "Suffix command list");
+    const auto replayStart = Clock::now();
     for (auto& state : recording.state) state(next.Get());
+    const auto replayMs = milliseconds(replayStart);
     recording.segments.reserve(recording.segments.size() + 1);
     for (const auto& event : recording.events) original_BeginEvent(next.Get(), event.metadata, event.data.data(), UINT(event.data.size()));
     for (size_t n = 0; n < recording.events.size(); ++n) original_EndEvent(segment.list);
@@ -537,5 +554,14 @@ void record_boundary(ID3D12GraphicsCommandList* list, Boundary callback) {
     recording.current_allocator = std::move(nextAllocator);
     recording.current = std::move(next);
     std::printf("D4R_D3D12_RECORD boundary=%zu state_calls=%zu frame_age=0\n", recording.segments.size(), recording.state.size());
+    if (profile_commands()) {
+        // This is the interval between NGX recording calls on this thread,
+        // not a Present/FPS measurement or an extra queued frame.
+        thread_local Clock::time_point previous{};
+        const double interval = previous == Clock::time_point{} ? 0 : std::chrono::duration<double, std::milli>(recordStart - previous).count();
+        previous = recordStart;
+        std::printf("D4R_COMMAND_RECORD total_ms=%.3f replay_ms=%.3f state_calls=%zu interval_ms=%.3f\n",
+            milliseconds(recordStart), replayMs, recording.state.size(), interval);
+    }
 }
 }

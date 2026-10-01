@@ -73,5 +73,70 @@ Native FP8 is not the validated baseline and has no performance claim here.
 Replacing the exact per-MMA f16 rounding with f32 FP8 accumulation requires a
 new layer/reference validation; it is not justified by the observed CPU stalls.
 
+Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
+M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
+4685 frames, all finite. Neither has a backend failure, CPU image copy or an
+aged-frame fallback. Their mean interop/NGX CPU stages total about 13.6 and
+10.1 ms respectively; these are different scenes, not a K/M comparison.
+
+The no-debugger K/4K run completes 5774 frames, with 5774 finite output scans
+and 63514 native transformer launches. The user reports 38-42 FPS. Additional
+CPU measurements exclude replay/publication as the main cause of low FPS:
+
+| CPU measurement | Mean, ms | Median, ms |
+| --- | ---: | ---: |
+| Command split setup | 0.284 | 0.275 |
+| State replay within split setup | 0.025 | 0.023 |
+| Submitted texture state publication | 0.029 | 0.029 |
+| Consumer suffix completion | 0.405 | 0.409 |
+| NGX recording interval | 27.474 | 28.466 |
+
+Recording intervals are between NGX recording calls on the same thread, not
+DXGI Present times. The interval includes rendering and application scheduling.
+A second K/4K run with the attached debugger completes 3567 frames without
+failure, with median recording interval 30.091 ms. The runs include different
+menu/game states; this does not establish a precise debugger FPS speedup.
+Its sparse debugger events also rule out a per-kernel OutputDebugString storm.
+An earlier control that stayed on the startup screen completed zero DLSS frames
+and is excluded. Normal game launches now omit the attached debugger; crash
+diagnostics remain available with `-CaptureExceptions`.
+
+The 2961-frame 4K K profile identifies the translated output tail as its largest
+kernel: 4.401670 ms mean GPU time, versus about 2.875 ms for all eleven native
+transformer layers combined. Ported upstream's texture-store recipe to native
+Windows. It retains accuracy mode, wave32, FP16 subnormals and f16 reference
+accumulation; native FP8 remains disabled.
+
+Both output variants execute on every checked frame and match the previous
+RGB output bit-exactly: eight consecutive 512x288 frames per variant, then
+three consecutive 3840x2160 frames per variant. All RGBA components are finite.
+Identical synthetic inputs and public NGX flags give these 4K event times
+(three samples each; host initialization and readback are outside the event):
+
+| K output variant | Translated mean, ms | Native stores mean, ms |
+| --- | ---: | ---: |
+| LDR, regular depth, high-resolution MV | 2.907823 | 1.803233 |
+| HDR, inverted depth, low-resolution MV | 2.978547 | 2.088347 |
+
+A subsequent game run executes 6221 frames with the native HDR output tail,
+zero backend failures and mean tail GPU time 1.801918 ms. The earlier game
+profile's 4.401670 ms is from a different scene/scheduling state; use the
+identical-input table for the controlled comparison, not an inferred FPS
+multiplier. This profiled game run did not enable the NaN scan.
+
+Reproduce the private texture build and full-frame comparisons:
+
+```powershell
+.\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll"
+.\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -Kernel hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel
+.\scripts\windows\test-native-texture.ps1 -OutputResolution 3840x2160 -Iterations 3
+```
+
+These objects contain code derived from the locally supplied NVIDIA PTX. They
+stay in ignored local directories and are excluded from the public package.
+The installer accepts them with `-LocalTextureKernels` only after validation,
+checking the exact DLL identity, object and manifest hashes. M retains its
+independently validated FP16-equivalent baseline.
+
 References: [HIP events](https://rocmdocs.amd.com/projects/HIP/en/develop/doxygen/html/group___event.html),
 [HIP occupancy API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/group___occupancy.html).

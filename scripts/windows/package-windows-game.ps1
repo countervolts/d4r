@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $defaults = @{PackageRoot='dist/windows-rdna4-game'; DiagnosticRoot='dist/windows-rdna4-command-list';
-    OptiScalerRoot='dist/optiscaler-windows-d4r'; ZludaRoot='dist/zluda-windows-f16-reference';
+    OptiScalerRoot='dist/optiscaler-windows-d4r'; ZludaRoot='dist/zluda-windows-profile';
     HipRoot='.tools/therock-10.2.0a20260929/_rocm_sdk_core';
     KernelKRoot='build/native-k-gfx1201'; KernelMRoot='build/native-m-gfx1201'}
 foreach ($name in $defaults.Keys) {

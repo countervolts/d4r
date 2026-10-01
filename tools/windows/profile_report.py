@@ -39,19 +39,27 @@ def metadata(directory):
 def report(directory, metadata_directory=None):
     kernel_metadata = metadata(metadata_directory)
     stages = collections.defaultdict(list)
+    commands = collections.defaultdict(list)
     kernels = collections.defaultdict(list)
     for path in sorted(directory.glob('*.log')):
         text = path.read_text(encoding='utf-8-sig', errors='replace')
         for name, value in re.findall(r'D4R_STAGE name=(\S+) cpu_ms=([0-9.]+)', text):
             stages[name].append(float(value))
+        for kind, fields in re.findall(r'(?m)^D4R_COMMAND_(RECORD|SUBMIT) ([^\r\n]+)', text):
+            for name, value in re.findall(r'(\w+_ms)=([0-9.]+)', fields):
+                number = float(value)
+                if name != 'interval_ms' or number > 0:
+                    commands[kind.lower() + '.' + name].append(number)
         for line in text.splitlines():
             if not line.startswith('D4R_KERNEL_PROFILE '):
                 continue
             fields = dict(re.findall(r'(\w+)=("[^"]+"|\S+)', line))
             kernels[(fields['kernel'].strip('"'), fields['backend'], fields['phase'])].append(fields)
     result = dict(cpuStages={name: stats(values) for name, values in stages.items()},
+                  commandStages={name: stats(values) for name, values in commands.items()},
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
+                      'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'HIP-event profiling synchronizes every sampled launch and changes scheduling.',
                       'Occupancy is an API prediction, not a measured hardware counter.',
                       'Bandwidth and WMMA utilization require additional supported hardware tooling.'])
@@ -83,6 +91,8 @@ def main():
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
     for name, row in result['cpuStages'].items():
         print(f"CPU {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for name, row in result['commandStages'].items():
+        print(f"COMMAND {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for row in result['kernels']:
         times = row['gpuMs']
         print(f"GPU {row['kernel']} {row['backend']} {row['phase']}: n={times['samples']} mean={times['mean']:.6f} ms total={times['total']:.3f} ms")

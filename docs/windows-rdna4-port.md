@@ -9,6 +9,51 @@ validation coverage are recorded below. Performance remains in progress.
 
 ## Milestone and gates
 
+Upstream refreshed and merged on 2026-10-01 through
+[`f0d1a65`](https://github.com/countervolts/d4r/commit/f0d1a65e27aff6cbe7eeaa13227c80facb9056ab)
+and artifact fix `65dfc9f`. Windows retains strict f16 rounding and the exact
+M attention baseline. Upstream's optional denormal override now drops only
+FP32 requirements, preserving FP16/FP64. All sixteen rebuilt native K/M
+objects have the same SHA256 as the previously validated objects. All thirteen
+ZLUDA patches apply to the pinned fresh base; all sixteen CTest gates pass.
+The local ZLUDA source includes that denormal correction at `2378af7`; the
+measured runtime remains the separately recorded `b0161a4` binary, with the
+override unset. Package metadata records the binary build's actual commit.
+
+Additional production-style runs: M at 1920x1080 completes 4833 frames with
+4833 finite-output GPU scans and no backend failures. K at 3840x2160 completes
+4685 frames, 51535 native launches and 4685 finite-output GPU scans. Both use
+current-frame VRAM interop, no CPU image copy and no previous-frame fallback.
+The user confirms visible imagery at 4K but reports low FPS and about 25% GPU
+usage. This percentage is not an isolated DLSS/WMMA hardware measurement.
+
+The game runner now launches without an attached debugger by default, while
+retaining a kill-on-close process job, raw stdout/stderr, exit code, loaded
+module inventory and frontend/driver logs. `-CaptureExceptions` enables the
+original attached debugger and minidumps. A K/4K run without it completes
+5774 frames / 63514 native launches / 5774 finite-output scans, zero failures.
+The user reports 38-42 FPS. Recording/replay measurements: average split setup
+0.284 ms, replay 0.025 ms, submitted texture-state publication 0.029 ms,
+suffix completion 0.405 ms. These do not explain tens of milliseconds of
+missing performance. NGX recording intervals average 27.474 ms, median
+28.466 ms; they are not a DXGI Present measurement. The first debugger control
+never left the startup screen and is explicitly not a valid FPS comparison.
+
+K output bottleneck: the 2961-frame 4K profile measures its translated output
+tail at 4.401670 ms, larger than all eleven native transformer layers combined.
+The Windows texture build preserves upstream Accuracy mode and creates private
+NVIDIA-derived output objects. Both LDR and the game's HDR/inverted-depth/low-MV
+variants pass strict full-frame comparisons: eight 512x288 frames each, then
+three 3840x2160 frames each, max absolute/relative RGB error 0 and all RGBA
+components finite. Controlled 4K tail GPU means: LDR 2.907823 -> 1.803233 ms;
+HDR 2.978547 -> 2.088347 ms. The 6221-frame game profile executes the native tail
+every frame, with zero backend failures and mean tail time 1.801918 ms. Scene
+differences preclude an exact game FPS speedup claim. `-LocalTextureKernels`
+requires matching source DLL, object and manifest hashes after validation;
+public ZIPs exclude these objects. Install/restore with private overrides
+restores sentinel DLL/config byte-exactly, without duplicate slash/backslash
+manifest paths.
+
 Performance diagnostics (2026-10-01): the separate ZLUDA `b0161a4` runtime
 passes 32 PTX launches in each context and all four native K/M frames with
 bit-exact RGB against their controls. All thirteen exported patches (0002
@@ -141,7 +186,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
-| M9: OptiScaler integration, profiling, installation | Patched frontend K/M PASS; K game menu and M saved level PASS; profiling and final package pending |
+| M9: OptiScaler integration, profiling, installation | Patched frontend and game K/M PASS, including K 4K and M 1080p finite output; native/translated GPU profiling and reversible install PASS; remaining FPS investigation and final archive in progress |
 
 ## Public NGX identity and OptiScaler gate (2026-10-01)
 

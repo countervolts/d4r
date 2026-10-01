@@ -11,6 +11,8 @@ param(
     [ValidateSet('driver','sdk','project','project-legacy')][string]$NgxAbi = 'driver',
     [string]$OptiScalerDll,
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
+    [ValidateSet(0,11)][int]$NgxCreateFlags = 0,
+    [string]$NgxOutputResolution = '512x288',
     [switch]$NgxOnly,
     [switch]$Trace,
     [switch]$RequireNativeNetwork,
@@ -311,7 +313,8 @@ DisableSplash=true
                         $summary.optiScaler = @{path=$OptiScalerDll; mode='standalone'; preset=$Preset}
                         $ngxArguments += @('--ngx-frontend', 'optiscaler')
                     }
-                    $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode)
+                    $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode,
+                        '--ngx-create-flags', "$NgxCreateFlags", '--ngx-output-resolution', $NgxOutputResolution)
                     if ($EarlyIndirectProbe) {
                         if (!$CommandListBackend) { throw '-EarlyIndirectProbe requires -CommandListBackend' }
                         $ngxArguments += @('--early-indirect', '1')
@@ -366,7 +369,14 @@ DisableSplash=true
             [IO.Path]::GetFileName($resolvedRuntime) -notmatch '^d4r-ngx-[0-9a-f]{32}$') {
             throw 'Refusing to remove a path outside the private NGX temporary runtime.'
         }
-        Remove-Item -LiteralPath $resolvedRuntime -Recurse -Force
+        # A scanner can briefly hold the just-unloaded DLL open. Cleanup must
+        # not skip environment restoration or discard the completed GPU logs.
+        $cleanupError=$null
+        foreach ($attempt in 1..10) {
+            try { Remove-Item -LiteralPath $resolvedRuntime -Recurse -Force -ErrorAction Stop; $cleanupError=$null; break }
+            catch { $cleanupError=$_.Exception.Message; if ($attempt -lt 10) { Start-Sleep -Milliseconds 300 } }
+        }
+        if ($cleanupError) { $summary.cleanupError=$cleanupError; $exitStatus=1; Write-Warning "Private runtime cleanup failed: $cleanupError" }
     }
     $summary.passed = $exitStatus -eq 0
     $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
