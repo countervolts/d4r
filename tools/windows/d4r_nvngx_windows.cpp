@@ -1,5 +1,6 @@
 // Native Windows backend. The Linux/Wine implementation remains separate.
 #include "ngx_windows_runtime.h"
+#include <dxgi.h>
 #include <unordered_map>
 #include <functional>
 
@@ -21,7 +22,11 @@ unsigned allocate(void** out, bool caps) {
     if (!runtime || !out) return invalid;
     void* value = d4r_ngx_parameters_create();
     if (!value) return failure;
-    parameters.emplace(value, true); *out = value;
+    *out = nullptr;
+    struct LocalParameters {
+        void* p;
+        ~LocalParameters() { if (p) d4r_ngx_parameters_destroy(p); }
+    } owned{value};
     if (caps) {
         std::lock_guard<std::mutex> lock(runtime->mutex);
         runtime->current(); void* official = nullptr;
@@ -36,14 +41,18 @@ unsigned allocate(void** out, bool caps) {
             if (d4r_ngx_get_void(official, name, &callback) == 1) d4r_ngx_set_void(value, name, callback);
         }
     }
+    parameters.emplace(value, true); *out = value; owned.p = nullptr;
     return 1;
 }
 }
 #define API extern "C" __declspec(dllexport)
-API unsigned NVSDK_NGX_D3D12_Init_Ext(unsigned long long app, const wchar_t* data, ID3D12Device* device, unsigned sdk, const void*) {
+// Capability marker for an explicit external backend selection. This function
+// is safe to call during DLL discovery: no GPU/runtime initialization occurs.
+API unsigned d4r_WindowsBackendVersion() { return 1; }
+API unsigned NVSDK_NGX_D3D12_Init_Ext(unsigned long long app, const wchar_t* data, ID3D12Device* device, unsigned sdk, const void* info) {
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
-        if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, app, data, sdk);
+        if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, app, data, sdk, static_cast<const d4r::ngx::FeatureCommonInfo*>(info));
         if (const char* backend = std::getenv("D4R_D3D12_COMMAND_BACKEND"); backend && std::string(backend) == "1")
             d4r::win::commands::install(device);
         return 1u;
@@ -52,9 +61,31 @@ API unsigned NVSDK_NGX_D3D12_Init_Ext(unsigned long long app, const wchar_t* dat
 API unsigned NVSDK_NGX_D3D12_Init(unsigned long long app, const wchar_t* data, ID3D12Device* device, const void* info, unsigned sdk) {
     return NVSDK_NGX_D3D12_Init_Ext(app, data, device, sdk, info);
 }
-API unsigned NVSDK_NGX_D3D12_Init_ProjectID(const char*, int, const char*, const wchar_t* data, ID3D12Device* device, unsigned sdk, const void* info) {
-    // Driver core's CUDA ABI uses the numerical application identity.
-    return NVSDK_NGX_D3D12_Init_Ext(241534723ull, data, device, sdk, info);
+API unsigned NVSDK_NGX_D3D12_Init_ProjectID(const char* project, int engine, const char* version, const wchar_t* data, ID3D12Device* device, unsigned sdk, const void* info) {
+    std::lock_guard<std::mutex> lock(apiMutex);
+    return call([&] {
+        if (!project || !*project) return invalid;
+        d4r::ngx::ProjectIdentity identity{project, engine, version ? version : ""};
+        if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, 0, data, sdk, static_cast<const d4r::ngx::FeatureCommonInfo*>(info), &identity);
+        if (const char* backend = std::getenv("D4R_D3D12_COMMAND_BACKEND"); backend && std::string(backend) == "1") d4r::win::commands::install(device);
+        return 1u;
+    });
+}
+API unsigned NVSDK_NGX_D3D12_GetFeatureRequirements(IDXGIAdapter* adapter, const d4r::ngx::FeatureDiscoveryInfo* info,
+    d4r::ngx::FeatureRequirement* requirements) {
+    if (!adapter || !info || !requirements) return invalid;
+    return call([&] {
+        *requirements = {}; requirements->FeatureSupported = 16; // Unsupported feature.
+        if (info->FeatureID != 1) return 1u;
+        DXGI_ADAPTER_DESC desc{}; d4r::win::dx(adapter->GetDesc(&desc), "NGX requirements adapter");
+        // OptiScaler can override the DXGI vendor ID. The physical HIP
+        // architecture and full adapter LUID are the authoritative identity.
+        d4r::diag::HipApi hip(d4r::win::env_path("D4R_HIP_ROOT")); hipDeviceProp_t props{}; hip.select_gfx1201(-1,props);
+        requirements->FeatureSupported = std::memcmp(&desc.AdapterLuid,props.luid,sizeof(LUID)) ? 4u : 0u;
+        std::strcpy(requirements->MinOSVersion,"10.0.22000.0");
+        std::printf("D4R_REQUIREMENTS feature=%u support=%u architecture=gfx1201\n",info->FeatureID,requirements->FeatureSupported);
+        return 1u;
+    });
 }
 API unsigned NVSDK_NGX_D3D12_AllocateParameters(void** p) {
     std::lock_guard<std::mutex> lock(apiMutex); return call([&] { return allocate(p, false); });

@@ -67,6 +67,7 @@ int main(int argc, char** argv)
         Library dlss(dlss_path), core(core_path);
         using Init = unsigned(*)(unsigned long long, const wchar_t*, const NgxFeatureCommonInfo*, unsigned);
         using DriverInit = unsigned(*)(unsigned long long, const wchar_t*, unsigned);
+        using ProjectInit = unsigned(*)(const char*, int, const char*, const wchar_t*, unsigned, const NgxFeatureCommonInfo*);
         using Shutdown = unsigned(*)();
         using Parameters = unsigned(*)(void**);
         using Destroy = unsigned(*)(void*);
@@ -89,7 +90,9 @@ int main(int argc, char** argv)
         std::printf("STAGE NVSDK_NGX_CUDA_Init sdk=0x15 core=%s dlss=%s\n", args.ngx_core.c_str(), args.dlss_dll.c_str());
         if (args.ngx_abi == "driver") check(driver_init(241534723ull, data_path.c_str(), 0x15), "NVSDK_NGX_CUDA_Init(driver ABI)");
         else if (args.ngx_abi == "sdk") check(init(241534723ull, data_path.c_str(), &common, 0x15), "NVSDK_NGX_CUDA_Init(SDK ABI)");
-        else throw std::runtime_error("--ngx-abi must be driver or sdk");
+        else if (args.ngx_abi == "project") check(core.symbol<ProjectInit>("NVSDK_NGX_CUDA_Init_ProjectID")(
+            "24480451-f00d-face-1304-0308dabad187", 0, "1.0", data_path.c_str(), 0x15, &common), "NVSDK_NGX_CUDA_Init_ProjectID");
+        else throw std::runtime_error("--ngx-abi must be driver, sdk or project");
         bool initialized = true;
         struct NgxCleanup { Shutdown shutdown; bool& active; ~NgxCleanup() { if (active) (void)shutdown(); } } nc{shutdown, initialized};
         void* caps = nullptr;

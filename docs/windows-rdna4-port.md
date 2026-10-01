@@ -38,6 +38,45 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
 | M9: OptiScaler integration, profiling, installation | Pending |
 
+## Public NGX identity and OptiScaler gate (2026-10-01)
+
+The Windows shim now implements D3D12 GetFeatureRequirements and forwards
+Init_ProjectID to CUDA Init_ProjectID with the caller's project/engine/version.
+The runtime owns the feature path strings and pointer list. The physical HIP
+gfx1201 architecture and full DXGI adapter LUID determine SR support; other
+features remain unsupported. Numeric driver initialization retains the tested
+three-argument CUDA Init ABI. `-NgxAbi project` selects the public project path
+in both CUDA and D3D12 probes. Capability parameter allocation is transactional.
+
+`ngx-project-api.zip` passes direct CUDA project initialization.
+`d3d12-k-project-api.zip` and `d3d12-m-project-api.zip` pass four recorded
+enhanced-barrier packed-format frames with 44 K / 40 M native launches.
+All RGB values exactly match the independently quantised earlier baselines,
+max absolute/relative error 0. Full rebuild and CTest pass 16/16 gates
+(`project-api-ctest.log`).
+
+The runner now accepts `-OptiScalerDll <absolute-path>`, creates a private
+OptiScaler.ini and captures the frontend log. Native-network hit validation is
+mandatory for the integration runs. The official 0.9.4 release silently chose
+FSR despite DLSS=enabled on AMD: `optiscaler-m-first.zip` is correctly **FAIL**
+with zero native launches. Current nightly 20261001 also gates DLSS on a
+System32 NVIDIA driver; preloading our NVAPI triggered access violation
+0xc0000005 in its loader hooks (`optiscaler-m-nightly-first.zip`). This is not
+a DLSS success. The probe no longer preloads NVAPI before OptiScaler startup.
+Crash capture avoids module resource enumeration in the exception filter,
+guards reentrancy and records the minidump's module list instead.
+
+A local OptiScaler source fork starts from
+`45a2001303ddff632e279f77aef85ceede5832cb`. Its explicit
+`[DLSS] AllowExternalBackend=true` option requires an absolute NvngxPath with
+the `d4r_WindowsBackendVersion` ABI-1 marker; it does not spoof HIP architecture.
+The marker is GPU-free and safe during discovery. The pending patch also lets
+the external backend load its own NVAPI provider through the original loader.
+This source integration has not yet passed the frontend harness.
+Microsoft Build Tools 17.14 / MSVC 14.44.35207 and SDK 10.0.26100 were installed
+from the signature-verified official bootstrapper without restarting Windows.
+No game files have been modified.
+
 ## Initial PSO and enhanced texture layouts (2026-10-01)
 
 The backend now captures the initial PSO supplied to public CreateCommandList,
@@ -74,7 +113,8 @@ gate. Unknown pre-initialization indirect signatures are still rejected.
 OptiScaler's default restore hotfixes are false; integration will keep
 RestoreComputeSignature, RestoreGraphicSignature and ExtendedStateRestore
 false because their original-method trampolines can bypass logical-list routing.
-Actual OptiScaler execution remains untested; no game files have been changed.
+Actual OptiScaler probes have exposed the frontend gate documented above;
+no game files have been changed.
 
 ## Native GPU resource-format conversion (2026-10-01)
 

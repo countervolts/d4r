@@ -8,6 +8,8 @@ param(
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,
     [ValidateSet('init', 'evaluate', 'd3d12')][string]$NgxMode = 'init',
+    [ValidateSet('driver','sdk','project')][string]$NgxAbi = 'driver',
+    [string]$OptiScalerDll,
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
     [switch]$NgxOnly,
     [switch]$Trace,
@@ -141,6 +143,11 @@ try {
         (Join-Path $PackageRoot 'bin/wmma_gfx1201.hsaco'),
         (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'),
         (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc2_layer_gfx1201.hsaco'))
+    if ($OptiScalerDll) {
+        if ($NgxMode -ne 'd3d12' -or !$CommandListBackend) { throw '-OptiScalerDll requires D3D12 and -CommandListBackend' }
+        if (![IO.Path]::IsPathRooted($OptiScalerDll)) { throw '-OptiScalerDll must be absolute' }
+        $files += $OptiScalerDll
+    }
     if ($NgxCore -or $DlssDll) {
         if (!$NgxCore -or !$DlssDll) { throw 'Supply both -NgxCore and -DlssDll absolute paths.' }
         if (![IO.Path]::IsPathRooted($NgxCore) -or ![IO.Path]::IsPathRooted($DlssDll)) {
@@ -251,7 +258,7 @@ try {
                 $ngxArguments = @('--hip-root', $HipRoot, '--cuda-dll', $selectedCuda,
                     '--ngx-core', $localCore, '--dlss-dll', $localDlss,
                     '--nvapi-dll', (Join-Path $PackageRoot 'nvapi-compat/nvapi64.dll'),
-                    '--ngx-mode', $NgxMode, '--preset', "$Preset", '--iterations', "$Iterations")
+                    '--ngx-mode', $NgxMode, '--ngx-abi', $NgxAbi, '--preset', "$Preset", '--iterations', "$Iterations")
                 if ($NgxMode -eq 'd3d12') {
                     # The driver NGX core resolves feature DLLs relative to its
                     # caller module as well as the executable. Keep the shim
@@ -259,11 +266,54 @@ try {
                     $localShim = Join-Path $ngxRuntimeDirectory 'd4r_nvngx.dll'
                     Copy-Item -LiteralPath (Join-Path $bin 'd4r_nvngx.dll') -Destination $localShim
                     Copy-Item -LiteralPath (Join-Path $bin 'pixel_convert_gfx1201.hsaco') -Destination $ngxRuntimeDirectory
+                    if ($OptiScalerDll) {
+                        $bridgeDirectory = Join-Path $ngxRuntimeDirectory 'd4r'
+                        New-Item -ItemType Directory -Path $bridgeDirectory | Out-Null
+                        Copy-Item -LiteralPath $localShim -Destination (Join-Path $bridgeDirectory '_nvngx.dll')
+                        Copy-Item -LiteralPath (Join-Path $bin 'pixel_convert_gfx1201.hsaco') -Destination $bridgeDirectory
+                        $localShim = Join-Path $ngxRuntimeDirectory 'OptiScaler.dll'
+                        Copy-Item -LiteralPath $OptiScalerDll -Destination $localShim
+                        $ini = @"
+[Upscalers]
+Dx12Upscaler=dlss
+[FrameGen]
+Enabled=false
+FGInput=nofg
+FGOutput=nofg
+[DLSS]
+Enabled=true
+AllowExternalBackend=true
+RenderPresetOverride=true
+RenderPresetForAll=$Preset
+UseGenericAppIdWithDlss=false
+[Libraries]
+NvngxPath=$bridgeDirectory
+NvngxDlssPath=$localDlss
+NvngxFeaturePath=$ngxRuntimeDirectory
+[Hotfix]
+RestoreComputeSignature=false
+RestoreGraphicSignature=false
+ExtendedStateRestore=false
+[Log]
+LogToFile=true
+LogLevel=0
+[Menu]
+DisableSplash=true
+"@
+                        $ini | Set-Content -LiteralPath (Join-Path $ngxRuntimeDirectory 'OptiScaler.ini') -Encoding UTF8
+                        $summary.optiScaler = @{path=$OptiScalerDll; mode='standalone'; preset=$Preset}
+                        $ngxArguments += @('--ngx-frontend', 'optiscaler')
+                    }
                     $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode)
                     if ($CommandListBackend) { $ngxArguments += @('--interop-mode', 'command-list') }
                 }
                 $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } elseif ($NgxMode -eq 'd3d12') { "d3d12-evaluate-preset-$Preset" } else { 'ngx-init' }
                 $ngxOk = Invoke-Probe $ngxName $ngxExe $ngxArguments
+                if ($OptiScalerDll) {
+                    Get-ChildItem -LiteralPath $ngxRuntimeDirectory -Filter '*.log' -File |
+                        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $OutputDirectory ('optiscaler-' + $_.Name)) }
+                    Copy-Item -LiteralPath (Join-Path $ngxRuntimeDirectory 'OptiScaler.ini') -Destination (Join-Path $OutputDirectory 'OptiScaler.ini')
+                }
                 if ($ngxOk -and $RequireNativeNetwork) {
                     $hits = @()
                     $nativeLayers = if ($Preset -eq 11) { @('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2','dec1','dec0') }

@@ -3,6 +3,7 @@
 #include "pixel_conversion.h"
 #include "cuda_image_api.h"
 #include "ngx_parameters.h"
+#include "ngx_public_abi.h"
 #include "d3d12_command_hooks.h"
 #include <chrono>
 #include <memory>
@@ -54,6 +55,10 @@ struct Runtime {
     std::unique_ptr<SharedTimeline> timeline;
     std::unique_ptr<PixelProgram> pixels;
     std::mutex mutex;
+    ngx::ProjectIdentity project;
+    ngx::FeatureCommonInfo common{};
+    std::vector<std::wstring> featurePaths;
+    std::vector<const wchar_t*> featurePathPointers;
     using Init = unsigned(*)(unsigned long long, const wchar_t*, unsigned);
     using Shutdown = unsigned(*)();
     using Allocate = unsigned(*)(void**);
@@ -68,7 +73,8 @@ struct Runtime {
     Release release = nullptr;
     Shutdown shutdown = nullptr;
 
-    Runtime(ID3D12Device* d3d, unsigned long long app, const wchar_t* data, unsigned sdk)
+    Runtime(ID3D12Device* d3d, unsigned long long app, const wchar_t* data, unsigned sdk,
+        const ngx::FeatureCommonInfo* info = nullptr, const ngx::ProjectIdentity* identity = nullptr)
         : hip(env_path("D4R_HIP_ROOT")), cuda(env_path("D4R_NVCUDA_DLL")),
           featureSearch(std::filesystem::path(diag::wide(env_path("D4R_DLSS_DLL"))).parent_path()),
           external{hip}, images(cuda), device(d3d) {
@@ -104,7 +110,24 @@ struct Runtime {
             evaluate = core->symbol<Evaluate>("NVSDK_NGX_CUDA_EvaluateFeature");
             release = core->symbol<Release>("NVSDK_NGX_CUDA_ReleaseFeature");
             shutdown = core->symbol<Shutdown>("NVSDK_NGX_CUDA_Shutdown");
-            ngx_check(core->symbol<Init>("NVSDK_NGX_CUDA_Init")(app, data, sdk), "CUDA Init(driver ABI)");
+            if (identity) {
+                if (identity->id.empty()) throw std::runtime_error("Empty NGX project identity");
+                project = *identity;
+                featurePaths.push_back(std::filesystem::path(diag::wide(env_path("D4R_DLSS_DLL"))).parent_path().wstring());
+                if (info) {
+                    if (info->PathListInfo.Length > 1024 || (info->PathListInfo.Length && !info->PathListInfo.Path)) throw std::runtime_error("Invalid NGX feature path list");
+                    for (unsigned i = 0; i < info->PathListInfo.Length; ++i) if (info->PathListInfo.Path[i]) featurePaths.emplace_back(info->PathListInfo.Path[i]);
+                    if (sdk >= 0x14) common.LoggingInfo = info->LoggingInfo;
+                }
+                for (const auto& path : featurePaths) featurePathPointers.push_back(path.c_str());
+                common.PathListInfo = {featurePathPointers.data(), unsigned(featurePathPointers.size())};
+                using ProjectInit = unsigned(*)(const char*, int, const char*, const wchar_t*, unsigned, const ngx::FeatureCommonInfo*);
+                std::printf("D4R_IDENTITY project=%s engine=%d version=%s sdk=0x%x\n", project.id.c_str(),project.engine,project.version.c_str(),sdk);
+                ngx_check(core->symbol<ProjectInit>("NVSDK_NGX_CUDA_Init_ProjectID")(project.id.c_str(),project.engine,project.version.c_str(),data,sdk,&common), "CUDA Init_ProjectID");
+            } else {
+                std::printf("D4R_IDENTITY application=%llu sdk=0x%x\n", app,sdk);
+                ngx_check(core->symbol<Init>("NVSDK_NGX_CUDA_Init")(app, data, sdk), "CUDA Init(driver ABI)");
+            }
             initialized = true;
             void* caps = nullptr;
             ngx_check(capabilities(&caps), "CUDA feature capabilities");

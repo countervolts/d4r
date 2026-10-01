@@ -55,6 +55,13 @@ inline void loaded_modules()
 }
 inline LONG WINAPI unhandled(EXCEPTION_POINTERS* info)
 {
+    // Loader hooks can fault while holding the loader lock. Do not enumerate
+    // modules or read their resources here; the dump contains the module list.
+    // Guard the final filter as well as the first-chance handler against a
+    // second exception inside DbgHelp.
+    static LONG dumping = 0;
+    if (InterlockedCompareExchange(&dumping, 1, 0) != 0)
+        return EXCEPTION_EXECUTE_HANDLER;
     std::fprintf(stderr, "EXCEPTION code=0x%08lx address=%p\n",
         info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
@@ -69,7 +76,6 @@ inline LONG WINAPI unhandled(EXCEPTION_POINTERS* info)
         static_cast<unsigned long long>(info->ContextRecord->Rdx),
         static_cast<unsigned long long>(info->ContextRecord->R8),
         static_cast<unsigned long long>(info->ContextRecord->R9));
-    loaded_modules();
     wchar_t directory[32768]{};
     const DWORD n = GetEnvironmentVariableW(L"D4R_DIAG_DIR", directory, 32768);
     if (n && n < 32768) {
@@ -115,6 +121,7 @@ struct Args {
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
+    std::string ngx_frontend = "d4r";
     std::string ngx_mode = "init";
     unsigned preset = 11;
     std::string fixture_dir;
@@ -145,6 +152,10 @@ struct Args {
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;
             else if (key == "--ngx-abi") ngx_abi = value;
+            else if (key == "--ngx-frontend") {
+                if (value != "d4r" && value != "optiscaler") throw std::runtime_error("ngx-frontend must be d4r or optiscaler");
+                ngx_frontend = value;
+            }
             else if (key == "--ngx-mode") ngx_mode = value;
             else if (key == "--preset") {
                 size_t end = 0;
@@ -178,7 +189,9 @@ public:
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
         if (!handle_) throw std::runtime_error("LoadLibrary " + utf8(path.c_str()) +
             " Win32=" + std::to_string(GetLastError()));
-        std::printf("LOAD requested=%s\n", utf8(path.c_str()).c_str());
+        wchar_t actual[32768]{};
+        GetModuleFileNameW(handle_, actual, 32768);
+        std::printf("LOAD requested=%s actual=%s\n", utf8(path.c_str()).c_str(), utf8(actual).c_str());
     }
     Library(const Library&) = delete;
     Library& operator=(const Library&) = delete;
