@@ -37,6 +37,18 @@ full-network measurement does not establish a win over FP16. Production keeps
 the baseline. See [windows-performance.md](windows-performance.md) for timings
 and one-command replay/paired profiling.
 
+Final production-mode K/4K verification completes 1838 frames and 22056 native
+launches with the final runtime and locally validated output stores, zero
+backend failures/CPU image copies/previous-frame outputs. Debugger, hook/stage
+profiling, serializing kernel events and GPU output scans are disabled in that
+run. The 60-second diagnostic is stopped deliberately by its process job;
+its recorded `diagnostic_timeout` is not classified as a crash. Output accuracy
+and finiteness are covered separately by the matching-runtime reference gates.
+The clean-source public archive passes every hash check: 64 manifest-listed
+entries, including a snapshot of 258 tracked source entries, no NVIDIA DLLs or
+private artifacts. `test-results/final-package-validation.json` and the ZIP's
+SHA256 sidecar record the exact final artifact identity.
+
 Current native Windows build, after the pinned tool/source setup described
 below (MSVC v143 / Windows SDK 10.0.26100 required for OptiScaler):
 
