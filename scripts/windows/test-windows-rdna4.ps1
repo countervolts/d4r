@@ -17,7 +17,7 @@ param(
     [switch]$CommandListBackend,
     [switch]$CaptureExceptions,
     [ValidateSet('baseline','packed','unorm')][string]$PixelProfile = 'baseline',
-    [ValidateSet('legacy','enhanced')][string]$BarrierMode = 'legacy',
+    [ValidateSet('legacy','enhanced','inherited-legacy','inherited-enhanced')][string]$BarrierMode = 'legacy',
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )

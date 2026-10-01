@@ -126,6 +126,7 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
         struct Snapshot {
             void* parameters = d4r_ngx_parameters_create();
             std::vector<d4r::win::ComPtr<ID3D12Resource>> resources;
+            d4r::win::ResourceAccess access[5];
             ~Snapshot() { if (parameters) d4r_ngx_parameters_destroy(parameters); }
         };
         auto snapshot = std::make_shared<Snapshot>();
@@ -139,6 +140,7 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
             d4r_ngx_set_d3d12_resource(snapshot->parameters, names[i], resource);
             const auto state = d4r::win::commands::resource_access(list, resource, d4r::win::ngx_resource_access(p, states[i],
                 i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            snapshot->access[i] = state;
             if (state.pending_split) throw std::runtime_error("NGX resource has an unfinished split barrier");
             d4r_ngx_set_uint(snapshot->parameters, states[i], unsigned(state.legacy));
             const std::string prefix(states[i]);
@@ -148,7 +150,22 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
             std::printf("D4R_RESOURCE_ACCESS plane=%s enhanced=%u legacy=0x%x layout=%u access=0x%x\n",
                 names[i], state.enhanced, unsigned(state.legacy), unsigned(state.layout), unsigned(state.access));
         }
-        d4r::win::commands::record_boundary(list, [feature, snapshot](ID3D12CommandQueue* queue) { feature->evaluate_boundary(queue, snapshot->parameters); });
+        d4r::win::commands::record_boundary(list, [feature, snapshot](ID3D12CommandQueue* queue) {
+            const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
+            const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
+            for (unsigned i = 0; i < 5; ++i) if (snapshot->access[i].inherited) {
+                const auto resolved = d4r::win::commands::submitted_resource_access(snapshot->resources[i].Get(), snapshot->access[i]);
+                if (resolved.pending_split) throw std::runtime_error("Inherited NGX texture has an unfinished split barrier");
+                const std::string prefix(states[i]);
+                d4r_ngx_set_uint(snapshot->parameters, states[i], unsigned(resolved.legacy));
+                d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Enhanced").c_str(), resolved.enhanced);
+                d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Layout").c_str(), unsigned(resolved.layout));
+                d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Access").c_str(), unsigned(resolved.access));
+                std::printf("D4R_INHERITED_ACCESS plane=%s tracked=%u enhanced=%u layout=%u legacy=0x%x\n",
+                    names[i], !resolved.inherited, resolved.enhanced, unsigned(resolved.layout), unsigned(resolved.legacy));
+            }
+            feature->evaluate_boundary(queue, snapshot->parameters);
+        });
         return 1u;
     });
 }

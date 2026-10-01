@@ -67,7 +67,7 @@ inline void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource
 }
 struct ResourceAccess {
     D3D12_RESOURCE_STATES legacy = D3D12_RESOURCE_STATE_COMMON;
-    bool enhanced = false, pending_split = false;
+    bool enhanced = false, pending_split = false, inherited = false;
     D3D12_BARRIER_LAYOUT layout = D3D12_BARRIER_LAYOUT_COMMON;
     D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS_COMMON;
     D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_ALL;

@@ -19,7 +19,9 @@ int main(int argc, char** argv) {
         const std::filesystem::path directory(diagDir ? wide(diagDir) : std::filesystem::current_path().wstring());
         std::filesystem::create_directories(directory);
         const bool commandBackend = args.interop_mode == "command-list";
-        const bool enhanced = args.barrier_mode == "enhanced";
+        const bool inherited = args.barrier_mode.rfind("inherited-", 0) == 0;
+        const bool enhanced = args.barrier_mode == "enhanced" || args.barrier_mode == "inherited-enhanced";
+        if (inherited && !commandBackend) throw std::runtime_error("Inherited state diagnostic requires the command-list backend");
         if (args.interop_mode == "images" && args.pixel_profile != "baseline") throw std::runtime_error("Raw CUDA image diagnostic requires baseline formats");
         std::printf("D3D12_PIXEL_PROFILE %s\n", args.pixel_profile.c_str());
         if (commandBackend && _putenv_s("D4R_D3D12_COMMAND_BACKEND", "1")) throw std::runtime_error("Cannot enable command backend");
@@ -117,10 +119,10 @@ int main(int argc, char** argv) {
             dst.pResource = texture.image.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             transition(list.Get(), texture.image.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                enhanced ? D3D12_RESOURCE_STATE_COMMON : i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            if (enhanced) enhancedBarrier(list.Get(), texture.image.Get(), i, true);
+                (enhanced || inherited) ? D3D12_RESOURCE_STATE_COMMON : i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (enhanced && !inherited) enhancedBarrier(list.Get(), texture.image.Get(), i, true);
         }
-        dx(list->Close(), "Close(synthetic producers)"); ID3D12CommandList* producer[] = {list.Get()};
+        if (!inherited) dx(list->Close(), "Close(synthetic producers)"); ID3D12CommandList* producer[] = {list.Get()};
         if (!commandBackend) { queue->ExecuteCommandLists(1, producer); drain(); }
         if (args.interop_mode == "images") {
             CudaApi cuda(args.cuda_dll); cuda.check(cuda.cuInit(0), "cuInit(image interop)");
@@ -218,6 +220,17 @@ int main(int argc, char** argv) {
         ComPtr<ID3D12GraphicsCommandList> predecessor;
         ComPtr<ID3D12CommandAllocator> predecessorAllocator;
         if (commandBackend) {
+            if (inherited) {
+                // Record state only in predecessor A after the backend has
+                // initialized. List B's Evaluate must resolve it at submission,
+                // after A, and retain it across subsequent frames/resets.
+                for (unsigned i = 0; i < 5; ++i) {
+                    if (enhanced) enhancedBarrier(list.Get(), textures[i].image.Get(), i, true);
+                    else transition(list.Get(), textures[i].image.Get(), D3D12_RESOURCE_STATE_COMMON,
+                        i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                }
+                dx(list->Close(), "Close tracked predecessor A");
+            }
             // Keep initial synthetic producers unsubmitted until the first
             // batch, before the list which contains the NGX evaluation.
             predecessor = list; predecessorAllocator = allocator;
@@ -230,7 +243,7 @@ int main(int argc, char** argv) {
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
             if (commandBackend) {
                 dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
-                if (enhanced) for (unsigned i = 0; i < 5; ++i) enhancedBarrier(list.Get(), textures[i].image.Get(), i, false);
+                if (enhanced && !inherited) for (unsigned i = 0; i < 5; ++i) enhancedBarrier(list.Get(), textures[i].image.Get(), i, false);
                 using RecordedEvaluate = unsigned(*)(ID3D12GraphicsCommandList*, void*, void*, void*);
                 check(shim.symbol<RecordedEvaluate>("NVSDK_NGX_D3D12_EvaluateFeature")(list.Get(), handle, parameters, nullptr), "D3D12 recorded same-frame Evaluate");
                 // The caller may reuse/mutate its parameter object as soon as

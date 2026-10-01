@@ -15,6 +15,22 @@ std::string last_error;
 bool installed = false;
 struct Event { UINT metadata; std::vector<uint8_t> data; };
 using State = std::function<void(ID3D12GraphicsCommandList*)>;
+struct TrackedResource {
+    ComPtr<ID3D12Resource> owner;
+    ResourceAccess state;
+};
+using ResourceStates = std::unordered_map<ID3D12Resource*, TrackedResource>;
+static constexpr GUID submitted_access_tag = {0x741b92df,0x9b13,0x4fc9,{0xb0,0x02,0x2c,0xe3,0x5a,0x68,0x92,0x41}};
+void publish_states(const ResourceStates& states) {
+    for (const auto& entry : states) {
+        // Buffers/simultaneous-access textures have automatic legacy state
+        // decay at ExecuteCommandLists completion. Only ordinary textures
+        // retain these explicit transitions across submission boundaries.
+        const auto desc = resource_desc(entry.second.owner.Get());
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) continue;
+        dx(entry.second.owner->SetPrivateData(submitted_access_tag, sizeof(ResourceAccess), &entry.second.state), "Publish submitted texture access");
+    }
+}
 struct Segment {
     // The application's original list is a weak pointer; holding it in its
     // own routing map would prevent final Release and leak the entire feature.
@@ -22,6 +38,7 @@ struct Segment {
     ComPtr<ID3D12GraphicsCommandList> owner;
     ComPtr<ID3D12CommandAllocator> allocator;
     Boundary boundary;
+    ResourceStates resource_states;
 };
 struct Recording {
     std::recursive_mutex mutex;
@@ -31,7 +48,7 @@ struct Recording {
     std::vector<Segment> segments;
     std::vector<State> state;
     std::vector<Event> events;
-    std::unordered_map<ID3D12Resource*, ResourceAccess> resource_states;
+    ResourceStates resource_states;
     unsigned active_queries = 0;
     bool render_pass = false, predication = false, indirect_state_unknown = false, closed = false;
     explicit Recording(ID3D12GraphicsCommandList* list) : original(list) {}
@@ -187,7 +204,9 @@ void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList* self, UIN
     if (access.recording) for (UINT i = 0; i < barrier_count; ++i)
         if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
             (barriers[i].Transition.Subresource == 0 || barriers[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) {
-            auto& state = access.recording->resource_states[barriers[i].Transition.pResource];
+            auto& tracked = access.recording->resource_states[barriers[i].Transition.pResource];
+            tracked.owner = retain(barriers[i].Transition.pResource);
+            auto& state = tracked.state;
             state = ResourceAccess(barriers[i].Transition.StateAfter);
             state.pending_split = barriers[i].Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
         }
@@ -201,7 +220,8 @@ void STDMETHODCALLTYPE hook_Barrier(ID3D12GraphicsCommandList* self, UINT32 barr
             const bool containsZero = range.NumMipLevels == 0 ? (range.IndexOrFirstMipLevel == 0 || range.IndexOrFirstMipLevel == UINT32_MAX) :
                 range.IndexOrFirstMipLevel == 0 && range.FirstArraySlice == 0 && range.FirstPlane == 0;
             if (containsZero) {
-                auto& state = access.recording->resource_states[barrier.pResource]; state.enhanced = true;
+                auto& tracked = access.recording->resource_states[barrier.pResource]; tracked.owner = retain(barrier.pResource);
+                auto& state = tracked.state; state.enhanced = true; state.inherited = false;
                 state.layout = barrier.LayoutAfter; state.access = barrier.AccessAfter; state.sync = barrier.SyncAfter;
                 state.pending_split = barrier.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;
             }
@@ -308,6 +328,48 @@ void STDMETHODCALLTYPE hook_ExecuteIndirect(ID3D12GraphicsCommandList* self, ID3
 
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 ExecuteFn original_execute = nullptr;
+// Queue-owned synchronization metadata has no reference back to the queue.
+// It serializes a split submission against other threads using the same queue.
+static constexpr GUID submission_lock_tag = {0x6c6158ba,0x209f,0x4a09,{0x97,0x10,0xa7,0x03,0x52,0x32,0xa0,0x69}};
+std::mutex queue_metadata_mutex;
+struct SubmissionLock final : IUnknown {
+    std::atomic<ULONG> references{1};
+    std::recursive_mutex mutex;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER; *out = nullptr;
+        if (iid != IID_IUnknown) return E_NOINTERFACE;
+        *out = static_cast<IUnknown*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto n = --references; if (!n) delete this; return n; }
+};
+ComPtr<SubmissionLock> submission_lock(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::mutex> lock(queue_metadata_mutex);
+    ComPtr<SubmissionLock> result; UINT bytes = sizeof(IUnknown*);
+    if (SUCCEEDED(queue->GetPrivateData(submission_lock_tag, &bytes, result.GetAddressOf()))) return result;
+    result.Attach(new SubmissionLock);
+    dx(queue->SetPrivateDataInterface(submission_lock_tag, result.Get()), "Queue submission metadata");
+    return result;
+}
+using QueueFenceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+QueueFenceFn original_queue_signal = nullptr, original_queue_wait = nullptr;
+HRESULT queue_fence(QueueFenceFn function, ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) noexcept {
+    if (internal) return function(queue, fence, value);
+    try {
+        auto queueLock = submission_lock(queue);
+        std::lock_guard<std::recursive_mutex> ordered(queueLock->mutex);
+        return function(queue, fence, value);
+    } catch (const std::exception& failure) {
+        { std::lock_guard<std::mutex> lock(error_mutex); last_error = failure.what(); }
+        std::fprintf(stderr, "D4R_QUEUE_FENCE_FAILURE %s\n", failure.what()); return E_FAIL;
+    }
+}
+HRESULT STDMETHODCALLTYPE hook_queue_signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    return queue_fence(original_queue_signal, queue, fence, value);
+}
+HRESULT STDMETHODCALLTYPE hook_queue_wait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    return queue_fence(original_queue_wait, queue, fence, value);
+}
 void complete(ID3D12CommandQueue* queue) {
     ComPtr<ID3D12Device> device; dx(queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf())), "Queue device(submit drain)");
     ComPtr<ID3D12Fence> fence; dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())), "Queue fence(submit drain)");
@@ -323,24 +385,39 @@ void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D1
     if (internal) { original_execute(queue, count, lists); return; }
     std::vector<std::shared_ptr<Recording>> owners;
     std::vector<ID3D12CommandList*> pending;
+    std::vector<ResourceStates> pending_states;
     InternalScope scope;
-    auto flush = [&] { if (!pending.empty()) { original_execute(queue, UINT(pending.size()), pending.data()); pending.clear(); } };
+    auto flush = [&] {
+        if (!pending.empty()) {
+            original_execute(queue, UINT(pending.size()), pending.data());
+            // Publish in the actual submitted order, never while recording.
+            // The callback's external fence waits for these producers on GPU.
+            for (const auto& states : pending_states) publish_states(states);
+            pending.clear(); pending_states.clear();
+        }
+    };
     bool boundaries = false;
     try {
+        auto queueLock = submission_lock(queue);
+        std::lock_guard<std::recursive_mutex> ordered(queueLock->mutex);
         for (UINT i = 0; i < count; ++i) {
             std::shared_ptr<Recording> recording;
             { std::lock_guard<std::mutex> lock(map_mutex);
               auto found = recordings.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
               if (found != recordings.end()) recording = found->second; }
-            if (!recording || recording->segments.empty()) { pending.push_back(lists[i]); continue; }
+            if (!recording) { pending.push_back(lists[i]); pending_states.emplace_back(); continue; }
             std::lock_guard<std::recursive_mutex> lock(recording->mutex);
+            if (recording->segments.empty()) {
+                pending.push_back(lists[i]); pending_states.push_back(recording->resource_states); continue;
+            }
             if (!recording->closed) throw std::runtime_error("Logical command list submitted before Close");
             owners.push_back(recording); boundaries = true;
             for (const auto& segment : recording->segments) {
-                pending.push_back(segment.list); flush();
+                pending.push_back(segment.list); pending_states.push_back(segment.resource_states); flush();
                 segment.boundary(queue);
             }
             pending.push_back(recording->current.Get());
+            pending_states.push_back(recording->resource_states);
         }
         flush();
         if (boundaries) complete(queue);
@@ -364,10 +441,17 @@ D3D12_RESOURCE_STATES resource_state(ID3D12GraphicsCommandList* list, ID3D12Reso
 }
 ResourceAccess resource_access(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, ResourceAccess fallback) {
     auto recording = get_recording(list, false);
+    fallback.inherited = true;
     if (!recording) return fallback;
     std::lock_guard<std::recursive_mutex> lock(recording->mutex);
     auto found = recording->resource_states.find(resource);
-    return found == recording->resource_states.end() ? fallback : found->second;
+    return found == recording->resource_states.end() ? fallback : found->second.state;
+}
+ResourceAccess submitted_resource_access(ID3D12Resource* resource, ResourceAccess fallback) {
+    if (!resource) return fallback;
+    ResourceAccess submitted; UINT size = sizeof(submitted);
+    if (SUCCEEDED(resource->GetPrivateData(submitted_access_tag, &size, &submitted)) && size == sizeof(submitted)) return submitted;
+    return fallback;
 }
 void install(ID3D12Device* device) {
     std::lock_guard<std::mutex> lock(installation_mutex);
@@ -405,6 +489,8 @@ void install(ID3D12Device* device) {
         // Queue inherits IUnknown, Object, DeviceChild; UpdateTileMappings,
         // CopyTileMappings precede ExecuteCommandLists in the public SDK.
         attach_method(queueTable[10], reinterpret_cast<void*>(hook_execute), reinterpret_cast<void**>(&original_execute), "ExecuteCommandLists");
+        attach_method(queueTable[queue_signal_slot], reinterpret_cast<void*>(hook_queue_signal), reinterpret_cast<void**>(&original_queue_signal), "QueueSignal");
+        attach_method(queueTable[queue_wait_slot], reinterpret_cast<void*>(hook_queue_wait), reinterpret_cast<void**>(&original_queue_wait), "QueueWait");
         auto deviceTable = *reinterpret_cast<void***>(device);
         attach_method(deviceTable[device_command_list_slot], reinterpret_cast<void*>(hook_create_list), reinterpret_cast<void**>(&original_create_list), "CreateCommandList");
         attach_method(deviceTable[device_signature_slot], reinterpret_cast<void*>(hook_signature), reinterpret_cast<void**>(&original_signature), "CreateCommandSignature");
@@ -435,6 +521,7 @@ void record_boundary(ID3D12GraphicsCommandList* list, Boundary callback) {
     ComPtr<ID3D12Device> device; dx(list->GetDevice(IID_PPV_ARGS(device.GetAddressOf())), "Boundary device");
     Segment segment; segment.list = access.target(); segment.owner = recording.current;
     segment.allocator = recording.current_allocator; segment.boundary = std::move(callback);
+    segment.resource_states = recording.resource_states;
     ComPtr<ID3D12CommandAllocator> nextAllocator; ComPtr<ID3D12GraphicsCommandList> next;
     dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(nextAllocator.GetAddressOf())), "Suffix allocator");
     dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, nextAllocator.Get(), nullptr, IID_PPV_ARGS(next.GetAddressOf())), "Suffix command list");

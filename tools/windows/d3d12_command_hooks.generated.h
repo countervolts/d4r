@@ -700,3 +700,5 @@ static void attach_recording_methods(void** table, unsigned version) {
 
 static constexpr unsigned device_signature_slot = 41;
 static constexpr unsigned device_command_list_slot = 12;
+static constexpr unsigned queue_signal_slot = 14;
+static constexpr unsigned queue_wait_slot = 15;

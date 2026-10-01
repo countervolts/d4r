@@ -145,7 +145,7 @@ struct Args {
                 pixel_profile = value;
             }
             else if (key == "--barrier-mode") {
-                if (value != "legacy" && value != "enhanced") throw std::runtime_error("barrier-mode must be legacy or enhanced");
+                if (value != "legacy" && value != "enhanced" && value != "inherited-legacy" && value != "inherited-enhanced") throw std::runtime_error("Invalid barrier-mode");
                 barrier_mode = value;
             }
             else if (key == "--ngx-core") ngx_core = value;

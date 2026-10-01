@@ -121,6 +121,10 @@ def generate(source):
     fields = list(dict.fromkeys(re.findall(r'\(STDMETHODCALLTYPE \*(\w+)\)', device)))
     lines.append(f'static constexpr unsigned device_signature_slot = {fields.index("CreateCommandSignature")};')
     lines.append(f'static constexpr unsigned device_command_list_slot = {fields.index("CreateCommandList")};')
+    queue = re.search(r'typedef struct ID3D12CommandQueueVtbl \{(.*?)\n\} ID3D12CommandQueueVtbl;', source, re.S)[1]
+    queue_fields = list(dict.fromkeys(re.findall(r'\(STDMETHODCALLTYPE \*(\w+)\)', queue)))
+    for name in ('Signal', 'Wait'):
+        lines.append(f'static constexpr unsigned queue_{name.lower()}_slot = {queue_fields.index(name)};')
     return '\n'.join(lines)
 
 

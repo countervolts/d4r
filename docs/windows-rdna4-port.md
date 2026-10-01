@@ -137,10 +137,32 @@ FP16 baselines, max absolute/relative error 0. Frame age and shim CPU image
 copy counts remain zero. Add `-BarrierMode enhanced` to the packed-run command
 below to reproduce. The explicit harness can also supply layout metadata.
 
-Tracking currently observes the evaluated list's barriers. A texture whose
-state was established only in a different list uses the caller-supplied state
-or the legacy NGX default; queue-wide state inheritance remains an integration
-gate. Unknown pre-initialization indirect signatures are still rejected.
+Tracking now also publishes explicit ordinary texture state/layout metadata
+in the actual queue submission order. Each split segment retains its own
+resource-state snapshot and COM references. An Evaluate input with no barrier
+in its own list resolves the most recently submitted state at the callback,
+after preceding lists in the batch. The metadata belongs to the resource, with
+no global pointer cache or ownership cycle. Legacy buffer/simultaneous-access
+decay is not treated as persistent texture state. Unknown states retain the
+explicit caller metadata or NGX legacy default and are logged as tracked=0.
+
+ExecuteCommandLists, Signal and Wait on one queue use a queue-owned submission
+mutex: another thread cannot insert a submission/fence into prefix -> DLSS ->
+suffix. Internal callback operations bypass that lock while the outer batch
+owns it. The lock metadata has no reference back to its owning queue.
+The backend now installs 83 public-method hooks.
+
+`optiscaler-m-inherited-final.zip` passes four complete enhanced-layout M frames
+with the transitions recorded only in predecessor A, none in the evaluated B.
+`optiscaler-k-inherited.zip` covers legacy state inheritance. Both have all
+five planes tracked=1 on all frames (M layouts 21/20; K states 0x40/0x8), full
+native network hits, zero NaN/Inf and exact RGB baseline agreement, max
+absolute/relative error 0. Full build/CTest still pass 16/16
+(`inherited-queue-final-ctest.log`). Use `-BarrierMode inherited-enhanced` or
+`inherited-legacy` to reproduce. Tracking still requires observing creation
+or a transition after hook installation; initial enhanced states outside
+that observation remain a game gate. Unknown pre-initialization indirect
+signatures are still rejected.
 OptiScaler's default restore hotfixes are false; integration will keep
 RestoreComputeSignature, RestoreGraphicSignature and ExtendedStateRestore
 false because their original-method trampolines can bypass logical-list routing.
