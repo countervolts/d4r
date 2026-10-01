@@ -60,6 +60,17 @@ ComPtr<ID3D12Resource> uav_buffer(ID3D12Device* device) {
     dx(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         nullptr, IID_PPV_ARGS(result.GetAddressOf())), "Pixel reference buffer"); return result;
 }
+ResourceAccess shader_access() {
+    ResourceAccess result; result.enhanced = true; result.layout = D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE;
+    result.access = D3D12_BARRIER_ACCESS_SHADER_RESOURCE; return result;
+}
+void native_layout(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, D3D12_BARRIER_LAYOUT before, D3D12_BARRIER_LAYOUT after,
+    D3D12_BARRIER_ACCESS accessBefore, D3D12_BARRIER_ACCESS accessAfter) {
+    ComPtr<ID3D12GraphicsCommandList7> newer; dx(list->QueryInterface(IID_PPV_ARGS(newer.GetAddressOf())), "Probe enhanced list");
+    D3D12_TEXTURE_BARRIER barrier{}; barrier.pResource = texture; barrier.LayoutBefore = before; barrier.LayoutAfter = after;
+    barrier.AccessBefore = accessBefore; barrier.AccessAfter = accessAfter; barrier.SyncBefore = barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+    D3D12_BARRIER_GROUP group{}; group.Type = D3D12_BARRIER_TYPE_TEXTURE; group.NumBarriers = 1; group.pTextureBarriers = &barrier; newer->Barrier(1,&group);
+}
 void fixture(uint8_t* row, unsigned y, PixelSpec spec) {
     for (unsigned x = 0; x < width; ++x) {
         unsigned i = x + y * width; auto* p = row + x * spec.bytes;
@@ -163,6 +174,8 @@ int main(int argc, char** argv) {
         ComPtr<IDXGIAdapter1> adapter;
         for (UINT i = 0; ; ++i) { dx(factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf()), "Pixel adapter"); DXGI_ADAPTER_DESC1 d{}; dx(adapter->GetDesc1(&d), "Pixel adapter desc"); if (!std::memcmp(&d.AdapterLuid, props.luid, sizeof(LUID))) break; }
         ComPtr<ID3D12Device> device; dx(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(device.GetAddressOf())), "Pixel D3D12");
+        const bool enhanced = args.interop_mode == "enhanced";
+        if (enhanced) { D3D12_FEATURE_DATA_D3D12_OPTIONS12 support{}; dx(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &support, sizeof(support)), "Enhanced barrier support"); if (!support.EnhancedBarriersSupported) throw std::runtime_error("Enhanced barriers unsupported"); }
         ComPtr<ID3D12CommandQueue> queue; D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; dx(device->CreateCommandQueue(&qd, IID_PPV_ARGS(queue.GetAddressOf())), "Pixel queue");
         SharedTimeline timeline(external, device.Get()); Shaders shader(device.Get()); auto reference = uav_buffer(device.Get());
         unsigned verified = 0;
@@ -173,7 +186,10 @@ int main(int argc, char** argv) {
             void* data = nullptr; D3D12_RANGE noRead{}; dx(upload->Map(0, &noRead, &data), "Pixel fixture upload");
             std::memset(data, 0x5a, size_t(shared.bytes)); for (unsigned y = 0; y < height; ++y) fixture(static_cast<uint8_t*>(data) + y * shared.footprint.Footprint.RowPitch, y, spec); upload->Unmap(0, nullptr);
             { List list(device.Get()); D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = shared.footprint; dst.pResource = input.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                transition(list.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST); list.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); transition(list.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); shared.copy_input(list.list.Get(), input.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); list.submit(queue.Get(), timeline); }
+                transition(list.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST); list.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                transition(list.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, enhanced ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (enhanced) native_layout(list.list.Get(),input.Get(),D3D12_BARRIER_LAYOUT_COMMON,D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE,D3D12_BARRIER_ACCESS_COMMON,D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+                shared.copy_input(list.list.Get(), input.Get(), enhanced ? shader_access() : ResourceAccess(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)); list.submit(queue.Get(), timeline); }
             D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 4; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             ComPtr<ID3D12DescriptorHeap> heap; dx(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(heap.GetAddressOf())), "Pixel descriptors");
             D3D12_CPU_DESCRIPTOR_HANDLE cpu{}, initial{}; D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
@@ -218,7 +234,11 @@ int main(int argc, char** argv) {
                 program.convert(true, canonical.data, canonical.pitch, shared.mapped, shared.footprint.Footprint.RowPitch, width, height, spec.storage, 3);
                 cpu.ptr = initial.ptr + stride; srv = {}; srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; srv.Buffer.NumElements = count; srv.Buffer.StructureByteStride = 16; device->CreateShaderResourceView(canonicalUpload.Get(), &srv, cpu);
                 cpu.ptr += stride; D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.Format = encodedFormat; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; device->CreateUnorderedAccessView(encoded.Get(), nullptr, &uv, cpu);
-                { List list(device.Get()); transition(list.list.Get(), encoded.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); list.list->SetPipelineState(shader.encode.Get()); list.list->SetComputeRootSignature(shader.root.Get()); ID3D12DescriptorHeap* heaps[] = {heap.Get()}; list.list->SetDescriptorHeaps(1, heaps); auto handle = gpu; handle.ptr += stride; list.list->SetComputeRootDescriptorTable(1, handle); handle.ptr += stride; list.list->SetComputeRootDescriptorTable(2, handle); unsigned constants[] = {width,height,0}; list.list->SetComputeRoot32BitConstants(4,3,constants,0); list.list->Dispatch((count+63)/64,1,1); transition(list.list.Get(), encoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); shared.copy_output(list.list.Get(), actualTexture.Get(), D3D12_RESOURCE_STATE_COMMON); transition(list.list.Get(), actualTexture.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); list.submit(queue.Get(),timeline); }
+                { List list(device.Get()); transition(list.list.Get(), encoded.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); list.list->SetPipelineState(shader.encode.Get()); list.list->SetComputeRootSignature(shader.root.Get()); ID3D12DescriptorHeap* heaps[] = {heap.Get()}; list.list->SetDescriptorHeaps(1, heaps); auto handle = gpu; handle.ptr += stride; list.list->SetComputeRootDescriptorTable(1, handle); handle.ptr += stride; list.list->SetComputeRootDescriptorTable(2, handle); unsigned constants[] = {width,height,0}; list.list->SetComputeRoot32BitConstants(4,3,constants,0); list.list->Dispatch((count+63)/64,1,1); transition(list.list.Get(), encoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    ResourceAccess state; state.enhanced = enhanced; shared.copy_output(list.list.Get(), actualTexture.Get(), state);
+                    if (enhanced) native_layout(list.list.Get(),actualTexture.Get(),D3D12_BARRIER_LAYOUT_COMMON,D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE,D3D12_BARRIER_ACCESS_COMMON,D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+                    else transition(list.list.Get(), actualTexture.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    list.submit(queue.Get(),timeline); }
                 srv = {}; srv.Format = item.view; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1; device->CreateShaderResourceView(actualTexture.Get(), &srv, initial);
                 auto encodedActual = read_reference(device.Get(), queue.Get(), timeline, shader, heap.Get(), gpu, reference.Get(), 4);
                 srv.Format = encodedFormat; device->CreateShaderResourceView(encoded.Get(), &srv, initial);
@@ -228,6 +248,6 @@ int main(int argc, char** argv) {
             }
             ++verified; std::printf("PASS PIXEL_FORMAT name=%s plane=%u pixels=%u decode_max_abs=%.9g encode=%u\n", item.name,item.plane,count,maxAbs,item.plane==0);
         }
-        std::printf("PASS D3D12_GPU_FORMATS architecture=gfx1201 cases=%u iterations=%u width=%u height=%u typed_srv_reference=1 typed_uav_reference=1\n", verified,args.iterations,width,height); return 0;
+        std::printf("PASS D3D12_GPU_FORMATS architecture=gfx1201 cases=%u iterations=%u width=%u height=%u enhanced=%u typed_srv_reference=1 typed_uav_reference=1\n", verified,args.iterations,width,height,enhanced); return 0;
     } catch (const std::exception& error) { std::fprintf(stderr,"FAIL D3D12_GPU_FORMATS %s\n",error.what()); loaded_modules(); return 1; }
 }

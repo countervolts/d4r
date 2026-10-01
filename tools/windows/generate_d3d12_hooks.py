@@ -120,6 +120,7 @@ def generate(source):
     device = re.search(r'typedef struct ID3D12DeviceVtbl \{(.*?)\n\} ID3D12DeviceVtbl;', source, re.S)[1]
     fields = list(dict.fromkeys(re.findall(r'\(STDMETHODCALLTYPE \*(\w+)\)', device)))
     lines.append(f'static constexpr unsigned device_signature_slot = {fields.index("CreateCommandSignature")};')
+    lines.append(f'static constexpr unsigned device_command_list_slot = {fields.index("CreateCommandList")};')
     return '\n'.join(lines)
 
 

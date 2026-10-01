@@ -192,9 +192,15 @@ include(CTest)
 add_test(NAME d3d12_gpu_pixel_formats COMMAND d4r_d3d12_pixel_probe
   --hip-root "${D4R_HIP_ROOT}" --module "${pixel_object}" --iterations 2)
 set_tests_properties(d3d12_gpu_pixel_formats PROPERTIES TIMEOUT 120 LABELS "hardware;gfx1201;formats")
+add_test(NAME d3d12_gpu_enhanced_formats COMMAND d4r_d3d12_pixel_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "${pixel_object}" --interop-mode enhanced --iterations 2)
+set_tests_properties(d3d12_gpu_enhanced_formats PROPERTIES TIMEOUT 120 LABELS "hardware;gfx1201;formats;enhanced_barriers")
 add_test(NAME d3d12_command_backend COMMAND d4r_d3d12_command_probe
   --hip-root "${D4R_HIP_ROOT}" --module "$<TARGET_FILE:d4r_nvngx_windows>" --interop-mode indirect --iterations 32)
 set_tests_properties(d3d12_command_backend PROPERTIES TIMEOUT 120 LABELS "hardware;d3d12;command_lists;lifetime")
+add_test(NAME d3d12_command_initial_pso COMMAND d4r_d3d12_command_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "$<TARGET_FILE:d4r_nvngx_windows>" --interop-mode initial-pso --iterations 32)
+set_tests_properties(d3d12_command_initial_pso PROPERTIES TIMEOUT 120 LABELS "hardware;d3d12;command_lists;lifetime")
 add_test(NAME d3d12_command_root_reset_warp COMMAND d4r_d3d12_command_probe
   --hip-root "${D4R_HIP_ROOT}" --module "$<TARGET_FILE:d4r_nvngx_windows>" --interop-mode indirect-root-reset --iterations 32)
 set_tests_properties(d3d12_command_root_reset_warp PROPERTIES TIMEOUT 120 LABELS "software;d3d12;command_lists;lifetime"

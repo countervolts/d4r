@@ -111,6 +111,7 @@ struct Args {
     std::string stream_lifetime = "persistent";
     std::string interop_mode = "roundtrip";
     std::string pixel_profile = "baseline";
+    std::string barrier_mode = "legacy";
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
@@ -135,6 +136,10 @@ struct Args {
             else if (key == "--pixel-profile") {
                 if (value != "baseline" && value != "packed" && value != "unorm") throw std::runtime_error("pixel-profile must be baseline, packed or unorm");
                 pixel_profile = value;
+            }
+            else if (key == "--barrier-mode") {
+                if (value != "legacy" && value != "enhanced") throw std::runtime_error("barrier-mode must be legacy or enhanced");
+                barrier_mode = value;
             }
             else if (key == "--ngx-core") ngx_core = value;
             else if (key == "--dlss-dll") dlss_dll = value;

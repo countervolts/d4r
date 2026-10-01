@@ -14,6 +14,7 @@ param(
     [switch]$RequireNativeNetwork,
     [switch]$CommandListBackend,
     [ValidateSet('baseline','packed','unorm')][string]$PixelProfile = 'baseline',
+    [ValidateSet('legacy','enhanced')][string]$BarrierMode = 'legacy',
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180
 )
@@ -258,7 +259,7 @@ try {
                     $localShim = Join-Path $ngxRuntimeDirectory 'd4r_nvngx.dll'
                     Copy-Item -LiteralPath (Join-Path $bin 'd4r_nvngx.dll') -Destination $localShim
                     Copy-Item -LiteralPath (Join-Path $bin 'pixel_convert_gfx1201.hsaco') -Destination $ngxRuntimeDirectory
-                    $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile)
+                    $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode)
                     if ($CommandListBackend) { $ngxArguments += @('--interop-mode', 'command-list') }
                 }
                 $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } elseif ($NgxMode -eq 'd3d12') { "d3d12-evaluate-preset-$Preset" } else { 'ngx-init' }

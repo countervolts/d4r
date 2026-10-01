@@ -5,7 +5,7 @@ param(
     [switch]$DebugLayer,
     [switch]$Warp,
     [switch]$NoHip,
-    [ValidateSet('basic','indirect','indirect-root-reset')][string]$Mode = 'indirect',
+    [ValidateSet('basic','indirect','indirect-root-reset','initial-pso')][string]$Mode = 'indirect',
     [string]$OutputDirectory = 'test-results/d3d12-command-development'
 )
 $ErrorActionPreference = 'Stop'

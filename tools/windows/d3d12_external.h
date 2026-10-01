@@ -65,6 +65,40 @@ inline void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource
     barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     list->ResourceBarrier(1, &barrier);
 }
+struct ResourceAccess {
+    D3D12_RESOURCE_STATES legacy = D3D12_RESOURCE_STATE_COMMON;
+    bool enhanced = false, pending_split = false;
+    D3D12_BARRIER_LAYOUT layout = D3D12_BARRIER_LAYOUT_COMMON;
+    D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS_COMMON;
+    D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_ALL;
+    ResourceAccess() = default;
+    ResourceAccess(D3D12_RESOURCE_STATES state) : legacy(state) {}
+};
+inline void texture_copy_barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
+    const ResourceAccess& original, bool output, bool restore) {
+    if (original.pending_split) throw std::runtime_error("Cannot use a texture inside an unfinished split barrier");
+    if (!original.enhanced) {
+        const auto copy = output ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+        if (original.legacy == copy) return;
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {texture, 0, restore ? copy : original.legacy, restore ? original.legacy : copy};
+        list->ResourceBarrier(1, &barrier); return;
+    }
+    ComPtr<ID3D12GraphicsCommandList7> newer;
+    dx(list->QueryInterface(IID_PPV_ARGS(newer.GetAddressOf())), "Enhanced interop command list");
+    D3D12_TEXTURE_BARRIER barrier{}; barrier.pResource = texture;
+    barrier.LayoutBefore = restore ? (output ? D3D12_BARRIER_LAYOUT_COPY_DEST : D3D12_BARRIER_LAYOUT_COPY_SOURCE) : original.layout;
+    barrier.LayoutAfter = restore ? original.layout : (output ? D3D12_BARRIER_LAYOUT_COPY_DEST : D3D12_BARRIER_LAYOUT_COPY_SOURCE);
+    barrier.AccessBefore = restore ? (output ? D3D12_BARRIER_ACCESS_COPY_DEST : D3D12_BARRIER_ACCESS_COPY_SOURCE) : original.access;
+    barrier.AccessAfter = restore ? original.access : (output ? D3D12_BARRIER_ACCESS_COPY_DEST : D3D12_BARRIER_ACCESS_COPY_SOURCE);
+    // Interop runs in a separate submitted direct list. ALL is a conservative
+    // synchronization scope for the app's original access class/layout.
+    barrier.SyncBefore = restore ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_ALL;
+    barrier.SyncAfter = restore ? D3D12_BARRIER_SYNC_ALL : D3D12_BARRIER_SYNC_COPY;
+    barrier.Subresources.IndexOrFirstMipLevel = 0; // Single subresource 0.
+    D3D12_BARRIER_GROUP group{}; group.Type = D3D12_BARRIER_TYPE_TEXTURE; group.NumBarriers = 1; group.pTextureBarriers = &barrier;
+    newer->Barrier(1, &group);
+}
 
 class SharedPlane {
     ExternalApi& api_;
@@ -108,25 +142,25 @@ public:
     }
     SharedPlane(const SharedPlane&) = delete;
     ~SharedPlane() { release(); }
-    void copy_input(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, D3D12_RESOURCE_STATES state) {
-        transition(list, texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    void copy_input(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, ResourceAccess state) {
+        texture_copy_barrier(list, texture, state, false, false);
         transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION source{}, dest{};
         source.pResource = texture; source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dest.pResource = buffer.Get(); dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dest.PlacedFootprint = footprint;
         list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
         transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-        transition(list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+        texture_copy_barrier(list, texture, state, false, true);
     }
-    void copy_output(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, D3D12_RESOURCE_STATES state) {
-        transition(list, texture, state, D3D12_RESOURCE_STATE_COPY_DEST);
+    void copy_output(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, ResourceAccess state) {
+        texture_copy_barrier(list, texture, state, true, false);
         transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{}, dest{};
         source.pResource = buffer.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = footprint;
         dest.pResource = texture; dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
         transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-        transition(list, texture, D3D12_RESOURCE_STATE_COPY_DEST, state);
+        texture_copy_barrier(list, texture, state, true, true);
     }
 };
 

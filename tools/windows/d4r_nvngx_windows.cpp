@@ -106,9 +106,16 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
             ID3D12Resource* resource = nullptr; (void)d4r_ngx_get_d3d12_resource(p, names[i], &resource);
             snapshot->resources.emplace_back(resource);
             d4r_ngx_set_d3d12_resource(snapshot->parameters, names[i], resource);
-            const auto state = d4r::win::commands::resource_state(list, resource, D3D12_RESOURCE_STATES(
-                d4r::ngx::uint_value(p, states[i], i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
-            d4r_ngx_set_uint(snapshot->parameters, states[i], unsigned(state));
+            const auto state = d4r::win::commands::resource_access(list, resource, d4r::win::ngx_resource_access(p, states[i],
+                i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            if (state.pending_split) throw std::runtime_error("NGX resource has an unfinished split barrier");
+            d4r_ngx_set_uint(snapshot->parameters, states[i], unsigned(state.legacy));
+            const std::string prefix(states[i]);
+            d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Enhanced").c_str(), state.enhanced);
+            d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Layout").c_str(), unsigned(state.layout));
+            d4r_ngx_set_uint(snapshot->parameters, (prefix + ".Access").c_str(), unsigned(state.access));
+            std::printf("D4R_RESOURCE_ACCESS plane=%s enhanced=%u legacy=0x%x layout=%u access=0x%x\n",
+                names[i], state.enhanced, unsigned(state.legacy), unsigned(state.layout), unsigned(state.access));
         }
         d4r::win::commands::record_boundary(list, [feature, snapshot](ID3D12CommandQueue* queue) { feature->evaluate_boundary(queue, snapshot->parameters); });
         return 1u;

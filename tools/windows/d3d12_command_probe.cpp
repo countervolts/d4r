@@ -39,9 +39,9 @@ void drain(ID3D12Device* device, ID3D12CommandQueue* queue) {
 struct NativeList {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
-    explicit NativeList(ID3D12Device* device) {
+    explicit NativeList(ID3D12Device* device, ID3D12PipelineState* initial = nullptr) {
         dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf())), "Probe allocator");
-        dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf())), "Probe command list");
+        dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), initial, IID_PPV_ARGS(list.GetAddressOf())), "Probe command list");
     }
     void submit(ID3D12Device* device, ID3D12CommandQueue* queue) {
         dx(list->Close(), "Close probe list"); ID3D12CommandList* lists[] = {list.Get()};
@@ -164,9 +164,10 @@ int main(int argc, char** argv) {
         auto record = shim.symbol<Record>("d4r_D3D12_RecordDiagnosticBoundary");
         auto live = shim.symbol<Live>("d4r_D3D12_LiveRecordings");
         const bool root_indirect = args.interop_mode == "indirect-root-reset";
-        const bool indirect_enabled = args.interop_mode != "basic";
-        if (args.interop_mode != "direct" && args.interop_mode != "basic" && args.interop_mode != "indirect" && !root_indirect)
-            throw std::runtime_error("Command probe mode must be basic, indirect, or indirect-root-reset");
+        const bool initial_pso = args.interop_mode == "initial-pso";
+        const bool indirect_enabled = args.interop_mode == "indirect" || root_indirect;
+        if (args.interop_mode != "direct" && args.interop_mode != "basic" && args.interop_mode != "indirect" && !root_indirect && !initial_pso)
+            throw std::runtime_error("Command probe mode must be basic, indirect, indirect-root-reset or initial-pso");
         D3D12_INDIRECT_ARGUMENT_DESC arguments[2]{};
         arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
         arguments[0].Constant.RootParameterIndex = 2;
@@ -202,11 +203,11 @@ int main(int argc, char** argv) {
                 input->GetGPUVirtualAddress(), output->GetGPUVirtualAddress(), indirect_buffer->GetGPUVirtualAddress());
             upload(first.Get(), 17, 10); upload(second.Get(), 25, 100);
             {
-                NativeList a(device.Get()), b(device.Get()), c(device.Get());
+                NativeList a(device.Get()), b(device.Get(), initial_pso ? pso.Get() : nullptr), c(device.Get());
                 a.list->CopyResource(input.Get(), first.Get());
                 transition(a.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 dx(a.list->Close(), "Close predecessor A");
-                b.list->SetComputeRootSignature(root.Get()); b.list->SetPipelineState(pso.Get());
+                b.list->SetComputeRootSignature(root.Get()); if (!initial_pso) b.list->SetPipelineState(pso.Get());
                 b.list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
                 b.list->SetComputeRootShaderResourceView(1, input->GetGPUVirtualAddress());
                 uint32_t temporary = seed;

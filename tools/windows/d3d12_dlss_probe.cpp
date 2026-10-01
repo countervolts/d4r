@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
         const std::filesystem::path directory(diagDir ? wide(diagDir) : std::filesystem::current_path().wstring());
         std::filesystem::create_directories(directory);
         const bool commandBackend = args.interop_mode == "command-list";
+        const bool enhanced = args.barrier_mode == "enhanced";
         if (args.interop_mode == "images" && args.pixel_profile != "baseline") throw std::runtime_error("Raw CUDA image diagnostic requires baseline formats");
         std::printf("D3D12_PIXEL_PROFILE %s\n", args.pixel_profile.c_str());
         if (commandBackend && _putenv_s("D4R_D3D12_COMMAND_BACKEND", "1")) throw std::runtime_error("Cannot enable command backend");
@@ -38,6 +39,17 @@ int main(int argc, char** argv) {
         if (!found) throw std::runtime_error("HIP adapter missing from DXGI");
         ComPtr<ID3D12Device> device;
         dx(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(device.GetAddressOf())), "D3D12CreateDevice");
+        if (enhanced) { D3D12_FEATURE_DATA_D3D12_OPTIONS12 support{}; dx(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &support, sizeof(support)), "Enhanced barrier support"); if (!support.EnhancedBarriersSupported) throw std::runtime_error("Enhanced barriers unavailable"); }
+        auto enhancedBarrier = [&](ID3D12GraphicsCommandList* command, ID3D12Resource* texture, unsigned plane, bool initial) {
+            ComPtr<ID3D12GraphicsCommandList7> newer; dx(command->QueryInterface(IID_PPV_ARGS(newer.GetAddressOf())), "Harness enhanced list");
+            D3D12_TEXTURE_BARRIER barrier{}; barrier.pResource = texture;
+            barrier.LayoutAfter = plane == 3 ? D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS : D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE;
+            barrier.LayoutBefore = initial ? D3D12_BARRIER_LAYOUT_COMMON : barrier.LayoutAfter;
+            barrier.AccessAfter = plane == 3 ? D3D12_BARRIER_ACCESS_UNORDERED_ACCESS : D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+            barrier.AccessBefore = initial ? D3D12_BARRIER_ACCESS_COMMON : barrier.AccessAfter;
+            barrier.SyncBefore = barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+            D3D12_BARRIER_GROUP group{}; group.Type = D3D12_BARRIER_TYPE_TEXTURE; group.NumBarriers = 1; group.pTextureBarriers = &barrier; newer->Barrier(1, &group);
+        };
         ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         dx(device->CreateCommandQueue(&qd, IID_PPV_ARGS(queue.GetAddressOf())), "CreateCommandQueue");
@@ -104,7 +116,8 @@ int main(int argc, char** argv) {
             dst.pResource = texture.image.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             transition(list.Get(), texture.image.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                enhanced ? D3D12_RESOURCE_STATE_COMMON : i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (enhanced) enhancedBarrier(list.Get(), texture.image.Get(), i, true);
         }
         dx(list->Close(), "Close(synthetic producers)"); ID3D12CommandList* producer[] = {list.Get()};
         if (!commandBackend) { queue->ExecuteCommandLists(1, producer); drain(); }
@@ -176,6 +189,12 @@ int main(int argc, char** argv) {
         struct FeatureCleanup { Release fn; void* h; ~FeatureCleanup() { (void)fn(h); } } featureCleanup{release, handle};
         static const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
         for (unsigned i = 0; i < 5; ++i) d4r_ngx_set_d3d12_resource(parameters, names[i], textures[i].image.Get());
+        if (enhanced && !commandBackend) {
+            const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
+            for (unsigned i = 0; i < 5; ++i) { const std::string prefix(states[i]); d4r_ngx_set_uint(parameters,(prefix+".Enhanced").c_str(),1);
+                d4r_ngx_set_uint(parameters,(prefix+".Layout").c_str(), i == 3 ? D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS : D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE);
+                d4r_ngx_set_uint(parameters,(prefix+".Access").c_str(), i == 3 ? D3D12_BARRIER_ACCESS_UNORDERED_ACCESS : D3D12_BARRIER_ACCESS_SHADER_RESOURCE); }
+        }
         d4r_ngx_set_int(parameters, "Disable.Watermark", 1);
         auto readback = make_buffer(device.Get(), textures[3].bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         ComPtr<ID3D12GraphicsCommandList> predecessor;
@@ -193,6 +212,7 @@ int main(int argc, char** argv) {
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
             if (commandBackend) {
                 dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
+                if (enhanced) for (unsigned i = 0; i < 5; ++i) enhancedBarrier(list.Get(), textures[i].image.Get(), i, false);
                 using RecordedEvaluate = unsigned(*)(ID3D12GraphicsCommandList*, void*, void*, void*);
                 check(shim.symbol<RecordedEvaluate>("NVSDK_NGX_D3D12_EvaluateFeature")(list.Get(), handle, parameters, nullptr), "D3D12 recorded same-frame Evaluate");
                 // The caller may reuse/mutate its parameter object as soon as
@@ -203,12 +223,14 @@ int main(int argc, char** argv) {
                 check(shim.symbol<Evaluate>("d4r_D3D12_EvaluateAtBoundary")(queue.Get(), handle, parameters), "D3D12 same-frame Evaluate");
                 dx(allocator->Reset(), "Reset(harness allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(harness list)");
             }
-            transition(list.Get(), textures[3].image.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            ResourceAccess outputAccess(D3D12_RESOURCE_STATE_UNORDERED_ACCESS); outputAccess.enhanced = enhanced;
+            outputAccess.layout = D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS; outputAccess.access = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+            texture_copy_barrier(list.Get(), textures[3].image.Get(), outputAccess, false, false);
             D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
             src.pResource = textures[3].image.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = textures[3].footprint;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            transition(list.Get(), textures[3].image.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            texture_copy_barrier(list.Get(), textures[3].image.Get(), outputAccess, false, true);
             dx(list->Close(), "Close(verification)");
             if (commandBackend && frame == 0) {
                 ID3D12CommandList* batch[] = {predecessor.Get(), list.Get()}; queue->ExecuteCommandLists(2, batch);
@@ -255,8 +277,8 @@ int main(int argc, char** argv) {
             if (variance < 1e-6) throw std::runtime_error("D3D12 output lost the synthetic pattern");
         }
         loaded_modules();
-        std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 queue_integration=%s\n",
-            args.preset, args.iterations, commandBackend ? "recorded_command_list" : "explicit_harness");
+        std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 enhanced=%u queue_integration=%s\n",
+            args.preset, args.iterations, enhanced, commandBackend ? "recorded_command_list" : "explicit_harness");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "FAIL D3D12_DLSS %s\n", error.what()); loaded_modules(); return 4; }
 }

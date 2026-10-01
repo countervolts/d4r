@@ -19,6 +19,16 @@ inline void ngx_check(unsigned result, const char* operation) {
     std::printf("D4R_NGX %s result=0x%08x\n", operation, result);
     if (result != 1) throw std::runtime_error(std::string(operation) + " NGX=" + std::to_string(result));
 }
+inline ResourceAccess ngx_resource_access(void* parameters, const char* name, D3D12_RESOURCE_STATES fallback) {
+    ResourceAccess result(D3D12_RESOURCE_STATES(ngx::uint_value(parameters, name, unsigned(fallback))));
+    const std::string prefix(name);
+    result.enhanced = ngx::uint_value(parameters, (prefix + ".Enhanced").c_str()) != 0;
+    if (result.enhanced) {
+        result.layout = D3D12_BARRIER_LAYOUT(ngx::uint_value(parameters, (prefix + ".Layout").c_str()));
+        result.access = D3D12_BARRIER_ACCESS(ngx::uint_value(parameters, (prefix + ".Access").c_str()));
+    }
+    return result;
+}
 inline std::filesystem::path pixel_module_path() {
     if (const char* path = std::getenv("D4R_FORMAT_MODULE")) return diag::wide(env_path("D4R_FORMAT_MODULE"));
     HMODULE module = nullptr;
@@ -251,7 +261,7 @@ private:
     void record_inputs(ID3D12GraphicsCommandList* list, void* parameters) {
         for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
             static const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
-            planes_[i].shared->copy_input(list, planes_[i].texture.Get(), D3D12_RESOURCE_STATES(ngx::uint_value(parameters, states[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
+            planes_[i].shared->copy_input(list, planes_[i].texture.Get(), ngx_resource_access(parameters, states[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
         }
     }
     void execute_cuda(ID3D12CommandQueue* queue) {
@@ -296,7 +306,7 @@ private:
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
     }
     void record_output(ID3D12GraphicsCommandList* list, void* parameters) {
-        planes_[3].shared->copy_output(list, planes_[3].texture.Get(), D3D12_RESOURCE_STATES(ngx::uint_value(parameters, "D4R.Output.State", D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
+        planes_[3].shared->copy_output(list, planes_[3].texture.Get(), ngx_resource_access(parameters, "D4R.Output.State", D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     }
 };
 }

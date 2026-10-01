@@ -13,6 +13,7 @@ void record_boundary(ID3D12GraphicsCommandList* list, Boundary callback);
 std::string error();
 size_t live_recordings();
 D3D12_RESOURCE_STATES resource_state(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES fallback);
+ResourceAccess resource_access(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, ResourceAccess fallback);
 // Internal copies and callback submissions must bypass logical list routing.
 struct InternalScope {
     bool previous;

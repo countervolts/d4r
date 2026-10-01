@@ -31,7 +31,7 @@ struct Recording {
     std::vector<Segment> segments;
     std::vector<State> state;
     std::vector<Event> events;
-    std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resource_states;
+    std::unordered_map<ID3D12Resource*, ResourceAccess> resource_states;
     unsigned active_queries = 0;
     bool render_pass = false, predication = false, indirect_state_unknown = false, closed = false;
     explicit Recording(ID3D12GraphicsCommandList* list) : original(list) {}
@@ -91,6 +91,31 @@ void attach_method(void* target, void* replacement, void** original, const char*
 static constexpr GUID signature_description_tag = {0xbdda6148,0x46f0,0x4d82,{0xa1,0x90,0x08,0x47,0x7e,0xda,0x32,0x12}};
 using SignatureFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
 SignatureFn original_signature = nullptr;
+using CreateListFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE,
+    ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
+CreateListFn original_create_list = nullptr;
+HRESULT STDMETHODCALLTYPE hook_create_list(ID3D12Device* device, UINT node, D3D12_COMMAND_LIST_TYPE type,
+    ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial, REFIID iid, void** out) {
+    const auto result = original_create_list(device, node, type, allocator, initial, iid, out);
+    if (!internal && SUCCEEDED(result) && out && *out) try {
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(list.GetAddressOf())))) {
+            auto recording = get_recording(list.Get());
+            std::lock_guard<std::recursive_mutex> lock(recording->mutex);
+            auto pipeline = retain(initial);
+            if (pipeline) recording->state.emplace_back([pipeline](ID3D12GraphicsCommandList* target) {
+                original_SetPipelineState(target, pipeline.Get());
+            });
+        }
+    } catch (const std::exception& failure) {
+        // A public Create must retain its result even if tracking runs out of
+        // memory. A later split must fail explicitly instead of replaying an
+        // incomplete initial state.
+        { std::lock_guard<std::mutex> lock(error_mutex); last_error = failure.what(); }
+        std::fprintf(stderr, "D4R_CREATE_LIST_TRACK_FAILURE %s\n", failure.what());
+    }
+    return result;
+}
 HRESULT STDMETHODCALLTYPE hook_signature(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid, void** out) {
     const auto result = original_signature(device, desc, root, iid, out);
     if (SUCCEEDED(result) && out && *out && desc && desc->NumArgumentDescs <= 4096) try {
@@ -160,14 +185,28 @@ void STDMETHODCALLTYPE hook_ClearState(ID3D12GraphicsCommandList* self, ID3D12Pi
 void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList* self, UINT barrier_count, const D3D12_RESOURCE_BARRIER* barriers) {
     Access access(self);
     if (access.recording) for (UINT i = 0; i < barrier_count; ++i)
-        if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && barriers[i].Flags != D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
-            access.recording->resource_states[barriers[i].Transition.pResource] = barriers[i].Transition.StateAfter;
+        if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+            (barriers[i].Transition.Subresource == 0 || barriers[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) {
+            auto& state = access.recording->resource_states[barriers[i].Transition.pResource];
+            state = ResourceAccess(barriers[i].Transition.StateAfter);
+            state.pending_split = barriers[i].Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+        }
     original_ResourceBarrier(access.target(), barrier_count, barriers);
 }
 void STDMETHODCALLTYPE hook_Barrier(ID3D12GraphicsCommandList* self, UINT32 barrier_groups_count, const D3D12_BARRIER_GROUP* barrier_groups) {
     Access access(self);
+    if (access.recording) for (UINT32 g = 0; g < barrier_groups_count; ++g) if (barrier_groups[g].Type == D3D12_BARRIER_TYPE_TEXTURE)
+        for (UINT32 b = 0; b < barrier_groups[g].NumBarriers; ++b) {
+            const auto& barrier = barrier_groups[g].pTextureBarriers[b]; const auto& range = barrier.Subresources;
+            const bool containsZero = range.NumMipLevels == 0 ? (range.IndexOrFirstMipLevel == 0 || range.IndexOrFirstMipLevel == UINT32_MAX) :
+                range.IndexOrFirstMipLevel == 0 && range.FirstArraySlice == 0 && range.FirstPlane == 0;
+            if (containsZero) {
+                auto& state = access.recording->resource_states[barrier.pResource]; state.enhanced = true;
+                state.layout = barrier.LayoutAfter; state.access = barrier.AccessAfter; state.sync = barrier.SyncAfter;
+                state.pending_split = barrier.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;
+            }
+        }
     original_Barrier(access.target(), barrier_groups_count, barrier_groups);
-    // Enhanced layout-to-legacy conversion is an explicit subsequent gate.
 }
 void STDMETHODCALLTYPE hook_BeginEvent(ID3D12GraphicsCommandList* self, UINT metadata, const void* data, UINT size) {
     Access access(self);
@@ -319,6 +358,11 @@ InternalScope::~InternalScope() { internal = previous; }
 std::string error() { std::lock_guard<std::mutex> lock(error_mutex); return last_error; }
 size_t live_recordings() { std::lock_guard<std::mutex> lock(map_mutex); return recordings.size(); }
 D3D12_RESOURCE_STATES resource_state(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES fallback) {
+    const auto state = resource_access(list, resource, ResourceAccess(fallback));
+    if (state.enhanced) throw std::runtime_error("Enhanced texture layout cannot be treated as a legacy state");
+    return state.legacy;
+}
+ResourceAccess resource_access(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, ResourceAccess fallback) {
     auto recording = get_recording(list, false);
     if (!recording) return fallback;
     std::lock_guard<std::recursive_mutex> lock(recording->mutex);
@@ -362,6 +406,7 @@ void install(ID3D12Device* device) {
         // CopyTileMappings precede ExecuteCommandLists in the public SDK.
         attach_method(queueTable[10], reinterpret_cast<void*>(hook_execute), reinterpret_cast<void**>(&original_execute), "ExecuteCommandLists");
         auto deviceTable = *reinterpret_cast<void***>(device);
+        attach_method(deviceTable[device_command_list_slot], reinterpret_cast<void*>(hook_create_list), reinterpret_cast<void**>(&original_create_list), "CreateCommandList");
         attach_method(deviceTable[device_signature_slot], reinterpret_cast<void*>(hook_signature), reinterpret_cast<void**>(&original_signature), "CreateCommandSignature");
         for (const auto& hook : attached) {
             const auto result = MH_QueueEnableHook(hook.target);

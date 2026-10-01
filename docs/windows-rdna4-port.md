@@ -38,6 +38,44 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
 | M9: OptiScaler integration, profiling, installation | Pending |
 
+## Initial PSO and enhanced texture layouts (2026-10-01)
+
+The backend now captures the initial PSO supplied to public CreateCommandList,
+in addition to Reset and SetPipelineState. Its suffix can dispatch without
+rebinding that PSO. The public foundation probe's `initial-pso` mode passes
+32 native RX 9070 XT iterations; the WARP diagnostic passes too. The runtime
+now installs 81 documented method hooks, including CreateCommandList.
+
+Resource tracking distinguishes legacy states from enhanced texture layouts
+for mip/array/plane zero. Barriers on unrelated subresources do not overwrite
+that state. An unfinished split barrier on an NGX texture explicitly rejects
+Evaluate. The queued snapshot owns the layout/access metadata. Native interop
+uses CommandList7 texture barriers to enter COPY_SOURCE/COPY_DEST and restore
+the exact enhanced layout and access class; it does not reinterpret enhanced
+layouts as legacy states. Legacy texture copies also affect only subresource
+zero. Shared linear buffers continue to use their own legacy COMMON/copy states.
+This follows [Microsoft's enhanced barrier interoperability rules](https://microsoft.github.io/DirectX-Specs/d3d/D3D12EnhancedBarriers.html).
+
+`d3d12_gpu_enhanced_formats` independently tests all nineteen storage/plane
+cases with a D3D12 enhanced producer and consumer. Full build and CTest pass
+16/16 gates (`enhanced-final-ctest.log`, fifteen hardware and one WARP).
+`d3d12-m-enhanced-packed.zip` and `d3d12-k-enhanced-packed.zip` each pass four
+recorded NGX frames with their complete native transformer. Enhanced snapshot
+logs report shader-resource layout 21 and unordered-access layout 20. All
+four RGB images in both runs exactly match their independently quantised
+FP16 baselines, max absolute/relative error 0. Frame age and shim CPU image
+copy counts remain zero. Add `-BarrierMode enhanced` to the packed-run command
+below to reproduce. The explicit harness can also supply layout metadata.
+
+Tracking currently observes the evaluated list's barriers. A texture whose
+state was established only in a different list uses the caller-supplied state
+or the legacy NGX default; queue-wide state inheritance remains an integration
+gate. Unknown pre-initialization indirect signatures are still rejected.
+OptiScaler's default restore hotfixes are false; integration will keep
+RestoreComputeSignature, RestoreGraphicSignature and ExtendedStateRestore
+false because their original-method trampolines can bypass logical-list routing.
+Actual OptiScaler execution remains untested; no game files have been changed.
+
 ## Native GPU resource-format conversion (2026-10-01)
 
 `pixel_convert_gfx1201.hsaco` converts imported D3D12 copy footprints to NGX's
