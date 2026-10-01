@@ -16,7 +16,9 @@ bool installed = false;
 struct Event { UINT metadata; std::vector<uint8_t> data; };
 using State = std::function<void(ID3D12GraphicsCommandList*)>;
 struct TrackedResource {
-    ComPtr<ID3D12Resource> owner;
+    // D3D12 command lists do not retain resource references. The caller keeps
+    // them alive through submission/completion. An extra tracking reference
+    // would keep swap-chain buffers alive and make ResizeBuffers fail.
     ResourceAccess state;
 };
 using ResourceStates = std::unordered_map<ID3D12Resource*, TrackedResource>;
@@ -26,9 +28,9 @@ void publish_states(const ResourceStates& states) {
         // Buffers/simultaneous-access textures have automatic legacy state
         // decay at ExecuteCommandLists completion. Only ordinary textures
         // retain these explicit transitions across submission boundaries.
-        const auto desc = resource_desc(entry.second.owner.Get());
+        const auto desc = resource_desc(entry.first);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) continue;
-        dx(entry.second.owner->SetPrivateData(submitted_access_tag, sizeof(ResourceAccess), &entry.second.state), "Publish submitted texture access");
+        dx(entry.first->SetPrivateData(submitted_access_tag, sizeof(ResourceAccess), &entry.second.state), "Publish submitted texture access");
     }
 }
 struct Segment {
@@ -206,7 +208,6 @@ void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList* self, UIN
         if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
             (barriers[i].Transition.Subresource == 0 || barriers[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) {
             auto& tracked = access.recording->resource_states[barriers[i].Transition.pResource];
-            tracked.owner = retain(barriers[i].Transition.pResource);
             auto& state = tracked.state;
             state = ResourceAccess(barriers[i].Transition.StateAfter);
             state.pending_split = barriers[i].Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
@@ -221,7 +222,7 @@ void STDMETHODCALLTYPE hook_Barrier(ID3D12GraphicsCommandList* self, UINT32 barr
             const bool containsZero = range.NumMipLevels == 0 ? (range.IndexOrFirstMipLevel == 0 || range.IndexOrFirstMipLevel == UINT32_MAX) :
                 range.IndexOrFirstMipLevel == 0 && range.FirstArraySlice == 0 && range.FirstPlane == 0;
             if (containsZero) {
-                auto& tracked = access.recording->resource_states[barrier.pResource]; tracked.owner = retain(barrier.pResource);
+                auto& tracked = access.recording->resource_states[barrier.pResource];
                 auto& state = tracked.state; state.enhanced = true; state.inherited = false;
                 state.layout = barrier.LayoutAfter; state.access = barrier.AccessAfter; state.sync = barrier.SyncAfter;
                 state.pending_split = barrier.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;

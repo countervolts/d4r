@@ -25,6 +25,7 @@ const Case cases[] = {
     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, 1, "depth-r32f"},
     {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, 1, "depth-r16unorm"},
     {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 1, "depth24"},
+    {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, 1, "depth32-stencil8-plane0"},
     {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT, 4, "exposure-r16f"},
     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, 4, "exposure-r32f"},
     {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, 4, "exposure-rgba16f"},
@@ -46,6 +47,7 @@ ComPtr<ID3D12Resource> make_texture(ID3D12Device* device, DXGI_FORMAT fmt, bool 
     D3D12_RESOURCE_DESC desc{}; desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width; desc.Height = height; desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Format = fmt; desc.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    if (fmt == DXGI_FORMAT_R32G8X24_TYPELESS) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT; heap.CreationNodeMask = heap.VisibleNodeMask = 1;
     ComPtr<ID3D12Resource> result;
     dx(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
@@ -182,6 +184,7 @@ int main(int argc, char** argv) {
         for (unsigned iteration = 0; iteration < args.iterations; ++iteration) for (const auto& item : cases) {
             PixelSpec spec = pixel_spec(item.plane, item.resource); if (!pixel_supported(item.plane, spec.storage)) throw std::runtime_error("Unsupported fixture plane");
             auto input = make_texture(device.Get(), item.resource); SharedPlane shared(external, device.Get(), resource_desc(input.Get()));
+            std::printf("PIXEL_FOOTPRINT format=%s plane0_format=%u pitch=%u storage_bytes=%u\n", item.name, shared.footprint.Footprint.Format, shared.footprint.Footprint.RowPitch, spec.bytes);
             auto upload = make_buffer(device.Get(), shared.bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
             void* data = nullptr; D3D12_RANGE noRead{}; dx(upload->Map(0, &noRead, &data), "Pixel fixture upload");
             std::memset(data, 0x5a, size_t(shared.bytes)); for (unsigned y = 0; y < height; ++y) fixture(static_cast<uint8_t*>(data) + y * shared.footprint.Footprint.RowPitch, y, spec); upload->Unmap(0, nullptr);

@@ -21,6 +21,11 @@ and before OptiScaler's own method hooks. Command signatures created during
 game startup therefore retain their public argument descriptions for replay.
 The standalone runner's `-EarlyIndirectProbe` exercises this startup order.
 
+`0003` preserves the Project ID and engine identity through OptiScaler's
+older `Init_with_ProjectID` entry point used by its XeSS/FSR inputs. It also
+propagates an explicit external backend initialization failure. Reproduce
+with the D3D12 runner's `-NgxAbi project-legacy`.
+
 Build with Microsoft Build Tools 2022, v143 and Windows SDK 10.0.26100:
 
 ```powershell

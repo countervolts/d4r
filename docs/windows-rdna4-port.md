@@ -8,6 +8,53 @@ An actual game session remains unverified.
 
 ## Milestone and gates
 
+First actual game runs (2026-10-01): Silent Hill 2 1.2, XeSS input -> OptiScaler
+DLSS K. `silent-hill2-k-first.zip` found the old Project ID wrapper initializing
+CUDA NGX with app 4919 instead of the caller's identity, and back-buffer
+tracking references blocking `ResizeBuffers` (DXGI_ERROR_INVALID_CALL).
+OptiScaler patch `0003` preserves identity; resource-state records now follow
+the public D3D12 caller-owned resource lifetime instead of retaining barriers'
+resources. A composition swap-chain regression resizes while its submitted,
+unreset command list remains alive; it passes on Radeon and WARP, along with
+all 16 CTest gates (`game-resize-ctest.log`). K/M legacy Project ID standalone
+frames have bit-exact RGB. The invalid-core test propagates the error from
+legacy Init rather than pretending initialization succeeded.
+
+`silent-hill2-k-project-resize.zip` successfully initializes CUDA DLSS and
+presents thousands of startup frames with no d4r failures. It has **zero
+completed DLSS frames** and is not a game acceptance pass. The next interactive
+run reaches native K feature creation at 2259x1271 -> 3840x2160 after Enter;
+the user reports a black screen during this phase. Capture and isolate this
+before claiming successful in-game execution.
+
+`silent-hill2-k-720p.zip` localizes the flashing “upscaler failed to run”
+message to the actual depth resource: DXGI `R32G8X24_TYPELESS` (19). The
+backend previously rejected it before executing CUDA Evaluate. Implemented
+its D3D12 depth copy plane as R32; it is not an interleaved 64-bit texel.
+The [public planar depth/stencil specification](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/PlanarDepthStencilDDISpec.md)
+defines this plane mapping. `GetCopyableFootprints` is checked against R32
+and width * 4 bytes; copies/barriers affect subresource 0 only. All 4403 depth
+pixels match an independent D3D12 typed SRV exactly in each of two legacy and
+two enhanced runs. Full build / CTest 16/16 pass
+(`d32-stencil-full-ctest.log`). The NGX runner supports
+`-PixelProfile depth-stencil` for full-network validation.
+`optiscaler-k-depth-stencil.zip` and `optiscaler-m-depth-stencil.zip` both
+pass four full frames, with all 44/40 native transformer launches and bit-exact
+RGB against the respective non-stencil depth baselines.
+
+The local game package is `dist/windows-rdna4-game`, produced by
+`scripts/windows/package-windows-game.ps1`. Its native manifest combines all
+11 K + 5 M objects; NVIDIA binaries are excluded. `windows-game.ps1` backs up
+replaced files, verifies package hashes and the local DLSS identity, sets the
+native runtime environment, and captures stdout/stderr, external debugger,
+OptiScaler, exception and version/driver logs. Install/restore regression
+restores original DLL/config sentinel bytes exactly. For Silent Hill 2,
+`-DiagnosticResolution 1280x720` backs up and restores its two graphics config
+files; this avoids modifying progression saves. Original settings after the
+stopped failing run have an identical SHA256. `-CacheDirectory` can reuse an
+already validated local JIT cache. Development package usage is documented in
+`docs/windows-game.md`; in-game success is still a gate.
+
 Startup coverage (2026-10-01): OptiScaler patch `0002` installs d4r at device
 discovery, before NGX initialization. `optiscaler-k-preinit-signature.zip` and
 `optiscaler-m-preinit-signature.zip` create a dispatch-only command signature
@@ -149,8 +196,8 @@ copy counts remain zero. Add `-BarrierMode enhanced` to the packed-run command
 below to reproduce. The explicit harness can also supply layout metadata.
 
 Tracking now also publishes explicit ordinary texture state/layout metadata
-in the actual queue submission order. Each split segment retains its own
-resource-state snapshot and COM references. An Evaluate input with no barrier
+in the actual queue submission order. Each split segment stores its own
+resource-state snapshot. An Evaluate input with no barrier
 in its own list resolves the most recently submitted state at the callback,
 after preceding lists in the batch. The metadata belongs to the resource, with
 no global pointer cache or ownership cycle. Legacy buffer/simultaneous-access

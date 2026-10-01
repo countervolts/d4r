@@ -1,0 +1,37 @@
+From 09488c47855aadbf85f68ab8c72c0f3ac5f915e9 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 1 Oct 2026 17:01:32 +0300
+Subject: [PATCH] Preserve legacy ProjectID initialization in the external
+ backend
+
+---
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 89c9ba8..1f723f1 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -313,6 +313,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_ProjectID(const char* InProj
+ 
+             if (result == NVSDK_NGX_Result_Success)
+                 NVNGXProxy::SetDx12Inited(true);
++            else if (State::Instance().dlssExternalBackend)
++                return result;
+         }
+     }
+ 
+@@ -343,6 +345,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_with_ProjectID(
+ {
+     LOG_FUNC();
+ 
++    if (State::Instance().dlssExternalBackend)
++        return NVSDK_NGX_D3D12_Init_ProjectID(InProjectId, InEngineType, InEngineVersion,
++                                               InApplicationDataPath, InDevice, InSDKVersion, InFeatureInfo);
++
+     LOG_INFO("InProjectId: {0}", InProjectId);
+     LOG_INFO("InEngineType: {0}", (int) InEngineType);
+     LOG_INFO("InEngineVersion: {0}", InEngineVersion);
+-- 
+2.55.0.windows.5
+

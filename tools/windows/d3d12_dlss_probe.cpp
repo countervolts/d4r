@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
                 i == 2 ? DXGI_FORMAT_R32G32B32A32_FLOAT : i == 4 ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
             if (args.pixel_profile == "unorm") desc.Format = i == 3 ? DXGI_FORMAT_B8G8R8A8_UNORM :
                 i == 2 ? DXGI_FORMAT_R16G16_SNORM : i == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT : desc.Format;
+            if (args.pixel_profile == "depth-stencil" && i == 1) { desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL; }
             if (i == 3) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -214,7 +215,10 @@ int main(int argc, char** argv) {
         using Requirements = unsigned(*)(IDXGIAdapter*,const d4r::ngx::FeatureDiscoveryInfo*,d4r::ngx::FeatureRequirement*);
         check(shim.symbol<Requirements>("NVSDK_NGX_D3D12_GetFeatureRequirements")(adapter.Get(),&discovery,&requirements),"D3D12 feature requirements");
         if (requirements.FeatureSupported != 0) throw std::runtime_error("D3D12 DLSS requirements unsupported");
-        if (args.ngx_abi == "project") {
+        if (args.ngx_abi == "project-legacy") {
+            using ProjectInit = unsigned(*)(const char*,int,const char*,const wchar_t*,ID3D12Device*,const void*,unsigned);
+            check(shim.symbol<ProjectInit>("NVSDK_NGX_D3D12_Init_with_ProjectID")("24480451-f00d-face-1304-0308dabad187",0,"1.0",directory.c_str(),device.Get(),nullptr,0x15),"D3D12 legacy project Init");
+        } else if (args.ngx_abi == "project") {
             using ProjectInit = unsigned(*)(const char*,int,const char*,const wchar_t*,ID3D12Device*,unsigned,const void*);
             check(shim.symbol<ProjectInit>("NVSDK_NGX_D3D12_Init_ProjectID")("24480451-f00d-face-1304-0308dabad187",0,"1.0",directory.c_str(),device.Get(),0x15,nullptr),"D3D12 project Init");
         } else check(shim.symbol<Init>("NVSDK_NGX_D3D12_Init_Ext")(241534723ull, directory.c_str(), device.Get(), 0x15, nullptr), "D3D12 Init");

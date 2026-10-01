@@ -161,6 +161,23 @@ int main(int argc, char** argv) {
         using Live = unsigned long long(*)();
         const bool no_hooks = std::getenv("D4R_COMMAND_PROBE_NO_HOOKS") != nullptr;
         if (!no_hooks && shim.symbol<Install>("d4r_D3D12_InstallCommandBackend")(device.Get()) != 1) throw std::runtime_error("Command backend installation failed");
+        {
+            ComPtr<IDXGIFactory2> newerFactory; dx(factory->QueryInterface(IID_PPV_ARGS(newerFactory.GetAddressOf())), "Resize regression factory");
+            DXGI_SWAP_CHAIN_DESC1 desc{}; desc.Width = desc.Height = 64;
+            desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+            desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; desc.BufferCount = 2;
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            ComPtr<IDXGISwapChain1> chain;
+            dx(newerFactory->CreateSwapChainForComposition(queue.Get(), &desc, nullptr, chain.GetAddressOf()), "Resize regression swap chain");
+            ComPtr<ID3D12Resource> backBuffer; dx(chain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())), "Resize regression back buffer");
+            NativeList recorded(device.Get());
+            transition(recorded.list.Get(), backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(recorded.list.Get(), backBuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+            recorded.submit(device.Get(), queue.Get()); backBuffer.Reset();
+            // The submitted list remains alive and unreset during resize.
+            dx(chain->ResizeBuffers(2, 96, 64, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers with retained submitted list");
+            std::printf("D3D12_RESIZE_REGRESSION submitted_list_alive=1 old_back_buffer_released=1\n");
+        }
         auto record = shim.symbol<Record>("d4r_D3D12_RecordDiagnosticBoundary");
         auto live = shim.symbol<Live>("d4r_D3D12_LiveRecordings");
         const bool root_indirect = args.interop_mode == "indirect-root-reset";

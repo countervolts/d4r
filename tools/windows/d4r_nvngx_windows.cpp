@@ -13,6 +13,13 @@ std::unordered_map<Handle*, std::shared_ptr<d4r::win::Feature>> features;
 std::unordered_map<void*, bool> parameters;
 constexpr unsigned failure = 0xBAD00002, invalid = 0xBAD00005;
 unsigned call(const std::function<unsigned()>& fn) noexcept {
+    static std::once_flag diagnosticOutput;
+    std::call_once(diagnosticOutput, [] {
+        if (std::getenv("D4R_DIAG_DIR")) {
+            std::setvbuf(stdout, nullptr, _IONBF, 0);
+            std::setvbuf(stderr, nullptr, _IONBF, 0);
+        }
+    });
     try { return fn(); }
     catch (const std::exception& error) {
         std::fprintf(stderr, "D4R_WINDOWS_FAILURE %s\n", error.what()); return failure;

@@ -115,6 +115,13 @@ public:
     SharedPlane(ExternalApi& api, ID3D12Device* device, const D3D12_RESOURCE_DESC& texture) : api_(api) {
         UINT rows = 0; UINT64 rowBytes = 0;
         device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, &rows, &rowBytes, &bytes);
+        if (texture.Format == DXGI_FORMAT_R32G8X24_TYPELESS || texture.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || texture.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) {
+            // D3D12 exposes D32S8 as separate depth/stencil copy planes. Only
+            // subresource 0 (R32 depth) belongs to NGX; never copy interleaved
+            // 64-bit texels or touch the stencil plane.
+            if ((footprint.Footprint.Format != DXGI_FORMAT_R32_FLOAT && footprint.Footprint.Format != DXGI_FORMAT_R32_TYPELESS) || rowBytes != texture.Width * 4)
+                throw std::runtime_error("Unexpected D32S8 depth-plane copy footprint");
+        }
         if (!bytes || bytes == UINT64_MAX || !footprint.Footprint.RowPitch)
             throw std::runtime_error("Invalid shared texture footprint");
         buffer = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON);

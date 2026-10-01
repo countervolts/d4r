@@ -8,7 +8,7 @@ param(
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,
     [ValidateSet('init', 'evaluate', 'd3d12')][string]$NgxMode = 'init',
-    [ValidateSet('driver','sdk','project')][string]$NgxAbi = 'driver',
+    [ValidateSet('driver','sdk','project','project-legacy')][string]$NgxAbi = 'driver',
     [string]$OptiScalerDll,
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
     [switch]$NgxOnly,
@@ -17,7 +17,7 @@ param(
     [switch]$CommandListBackend,
     [switch]$CaptureExceptions,
     [switch]$EarlyIndirectProbe,
-    [ValidateSet('baseline','packed','unorm')][string]$PixelProfile = 'baseline',
+    [ValidateSet('baseline','packed','unorm','depth-stencil')][string]$PixelProfile = 'baseline',
     [ValidateSet('legacy','enhanced','inherited-legacy','inherited-enhanced')][string]$BarrierMode = 'legacy',
     [int]$Iterations = 32,
     [int]$TimeoutSeconds = 180

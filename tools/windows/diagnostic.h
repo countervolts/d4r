@@ -142,7 +142,7 @@ struct Args {
             else if (key == "--stream-lifetime") stream_lifetime = value;
             else if (key == "--interop-mode") interop_mode = value;
             else if (key == "--pixel-profile") {
-                if (value != "baseline" && value != "packed" && value != "unorm") throw std::runtime_error("pixel-profile must be baseline, packed or unorm");
+                if (value != "baseline" && value != "packed" && value != "unorm" && value != "depth-stencil") throw std::runtime_error("Invalid pixel-profile");
                 pixel_profile = value;
             }
             else if (key == "--barrier-mode") {
