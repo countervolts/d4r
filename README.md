@@ -17,8 +17,12 @@ output match the FP16 baseline exactly after resource-format quantisation.
 The build incorporates upstream RDNA4 commit `dbef4b2`. Patched OptiScaler now
 passes standalone K/M native-network tests with exact RGB agreement against
 the direct-d4r baseline; see [the source patch](patches/optiscaler/README.md).
-Game integration and performance profiling remain in progress; no game support is
-claimed yet. See [build instructions and hardware results](docs/windows-rdna4-port.md).
+Silent Hill 2 now renders K through the native Windows backend; M also renders
+a saved gameplay level with GPU output NaN/Inf checks. Startup depth/stencil
+and swap-chain lifetime issues found in the game have regression checks.
+Performance and wider resolution coverage remain in progress. See
+[the reversible game package](docs/windows-game.md) and
+[build instructions and hardware results](docs/windows-rdna4-port.md).
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

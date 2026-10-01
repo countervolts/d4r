@@ -172,6 +172,14 @@ int main(int argc, char** argv) {
     try {
         Args args(argc, argv); HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_gfx1201(args.device, props);
         ExternalApi external{hip}; PixelProgram program(hip, wide(args.module));
+        {
+            PixelAllocation diagnostic(hip,3,1,8);
+            const uint16_t bad[] = {0x7e00,0x7c00,0xfc00,0x3c00,0,1,0x3ff,0x7bff,0x8000,0x8001,0xbc00,0x400};
+            hip.check(hip.hipMemcpy(diagnostic.data,bad,sizeof(bad),hipMemcpyHostToDevice), "Upload nonfinite validation fixture");
+            const auto counts = program.validate(diagnostic.data,diagnostic.pitch,3,1);
+            if (counts[0] != 1 || counts[1] != 2) throw std::runtime_error("GPU NaN/Inf validation counters mismatch");
+            std::printf("PASS OUTPUT_VALIDATION_FIXTURE nan=1 inf=2 finite=9\n");
+        }
         ComPtr<IDXGIFactory4> factory; dx(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "Pixel DXGI");
         ComPtr<IDXGIAdapter1> adapter;
         for (UINT i = 0; ; ++i) { dx(factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf()), "Pixel adapter"); DXGI_ADAPTER_DESC1 d{}; dx(adapter->GetDesc1(&d), "Pixel adapter desc"); if (!std::memcmp(&d.AdapterLuid, props.luid, sizeof(LUID))) break; }

@@ -4,11 +4,40 @@ Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
 This is a work log for an implementation in progress. Standalone DLSS K/M
 works on the real Windows GPU, including the patched OptiScaler frontend.
-An actual game session remains unverified.
+Silent Hill 2 now renders through the Windows backend; gameplay and output
+validation coverage are recorded below. Performance remains in progress.
 
 ## Milestone and gates
 
-First actual game runs (2026-10-01): Silent Hill 2 1.2, XeSS input -> OptiScaler
+Actual K rendering: `silent-hill2-k-depth-plane.zip` completes **1794 DLSS
+frames / 19734 native K launches / zero d4r failures** at 753x424 -> 1280x720
+with the game's depth-inverted HDR path and DXGI-19 depth plane. The captured
+menu is rendered correctly; no CPU image copies or frame-age fallback are
+used. Its restored graphics settings match the original SHA256.
+
+GPU output validation is now available via `D4R_VALIDATE_OUTPUT=1` or the
+game runner's `-ValidateOutput`. A native GPU scan classifies all canonical
+RGBA16F components, returning only two 32-bit NaN/Inf counters. A negative
+fixture with one NaN and two infinities passes. All four K/M standalone
+validated frames have zero NaN/Inf and bit-exact RGB against their control
+frames (`optiscaler-k-output-validation.zip`, `optiscaler-m-output-validation.zip`).
+The pixel format tests including the negative fixture pass legacy/enhanced
+barriers (`output-validation-formats-ctest.log`).
+
+`silent-hill2-m-output-validation` now renders the actual saved gameplay
+level with all five native M transformer layers. A screenshot shows the
+character and street scene; 1349 full 1280x720 output scans have zero
+NaN/Inf in all 3686400 components. There are 1348 complete frame log records,
+13490 native launches and zero d4r failures; the bounded stop interrupts the
+last frame log after its successful scan. The runner now counts only complete
+records and reports validation counts and per-kernel native/translated hits.
+The current-frame backend remains slow:
+observed interop + NGX CPU completion is roughly 74–86 ms in these runs.
+These are initial stage measurements, not isolated kernel GPU timings or
+a controlled K/M performance comparison. Profile before optimizing.
+
+First actual game runs (2026-10-01): Silent Hill 2 v1.1.258834 (the GSA settings
+schema reports 1.2.0.0), XeSS input -> OptiScaler
 DLSS K. `silent-hill2-k-first.zip` found the old Project ID wrapper initializing
 CUDA NGX with app 4919 instead of the caller's identity, and back-buffer
 tracking references blocking `ResizeBuffers` (DXGI_ERROR_INVALID_CALL).
@@ -53,7 +82,7 @@ restores original DLL/config sentinel bytes exactly. For Silent Hill 2,
 files; this avoids modifying progression saves. Original settings after the
 stopped failing run have an identical SHA256. `-CacheDirectory` can reuse an
 already validated local JIT cache. Development package usage is documented in
-`docs/windows-game.md`; in-game success is still a gate.
+`docs/windows-game.md`; K menu and M saved-level results are recorded above.
 
 Startup coverage (2026-10-01): OptiScaler patch `0002` installs d4r at device
 discovery, before NGX initialization. `optiscaler-k-preinit-signature.zip` and
@@ -95,7 +124,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
-| M9: OptiScaler integration, profiling, installation | Patched frontend K/M PASS; game, profiling and final package pending |
+| M9: OptiScaler integration, profiling, installation | Patched frontend K/M PASS; K game menu and M saved level PASS; profiling and final package pending |
 
 ## Public NGX identity and OptiScaler gate (2026-10-01)
 
@@ -137,7 +166,8 @@ NVIDIA architecture as a proxy. GetFeatureRequirements spoofing is bypassed.
 Explicit external DLSS selection returns errors instead of silently using FSR.
 Microsoft Build Tools 17.14 / MSVC 14.44.35207 and SDK 10.0.26100 were installed
 from the signature-verified official bootstrapper without restarting Windows.
-No game files have been modified.
+At this historical frontend milestone no game files had been modified; the
+later game installer and reversible file backups are described above.
 
 The OptiScaler fork commit is `33bbac2` on `windows-rdna4-d4r`. Its reproducible
 source patch and build instructions are in [patches/optiscaler](../patches/optiscaler/README.md).

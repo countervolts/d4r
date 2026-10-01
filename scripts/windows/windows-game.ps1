@@ -7,6 +7,7 @@ param(
     [int]$RunSeconds = 0,
     [string]$DiagnosticResolution,
     [string]$CacheDirectory = $env:ZLUDA_CACHE_DIR,
+    [switch]$ValidateOutput,
     [string[]]$GameArguments = @('-dx12','-windowed','-ResX=1280','-ResY=720'),
     [string]$OutputDirectory
 )
@@ -132,6 +133,7 @@ $settings = @{
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
 $old = @{}; $process = $null; $originalSettings = @()
+if ($ValidateOutput) { $settings['D4R_VALIDATE_OUTPUT']='1' }
 try {
     if ($DiagnosticResolution) {
         if ([IO.Path]::GetFileName($GameExe) -ne 'SHProto-Win64-Shipping.exe' -or $DiagnosticResolution -notmatch '^([0-9]{3,4})x([0-9]{3,4})$') { throw 'DiagnosticResolution currently supports Silent Hill 2 only; use e.g. 1280x720.' }
@@ -179,11 +181,22 @@ try {
     $stdout = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stdout.log') -Raw
     $debugger = Get-Content -LiteralPath (Join-Path $OutputDirectory 'debugger.log') -Raw
     $gameExit = [regex]::Match($debugger, 'EXIT code=0x([0-9a-f]+)')
+    # A bounded stop can interrupt the last printf; count only complete records.
+    $frames = [regex]::Matches($stdout, '(?m)^D4R_FRAME cpu_frame_copies=([0-9]+) frame_age=([0-9]+) interop_ngx_ms=([0-9.]+)\r?$')
+    $checks = [regex]::Matches($stdout, '(?m)^D4R_OUTPUT_VALIDATION elements=([0-9]+) nan=([0-9]+) inf=([0-9]+) diagnostics_cpu_bytes=8\r?$')
+    $nonfinite = @($checks | Where-Object { $_.Groups[2].Value -ne '0' -or $_.Groups[3].Value -ne '0' }).Count
+    $launches = [regex]::Matches($stderr, '\[d4r-launch\] kernel="([^"]+)" backend=(native|translated)')
+    $kernels = @($launches | ForEach-Object { $_.Groups[1].Value + ' ' + $_.Groups[2].Value } | Group-Object | ForEach-Object {
+        $parts=$_.Name.Split(' '); @{kernel=$parts[0]; backend=$parts[1]; launches=$_.Count}
+    })
     @{exitCode=$(if ($gameExit.Success) { '0x' + $gameExit.Groups[1].Value } else { 'diagnostic_timeout' }); runSeconds=$timer.Elapsed.TotalSeconds; preset=$Preset;
         nativeLaunches=([regex]::Matches($stderr, '\[d4r-launch\].*backend=native')).Count;
-        completedFrames=([regex]::Matches($stdout, 'D4R_FRAME ')).Count;
+        completedFrames=$frames.Count; outputValidationRequested=[bool]$ValidateOutput;
+        outputGpuChecks=$checks.Count; nonfiniteOutputs=$nonfinite; kernels=$kernels;
+        previousFrameOutputs=@($frames | Where-Object { $_.Groups[2].Value -ne '0' }).Count;
+        cpuImageCopyFrames=@($frames | Where-Object { $_.Groups[1].Value -ne '0' }).Count;
         failures=([regex]::Matches($stderr, 'D4R_WINDOWS_FAILURE|D4R_COMMAND_FAILURE')).Count} |
-        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
+        ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath ($OutputDirectory + '.zip') -Force
     Write-Host "Game diagnostic bundle: $OutputDirectory.zip"
 } finally {

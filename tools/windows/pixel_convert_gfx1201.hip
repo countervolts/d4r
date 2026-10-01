@@ -131,3 +131,17 @@ extern "C" __global__ void d4r_pixel_encode(const u8* source, u64 source_pitch, 
     float value[4]; for (unsigned c = 0; c < 4; ++c) value[c] = from_half(halves[c]);
     encode(dest + u64(y) * dest_pitch + u64(x) * pixel_bytes(Storage(format)), Storage(format), value);
 }
+
+// Diagnostic scan of the canonical RGBA16F output; no image readback.
+extern "C" __global__ void d4r_pixel_validate(const u8* source, u64 pitch,
+    unsigned width, unsigned height, unsigned* counters) {
+    unsigned i = blockIdx.x * 256u + threadIdx.x;
+    if (u64(i) >= u64(width) * height) return;
+    const auto* values = reinterpret_cast<const u16*>(source + u64(i / width) * pitch) + (i % width) * 4;
+    unsigned nans = 0, infinities = 0;
+    for (unsigned c = 0; c < 4; ++c) if ((values[c] & 0x7c00u) == 0x7c00u) {
+        if (values[c] & 0x3ffu) ++nans; else ++infinities;
+    }
+    if (nans) __atomic_fetch_add(counters, nans, __ATOMIC_RELAXED);
+    if (infinities) __atomic_fetch_add(counters + 1, infinities, __ATOMIC_RELAXED);
+}

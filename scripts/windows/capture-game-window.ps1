@@ -15,10 +15,13 @@ public static class D4RWindowCapture {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 }
 '@
 }
 $windows = [Collections.Generic.List[object]]::new()
+$previousDpi=[D4RWindowCapture]::SetThreadDpiAwarenessContext([IntPtr](-4))
+try {
 $callback = [D4RWindowCapture+Callback]{ param($window,$data)
     [uint32]$owner = 0
     [void][D4RWindowCapture]::GetWindowThreadProcessId($window,[ref]$owner)
@@ -42,5 +45,10 @@ $graphics = [Drawing.Graphics]::FromImage($bitmap)
 try {
     $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$bitmap.Size)
     $bitmap.Save([IO.Path]::GetFullPath($OutputPath),[Drawing.Imaging.ImageFormat]::Png)
-} finally { $graphics.Dispose(); $bitmap.Dispose() }
+} finally {
+    $graphics.Dispose(); $bitmap.Dispose()
+}
 Write-Host "Captured game window: $OutputPath"
+} finally {
+    if ($previousDpi -ne [IntPtr]::Zero) { [void][D4RWindowCapture]::SetThreadDpiAwarenessContext($previousDpi) }
+}

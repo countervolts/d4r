@@ -322,6 +322,13 @@ private:
         output.image->download_device(reinterpret_cast<uintptr_t>(output.canonical ? output.canonical->data : output.shared->mapped),
             output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM output completion");
+        if (std::getenv("D4R_VALIDATE_OUTPUT")) {
+            if (!rt_->pixels) rt_->pixels = std::make_unique<PixelProgram>(rt_->hip, pixel_module_path());
+            const auto counts = rt_->pixels->validate(output.canonical ? output.canonical->data : output.shared->mapped,
+                output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height);
+            std::printf("D4R_OUTPUT_VALIDATION elements=%llu nan=%u inf=%u diagnostics_cpu_bytes=8\n", output.desc.Width * output.desc.Height * 4, counts[0], counts[1]);
+            if (counts[0] || counts[1]) throw std::runtime_error("DLSS output contains NaN/Inf");
+        }
         if (output.canonical) rt_->pixels->convert(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
             output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height, output.spec.storage, 3);
         rt_->timeline->signal_output(queue);

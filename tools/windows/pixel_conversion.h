@@ -1,6 +1,7 @@
 #pragma once
 #include "d3d12_external.h"
 #include "pixel_format.h"
+#include <array>
 
 namespace d4r::win {
 struct PixelSpec {
@@ -52,6 +53,8 @@ class PixelProgram {
     diag::HipApi& hip_;
     hipModule_t module_ = nullptr;
     hipFunction_t decode_ = nullptr, encode_ = nullptr;
+    hipFunction_t validate_ = nullptr;
+    void* counters_ = nullptr;
 public:
     PixelProgram(diag::HipApi& hip, const std::filesystem::path& module) : hip_(hip) {
         try {
@@ -60,8 +63,20 @@ public:
             hip.check(hip.hipModuleGetFunction(&encode_, module_, "d4r_pixel_encode"), "Resolve GPU pixel encode");
         } catch (...) { if (module_) (void)hip.hipModuleUnload(module_); throw; }
     }
-    ~PixelProgram() { if (module_) (void)hip_.hipModuleUnload(module_); }
+    ~PixelProgram() { if (counters_) (void)hip_.hipFree(counters_); if (module_) (void)hip_.hipModuleUnload(module_); }
     PixelProgram(const PixelProgram&) = delete;
+    std::array<unsigned,2> validate(const void* source, uint64_t pitch, unsigned width, unsigned height) {
+        if (!width || !height || uint64_t(width) * height > UINT32_MAX / 4) throw std::runtime_error("Invalid output validation dimensions");
+        if (!validate_) hip_.check(hip_.hipModuleGetFunction(&validate_, module_, "d4r_pixel_validate"), "Resolve output validation kernel");
+        if (!counters_) hip_.check(hip_.hipMalloc(&counters_, 2 * sizeof(unsigned)), "Allocate validation counters");
+        std::array<unsigned,2> result{};
+        hip_.check(hip_.hipMemcpy(counters_, result.data(), sizeof(result), hipMemcpyHostToDevice), "Clear validation counters");
+        void* args[] = {&source, &pitch, &width, &height, &counters_};
+        hip_.check(hip_.hipModuleLaunchKernel(validate_, unsigned((uint64_t(width) * height + 255) / 256),1,1,256,1,1,0,nullptr,args,nullptr), "Validate output on GPU");
+        hip_.check(hip_.hipDeviceSynchronize(), "Output validation completion");
+        hip_.check(hip_.hipMemcpy(result.data(), counters_, sizeof(result), hipMemcpyDeviceToHost), "Read validation counters");
+        return result;
+    }
     void convert(bool encode, const void* source, uint64_t sourcePitch, void* dest, uint64_t destPitch,
         unsigned width, unsigned height, pixel::Storage format, unsigned plane) {
         if (!width || !height || uint64_t(width) * height > UINT32_MAX) throw std::runtime_error("Invalid GPU conversion dimensions");

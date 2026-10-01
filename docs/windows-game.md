@@ -1,8 +1,10 @@
 # Native Windows RDNA4 game development package
 
 Validated hardware: Windows 11 x64 / Radeon RX 9070 XT / gfx1201. Native K and
-M transformer kernels pass standalone D3D12 + OptiScaler checks. Actual game
-compatibility and performance are still being validated. This is a local
+M transformer kernels pass standalone D3D12 + OptiScaler checks. Silent Hill 2
+K now renders real menu frames and M renders a saved gameplay level with
+GPU NaN/Inf checks. Resolution coverage and performance are still being
+validated. This is a local
 development package; no NVIDIA proprietary DLL is included.
 
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
@@ -38,6 +40,11 @@ files, temporarily selects a window at that resolution, and restores the
 original bytes after the test. It does not change progression saves. First-use
 PTX compilation can be slow; `-CacheDirectory <existing-ZLUDA-cache>` reuses
 modules with matching GPU, codegen switches and ZLUDA binary fingerprint.
+
+Add `-ValidateOutput` to scan the entire RGBA16F DLSS output for NaN/Inf on
+the GPU before returning it to D3D12. Only two diagnostic counters (8 bytes)
+are read by the CPU; image data remains in VRAM. Validation failures are
+reported explicitly. Disable this diagnostic when measuring production speed.
 
 Original files are backed up before replacement. Restore with:
 
