@@ -6,16 +6,17 @@ d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in W
 
 **Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It has been tested on one GPU in a handful of games and depends on unreleased patches to ZLUDA and vkd3d-proton.
 
-**Windows / RDNA4 development:** the `windows-rdna4` branch adds native Windows
-gfx1201 HIP/ZLUDA diagnostics, validated D3D12/HIP interop, an NGX init probe,
-and a CPU-checked gfx12 WMMA backend. K `enc1` and `enc2` execute on
-gfx1201 and match the existing numpy model on synthetic nonzero fixtures.
-This branch incorporates upstream RDNA4 commit `dbef4b2`; native Windows CMake
-builds all 11 K and 5 M modules with the upstream gfx12 layout. Other layers,
-full K/M image validation and the Windows game runtime are still in progress.
-Build commands, hardware results and remaining
-porting gates are in [docs/windows-rdna4-port.md](docs/windows-rdna4-port.md).
-This branch does not yet provide a Windows DLSS runtime.
+**Windows / RDNA4 development:** `windows-rdna4` runs native K and M networks
+in a standalone Windows D3D12 harness on an RX 9070 XT (gfx1201). All K layers
+and all spatial blocks in forty temporal M launches pass NumPy/PTX validation.
+The Windows shim imports D3D12 VRAM through HIP, executes DLSS at command-list
+submission, and returns output in the same frame without CPU image copies.
+RGBA16/32F, R11G11B10, RGBA/BGRA8, depth, exposure and motion formats have
+independent D3D12 typed SRV/UAV conversion tests. Four-frame K/M runs with packed
+output match the FP16 baseline exactly after resource-format quantisation.
+The build incorporates upstream RDNA4 commit `dbef4b2`. OptiScaler/game
+integration and performance profiling remain in progress; no game support is
+claimed yet. See [build instructions and hardware results](docs/windows-rdna4-port.md).
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

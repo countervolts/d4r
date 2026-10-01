@@ -3,6 +3,7 @@
 #include "ngx_cuda_evaluate.h"
 #include <dxgi1_6.h>
 #include <memory>
+#include <array>
 
 int main(int argc, char** argv) {
     using namespace d4r::diag;
@@ -17,6 +18,8 @@ int main(int argc, char** argv) {
         const std::filesystem::path directory(diagDir ? wide(diagDir) : std::filesystem::current_path().wstring());
         std::filesystem::create_directories(directory);
         const bool commandBackend = args.interop_mode == "command-list";
+        if (args.interop_mode == "images" && args.pixel_profile != "baseline") throw std::runtime_error("Raw CUDA image diagnostic requires baseline formats");
+        std::printf("D3D12_PIXEL_PROFILE %s\n", args.pixel_profile.c_str());
         if (commandBackend && _putenv_s("D4R_D3D12_COMMAND_BACKEND", "1")) throw std::runtime_error("Cannot enable command backend");
         for (const auto& pair : {std::make_pair("D4R_HIP_ROOT", args.hip_root),
              std::make_pair("D4R_NVCUDA_DLL", args.cuda_dll), std::make_pair("D4R_NVAPI_DLL", args.nvapi_dll),
@@ -63,6 +66,10 @@ int main(int argc, char** argv) {
             desc.Height = i == 4 ? 1 : i == 3 ? outHeight : height;
             desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
             desc.Format = i == 0 || i == 3 ? DXGI_FORMAT_R16G16B16A16_FLOAT : i == 2 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+            if (args.pixel_profile == "packed") desc.Format = i == 0 || i == 3 ? DXGI_FORMAT_R11G11B10_FLOAT :
+                i == 2 ? DXGI_FORMAT_R32G32B32A32_FLOAT : i == 4 ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+            if (args.pixel_profile == "unorm") desc.Format = i == 3 ? DXGI_FORMAT_B8G8R8A8_UNORM :
+                i == 2 ? DXGI_FORMAT_R16G16_SNORM : i == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT : desc.Format;
             if (i == 3) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -79,11 +86,16 @@ int main(int argc, char** argv) {
                 if (i == 0) {
                     uint16_t pixel[] = {uint16_t(((x / 16 + y / 16) & 1) ? 0x3a00 : 0x3400),
                         uint16_t((x & 32) ? 0x3800 : 0x3400), uint16_t((y & 32) ? 0x3a00 : 0x3800), 0x3c00};
-                    std::memcpy(row + x * 8, pixel, sizeof(pixel));
+                    if (desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                        const uint32_t packed = uint32_t(pixel[0] >> 4) | (uint32_t(pixel[1] >> 4) << 11) | (uint32_t(pixel[2] >> 5) << 22);
+                        std::memcpy(row + x * 4, &packed, 4);
+                    } else std::memcpy(row + x * 8, pixel, sizeof(pixel));
                 } else if (i == 1 || i == 4) {
-                    const float value = i == 1 ? .5f : 1.f; std::memcpy(row + x * 4, &value, 4);
+                    if (desc.Format == DXGI_FORMAT_R16_FLOAT) { const uint16_t one = 0x3c00; std::memcpy(row + x * 2, &one, 2); }
+                    else { const float value = i == 1 ? .5f : 1.f; std::memcpy(row + x * 4, &value, 4); }
                 } else if (i == 3) {
-                    const uint16_t pixel[] = {0x7e00, 0x7e00, 0x7e00, 0x7e00}; std::memcpy(row + x * 8, pixel, 8);
+                    if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) { const uint16_t pixel[] = {0x7e00, 0x7e00, 0x7e00, 0x7e00}; std::memcpy(row + x * 8, pixel, 8); }
+                    else { const uint32_t sentinel = 0xffffffff; std::memcpy(row + x * 4, &sentinel, 4); }
                 }
             }
             texture.upload->Unmap(0, nullptr);
@@ -206,8 +218,30 @@ int main(int argc, char** argv) {
             void* raw = nullptr; D3D12_RANGE range{0, size_t(textures[3].bytes)};
             dx(readback->Map(0, &range, &raw), "Map(verification only)");
             std::vector<uint16_t> pixels(size_t(outWidth) * outHeight * 4);
-            for (unsigned y = 0; y < outHeight; ++y) std::memcpy(pixels.data() + size_t(y) * outWidth * 4,
-                static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch, outWidth * 8);
+            const auto format = resource_desc(textures[3].image.Get()).Format;
+            if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                for (unsigned y = 0; y < outHeight; ++y) std::memcpy(pixels.data() + size_t(y) * outWidth * 4,
+                    static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch, outWidth * 8);
+            } else {
+                std::ofstream native(directory / ("output-" + std::to_string(frame) + (args.pixel_profile == "packed" ? ".r11g11b10f" : ".bgra8")), std::ios::binary);
+                // Independently decode the diagnostic readback for previews and
+                // frame comparisons. No CPU image copies are in the backend.
+                static const auto unormHalf = [] {
+                    std::array<uint16_t, 256> lut{};
+                    for (unsigned b = 0; b < 256; ++b) { double best = INFINITY; for (unsigned h = 0; h <= 0x3c00; ++h) { double error = std::abs(double(half_value(uint16_t(h))) - double(b)/255.); if (error < best || (error == best && !(h & 1))) { best = error; lut[b] = uint16_t(h); } } }
+                    return lut;
+                }();
+                for (unsigned y = 0; y < outHeight; ++y) {
+                    const auto* row = static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch;
+                    native.write(reinterpret_cast<const char*>(row), outWidth * 4);
+                    for (unsigned x = 0; x < outWidth; ++x) {
+                        auto* p = pixels.data() + (size_t(y) * outWidth + x) * 4;
+                        if (format == DXGI_FORMAT_R11G11B10_FLOAT) { uint32_t value = 0; std::memcpy(&value,row + x * 4,4); p[0] = uint16_t((value & 2047) << 4); p[1] = uint16_t(((value >> 11) & 2047) << 4); p[2] = uint16_t((value >> 22) << 5); p[3] = 0x3c00; }
+                        else for (unsigned c = 0; c < 4; ++c) p[c] = unormHalf[row[x * 4 + (c == 0 ? 2 : c == 2 ? 0 : c)]];
+                    }
+                }
+                if (!native) throw std::runtime_error("Saving native output format failed");
+            }
             D3D12_RANGE noWrite{}; readback->Unmap(0, &noWrite);
             double sum = 0, square = 0;
             for (size_t i = 0; i < pixels.size(); ++i) {

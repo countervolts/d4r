@@ -110,6 +110,7 @@ struct Args {
     std::string hip_root, cuda_dll, module, context = "primary";
     std::string stream_lifetime = "persistent";
     std::string interop_mode = "roundtrip";
+    std::string pixel_profile = "baseline";
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
@@ -131,6 +132,10 @@ struct Args {
             else if (key == "--context") context = value;
             else if (key == "--stream-lifetime") stream_lifetime = value;
             else if (key == "--interop-mode") interop_mode = value;
+            else if (key == "--pixel-profile") {
+                if (value != "baseline" && value != "packed" && value != "unorm") throw std::runtime_error("pixel-profile must be baseline, packed or unorm");
+                pixel_profile = value;
+            }
             else if (key == "--ngx-core") ngx_core = value;
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;

@@ -2,7 +2,8 @@
 
 Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
-This is a work log for an implementation in progress, not a claim of DLSS support.
+This is a work log for an implementation in progress. Standalone DLSS K/M
+works on the real Windows GPU; OptiScaler/game support remains unverified.
 
 ## Milestone and gates
 
@@ -36,6 +37,67 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
 | M9: OptiScaler integration, profiling, installation | Pending |
+
+## Native GPU resource-format conversion (2026-10-01)
+
+`pixel_convert_gfx1201.hsaco` converts imported D3D12 copy footprints to NGX's
+RGBA16F/RG16F/R32F arrays and converts output back to the original resource
+format. Canonical formats retain the existing direct path. Other formats use
+pitched HIP allocations and native decode/encode kernels; images stay in VRAM.
+Completion currently synchronizes the host before NGX uses its other streams.
+The module is installed beside `d4r_nvngx.dll`; `D4R_FORMAT_MODULE` can override
+its absolute path. The diagnostic runner copies it into its owned temporary
+NGX runtime alongside the shim. No NVIDIA binaries are installed in packages.
+
+Supported storage: RGBA16/32F, RGBA/BGRA8 UNORM, R11G11B10 FLOAT, RGB10A2 UNORM,
+RG16/32F, RG16 SNORM/UNORM, R16F exposure, R32F/D32 depth, D24/R24 depth and
+D16/R16 UNORM depth. Typeless R16 means floating-point exposure or UNORM depth,
+according to the NGX plane. sRGB and D32S8 conversion are explicitly rejected
+until independently validated. Optional mask textures are not supported yet.
+
+The public `d4r_d3d12_pixel_probe` tests nineteen plane/format combinations at
+259x17, with padded pitches, partial workgroups and row guards. D3D12 typed SRV
+loads provide independent float32 decode values, with a mathematical binary16
+nearest-value search for CUDA RNE conversion. HLSL `f32tof16` is not used as
+an RNE reference: the current driver truncates that operation. Color encode
+is compared bit-for-bit to typed UAV stores read through a D3D12 consumer SRV.
+The reference includes HDR limits, subnormals, signed motion endpoints, UNORM
+rounding/clamping and packed channel permutations. An initial RNE R11 encoder
+failed this test; truncation now matches the driver, including finite HDR limits.
+See [Microsoft's format-conversion specification](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm).
+
+Results on RX 9070 XT / TheRock:
+
+* `pixel-final-ctest.log`: 14/14 PASS (13 hardware tests and one WARP test).
+* `pixel-milestone-diagnostics.zip`: all fourteen public diagnostic gates PASS.
+* `d3d12-m-packed-formats.zip`: four M frames, forty native network launches,
+  R11 color/output, RGBA32 motion, R16 exposure, zero shim CPU image copies.
+* `d3d12-m-unorm-formats.zip`: four M frames with BGRA8 output, RG16 SNORM
+  motion and RGBA32 exposure; forty native launches, frame age zero.
+* `d3d12-k-packed-formats.zip`: four K frames and forty-four native launches.
+* Each of those three complete runs matches its FP16 baseline after the
+  independent D3D12 resource-format quantisation: RGB max absolute/relative
+  error 0, PSNR infinite. No tolerance was relaxed for packed output.
+
+Reproduce a complete packed M run with locally supplied NVIDIA DLLs:
+
+```powershell
+$env:D4R_ZLUDA_NATIVE_DIR="$PWD/build/native-m-gfx1201"
+$env:ZLUDA_CACHE_DIR="$PWD/build/zluda-cache-windows"
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -ZludaRoot "$PWD/dist/zluda-windows-f16-reference" -PackageRoot "$PWD/dist/windows-rdna4-command-list" -NgxCore "$PWD/_nvngx.dll" -DlssDll "$PWD/nvngx_dlss.dll" -NgxMode d3d12 -Preset 13 -NgxOnly -RequireNativeNetwork -CommandListBackend -PixelProfile packed -Trace -Iterations 4 -OutputDirectory "$PWD/test-results/d3d12-m-packed-formats"
+```
+
+One public diagnostic command, without NVIDIA DLLs:
+
+```powershell
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -ZludaRoot "$PWD/dist/zluda-windows-f16-reference" -PackageRoot "$PWD/dist/windows-rdna4-command-list"
+```
+
+The exact complete-frame comparison uses `frame_compare.py --exact` with
+`--output-storage r11g11b10f` or `bgra8`. Ordinary comparisons still use the
+existing FP16 output gates. Game integration next needs command-list initial
+PSO handling, enhanced-layout tracking, optional mask import and OptiScaler
+API/state-hook compatibility. The game directory is still untouched.
 
 ## M temporal precision regression (2026-09-30)
 

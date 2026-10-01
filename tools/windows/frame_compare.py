@@ -20,6 +20,16 @@ def main(args):
             raise RuntimeError(f'Output size mismatch for {path.name}')
         if not np.isfinite(reference).all() or not np.isfinite(output).all():
             raise RuntimeError(f'NaN/Inf in {path.name}')
+        if args.output_storage == 'r11g11b10f':
+            # D3D float narrowing truncates. Compare after the independent
+            # resource-format quantisation, rather than relaxing the PSNR gate.
+            bits = reference.reshape(-1, 4).view(np.uint16).copy()
+            bits[bits & 0x8000 != 0] = 0
+            bits[:, :2] &= 0x7ff0
+            bits[:, 2] &= 0x7fe0
+            reference = bits.view(np.float16).reshape(-1)
+        elif args.output_storage == 'bgra8':
+            reference = (np.rint(np.clip(reference.astype(np.float32), 0, 1) * 255) / 255).astype(np.float16)
         x = reference.reshape(-1, 4)[:, :3].astype(np.float64)
         y = output.reshape(-1, 4)[:, :3].astype(np.float64)
         error = np.abs(x - y)
@@ -30,7 +40,7 @@ def main(args):
         print(f'FRAME_REFERENCE name={path.name} max_abs={error.max():.9g} '
               f'max_rel={(error / np.maximum(np.abs(x), .001)).max():.9g} rms={rms:.9g} psnr_db={psnr:.6g} '
               f'fraction_over_1pct={outliers:.9g}')
-        if psnr < args.min_psnr or error.max() > .025 * peak or outliers > .0001:
+        if (args.exact and np.any(error != 0)) or psnr < args.min_psnr or error.max() > .025 * peak or outliers > .0001:
             raise RuntimeError(f'Complete pipeline mismatch in {path.name}')
     print(f'PASS FRAME_REFERENCE frames={len(frames)} finite=1 min_psnr_db={args.min_psnr}')
 
@@ -42,6 +52,8 @@ if __name__ == '__main__':
     parser.add_argument('--width', type=int, default=512)
     parser.add_argument('--height', type=int, default=288)
     parser.add_argument('--min-psnr', type=float, default=60.)
+    parser.add_argument('--output-storage', choices=('rgba16f', 'r11g11b10f', 'bgra8'), default='rgba16f')
+    parser.add_argument('--exact', action='store_true')
     args = parser.parse_args()
     try:
         main(args)

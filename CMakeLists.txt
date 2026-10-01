@@ -21,6 +21,14 @@ add_custom_command(OUTPUT "${probe_object}"
     -o "${probe_object}"
   DEPENDS tools/windows/probe_kernel.hip VERBATIM)
 add_custom_target(d4r_probe_code_object ALL DEPENDS "${probe_object}")
+set(pixel_object "${CMAKE_CURRENT_BINARY_DIR}/pixel_convert_gfx1201.hsaco")
+add_custom_command(OUTPUT "${pixel_object}"
+  COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=gfx1201
+    --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
+    -nogpuinc -nogpulib -O2 "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/pixel_convert_gfx1201.hip"
+    -o "${pixel_object}"
+  DEPENDS tools/windows/pixel_convert_gfx1201.hip tools/windows/pixel_format.h kernels/common/hip_device_minimal.h VERBATIM)
+add_custom_target(d4r_pixel_code_object ALL DEPENDS "${pixel_object}")
 set(wmma_object "${CMAKE_CURRENT_BINARY_DIR}/wmma_gfx1201.hsaco")
 add_custom_command(OUTPUT "${wmma_object}"
   COMMAND "${D4R_HIP_CLANG}" -x hip --offload-arch=gfx1201
@@ -68,7 +76,7 @@ foreach(family k m)
   endforeach()
 endforeach()
 add_custom_target(d4r_native_gfx1201_compile ALL DEPENDS ${native_objects})
-foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe native_replay_probe cuda_driver_probe cuda_mma_probe cuda_image_probe d3d12_command_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe d3d12_dlss_probe)
+foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe native_replay_probe cuda_driver_probe cuda_mma_probe cuda_image_probe d3d12_command_probe d3d12_pixel_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe d3d12_dlss_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
   target_include_directories(d4r_${probe} PRIVATE "${D4R_HIP_ROOT}/include")
@@ -90,6 +98,7 @@ if(NOT EXISTS "${D4R_MINHOOK_ROOT}/include/MinHook.h")
 endif()
 add_subdirectory("${D4R_MINHOOK_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/minhook" EXCLUDE_FROM_ALL)
 add_library(d4r_nvngx_windows SHARED tools/windows/d4r_nvngx_windows.cpp tools/windows/d3d12_command_hooks.cpp)
+add_dependencies(d4r_nvngx_windows d4r_pixel_code_object)
 set_target_properties(d4r_nvngx_windows PROPERTIES PREFIX "" OUTPUT_NAME "d4r_nvngx")
 target_compile_definitions(d4r_nvngx_windows PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
 target_include_directories(d4r_nvngx_windows PRIVATE "${D4R_HIP_ROOT}/include")
@@ -139,6 +148,8 @@ install(TARGETS d4r_nvapi_compat RUNTIME DESTINATION nvapi-compat)
 target_link_libraries(d4r_d3d12_hip_interop_probe PRIVATE d3d12 dxgi dxguid)
 target_link_libraries(d4r_d3d12_dlss_probe PRIVATE d3d12 dxgi dxguid)
 target_link_libraries(d4r_d3d12_command_probe PRIVATE d3d12 dxgi dxguid)
+target_link_libraries(d4r_d3d12_pixel_probe PRIVATE d3d12 dxgi dxguid)
+add_dependencies(d4r_d3d12_pixel_probe d4r_pixel_code_object)
 add_dependencies(d4r_d3d12_command_probe d4r_nvngx_windows)
 set(D4R_AGILITY_ROOT "" CACHE PATH "Optional unpacked Microsoft.Direct3D.D3D12 1.619.5 debug SDK")
 if(EXISTS "${D4R_AGILITY_ROOT}/build/native/bin/x64/d3d12SDKLayers.dll")
@@ -158,6 +169,7 @@ add_dependencies(d4r_hip_gfx1201_probe d4r_probe_code_object)
 add_dependencies(d4r_gfx12_wmma_probe d4r_wmma_code_object)
 add_dependencies(d4r_k_module_probe d4r_native_gfx1201_compile)
 install(FILES "${probe_object}" DESTINATION bin)
+install(FILES "${pixel_object}" DESTINATION bin)
 install(FILES "${wmma_object}" DESTINATION bin)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
 install(FILES scripts/windows/test-k-replay.ps1 DESTINATION .)
@@ -177,6 +189,9 @@ install(FILES kernels/tools/pwin_model.py kernels/tools/pwin_check.py kernels/to
 install(FILES kernels/tools/model_enc3.py kernels/tools/swin_model.py kernels/tools/swin_check.py DESTINATION reference)
 install(FILES docs/windows-rdna4-port.md DESTINATION docs)
 include(CTest)
+add_test(NAME d3d12_gpu_pixel_formats COMMAND d4r_d3d12_pixel_probe
+  --hip-root "${D4R_HIP_ROOT}" --module "${pixel_object}" --iterations 2)
+set_tests_properties(d3d12_gpu_pixel_formats PROPERTIES TIMEOUT 120 LABELS "hardware;gfx1201;formats")
 add_test(NAME d3d12_command_backend COMMAND d4r_d3d12_command_probe
   --hip-root "${D4R_HIP_ROOT}" --module "$<TARGET_FILE:d4r_nvngx_windows>" --interop-mode indirect --iterations 32)
 set_tests_properties(d3d12_command_backend PROPERTIES TIMEOUT 120 LABELS "hardware;d3d12;command_lists;lifetime")

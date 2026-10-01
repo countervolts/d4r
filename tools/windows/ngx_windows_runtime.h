@@ -1,5 +1,6 @@
 #pragma once
 #include "d3d12_external.h"
+#include "pixel_conversion.h"
 #include "cuda_image_api.h"
 #include "ngx_parameters.h"
 #include "d3d12_command_hooks.h"
@@ -18,6 +19,15 @@ inline void ngx_check(unsigned result, const char* operation) {
     std::printf("D4R_NGX %s result=0x%08x\n", operation, result);
     if (result != 1) throw std::runtime_error(std::string(operation) + " NGX=" + std::to_string(result));
 }
+inline std::filesystem::path pixel_module_path() {
+    if (const char* path = std::getenv("D4R_FORMAT_MODULE")) return diag::wide(env_path("D4R_FORMAT_MODULE"));
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&pixel_module_path), &module)) throw std::runtime_error("Locate GPU conversion module directory");
+    wchar_t path[32768]{}; const DWORD length = GetModuleFileNameW(module, path, 32768);
+    if (!length || length == 32768) throw std::runtime_error("GPU conversion module path is invalid");
+    return std::filesystem::path(path).parent_path() / L"pixel_convert_gfx1201.hsaco";
+}
 
 struct Runtime {
     diag::HipApi hip;
@@ -32,6 +42,7 @@ struct Runtime {
     CUcontext context = nullptr;
     bool initialized = false;
     std::unique_ptr<SharedTimeline> timeline;
+    std::unique_ptr<PixelProgram> pixels;
     std::mutex mutex;
     using Init = unsigned(*)(unsigned long long, const wchar_t*, unsigned);
     using Shutdown = unsigned(*)();
@@ -105,6 +116,7 @@ struct Runtime {
         if (context) (void)cuda.cuCtxSetCurrent(context);
         if (initialized) { (void)shutdown(); initialized = false; }
         timeline.reset();
+        pixels.reset();
         if (context) {
             (void)cuda.cuCtxSynchronize(); (void)cuda.cuCtxSetCurrent(nullptr);
             (void)cuda.cuDevicePrimaryCtxRelease_v2(ordinal); context = nullptr;
@@ -123,13 +135,15 @@ class Feature {
         D3D12_RESOURCE_DESC desc{};
         std::unique_ptr<SharedPlane> shared;
         std::unique_ptr<cuda::Image> image;
+        std::unique_ptr<PixelAllocation> canonical;
+        PixelSpec spec{};
     } planes_[5];
     void cleanup() noexcept {
         (void)rt_->cuda.cuCtxSetCurrent(rt_->context);
         (void)rt_->cuda.cuCtxSynchronize();
         if (handle_) { (void)rt_->release(handle_); handle_ = nullptr; }
         for (auto& plane : planes_) {
-            plane.image.reset(); plane.shared.reset(); plane.texture.Reset();
+            plane.image.reset(); plane.canonical.reset(); plane.shared.reset(); plane.texture.Reset();
         }
         if (scratch_) { (void)rt_->cuda.cuMemFree_v2(scratch_); scratch_ = 0; }
         if (parameters_) { (void)rt_->destroy(parameters_); parameters_ = nullptr; }
@@ -209,17 +223,22 @@ private:
                 throw std::runtime_error("Interop baseline requires single-sample 2D textures");
             const bool half = i == 0 || i == 2 || i == 3;
             const unsigned channels = i == 0 || i == 3 ? 4 : i == 2 ? 2 : 1;
-            const DXGI_FORMAT format = channels == 4 ? DXGI_FORMAT_R16G16B16A16_FLOAT :
-                channels == 2 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT;
-            if (desc.Format != format && !(i == 1 && (desc.Format == DXGI_FORMAT_R32_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT)))
-                throw std::runtime_error(std::string("GPU conversion not yet implemented for ") + names[i] + " format=" + std::to_string(desc.Format));
+            if (desc.Width > UINT32_MAX) throw std::runtime_error("Texture width exceeds GPU conversion ABI");
+            const PixelSpec spec = pixel_spec(i, desc.Format);
+            if (!pixel_supported(i, spec.storage)) throw std::runtime_error(std::string("Unsupported ") + names[i] + " DXGI format=" + std::to_string(desc.Format));
             auto& plane = planes_[i];
             if (!plane.shared || plane.desc.Width != desc.Width || plane.desc.Height != desc.Height || plane.desc.Format != desc.Format) {
                 rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Synchronize(resize interop)");
-                plane.image.reset(); plane.shared.reset();
+                plane.image.reset(); plane.canonical.reset(); plane.shared.reset();
                 plane.shared = std::make_unique<SharedPlane>(rt_->external, rt_->device.Get(), desc);
+                if (!spec.direct) {
+                    if (!rt_->pixels) rt_->pixels = std::make_unique<PixelProgram>(rt_->hip, pixel_module_path());
+                    plane.canonical = std::make_unique<PixelAllocation>(rt_->hip, unsigned(desc.Width), desc.Height, channels * (half ? 2 : 4));
+                }
                 plane.image = std::make_unique<cuda::Image>(rt_->images, unsigned(desc.Width), desc.Height, half ? 16 : 32, channels, i == 3, i == 0 ? 1 : 0);
-                plane.desc = desc;
+                plane.desc = desc; plane.spec = spec;
+                std::printf("D4R_FORMAT plane=%s dxgi=%u canonical_channels=%u canonical_bits=%u gpu_conversion=%u cpu_copy=0\n",
+                    names[i], unsigned(desc.Format), channels, half ? 16u : 32u, !spec.direct);
             }
             plane.texture = texture;
             d4r_ngx_set_void(parameters_, names[i], &plane.image->object);
@@ -240,7 +259,14 @@ private:
         rt_->timeline->wait_input(queue);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Interop input producer completion");
         for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
-            planes_[i].image->upload_device(reinterpret_cast<uintptr_t>(planes_[i].shared->mapped), planes_[i].shared->footprint.Footprint.RowPitch);
+            auto& plane = planes_[i];
+            void* data = plane.shared->mapped; uint64_t pitch = plane.shared->footprint.Footprint.RowPitch;
+            if (plane.canonical) {
+                rt_->pixels->convert(false, data, pitch, plane.canonical->data, plane.canonical->pitch,
+                    unsigned(plane.desc.Width), plane.desc.Height, plane.spec.storage, i);
+                data = plane.canonical->data; pitch = plane.canonical->pitch;
+            }
+            plane.image->upload_device(reinterpret_cast<uintptr_t>(data), pitch);
         }
         if (std::getenv("D4R_INTEROP_VERIFY")) {
             for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
@@ -259,8 +285,12 @@ private:
         // NGX can use internal nonblocking streams. The default stream alone
         // does not establish completion of those streams.
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "NGX all-stream completion");
-        planes_[3].image->download_device(reinterpret_cast<uintptr_t>(planes_[3].shared->mapped), planes_[3].shared->footprint.Footprint.RowPitch);
+        auto& output = planes_[3];
+        output.image->download_device(reinterpret_cast<uintptr_t>(output.canonical ? output.canonical->data : output.shared->mapped),
+            output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM output completion");
+        if (output.canonical) rt_->pixels->convert(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
+            output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height, output.spec.storage, 3);
         rt_->timeline->signal_output(queue);
         std::printf("D4R_FRAME cpu_frame_copies=%u frame_age=0 interop_ngx_ms=%.3f\n", std::getenv("D4R_INTEROP_VERIFY") ? 1u : 0u,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
