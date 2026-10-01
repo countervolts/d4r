@@ -102,10 +102,14 @@ The backend intercepts documented D3D12 COM methods using pinned open-source
 [MinHook 1.3.4](https://github.com/TsudaKageyu/minhook/releases/tag/v1.3.4), commit
 `c3fcafdc10146beb5919319d0683e44e3c30d537`. No NVIDIA instructions, proprietary
 DLL contents or private driver interfaces are patched. The typed forwarding
-code is generated from public SDK CommandList0..7 declarations. The additional
-CommandList8..10 declarations were audited in Microsoft's current public
-DirectX-Headers, `adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4`; coverage of those
-newer methods is the next implementation step.
+code is generated from public SDK CommandList0..7 declarations, with typed
+CommandList8..10 additions audited in Microsoft's current public
+DirectX-Headers, `adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4`. The AMD runtime
+exposes CommandList10: eighty public-method hooks now install successfully.
+SetProgram descriptors are copied by value. Work-graph replay omits INITIALIZE
+to preserve already initialized backing memory; see the
+[Microsoft work-graph specification](https://microsoft.github.io/DirectX-Specs/d3d/WorkGraphs.html#d3d12_set_work_graph_flags).
+Full GPU work-graph execution is not a tested gate yet.
 
 At NGX Evaluate, the caller's resource references and typed parameter values are
 copied into an owned snapshot. The recorded prefix is closed. Subsequent calls
@@ -142,10 +146,60 @@ frames are bit-exact against `d3d12-k-final`. Complete CTest: 12/12 PASS
 
 Enable this backend with `D4R_D3D12_COMMAND_BACKEND=1`; the diagnostic runner
 sets it through `-CommandListBackend`. Before game testing, remaining gates are
-newer command methods, indirect-state reconstruction, enhanced barrier layouts,
+enhanced barrier layouts,
 actual game texture formats and interaction with OptiScaler's own state hooks.
 Closed lists, active render/query scopes, GPU predication and unknown indirect
 state are currently explicitly rejected instead of guessing their semantics.
+
+## Indirect commands and Windows diagnostics (2026-10-01)
+
+CreateCommandSignature interception stores its public argument description
+using ID3D12Object::SetPrivateData, owned by the original COM object. There is
+no driver-private introspection or independent signature-lifetime table.
+After ExecuteIndirect, replay restores exactly the documented zero/NULL values
+for affected root constants, views, VB slots and IB; unaffected state remains
+inherited. See [Microsoft's indirect drawing specification](https://learn.microsoft.com/en-us/windows/win32/direct3d12/indirect-drawing).
+Signatures created before interception remain explicitly untracked.
+
+The RX 9070 XT passes 32 queue/backend iterations alternating direct Dispatch
+and dispatch-only ExecuteIndirect. Bindings, ordering, temporary host argument
+copies and final Release are verified (`d3d12-indirect-plain-final`). Microsoft
+WARP passes 32 backend iterations with an indirect signature that changes a
+root constant, followed by direct Dispatch without rebinding: both prefix and
+suffix observe the required zero (`d3d12-indirect-root-warp-backend.log`).
+WARP is reported as software, never as gfx1201.
+CTest now passes 13/13 (twelve physical GPU gates plus the WARP root-reset
+regression), `d3d12-command-v10-final-ctest.log`. Four ordinary recorded M
+frames still execute forty native transformer launches and remain bit-exact
+against the previous CommandList7 implementation (`d3d12-m-command-v10.zip`,
+`d3d12-m-command-v10-reference.log`).
+
+**Unresolved native AMD root-mutating indirect regression:** that same valid
+root-constant/Dispatch signature removes the AMD device (0x887a0006). It also
+fails with d4r hooks disabled and with HIP omitted, under inbox D3D12Core and
+Agility 1.619.5, with UPLOAD and DEFAULT argument buffers. DRED stops inside
+ExecuteIndirect and reports 0x80015c000 when the argument-buffer GPU VA is
+0x200057000. The exact fault address is four times that allocation's VA; this
+is an observation, not a proven driver cause. This workload passes on WARP.
+Do not classify native root-mutating indirect execution as validated. The
+default physical test covers dispatch-only signatures; the root mutation case
+is a separate reproducible diagnostic:
+
+```powershell
+powershell -NoProfile -File scripts/windows/test-d3d12-command.ps1 -NoHooks -NoHip -Mode indirect-root-reset -Iterations 2 -OutputDirectory test-results/amd-root-indirect-reproducer
+```
+
+Logs retain stdout/stderr, device-removed reason, DRED breadcrumbs/fault address,
+loaded DLL versions and exception minidumps via D4R_DIAG_DIR. `-Warp` selects
+the software comparison. No game or NVIDIA DLL is required.
+
+Optional app-local debug target: set D4R_AGILITY_ROOT to unpacked official
+Microsoft.Direct3D.D3D12 1.619.5. NuGet ZIP SHA256:
+`0e9bcf32aac9a79343ede9b21e4864950ee54577e3d8e19bfcdf002bb4e9bfd6`.
+On this machine, the public debug interfaces still return SDK_COMPONENT_MISSING
+despite app-local SDKLayers loading. Installing Windows Graphics Tools failed
+with DISM's component-store-corrupted error. No repair, reboot, security change
+or game runtime dependency was introduced. DRED works without that layer.
 
 ## Source baseline (checked 2026-09-29)
 

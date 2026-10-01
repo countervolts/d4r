@@ -1,13 +1,24 @@
 """Generate typed command forwarding from public MinGW D3D12 SDK declarations.
 
 Run with --header <SDK/include/d3d12.h> --output d3d12_command_hooks.generated.h.
-Every recording method through CommandList7 is forwarded. State setters copy
+Every recording method through CommandList10 is forwarded. State setters copy
 their host arguments; COM object arguments retain a reference. SDK slot numbers
 are derived from the public interface inheritance, never a driver binary.
 """
 import argparse
 import pathlib
 import re
+
+# Public additions verified against Microsoft's DirectX-Headers adbd6f3b.
+# The old MinGW SDK has the needed scalar types but lacks the work-graph
+# descriptor names; NewProgramDescription is a typed public-ABI mirror.
+NEWER = [
+    (8, 'OMSetFrontAndBackStencilRef', 'UINT front_stencil, UINT back_stencil'),
+    (9, 'RSSetDepthBias', 'FLOAT depth_bias, FLOAT clamp, FLOAT slope'),
+    (9, 'IASetIndexBufferStripCutValue', 'D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value'),
+    (10, 'SetProgram', 'const NewProgramDescription* desc'),
+    (10, 'DispatchGraph', 'const void* desc'),
+]
 
 POINTER_COUNTS = {
     'RSSetViewports': {'viewports': 'viewport_count'},
@@ -89,7 +100,26 @@ def generate(source):
             registrations[-1] = f'    if (version >= {version})' + registrations[-1][3:]
             slot += 1
             lines.append('')
+    for version, name, arguments in NEWER:
+        declarations = arguments.split(', ')
+        names = [re.search(r'(\w+)$', argument)[1] for argument in declarations]
+        signature = ', '.join(['ID3D12GraphicsCommandList* self'] + declarations)
+        lines += [f'using Fn_{name} = void(STDMETHODCALLTYPE*)({signature});', f'static Fn_{name} original_{name} = nullptr;']
+        if name == 'SetProgram':
+            lines.append(f'static void STDMETHODCALLTYPE hook_{name}({signature});')
+        else:
+            lines += [f'static void STDMETHODCALLTYPE hook_{name}({signature}) {{', '    Access access(self);']
+            if name != 'DispatchGraph':
+                lines += ['    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {',
+                          f'        original_{name}(' + ', '.join(['target'] + names) + ');', '    });']
+            lines += [f'    original_{name}(' + ', '.join(['access.target()'] + names) + ');', '}']
+        registrations.append(f'    if (version >= {version}) attach_method(table[{slot}], reinterpret_cast<void*>(hook_{name}), reinterpret_cast<void**>(&original_{name}), "{name}");')
+        slot += 1
+        lines.append('')
     lines += ['static void attach_recording_methods(void** table, unsigned version) {'] + registrations + ['}', '']
+    device = re.search(r'typedef struct ID3D12DeviceVtbl \{(.*?)\n\} ID3D12DeviceVtbl;', source, re.S)[1]
+    fields = list(dict.fromkeys(re.findall(r'\(STDMETHODCALLTYPE \*(\w+)\)', device)))
+    lines.append(f'static constexpr unsigned device_signature_slot = {fields.index("CreateCommandSignature")};')
     return '\n'.join(lines)
 
 

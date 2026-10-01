@@ -1,4 +1,5 @@
 #include "d3d12_command_hooks.h"
+#include "d3d12_newer_commands.h"
 #include <MinHook.h>
 #include <atomic>
 #include <memory>
@@ -86,6 +87,40 @@ void attach_method(void* target, void* replacement, void** original, const char*
 }
 
 #include "d3d12_command_hooks.generated.h"
+
+static constexpr GUID signature_description_tag = {0xbdda6148,0x46f0,0x4d82,{0xa1,0x90,0x08,0x47,0x7e,0xda,0x32,0x12}};
+using SignatureFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
+SignatureFn original_signature = nullptr;
+HRESULT STDMETHODCALLTYPE hook_signature(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid, void** out) {
+    const auto result = original_signature(device, desc, root, iid, out);
+    if (SUCCEEDED(result) && out && *out && desc && desc->NumArgumentDescs <= 4096) try {
+        ComPtr<ID3D12CommandSignature> signature;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(signature.GetAddressOf())))) {
+            std::vector<uint8_t> value(sizeof(UINT) + desc->NumArgumentDescs * sizeof(D3D12_INDIRECT_ARGUMENT_DESC));
+            std::memcpy(value.data(), &desc->NumArgumentDescs, sizeof(UINT));
+            if (desc->NumArgumentDescs)
+                std::memcpy(value.data() + sizeof(UINT), desc->pArgumentDescs, value.size() - sizeof(UINT));
+            const auto tagged = signature->SetPrivateData(signature_description_tag, UINT(value.size()), value.data());
+            if (FAILED(tagged)) std::fprintf(stderr, "D4R_SIGNATURE_TRACK_FAILURE result=0x%08x\n", unsigned(tagged));
+        }
+    } catch (const std::exception& failure) {
+        // Preserve the successful public API call. An untracked signature is
+        // rejected at a later split instead of unwinding into the application.
+        std::fprintf(stderr, "D4R_SIGNATURE_TRACK_FAILURE %s\n", failure.what());
+    }
+    return result;
+}
+void STDMETHODCALLTYPE hook_SetProgram(ID3D12GraphicsCommandList* self, const NewProgramDescription* desc) {
+    Access access(self);
+    if (access.recording && desc) {
+        auto saved = *desc;
+        // INITIALIZE changes backing memory. Rebinding an already initialized
+        // work graph in the suffix must preserve its prefix's GPU state.
+        if (saved.type == 5) saved.work_graph.flags &= ~1u;
+        access.recording->state.emplace_back([saved](ID3D12GraphicsCommandList* target) { original_SetProgram(target, &saved); });
+    }
+    original_SetProgram(access.target(), desc);
+}
 
 using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
 ReleaseFn original_release = nullptr;
@@ -183,7 +218,52 @@ void STDMETHODCALLTYPE hook_ExecuteBundle(ID3D12GraphicsCommandList* self, ID3D1
 void STDMETHODCALLTYPE hook_ExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* command_signature,
     UINT max_command_count, ID3D12Resource* arg_buffer, UINT64 arg_buffer_offset, ID3D12Resource* count_buffer, UINT64 count_buffer_offset) {
     Access access(self);
-    if (access.recording) access.recording->indirect_state_unknown = true;
+    if (access.recording) {
+        UINT bytes = 0;
+        (void)command_signature->GetPrivateData(signature_description_tag, &bytes, nullptr);
+        if (bytes < sizeof(UINT) || bytes > sizeof(UINT) + 4096 * sizeof(D3D12_INDIRECT_ARGUMENT_DESC)) {
+            access.recording->indirect_state_unknown = true;
+        } else {
+            std::vector<uint8_t> description(bytes);
+            UINT count = 0;
+            const auto result = command_signature->GetPrivateData(signature_description_tag, &bytes, description.data());
+            std::memcpy(&count, description.data(), sizeof(count));
+            if (FAILED(result) || count > 4096 || bytes != sizeof(UINT) + count * sizeof(D3D12_INDIRECT_ARGUMENT_DESC)) access.recording->indirect_state_unknown = true;
+            else {
+                std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments(count);
+                std::memcpy(arguments.data(), description.data() + sizeof(UINT), count * sizeof(D3D12_INDIRECT_ARGUMENT_DESC));
+                bool compute = false;
+                for (const auto& arg : arguments) compute |= arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH || arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+                // Microsoft documents that only bindings modified by the
+                // signature are reset to zero/NULL after ExecuteIndirect.
+                access.recording->state.emplace_back([arguments, compute](ID3D12GraphicsCommandList* target) {
+                    for (const auto& arg : arguments) switch (arg.Type) {
+                        // Public SDK addition after the pinned MinGW header:
+                        // INCREMENTING_CONSTANT has the same first two UINTs.
+                        case static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(11):
+                            (compute ? original_SetComputeRoot32BitConstant : original_SetGraphicsRoot32BitConstant)
+                                (target, arg.Constant.RootParameterIndex, 0, arg.Constant.DestOffsetIn32BitValues); break;
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+                            std::vector<UINT> zeros(arg.Constant.Num32BitValuesToSet);
+                            auto setter = compute ? original_SetComputeRoot32BitConstants : original_SetGraphicsRoot32BitConstants;
+                            setter(target, arg.Constant.RootParameterIndex, UINT(zeros.size()), zeros.data(), arg.Constant.DestOffsetIn32BitValues); break;
+                        }
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+                            (compute ? original_SetComputeRootConstantBufferView : original_SetGraphicsRootConstantBufferView)(target, arg.ConstantBufferView.RootParameterIndex, 0); break;
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+                            (compute ? original_SetComputeRootShaderResourceView : original_SetGraphicsRootShaderResourceView)(target, arg.ShaderResourceView.RootParameterIndex, 0); break;
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+                            (compute ? original_SetComputeRootUnorderedAccessView : original_SetGraphicsRootUnorderedAccessView)(target, arg.UnorderedAccessView.RootParameterIndex, 0); break;
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: original_IASetIndexBuffer(target, nullptr); break;
+                        case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+                            D3D12_VERTEX_BUFFER_VIEW empty{}; original_IASetVertexBuffers(target, arg.VertexBuffer.Slot, 1, &empty); break;
+                        }
+                        default: break;
+                    }
+                });
+            }
+        }
+    }
     original_ExecuteIndirect(access.target(), command_signature, max_command_count, arg_buffer, arg_buffer_offset, count_buffer, count_buffer_offset);
 }
 
@@ -265,8 +345,13 @@ void install(ID3D12Device* device) {
         ComPtr<IUnknown> newest;
         const GUID* ids[] = {&IID_ID3D12GraphicsCommandList, &IID_ID3D12GraphicsCommandList1, &IID_ID3D12GraphicsCommandList2,
             &IID_ID3D12GraphicsCommandList3, &IID_ID3D12GraphicsCommandList4, &IID_ID3D12GraphicsCommandList5,
-            &IID_ID3D12GraphicsCommandList6, &IID_ID3D12GraphicsCommandList7};
-        for (unsigned n = 0; n < 8; ++n) if (SUCCEEDED(list->QueryInterface(*ids[n], reinterpret_cast<void**>(newest.ReleaseAndGetAddressOf())))) version = n;
+            &IID_ID3D12GraphicsCommandList6, &IID_ID3D12GraphicsCommandList7,
+            &command_list8_iid, &command_list9_iid, &command_list10_iid};
+        for (unsigned n = 0; n < 11; ++n) {
+            ComPtr<IUnknown> candidate;
+            if (SUCCEEDED(list->QueryInterface(*ids[n], reinterpret_cast<void**>(candidate.GetAddressOf())))) { newest = std::move(candidate); version = n; }
+        }
+        if (newest.Get() != static_cast<IUnknown*>(list.Get())) throw std::runtime_error("D3D12 command-list versions need a separate interface identity adapter");
         auto table = *reinterpret_cast<void***>(list.Get());
         attach_recording_methods(table, version);
         attach_method(table[2], reinterpret_cast<void*>(hook_release), reinterpret_cast<void**>(&original_release), "Release");
@@ -276,6 +361,8 @@ void install(ID3D12Device* device) {
         // Queue inherits IUnknown, Object, DeviceChild; UpdateTileMappings,
         // CopyTileMappings precede ExecuteCommandLists in the public SDK.
         attach_method(queueTable[10], reinterpret_cast<void*>(hook_execute), reinterpret_cast<void**>(&original_execute), "ExecuteCommandLists");
+        auto deviceTable = *reinterpret_cast<void***>(device);
+        attach_method(deviceTable[device_signature_slot], reinterpret_cast<void*>(hook_signature), reinterpret_cast<void**>(&original_signature), "CreateCommandSignature");
         for (const auto& hook : attached) {
             const auto result = MH_QueueEnableHook(hook.target);
             if (result != MH_OK) throw std::runtime_error(MH_StatusToString(result));

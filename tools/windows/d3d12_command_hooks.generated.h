@@ -577,6 +577,47 @@ using Fn_Barrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, UIN
 static Fn_Barrier original_Barrier = nullptr;
 static void STDMETHODCALLTYPE hook_Barrier(ID3D12GraphicsCommandList* self, UINT32 barrier_groups_count, const D3D12_BARRIER_GROUP *barrier_groups);
 
+using Fn_OMSetFrontAndBackStencilRef = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, UINT front_stencil, UINT back_stencil);
+static Fn_OMSetFrontAndBackStencilRef original_OMSetFrontAndBackStencilRef = nullptr;
+static void STDMETHODCALLTYPE hook_OMSetFrontAndBackStencilRef(ID3D12GraphicsCommandList* self, UINT front_stencil, UINT back_stencil) {
+    Access access(self);
+    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
+        original_OMSetFrontAndBackStencilRef(target, front_stencil, back_stencil);
+    });
+    original_OMSetFrontAndBackStencilRef(access.target(), front_stencil, back_stencil);
+}
+
+using Fn_RSSetDepthBias = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, FLOAT depth_bias, FLOAT clamp, FLOAT slope);
+static Fn_RSSetDepthBias original_RSSetDepthBias = nullptr;
+static void STDMETHODCALLTYPE hook_RSSetDepthBias(ID3D12GraphicsCommandList* self, FLOAT depth_bias, FLOAT clamp, FLOAT slope) {
+    Access access(self);
+    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
+        original_RSSetDepthBias(target, depth_bias, clamp, slope);
+    });
+    original_RSSetDepthBias(access.target(), depth_bias, clamp, slope);
+}
+
+using Fn_IASetIndexBufferStripCutValue = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value);
+static Fn_IASetIndexBufferStripCutValue original_IASetIndexBufferStripCutValue = nullptr;
+static void STDMETHODCALLTYPE hook_IASetIndexBufferStripCutValue(ID3D12GraphicsCommandList* self, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) {
+    Access access(self);
+    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
+        original_IASetIndexBufferStripCutValue(target, value);
+    });
+    original_IASetIndexBufferStripCutValue(access.target(), value);
+}
+
+using Fn_SetProgram = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, const NewProgramDescription* desc);
+static Fn_SetProgram original_SetProgram = nullptr;
+static void STDMETHODCALLTYPE hook_SetProgram(ID3D12GraphicsCommandList* self, const NewProgramDescription* desc);
+
+using Fn_DispatchGraph = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, const void* desc);
+static Fn_DispatchGraph original_DispatchGraph = nullptr;
+static void STDMETHODCALLTYPE hook_DispatchGraph(ID3D12GraphicsCommandList* self, const void* desc) {
+    Access access(self);
+    original_DispatchGraph(access.target(), desc);
+}
+
 static void attach_recording_methods(void** table, unsigned version) {
     if (version >= 0) attach_method(table[9], reinterpret_cast<void*>(hook_Close), reinterpret_cast<void**>(&original_Close), "Close");
     if (version >= 0) attach_method(table[10], reinterpret_cast<void*>(hook_Reset), reinterpret_cast<void**>(&original_Reset), "Reset");
@@ -650,4 +691,11 @@ static void attach_recording_methods(void** table, unsigned version) {
     if (version >= 5) attach_method(table[78], reinterpret_cast<void*>(hook_RSSetShadingRateImage), reinterpret_cast<void**>(&original_RSSetShadingRateImage), "RSSetShadingRateImage");
     if (version >= 6) attach_method(table[79], reinterpret_cast<void*>(hook_DispatchMesh), reinterpret_cast<void**>(&original_DispatchMesh), "DispatchMesh");
     if (version >= 7) attach_method(table[80], reinterpret_cast<void*>(hook_Barrier), reinterpret_cast<void**>(&original_Barrier), "Barrier");
+    if (version >= 8) attach_method(table[81], reinterpret_cast<void*>(hook_OMSetFrontAndBackStencilRef), reinterpret_cast<void**>(&original_OMSetFrontAndBackStencilRef), "OMSetFrontAndBackStencilRef");
+    if (version >= 9) attach_method(table[82], reinterpret_cast<void*>(hook_RSSetDepthBias), reinterpret_cast<void**>(&original_RSSetDepthBias), "RSSetDepthBias");
+    if (version >= 9) attach_method(table[83], reinterpret_cast<void*>(hook_IASetIndexBufferStripCutValue), reinterpret_cast<void**>(&original_IASetIndexBufferStripCutValue), "IASetIndexBufferStripCutValue");
+    if (version >= 10) attach_method(table[84], reinterpret_cast<void*>(hook_SetProgram), reinterpret_cast<void**>(&original_SetProgram), "SetProgram");
+    if (version >= 10) attach_method(table[85], reinterpret_cast<void*>(hook_DispatchGraph), reinterpret_cast<void**>(&original_DispatchGraph), "DispatchGraph");
 }
+
+static constexpr unsigned device_signature_slot = 41;
