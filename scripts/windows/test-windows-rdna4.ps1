@@ -15,6 +15,7 @@ param(
     [switch]$Trace,
     [switch]$RequireNativeNetwork,
     [switch]$CommandListBackend,
+    [switch]$CaptureExceptions,
     [ValidateSet('baseline','packed','unorm')][string]$PixelProfile = 'baseline',
     [ValidateSet('legacy','enhanced')][string]$BarrierMode = 'legacy',
     [int]$Iterations = 32,
@@ -71,6 +72,11 @@ function Quote-Argument([string]$Value) {
 }
 function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
     if (!(Test-Path -LiteralPath $Exe)) { throw "Executable missing: $Exe" }
+    if ($CaptureExceptions) {
+        $Arguments = @('--output-directory', $OutputDirectory, '--', $Exe) + $Arguments
+        $Exe = Join-Path $PackageRoot 'bin/d4r_debug_launcher.exe'
+        if (!(Test-Path -LiteralPath $Exe)) { throw "Debugger launcher missing: $Exe" }
+    }
     $stdout = Join-Path $OutputDirectory "$Name.stdout.log"
     $stderr = Join-Path $OutputDirectory "$Name.stderr.log"
     $argumentLine = ($Arguments | ForEach-Object { Quote-Argument $_ }) -join ' '

@@ -14,8 +14,10 @@ submission, and returns output in the same frame without CPU image copies.
 RGBA16/32F, R11G11B10, RGBA/BGRA8, depth, exposure and motion formats have
 independent D3D12 typed SRV/UAV conversion tests. Four-frame K/M runs with packed
 output match the FP16 baseline exactly after resource-format quantisation.
-The build incorporates upstream RDNA4 commit `dbef4b2`. OptiScaler/game
-integration and performance profiling remain in progress; no game support is
+The build incorporates upstream RDNA4 commit `dbef4b2`. Patched OptiScaler now
+passes standalone K/M native-network tests with exact RGB agreement against
+the direct-d4r baseline; see [the source patch](patches/optiscaler/README.md).
+Game integration and performance profiling remain in progress; no game support is
 claimed yet. See [build instructions and hardware results](docs/windows-rdna4-port.md).
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.

@@ -193,7 +193,16 @@ int main(int argc, char** argv) {
         for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
              "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"}) d4r_ngx_set_uint(parameters, name, args.preset);
         void* handle = nullptr;
-        check(shim.symbol<Create>("NVSDK_NGX_D3D12_CreateFeature")(nullptr, 1, parameters, &handle), "D3D12 CreateFeature");
+        // Public NGX and OptiScaler require an open creation command list.
+        // Submit it independently from the pending synthetic input producer.
+        ComPtr<ID3D12CommandAllocator> creationAllocator;
+        ComPtr<ID3D12GraphicsCommandList> creationList;
+        dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(creationAllocator.GetAddressOf())), "Create feature allocator");
+        dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, creationAllocator.Get(), nullptr,
+            IID_PPV_ARGS(creationList.GetAddressOf())), "Create feature command list");
+        check(shim.symbol<Create>("NVSDK_NGX_D3D12_CreateFeature")(creationList.Get(), 1, parameters, &handle), "D3D12 CreateFeature");
+        dx(creationList->Close(), "Close feature creation list");
+        ID3D12CommandList* creationBatch[] = {creationList.Get()}; queue->ExecuteCommandLists(1, creationBatch); drain();
         auto release = shim.symbol<Release>("NVSDK_NGX_D3D12_ReleaseFeature");
         struct FeatureCleanup { Release fn; void* h; ~FeatureCleanup() { (void)fn(h); } } featureCleanup{release, handle};
         static const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};

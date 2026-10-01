@@ -3,7 +3,8 @@
 Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
 This is a work log for an implementation in progress. Standalone DLSS K/M
-works on the real Windows GPU; OptiScaler/game support remains unverified.
+works on the real Windows GPU, including the patched OptiScaler frontend.
+An actual game session remains unverified.
 
 ## Milestone and gates
 
@@ -36,7 +37,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
-| M9: OptiScaler integration, profiling, installation | Pending |
+| M9: OptiScaler integration, profiling, installation | Patched frontend K/M PASS; game, profiling and final package pending |
 
 ## Public NGX identity and OptiScaler gate (2026-10-01)
 
@@ -70,12 +71,42 @@ A local OptiScaler source fork starts from
 `45a2001303ddff632e279f77aef85ceede5832cb`. Its explicit
 `[DLSS] AllowExternalBackend=true` option requires an absolute NvngxPath with
 the `d4r_WindowsBackendVersion` ABI-1 marker; it does not spoof HIP architecture.
-The marker is GPU-free and safe during discovery. The pending patch also lets
-the external backend load its own NVAPI provider through the original loader.
-This source integration has not yet passed the frontend harness.
+The marker is GPU-free and safe during discovery. The patch lets the external
+backend load its own NVAPI provider through the original loader and preserves
+the exact locally supplied CUDA NGX core path from frontend redirection.
+Physical adapter capability is queried outside DLL startup instead of using
+NVIDIA architecture as a proxy. GetFeatureRequirements spoofing is bypassed.
+Explicit external DLSS selection returns errors instead of silently using FSR.
 Microsoft Build Tools 17.14 / MSVC 14.44.35207 and SDK 10.0.26100 were installed
 from the signature-verified official bootstrapper without restarting Windows.
 No game files have been modified.
+
+The OptiScaler fork commit is `33bbac2` on `windows-rdna4-d4r`. Its reproducible
+source patch and build instructions are in [patches/optiscaler](../patches/optiscaler/README.md).
+`build-optiscaler-windows.ps1` produces a DLL, PDB, GPL license and dependency
+metadata from pinned source/submodules; it disables upstream's unrelated
+packaging post-build commands. The public D3D12 probe now supplies and submits
+a real open creation command list, as required by OptiScaler's API.
+
+`optiscaler-k-final.zip` and `optiscaler-m-final.zip` pass four complete
+OptiScaler -> Windows d4r -> CUDA NGX -> ZLUDA/HIP evaluations on RX 9070 XT.
+They contain 44 K and 40 M native transformer launches, respectively. Every
+RGB value exactly matches the independently quantised direct-d4r baseline;
+max absolute/relative error is 0. No FSR evaluation, NaN/Inf, shim CPU image copy
+or previous-frame output is observed. The invalid-core regression intentionally
+passes the shim as the CUDA core: it fails with an explicit frontend
+`refusing FSR fallback` message and zero FSR evaluations, as required.
+
+The loader crash was localized with a PDB to Util::IsSubpath calling
+filesystem::relative/weakly_canonical from LdrLoadDll interception. The patched
+check is lexical, case-insensitive and handles empty relative paths without
+filesystem I/O. The separate `d4r_debug_launcher.exe`, enabled by
+`-CaptureExceptions`, captures minidumps, first/second-chance exception codes,
+module load/unload addresses and raw stack slots outside the hooked process.
+It propagates the child's exit code and terminates its child on runner timeout
+via a process lifetime job. `optiscaler-m-source-debug2.zip` contains the
+successful dump capture and `optiscaler-source-stack-symbols.log` the source
+attribution. The ordinary in-process crash filter remains available too.
 
 ## Initial PSO and enhanced texture layouts (2026-10-01)
 
