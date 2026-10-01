@@ -273,11 +273,25 @@ __device__ __forceinline__ sop lds16(const half_t* p)
 // e4m3 bytes of an f16 operand whose values are e4m3 values (K order kept: byte j = element j)
 __device__ __forceinline__ gop to_fp8(sop v)
 {
+#if defined(D4R_FP8_HW_PACK) && defined(__GFX12__)
+    // Inputs already contain exact e4m3 values. gfx12's native packed convert
+    // avoids the software subnormal/sign/exponent reconstruction below. Keep
+    // opt-in until all finite encodings and layer/network outputs pass replay.
+    gop result;
+#pragma unroll
+    for (int word = 0; word < 2; ++word) {
+        int packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * word], (float)v[4 * word + 1], 0, false);
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * word + 2], (float)v[4 * word + 3], packed, true);
+        result[word] = (uint32_t)packed;
+    }
+    return result;
+#else
     uint32_t c[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         c[j] = codes8x2((hv2){v[2 * j], v[2 * j + 1]});
     return (u2v){__builtin_amdgcn_perm(c[1], c[0], 0x06040200u), __builtin_amdgcn_perm(c[3], c[2], 0x06040200u)};
+#endif
 }
 // f32 += A B over 16 K for e4m3 operands
 __device__ __forceinline__ f8v wmma8(gop a, gop b, f8v c)

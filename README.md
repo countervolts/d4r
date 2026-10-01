@@ -14,13 +14,17 @@ submission, and returns output in the same frame without CPU image copies.
 RGBA16/32F, R11G11B10, RGBA/BGRA8, depth, exposure and motion formats have
 independent D3D12 typed SRV/UAV conversion tests. Four-frame K/M runs with packed
 output match the FP16 baseline exactly after resource-format quantisation.
-The build incorporates upstream RDNA4 commit `dbef4b2`. Patched OptiScaler now
+The build incorporates upstream updates through `f0d1a65`. Patched OptiScaler now
 passes standalone K/M native-network tests with exact RGB agreement against
 the direct-d4r baseline; see [the source patch](patches/optiscaler/README.md).
 Silent Hill 2 now renders K through the native Windows backend; M also renders
 a saved gameplay level with GPU output NaN/Inf checks. Startup depth/stencil
 and swap-chain lifetime issues found in the game have regression checks.
-Performance and wider resolution coverage remain in progress. See
+Both K and M now pass 3840x2160 game output scans. K reaches a user-reported
+49-51 FPS in the measured scene after native output stores and command-hook
+lookup caching. Native M FP8 is separately replay/network validated; the
+default keeps the FP16-equivalent baseline based on measured performance.
+All sixteen CTest gates pass with the final native Windows ZLUDA runtime. See
 [the reversible game package](docs/windows-game.md) and
 [build instructions and hardware results](docs/windows-rdna4-port.md).
 
@@ -53,7 +57,7 @@ On the same GPU DLSS starts at a disadvantage: its networks were designed for NV
 
 For users who prioritize fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` and restart the game. It defaults to `false`. This selects accuracy variants of every native kernel and restores conservative translation settings. It aims to match NVIDIA's arithmetic; 1:1 image quality against RTX DLSS is not yet proven. See [native kernel numerics](docs/native-kernels.md#numerics).
 
-## GPU support
+## GPU support (Linux upstream)
 
 d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and 4.5 network kernels for the targets below and selects the matching set at runtime. Only the RX 7700 XT has been tested by this project on a real GPU; an external video reports DLSS 4.5 running through d4r 0.1.2 on an RX 7900 XTX. RDNA4 runtime and performance remain unverified on hardware.
 

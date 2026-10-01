@@ -69,9 +69,8 @@ memory, LDS and predicted blocks per multiprocessor. Add
 `--metadata-directory <directory-of-llvm-readobj-notes>` for native wave sizes
 and compiler spill counts. Reports and proprietary workload inputs remain local.
 
-Native FP8 is not the validated baseline and has no performance claim here.
-Replacing the exact per-MMA f16 rounding with f32 FP8 accumulation requires a
-new layer/reference validation; it is not justified by the observed CPU stalls.
+Native FP8 remains a separate optional experiment; the package uses the
+validated FP16-equivalent baseline. Its later checks and timings are below.
 
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
@@ -171,6 +170,59 @@ All sixteen CTest gates pass, including 64 same-object Reset/split checks in
 each physical command-backend test and the software indirect-root regression.
 Use `-ProfileCommandHooks -ProfileStages` to collect samples; the sampler is
 disabled for ordinary play.
+
+Native M FP8 was subsequently compiled and tested on this gfx1201. ISA confirms
+`v_wmma_f32_16x16x16_fp8_fp8`, with packed e4m3 weight images; exact FP16
+attention/PV remains. All logical outputs and merges in forty recorded launches
+match the previously NumPy-validated FP16 baseline byte-for-byte. Full DLSS RGB
+also matches exactly: four 512x288 LDR frames and four 3840x2160 HDR frames,
+all RGBA finite. This establishes correctness for those fixtures, not a speedup.
+
+The original software operand packing makes the FP8 network slower in the
+four-frame 4K test: sum of five main-kernel event means (tube weighted six times)
+is 27.789640 ms versus FP16's 23.550875 ms. A paired in-process replay confirms
+the regression without relying solely on separate process timings. Both modules
+and prepared weights remain resident, 512 launches warm the GPU, then sixty-four
+AB/BA pairs time the same restored input using HIP events. Diagnostic CPU input
+restoration is outside the timed event and is unrelated to game VRAM interop.
+
+Added opt-in `D4R_FP8_HW_PACK`: native packed conversion of already quantised
+operands replaces software exponent/subnormal reconstruction. It preserves all
+254 finite OCP e4m3 encodings, including signed zero, in an exhaustive GPU check.
+All forty recorded launches still match exactly. Four complete 4K HDR frames
+also match FP16 RGB exactly with finite RGBA. ISA confirms both packed converts
+and FP8 WMMA. The baseline build's sixteen objects remain byte-identical.
+
+| Paired replay median, ms | FP16 (software-packing test) | FP8 software packing | FP16 (hardware-packing test) | FP8 hardware packing |
+| --- | ---: | ---: | ---: | ---: |
+| enc1 | 0.175450 | 0.217050 | 0.175100 | 0.177700 |
+| enc2 | 0.141350 | 0.164550 | 0.132550 | 0.131550 |
+| enc3 tube | 0.108000 | 0.112000 | 0.107600 | 0.099850 |
+| dec2 | 0.129900 | 0.146000 | 0.143250 | 0.140850 |
+| dec1 | 0.169650 | 0.194450 | 0.154250 | 0.156550 |
+
+These are two paired tests on the captured 512x288 workload. Medians avoid large
+isolated scheduling outliers; raw per-pair ratios are retained. They identify a
+substantial cost in software packing but do not establish an overall FPS gain.
+The separately run four-frame 4K hardware-packing network mean is 24.603463 ms;
+it still does not beat the measured FP16 total. Default packaging retains FP16.
+Hardware counters for bandwidth or WMMA utilization were not measured.
+
+Reproduce the isolated build, encoding/replay checks and paired timings using
+the existing private validated captures; no source editing is required:
+
+```powershell
+.\scripts\windows\build-native-m-fp8.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -HardwarePacking
+.\scripts\windows\test-native-m-fp8.ps1 -ModuleDirectory "$PWD\build\native-m-fp8-hardware-pack" -CaptureDirectory "$PWD\test-results\ngx-m-exact-pv-capture\captures" -BaselineValidation "$PWD\test-results\m-native-exact-pv-temporal-reference\summary.json" -Benchmark
+```
+
+Omit `-HardwarePacking` to compile the original FP8 experiment. The replay
+validator stops at the first mismatch, retains GPU stdout/stderr/exit code and
+hashes every compared logical output. `profile_report.py` accepts replay logs
+and reports per-pair GPU time and candidate/control ratios. This experiment is
+not installed by the game runner or substituted silently for the baseline.
+The conversion builtin is listed in the official
+[Clang AMDGPU builtin reference](https://clang.llvm.org/docs/AMDGPUBuiltinReference.html#builtin-amdgcn-cvt-pk-fp8-f32).
 
 References: [HIP events](https://rocmdocs.amd.com/projects/HIP/en/develop/doxygen/html/group___event.html),
 [HIP occupancy API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/group___occupancy.html).

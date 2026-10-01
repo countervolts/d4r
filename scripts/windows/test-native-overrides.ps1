@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-therock' }
-if (!$ZludaRoot) { $ZludaRoot = Join-Path $repo 'dist/zluda-windows-native' }
+if (!$ZludaRoot) { $ZludaRoot = Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/native-identity-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $previous = @{D4R_ZLUDA_NATIVE_DIR=$env:D4R_ZLUDA_NATIVE_DIR; D4R_ZLUDA_VERBOSE=$env:D4R_ZLUDA_VERBOSE; D4R_DIAG_DIR=$env:D4R_DIAG_DIR}

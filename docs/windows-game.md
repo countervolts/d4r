@@ -3,21 +3,27 @@
 Validated hardware: Windows 11 x64 / Radeon RX 9070 XT / gfx1201. Native K and
 M transformer kernels pass standalone D3D12 + OptiScaler checks. Silent Hill 2
 K now renders real menu frames and M renders a saved gameplay level with
-GPU NaN/Inf checks. K also passes 3840x2160 output and M passes 1920x1080.
-Further performance work is in progress. This is a local
+GPU NaN/Inf checks. Both K and M pass 3840x2160 output on this machine.
+The user reports 49-51 FPS for K in the measured scene after the command-hook
+fix and locally built output-store optimization. This is a local
 development package; no NVIDIA proprietary DLL is included.
 
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
 OptiScaler using the scripts in `scripts/windows`, then run:
 
 ```powershell
-.\scripts\windows\package-windows-game.ps1
+.\scripts\windows\package-windows-game.ps1 -ArchivePath "$PWD\dist\windows-rdna4-game.zip"
 ```
 
 The package pins TheRock 10.2.0a20260929 because its Windows external-memory
 mapping lifetime passes the repeated import/release test. Stable HIP 7.2 has
 a reproduced mapped-view leak; see `docs/windows-rdna4-port.md` for the source
 fix, exact dependency versions, validation and complete build commands.
+The ZIP contains only manifest-listed files, including a snapshot of committed
+d4r source. Private NVIDIA-derived objects, caches and diagnostic captures are
+excluded. Original FP8 M and the optional hardware-packing variant pass strict
+replay/network tests but do not establish a full-network speedup, so the game
+package retains its FP16-equivalent M baseline.
 
 Run a D3D12 game without anti-cheat using your locally supplied NVIDIA DLLs:
 

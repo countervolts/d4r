@@ -42,8 +42,13 @@ def report(directory, metadata_directory=None):
     commands = collections.defaultdict(list)
     kernels = collections.defaultdict(list)
     hook_threads = collections.defaultdict(list)
+    replay = collections.defaultdict(lambda: collections.defaultdict(dict))
     for path in sorted(directory.glob('*.log')):
-        text = path.read_text(encoding='utf-8-sig', errors='replace')
+        data = path.read_bytes()
+        text = data.decode('utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig', errors='replace')
+        for name, variant, pair, value in re.findall(
+                r'D4R_REPLAY_PROFILE kernel=(\S+) variant=(control|candidate) pair=([0-9]+) gpu_ms=([0-9.]+)', text):
+            replay[name][int(pair)][variant] = float(value)
         for name, value in re.findall(r'D4R_STAGE name=(\S+) cpu_ms=([0-9.]+)', text):
             stages[name].append(float(value))
         for kind, fields in re.findall(r'(?m)^D4R_COMMAND_(RECORD|SUBMIT) ([^\r\n]+)', text):
@@ -64,6 +69,7 @@ def report(directory, metadata_directory=None):
     result = dict(cpuStages={name: stats(values) for name, values in stages.items()},
                   commandStages={name: stats(values) for name, values in commands.items()},
                   commandHookSamples=[],
+                  replayPairs=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
@@ -72,6 +78,13 @@ def report(directory, metadata_directory=None):
                       'HIP-event profiling synchronizes every sampled launch and changes scheduling.',
                       'Occupancy is an API prediction, not a measured hardware counter.',
                       'Bandwidth and WMMA utilization require additional supported hardware tooling.'])
+    for name, pairs in replay.items():
+        complete = [row for row in pairs.values() if set(row) == {'control', 'candidate'}]
+        if complete:
+            result['replayPairs'].append(dict(kernel=name,
+                controlGpuMs=stats([row['control'] for row in complete]),
+                candidateGpuMs=stats([row['candidate'] for row in complete]),
+                candidateToControl=stats([row['candidate'] / row['control'] for row in complete if row['control'] > 0])))
     for thread, rows in hook_threads.items():
         sums = {name: sum(float(row[name]) for row in rows) for name in
                 ('period_ms', 'calls', 'samples', 'marked', 'access_sum_ms', 'capture_sum_ms', 'driver_sum_ms')}
@@ -105,7 +118,7 @@ def main():
     parser.add_argument('--metadata-directory', type=pathlib.Path, help='llvm-readobj --notes output for native code objects')
     args = parser.parse_args()
     result = report(args.directory, args.metadata_directory)
-    if not result['cpuStages'] and not result['kernels']:
+    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs')):
         parser.error('no complete stage or HIP-event records found')
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -116,6 +129,9 @@ def main():
     for row in result['commandHookSamples']:
         print(f"HOOK thread={row['thread']} samples={int(row['samples'])} access={row['accessMeanUs']:.3f} us "
               f"capture={row['captureMeanUsPerSample']:.3f} us estimated_cpu={row['estimatedAccessCaptureMsPerSecond']:.3f} ms/s")
+    for row in result['replayPairs']:
+        print(f"PAIRED {row['kernel']}: n={row['controlGpuMs']['samples']} control_median={row['controlGpuMs']['median']:.6f} ms "
+              f"candidate_median={row['candidateGpuMs']['median']:.6f} ms ratio_median={row['candidateToControl']['median']:.6f}")
     for row in result['kernels']:
         times = row['gpuMs']
         print(f"GPU {row['kernel']} {row['backend']} {row['phase']}: n={times['samples']} mean={times['mean']:.6f} ms total={times['total']:.3f} ms")

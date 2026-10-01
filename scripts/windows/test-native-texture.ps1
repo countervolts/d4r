@@ -22,7 +22,7 @@ try {
     foreach ($flags in @(0,11)) {
         foreach ($mode in @('control','candidate')) {
             $env:D4R_ZLUDA_NATIVE_DIR=if ($mode -eq 'control') { Join-Path $repo 'build/native-k-gfx1201' } else { $combined }
-            $arguments=@{RuntimeProfile='therock'; ZludaRoot=(Join-Path $repo 'dist/zluda-windows-profile');
+            $arguments=@{RuntimeProfile='therock'; ZludaRoot=(Join-Path $repo 'dist/zluda-windows-final');
                 PackageRoot=(Join-Path $repo 'dist/windows-rdna4-command-list'); NgxCore=(Join-Path $repo '_nvngx.dll');
                 DlssDll=(Join-Path $repo 'nvngx_dlss.dll'); NgxMode='d3d12'; NgxAbi='project-legacy'; Preset=11;
                 NgxCreateFlags=$flags; NgxOutputResolution=$OutputResolution; NgxOnly=$true; RequireNativeNetwork=$true; CommandListBackend=$true;

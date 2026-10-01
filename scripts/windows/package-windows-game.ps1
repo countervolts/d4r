@@ -7,13 +7,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $defaults = @{PackageRoot='dist/windows-rdna4-game'; DiagnosticRoot='dist/windows-rdna4-command-list';
-    OptiScalerRoot='dist/optiscaler-windows-d4r'; ZludaRoot='dist/zluda-windows-profile';
+    OptiScalerRoot='dist/optiscaler-windows-d4r'; ZludaRoot='dist/zluda-windows-final';
     HipRoot='.tools/therock-10.2.0a20260929/_rocm_sdk_core';
     KernelKRoot='build/native-k-gfx1201'; KernelMRoot='build/native-m-gfx1201'}
 foreach ($name in $defaults.Keys) {
     if (!(Get-Variable -Name $name -ValueOnly)) { Set-Variable -Name $name -Value (Join-Path $repo $defaults[$name]) }
 }
 $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
+$sourceCommit=(& git -C $repo rev-parse HEAD).Trim()
+$sourceDirty=[bool](& git -C $repo status --porcelain)
+if ($ArchivePath -and $sourceDirty) { throw 'Commit source changes before creating the distributable archive.' }
 New-Item -ItemType Directory -Force $PackageRoot | Out-Null
 $stagedFiles = [Collections.Generic.List[string]]::new()
 function Stage([string]$source, [string]$relative) {
@@ -61,10 +64,15 @@ Stage (Join-Path $HipRoot 'share/doc/amd_comgr/LICENSE.txt') 'licenses/amd_comgr
 Stage (Join-Path $repo 'external/clr/LICENSE.md') 'licenses/HIP-CLR.txt'
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/optiscaler') -Filter '*.patch') { Stage $patch.FullName ('source-patches/optiscaler/' + $patch.Name) }
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/zluda') -Filter '*.patch') { Stage $patch.FullName ('source-patches/zluda/' + $patch.Name) }
+$sourceArchive=Join-Path $repo 'build/d4r-windows-rdna4-source.zip'
+New-Item -ItemType Directory -Force (Split-Path $sourceArchive) | Out-Null
+& git -C $repo archive --format=zip --output $sourceArchive $sourceCommit
+if ($LASTEXITCODE) { throw 'Cannot archive the committed d4r source.' }
+Stage $sourceArchive 'source/d4r-windows-rdna4-source.zip'
 $metadata = [ordered]@{
     architecture='gfx1201'; nativeKernels=16; dlssSha256='3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983';
-    d4rCommit=(& git -C $repo rev-parse HEAD).Trim();
-    d4rWorkingTreeDirty=[bool](& git -C $repo status --porcelain);
+    d4rCommit=$sourceCommit;
+    d4rWorkingTreeDirty=$sourceDirty;
     optiScaler=(Get-Content -LiteralPath (Join-Path $OptiScalerRoot 'build-info.json') -Raw | ConvertFrom-Json);
     zludaBuild=(Get-Content -LiteralPath (Join-Path $ZludaRoot 'build-info.json') -Raw | ConvertFrom-Json);
     hipRuntime='TheRock 10.2.0a20260929 / HIP 7.17.26386';

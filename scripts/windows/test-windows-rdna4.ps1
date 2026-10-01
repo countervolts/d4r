@@ -42,7 +42,7 @@ $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 if (!$HipRoot) { $HipRoot = 'C:\Program Files\AMD\ROCm\7.2' }
 $HipRoot = [IO.Path]::GetFullPath($HipRoot)
 if (!$ZludaRoot) {
-    $builtZluda = Join-Path $repoRoot 'dist/zluda-windows-native'
+    $builtZluda = Join-Path $repoRoot 'dist/zluda-windows-final'
     $localZluda = [IO.Path]::GetFullPath((Join-Path $PackageRoot '../../.tools/zluda/zluda'))
     if (Test-Path (Join-Path $builtZluda 'build-info.json')) { $ZludaRoot = $builtZluda }
     elseif (Test-Path (Join-Path $localZluda 'nvcuda.dll')) { $ZludaRoot = $localZluda }

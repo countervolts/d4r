@@ -2,10 +2,11 @@
 
 Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
-This is a work log for an implementation in progress. Standalone DLSS K/M
+This file records current results followed by the dated development history. Standalone DLSS K/M
 works on the real Windows GPU, including the patched OptiScaler frontend.
 Silent Hill 2 now renders through the Windows backend; gameplay and output
-validation coverage are recorded below. Performance remains in progress.
+validation coverage are recorded below. Performance and game coverage have
+explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
@@ -16,9 +17,44 @@ M attention baseline. Upstream's optional denormal override now drops only
 FP32 requirements, preserving FP16/FP64. All sixteen rebuilt native K/M
 objects have the same SHA256 as the previously validated objects. All thirteen
 ZLUDA patches apply to the pinned fresh base; all sixteen CTest gates pass.
-The local ZLUDA source includes that denormal correction at `2378af7`; the
-measured runtime remains the separately recorded `b0161a4` binary, with the
-override unset. Package metadata records the binary build's actual commit.
+Final ZLUDA source and binary are `2378af72e586e1730d15f75e0322daab674f0862`,
+built cleanly into `dist/zluda-windows-final`; nvcuda SHA256 is
+`ccc700974fa5d0b9a5f5c39e617c17ca22f34701d40f745f2f96f039a75b22f8`.
+All sixteen CTest gates pass on it. Three K/4K HDR frames and four M baseline
+frames remain bit-exact to their prior controls, all RGBA finite. Historical
+performance runs below used `b0161a4` with the denormal override unset.
+Package metadata records the binary build's actual commit.
+
+The final-runtime M game test completes 1940 4K frames and 1940 finite GPU
+scans, with 19410 native launches (including a partial final frame), zero
+backend failures/CPU image copies/previous-frame outputs. Native M FP8 also
+passes all logical output/merge values from forty NumPy-validated captures,
+plus four 512x288 and four 4K complete frames. Its original software packing
+regresses performance; the opt-in hardware packing preserves all 254 finite
+FP8 encodings and all forty captures, with exact RGB in four additional 4K
+frames. Paired in-process event tests confirm reduced packing cost, but the
+full-network measurement does not establish a win over FP16. Production keeps
+the baseline. See [windows-performance.md](windows-performance.md) for timings
+and one-command replay/paired profiling.
+
+Current native Windows build, after the pinned tool/source setup described
+below (MSVC v143 / Windows SDK 10.0.26100 required for OptiScaler):
+
+```powershell
+.\scripts\windows\build-zluda-windows.ps1
+.\scripts\windows\build-windows-rdna4.ps1 -RuntimeProfile therock -ZludaRoot "$PWD\dist\zluda-windows-final" -InstallDirectory "$PWD\dist\windows-rdna4-command-list"
+.\scripts\windows\stage-native-k.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -PackageRoot "$PWD\dist\windows-rdna4-command-list"
+.\scripts\windows\stage-native-m.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -PackageRoot "$PWD\dist\windows-rdna4-command-list"
+.\scripts\windows\build-optiscaler-windows.ps1
+& .\.tools\python\cmake\data\bin\ctest.exe --test-dir build/windows-rdna4-therock --output-on-failure
+.\scripts\windows\package-windows-game.ps1 -ArchivePath "$PWD\dist\windows-rdna4-game.zip"
+```
+
+The archive requires committed source. It includes a tracked-source snapshot,
+all runtime file hashes/versions, dependency licenses and source patches, and
+excludes local NVIDIA DLLs, PTX/weights/captures and private texture objects.
+The optional texture optimization is built/validated locally and supplied with
+`-LocalTextureKernels`; it is never folded into the public source snapshot.
 
 Additional production-style runs: M at 1920x1080 completes 4833 frames with
 4833 finite-output GPU scans and no backend failures. K at 3840x2160 completes
@@ -178,14 +214,17 @@ with `-EarlyIndirectProbe` in the standalone OptiScaler runner. This avoids
 the previously documented unknown-signature rejection for observed startup
 objects; signatures created before the frontend is loaded remain untracked.
 
-Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
+Current milestone: M0-M9 functional gates pass on the tested Windows GPU/game.
+The package uses FP16-equivalent K/M and conservative denormal handling.
+Native NGX Create/Evaluate on the simple
 requested E path passes with the user's DLLs. All 11 K layers now pass synthetic
 and real-weight NumPy/PTX replay checks; native K Evaluate produces four finite
 frames on Windows. M now passes all five synthetic and real-weight layers against
 NumPy and independent PTX, and four native CUDA frames. The standalone D3D12
 harness now produces four K and four M frames using imported VRAM and shared
 fences, with bit-exact RGB agreement against the corresponding CUDA harnesses.
-Game integration remains in progress. The ordinary NGX D3D12 Evaluate API now
+Silent Hill 2 K/M integration passes, including current-frame 4K VRAM interop.
+The ordinary NGX D3D12 Evaluate API now
 records a boundary in an open command list; a native queue interception backend
 executes prefix, CUDA evaluation, then suffix in the same submitted frame.
 A full temporal M scan
@@ -207,7 +246,7 @@ Do not integrate NGX until the integer PTX workload is stable on the real GPU.
 | M6: K layers, full transformer and image validation | PASS: 11 real-weight layers, 44 native launches, four D3D12 frames bit-exact against native CUDA, 81.85–92.91 dB versus translated K |
 | M7: M FP16-equivalent baseline and full transformer | PASS: all blocks of 40 native launches exactly match NumPy; targeted independent PTX regression matches; four D3D12 frames bit-exact against corrected translated M |
 | M8: standalone Windows D3D12 NGX harness | PASS for ordinary recorded EvaluateFeature and explicit boundaries: K/M, four frames each, no shim CPU image copies; both bit-exact against explicit boundary baselines |
-| M9: OptiScaler integration, profiling, installation | Patched frontend and game K/M PASS, including K 4K and M 1080p finite output; native/translated GPU profiling and reversible install PASS; remaining FPS investigation and final archive in progress |
+| M9: OptiScaler integration, profiling, installation | Patched frontend and game K/M PASS at 4K with finite output; native/translated/FP8 profiling, reversible install and manifest-only public archive PASS; K user reports 49-51 FPS |
 
 ## Public NGX identity and OptiScaler gate (2026-10-01)
 

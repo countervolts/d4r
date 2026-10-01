@@ -14,8 +14,9 @@ struct Allocation {
     int id;
     size_t size;
     void* device = nullptr;
+    std::vector<uint8_t> initial;
     Allocation(d4r::diag::HipApi& api, int identifier, const std::vector<uint8_t>& bytes)
-        : hip(api), id(identifier), size(bytes.size()) {
+        : hip(api), id(identifier), size(bytes.size()), initial(bytes) {
         hip.check(hip.hipMalloc(&device, size), "hipMalloc(replay)");
         try { hip.check(hip.hipMemcpy(device, bytes.data(), size, hipMemcpyHostToDevice), "hipMemcpy(replay upload)"); }
         catch (...) { (void)hip.hipFree(device); device = nullptr; throw; }
@@ -90,14 +91,15 @@ int main(int argc, char** argv) {
             if (size != sizeof(coordinates)) throw std::runtime_error("Swin diagnostic coordinates ABI");
             hip.check(hip.hipMemcpy(address, coordinates, size, hipMemcpyHostToDevice), "Set Swin diagnostic block");
         }
-        auto scalar = [&](const char* name, unsigned fallback) {
+        auto module_scalar = [&](hipModule_t owner, const char* name, unsigned fallback) {
             hipDeviceptr_t address = nullptr; size_t size = 0;
-            if (hip.hipModuleGetGlobal(&address, &size, module, name) != hipSuccess) return fallback;
+            if (hip.hipModuleGetGlobal(&address, &size, owner, name) != hipSuccess) return fallback;
             if (size != 4) throw std::runtime_error(std::string("Invalid native metadata ") + name);
             unsigned value = 0;
             hip.check(hip.hipMemcpy(&value, address, 4, hipMemcpyDeviceToHost), name);
             return value ? value : fallback;
         };
+        auto scalar = [&](const char* name, unsigned fallback) { return module_scalar(module, name, fallback); };
         block[2] = scalar("d4r_block_z", block[2]);
         const unsigned persistentGrid = scalar("d4r_grid_x", 0);
         if (persistentGrid) { grid[0] = persistentGrid; grid[1] = grid[2] = 1; }
@@ -111,7 +113,65 @@ int main(int argc, char** argv) {
         }
         std::printf("REPLAY kernel=%s grid=%u,%u,%u block=%u,%u,%u allocations=%zu arguments=%zu\n",
             kernel.c_str(), grid[0], grid[1], grid[2], block[0], block[1], block[2], allocations.size(), parameters.size());
-        for (unsigned iteration = 0; iteration < args.iterations; ++iteration)
+        if (!args.benchmark_module.empty()) {
+            hipModule_t candidate = nullptr;
+            hip.check(hip.hipModuleLoad(&candidate, args.benchmark_module.c_str()), "Load paired benchmark candidate");
+            Cleanup candidate_cleanup{hip, candidate};
+            if (module_scalar(candidate, "d4r_block_z", block[2]) != block[2] ||
+                module_scalar(candidate, "d4r_grid_x", 0) != persistentGrid)
+                throw std::runtime_error("Paired modules require identical launch geometry");
+            hipFunction_t other = nullptr, other_prep = nullptr;
+            hip.check(hip.hipModuleGetFunction(&other, candidate, kernel.c_str()), "Find paired benchmark function");
+            if (hip.hipModuleGetFunction(&other_prep, candidate, (kernel + "_prep").c_str()) == hipSuccess) {
+                const auto blocks = module_scalar(candidate, "d4r_prep_blocks", 0);
+                if (!blocks) throw std::runtime_error("Paired candidate prep metadata is missing");
+                hip.check(hip.hipModuleLaunchKernel(other_prep, blocks, 1, 1, 128, 1, 1, 0, nullptr,
+                    launchArguments, nullptr), "Paired candidate prep");
+            }
+            auto create = hip.library.symbol<decltype(&::hipEventCreate)>("hipEventCreate");
+            auto destroy = hip.library.symbol<decltype(&::hipEventDestroy)>("hipEventDestroy");
+            auto record = hip.library.symbol<decltype(&::hipEventRecord)>("hipEventRecord");
+            auto synchronize = hip.library.symbol<decltype(&::hipEventSynchronize)>("hipEventSynchronize");
+            auto elapsed = hip.library.symbol<decltype(&::hipEventElapsedTime)>("hipEventElapsedTime");
+            struct Event {
+                decltype(destroy) release; hipEvent_t value = nullptr;
+                ~Event() { if (value) (void)release(value); }
+            } begin{destroy}, end{destroy};
+            hip.check(create(&begin.value), "Create paired start event");
+            hip.check(create(&end.value), "Create paired end event");
+            auto launch = [&](hipFunction_t fn) {
+                hip.check(hip.hipModuleLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                    shared, nullptr, launchArguments, nullptr), "Paired benchmark launch");
+            };
+            // Both modules and weight images stay resident on the same GPU.
+            // Warm continuous work first, then alternate AB/BA order. Restore
+            // captured inputs outside the event so neither module consumes
+            // modified temporal inputs from a preceding sample.
+            const auto verbose = hip.verbose; hip.verbose = false;
+            for (unsigned warm = 0; warm < 16; ++warm)
+                for (auto fn : {function, other}) for (unsigned batch = 0; batch < 16; ++batch) launch(fn);
+            hip.check(hip.hipDeviceSynchronize(), "Paired benchmark warmup");
+            for (unsigned pair = 0; pair < args.iterations; ++pair) for (unsigned order = 0; order < 2; ++order) {
+                const unsigned variant = order ^ (pair & 1u);
+                for (const auto& allocation : allocations)
+                    hip.check(hip.hipMemcpy(allocation->device, allocation->initial.data(), allocation->size,
+                        hipMemcpyHostToDevice), "Restore paired captured input");
+                hip.check(record(begin.value, nullptr), "Record paired start");
+                launch(variant ? other : function);
+                hip.check(record(end.value, nullptr), "Record paired end");
+                hip.check(synchronize(end.value), "Complete paired sample");
+                float ms = 0; hip.check(elapsed(&ms, begin.value, end.value), "Paired GPU elapsed time");
+                std::printf("D4R_REPLAY_PROFILE kernel=%s variant=%s pair=%u gpu_ms=%.6f warmup_launches=512 paired=1 input_restore_outside_event=1\n",
+                    kernel.c_str(), variant ? "candidate" : "control", pair, double(ms));
+            }
+            hip.verbose = verbose;
+            // Leave a single ordinary control replay for numerical checking.
+            for (const auto& allocation : allocations)
+                hip.check(hip.hipMemcpy(allocation->device, allocation->initial.data(), allocation->size,
+                    hipMemcpyHostToDevice), "Restore final reference input");
+            launch(function);
+        }
+        for (unsigned iteration = 0; args.benchmark_module.empty() && iteration < args.iterations; ++iteration)
             hip.check(hip.hipModuleLaunchKernel(function, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared,
                 nullptr, launchArguments, nullptr), "hipModuleLaunchKernel(replay)");
         hip.check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize(replay)");
@@ -132,7 +192,8 @@ int main(int argc, char** argv) {
             file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
             if (!file) throw std::runtime_error("Cannot save replay allocation");
         }
-        std::printf("PASS NATIVE_REPLAY architecture=gfx1201 kernel=%s iterations=%u numerical_reference=pending\n", kernel.c_str(), args.iterations);
+        std::printf("PASS NATIVE_REPLAY architecture=gfx1201 kernel=%s iterations=%u benchmark_pairs=%u numerical_reference=pending\n",
+            kernel.c_str(), args.benchmark_module.empty() ? args.iterations : 1, args.benchmark_module.empty() ? 0 : args.iterations);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL NATIVE_REPLAY %s\n", error.what()); loaded_modules(); return 4;

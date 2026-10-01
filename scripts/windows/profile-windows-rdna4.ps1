@@ -7,7 +7,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-profile' }
+if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$PackageRoot) { $PackageRoot=Join-Path $repo 'dist/windows-rdna4-command-list' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo ('test-results/profile-' + $Preset + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
 $settings=@{D4R_ZLUDA_PROFILE='1'; D4R_PROFILE_STAGES='1'; D4R_VALIDATE_OUTPUT='1';

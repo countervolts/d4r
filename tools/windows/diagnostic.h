@@ -128,6 +128,7 @@ struct Args {
     unsigned ngx_create_flags = 0;
     unsigned output_width = 512, output_height = 288;
     std::string fixture_dir;
+    std::string benchmark_module;
     std::string output_dir;
     std::string kernel_name = "enc1";
     unsigned iterations = 32;
@@ -184,6 +185,7 @@ struct Args {
                     throw std::runtime_error("preset must be 5 (E), 11 (K) or 13 (M)");
             }
             else if (key == "--fixture-dir") fixture_dir = value;
+            else if (key == "--benchmark-module") benchmark_module = value;
             else if (key == "--output-dir") output_dir = value;
             else if (key == "--kernel-name") kernel_name = value;
             else if (key == "--iterations") {
