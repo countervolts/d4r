@@ -118,6 +118,7 @@ struct Args {
     std::string interop_mode = "roundtrip";
     std::string pixel_profile = "baseline";
     std::string barrier_mode = "legacy";
+    bool early_indirect = false;
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
@@ -148,6 +149,7 @@ struct Args {
                 if (value != "legacy" && value != "enhanced" && value != "inherited-legacy" && value != "inherited-enhanced") throw std::runtime_error("Invalid barrier-mode");
                 barrier_mode = value;
             }
+            else if (key == "--early-indirect") early_indirect = value == "1";
             else if (key == "--ngx-core") ngx_core = value;
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;

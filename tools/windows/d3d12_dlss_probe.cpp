@@ -5,6 +5,7 @@
 #include <dxgi1_6.h>
 #include <memory>
 #include <array>
+#include <d3dcompiler.h>
 
 int main(int argc, char** argv) {
     using namespace d4r::diag;
@@ -168,6 +169,40 @@ int main(int argc, char** argv) {
             return 0;
         }
         Library shim(wide(args.module));
+        ComPtr<ID3D12CommandSignature> earlySignature;
+        ComPtr<ID3D12RootSignature> earlyRoot;
+        ComPtr<ID3D12PipelineState> earlyPso;
+        ComPtr<ID3D12Resource> earlyArguments;
+        if (args.early_indirect) {
+            if (!commandBackend) throw std::runtime_error("Early indirect diagnostic requires command-list backend");
+            // Discover a device through the frontend before NGX Init. This is
+            // the startup order used by games which create signatures early.
+            ComPtr<ID3D12Device> discovered;
+            dx(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(discovered.GetAddressOf())), "Early frontend device discovery");
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            ComPtr<ID3DBlob> rootCode, errors, code;
+            dx(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, rootCode.GetAddressOf(), errors.GetAddressOf()), "Early empty root signature");
+            dx(device->CreateRootSignature(0, rootCode->GetBufferPointer(), rootCode->GetBufferSize(), IID_PPV_ARGS(earlyRoot.GetAddressOf())), "Early root signature");
+            constexpr char shader[] = "[numthreads(1,1,1)] void main() {}";
+            dx(D3DCompile(shader, sizeof(shader) - 1, "early-indirect", nullptr, nullptr, "main", "cs_5_0", 0, 0, code.GetAddressOf(), errors.ReleaseAndGetAddressOf()), "Early noop shader");
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+            pipeline.pRootSignature = earlyRoot.Get(); pipeline.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            dx(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(earlyPso.GetAddressOf())), "Early noop PSO");
+            D3D12_INDIRECT_ARGUMENT_DESC argument{}; argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            D3D12_COMMAND_SIGNATURE_DESC signature{}; signature.ByteStride = 12; signature.NumArgumentDescs = 1; signature.pArgumentDescs = &argument;
+            dx(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(earlySignature.GetAddressOf())), "Pre-NGX command signature");
+            earlyArguments = make_buffer(device.Get(), 12, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto upload = make_buffer(device.Get(), 12, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* mapped = nullptr; D3D12_RANGE noRead{}; dx(upload->Map(0, &noRead, &mapped), "Early indirect upload");
+            const uint32_t dimensions[] = {0, 1, 1}; std::memcpy(mapped, dimensions, sizeof(dimensions)); upload->Unmap(0, nullptr);
+            ComPtr<ID3D12CommandAllocator> copyAllocator; ComPtr<ID3D12GraphicsCommandList> copy;
+            dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(copyAllocator.GetAddressOf())), "Early copy allocator");
+            dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copyAllocator.Get(), nullptr, IID_PPV_ARGS(copy.GetAddressOf())), "Early copy list");
+            copy->CopyResource(earlyArguments.Get(), upload.Get());
+            transition(copy.Get(), earlyArguments.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            dx(copy->Close(), "Early copy close"); ID3D12CommandList* batch[] = {copy.Get()}; queue->ExecuteCommandLists(1, batch); drain();
+            std::printf("D3D12_EARLY_INDIRECT signature_created_before_ngx_init=1\n");
+        }
         using Init = unsigned(*)(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const void*);
         using Allocate = unsigned(*)(void**); using Destroy = unsigned(*)(void*);
         using Create = unsigned(*)(ID3D12GraphicsCommandList*, unsigned, void*, void**);
@@ -243,6 +278,10 @@ int main(int argc, char** argv) {
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
             if (commandBackend) {
                 dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
+                if (earlySignature) {
+                    list->SetComputeRootSignature(earlyRoot.Get()); list->SetPipelineState(earlyPso.Get());
+                    list->ExecuteIndirect(earlySignature.Get(), 1, earlyArguments.Get(), 0, nullptr, 0);
+                }
                 if (enhanced && !inherited) for (unsigned i = 0; i < 5; ++i) enhancedBarrier(list.Get(), textures[i].image.Get(), i, false);
                 using RecordedEvaluate = unsigned(*)(ID3D12GraphicsCommandList*, void*, void*, void*);
                 check(shim.symbol<RecordedEvaluate>("NVSDK_NGX_D3D12_EvaluateFeature")(list.Get(), handle, parameters, nullptr), "D3D12 recorded same-frame Evaluate");

@@ -16,6 +16,7 @@ param(
     [switch]$RequireNativeNetwork,
     [switch]$CommandListBackend,
     [switch]$CaptureExceptions,
+    [switch]$EarlyIndirectProbe,
     [ValidateSet('baseline','packed','unorm')][string]$PixelProfile = 'baseline',
     [ValidateSet('legacy','enhanced','inherited-legacy','inherited-enhanced')][string]$BarrierMode = 'legacy',
     [int]$Iterations = 32,
@@ -311,6 +312,10 @@ DisableSplash=true
                         $ngxArguments += @('--ngx-frontend', 'optiscaler')
                     }
                     $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode)
+                    if ($EarlyIndirectProbe) {
+                        if (!$CommandListBackend) { throw '-EarlyIndirectProbe requires -CommandListBackend' }
+                        $ngxArguments += @('--early-indirect', '1')
+                    }
                     if ($CommandListBackend) { $ngxArguments += @('--interop-mode', 'command-list') }
                 }
                 $ngxName = if ($NgxMode -eq 'evaluate') { "ngx-evaluate-preset-$Preset" } elseif ($NgxMode -eq 'd3d12') { "d3d12-evaluate-preset-$Preset" } else { 'ngx-init' }

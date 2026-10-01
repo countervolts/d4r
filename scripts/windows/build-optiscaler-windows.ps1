@@ -12,7 +12,8 @@ if (!$InstallRoot) { $InstallRoot = Join-Path $repo 'dist/optiscaler-windows-d4r
 $SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 $base = '45a2001303ddff632e279f77aef85ceede5832cb'
-$patch = Join-Path $repo 'patches/optiscaler/0001-windows-external-d4r-backend.patch'
+$patches = @(Get-ChildItem -LiteralPath (Join-Path $repo 'patches/optiscaler') -Filter '*.patch' | Sort-Object Name)
+if (!$patches.Count) { throw 'OptiScaler source patches are missing.' }
 $previousPath = $env:PATH
 try {
     # Git for Windows' submodule helper needs its POSIX utility directory.
@@ -28,15 +29,17 @@ try {
     }
     & git -C $SourceRoot merge-base --is-ancestor $base HEAD
     if ($LASTEXITCODE) { throw "OptiScaler must be based on audited commit $base" }
-    $ErrorActionPreference = 'Continue'
-    & git -C $SourceRoot apply --reverse --check $patch 2>$null
-    $alreadyApplied = $LASTEXITCODE -eq 0
-    $ErrorActionPreference = 'Stop'
-    if (!$alreadyApplied) {
-        & git -C $SourceRoot apply --check $patch
-        if ($LASTEXITCODE) { throw 'External backend patch conflicts with the existing source; no files changed.' }
-        & git -C $SourceRoot apply $patch
-        if ($LASTEXITCODE) { throw 'External backend patch failed.' }
+    foreach ($patch in $patches) {
+        $ErrorActionPreference = 'Continue'
+        & git -C $SourceRoot apply --reverse --check $patch.FullName 2>$null
+        $alreadyApplied = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = 'Stop'
+        if (!$alreadyApplied) {
+            & git -C $SourceRoot apply --check $patch.FullName
+            if ($LASTEXITCODE) { throw "Source patch conflicts: $($patch.Name); existing changes retained." }
+            & git -C $SourceRoot apply $patch.FullName
+            if ($LASTEXITCODE) { throw "Source patch failed: $($patch.Name)" }
+        }
     }
     & git -C $SourceRoot submodule update --init --depth 1
     if ($LASTEXITCODE) { throw 'Pinned OptiScaler submodules failed.' }
@@ -63,11 +66,11 @@ try {
         Copy-Item -LiteralPath (Join-Path $SourceRoot "x64/Release/$file") -Destination $InstallRoot -Force
     }
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'LICENSE') -Destination (Join-Path $InstallRoot 'GPL-3.0.txt') -Force
-    Copy-Item -LiteralPath $patch -Destination $InstallRoot -Force
+    foreach ($patch in $patches) { Copy-Item -LiteralPath $patch.FullName -Destination $InstallRoot -Force }
     $metadata = @{base=$base; sourceCommit=(& git -C $SourceRoot rev-parse HEAD).Trim();
         sourceDirty=[bool](& git -C $SourceRoot status --porcelain); backendAbi=1;
         buildTools=$BuildToolsRoot; msbuildVersion=(& $msbuild -version -nologo | Select-Object -Last 1);
-        patchSha256=(Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash;
+        patches=@($patches | ForEach-Object { @{name=$_.Name; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash} });
         dllSha256=(Get-FileHash -LiteralPath (Join-Path $InstallRoot 'OptiScaler.dll') -Algorithm SHA256).Hash;
         submodules=@(& git -C $SourceRoot submodule status)}
     $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallRoot 'build-info.json') -Encoding UTF8

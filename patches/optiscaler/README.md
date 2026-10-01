@@ -16,6 +16,11 @@ selected external DLSS backend reports initialization/load errors instead of
 silently switching to FSR. The patch fixes the upstream loader's filesystem
 exception by making IsSubpath a lexical check, and retains a PDB for diagnosis.
 
+`0002` installs the command backend at D3D12 device discovery, before NGX Init
+and before OptiScaler's own method hooks. Command signatures created during
+game startup therefore retain their public argument descriptions for replay.
+The standalone runner's `-EarlyIndirectProbe` exercises this startup order.
+
 Build with Microsoft Build Tools 2022, v143 and Windows SDK 10.0.26100:
 
 ```powershell

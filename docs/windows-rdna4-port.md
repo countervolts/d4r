@@ -8,6 +8,17 @@ An actual game session remains unverified.
 
 ## Milestone and gates
 
+Startup coverage (2026-10-01): OptiScaler patch `0002` installs d4r at device
+discovery, before NGX initialization. `optiscaler-k-preinit-signature.zip` and
+`optiscaler-m-preinit-signature.zip` create a dispatch-only command signature
+before NGX Init, execute it in the evaluation list, and run four full frames.
+Both use all native transformer layers (44 K / 40 M launches), with bit-exact
+RGB against their control frames. K uses inherited legacy states; M uses
+inherited enhanced layouts. The full build and all 16 CTest gates pass. Reproduce
+with `-EarlyIndirectProbe` in the standalone OptiScaler runner. This avoids
+the previously documented unknown-signature rejection for observed startup
+objects; signatures created before the frontend is loaded remain untracked.
+
 Current milestone: M1/M2/M4/M5 passed; native NGX Create/Evaluate on the simple
 requested E path passes with the user's DLLs. All 11 K layers now pass synthetic
 and real-weight NumPy/PTX replay checks; native K Evaluate produces four finite

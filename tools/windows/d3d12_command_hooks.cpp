@@ -144,6 +144,7 @@ HRESULT STDMETHODCALLTYPE hook_signature(ID3D12Device* device, const D3D12_COMMA
                 std::memcpy(value.data() + sizeof(UINT), desc->pArgumentDescs, value.size() - sizeof(UINT));
             const auto tagged = signature->SetPrivateData(signature_description_tag, UINT(value.size()), value.data());
             if (FAILED(tagged)) std::fprintf(stderr, "D4R_SIGNATURE_TRACK_FAILURE result=0x%08x\n", unsigned(tagged));
+            else std::fprintf(stderr, "D4R_COMMAND_SIGNATURE arguments=%u tracked=1\n", desc->NumArgumentDescs);
         }
     } catch (const std::exception& failure) {
         // Preserve the successful public API call. An untracked signature is
