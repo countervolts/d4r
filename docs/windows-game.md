@@ -53,6 +53,8 @@ command-list split/replay, submitted state publication and suffix completion.
 The recording interval measures NGX calls on the recording thread, not Present.
 `-ProfileKernels` enables synchronizing HIP-event kernel profiling and changes
 frame scheduling; use it separately from a production FPS measurement.
+`-ProfileCommandHooks` samples one in 64 D3D12 interceptions to distinguish
+tracking/lock waits from driver calls. It is disabled in ordinary runs.
 The runner drains stdout/stderr concurrently as raw bytes; the earlier
 line-oriented PowerShell collector imposed large per-frame delays. The optional
 ZLUDA kernel profiler is for diagnostics only. Measurements and reproduction

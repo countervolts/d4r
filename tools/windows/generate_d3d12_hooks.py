@@ -95,7 +95,7 @@ def generate(source):
                             captured.append(argument)
                     lines += ['    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {',
                               f'        original_{name}(' + ', '.join(['target'] + captured) + ');', '    });']
-                lines += [f'    return original_{name}({call});', '}']
+                lines += ['    access.driver_call();', f'    return original_{name}({call});', '}']
             registrations.append(f'    attach_method(table[{slot}], reinterpret_cast<void*>(hook_{name}), reinterpret_cast<void**>(&original_{name}), "{name}");')
             registrations[-1] = f'    if (version >= {version})' + registrations[-1][3:]
             slot += 1
@@ -112,7 +112,7 @@ def generate(source):
             if name != 'DispatchGraph':
                 lines += ['    if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {',
                           f'        original_{name}(' + ', '.join(['target'] + names) + ');', '    });']
-            lines += [f'    original_{name}(' + ', '.join(['access.target()'] + names) + ');', '}']
+            lines += ['    access.driver_call();', f'    original_{name}(' + ', '.join(['access.target()'] + names) + ');', '}']
         registrations.append(f'    if (version >= {version}) attach_method(table[{slot}], reinterpret_cast<void*>(hook_{name}), reinterpret_cast<void**>(&original_{name}), "{name}");')
         slot += 1
         lines.append('')

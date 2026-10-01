@@ -138,5 +138,39 @@ The installer accepts them with `-LocalTextureKernels` only after validation,
 checking the exact DLL identity, object and manifest hashes. M retains its
 independently validated FP16-equivalent baseline.
 
+The following no-debugger K/4K run completes 9982 frames and 9982 finite GPU
+scans. Kernel event profiling is disabled; the validated private output tail
+executes natively. The user reports 43-47 FPS. Mean NGX recording interval is
+21.867 ms. No backend failure, CPU image copy or previous-frame output occurs.
+
+Random one-in-64 hook samples then identify contention in the shared routing
+table used by every intercepted D3D12 command. Per-thread weak lookup caches
+now bypass that table on repeated calls to a list. Table mutations invalidate
+cache generations; Reset/address reuse cannot route to a previous suffix, and
+thread caches do not retain game resources. The per-list and submission locks
+remain. A GPU regression resets and re-splits the exact same list with changed
+root constants twice per iteration, checking both prefix and suffix results.
+
+| Sampled command-hook access | Shared table | Per-thread weak cache |
+| --- | ---: | ---: |
+| Busiest recording thread, mean us/call | 0.203 | 0.066 |
+| Estimated access + capture across threads, ms/s | 977.528 | 233.606 |
+
+The latter estimate includes lock waits summed across concurrently running
+threads, not CPU execution time or serial frame latency. The two game runs
+have different thread populations (31 versus 29); there is no identical frame
+trace. Generated forwarding methods have separate driver/capture markers;
+special-case hooks contribute access samples but lack those body markers.
+
+With the cache, 4770 complete K/4K frames and finite GPU scans pass, with zero
+backend failures, CPU image copies or previous-frame output. Median NGX
+recording interval is 19.473 ms. The user reports 49-51 FPS and 53% GPU usage
+in the previously measured scene. These user readings are separate from the
+sampled hook estimates and do not establish isolated WMMA utilization.
+All sixteen CTest gates pass, including 64 same-object Reset/split checks in
+each physical command-backend test and the software indirect-root regression.
+Use `-ProfileCommandHooks -ProfileStages` to collect samples; the sampler is
+disabled for ordinary play.
+
 References: [HIP events](https://rocmdocs.amd.com/projects/HIP/en/develop/doxygen/html/group___event.html),
 [HIP occupancy API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/group___occupancy.html).

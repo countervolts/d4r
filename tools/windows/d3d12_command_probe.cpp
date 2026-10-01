@@ -82,6 +82,7 @@ struct Callback {
     ID3D12Resource* readback;
     uint32_t expected_seed = seed;
     bool prefix_verified = false;
+    uint32_t expected_multiplier = 17, expected_addend = 10;
 };
 void WINAPI boundary(ID3D12CommandQueue* queue, void* context) {
     auto& callback = *static_cast<Callback*>(context);
@@ -93,7 +94,8 @@ void WINAPI boundary(ID3D12CommandQueue* queue, void* context) {
     list.list->CopyResource(callback.input, callback.replacement);
     transition(list.list.Get(), callback.input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list.submit(callback.device, queue);
-    callback.prefix_verified = verify(callback.readback, 17, 10, callback.expected_seed);
+    callback.prefix_verified = verify(callback.readback, callback.expected_multiplier,
+        callback.expected_addend, callback.expected_seed);
 }
 }
 
@@ -263,13 +265,38 @@ int main(int argc, char** argv) {
                 ID3D12CommandList* batch[] = {a.list.Get(), b.list.Get(), c.list.Get()};
                 queue->ExecuteCommandLists(no_hooks ? 2 : 3, batch + (no_hooks ? 1 : 0)); drain(device.Get(), queue.Get());
                 if (!callback.prefix_verified || !verify(readback.Get(), 25, 100, expected_seed)) throw std::runtime_error("Queue order or suffix root state mismatch");
+                if (!no_hooks) for (unsigned reuse = 0; reuse < 2; ++reuse) {
+                    // Populate the same thread's routing cache with a split
+                    // list, Reset that exact COM object, then split again with
+                    // different root state. A cached previous Recording would
+                    // keep targeting the old suffix or replay the old Seed.
+                    dx(b.allocator->Reset(), "Reset reused allocator");
+                    dx(b.list->Reset(b.allocator.Get(), initial_pso ? pso.Get() : nullptr), "Reset reused logical list");
+                    b.list->SetComputeRootSignature(root.Get());
+                    if (!initial_pso) b.list->SetPipelineState(pso.Get());
+                    b.list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
+                    b.list->SetComputeRootShaderResourceView(1, input->GetGPUVirtualAddress());
+                    callback.expected_seed = seed + iteration + reuse + 1;
+                    callback.expected_multiplier = 25; callback.expected_addend = 100;
+                    callback.prefix_verified = false;
+                    b.list->SetComputeRoot32BitConstant(2, callback.expected_seed, 0);
+                    b.list->Dispatch(count / 64, 1, 1);
+                    if (record(b.list.Get(), boundary, &callback) != 1) throw std::runtime_error("Record reused split failed");
+                    b.list->Dispatch(count / 64, 1, 1);
+                    transition(b.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    b.list->CopyResource(readback.Get(), output.Get());
+                    transition(b.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    b.submit(device.Get(), queue.Get());
+                    if (!callback.prefix_verified || !verify(readback.Get(), 25, 100, callback.expected_seed))
+                        throw std::runtime_error("Reset reused logical list retained stale routing/root state");
+                }
             }
             if (live() != 0) throw std::runtime_error("D3D12 recording metadata leaked after command-list Release");
         }
         const bool warp = std::getenv("D4R_COMMAND_PROBE_WARP") != nullptr;
-        std::printf("PASS D3D12_COMMAND_BACKEND adapter=%s architecture=%s backend=%u iterations=%u batch_order=1 root_state=1 deep_copy=1 indirect=%u indirect_reset=%u live_recordings=0 frame_age=0\n",
+        std::printf("PASS D3D12_COMMAND_BACKEND adapter=%s architecture=%s backend=%u iterations=%u batch_order=1 root_state=1 deep_copy=1 indirect=%u indirect_reset=%u reset_reuse=%u live_recordings=0 frame_age=0\n",
             warp ? "WARP" : "AMD", warp ? "software" : no_hip ? "not_queried" : "gfx1201", !no_hooks,
-            args.iterations, indirect_enabled, root_indirect);
+            args.iterations, indirect_enabled, root_indirect, no_hooks ? 0 : 2 * args.iterations);
         return 0;
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "FAIL D3D12_COMMAND_BACKEND %s\n", failure.what());

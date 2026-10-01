@@ -60,28 +60,93 @@ struct Recording {
     explicit Recording(ID3D12GraphicsCommandList* list) : original(list) {}
 };
 std::unordered_map<ID3D12GraphicsCommandList*, std::shared_ptr<Recording>> recordings;
+std::atomic<uint64_t> recording_generation{0};
+struct RecordingCache {
+    ID3D12GraphicsCommandList* list = nullptr;
+    uint64_t generation = 0;
+    // A thread's last lookup must not retain suffix lists, allocators or game
+    // resources after Reset/final Release. Address reuse also needs a new
+    // generation, even if the old Recording is alive in a submit callback.
+    std::weak_ptr<Recording> value;
+};
+thread_local RecordingCache recording_cache;
 std::shared_ptr<Recording> get_recording(ID3D12GraphicsCommandList* self, bool create = true) {
     if (internal) return {};
+    const auto generation = recording_generation.load(std::memory_order_acquire);
+    if (recording_cache.list == self && recording_cache.generation == generation) {
+        if (auto value = recording_cache.value.lock()) return value;
+    }
     std::lock_guard<std::mutex> lock(map_mutex);
     auto found = recordings.find(self);
-    if (found != recordings.end()) return found->second;
-    if (!create) return {};
-    auto value = std::make_shared<Recording>(self);
-    recordings.emplace(self, value); return value;
+    std::shared_ptr<Recording> value;
+    if (found != recordings.end()) value = found->second;
+    else {
+        if (!create) return {};
+        value = std::make_shared<Recording>(self);
+        recordings.emplace(self, value);
+        recording_generation.fetch_add(1, std::memory_order_release);
+    }
+    recording_cache.list = self;
+    recording_cache.value = value;
+    recording_cache.generation = recording_generation.load(std::memory_order_relaxed);
+    return value;
 }
 void forget(ID3D12GraphicsCommandList* self) {
     std::shared_ptr<Recording> released;
     { std::lock_guard<std::mutex> lock(map_mutex);
       auto it = recordings.find(self);
-      if (it != recordings.end()) { released = std::move(it->second); recordings.erase(it); } }
+      if (it != recordings.end()) {
+          released = std::move(it->second); recordings.erase(it);
+          recording_generation.fetch_add(1, std::memory_order_release);
+      } }
     // Release retained COM objects without holding the map mutex.
 }
+struct HookSample {
+    uint32_t random = GetCurrentThreadId() | 1u;
+    uint64_t calls = 0, samples = 0, marked = 0;
+    double access_ms = 0, capture_ms = 0, driver_ms = 0;
+    Clock::time_point since = Clock::now();
+    bool choose() {
+        ++calls; random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+        return !(random & 63u);
+    }
+    void flush() {
+        const double elapsed = milliseconds(since);
+        if (elapsed < 2000) return;
+        std::printf("D4R_COMMAND_HOOK_SAMPLE thread=%lu period_ms=%.3f calls=%llu samples=%llu marked=%llu access_sum_ms=%.6f capture_sum_ms=%.6f driver_sum_ms=%.6f sampling=64\n",
+            GetCurrentThreadId(), elapsed, (unsigned long long)calls, (unsigned long long)samples,
+            (unsigned long long)marked, access_ms, capture_ms, driver_ms);
+        calls = samples = marked = 0; access_ms = capture_ms = driver_ms = 0; since = Clock::now();
+    }
+};
+thread_local HookSample hook_sample;
+bool sample_hooks() { static const bool enabled = std::getenv("D4R_PROFILE_COMMAND_HOOKS") != nullptr; return enabled; }
 struct Access {
     std::shared_ptr<Recording> recording;
     std::unique_lock<std::recursive_mutex> lock;
     ID3D12GraphicsCommandList* self;
-    explicit Access(ID3D12GraphicsCommandList* list) : recording(get_recording(list)), self(list) {
+    bool sampled = false;
+    Clock::time_point begin{}, acquired{}, driver{};
+    explicit Access(ID3D12GraphicsCommandList* list) : self(list) {
+        sampled = !internal && sample_hooks() && hook_sample.choose();
+        if (sampled) begin = Clock::now();
+        recording = get_recording(list);
         if (recording) lock = std::unique_lock<std::recursive_mutex>(recording->mutex);
+        if (sampled) acquired = Clock::now();
+    }
+    void driver_call() {
+        if (sampled) driver = Clock::now();
+    }
+    ~Access() {
+        if (!sampled) return;
+        ++hook_sample.samples;
+        hook_sample.access_ms += std::chrono::duration<double, std::milli>(acquired - begin).count();
+        if (driver != Clock::time_point{}) {
+            ++hook_sample.marked;
+            hook_sample.capture_ms += std::chrono::duration<double, std::milli>(driver - acquired).count();
+            hook_sample.driver_ms += milliseconds(driver);
+        }
+        hook_sample.flush();
     }
     ID3D12GraphicsCommandList* target() const {
         return recording && recording->current ? recording->current.Get() : self;

@@ -54,6 +54,27 @@ public ZIPs exclude these objects. Install/restore with private overrides
 restores sentinel DLL/config byte-exactly, without duplicate slash/backslash
 manifest paths.
 
+Production K/4K with private output stores completes 9982 frames and 9982
+finite GPU scans; the user reports 43-47 FPS. Random per-hook CPU sampling
+then localizes contention to the shared command-list routing map. A per-thread
+weak lookup cache bypasses that mutex for repeated calls, invalidating on map
+mutations to preserve Reset/final Release/address reuse. Queue and per-list
+synchronization remain. The regression resets/re-splits the same object twice
+per iteration with different root constants and verifies both GPU outputs.
+All sixteen CTest gates pass. The cached game run completes 4770 K/4K frames
+and 4770 finite GPU scans, zero failures/CPU image copies/aged outputs. The user
+reports 49-51 FPS and 53% GPU usage. Aggregated sampled access/capture time
+falls from 977.528 to 233.606 ms/s across threads; it includes parallel lock
+waits and must not be treated as serial frame time. Median recording interval
+is 19.473 ms. `-ProfileCommandHooks` is optional and off during ordinary play.
+Detailed scope and timings are in [windows-performance.md](windows-performance.md).
+Post-cache full-pipeline checks also pass: three K/4K HDR frames and four M
+512x288 frames match their previously validated controls with max absolute and
+relative RGB error 0, all RGBA finite. Public archive validation checks all 63
+entries and their SHA256 against package.json; NVIDIA DLLs and private texture
+objects are absent. `package-windows-game.ps1 -ArchivePath <zip>` archives only
+the staged manifest, including on Windows PowerShell 5.1.
+
 Performance diagnostics (2026-10-01): the separate ZLUDA `b0161a4` runtime
 passes 32 PTX launches in each context and all four native K/M frames with
 bit-exact RGB against their controls. All thirteen exported patches (0002

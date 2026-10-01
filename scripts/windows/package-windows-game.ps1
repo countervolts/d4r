@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$PackageRoot, [string]$DiagnosticRoot, [string]$OptiScalerRoot,
-    [string]$ZludaRoot, [string]$HipRoot, [string]$KernelKRoot, [string]$KernelMRoot
+    [string]$ZludaRoot, [string]$HipRoot, [string]$KernelKRoot, [string]$KernelMRoot,
+    [string]$ArchivePath
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -76,3 +77,21 @@ if (Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Where-Object { $_.N
     throw 'Proprietary NVIDIA binaries must not be in the package.'
 }
 Write-Host "Windows game development package: $PackageRoot (NVIDIA DLLs excluded)"
+if ($ArchivePath) {
+    $ArchivePath=[IO.Path]::GetFullPath($ArchivePath)
+    if ($ArchivePath.StartsWith($PackageRoot+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Place the ZIP outside the package directory.' }
+    Add-Type -AssemblyName System.IO.Compression,System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Force (Split-Path $ArchivePath) | Out-Null
+    $stream=[IO.File]::Open($ArchivePath,[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    $archive=$null
+    try {
+        $archive=[IO.Compression.ZipArchive]::new($stream,[IO.Compression.ZipArchiveMode]::Create)
+        # Never archive caches, results, private texture outputs or a local DLL
+        # merely because it happens to be somewhere under PackageRoot.
+        foreach ($relative in @($stagedFiles)+@('package.json')) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive,
+                (Join-Path $PackageRoot $relative),$relative.Replace('\','/'),[IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { if ($archive) { $archive.Dispose() }; $stream.Dispose() }
+    Write-Host "Public package archive: $ArchivePath"
+}

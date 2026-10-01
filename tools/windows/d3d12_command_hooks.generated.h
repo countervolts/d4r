@@ -16,6 +16,7 @@ using Fn_DrawInstanced = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* sel
 static Fn_DrawInstanced original_DrawInstanced = nullptr;
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList* self, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location) {
     Access access(self);
+    access.driver_call();
     return original_DrawInstanced(access.target(), vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
 }
 
@@ -23,6 +24,7 @@ using Fn_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandLi
 static Fn_DrawIndexedInstanced original_DrawIndexedInstanced = nullptr;
 static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList* self, UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location, INT base_vertex_location, UINT start_instance_location) {
     Access access(self);
+    access.driver_call();
     return original_DrawIndexedInstanced(access.target(), index_count_per_instance, instance_count, start_vertex_location, base_vertex_location, start_instance_location);
 }
 
@@ -30,6 +32,7 @@ using Fn_Dispatch = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, UI
 static Fn_Dispatch original_Dispatch = nullptr;
 static void STDMETHODCALLTYPE hook_Dispatch(ID3D12GraphicsCommandList* self, UINT x, UINT u, UINT z) {
     Access access(self);
+    access.driver_call();
     return original_Dispatch(access.target(), x, u, z);
 }
 
@@ -37,6 +40,7 @@ using Fn_CopyBufferRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* 
 static Fn_CopyBufferRegion original_CopyBufferRegion = nullptr;
 static void STDMETHODCALLTYPE hook_CopyBufferRegion(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
     Access access(self);
+    access.driver_call();
     return original_CopyBufferRegion(access.target(), dst_buffer, dst_offset, src_buffer, src_offset, byte_count);
 }
 
@@ -44,6 +48,7 @@ using Fn_CopyTextureRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*
 static Fn_CopyTextureRegion original_CopyTextureRegion = nullptr;
 static void STDMETHODCALLTYPE hook_CopyTextureRegion(ID3D12GraphicsCommandList* self, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT dst_x, UINT dst_y, UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *src_box) {
     Access access(self);
+    access.driver_call();
     return original_CopyTextureRegion(access.target(), dst, dst_x, dst_y, dst_z, src, src_box);
 }
 
@@ -51,6 +56,7 @@ using Fn_CopyResource = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self
 static Fn_CopyResource original_CopyResource = nullptr;
 static void STDMETHODCALLTYPE hook_CopyResource(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_resource, ID3D12Resource *src_resource) {
     Access access(self);
+    access.driver_call();
     return original_CopyResource(access.target(), dst_resource, src_resource);
 }
 
@@ -58,6 +64,7 @@ using Fn_CopyTiles = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, I
 static Fn_CopyTiles original_CopyTiles = nullptr;
 static void STDMETHODCALLTYPE hook_CopyTiles(ID3D12GraphicsCommandList* self, ID3D12Resource *tiled_resource, const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate, const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
     Access access(self);
+    access.driver_call();
     return original_CopyTiles(access.target(), tiled_resource, tile_region_start_coordinate, tile_region_size, buffer, buffer_offset, flags);
 }
 
@@ -65,6 +72,7 @@ using Fn_ResolveSubresource = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList
 static Fn_ResolveSubresource original_ResolveSubresource = nullptr;
 static void STDMETHODCALLTYPE hook_ResolveSubresource(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_resource, UINT dst_sub_resource, ID3D12Resource *src_resource, UINT src_sub_resource, DXGI_FORMAT format) {
     Access access(self);
+    access.driver_call();
     return original_ResolveSubresource(access.target(), dst_resource, dst_sub_resource, src_resource, src_sub_resource, format);
 }
 
@@ -75,6 +83,7 @@ static void STDMETHODCALLTYPE hook_IASetPrimitiveTopology(ID3D12GraphicsCommandL
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_IASetPrimitiveTopology(target, primitive_topology);
     });
+    access.driver_call();
     return original_IASetPrimitiveTopology(access.target(), primitive_topology);
 }
 
@@ -86,6 +95,7 @@ static void STDMETHODCALLTYPE hook_RSSetViewports(ID3D12GraphicsCommandList* sel
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_RSSetViewports(target, viewport_count, values_pointer(saved_viewports));
     });
+    access.driver_call();
     return original_RSSetViewports(access.target(), viewport_count, viewports);
 }
 
@@ -97,6 +107,7 @@ static void STDMETHODCALLTYPE hook_RSSetScissorRects(ID3D12GraphicsCommandList* 
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_RSSetScissorRects(target, rect_count, values_pointer(saved_rects));
     });
+    access.driver_call();
     return original_RSSetScissorRects(access.target(), rect_count, rects);
 }
 
@@ -108,6 +119,7 @@ static void STDMETHODCALLTYPE hook_OMSetBlendFactor(ID3D12GraphicsCommandList* s
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_OMSetBlendFactor(target, values_pointer(saved_blend_factor));
     });
+    access.driver_call();
     return original_OMSetBlendFactor(access.target(), blend_factor);
 }
 
@@ -118,6 +130,7 @@ static void STDMETHODCALLTYPE hook_OMSetStencilRef(ID3D12GraphicsCommandList* se
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_OMSetStencilRef(target, stencil_ref);
     });
+    access.driver_call();
     return original_OMSetStencilRef(access.target(), stencil_ref);
 }
 
@@ -129,6 +142,7 @@ static void STDMETHODCALLTYPE hook_SetPipelineState(ID3D12GraphicsCommandList* s
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetPipelineState(target, saved_pipeline_state.Get());
     });
+    access.driver_call();
     return original_SetPipelineState(access.target(), pipeline_state);
 }
 
@@ -148,6 +162,7 @@ static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList*
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetDescriptorHeaps(target, heap_count, saved_heaps.raw.data());
     });
+    access.driver_call();
     return original_SetDescriptorHeaps(access.target(), heap_count, heaps);
 }
 
@@ -159,6 +174,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRootSignature(ID3D12GraphicsCommand
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRootSignature(target, saved_root_signature.Get());
     });
+    access.driver_call();
     return original_SetComputeRootSignature(access.target(), root_signature);
 }
 
@@ -170,6 +186,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootSignature(ID3D12GraphicsComman
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRootSignature(target, saved_root_signature.Get());
     });
+    access.driver_call();
     return original_SetGraphicsRootSignature(access.target(), root_signature);
 }
 
@@ -180,6 +197,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRootDescriptorTable(ID3D12GraphicsC
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRootDescriptorTable(target, root_parameter_index, base_descriptor);
     });
+    access.driver_call();
     return original_SetComputeRootDescriptorTable(access.target(), root_parameter_index, base_descriptor);
 }
 
@@ -190,6 +208,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootDescriptorTable(ID3D12Graphics
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRootDescriptorTable(target, root_parameter_index, base_descriptor);
     });
+    access.driver_call();
     return original_SetGraphicsRootDescriptorTable(access.target(), root_parameter_index, base_descriptor);
 }
 
@@ -200,6 +219,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRoot32BitConstant(ID3D12GraphicsCom
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRoot32BitConstant(target, root_parameter_index, data, dst_offset);
     });
+    access.driver_call();
     return original_SetComputeRoot32BitConstant(access.target(), root_parameter_index, data, dst_offset);
 }
 
@@ -210,6 +230,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRoot32BitConstant(ID3D12GraphicsCo
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRoot32BitConstant(target, root_parameter_index, data, dst_offset);
     });
+    access.driver_call();
     return original_SetGraphicsRoot32BitConstant(access.target(), root_parameter_index, data, dst_offset);
 }
 
@@ -221,6 +242,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRoot32BitConstants(ID3D12GraphicsCo
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRoot32BitConstants(target, root_parameter_index, constant_count, values_pointer(saved_data), dst_offset);
     });
+    access.driver_call();
     return original_SetComputeRoot32BitConstants(access.target(), root_parameter_index, constant_count, data, dst_offset);
 }
 
@@ -232,6 +254,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRoot32BitConstants(ID3D12GraphicsC
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRoot32BitConstants(target, root_parameter_index, constant_count, values_pointer(saved_data), dst_offset);
     });
+    access.driver_call();
     return original_SetGraphicsRoot32BitConstants(access.target(), root_parameter_index, constant_count, data, dst_offset);
 }
 
@@ -242,6 +265,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRootConstantBufferView(ID3D12Graphi
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRootConstantBufferView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetComputeRootConstantBufferView(access.target(), root_parameter_index, address);
 }
 
@@ -252,6 +276,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootConstantBufferView(ID3D12Graph
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRootConstantBufferView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetGraphicsRootConstantBufferView(access.target(), root_parameter_index, address);
 }
 
@@ -262,6 +287,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRootShaderResourceView(ID3D12Graphi
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRootShaderResourceView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetComputeRootShaderResourceView(access.target(), root_parameter_index, address);
 }
 
@@ -272,6 +298,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootShaderResourceView(ID3D12Graph
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRootShaderResourceView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetGraphicsRootShaderResourceView(access.target(), root_parameter_index, address);
 }
 
@@ -282,6 +309,7 @@ static void STDMETHODCALLTYPE hook_SetComputeRootUnorderedAccessView(ID3D12Graph
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetComputeRootUnorderedAccessView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetComputeRootUnorderedAccessView(access.target(), root_parameter_index, address);
 }
 
@@ -292,6 +320,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootUnorderedAccessView(ID3D12Grap
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetGraphicsRootUnorderedAccessView(target, root_parameter_index, address);
     });
+    access.driver_call();
     return original_SetGraphicsRootUnorderedAccessView(access.target(), root_parameter_index, address);
 }
 
@@ -303,6 +332,7 @@ static void STDMETHODCALLTYPE hook_IASetIndexBuffer(ID3D12GraphicsCommandList* s
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_IASetIndexBuffer(target, values_pointer(saved_view));
     });
+    access.driver_call();
     return original_IASetIndexBuffer(access.target(), view);
 }
 
@@ -314,6 +344,7 @@ static void STDMETHODCALLTYPE hook_IASetVertexBuffers(ID3D12GraphicsCommandList*
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_IASetVertexBuffers(target, start_slot, view_count, values_pointer(saved_views));
     });
+    access.driver_call();
     return original_IASetVertexBuffers(access.target(), start_slot, view_count, views);
 }
 
@@ -325,6 +356,7 @@ static void STDMETHODCALLTYPE hook_SOSetTargets(ID3D12GraphicsCommandList* self,
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SOSetTargets(target, start_slot, view_count, values_pointer(saved_views));
     });
+    access.driver_call();
     return original_SOSetTargets(access.target(), start_slot, view_count, views);
 }
 
@@ -337,6 +369,7 @@ static void STDMETHODCALLTYPE hook_OMSetRenderTargets(ID3D12GraphicsCommandList*
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_OMSetRenderTargets(target, render_target_descriptor_count, values_pointer(saved_render_target_descriptors), single_descriptor_handle, values_pointer(saved_depth_stencil_descriptor));
     });
+    access.driver_call();
     return original_OMSetRenderTargets(access.target(), render_target_descriptor_count, render_target_descriptors, single_descriptor_handle, depth_stencil_descriptor);
 }
 
@@ -344,6 +377,7 @@ using Fn_ClearDepthStencilView = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandL
 static Fn_ClearDepthStencilView original_ClearDepthStencilView = nullptr;
 static void STDMETHODCALLTYPE hook_ClearDepthStencilView(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT *rects) {
     Access access(self);
+    access.driver_call();
     return original_ClearDepthStencilView(access.target(), dsv, flags, depth, stencil, rect_count, rects);
 }
 
@@ -351,6 +385,7 @@ using Fn_ClearRenderTargetView = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandL
 static Fn_ClearRenderTargetView original_ClearRenderTargetView = nullptr;
 static void STDMETHODCALLTYPE hook_ClearRenderTargetView(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT rect_count, const D3D12_RECT *rects) {
     Access access(self);
+    access.driver_call();
     return original_ClearRenderTargetView(access.target(), rtv, color, rect_count, rects);
 }
 
@@ -358,6 +393,7 @@ using Fn_ClearUnorderedAccessViewUint = void(STDMETHODCALLTYPE*)(ID3D12GraphicsC
 static Fn_ClearUnorderedAccessViewUint original_ClearUnorderedAccessViewUint = nullptr;
 static void STDMETHODCALLTYPE hook_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects) {
     Access access(self);
+    access.driver_call();
     return original_ClearUnorderedAccessViewUint(access.target(), gpu_handle, cpu_handle, resource, values, rect_count, rects);
 }
 
@@ -365,6 +401,7 @@ using Fn_ClearUnorderedAccessViewFloat = void(STDMETHODCALLTYPE*)(ID3D12Graphics
 static Fn_ClearUnorderedAccessViewFloat original_ClearUnorderedAccessViewFloat = nullptr;
 static void STDMETHODCALLTYPE hook_ClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects) {
     Access access(self);
+    access.driver_call();
     return original_ClearUnorderedAccessViewFloat(access.target(), gpu_handle, cpu_handle, resource, values, rect_count, rects);
 }
 
@@ -372,6 +409,7 @@ using Fn_DiscardResource = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* s
 static Fn_DiscardResource original_DiscardResource = nullptr;
 static void STDMETHODCALLTYPE hook_DiscardResource(ID3D12GraphicsCommandList* self, ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) {
     Access access(self);
+    access.driver_call();
     return original_DiscardResource(access.target(), resource, region);
 }
 
@@ -387,6 +425,7 @@ using Fn_ResolveQueryData = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* 
 static Fn_ResolveQueryData original_ResolveQueryData = nullptr;
 static void STDMETHODCALLTYPE hook_ResolveQueryData(ID3D12GraphicsCommandList* self, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT start_index, UINT query_count, ID3D12Resource *dst_buffer, UINT64 aligned_dst_buffer_offset) {
     Access access(self);
+    access.driver_call();
     return original_ResolveQueryData(access.target(), heap, type, start_index, query_count, dst_buffer, aligned_dst_buffer_offset);
 }
 
@@ -398,6 +437,7 @@ using Fn_SetMarker = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, U
 static Fn_SetMarker original_SetMarker = nullptr;
 static void STDMETHODCALLTYPE hook_SetMarker(ID3D12GraphicsCommandList* self, UINT metadata, const void *data, UINT size) {
     Access access(self);
+    access.driver_call();
     return original_SetMarker(access.target(), metadata, data, size);
 }
 
@@ -417,6 +457,7 @@ using Fn_AtomicCopyBufferUINT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandLi
 static Fn_AtomicCopyBufferUINT original_AtomicCopyBufferUINT = nullptr;
 static void STDMETHODCALLTYPE hook_AtomicCopyBufferUINT(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT dependent_resource_count, ID3D12Resource *const *dependent_resources, const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) {
     Access access(self);
+    access.driver_call();
     return original_AtomicCopyBufferUINT(access.target(), dst_buffer, dst_offset, src_buffer, src_offset, dependent_resource_count, dependent_resources, dependent_sub_resource_ranges);
 }
 
@@ -424,6 +465,7 @@ using Fn_AtomicCopyBufferUINT64 = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommand
 static Fn_AtomicCopyBufferUINT64 original_AtomicCopyBufferUINT64 = nullptr;
 static void STDMETHODCALLTYPE hook_AtomicCopyBufferUINT64(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT dependent_resource_count, ID3D12Resource *const *dependent_resources, const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) {
     Access access(self);
+    access.driver_call();
     return original_AtomicCopyBufferUINT64(access.target(), dst_buffer, dst_offset, src_buffer, src_offset, dependent_resource_count, dependent_resources, dependent_sub_resource_ranges);
 }
 
@@ -434,6 +476,7 @@ static void STDMETHODCALLTYPE hook_OMSetDepthBounds(ID3D12GraphicsCommandList* s
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_OMSetDepthBounds(target, min, max);
     });
+    access.driver_call();
     return original_OMSetDepthBounds(access.target(), min, max);
 }
 
@@ -445,6 +488,7 @@ static void STDMETHODCALLTYPE hook_SetSamplePositions(ID3D12GraphicsCommandList*
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetSamplePositions(target, sample_count, pixel_count, values_pointer(saved_sample_positions));
     });
+    access.driver_call();
     return original_SetSamplePositions(access.target(), sample_count, pixel_count, sample_positions);
 }
 
@@ -452,6 +496,7 @@ using Fn_ResolveSubresourceRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsComma
 static Fn_ResolveSubresourceRegion original_ResolveSubresourceRegion = nullptr;
 static void STDMETHODCALLTYPE hook_ResolveSubresourceRegion(ID3D12GraphicsCommandList* self, ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x, UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx, D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) {
     Access access(self);
+    access.driver_call();
     return original_ResolveSubresourceRegion(access.target(), dst_resource, dst_sub_resource_idx, dst_x, dst_y, src_resource, src_sub_resource_idx, src_rect, format, mode);
 }
 
@@ -462,6 +507,7 @@ static void STDMETHODCALLTYPE hook_SetViewInstanceMask(ID3D12GraphicsCommandList
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetViewInstanceMask(target, mask);
     });
+    access.driver_call();
     return original_SetViewInstanceMask(access.target(), mask);
 }
 
@@ -469,6 +515,7 @@ using Fn_WriteBufferImmediate = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandLi
 static Fn_WriteBufferImmediate original_WriteBufferImmediate = nullptr;
 static void STDMETHODCALLTYPE hook_WriteBufferImmediate(ID3D12GraphicsCommandList* self, UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters, const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) {
     Access access(self);
+    access.driver_call();
     return original_WriteBufferImmediate(access.target(), count, parameters, modes);
 }
 
@@ -480,6 +527,7 @@ static void STDMETHODCALLTYPE hook_SetProtectedResourceSession(ID3D12GraphicsCom
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetProtectedResourceSession(target, saved_protected_resource_session.Get());
     });
+    access.driver_call();
     return original_SetProtectedResourceSession(access.target(), protected_resource_session);
 }
 
@@ -495,6 +543,7 @@ using Fn_InitializeMetaCommand = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandL
 static Fn_InitializeMetaCommand original_InitializeMetaCommand = nullptr;
 static void STDMETHODCALLTYPE hook_InitializeMetaCommand(ID3D12GraphicsCommandList* self, ID3D12MetaCommand *meta_command, const void *initialization_parameters_data, SIZE_T initialization_parameters_data_size_in_bytes) {
     Access access(self);
+    access.driver_call();
     return original_InitializeMetaCommand(access.target(), meta_command, initialization_parameters_data, initialization_parameters_data_size_in_bytes);
 }
 
@@ -502,6 +551,7 @@ using Fn_ExecuteMetaCommand = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList
 static Fn_ExecuteMetaCommand original_ExecuteMetaCommand = nullptr;
 static void STDMETHODCALLTYPE hook_ExecuteMetaCommand(ID3D12GraphicsCommandList* self, ID3D12MetaCommand *meta_command, const void *execution_parameters_data, SIZE_T execution_parameters_data_size_in_bytes) {
     Access access(self);
+    access.driver_call();
     return original_ExecuteMetaCommand(access.target(), meta_command, execution_parameters_data, execution_parameters_data_size_in_bytes);
 }
 
@@ -509,6 +559,7 @@ using Fn_BuildRaytracingAccelerationStructure = void(STDMETHODCALLTYPE*)(ID3D12G
 static Fn_BuildRaytracingAccelerationStructure original_BuildRaytracingAccelerationStructure = nullptr;
 static void STDMETHODCALLTYPE hook_BuildRaytracingAccelerationStructure(ID3D12GraphicsCommandList* self, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT postbuild_info_descs_count, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs) {
     Access access(self);
+    access.driver_call();
     return original_BuildRaytracingAccelerationStructure(access.target(), desc, postbuild_info_descs_count, postbuild_info_descs);
 }
 
@@ -516,6 +567,7 @@ using Fn_EmitRaytracingAccelerationStructurePostbuildInfo = void(STDMETHODCALLTY
 static Fn_EmitRaytracingAccelerationStructurePostbuildInfo original_EmitRaytracingAccelerationStructurePostbuildInfo = nullptr;
 static void STDMETHODCALLTYPE hook_EmitRaytracingAccelerationStructurePostbuildInfo(ID3D12GraphicsCommandList* self, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc, UINT src_acceleration_structures_count, const D3D12_GPU_VIRTUAL_ADDRESS *src_acceleration_structure_data) {
     Access access(self);
+    access.driver_call();
     return original_EmitRaytracingAccelerationStructurePostbuildInfo(access.target(), desc, src_acceleration_structures_count, src_acceleration_structure_data);
 }
 
@@ -523,6 +575,7 @@ using Fn_CopyRaytracingAccelerationStructure = void(STDMETHODCALLTYPE*)(ID3D12Gr
 static Fn_CopyRaytracingAccelerationStructure original_CopyRaytracingAccelerationStructure = nullptr;
 static void STDMETHODCALLTYPE hook_CopyRaytracingAccelerationStructure(ID3D12GraphicsCommandList* self, D3D12_GPU_VIRTUAL_ADDRESS dst_acceleration_structure_data, D3D12_GPU_VIRTUAL_ADDRESS src_acceleration_structure_data, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
     Access access(self);
+    access.driver_call();
     return original_CopyRaytracingAccelerationStructure(access.target(), dst_acceleration_structure_data, src_acceleration_structure_data, mode);
 }
 
@@ -534,6 +587,7 @@ static void STDMETHODCALLTYPE hook_SetPipelineState1(ID3D12GraphicsCommandList* 
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_SetPipelineState1(target, saved_state_object.Get());
     });
+    access.driver_call();
     return original_SetPipelineState1(access.target(), state_object);
 }
 
@@ -541,6 +595,7 @@ using Fn_DispatchRays = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self
 static Fn_DispatchRays original_DispatchRays = nullptr;
 static void STDMETHODCALLTYPE hook_DispatchRays(ID3D12GraphicsCommandList* self, const D3D12_DISPATCH_RAYS_DESC *desc) {
     Access access(self);
+    access.driver_call();
     return original_DispatchRays(access.target(), desc);
 }
 
@@ -552,6 +607,7 @@ static void STDMETHODCALLTYPE hook_RSSetShadingRate(ID3D12GraphicsCommandList* s
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_RSSetShadingRate(target, base_shading_rate, values_pointer(saved_combiners));
     });
+    access.driver_call();
     return original_RSSetShadingRate(access.target(), base_shading_rate, combiners);
 }
 
@@ -563,6 +619,7 @@ static void STDMETHODCALLTYPE hook_RSSetShadingRateImage(ID3D12GraphicsCommandLi
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) mutable {
         original_RSSetShadingRateImage(target, saved_shading_rate_image.Get());
     });
+    access.driver_call();
     return original_RSSetShadingRateImage(access.target(), shading_rate_image);
 }
 
@@ -570,6 +627,7 @@ using Fn_DispatchMesh = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self
 static Fn_DispatchMesh original_DispatchMesh = nullptr;
 static void STDMETHODCALLTYPE hook_DispatchMesh(ID3D12GraphicsCommandList* self, UINT thread_group_count_x, UINT thread_group_count_y, UINT thread_group_count_z) {
     Access access(self);
+    access.driver_call();
     return original_DispatchMesh(access.target(), thread_group_count_x, thread_group_count_y, thread_group_count_z);
 }
 
@@ -584,6 +642,7 @@ static void STDMETHODCALLTYPE hook_OMSetFrontAndBackStencilRef(ID3D12GraphicsCom
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
         original_OMSetFrontAndBackStencilRef(target, front_stencil, back_stencil);
     });
+    access.driver_call();
     original_OMSetFrontAndBackStencilRef(access.target(), front_stencil, back_stencil);
 }
 
@@ -594,6 +653,7 @@ static void STDMETHODCALLTYPE hook_RSSetDepthBias(ID3D12GraphicsCommandList* sel
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
         original_RSSetDepthBias(target, depth_bias, clamp, slope);
     });
+    access.driver_call();
     original_RSSetDepthBias(access.target(), depth_bias, clamp, slope);
 }
 
@@ -604,6 +664,7 @@ static void STDMETHODCALLTYPE hook_IASetIndexBufferStripCutValue(ID3D12GraphicsC
     if (access.recording) access.recording->state.emplace_back([=](ID3D12GraphicsCommandList* target) {
         original_IASetIndexBufferStripCutValue(target, value);
     });
+    access.driver_call();
     original_IASetIndexBufferStripCutValue(access.target(), value);
 }
 
@@ -615,6 +676,7 @@ using Fn_DispatchGraph = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* sel
 static Fn_DispatchGraph original_DispatchGraph = nullptr;
 static void STDMETHODCALLTYPE hook_DispatchGraph(ID3D12GraphicsCommandList* self, const void* desc) {
     Access access(self);
+    access.driver_call();
     original_DispatchGraph(access.target(), desc);
 }
 

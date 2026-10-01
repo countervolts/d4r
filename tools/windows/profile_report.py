@@ -41,6 +41,7 @@ def report(directory, metadata_directory=None):
     stages = collections.defaultdict(list)
     commands = collections.defaultdict(list)
     kernels = collections.defaultdict(list)
+    hook_threads = collections.defaultdict(list)
     for path in sorted(directory.glob('*.log')):
         text = path.read_text(encoding='utf-8-sig', errors='replace')
         for name, value in re.findall(r'D4R_STAGE name=(\S+) cpu_ms=([0-9.]+)', text):
@@ -51,18 +52,37 @@ def report(directory, metadata_directory=None):
                 if name != 'interval_ms' or number > 0:
                     commands[kind.lower() + '.' + name].append(number)
         for line in text.splitlines():
+            if line.startswith('D4R_COMMAND_HOOK_SAMPLE '):
+                fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                if all(name in fields for name in ('thread', 'period_ms', 'calls', 'samples', 'marked',
+                                                   'access_sum_ms', 'capture_sum_ms', 'driver_sum_ms')):
+                    hook_threads[fields['thread']].append(fields)
             if not line.startswith('D4R_KERNEL_PROFILE '):
                 continue
             fields = dict(re.findall(r'(\w+)=("[^"]+"|\S+)', line))
             kernels[(fields['kernel'].strip('"'), fields['backend'], fields['phase'])].append(fields)
     result = dict(cpuStages={name: stats(values) for name, values in stages.items()},
                   commandStages={name: stats(values) for name, values in commands.items()},
+                  commandHookSamples=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
+                      'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
+                      'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
                       'HIP-event profiling synchronizes every sampled launch and changes scheduling.',
                       'Occupancy is an API prediction, not a measured hardware counter.',
                       'Bandwidth and WMMA utilization require additional supported hardware tooling.'])
+    for thread, rows in hook_threads.items():
+        sums = {name: sum(float(row[name]) for row in rows) for name in
+                ('period_ms', 'calls', 'samples', 'marked', 'access_sum_ms', 'capture_sum_ms', 'driver_sum_ms')}
+        if not sums['samples'] or not sums['period_ms']:
+            continue
+        scale = sums['calls'] / sums['samples']
+        estimate = scale * (sums['access_sum_ms'] + sums['capture_sum_ms'])
+        result['commandHookSamples'].append(dict(thread=int(thread), periods=len(rows), **sums,
+            accessMeanUs=1000 * sums['access_sum_ms'] / sums['samples'],
+            captureMeanUsPerSample=1000 * sums['capture_sum_ms'] / sums['samples'],
+            estimatedAccessCaptureMs=estimate, estimatedAccessCaptureMsPerSecond=1000 * estimate / sums['period_ms']))
     for (name, backend, phase), rows in kernels.items():
         item = dict(kernel=name, backend=backend, phase=phase,
                     gpuMs=stats([float(row['gpu_ms']) for row in rows]),
@@ -93,6 +113,9 @@ def main():
         print(f"CPU {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for name, row in result['commandStages'].items():
         print(f"COMMAND {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for row in result['commandHookSamples']:
+        print(f"HOOK thread={row['thread']} samples={int(row['samples'])} access={row['accessMeanUs']:.3f} us "
+              f"capture={row['captureMeanUsPerSample']:.3f} us estimated_cpu={row['estimatedAccessCaptureMsPerSecond']:.3f} ms/s")
     for row in result['kernels']:
         times = row['gpuMs']
         print(f"GPU {row['kernel']} {row['backend']} {row['phase']}: n={times['samples']} mean={times['mean']:.6f} ms total={times['total']:.3f} ms")

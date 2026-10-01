@@ -11,6 +11,7 @@ param(
     [switch]$ValidateOutput,
     [switch]$ProfileStages,
     [switch]$ProfileKernels,
+    [switch]$ProfileCommandHooks,
     [switch]$VerboseRuntime,
     [switch]$CaptureExceptions,
     [string[]]$GameArguments = @('-dx12'),
@@ -176,6 +177,7 @@ $settings = @{
     D4R_VALIDATE_OUTPUT=$(if ($ValidateOutput) { '1' } else { $null });
     D4R_PROFILE_STAGES=$(if ($ProfileStages) { '1' } else { $null });
     D4R_ZLUDA_PROFILE=$(if ($ProfileKernels) { '1' } else { $null });
+    D4R_PROFILE_COMMAND_HOOKS=$(if ($ProfileCommandHooks) { '1' } else { $null });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
@@ -258,7 +260,7 @@ try {
         outputGpuChecks=$checks.Count; nonfiniteOutputs=$nonfinite; kernels=$kernels;
         previousFrameOutputs=@($frames | Where-Object { $_.Groups[2].Value -ne '0' }).Count;
         cpuImageCopyFrames=@($frames | Where-Object { $_.Groups[1].Value -ne '0' }).Count;
-        failures=([regex]::Matches($stderr, 'D4R_WINDOWS_FAILURE|D4R_COMMAND_FAILURE')).Count} |
+        failures=([regex]::Matches($stderr, 'D4R_[A-Z0-9_]*FAILURE\b')).Count} |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath ($OutputDirectory + '.zip') -Force
     Write-Host "Game diagnostic bundle: $OutputDirectory.zip"
