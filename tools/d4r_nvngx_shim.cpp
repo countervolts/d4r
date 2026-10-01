@@ -529,6 +529,8 @@ static void load_portable_config()
 
     // Native kernels: d4r\kernels, each used only when DLSS's PTX for it matches (see the bridge).
     const std::string native = ascii_lower(ini_value(ini, "kernels", "NativeKernels"));
+    // The bridge selects accuracy variants and enforces their compiler/sync policy before cuInit.
+    portable_set_unix("D4R_PREFER_ACCURACY", ini_flag(ini, "kernels", "PreferAccuracy", 0) ? "1" : "0");
     const bool nativeOn = native.empty() || native == "on" || native == "true" || native == "1" || native == "fast";
     if (!nativeOn && native != "off" && native != "false" && native != "0")
         g_portable.notes.push_back("d4r.ini: [Kernels] NativeKernels must be on or off, not '" + native + "'");

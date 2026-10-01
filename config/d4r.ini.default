@@ -36,9 +36,15 @@ Model = K
 FrameAge = 0
 
 [Kernels]
+; Prefer NVIDIA's original arithmetic over speed for every native kernel and the translated fallback.
+; Restores intermediate FP8 quantization, per-MMA f16 rounding and original denormal handling; keeps
+; NGX's synchronizations. Selects accuracy variants in NativeKernelDir*/accuracy (or a marked accuracy
+; directory directly). Missing accuracy kernels use translated PTX, never the fast set. Slower; this
+; aims for fidelity, but RTX image parity is not proven. (D4R_PREFER_ACCURACY)
+PreferAccuracy = false
 ; Native RDNA3 / RDNA4 kernels for the DLSS 4 and 4.5 network layers (replace ZLUDA's translated code).
-;   fast  = native kernels with relaxed numerics (visually identical to exact, ~15% faster)
-;   exact = native kernels that reproduce NVIDIA's FP8/f16 rounding bit for bit
+;   fast  = native kernels with relaxed numerics (unless PreferAccuracy is true)
+;   exact = a separately built directory with conservative FP8/f16 rounding; not an RTX parity guarantee
 ;   off   = ZLUDA-translated kernels only
 ; fast/exact need the code objects built by the native-kernel tools ([Paths] NativeKernelDir*).
 NativeKernels = off

@@ -33,6 +33,8 @@ On the same GPU DLSS starts at a disadvantage: its networks were designed for NV
 
 - In some games using some models native upscaling can show visible artifacting.
 
+For users who prioritize fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` and restart the game. It defaults to `false`. This selects accuracy variants of every native kernel and restores conservative translation settings. It aims to match NVIDIA's arithmetic; 1:1 image quality against RTX DLSS is not yet proven. See [native kernel numerics](docs/native-kernels.md#numerics).
+
 ## GPU support
 
 d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and 4.5 network kernels for the targets below and selects the matching set at runtime. Only the RX 7700 XT has been tested by this project on a real GPU; an external video reports DLSS 4.5 running through d4r 0.1.2 on an RX 7900 XTX. RDNA4 runtime and performance remain unverified on hardware.
@@ -47,7 +49,7 @@ d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and
 | RX 9060 XT / 9060 | gfx1200 | native FP8 (`NativeFp8`, default on) | compile only |
 | RDNA2 and older | | | unsupported |
 
-Native network kernels are built for all listed gfx11/gfx12 targets. Texture kernels are compiled for each target by `d4r_emit` when supplied to the package script; RDNA4 also has a `-fp8` variant. The bridge selects the KFD GPU with the most SIMDs, avoiding an integrated GPU when a discrete GPU is present; `D4R_GPU_ARCH` overrides that choice. Missing native kernels fall back to ZLUDA. Without the native network kernels, NVIDIA's translated DLSS 4 layers produce invalid values and DLSS discards the network's output, so K loses the transformer's image quality. Preset E does not use the native network kernels.
+Native network kernels are built for all listed gfx11/gfx12 targets. Texture kernels are compiled for each target by `d4r_emit` when supplied to the package script; RDNA4 also has a `-fp8` variant. The bridge selects the KFD GPU with the most SIMDs, avoiding an integrated GPU when a discrete GPU is present; `D4R_GPU_ARCH` overrides that choice. Missing native kernels fall back to ZLUDA and can be much slower. Earlier translated K layers produced invalid values; preserving FP16 denormal handling fixes that failure in recorded captures, but RTX image-quality parity remains unverified. Preset E does not use the native network kernels.
 
 ## How it works
 

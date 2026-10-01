@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "d4r_native_selection.h"
 
 typedef int CUresult;
 typedef int CUdevice;
@@ -443,39 +444,28 @@ static void prepare_native_kernels(const char* cache_home)
     /* RDNA4 with native FP8 WMMA (D4R_ZLUDA_WMMA_FP8_NATIVE=1, d4r.ini NativeFp8): the <target>-fp8 variant,
        whose kernels match ZLUDA's FP8 lowering; no other GPU has such a directory */
     const char* fp8 = getenv("D4R_ZLUDA_WMMA_FP8_NATIVE");
-    if (fp8 != NULL && strcmp(fp8, "1") == 0 && strncmp(architecture, "gfx12", 5) == 0)
+    const char* prefer = getenv("D4R_PREFER_ACCURACY");
+    const int accuracy = prefer != NULL && strcmp(prefer, "1") == 0;
+    const int kind = d4r_select_native_source(configured, architecture, accuracy,
+        fp8 != NULL && strcmp(fp8, "1") == 0, source, sizeof(source));
+    if (kind == 0)
     {
-        snprintf(source, sizeof(source), "%s/%s-fp8", configured, architecture);
-        snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-        manifest = fopen(path, "r");
+        tracef("native kernels: no %sset for this GPU (%s) in %s; ZLUDA compiles every DLSS kernel",
+               accuracy ? "accuracy " : "", architecture[0] != '\0' ? architecture : "unknown target", configured);
+        unsetenv("D4R_ZLUDA_NATIVE_DIR");
+        return;
     }
+    if (kind == 2)
+    {
+        setenv("D4R_ZLUDA_NATIVE_DIR", source, 1);
+        tracef("native kernels: %sdeveloper set in %s", accuracy ? "accuracy " : "", source);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
+    manifest = fopen(path, "r");
     if (manifest == NULL)
     {
-        snprintf(source, sizeof(source), "%s/%s", configured, architecture);
-        snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-        manifest = architecture[0] != '\0' ? fopen(path, "r") : NULL;
-    }
-    if (manifest == NULL)
-    {
-        snprintf(source, sizeof(source), "%s", configured);
-        snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-        manifest = fopen(path, "r");
-    }
-    if (manifest == NULL)
-    {
-        /* a developer directory is used as it is; a release one without this GPU's target is not */
-        DIR* directory = opendir(configured);
-        int targets = 0;
-        for (struct dirent* entry; directory != NULL && (entry = readdir(directory)) != NULL;)
-            targets += strncmp(entry->d_name, "gfx", 3) == 0;
-        if (directory != NULL)
-            closedir(directory);
-        if (targets != 0)
-        {
-            tracef("native kernels: none for this GPU (%s) in %s; ZLUDA compiles every DLSS kernel",
-                   architecture[0] != '\0' ? architecture : "unknown target", configured);
-            unsetenv("D4R_ZLUDA_NATIVE_DIR");
-        }
+        unsetenv("D4R_ZLUDA_NATIVE_DIR");
         return;
     }
     char line[512];
@@ -767,6 +757,13 @@ int WINAPI d4rOutputKernelNative(void)
 
 static void load_zluda(void)
 {
+    /* A policy switch, applied before ZLUDA loads or reads its compilation/cache settings. This
+       also covers native-off and missing/version-mismatched native kernels. */
+    const int accuracy = d4r_apply_accuracy_policy();
+    if (accuracy)
+    {
+        tracef("PreferAccuracy on: original denormal handling, per-MMA rounding, wave32 and NGX synchronizations");
+    }
     /* D4R_ZLUDA_LIBCUDA may name ZLUDA's libcuda.so directly, for processes
        (such as Proton games) whose library search path is not ours. */
     const char* configured = getenv("D4R_ZLUDA_LIBCUDA");
@@ -794,6 +791,28 @@ static void load_zluda(void)
     if (cache != NULL && cache[0] != '\0')
     {
         expand_home(cache, cache_home, sizeof(cache_home));
+        make_directories(cache_home);
+    }
+    if (accuracy)
+    {
+        /* FAST_MATH is not fingerprinted by older ZLUDA runtimes. Use a separate cache even
+           when a previous run explicitly enabled that experimental compiler switch. */
+        char base[1024];
+        const char* xdg = getenv("XDG_CACHE_HOME");
+        if (cache_home[0] != '\0')
+            snprintf(base, sizeof(base), "%s", cache_home);
+        else if (xdg != NULL && xdg[0] != '\0')
+            snprintf(base, sizeof(base), "%s", xdg);
+        else
+        {
+            const char* home = getenv("HOME");
+            snprintf(base, sizeof(base), "%s/.cache", home != NULL ? home : "/tmp");
+        }
+        if (snprintf(cache_home, sizeof(cache_home), "%s/d4r-accuracy", base) >= (int)sizeof(cache_home))
+        {
+            set_load_error("accuracy cache path is too long");
+            return;
+        }
         make_directories(cache_home);
     }
     prepare_native_kernels(cache_home[0] != '\0' ? cache_home : NULL);

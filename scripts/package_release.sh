@@ -20,12 +20,17 @@
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
 #   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
 #   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
+#   D4R_BUILD_INFO    optional build-toolchain/provenance text to include in d4r/source/
+#   D4R_PACKAGE_KERNEL_JOBS  independent target builds at once (default 1)
 # The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
+#                    Accuracy texture sets go in accuracy/<target>/, built with D4R_PREFER_ACCURACY=1.
+#   D4R_ZLUDA_EMIT  d4r_emit from the patched ZLUDA build; required in full builds when an accuracy
+#                    texture set is not supplied in D4R_BUNDLE_TEX/accuracy/<target>.
 # D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
 set -euo pipefail
 
@@ -121,12 +126,13 @@ for arch in $ARCHS; do
   folders+=("$arch")
   [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
 done
-for folder in "${folders[@]}"; do
+build_target() {
+  local folder="$1" arch fp8 tex_dir accurate accurate_tex f
   arch="${folder%-fp8}"
   fp8=0
   [[ "$folder" == *-fp8 ]] && fp8=1
-  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
-  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
+  D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
+  D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
   rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt  # empty LTO notes from clang's -save-temps
   if [[ "$VARIANT" == full ]]; then
     tex_dir=""
@@ -143,7 +149,49 @@ for folder in "${folders[@]}"; do
     fi
   fi
   python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
+
+  # Every release target also gets conservative network and texture variants. Do not copy fast
+  # texture objects into this set: their compiler policy is fixed inside the binary.
+  accurate="$STAGE/d4r/kernels/accuracy/$folder"
+  D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$accurate" >/dev/null
+  D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$accurate" >/dev/null
+  if [[ "$VARIANT" == full ]]; then
+    accurate_tex="$D4R_BUNDLE_TEX/accuracy/$folder"
+    if [[ -f "$accurate_tex/d4r-accuracy.txt" && "$(cat "$accurate_tex/d4r-accuracy.txt")" == 1 ]]; then
+      for f in "$accurate_tex"/*.hsaco; do
+        [[ -f "$f" ]] || continue
+        [[ -e "$accurate/$(basename "$f")" ]] || cp "$f" "$accurate/"
+      done
+    else
+      : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply D4R_BUNDLE_TEX/accuracy/$folder}"
+      D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
+        D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" tex "$accurate" >/dev/null
+    fi
+  fi
+  if [[ "$VARIANT" == full ]]; then
+    for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
+      [[ -f "$accurate/$(basename "$f")" ]] || {
+        echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
+      }
+    done
+  fi
+  rm -f "$accurate"/*.resolution.txt
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}"
+}
+kernel_jobs="${D4R_PACKAGE_KERNEL_JOBS:-1}"
+[[ "$kernel_jobs" =~ ^[1-9][0-9]*$ ]] || { echo "D4R_PACKAGE_KERNEL_JOBS must be positive" >&2; exit 2; }
+pending=()
+kernel_failed=0
+for folder in "${folders[@]}"; do
+  build_target "$folder" &
+  pending+=("$!")
+  if (( ${#pending[@]} >= kernel_jobs )); then
+    wait "${pending[0]}" || kernel_failed=1
+    pending=("${pending[@]:1}")
+  fi
 done
+for pid in "${pending[@]}"; do wait "$pid" || kernel_failed=1; done
+[[ "$kernel_failed" == 0 ]] || { echo "native target build failed; no release ZIP created" >&2; exit 1; }
 
 # licenses and sources
 ZLUDA_SRC="${D4R_ZLUDA_SRC:-$(dirname "$ZLUDA")/d4r-zluda-upstream}"
@@ -168,6 +216,9 @@ file_version() { [[ -f "$1" ]] && strings -el "$1" | grep -A1 '^FileVersion$' | 
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@ZLUDA_COMMIT@/$ZLUDA_COMMIT/g" -e "s/@VKD3D_COMMIT@/$VKD3D_COMMIT/g" \
   -e "s/@DLSS_VERSION@/$(file_version "$STAGE/d4r/nvngx_dlss.dll")/g" -e "s/@NGX_VERSION@/$(file_version "$STAGE/d4r/ngx/_nvngx.dll")/g" \
   "$ROOT/packaging/SOURCES.txt" | variant > "$STAGE/d4r/source/SOURCES.txt"
+if [[ -n "${D4R_BUILD_INFO:-}" ]]; then
+  cp "$D4R_BUILD_INFO" "$STAGE/d4r/source/BUILD_INFO.txt"
+fi
 sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
 
 # One timestamp for every file (SOURCE_DATE_EPOCH, default the last commit): ZLUDA's kernel cache is keyed on

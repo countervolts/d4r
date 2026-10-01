@@ -39,7 +39,7 @@ Without the vkd3d-proton patch the shim shows the newest finished result instead
 
 - **CUDA NGX instead of D3D12 NGX.** NVIDIA's D3D12 path needs NVIDIA's driver. The CUDA path only needs a CUDA driver API, which ZLUDA provides.
 - **The Ada identity.** NGX picks network weights by GPU architecture. The weights have to match the PTX that ZLUDA compiles, which is sm_89 for DLSS 310.
-- **Native kernels.** ZLUDA translates NVIDIA's warp-level matrix code faithfully but slowly (register pressure, lane shuffles, per-instruction mode switches). In the DLSS 4 transformer, ZLUDA's translation also produced non-finite outputs, which the final kernel masks, so the network had no effect. The native layers fix both.
+- **Native kernels.** Translating NVIDIA's warp-level matrix code is slow (register pressure, lane shuffles, per-instruction mode switches). Earlier translated K layers also produced non-finite outputs that the final kernel masked. Native layers avoid that path; the compiler now preserves FP16 denormal requirements too, which fixes the translated failure in recorded captures. Numerical and image-quality parity with RTX hardware remains unverified.
 - **The GPU-side hand-offs.** With DLSS itself fast, most of the remaining gap to FSR 4 was the GPU idling while CPU threads waited on each other. Moving the waits onto the GPU raised GPU utilisation from about 95% to 99%.
 
 ## Configuration
@@ -51,6 +51,7 @@ Without the vkd3d-proton patch the shim shows the newest finished result instead
 | `[DLSS] Model` | `D4R_DLSS_PRESET` | DLSS network: `E` (CNN), `K` (DLSS 4), `M` (DLSS 4.5) |
 | `[Latency] FrameAge` | `D4R_SHIM_SPLIT_FRAME`, `D4R_SHIM_MAX_IN_FLIGHT` | 0 = same-frame results; higher values pipeline frames |
 | `[Kernels] NativeKernels` | `D4R_ZLUDA_NATIVE_DIR` | native kernel directory (`fast` / `exact` / `off`) |
+| `[Kernels] PreferAccuracy` | `D4R_PREFER_ACCURACY` | default off; accuracy variants for every native family and conservative translation/synchronization settings |
 | `[Interop] VramInterop` | `D4R_SHIM_VRAM_INTEROP` | keep inputs and output in VRAM |
 | `[Interop] GpuWait` | `D4R_SHIM_GPU_WAIT` | GPU-side wait for the game's inputs |
 | `[Interop] LinearInputs` | `D4R_SHIM_LINEAR_INPUTS` | NGX samples the input buffers in place |

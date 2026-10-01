@@ -64,9 +64,15 @@ For ZLUDA-compiled code, compare rocjitsu runs with other rocjitsu runs: the emu
 
 ## Numerics
 
-NVIDIA's tensor-core code rounds its f16 accumulator after every 16-deep step. The native kernels either do the same (bit-exact against the reference models) or keep f32 accumulators through a chain (`PWIN_F32ACC`, `SWIN_F32ACC`). The f32 version is more accurate than NVIDIA's own rounding, and its replayed output differs from the exact one by about 66 dB PSNR, which is invisible.
+The conservative kernels round their f16 accumulator after each MMA step (k16 for K, k32 for M). The fast kernels keep f32 accumulators through a chain (`PWIN_F32ACC`, `SWIN_F32ACC`); RDNA3 M also skips intermediate FP8 re-quantization (`SWIN_NO_Q8`). Wider arithmetic changes the network's intermediate values; it does not establish better image quality. Recorded fast-versus-conservative replays were close (about 66 dB PSNR), but that is not an RTX reference comparison or a guarantee for all scenes.
 
 The installed K set uses f32 accumulation for enc0–enc2 and dec0–dec2 and exact rounding for the deep layers. The M set uses the fast numerics throughout.
+
+**`[Kernels] PreferAccuracy = true`** (default `false`, environment `D4R_PREFER_ACCURACY=1`) selects a separate accuracy set for all K/M network layers and all texture/output variants, on every supported target, including gfx12 FP8. K disables `PWIN_F32ACC`; M restores FP8 quantization and rounds each k32 accumulator to f16. Texture builds use wave32 and retain the original denormal requirements; the existing exact round-half-away rewrite is retained. Native texture heads/tails already round their accumulators per k32 step. The bridge also disables `IgnoreDenormals`, translated f32 accumulator shadows, wave64 translation and NGX synchronization elision before ZLUDA loads, including when native kernels are off or fail their PTX hash check. Other interop and latency settings remain independent.
+
+The bridge selects `kernels/accuracy/<target>` (or `<target>-fp8`). Accuracy directories carry a `d4r-accuracy.txt` marker written only after a successful build. A marked flat developer directory also works. Missing accuracy variants fall back to translated PTX and are logged; the bridge never substitutes fast native binaries. Restart the game when changing the setting. The mode uses a separate `d4r-accuracy` JIT cache under the configured cache directory so older runtimes cannot reuse experimental fast-math results. The first accuracy run may compile new kernels.
+
+This mode aims to preserve NVIDIA's arithmetic, not to promise bit-identical RTX output: matrix accumulation order differs across hardware, and the shim still canonicalizes input formats and does not forward the optional transparency/current-color-bias masks. RTX parity requires identical captured inputs, library version, preset and temporal sequence on NVIDIA hardware.
 
 ## Building
 
@@ -75,9 +81,12 @@ kernels/build.sh k          # DLSS 4 layers   (ROCm clang only)
 kernels/build.sh m          # DLSS 4.5 layers
 kernels/build.sh tex        # texture kernels (needs D4R_DLSS_DLL and D4R_ZLUDA_BUILD)
 kernels/build.sh all DIR    # everything into DIR (default kernels/out/native)
+D4R_PREFER_ACCURACY=1 kernels/build.sh all DIR/accuracy  # conservative versions of every family
 ```
 
 `D4R_GPU_ARCH` selects one target for this standalone build (default gfx1101). The release script builds the network layers for gfx1100–gfx1103 and gfx1200–gfx1201 by default and puts each set in its own directory. The network kernels need gfx11 or gfx12 WMMA. Texture-kernel builds use `D4R_ZLUDA_EMIT` to generate code objects for the selected target without that GPU. Set `D4R_NATIVE_FP8=1` on gfx12 for the matching FP8 M and texture variants.
+
+The release includes both fast and accuracy network sets. Full releases also include accuracy texture sets: supply them in `D4R_BUNDLE_TEX/accuracy/<target>` or set `D4R_ZLUDA_EMIT` so packaging builds them. Build accuracy sets into a separate directory; the builder refuses to mark a directory containing unmarked older binaries as accurate.
 
 ## Validating a kernel
 

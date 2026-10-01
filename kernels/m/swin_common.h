@@ -9,6 +9,9 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include "../common/wmma_layout.h"
+#ifdef D4R_ACCURACY
+#define SWIN_EXACT
+#endif
 #if defined(D4R_FP8_WMMA) && D4R_WMMA_LAYOUT != 12 && defined(__AMDGCN__)
 #error "D4R_FP8_WMMA needs the gfx12 WMMA layout"
 #endif

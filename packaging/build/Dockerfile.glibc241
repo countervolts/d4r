@@ -1,0 +1,19 @@
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential clang cmake ninja-build pkg-config libssl-dev python3 python3-numpy \
+    git git-lfs wine64-tools libwine-dev gcc-mingw-w64-x86-64-posix \
+    g++-mingw-w64-x86-64-posix meson libvulkan-dev zip unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm loads the system's AMD DRM library even for the CPU-only loader check.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libdrm-amdgpu1 libdrm2 mingw-w64-tools glslang-tools spirv-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/lib/wine/winegcc /usr/local/bin/winegcc \
+    && ln -s /usr/lib/wine/winebuild /usr/local/bin/winebuild \
+    && ln -s /usr/bin/clang-19 /usr/local/bin/clang-cl \
+    && useradd --uid 1000 --create-home builder
+USER builder
+WORKDIR /work
