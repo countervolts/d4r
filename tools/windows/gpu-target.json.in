@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "architecture": "@D4R_GPU_ARCH@",
+  "wavefrontSize": 32,
+  "validation": "Compilation is not hardware validation; run the GPU diagnostics."
+}

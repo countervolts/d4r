@@ -34,7 +34,7 @@ int main(int argc, char** argv)
         if (dlss_path.filename() != L"nvngx_dlss.dll") throw std::runtime_error("DLSS file must be named nvngx_dlss.dll");
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         SearchDirectory cuda_search(std::filesystem::path(wide(args.cuda_dll)).parent_path());
         CudaApi cuda(args.cuda_dll);
         cuda.check(cuda.cuInit(0), "cuInit");
@@ -124,7 +124,7 @@ int main(int argc, char** argv)
         cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize");
         cuda.check(cuda.cuCtxSetCurrent(nullptr), "cuCtxSetCurrent(NULL)");
         cuda.check(cuda.cuDevicePrimaryCtxRelease_v2(device), "cuDevicePrimaryCtxRelease_v2"); context = nullptr;
-        std::printf("PASS NGX_INIT architecture=gfx1201 sr_available=1 transformer_validation=pending\n");
+        std::printf("PASS NGX_INIT architecture=%s sr_available=1 transformer_validation=pending\n", d4r::diag::HipApi::target_arch());
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL NGX_INIT %s\n", e.what());

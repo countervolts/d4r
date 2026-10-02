@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<HipApi> hip;
         hipDeviceProp_t props{};
         const bool no_hip = std::getenv("D4R_COMMAND_PROBE_NO_HIP") != nullptr;
-        if (!no_hip) { hip = std::make_unique<HipApi>(args.hip_root); hip->select_gfx1201(args.device, props); }
+        if (!no_hip) { hip = std::make_unique<HipApi>(args.hip_root); hip->select_architecture(args.device, props); }
         ComPtr<IDXGIFactory4> factory; dx(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "Probe DXGI");
         ComPtr<IDXGIAdapter1> adapter;
         for (UINT i = 0; ; ++i) {
@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
         }
         const bool warp = std::getenv("D4R_COMMAND_PROBE_WARP") != nullptr;
         std::printf("PASS D3D12_COMMAND_BACKEND adapter=%s architecture=%s backend=%u iterations=%u batch_order=1 root_state=1 deep_copy=1 indirect=%u indirect_reset=%u reset_reuse=%u live_recordings=0 frame_age=0\n",
-            warp ? "WARP" : "AMD", warp ? "software" : no_hip ? "not_queried" : "gfx1201", !no_hooks,
+            warp ? "WARP" : "AMD", warp ? "software" : no_hip ? "not_queried" : HipApi::target_arch(), !no_hooks,
             args.iterations, indirect_enabled, root_indirect, no_hooks ? 0 : 2 * args.iterations);
         return 0;
     } catch (const std::exception& failure) {

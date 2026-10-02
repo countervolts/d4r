@@ -27,11 +27,11 @@ int __cdecl initialize()
             const char* root = std::getenv("HIP_PATH");
             if (!root) return -5;
             auto runtime = std::make_unique<d4r::diag::HipApi>(root);
-            device_ordinal = runtime->select_gfx1201(-1, properties);
+            device_ordinal = runtime->select_architecture(-1, properties);
             hip = std::move(runtime);
             runtime_ready.store(true, std::memory_order_release);
         }
-        std::printf("NVAPI_COMPAT initialize physical=gfx1201 CUDA_model_profile=AD100\n");
+        std::printf("NVAPI_COMPAT initialize physical=%s CUDA_model_profile=AD100\n", properties.gcnArchName);
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "NVAPI_COMPAT init failed: %s\n", e.what()); return -1; }
 }
@@ -48,7 +48,7 @@ int __cdecl architecture(void* handle, ArchInfo* info)
     if (!valid(handle) || !info) return -5;
     if (info->version != (sizeof(ArchInfo) | 1u << 16) && info->version != (sizeof(ArchInfo) | 2u << 16)) return -9;
     info->architecture = 0x190; info->implementation = 2; info->revision = 0x11;
-    std::printf("NVAPI_COMPAT GetArchInfo profile=AD102 physical=gfx1201\n");
+    std::printf("NVAPI_COMPAT GetArchInfo profile=AD102 physical=%s\n", properties.gcnArchName);
     return 0;
 }
 int __cdecl adapter_id(void* handle, void* luid)

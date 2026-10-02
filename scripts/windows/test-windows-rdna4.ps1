@@ -4,6 +4,7 @@ param(
     [ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable',
     [string]$ZludaRoot,
     [string]$PackageRoot,
+    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch,
     [string]$OutputDirectory,
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,
@@ -26,6 +27,7 @@ param(
     [int]$TimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($RuntimeProfile -eq 'therock') {
     # Works both from scripts/windows and the installed dist/<profile> directory.
@@ -40,6 +42,7 @@ if (!$PackageRoot) {
     else { $PackageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../dist/windows-rdna4-diagnostics')) }
 }
 $PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
+$GpuArch=Get-D4RGpuTarget $PackageRoot $GpuArch
 if (!$HipRoot) { $HipRoot = 'C:\Program Files\AMD\ROCm\7.2' }
 $HipRoot = [IO.Path]::GetFullPath($HipRoot)
 if (!$ZludaRoot) {
@@ -68,7 +71,7 @@ foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8
 }
 $exitStatus = 1
 $ngxRuntimeDirectory = $null
-$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
+$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); profile=$RuntimeProfile; architecture=$GpuArch; hipRoot=$HipRoot; zludaRoot=$ZludaRoot; tests=@()}
 function Quote-Argument([string]$Value) {
     # All generated paths are absolute file/directory paths, with no trailing backslash.
     if ($Value.Contains('"')) { throw 'Double quotes are not allowed in arguments' }
@@ -162,10 +165,10 @@ try {
     $comgr = Join-Path $HipRoot 'bin/amd_comgr_3.dll'
     if (!(Test-Path -LiteralPath $comgr)) { $comgr = Join-Path $HipRoot 'bin/amd_comgr.dll' }
     $files = @((Join-Path $HipRoot 'bin/amdhip64_7.dll'), $comgr,
-        (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco'),
-        (Join-Path $PackageRoot 'bin/wmma_gfx1201.hsaco'),
-        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc1_layer_gfx1201.hsaco'),
-        (Join-Path $PackageRoot 'experimental/k/dltss_pwin_enc2_layer_gfx1201.hsaco'))
+        (Join-Path $ZludaRoot 'nvcuda.dll'), (Join-Path $PackageRoot "bin/probe_${GpuArch}.hsaco"),
+        (Join-Path $PackageRoot "bin/wmma_${GpuArch}.hsaco"),
+        (Join-Path $PackageRoot "experimental/k/dltss_pwin_enc1_layer_${GpuArch}.hsaco"),
+        (Join-Path $PackageRoot "experimental/k/dltss_pwin_enc2_layer_${GpuArch}.hsaco"))
     if ($OptiScalerDll) {
         if ($NgxMode -ne 'd3d12' -or !$CommandListBackend) { throw '-OptiScalerDll requires D3D12 and -CommandListBackend' }
         if (![IO.Path]::IsPathRooted($OptiScalerDll)) { throw '-OptiScalerDll must be absolute' }
@@ -192,12 +195,12 @@ try {
     $bin = Join-Path $PackageRoot 'bin'
     $hipOk = $true
     if (!$NgxOnly) { $hipOk = Invoke-Probe 'hip' (Join-Path $bin 'd4r_hip_gfx1201_probe.exe') @(
-        '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', "$Iterations")
+        '--hip-root', $HipRoot, '--module', (Join-Path $bin "probe_${GpuArch}.hsaco"), '--iterations', "$Iterations")
     }
     if ($hipOk) {
         if (!$NgxOnly) {
         $wmmaOk = Invoke-Probe 'gfx12-wmma' (Join-Path $bin 'd4r_gfx12_wmma_probe.exe') @(
-            '--hip-root', $HipRoot, '--module', (Join-Path $bin 'wmma_gfx1201.hsaco'), '--iterations', "$Iterations")
+            '--hip-root', $HipRoot, '--module', (Join-Path $bin "wmma_${GpuArch}.hsaco"), '--iterations', "$Iterations")
         if (!$wmmaOk) { throw 'gfx12 WMMA layout validation failed; refusing to mark K/M readiness.' }
         $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
         if (!$pythonCommand) { throw 'Python 3.11+ with NumPy 2.4.6 is needed for K reference checks; run setup-windows-tools.ps1.' }
@@ -205,7 +208,7 @@ try {
             $kFixture = Join-Path $OutputDirectory "k-$layer-fixture"
             $kModuleOk = Invoke-Probe "k-$layer-gpu" (Join-Path $bin 'd4r_k_module_probe.exe') @(
                 '--hip-root', $HipRoot,
-                '--module', (Join-Path $PackageRoot "experimental/k/dltss_pwin_${layer}_layer_gfx1201.hsaco"),
+                '--module', (Join-Path $PackageRoot "experimental/k/dltss_pwin_${layer}_layer_${GpuArch}.hsaco"),
                 '--kernel-name', $layer, '--fixture-dir', $kFixture, '--iterations', "$Iterations")
             if (!$kModuleOk) { throw "K $layer GPU execution failed; see the k-$layer-gpu logs." }
             $kReferenceOk = Invoke-Probe "k-$layer-reference" $pythonCommand.Source @(
@@ -247,19 +250,19 @@ try {
                 '--hip-root', $HipRoot, '--module', (Join-Path $bin 'd4r_nvngx.dll'), '--interop-mode', 'indirect', '--iterations', "$Iterations")
             if (!$commandOk) { throw 'D3D12 command-list order/state/lifetime validation failed.' }
             $pixelsOk = Invoke-Probe 'd3d12-gpu-pixel-formats' (Join-Path $bin 'd4r_d3d12_pixel_probe.exe') @(
-                '--hip-root', $HipRoot, '--module', (Join-Path $bin 'pixel_convert_gfx1201.hsaco'), '--iterations', '2')
+                '--hip-root', $HipRoot, '--module', (Join-Path $bin "pixel_convert_${GpuArch}.hsaco"), '--iterations', '2')
             if (!$pixelsOk) { throw 'D3D12 typed SRV/UAV format conversion validation failed.' }
             $mapOk = Invoke-Probe 'interop-map-lifetime' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
                 '--hip-root', $HipRoot, '--interop-mode', 'map', '--iterations', '64')
             $interopOk = Invoke-Probe 'interop-roundtrip' (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
-                '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', "$Iterations")
+                '--hip-root', $HipRoot, '--module', (Join-Path $bin "probe_${GpuArch}.hsaco"), '--iterations', "$Iterations")
             if (!$mapOk -or !$interopOk) {
                 foreach ($mode in @('resource', 'import')) {
                     Invoke-Probe "interop-$mode-lifetime" (Join-Path $bin 'd4r_d3d12_hip_interop_probe.exe') @(
                         '--hip-root', $HipRoot, '--interop-mode', $mode, '--iterations', '32') | Out-Null
                 }
                 Invoke-Probe 'hip-stream-lifetime' (Join-Path $bin 'd4r_hip_stream_lifecycle_probe.exe') @(
-                    '--hip-root', $HipRoot, '--module', (Join-Path $bin 'probe_gfx1201.hsaco'), '--iterations', '32') | Out-Null
+                    '--hip-root', $HipRoot, '--module', (Join-Path $bin "probe_${GpuArch}.hsaco"), '--iterations', '32') | Out-Null
             }
             }
             if ($mapOk -and $interopOk) { $exitStatus = 0 }
@@ -288,12 +291,12 @@ try {
                     # alongside the private user-supplied DLLs for this test.
                     $localShim = Join-Path $ngxRuntimeDirectory 'd4r_nvngx.dll'
                     Copy-Item -LiteralPath (Join-Path $bin 'd4r_nvngx.dll') -Destination $localShim
-                    Copy-Item -LiteralPath (Join-Path $bin 'pixel_convert_gfx1201.hsaco') -Destination $ngxRuntimeDirectory
+                    Copy-Item -LiteralPath (Join-Path $bin "pixel_convert_${GpuArch}.hsaco") -Destination $ngxRuntimeDirectory
                     if ($OptiScalerDll) {
                         $bridgeDirectory = Join-Path $ngxRuntimeDirectory 'd4r'
                         New-Item -ItemType Directory -Path $bridgeDirectory | Out-Null
                         Copy-Item -LiteralPath $localShim -Destination (Join-Path $bridgeDirectory '_nvngx.dll')
-                        Copy-Item -LiteralPath (Join-Path $bin 'pixel_convert_gfx1201.hsaco') -Destination $bridgeDirectory
+                        Copy-Item -LiteralPath (Join-Path $bin "pixel_convert_${GpuArch}.hsaco") -Destination $bridgeDirectory
                         $localShim = Join-Path $ngxRuntimeDirectory 'OptiScaler.dll'
                         Copy-Item -LiteralPath $OptiScalerDll -Destination $localShim
                         $ini = @"

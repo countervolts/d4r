@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--module, --fixture-dir and --output-dir are required");
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         const std::filesystem::path input(wide(args.fixture_dir)), output(wide(args.output_dir));
         auto parameters = read_file(input / L"args.bin");
         if (parameters.empty() || parameters.size() > 4096) throw std::runtime_error("Invalid replay parameter size");
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
             std::memcpy(parameters.data() + offset, &pointer, 8);
         }
         hipModule_t module = nullptr;
-        hip.check(hip.hipModuleLoad(&module, args.module.c_str()), "hipModuleLoad(replay gfx1201)");
+        hip.check(hip.hipModuleLoad(&module, args.module.c_str()), "hipModuleLoad(replay)");
         struct Cleanup { HipApi& hip; hipModule_t module; ~Cleanup() { (void)hip.hipModuleUnload(module); } } cleanup{hip, module};
         if (const char* debugBlock = std::getenv("D4R_SWIN_DEBUG_BLOCK")) {
             int coordinates[2]{};
@@ -240,7 +240,7 @@ int main(int argc, char** argv) {
             file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
             if (!file) throw std::runtime_error("Cannot save replay allocation");
         }
-        std::printf("PASS NATIVE_REPLAY architecture=gfx1201 kernel=%s iterations=%u benchmark_pairs=%u numerical_reference=pending\n",
+        std::printf("PASS NATIVE_REPLAY architecture=%s kernel=%s iterations=%u benchmark_pairs=%u numerical_reference=pending\n", d4r::diag::HipApi::target_arch(),
             kernel.c_str(), args.benchmark_module.empty() ? args.iterations : 1, args.benchmark_module.empty() ? 0 : args.iterations);
         return 0;
     } catch (const std::exception& error) {

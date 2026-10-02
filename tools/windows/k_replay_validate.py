@@ -139,7 +139,7 @@ def validate(layer, directory, output, window_count=1, real_capture=False):
     if maximum > absolute_limit or psnr < 60:
         worst = int(difference.argmax())
         raise RuntimeError(f'K mismatch at {worst}: reference={expected[worst]}, gpu={actual[worst]}')
-    print(f'PASS K_REPLAY_REFERENCE kernel={layer} architecture=gfx1201 nan_inf=0')
+    print(f'PASS K_REPLAY_REFERENCE kernel={layer} reference_layout=gfx12 nan_inf=0')
 
 
 if __name__ == '__main__':

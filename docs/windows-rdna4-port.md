@@ -1,6 +1,7 @@
 # Windows / RDNA4 port
 
-Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
+Branch: `windows-rdna4`. Native Windows build targets: **gfx1200 / gfx1201**.
+Validated physical hardware: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
 Upstream integration: [PR #11](https://github.com/countervolts/d4r/pull/11)
 is merged into `countervolts/d4r:windows` at `c522101`.
@@ -16,6 +17,16 @@ validation coverage are recorded below. Performance and game coverage have
 explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
+
+2026-10-02 target coverage: gfx1200 and gfx1201 now have separate host/device
+builds and guarded packages. Both compile; gfx1201 passes 20 CTest gates on
+RX 9070 XT, and gfx1200 passes four software-only gates. No physical gfx1200
+test is available. K's new host build passes twelve finite 4K burst/recreation
+frames with all six async RGB images exact. M's four new-build 4K RGB images
+exactly match the previous build. The fork audit, adopted MSVC fixes,
+per-target commands, validation limits and first hardware gate are maintained
+in [windows-gpu-support.md](windows-gpu-support.md). RDNA3 runtime/layout changes
+from the reviewed fork are not imported. K performance remains open.
 
 **Current milestone: K performance remains open.** The latest unprofiled 4K
 Silent Hill 2 scene capture records 65.250 FPS. Functional K/M and the
@@ -1496,7 +1507,8 @@ automatically on CUDA failure when `trace/nvcuda.dll` is available. The trace
 DLL forwards to the real DLL through `ZLUDA_CUDA_LIB`; explicit loading no
 longer bypasses the trace by accidentally passing the real DLL to the launcher.
 
-The HIP module compiler uses the selected SDK, fixed `--offload-arch=gfx1201`,
+The HIP module compiler uses the selected SDK, `--offload-arch=${D4R_GPU_ARCH}`
+(gfx1201 by default, optionally gfx1200),
 wave32 and no host/device library dependency. Host code uses the installed HIP
 header ABI and loads that SDK's `amdhip64_7.dll` by absolute path. CUDA loads the
 provided ZLUDA DLL by absolute path, matches the adapter against HIP PCI identity,

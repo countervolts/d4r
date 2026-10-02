@@ -5,12 +5,13 @@ param(
     [string]$HipRoot = 'C:\Program Files\AMD\ROCm\7.2',
     [string]$ZludaRoot,
     [ValidateSet('cu','wgp')][string]$ShaderMode='cu',
+    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch='gfx1201',
     [string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
-if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo 'build/private-textures-gfx1201' }
+if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/private-textures-$GpuArch" }
 & python (Join-Path $repo 'tools/windows/build_native_texture.py') --dlss-dll $DlssDll --hip-root $HipRoot `
-    --zluda-root $ZludaRoot --kernel $Kernel --output-directory $OutputDirectory --shader-mode $ShaderMode
+    --zluda-root $ZludaRoot --kernel $Kernel --output-directory $OutputDirectory --shader-mode $ShaderMode --gpu-arch $GpuArch
 if ($LASTEXITCODE) { throw "Native texture build failed ($LASTEXITCODE); inspect the output work directory." }

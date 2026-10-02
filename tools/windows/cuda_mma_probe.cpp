@@ -1,5 +1,6 @@
 #include "hip_api.h"
 #include "cuda_api.h"
+#include "binary16.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -60,6 +61,10 @@ static constexpr char source[] = R"PTX(
 }
 )PTX";
 
+#if defined(_MSC_VER)
+using d4r::diag::binary16::half_bits;
+using d4r::diag::binary16::half_value;
+#else
 static uint16_t half_bits(double value) {
     _Float16 half = static_cast<_Float16>(value);
     uint16_t bits;
@@ -71,6 +76,7 @@ static double half_value(uint16_t bits) {
     std::memcpy(&half, &bits, sizeof(bits));
     return static_cast<double>(half);
 }
+#endif
 
 int main(int argc, char** argv) {
     using namespace d4r::diag;
@@ -79,7 +85,7 @@ int main(int argc, char** argv) {
         Args args(argc, argv);
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         CudaApi cuda(args.cuda_dll);
         cuda.check(cuda.cuInit(0), "cuInit");
         CUdevice device = -1;
@@ -155,7 +161,7 @@ int main(int argc, char** argv) {
                 }
         std::printf("MMA_REFERENCE cases=%zu elements=%zu differing=%zu\n", cases, d.size(), mismatch);
         if (mismatch) return 5;
-        std::printf("PASS CUDA_F16_MMA architecture=gfx1201 cases=%zu exact_f16=1\n", cases);
+        std::printf("PASS CUDA_F16_MMA architecture=%s cases=%zu exact_f16=1\n", d4r::diag::HipApi::target_arch(), cases);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL CUDA_F16_MMA %s\n", error.what());

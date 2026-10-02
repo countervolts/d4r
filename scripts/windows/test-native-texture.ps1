@@ -1,27 +1,30 @@
 [CmdletBinding()]
-param([string]$TextureRoot, [string]$ControlTextureRoot, [string]$CommonTextureRoot, [string]$ZludaRoot,
+param([string]$TextureRoot, [string]$ControlTextureRoot, [string]$CommonTextureRoot, [string]$ZludaRoot, [string]$PackageRoot,
     [string]$OutputDirectory, [int]$Iterations=8, [string]$OutputResolution='512x288', [string]$InputResolution,
     [switch]$CandidateFirst,
     [ValidateSet('output','input')][string]$KernelStage='output')
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-if (!$TextureRoot) { $TextureRoot=Join-Path $repo 'build/private-textures-gfx1201' }
+if (!$PackageRoot) { $PackageRoot=Join-Path $repo 'dist/windows-rdna4-command-list' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
+if (!$TextureRoot) { $TextureRoot=Join-Path $repo "build/private-textures-$GpuArch" }
 if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo 'test-results/k-native-texture-reference' }
 if ($OutputResolution -notmatch '^([0-9]+)x([0-9]+)$') { throw 'OutputResolution must be WIDTHxHEIGHT.' }
 $outputWidth=[int]$Matches[1]; $outputHeight=[int]$Matches[2]
 $combined=Join-Path $OutputDirectory 'private-native'
 New-Item -ItemType Directory -Force $combined | Out-Null
-foreach ($directory in @((Join-Path $repo 'build/native-k-gfx1201'),$CommonTextureRoot,$TextureRoot) | Where-Object { $_ }) {
+foreach ($directory in @((Join-Path $repo "build/native-k-$GpuArch"),$CommonTextureRoot,$TextureRoot) | Where-Object { $_ }) {
     Get-ChildItem -LiteralPath $directory -Filter '*.hsaco' | Copy-Item -Destination $combined -Force
 }
 & python (Join-Path $repo 'kernels/tools/kernel_manifest.py') $combined (Join-Path $repo 'nvngx_dlss.dll')
 if ($LASTEXITCODE) { throw 'Combined private manifest failed.' }
-$controlNative=Join-Path $repo 'build/native-k-gfx1201'
+$controlNative=Join-Path $repo "build/native-k-$GpuArch"
 if ($ControlTextureRoot -or $CommonTextureRoot) {
     $controlNative=Join-Path $OutputDirectory 'control-private-native'
     New-Item -ItemType Directory -Force $controlNative | Out-Null
-    foreach ($directory in @((Join-Path $repo 'build/native-k-gfx1201'),$CommonTextureRoot,$ControlTextureRoot) | Where-Object { $_ }) {
+    foreach ($directory in @((Join-Path $repo "build/native-k-$GpuArch"),$CommonTextureRoot,$ControlTextureRoot) | Where-Object { $_ }) {
         Get-ChildItem -LiteralPath $directory -Filter '*.hsaco' | Copy-Item -Destination $controlNative -Force
     }
     & python (Join-Path $repo 'kernels/tools/kernel_manifest.py') $controlNative (Join-Path $repo 'nvngx_dlss.dll')
@@ -37,6 +40,7 @@ $stagedObjects=@{}
 foreach ($stage in @(@{name='control'; root=$controlNative},@{name='candidate'; root=$combined})) {
     $stagedObjects[$stage.name]=@{}
     foreach ($object in Get-ChildItem -LiteralPath $stage.root -Filter '*.hsaco') {
+        Assert-D4RCodeObjectTarget $object.FullName $GpuArch
         $stagedObjects[$stage.name][$object.Name]=(Get-FileHash -LiteralPath $object.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
@@ -52,7 +56,7 @@ try {
             $expectedBackend=if (Test-Path -LiteralPath (Join-Path $env:D4R_ZLUDA_NATIVE_DIR ($kernel + '.hsaco'))) { 'native' } else { 'translated' }
             if ($mode -eq 'candidate' -and $expectedBackend -ne 'native') { throw "Missing candidate object: $kernel" }
             $arguments=@{RuntimeProfile='therock'; ZludaRoot=$ZludaRoot;
-                PackageRoot=(Join-Path $repo 'dist/windows-rdna4-command-list'); NgxCore=(Join-Path $repo '_nvngx.dll');
+                PackageRoot=$PackageRoot; NgxCore=(Join-Path $repo '_nvngx.dll');
                 DlssDll=(Join-Path $repo 'nvngx_dlss.dll'); NgxMode='d3d12'; NgxAbi='project-legacy'; Preset=11;
                 NgxCreateFlags=$flags; NgxOutputResolution=$OutputResolution; NgxOnly=$true; RequireNativeNetwork=$true; CommandListBackend=$true;
                 NgxInputResolution=$InputResolution;
@@ -76,7 +80,7 @@ try {
         & python (Join-Path $repo 'tools/windows/frame_compare.py') --reference $control --actual $candidate --width $outputWidth --height $outputHeight --exact
         if ($LASTEXITCODE) { throw "Texture flags=$flags full-frame RGB mismatch; preserve baseline." }
     }
-    @{passed=$true; architecture='gfx1201'; framesPerVariant=$Iterations; outputResolution=$OutputResolution; createFlags=@(0,11); strictRgb=$true;
+    @{passed=$true; architecture=$GpuArch; framesPerVariant=$Iterations; outputResolution=$OutputResolution; createFlags=@(0,11); strictRgb=$true;
         inputResolution=$InputResolution;
         serializingProfile=$true; candidateFirst=[bool]$CandidateFirst; kernelStage=$KernelStage;
         controlTextureRoot=$ControlTextureRoot; commonTextureRoot=$CommonTextureRoot;

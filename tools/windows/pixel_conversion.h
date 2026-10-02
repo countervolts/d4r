@@ -58,6 +58,7 @@ class PixelProgram {
 public:
     PixelProgram(diag::HipApi& hip, const std::filesystem::path& module) : hip_(hip) {
         try {
+            diag::require_code_object_target(module, diag::HipApi::target_arch());
             hip.check(hip.hipModuleLoad(&module_, diag::utf8(module.c_str()).c_str()), "Load native GPU format conversion");
             hip.check(hip.hipModuleGetFunction(&decode_, module_, "d4r_pixel_decode"), "Resolve GPU pixel decode");
             hip.check(hip.hipModuleGetFunction(&encode_, module_, "d4r_pixel_encode"), "Resolve GPU pixel encode");

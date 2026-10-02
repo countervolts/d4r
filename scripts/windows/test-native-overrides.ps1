@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param([string]$HipRoot, [string]$PackageRoot, [string]$ZludaRoot, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-therock' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$ZludaRoot) { $ZludaRoot = Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/native-identity-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
@@ -29,7 +31,7 @@ try {
     $good = Join-Path $OutputDirectory 'matching-identity'
     New-Item -ItemType Directory -Force $bad,$good | Out-Null
     foreach ($directory in @($bad,$good)) {
-        Copy-Item -LiteralPath (Join-Path $PackageRoot 'bin/probe_gfx1201.hsaco') -Destination (Join-Path $directory 'd4r_ptx_pattern.hsaco') -Force
+        Copy-Item -LiteralPath (Join-Path $PackageRoot "bin/probe_${GpuArch}.hsaco") -Destination (Join-Path $directory 'd4r_ptx_pattern.hsaco') -Force
     }
     'd4r_ptx_pattern 0000000000000000' | Set-Content -LiteralPath (Join-Path $bad 'd4r-kernels.txt') -Encoding ASCII
     $env:D4R_ZLUDA_NATIVE_DIR = $bad

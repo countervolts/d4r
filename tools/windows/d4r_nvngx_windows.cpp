@@ -87,10 +87,10 @@ API unsigned NVSDK_NGX_D3D12_GetFeatureRequirements(IDXGIAdapter* adapter, const
         DXGI_ADAPTER_DESC desc{}; d4r::win::dx(adapter->GetDesc(&desc), "NGX requirements adapter");
         // OptiScaler can override the DXGI vendor ID. The physical HIP
         // architecture and full adapter LUID are the authoritative identity.
-        d4r::diag::HipApi hip(d4r::win::env_path("D4R_HIP_ROOT")); hipDeviceProp_t props{}; hip.select_gfx1201(-1,props);
+        d4r::diag::HipApi hip(d4r::win::env_path("D4R_HIP_ROOT")); hipDeviceProp_t props{}; hip.select_architecture(-1,props);
         requirements->FeatureSupported = std::memcmp(&desc.AdapterLuid,props.luid,sizeof(LUID)) ? 4u : 0u;
         std::strcpy(requirements->MinOSVersion,"10.0.22000.0");
-        std::printf("D4R_REQUIREMENTS feature=%u support=%u architecture=gfx1201\n",info->FeatureID,requirements->FeatureSupported);
+        std::printf("D4R_REQUIREMENTS feature=%u support=%u architecture=%s\n",info->FeatureID,requirements->FeatureSupported,d4r::diag::HipApi::target_arch());
         return 1u;
     });
 }

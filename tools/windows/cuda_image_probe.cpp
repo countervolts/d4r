@@ -8,7 +8,7 @@ int main(int argc, char** argv) {
         Args args(argc, argv);
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         SearchDirectory search(std::filesystem::path(wide(args.cuda_dll)).parent_path());
         CudaApi cuda(args.cuda_dll);
         cuda.check(cuda.cuInit(0), "cuInit");
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
             }
         }
         cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize");
-        std::printf("PASS CUDA_IMAGES architecture=gfx1201 iterations=%u descriptor_and_storage=1 pitched_device_copies=1 fp16_fp32=1 async_array_copy=%u\n",
+        std::printf("PASS CUDA_IMAGES architecture=%s iterations=%u descriptor_and_storage=1 pitched_device_copies=1 fp16_fp32=1 async_array_copy=%u\n", d4r::diag::HipApi::target_arch(),
             args.iterations, unsigned(std::getenv("D4R_DIAG_ASYNC_ARRAY_COPY") != nullptr));
         return 0;
     } catch (const std::exception& e) {

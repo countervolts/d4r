@@ -6,13 +6,15 @@ param(
     [switch]$Translated
 )
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$PackageRoot) { $PackageRoot=Join-Path $repo 'dist/windows-rdna4-command-list' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo ('test-results/profile-' + $Preset + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
 $settings=@{D4R_ZLUDA_PROFILE='1'; D4R_PROFILE_STAGES='1'; D4R_VALIDATE_OUTPUT='1';
     D4R_ZLUDA_PROFILE_DEFERRED=$null; D4R_ZLUDA_PROFILE_ALLOW_LEGACY=$null; D4R_ZLUDA_PROFILE_EVERY=$null;
-    D4R_ZLUDA_NATIVE_DIR=$(if ($Translated) { $null } elseif ($Preset -eq 11) { Join-Path $repo 'build/native-k-gfx1201' } else { Join-Path $repo 'build/native-m-gfx1201' })}
+    D4R_ZLUDA_NATIVE_DIR=$(if ($Translated) { $null } elseif ($Preset -eq 11) { Join-Path $repo "build/native-k-$GpuArch" } else { Join-Path $repo "build/native-m-$GpuArch" })}
 $old=@{}
 try {
     foreach ($key in $settings.Keys) { $old[$key]=[Environment]::GetEnvironmentVariable($key,'Process'); [Environment]::SetEnvironmentVariable($key,$settings[$key],'Process') }

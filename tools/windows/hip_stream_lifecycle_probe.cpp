@@ -9,7 +9,7 @@ int main(int argc, char** argv)
         Args args(argc, argv);
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         hipModule_t module = nullptr;
         hipFunction_t kernel = nullptr;
         void* output = nullptr;

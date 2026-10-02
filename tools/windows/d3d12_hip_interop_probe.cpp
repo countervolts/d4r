@@ -137,7 +137,7 @@ int main(int argc, char** argv)
             throw std::runtime_error("--stream-lifetime must be persistent or cycle");
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         ExternalApi external{hip};
         ComPtr<IDXGIFactory4> factory;
         dx(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "CreateDXGIFactory1");
@@ -336,7 +336,7 @@ int main(int argc, char** argv)
         DWORD handles_after = 0; GetProcessHandleCount(GetCurrentProcess(), &handles_after);
         std::printf("HANDLES before=%lu after=%lu\n", handles_before, handles_after);
         if (final_cycle_handles > warmed_handles + 4) throw std::runtime_error("Handle count grew after first-cycle warmup");
-        std::printf("PASS INTEROP architecture=gfx1201 iterations=%u texture=R32_UINT external_fence=1\n", args.iterations);
+        std::printf("PASS INTEROP architecture=%s iterations=%u texture=R32_UINT external_fence=1\n", d4r::diag::HipApi::target_arch(), args.iterations);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL INTEROP %s\n", e.what());

@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
              std::make_pair("D4R_NVCUDA_DLL", args.cuda_dll), std::make_pair("D4R_NVAPI_DLL", args.nvapi_dll),
              std::make_pair("D4R_NGX_CORE", args.ngx_core), std::make_pair("D4R_DLSS_DLL", args.dlss_dll)})
             if (_putenv_s(pair.first, pair.second.c_str())) throw std::runtime_error("Cannot set runtime environment");
-        HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_gfx1201(args.device, props);
+        HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_architecture(args.device, props);
         ComPtr<IDXGIFactory4> factory; dx(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "CreateDXGIFactory1");
         ComPtr<IDXGIAdapter1> adapter;
         bool found = false;
@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
                 if (!matches) throw std::runtime_error("Imported D3D12 VRAM to CUDA array mismatch on plane " + std::to_string(i));
                 timeline.drain(queue.Get());
             }
-            std::printf("PASS D3D12_ARRAY_COPY architecture=gfx1201 planes=5 cpu_copies_between_apis=0\n");
+            std::printf("PASS D3D12_ARRAY_COPY architecture=%s planes=5 cpu_copies_between_apis=0\n", d4r::diag::HipApi::target_arch());
             return 0;
         }
         Library shim(wide(args.module));
@@ -398,7 +398,7 @@ int main(int argc, char** argv) {
             std::printf("D4R_BURST_VALIDATION frames=%zu cpu_readback_after_all_submissions=1\n", submitted.size());
         }
         loaded_modules();
-        std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 enhanced=%u queue_integration=%s\n",
+        std::printf("PASS D3D12_DLSS architecture=%s preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 enhanced=%u queue_integration=%s\n", d4r::diag::HipApi::target_arch(),
             args.preset, args.iterations, enhanced, commandBackend ? "recorded_command_list" : "explicit_harness");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "FAIL D3D12_DLSS %s\n", error.what()); loaded_modules(); return 4; }

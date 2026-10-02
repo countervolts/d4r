@@ -3,15 +3,17 @@ param([string]$HipRoot, [string]$PackageRoot, [string]$OutputDirectory,
     [string[]]$Layers = @('enc1','enc2','enc3_tube','dec2','dec1'),
     [ValidateRange(1,10000)][int]$Iterations = 32)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-therock' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/m-replay-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $previousPython = $env:PYTHONPATH
 $previousDiag = $env:D4R_DIAG_DIR
 $env:PYTHONPATH = "$(Join-Path $repo '.tools/python/vendor');$previousPython"
-$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); hipRoot=$HipRoot; layers=@(); passed=$false}
+$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); hipRoot=$HipRoot; architecture=$GpuArch; layers=@(); passed=$false}
 try {
     foreach ($layer in $Layers) {
         if ($layer -notmatch '^(enc[12]|enc3_tube|dec[12])$') { throw "Invalid M layer $layer" }
@@ -24,7 +26,7 @@ try {
             > (Join-Path $folder 'fixture.stdout.log') 2> (Join-Path $folder 'fixture.stderr.log')
         if ($LASTEXITCODE) { throw "M $layer fixture generation failed: $folder" }
         & (Join-Path $PackageRoot 'bin/d4r_native_replay_probe.exe') --hip-root $HipRoot `
-            --module (Join-Path $PackageRoot "experimental/m/rrlite_${layer}_4x4_gfx1201.hsaco") `
+            --module (Join-Path $PackageRoot "experimental/m/rrlite_${layer}_4x4_${GpuArch}.hsaco") `
             --fixture-dir $fixture --output-dir $output --iterations $Iterations `
             > (Join-Path $folder 'gpu.stdout.log') 2> (Join-Path $folder 'gpu.stderr.log')
         if ($LASTEXITCODE) { throw "M $layer GPU replay failed: $folder" }

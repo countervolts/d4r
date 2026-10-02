@@ -1,5 +1,6 @@
 #pragma once
 #include "diagnostic.h"
+#include "gpu_target.h"
 #include <hip/hip_runtime_api.h>
 
 namespace d4r::diag {
@@ -40,7 +41,8 @@ struct HipApi {
         if (verbose || result != hipSuccess) std::printf("HIP %s -> %d (%s)\n", call, static_cast<int>(result), hipGetErrorName(result));
         if (result != hipSuccess) throw std::runtime_error(std::string(call) + ": " + hipGetErrorString(result));
     }
-    int select_gfx1201(int requested, hipDeviceProp_t& selected) const {
+    static const char* target_arch() { return D4R_TARGET_ARCH; }
+    int select_architecture(int requested, hipDeviceProp_t& selected) const {
         // Architecture spoofing invalidates a gfx12 correctness test.
         for (const char* name : {"HSA_OVERRIDE_GFX_VERSION", "HSA_OVERRIDE_GFX_VERSION_0"})
             if (std::getenv(name)) throw std::runtime_error(std::string("Unset architecture override ") + name);
@@ -59,14 +61,16 @@ struct HipApi {
                 i, props.name, props.gcnArchName, props.warpSize, props.totalGlobalMem,
                 props.pciDomainID, props.pciBusID, props.pciDeviceID);
             const std::string arch = props.gcnArchName;
-            if (arch.substr(0, arch.find(':')) == "gfx1201" && (requested < 0 || requested == i) && found < 0) {
+            if (gpu_architecture(arch) == target_arch() && (requested < 0 || requested == i) && found < 0) {
                 found = i;
                 selected = props;
             }
         }
-        if (found < 0) throw std::runtime_error("No selected gfx1201 device; never substitute gfx110x");
+        if (found < 0) throw std::runtime_error(std::string("No selected ") + target_arch() + " device; refusing architecture substitution");
+        require_gpu_target(selected.gcnArchName, target_arch());
         check(hipSetDevice(found), "hipSetDevice");
-        std::printf("SELECTED HIP ordinal=%d architecture=gfx1201\n", found);
+        std::printf("SELECTED HIP ordinal=%d architecture=%s validation=%s\n", found, target_arch(),
+            std::string(target_arch()) == "gfx1201" ? "previously_tested_target" : "hardware_unverified_target");
         return found;
     }
 };

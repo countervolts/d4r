@@ -26,6 +26,7 @@ param(
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 if ($ProfileGpuBoundary -and !$AsyncInterop) { throw '-ProfileGpuBoundary requires -AsyncInterop.' }
 if ($ProfileKernels -and $ProfileKernelsDeferred) { throw 'Choose either serializing or deferred kernel profiling.' }
 if ($ProfileLegacyStream -and !$ProfileKernelsDeferred) { throw '-ProfileLegacyStream requires -ProfileKernelsDeferred.' }
@@ -67,7 +68,9 @@ if (!$NgxCore -or !$DlssDll) { throw 'Pass both local NVIDIA DLL paths with -Ngx
 $NgxCore = (Get-Item -LiteralPath $NgxCore).FullName
 $DlssDll = (Get-Item -LiteralPath $DlssDll).FullName
 $metadata = Get-Content -LiteralPath (Join-Path $package 'package.json') -Raw | ConvertFrom-Json
+$GpuArch=Get-D4RGpuTarget $package $metadata.architecture
 foreach ($file in $metadata.files) {
+    if ($file.path.EndsWith('.hsaco')) { Assert-D4RCodeObjectTarget (Join-Path $package $file.path) $GpuArch }
     if ((Get-FileHash -LiteralPath (Join-Path $package $file.path) -Algorithm SHA256).Hash -ne $file.sha256) { throw "Package file changed; rebuild package: $($file.path)" }
 }
 if ((Get-FileHash -LiteralPath $DlssDll -Algorithm SHA256).Hash -ne $metadata.dlssSha256) { throw 'DLSS DLL does not match the validated 310.9.1 native manifest. Rebuild and validate native manifests for this DLL first.' }
@@ -75,7 +78,7 @@ $textureFiles=@(); $textureManifest=@()
 if ($LocalTextureKernels) {
     $LocalTextureKernels=(Get-Item -LiteralPath $LocalTextureKernels -ErrorAction Stop).FullName
     $validation=Get-Content -LiteralPath (Join-Path $LocalTextureKernels 'validation.json') -Raw | ConvertFrom-Json
-    if (!$validation.passed -or !$validation.strictRgb -or $validation.architecture -ne 'gfx1201' -or
+    if (!$validation.passed -or !$validation.strictRgb -or $validation.architecture -ne $GpuArch -or
         $validation.source.dlssSha256 -ne $metadata.dlssSha256 -or !$validation.source.accuracy) {
         throw 'Local texture kernels must pass test-native-texture.ps1 with the exact packaged DLSS identity.'
     }
@@ -85,6 +88,7 @@ if ($LocalTextureKernels) {
         }
         $path=Join-Path $LocalTextureKernels $object.Name
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $object.Value) { throw 'Local texture object changed after validation.' }
+        Assert-D4RCodeObjectTarget $path $GpuArch
         $textureFiles+=Get-Item -LiteralPath $path
     }
     if ($textureFiles.Count -ne 2) { throw 'Expected both validated local K output variants.' }
@@ -123,7 +127,12 @@ function InstallFile([string]$source, [string]$relative) {
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 }
 InstallFile (Join-Path $package 'OptiScaler.dll') 'dxgi.dll'
-foreach ($file in Get-ChildItem -LiteralPath (Join-Path $package 'd4r') -Recurse -File) { InstallFile $file.FullName $file.FullName.Substring($package.Length+1) }
+foreach ($file in $metadata.files) {
+    $relative=$file.path.Replace('/','\')
+    if ($relative.StartsWith('d4r\',[StringComparison]::OrdinalIgnoreCase)) {
+        InstallFile (Join-Path $package $relative) $relative
+    }
+}
 if ($LocalTextureKernels) {
     foreach ($file in $textureFiles) { InstallFile $file.FullName ('d4r/native/' + $file.Name) }
     $combinedManifest=Join-Path $backup 'generated-native-manifest.txt'
@@ -177,7 +186,7 @@ $settings = @{
     D4R_NVCUDA_DLL=(GamePath 'd4r/zluda/nvcuda.dll'); ZLUDA_CUDA_LIB=(GamePath 'd4r/zluda/nvcuda.dll');
     D4R_NVAPI_DLL=(GamePath 'd4r/nvapi/nvapi64.dll'); D4R_NVAPI_BACKEND=(GamePath 'd4r/zluda/nvapi64.dll');
     D4R_NGX_CORE=(GamePath 'd4r/vendor/_nvngx.dll'); D4R_DLSS_DLL=(GamePath 'd4r/vendor/nvngx_dlss.dll');
-    D4R_FORMAT_MODULE=(GamePath 'd4r/pixel_convert_gfx1201.hsaco');
+    D4R_FORMAT_MODULE=(GamePath "d4r/pixel_convert_${GpuArch}.hsaco");
     D4R_ZLUDA_NATIVE_DIR=(GamePath 'd4r/native'); D4R_D3D12_COMMAND_BACKEND='1'; D4R_ZLUDA_VERBOSE='1';
     D4R_ZLUDA_WMMA='1'; D4R_ZLUDA_WMMA_FP8='1'; D4R_ZLUDA_WMMA_FP8_NATIVE='0'; D4R_ZLUDA_WMMA_F16_REFERENCE='1';
     # Do not inherit relaxation flags from unrelated experiments. Unset and

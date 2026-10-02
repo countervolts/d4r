@@ -46,7 +46,7 @@ int main(int argc, char** argv)
         // Require the real HIP architecture, then match the CUDA device by PCI identity.
         HipApi hip(args.hip_root);
         hipDeviceProp_t props{};
-        hip.select_gfx1201(args.device, props);
+        hip.select_architecture(args.device, props);
         CudaApi api(args.cuda_dll);
         loaded_modules();
         std::printf("STAGE cuInit\n");
@@ -130,7 +130,7 @@ int main(int argc, char** argv)
         if (primary) api.check(api.cuDevicePrimaryCtxRelease_v2(device), "cuDevicePrimaryCtxRelease_v2");
         else api.check(api.cuCtxDestroy_v2(context), "cuCtxDestroy_v2");
         cleanup.context = nullptr;
-        std::printf("PASS CUDA architecture=gfx1201 context=%s iterations=%u guard_verified=1 queued=%u\n",
+        std::printf("PASS CUDA architecture=%s context=%s iterations=%u guard_verified=1 queued=%u\n", d4r::diag::HipApi::target_arch(),
             args.context.c_str(), args.iterations, unsigned(queued));
         return 0;
     } catch (const std::exception& e) {

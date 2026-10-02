@@ -52,8 +52,9 @@ def generate(source):
     slot = 9  # IUnknown(3), ID3D12Object(4), DeviceChild(1), CommandList(1).
     for version, interface, methods in sorted(classes):
         for result, name, arguments in methods:
-            result = ' '.join(result.split())
-            arguments = ' '.join(arguments.split())
+            # MinGW WINBOOL and Microsoft SDK BOOL have the same ABI.
+            result = ' '.join(result.split()).replace('WINBOOL', 'BOOL')
+            arguments = ' '.join(arguments.split()).replace('WINBOOL', 'BOOL')
             declarations = [arg.strip() for arg in arguments.split(',')] if arguments else []
             names = []
             for declaration in declarations:

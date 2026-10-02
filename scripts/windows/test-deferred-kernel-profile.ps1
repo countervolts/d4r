@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param([string]$ZludaRoot, [string]$PackageRoot, [string]$HipRoot, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$ZludaRoot) { $ZludaRoot = Join-Path $repo 'dist/zluda-windows-deferred-profile' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-command-list' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/deferred-profile-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
@@ -64,7 +66,7 @@ try {
             if ($exitCode) { throw "$name failed ($exitCode); logs: $OutputDirectory" }
             $out=Get-Content -LiteralPath $stdout -Raw
             $err=Get-Content -LiteralPath $stderr -Raw
-            if ($out -notmatch 'PASS CUDA architecture=gfx1201' -or $out -notmatch 'guard_verified=1') { throw "$name did not verify PTX output" }
+            if ($out -notmatch "PASS CUDA architecture=$GpuArch" -or $out -notmatch 'guard_verified=1') { throw "$name did not verify PTX output" }
             $records=[regex]::Matches($err, '(?m)^D4R_KERNEL_PROFILE kernel="d4r_ptx_pattern" [^\r\n]*serializing=0 deferred=1 [^\r\n]+')
             $invalid=[regex]::Matches($err, '(?m)^D4R_KERNEL_PROFILE_INVALID kernel="d4r_ptx_pattern" [^\r\n]*reason=invalid_elapsed_time serializing=0 deferred=1 [^\r\n]+')
             if ($records.Count + $invalid.Count -ne $iterations -or $err -match 'serializing=1|D4R_KERNEL_PROFILE_SKIPPED') {
@@ -89,11 +91,11 @@ try {
     $arguments=@('--hip-root', ('"' + $HipRoot + '"'), '--cuda-dll', ('"' + (Join-Path $ZludaRoot 'nvcuda.dll') + '"'), '--iterations', '3')
     $exitCode=RunProbe $arguments $stdout $stderr
     $out=Get-Content -LiteralPath $stdout -Raw; $err=Get-Content -LiteralPath $stderr -Raw
-    if ($exitCode -or $out -notmatch 'PASS CUDA architecture=gfx1201' -or
+    if ($exitCode -or $out -notmatch "PASS CUDA architecture=$GpuArch" -or
         $err -notmatch 'reason=legacy_default_stream' -or $err -match '(?m)^D4R_KERNEL_PROFILE ') {
         throw 'Default-stream diagnostics did not safely skip timing events.'
     }
-    @{passed=$true; architecture='gfx1201'; cases=$cases; defaultStreamSkipped=$true; addedCompletionWaits=0} |
+    @{passed=$true; architecture=$GpuArch; cases=$cases; defaultStreamSkipped=$true; addedCompletionWaits=0} |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'validation.json') -Encoding UTF8
     Write-Host "PASS deferred kernel profiling: $OutputDirectory"
 } finally {

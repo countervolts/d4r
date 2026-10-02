@@ -170,7 +170,7 @@ std::vector<uint32_t> read_reference(ID3D12Device* device, ID3D12CommandQueue* q
 int main(int argc, char** argv) {
     start();
     try {
-        Args args(argc, argv); HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_gfx1201(args.device, props);
+        Args args(argc, argv); HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_architecture(args.device, props);
         ExternalApi external{hip}; PixelProgram program(hip, wide(args.module));
         {
             PixelAllocation diagnostic(hip,3,1,8);
@@ -259,6 +259,6 @@ int main(int argc, char** argv) {
             }
             ++verified; std::printf("PASS PIXEL_FORMAT name=%s plane=%u pixels=%u decode_max_abs=%.9g encode=%u\n", item.name,item.plane,count,maxAbs,item.plane==0);
         }
-        std::printf("PASS D3D12_GPU_FORMATS architecture=gfx1201 cases=%u iterations=%u width=%u height=%u enhanced=%u typed_srv_reference=1 typed_uav_reference=1\n", verified,args.iterations,width,height,enhanced); return 0;
+        std::printf("PASS D3D12_GPU_FORMATS architecture=%s cases=%u iterations=%u width=%u height=%u enhanced=%u typed_srv_reference=1 typed_uav_reference=1\n", d4r::diag::HipApi::target_arch(), verified,args.iterations,width,height,enhanced); return 0;
     } catch (const std::exception& error) { std::fprintf(stderr,"FAIL D3D12_GPU_FORMATS %s\n",error.what()); loaded_modules(); return 1; }
 }

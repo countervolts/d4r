@@ -360,9 +360,9 @@ static void STDMETHODCALLTYPE hook_SOSetTargets(ID3D12GraphicsCommandList* self,
     return original_SOSetTargets(access.target(), start_slot, view_count, views);
 }
 
-using Fn_OMSetRenderTargets = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor);
+using Fn_OMSetRenderTargets = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList* self, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, BOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor);
 static Fn_OMSetRenderTargets original_OMSetRenderTargets = nullptr;
-static void STDMETHODCALLTYPE hook_OMSetRenderTargets(ID3D12GraphicsCommandList* self, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) {
+static void STDMETHODCALLTYPE hook_OMSetRenderTargets(ID3D12GraphicsCommandList* self, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, BOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) {
     Access access(self);
     auto saved_render_target_descriptors = copy_values(render_target_descriptors, (single_descriptor_handle ? 1 : render_target_descriptor_count));
     auto saved_depth_stencil_descriptor = copy_values(depth_stencil_descriptor, 1);

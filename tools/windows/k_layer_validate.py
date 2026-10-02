@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare real gfx1201 K enc1/enc2 launches with the existing numpy reference."""
+"""Compare RDNA4 K enc1/enc2 launches with the existing numpy reference."""
 import argparse
 import math
 import pathlib
@@ -73,7 +73,7 @@ def main():
     # after each K stage has been compared on captured DLSS weights/activations.
     if full_abs > 0.001 or full_psnr < 60.0 or merged_abs > 0.001 or merged_psnr < 60.0:
         raise RuntimeError(f"K {args.kernel_name} numerical mismatch against pwin_model.py")
-    print(f"PASS K_REFERENCE architecture=gfx1201 kernel={args.kernel_name} "
+    print(f"PASS K_REFERENCE reference_layout=gfx12 kernel={args.kernel_name} "
           "nonzero_weights=1 transformer_executed=1 nan_inf=0")
 
 

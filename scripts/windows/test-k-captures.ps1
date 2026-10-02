@@ -3,9 +3,11 @@ param([Parameter(Mandatory=$true)][string]$CaptureDirectory, [string]$HipRoot,
     [string]$PackageRoot, [string]$OutputDirectory, [int]$Windows = 12,
     [Parameter(Mandatory=$true)][string]$DlssDll, [int]$PtxWindows = 2)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-therock' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/k-real-reference-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $previousPython = $env:PYTHONPATH
@@ -23,7 +25,7 @@ try {
         New-Item -ItemType Directory -Force $folder | Out-Null
         $env:D4R_DIAG_DIR = $folder
         & (Join-Path $PackageRoot 'bin/d4r_native_replay_probe.exe') --hip-root $HipRoot `
-            --module (Join-Path $PackageRoot "experimental/k/${name}_gfx1201.hsaco") `
+            --module (Join-Path $PackageRoot "experimental/k/${name}_${GpuArch}.hsaco") `
             --fixture-dir $capture.FullName --output-dir $output --iterations 1 `
             > (Join-Path $folder 'gpu.stdout.log') 2> (Join-Path $folder 'gpu.stderr.log')
         if ($LASTEXITCODE) { throw "K $layer actual GPU replay failed: $folder" }

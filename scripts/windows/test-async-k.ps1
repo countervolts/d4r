@@ -11,12 +11,14 @@ param(
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$NgxCore) { $NgxCore = Join-Path $repo '_nvngx.dll' }
 if (!$DlssDll) { $DlssDll = Join-Path $repo 'nvngx_dlss.dll' }
-if (!$NativeRoot) { $NativeRoot = Join-Path $repo 'build/native-k-gfx1201' }
 if (!$ZludaRoot) { $ZludaRoot = Join-Path $repo 'dist/zluda-windows-api-profile' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-command-list' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
+if (!$NativeRoot) { $NativeRoot = Join-Path $repo "build/native-k-$GpuArch" }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/async-k-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
 if ($Resolution -notmatch '^([0-9]+)x([0-9]+)$') { throw 'Resolution must be WIDTHxHEIGHT' }
 $width=$Matches[1]; $height=$Matches[2]
@@ -71,7 +73,7 @@ try {
             Tee-Object -FilePath (Join-Path $OutputDirectory "$mode-comparison.log")
         if ($LASTEXITCODE) { throw "Async $mode output mismatch" }
     }
-    @{passed=$true; architecture='gfx1201'; preset=11; resolution=$Resolution;
+    @{passed=$true; architecture=$GpuArch; preset=11; resolution=$Resolution;
         inputResolution=$InputResolution;
         modes=@('burst','recreate'); framesPerMode=3; exactRgb=$true; gpuBoundaryTiming=[bool]$ProfileGpuBoundary;
         deferredKernelTiming=[bool]$ProfileKernelsDeferred; batchInputs=[bool]$BatchInputCopies; pixelProfile=$PixelProfile} |

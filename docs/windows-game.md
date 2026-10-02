@@ -8,6 +8,14 @@ The user reports 49-51 FPS for K in the measured scene after the command-hook
 fix and locally built output-store optimization. This is a local
 development package; no NVIDIA proprietary DLL is included.
 
+Builds also accept gfx1200 (for example RX 9060/9060 XT). This target is
+**compile-tested only**; no physical gfx1200 validation has been performed.
+RX 9070 and other gfx1201 cards also remain untested. Use a package built for
+the GPU's actual HIP architecture: its `gpu-target.json`, host shim and ELF
+code objects must agree. Installation/runtime reject mixed targets. See
+[windows-gpu-support.md](windows-gpu-support.md) for separate-target build
+commands, the fork review and the first hardware diagnostic gate.
+
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
 OptiScaler using the scripts in `scripts/windows`, then run:
 

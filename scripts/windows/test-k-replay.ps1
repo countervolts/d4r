@@ -7,15 +7,17 @@ param(
     [int]$Iterations = 32
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if (!$PackageRoot) { $PackageRoot = Join-Path $repo 'dist/windows-rdna4-therock' }
+$GpuArch=Get-D4RGpuTarget $PackageRoot $null
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $repo ('test-results/k-replay-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $previousPython = $env:PYTHONPATH
 $previousDiag = $env:D4R_DIAG_DIR
 $env:PYTHONPATH = "$(Join-Path $repo '.tools/python/vendor');$previousPython"
-$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); hipRoot=$HipRoot; layers=@(); passed=$false}
+$summary = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); hipRoot=$HipRoot; architecture=$GpuArch; layers=@(); passed=$false}
 try {
     if ($Iterations -lt 1 -or $Iterations -gt 10000) { throw 'Iterations must be 1..10000' }
     foreach ($layer in $Layers) {
@@ -29,7 +31,7 @@ try {
             > (Join-Path $folder 'fixture.stdout.log') 2> (Join-Path $folder 'fixture.stderr.log')
         if ($LASTEXITCODE) { throw "K $layer fixture generation failed; see $folder" }
         & (Join-Path $PackageRoot 'bin/d4r_native_replay_probe.exe') --hip-root $HipRoot `
-            --module (Join-Path $PackageRoot "experimental/k/dltss_pwin_${layer}_layer_gfx1201.hsaco") `
+            --module (Join-Path $PackageRoot "experimental/k/dltss_pwin_${layer}_layer_${GpuArch}.hsaco") `
             --fixture-dir $fixture --output-dir $output --iterations $Iterations `
             > (Join-Path $folder 'gpu.stdout.log') 2> (Join-Path $folder 'gpu.stderr.log')
         if ($LASTEXITCODE) { throw "K $layer GPU replay failed; see $folder" }
