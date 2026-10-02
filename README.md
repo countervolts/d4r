@@ -1,102 +1,103 @@
-# d4r для Windows / RDNA4
+# d4r for Windows / RDNA4
 
-Windows-форк [countervolts/d4r](https://github.com/countervolts/d4r) для запуска
-DLSS Super Resolution на **AMD Radeon RX 9070 XT / gfx1201** через D3D12,
-OptiScaler, ZLUDA и HIP. Целевые модели: **DLSS 4 preset K** и
-**DLSS 4.5 preset M**. Runtime работает непосредственно в Windows 11.
+A Windows fork of [countervolts/d4r](https://github.com/countervolts/d4r) that
+runs DLSS Super Resolution on **AMD Radeon RX 9070 XT / gfx1201** through
+D3D12, OptiScaler, ZLUDA and HIP. The target models are **DLSS 4 preset K**
+and **DLSS 4.5 preset M**. The runtime runs directly on Windows 11.
 
-**Статус: development / prerelease.** K и M работают на тестовой RX 9070 XT,
-включая 4K в Silent Hill 2. Текущий приоритет — производительность K.
+**Status: development / prerelease.** K and M run on the tested RX 9070 XT,
+including 4K in Silent Hill 2. Improving K performance is the current priority.
 
-## Скачать и запустить
+## Download and run
 
-[Готовые сборки](https://github.com/xdfnx-dev/d4r/releases) содержат Windows
-shim, исправленный ZLUDA, изолированный HIP runtime, patched OptiScaler,
-11 native K kernels, 5 native M kernels и исходники соответствующего commit.
+[Prebuilt releases](https://github.com/xdfnx-dev/d4r/releases) include the
+Windows shim, patched ZLUDA, isolated HIP runtime, patched OptiScaler,
+11 native K kernels, 5 native M kernels and the corresponding committed sources.
 
-Понадобятся Windows 11 x64, RX 9070 XT и D3D12 игра без anti-cheat.
-Проверенный AMD driver: `32.0.31041.1004`. Другие GPU и драйверы пока
-не прошли такую же проверку.
+You need Windows 11 x64, an RX 9070 XT and a D3D12 game without anti-cheat.
+The tested AMD driver is `32.0.31041.1004`. Other GPUs and drivers have not
+received the same validation.
 
-Предоставьте собственные локальные `_nvngx.dll` и `nvngx_dlss.dll`.
-Проверенная пара: NGX `32.0.16.1714`, DLSS `310.9.1.0`. Native manifest
-проверяет SHA256 DLSS DLL. NVIDIA binaries в сборку не включены.
+Supply your own local `_nvngx.dll` and `nvngx_dlss.dll`. The tested pair is
+NGX `32.0.16.1714` and DLSS `310.9.1.0`. The native manifest checks the
+DLSS DLL's SHA256. NVIDIA binaries are excluded from the release.
 
-Распакуйте ZIP и выполните команду из его каталога, подставив свои пути:
+Extract the ZIP and run this command from its directory, replacing the paths
+with your game and local DLL locations:
 
 ```powershell
 .\windows-game.ps1 -GameExe "D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe" -NgxCore "C:\Users\Administrator\d4r\_nvngx.dll" -DlssDll "C:\Users\Administrator\d4r\nvngx_dlss.dll" -Preset 11 -AsyncInterop
 ```
 
-В игре выберите upscaler, который перехватывает OptiScaler. `-Preset 11`
-выбирает K, `-Preset 13` — M. Начинайте проверку M без `-AsyncInterop`:
-асинхронный путь сейчас проверяется прежде всего на K. Первый запуск может
-занять время на PTX compilation; следующие используют cache.
+Select an upscaler intercepted by OptiScaler in the game. `-Preset 11` selects
+K; `-Preset 13` selects M. Start M testing without `-AsyncInterop`: the async
+path is currently being tested primarily with K. The first launch may take
+time to compile PTX; subsequent launches reuse the cache.
 
-Скрипт устанавливает `dxgi.dll`, конфигурацию OptiScaler и каталог `d4r`
-рядом с EXE, предварительно сохраняя заменяемые файлы. Вход и выход текущего
-кадра остаются в VRAM. Восстановление исходных файлов:
+The script installs `dxgi.dll`, an OptiScaler configuration and a `d4r`
+directory beside the game EXE, backing up replaced files first. The current
+frame's inputs and output stay in VRAM. Restore the original files with:
 
 ```powershell
 .\windows-game.ps1 -Action restore -GameExe "D:\Games\SILENT HILL 2\SHProto\Binaries\Win64\SHProto-Win64-Shipping.exe"
 ```
 
-Подробные параметры установки и восстановления:
-[docs/windows-game.md](docs/windows-game.md).
+See [docs/windows-game.md](docs/windows-game.md) for installation options,
+DLL requirements and restoration details.
 
-## Что проверено
+## Validation
 
-| Проверка | Результат на RX 9070 XT |
+| Check | Result on RX 9070 XT |
 | --- | --- |
-| Обнаружение GPU | HIP автоматически определяет `gfx1201`; проверяется D3D12/HIP LUID |
-| HIP и CUDA через ZLUDA | Native HIP kernel и CUDA Driver API / PTX tests проходят |
-| D3D12 ↔ HIP | Shared VRAM buffers и fences; import/release lifetime test проходит |
-| K transformer | Все 11 native layers, NumPy/PTX/replay validation |
-| M transformer | Все 5 native layers, 40 temporal captures, exact baseline |
-| Async K | Очередь кадров и Release/CreateFeature точно совпадают с synchronous RGB |
-| Silent Hill 2 / K / 4K | 16 941 кадр с проверкой NaN/Inf, 203 292 native launches, 0 backend errors |
-| Windows hardware tests | Все 16 CTest gates проходят |
+| GPU detection | HIP automatically detects `gfx1201`; D3D12/HIP LUID is checked |
+| HIP and CUDA through ZLUDA | Native HIP kernel and CUDA Driver API / PTX tests pass |
+| D3D12 ↔ HIP | Shared VRAM buffers and fences; import/release lifetime test passes |
+| K transformer | All 11 native layers, NumPy/PTX/replay validation |
+| M transformer | All 5 native layers, 40 temporal captures, exact baseline |
+| Async K | Queued frames and Release/CreateFeature match synchronous RGB exactly |
+| Silent Hill 2 / K / 4K | 16,941 frames checked for NaN/Inf, 203,292 native launches, 0 backend errors |
+| Windows hardware tests | All 16 CTest gates pass |
 
-Точные совпадения относятся к проверенным reference/control implementations
-этого проекта. Сравнение с DLSS на физической RTX ещё не выполнено.
-Проверка одной игры не подтверждает совместимость со всеми D3D12 играми.
+Exact comparisons refer to this project's validated reference/control
+implementations. Comparison with DLSS on a physical RTX has not been performed.
+Testing one game does not establish compatibility with every D3D12 game.
 
-## Производительность и ограничения
+## Performance and limitations
 
-В локальной 4K сцене пользователь наблюдает около **62 FPS / 63% GPU** с
-async interop, против **49–51 FPS / 53%** в предыдущем synchronous варианте.
-Замеры также используют локально построенные и проверенные K output-store
-kernels. Они содержат NVIDIA-derived code и в публичный ZIP не входят;
-команды их локальной сборки есть в
+In the local 4K scene, the user reports approximately **62 FPS / 63% GPU** with
+async interop, compared with **49–51 FPS / 53%** in the earlier synchronous run.
+These measurements also use locally built and validated K output-store kernels.
+Those objects contain NVIDIA-derived code and are excluded from the public ZIP.
+Local build and validation commands are in
 [docs/windows-performance.md](docs/windows-performance.md).
 
-Производительность K ещё дорабатывается. Замеры не являются контролируемым
-сравнением с FSR4. `-AsyncInterop` опционален и требует одной D3D12 command
-queue. Feature release и resource reconfiguration ожидают завершения GPU
-consumers; обычная отправка кадра не удерживает CUDA mutex.
+K performance remains under development. These readings are not a controlled
+FSR4 comparison. `-AsyncInterop` is opt-in and requires one D3D12 command queue.
+Feature release and resource reconfiguration wait for GPU consumers to finish;
+ordinary frame submission does not hold the CUDA mutex.
 
-M использует проверенную FP16-equivalent baseline. Native RDNA4 FP8 отдельно
-валидирован, но не показал выигрыша для полной сети и выключен по умолчанию.
-Windows preset L пока не валидирован. Frame Generation и DLSS 5 не входят
-в текущую задачу.
+M uses the validated FP16-equivalent baseline. Native RDNA4 FP8 is separately
+validated but has not demonstrated a full-network speedup and is disabled by
+default. Windows preset L is not validated. Frame Generation and DLSS 5 are
+outside the current scope.
 
-Package использует TheRock `10.2.0a20260929` / HIP `7.17.26386`. Stable HIP
-7.2 воспроизводит leak при освобождении mapped external memory; поэтому
-закреплён отдельный TheRock runtime. GPU architecture не подменяется.
+The package uses TheRock `10.2.0a20260929` / HIP `7.17.26386`. Stable HIP 7.2
+reproduces a mapped external-memory release leak, so the validated package
+pins a separate TheRock runtime. GPU architecture is never overridden.
 
-## Сборка из исходников
+## Build from source
 
 ```powershell
 git clone https://github.com/xdfnx-dev/d4r.git
 cd d4r
 ```
 
-Подготовка закреплённых toolchains и patches описана в
-[docs/windows-rdna4-port.md](docs/windows-rdna4-port.md). Нужны CMake + Ninja,
-LLVM/MinGW, Rust GNU toolchain, TheRock HIP, а для OptiScaler — MSVC v143
-и Windows SDK. Setup-скрипты используют `.tools`; source dependencies — `external`.
+Pinned toolchain and source-patch setup is documented in
+[docs/windows-rdna4-port.md](docs/windows-rdna4-port.md). You need CMake + Ninja,
+LLVM/MinGW, a Rust GNU toolchain, TheRock HIP and, for OptiScaler, MSVC v143
+and the Windows SDK. Setup scripts use `.tools`; source dependencies use `external`.
 
-После подготовки зависимостей выполните из корня репозитория:
+After preparing the dependencies, run from the repository root:
 
 ```powershell
 .\scripts\windows\build-zluda-windows.ps1
@@ -107,42 +108,42 @@ LLVM/MinGW, Rust GNU toolchain, TheRock HIP, а для OptiScaler — MSVC v143
 .\scripts\windows\package-windows-game.ps1 -ArchivePath "$PWD\dist\windows-rdna4-game.zip"
 ```
 
-Создание distributable ZIP требует committed source. Package включает manifest
-с hashes, dependency licenses, source patches и snapshot этого commit.
+Creating a distributable ZIP requires committed source. The package includes
+a hash manifest, dependency licenses, source patches and a snapshot of that commit.
 
-## Тесты и диагностика
+## Tests and diagnostics
 
-После сборки hardware gates:
+After building, run the hardware gates:
 
 ```powershell
 & .\.tools\python\cmake\data\bin\ctest.exe --test-dir build/windows-rdna4-therock --output-on-failure
 ```
 
-Async K regression с локальными NVIDIA DLL в корне репозитория:
+Run the async K regression with your local NVIDIA DLLs at the repository root:
 
 ```powershell
 .\scripts\windows\test-async-k.ps1 -ZludaRoot "$PWD\dist\zluda-windows-final"
 ```
 
-Успех: `PASS`, exact RGB, finite output и `passed: true` в `validation.json`.
-Для ограниченного game test добавьте `-RunSeconds 120 -ValidateOutput` к
-команде запуска. Скрипт сохраняет один ZIP с stdout/stderr, runtime/driver
-information, native/translated kernel records и OptiScaler logs. Для crash
-диагностики используйте `-CaptureExceptions`.
+Success requires `PASS`, exact RGB, finite output and `passed: true` in
+`validation.json`. For a bounded game test, add `-RunSeconds 120 -ValidateOutput`
+to the launch command. The script saves one ZIP containing stdout/stderr,
+runtime/driver information, native/translated kernel records and OptiScaler logs.
+Use `-CaptureExceptions` when investigating a crash.
 
-`-ProfileStages` измеряет host stages, `-ProfileCudaApi` — существующие CUDA
-API waits, `-ProfileGpuBoundary` вместе с `-AsyncInterop` — D3D12 GPU intervals
-вокруг interop. `-ProfileKernels` синхронизирует HIP events и меняет scheduling.
-При замере обычного FPS оставляйте profiling и output scans выключенными.
+`-ProfileStages` measures host stages; `-ProfileCudaApi` measures existing CUDA
+API waits; `-ProfileGpuBoundary` with `-AsyncInterop` measures D3D12 GPU intervals
+around interop. `-ProfileKernels` synchronizes HIP events and changes scheduling.
+Leave profiling and output scans disabled when measuring ordinary FPS.
 
-## Документация и лицензии
+## Documentation and licenses
 
-- [Архитектура, зависимости, milestones и результаты](docs/windows-rdna4-port.md).
-- [Game install / restore](docs/windows-game.md).
-- [Измерения K/M и FP8](docs/windows-performance.md).
+- [Architecture, dependencies, milestones and results](docs/windows-rdna4-port.md).
+- [Game installation and restoration](docs/windows-game.md).
+- [K/M and FP8 measurements](docs/windows-performance.md).
 - [OptiScaler source patches](patches/optiscaler/README.md).
 - [ZLUDA source patches](patches/zluda).
 
-Проект основан на работе countervolts; Linux upstream code и документация
-сохранены для совместимости. Форк не связан с NVIDIA или AMD. Лицензия d4r:
-[LICENSE](LICENSE); лицензии зависимостей включены в package.
+This project builds on countervolts' work; Linux upstream code and documentation
+are retained for compatibility. The fork is not affiliated with NVIDIA or AMD.
+d4r's license is in [LICENSE](LICENSE); dependency licenses are included in the package.
