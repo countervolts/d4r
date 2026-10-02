@@ -1,0 +1,55 @@
+D4R WINDOWS QUICK TEST -- READ THIS FIRST
+
+This is an EXPERIMENTAL Windows 11 D3D12 build for RDNA3 / RDNA3.5 / RDNA4.
+Only RX 9070 XT has been tested here. Other cards may fail.
+The package detects the real GPU automatically. Do not rename any DLLs.
+
+1. EXTRACT THE WHOLE ZIP to a normal writable folder, e.g. Desktop\d4r-test.
+   Do not run it inside the ZIP. Do not copy files into the game manually.
+
+2. CLOSE YOUR GAME. Have these TWO ORIGINAL NVIDIA files ready:
+   _nvngx.dll       version 32.0.16.1714
+   nvngx_dlss.dll   version 310.9.1
+   NVIDIA DLLs are not included. Other versions are rejected.
+   The small _nvngx.dll inside this package is d4r, NOT the original NVIDIA file.
+
+3. DOUBLE-CLICK START-K.cmd. Pick the actual game .exe when asked.
+   Pick your two NVIDIA DLLs. These choices are remembered for the next run.
+   Next time, press Enter for the same game, or C to choose another.
+   If Steam/Epic is needed, keep it open. Choose a D3D12 game without anti-cheat.
+   If a launcher opens, type C and choose the real game executable next time.
+
+4. IN THE GAME, select DLSS if available, otherwise FSR/XeSS for OptiScaler.
+   Leave frame generation OFF. First launch can compile for several minutes.
+   Keep the console open. Play for 30 seconds, check the image, then EXIT THE GAME.
+   START-M.cmd tests DLSS 4.5 preset M; START-K.cmd tests DLSS 4 preset K.
+
+5. SEND THE SINGLE ZIP shown as "SEND THIS ONE FILE" in the console.
+   It is also in the results folder. Tell us your GPU, game, K/M and image result:
+   "correct image", "black screen", "crash" or "visual corruption".
+   A passing backend log does not automatically prove the image is correct.
+   Logs can contain local paths. Review them before posting them publicly.
+
+TO UNINSTALL: close the game and double-click RESTORE-GAME.cmd.
+Original replaced files are backed up and restored; changed files are preserved.
+Restore the previous game BEFORE choosing a different game for the next test.
+Always launch tests through START-K/M.cmd, not the usual game shortcut.
+
+IF SOMETHING FAILS:
+- Wrong NVIDIA DLL: select the exact versions above on the next run.
+- No supported GPU / HIP failure: send the ZIP; do not spoof the GPU architecture.
+- vkd3d/Wine detected: use the game's original native Windows D3D12 files.
+- Access denied: extract to a writable folder. Do not disable system security.
+- Do not start a second test while the first game is running.
+
+No HIP SDK installation is required; the isolated runtime is included.
+This uses synchronous interop, output checks and crash capture by default.
+It is a correctness diagnostic, NOT an FPS benchmark or an optimized daily-use build.
+Colour, depth, motion and output remain in VRAM in the runtime fast path.
+
+Runtime files are in files/. Cache/settings are created in work/.
+Licenses are in licenses/. Corresponding sources are a SEPARATE release download;
+testers do not need to download or build them. No NVIDIA proprietary DLLs are shipped.
+
+Report: https://github.com/countervolts/d4r/issues/10
+Source: https://github.com/xdfnx-dev/d4r

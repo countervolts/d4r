@@ -30,6 +30,14 @@ Only RX 9070 XT has physical validation here; all other targets are compile-test
 The installer checks the real HIP target before changing game files. See
 [Windows GPU coverage and issue #10 diagnostics](docs/windows-gpu-support.md).
 
+For a short Windows hardware test, the fork's
+[quick-test prereleases](https://github.com/xdfnx-dev/d4r/releases) provide one
+ZIP that detects the GPU automatically. Extract it and double-click START-K.cmd
+or START-M.cmd, select your game and local NVIDIA DLLs, then send the single
+diagnostic ZIP after exiting. RESTORE-GAME.cmd restores replaced files. Read
+[the short English instructions](docs/windows-quick-test.txt). Corresponding
+sources are a separate release asset; the test requires no SDK installation.
+
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 > **Not affiliated with NVIDIA or AMD.**

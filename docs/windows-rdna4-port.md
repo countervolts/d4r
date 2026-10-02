@@ -19,6 +19,24 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
+2026-10-02 quick-test packaging: one universal ZIP shares the identical
+OptiScaler/ZLUDA/HIP runtime and selects among all eleven previously compiled
+host/kernel targets using read-only HIP discovery. START-K.cmd / START-M.cmd
+use file pickers, remember validated game/DLL paths, back up replaced files,
+run synchronous output/crash diagnostics, and produce one report ZIP.
+RESTORE-GAME.cmd works without HIP discovery or NVIDIA DLL selection. No
+runtime arithmetic changes or additional hardware-support claims are made.
+The short English instructions are in `windows-quick-test.txt`; developer
+sources and exact patched GPL OptiScaler/submodule sources are a separate asset.
+An isolated Windows PowerShell 5 fixture verifies automatic gfx1201 selection,
+spaces/Unicode paths, remembered selection, exact install/restore, and rejection
+of wrong NGX/DLSS DLLs, vkd3d and modified package files before game writes.
+No real game is launched by these packaging checks. Reproduce packaging with
+`package-windows-quick-test.ps1 -PackageRoot <new-dir> -ArchivePath <zip>` and
+`tools/windows/package_quick_test_sources.py --output <source-zip>` after commit.
+The quick-test build is a correctness diagnostic, not the async/private-texture
+performance configuration; K optimization remains open.
+
 2026-10-02 coverage: all eleven listed RDNA3 / RDNA3.5 / RDNA4 targets compile
 with separate host/device objects and guarded packages. Only RX 9070 XT has
 physical validation here; no other-target GPU workloads are executed. The
