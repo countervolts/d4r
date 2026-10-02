@@ -525,6 +525,47 @@ game-sized async/burst/recreation frames, with all six async RGB images exact
 (`k-enc0-shared-wgp-async-game-input`). Default selection of private output
 objects remains CU until a game comparison establishes the candidate's effect.
 
+### Combined K game check
+
+The private WGP outputs are rebuilt from clean ZLUDA source `fb0adc8`; both
+object hashes match the earlier validated experimental objects. A final
+2259x1271 -> 3840x2160 comparison completes twelve finite control/candidate
+frames, all six candidate RGB outputs exact, with all expected native hits and
+valid timings (`k-output-wgp-clean-source-final-4k`). This supplies clean build
+provenance without changing the tested binary identities.
+
+The subsequent Silent Hill 2 game check combines the exact CMake shared-V enc0
+and those private WGP outputs. Package source is clean `68b551b`; the runtime
+remains the validated `67127dd` ZLUDA build with its warm cache, while the
+offline output objects carry WGP placement. DLSS is the locally provided
+310.9.1.0 DLL. Async interop and batched GPU inputs are enabled; debugger,
+serializing/deferred kernel profiling, detailed stage/boundary timestamps and
+output scans are disabled.
+
+After the user confirms the stationary foreground comparison scene, thirty
+seconds capture 1954 presents: **65.250 FPS**, mean/median/p95 frame intervals
+15.326/15.318/16.306 ms. Every present uses Hardware Independent Flip with
+SyncInterval 0. PresentMon mean GPU busy/wait is 14.403/0.807 ms. Sixty unique
+ADLX polls record **93.500%** mean device usage, **3118.400 MHz** core,
+2505 MHz VRAM and **318.817 W** board power, with 57 C temperature and 82.9 C
+hotspot. Median telemetry query time is 0.083 ms per 500 ms poll.
+
+The preceding accepted scene capture was 64.661 FPS: the new result is only
+0.589 FPS higher, about 0.91%, with mean frame interval 0.139 ms shorter.
+This is one historical control and one candidate capture, without a fresh
+repeated game A/B. It does not establish a reproducible gain or isolate enc0
+from output placement. WGP remains an optional experiment, and the overall
+K performance gate stays open.
+
+The full bounded run completes **35664 K frames** and **427968 native
+launches**, including feature recreation and color-format reimports. There
+are zero backend errors, CPU image copies, previous-frame outputs or recorded
+crashes. `diagnostic_timeout` denotes the intentional ten-minute stop.
+Numerical game scans are off, so the game's zero reported nonfinite count is
+not a NaN/Inf validation result; use the separate finite/exact-frame gates.
+Raw capture, environment, package identities and summary remain in
+`test-results/silent-hill2-k-vshare-wgp-4k` and its diagnostic ZIP.
+
 ```powershell
 .\scripts\windows\build-zluda-windows.ps1 -InstallRoot "$PWD\dist\zluda-windows-wgp-experiment"
 .\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -ZludaRoot "$PWD\dist\zluda-windows-wgp-experiment" -ShaderMode wgp -OutputDirectory "$PWD\build\private-textures-wgp-gfx1201"

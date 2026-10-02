@@ -18,16 +18,29 @@ explicit limits; the validated package keeps conservative arithmetic.
 ## Milestone and gates
 
 **Current milestone: K performance remains open.** The latest unprofiled 4K
-Silent Hill 2 scene capture records 64.661 FPS. Functional K/M and the
+Silent Hill 2 scene capture records 65.250 FPS. Functional K/M and the
 reproducible archive do not close this gate. Prioritize measured K kernel cost
 and retain queue/synchronization checks; postpone further M/FP8 optimization.
 The user's approximately 80+ FPS with FSR4 is not a captured same-scene control.
 
-A subsequent unprofiled K/4K capture records **64.661 FPS** with direct AMD
+The preceding unprofiled K/4K capture records **64.661 FPS** with direct AMD
 ADLX mean usage **93.183%**, core clock **3124.667 MHz** and board power
 **316.717 W**. The user identified the previous 63% reading as Task Manager,
 which is distinct from ADLX's device-wide metric. This capture places GPU kernel cost
 at the center of the next K investigation, while retaining queue measurements.
+
+The shared-V enc0 + private WGP output candidate records **65.250 FPS** over
+1954 presents in the user-confirmed stationary scene, at the same
+2259x1271 -> 3840x2160 dimensions. ADLX mean usage is **93.500%**, core clock
+**3118.400 MHz** and board power **318.817 W**. The 0.589 FPS historical
+comparison is too small to establish a reproducible gain; a fresh repeated
+game control remains necessary before selecting WGP by default. The bounded
+ten-minute run completes **35664 K frames / 427968 native launches**, with
+zero backend errors, CPU image copies, previous-frame outputs or recorded
+crashes. Output scans are disabled in this unprofiled game run; standalone
+finite/exact-image gates supply its numerical coverage. Results:
+`test-results/silent-hill2-k-vshare-wgp-4k`. See
+[windows-performance.md](windows-performance.md#combined-k-game-check).
 
 Native replay benchmarks now compare fresh exact allocations before timing,
 support event/dispatch profiling and paired batches, retain independent host
