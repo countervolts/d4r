@@ -151,6 +151,47 @@ All sixteen CTest gates pass on the rebuilt shim. Reproduce with:
 .\scripts\windows\test-async-k.ps1 -ProfileGpuBoundary
 ```
 
+The 2026-10-02 game timestamp run completes 9384 K/4K frames without backend
+errors (`test-results/silent-hill2-k-gpu-boundary-4k`). Median GPU intervals:
+input copies 0.061 ms, external span 5.586 ms, output copy 0.208 ms, entire
+boundary 5.856 ms, between boundaries 9.512 ms. Median input interval is
+15.383 ms. Output scans and serializing kernel events are off. This locates
+the remaining time outside the small D3D12 copies; it does not prove whether
+that time is game GPU work, CPU waits or context scheduling.
+
+### Present and GPU-busy capture
+
+`capture-presentmon.ps1` attaches the official PresentMon 2.6.0 x64 CLI to
+one running game process. It verifies SHA256
+`b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af`,
+uses a unique ETW session and stops at its time bound/process exit, without
+replacing any existing trace or installing a service. It saves CSV, console
+output, driver version, target PID and the HWS registry setting. The default
+downloads the pinned CLI into `.tools` if needed. Run elevated when ETW access
+requires it; no driver or security setting is changed.
+
+```powershell
+.\scripts\windows\capture-presentmon.ps1 -Seconds 30
+python .\tools\windows\profile_report.py <capture-directory> --output profile.json
+```
+
+Keep the game foreground and use the same scene/quality setting for comparison.
+The report separates swapchains and preserves missing metrics. Present FPS
+comes from present intervals, rather than NGX recording timestamps. GPU
+busy/wait are ETW estimates, not a hardware sensor percentage; CPU busy is
+frame work/wait attribution before Present, not physical CPU utilization.
+HWS and cross-API context attribution can affect accuracy. Metric definitions:
+[PresentMon console documentation](https://github.com/GameTechDev/PresentMon/blob/v2.6.0/README-ConsoleApplication.md).
+
+The initial 60-second trace captures 2172 presents during a changing
+Independent Flip / Composed Flip session, with mean present interval
+27.593 ms (36.241 FPS), mean GPU busy 18.759 ms and GPU wait 2.303 ms.
+This is not a controlled capture of the user's 62 FPS scene and is excluded
+from speedup conclusions. Its containing game run completes 9627 K/4K frames
+without backend errors; ordinary recording intervals later return to about
+16 ms. A stable foreground-scene capture is needed before optimizing from
+the ETW metrics. Raw files: `test-results/silent-hill2-k-presentmon-4k`.
+
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
 4685 frames, all finite. Neither has a backend failure, CPU image copy or an

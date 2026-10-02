@@ -71,8 +71,22 @@ copies, the external-fence span and output copies. Copy-slot completion
 controls query reuse/readback; only 32 timing bytes are read, with no extra
 completion wait. The timestamp-enabled burst/recreate gate passes all twelve
 K/4K frames with exact candidate RGB (`test-results/k-async-gpu-boundary-4k`),
-and all sixteen CTest gates pass on the rebuilt shim. Game timestamps remain
-the next performance diagnostic; their span includes scheduling as well as HIP.
+and all sixteen CTest gates pass on the rebuilt shim. A 9384-frame game run
+measures median input/output copies at 0.061/0.208 ms and external span at
+5.586 ms, with zero backend failures. The span includes scheduling as well
+as HIP. PresentMon 2.6.0 capture/report tooling is added; its first trace
+contains changing presentation modes and is not a controlled capture of
+the user's 62 FPS scene. See `windows-performance.md` for exact metrics and
+the stable foreground-scene gate that remains open.
+
+The public prerelease `windows-rdna4-dev-20261002-a346d76` is published to
+`xdfnx-dev/d4r`, containing source commit `a346d76` and ZLUDA `a1c506f`.
+Archive: `d4r-windows-rdna4-20261002.zip`, 88893567 bytes, SHA256
+`5b9a47e9d0c9a042567c2096eb8eaafb0a28473614b656865d794a39f5165d8e`.
+All 65 entries and the 274-entry source snapshot match the manifest; GitHub's
+uploaded asset digest matches the local ZIP. NVIDIA DLLs/private kernels and
+captures are excluded. This is a development artifact, not completion of
+the K performance gate.
 
 Three ordinary K/4K async frames and three queued together without intermediate
 CPU completion all match their corresponding prior synchronous RGB exactly;

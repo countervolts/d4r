@@ -5,7 +5,9 @@ are not hardware counters. No bandwidth / WMMA utilization is inferred here.
 """
 import argparse
 import collections
+import csv
 import json
+import math
 import pathlib
 import re
 import statistics
@@ -34,6 +36,44 @@ def metadata(directory):
                     'wavefront_size', 'vgpr_count', 'sgpr_count', 'vgpr_spill_count', 'sgpr_spill_count',
                     'group_segment_fixed_size', 'private_segment_fixed_size') if key in fields}
     return result
+
+
+def presentmon(directory):
+    # Keep swapchains separate: combining startup/menu/overlay chains invents
+    # frame intervals. Missing/NA metrics remain absent rather than becoming 0.
+    captures = []
+    for path in sorted(directory.glob('presentmon*.csv')):
+        groups = collections.defaultdict(list)
+        with path.open(encoding='utf-8-sig', newline='') as stream:
+            for row in csv.DictReader(stream):
+                if row.get('ProcessID') and row.get('SwapChainAddress'):
+                    groups[(row['ProcessID'], row['SwapChainAddress'])].append(row)
+        for (process, swapchain), rows in groups.items():
+            metrics = {}
+            for name in ('MsBetweenPresents', 'MsBetweenAppStart', 'MsCPUBusy', 'MsCPUWait',
+                         'MsGPULatency', 'MsGPUTime', 'MsGPUBusy', 'MsGPUWait',
+                         'MsInPresentAPI', 'DisplayedTime', 'DisplayLatency'):
+                values = []
+                for row in rows:
+                    raw = row.get(name, row.get(name.removeprefix('Ms'), ''))
+                    try:
+                        value = float(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if math.isfinite(value) and value >= 0:
+                        values.append(value)
+                if values:
+                    metrics[name] = stats(values)
+            item = dict(file=path.name, processId=int(process), swapchain=swapchain,
+                        frames=len(rows), metrics=metrics,
+                        presentModes=dict(collections.Counter(row.get('PresentMode', '') for row in rows)),
+                        syncIntervals=dict(collections.Counter(row.get('SyncInterval', '') for row in rows)))
+            interval = metrics.get('MsBetweenPresents', metrics.get('MsBetweenAppStart'))
+            if interval and interval['mean'] > 0:
+                item['presentFps'] = 1000. / interval['mean']
+            captures.append(item)
+    captures.sort(key=lambda row: row['frames'], reverse=True)
+    return captures
 
 
 def report(directory, metadata_directory=None):
@@ -83,12 +123,14 @@ def report(directory, metadata_directory=None):
                   commandHookSamples=[],
                   cudaApi=[],
                   gpuBoundaryStages={},
+                  presentMon=presentmon(directory),
                   replayPairs=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
                       'CUDA API profiles measure host call duration without GPU events or added synchronization; they still include existing waits.',
                       'D3D12 boundary timestamps span copies and HIP/scheduling across the external fence; they do not isolate kernel execution or measure Present.',
                       'Boundary timestamps are read after existing completion fences; only 32 timing bytes are read, with no extra completion wait. GPU clock idle behavior can affect intervals.',
+                      'PresentMon ETW GPU busy/wait are per-process frame estimates, not hardware sensor utilization. HWS and cross-API context attribution can affect them.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
@@ -158,7 +200,7 @@ def main():
     parser.add_argument('--metadata-directory', type=pathlib.Path, help='llvm-readobj --notes output for native code objects')
     args = parser.parse_args()
     result = report(args.directory, args.metadata_directory)
-    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi', 'gpuBoundaryStages')):
+    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi', 'gpuBoundaryStages', 'presentMon')):
         parser.error('no complete stage or HIP-event records found')
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -168,6 +210,10 @@ def main():
         print(f"COMMAND {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for name, row in result['gpuBoundaryStages'].items():
         print(f"GPU BOUNDARY {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for capture in result['presentMon']:
+        print(f"PRESENT {capture['file']} process={capture['processId']} swapchain={capture['swapchain']} frames={capture['frames']} fps={capture.get('presentFps', float('nan')):.3f}")
+        for name, row in capture['metrics'].items():
+            print(f"  {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for row in result['cudaApi'][:20]:
         print(f"CUDA API {row['api']} {row['thread']}: n={row['calls']} mean={row['meanMs']:.6f} ms total={row['totalMs']:.3f} ms max={row['maxMs']:.3f} ms")
     for row in result['commandHookSamples']:
