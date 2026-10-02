@@ -2,6 +2,11 @@
 
 Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
+Upstream integration: [draft PR #11](https://github.com/countervolts/d4r/pull/11)
+targets `countervolts/d4r:windows` from `xdfnx-dev/d4r:upstream-windows`.
+The integration branch retains upstream's README with a Windows status section;
+the fork's `main` keeps the dedicated English Windows README. The PR is open,
+mergeable and allows maintainer edits. K performance remains a separate open gate.
 This file records current results followed by the dated development history. Standalone DLSS K/M
 works on the real Windows GPU, including the patched OptiScaler frontend.
 Silent Hill 2 now renders through the Windows backend; gameplay and output
