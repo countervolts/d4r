@@ -24,6 +24,12 @@ full-network speedup. Windows preset L is not validated. See
 [Windows measurements](docs/windows-performance.md). NVIDIA DLLs are supplied
 locally and excluded from packages.
 
+Experimental Windows builds also cover RDNA3 `gfx1100..gfx1103`, RDNA3.5
+`gfx1150..gfx1154` and RDNA4 `gfx1200/gfx1201`, with separate guarded packages.
+Only RX 9070 XT has physical validation here; all other targets are compile-tested.
+The installer checks the real HIP target before changing game files. See
+[Windows GPU coverage and issue #10 diagnostics](docs/windows-gpu-support.md).
+
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 > **Not affiliated with NVIDIA or AMD.**
