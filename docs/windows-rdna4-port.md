@@ -140,6 +140,21 @@ metrics as absent and preserving the driver's raw timestamp. See
 The combined capture smoke test passes, followed by the user-confirmed
 1935-present/60-poll measurement recorded at the top of this document. Logs
 and runtime/DLL hashes: `test-results/silent-hill2-k-telemetry-unprofiled-4k`.
+Its ten-minute game summary completes **37187 K/4K frames**, zero backend
+errors/CPU image copies/previous-frame outputs or recorded crashes.
+
+The next isolated K enc1 experiment replaces FP32 WMMA + FP16 rounding with
+gfx12's packed FP16 accumulator instruction. ISA conversions and VGPRs fall,
+but the real output changes and reference PSNR falls. A 64-matrix public GPU
+reproducer shows the direct instruction differs from FP32 + FP16 rounding
+already at a single K16 step while the adapter is exact against the packed
+instruction. The experiment is rejected at enc1; no subsequent layer or game
+uses it. Baseline preservation takes priority over the instruction reduction.
+`D4R_K_F16_WMMA` remains disabled in every normal build. Reproducer/results and
+exact metrics are in `windows-performance.md`.
+All sixteen ordinary K/M objects remain byte-identical after rebuilding with
+the disabled experimental code. All seventeen CTest gates pass; gfx1101 enc1
+compile-only compatibility and the ready-made public WMMA script also pass.
 
 The public prerelease `windows-rdna4-dev-20261002-a346d76` is published to
 `xdfnx-dev/d4r`, containing source commit `a346d76` and ZLUDA `a1c506f`.

@@ -229,6 +229,20 @@ WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
 {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(wm_h8, a), __builtin_bit_cast(wm_h8, b), c);
 }
+#ifdef D4R_K_F16_WMMA
+// Rejected K experiment: direct packed F16 changes the arithmetic on gfx1201.
+// The public WMMA reproducer and enc1 replay are in tools/windows and docs.
+// Experimental gfx12 packed FP16 C/D. K's strict baseline enters each K16
+// step with an already FP16-rounded accumulator. Keep the existing logical
+// eight-row contract; only this instruction/register representation changes.
+WM_FN wm_f8v wm_mma_f16_step(const wm_op& a, const wm_op& b, wm_f8v c)
+{
+    const wm_h8 hc = __builtin_convertvector(c, wm_h8);
+    const wm_h8 hd = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+        __builtin_bit_cast(wm_h8, a), __builtin_bit_cast(wm_h8, b), hc);
+    return __builtin_convertvector(hd, wm_f8v);
+}
+#endif
 #else
 WM_FN wm_f8v wm_mma11(const wm_u8v& a, const wm_u8v& b, wm_f8v c)
 {

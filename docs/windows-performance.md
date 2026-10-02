@@ -342,8 +342,53 @@ sensor/window and its discrepancy is unresolved. Do not infer a physical CPU
 limit, isolated shader occupancy or a FSR4 speed comparison. Query overhead
 is median 0.094 ms per 500 ms poll, with a roughly 12 ms first query. Results:
 `test-results/silent-hill2-k-telemetry-unprofiled-4k`. The game stability
-summary is still pending its existing ten-minute bound. Remaining K work now
-prioritizes transformer/output-kernel cost; frame scheduling remains measured.
+summary completes 37187 K frames with zero backend failures, CPU image copies,
+previous-frame outputs or recorded crashes, stopping at its ten-minute bound.
+Remaining K work now prioritizes transformer/output-kernel cost; frame
+scheduling remains measured.
+
+### Rejected packed FP16 accumulator experiment
+
+An isolated `D4R_K_F16_WMMA` enc1 build uses gfx12's documented packed FP16
+C/D intrinsic, retaining the current operand/accumulator lane mapping. It
+removes most conversion instructions (1066 static F16/F32 conversions become
+two) and reduces main-kernel VGPRs from 218 to 201; LDS remains 24576 bytes,
+with zero spills. These are compiler/ISA counts, not GPU time or occupancy.
+The candidate is rejected before moving to another layer: its real replay
+changes 1182727 half codes in the output allocation, max absolute difference
+0.0390625 from the validated baseline. All values are finite. Against the
+current twelve-window NumPy reference, PSNR drops from baseline 78.7702 dB
+to 69.2377 dB; max absolute error rises from 0.009765625 to 0.0390625.
+Two independent PTX windows give 70.4022/70.08 dB. These pass the existing
+coarse reference thresholds but do not satisfy this optimization's baseline
+preservation gate. No game installation or performance claim follows.
+
+A public 64-matrix primitive reproducer isolates the difference to direct
+instruction arithmetic. The packed intrinsic and the layout adapter agree
+bit-for-bit. Direct FP16 output differs from FP32 WMMA rounded once to FP16
+even after one K16 step (1674 of 4096 elements, max absolute 0.00390625).
+After eight steps, 2874 elements differ, max absolute 0.0625. This rules out
+the adapter packing as the source of this fixture's difference; the hardware
+internal accumulation/rounding cause is not established. Production K keeps
+its existing FP32-instruction/FP16-rounding baseline and the experimental flag
+is off in every normal build. Results: `test-results/k-f16-wmma-enc1` and
+`test-results/wmma-f16-arithmetic-compare-fixed`.
+The finished `test-wmma-f16.ps1` repeats the same 64-case result. Rebuilding
+every ordinary K/M object leaves all sixteen byte-identical; all seventeen
+CTest gates pass and enc1 still compiles for gfx1101 (compile-only). Logs:
+`test-results/wmma-f16-script-check` and `test-results/k-f16-baseline-ctest.log`.
+
+```powershell
+.\scripts\windows\test-wmma-f16.ps1
+.\scripts\windows\build-native-k-f16-wmma.ps1 -Layer enc1
+```
+
+The first command compiles and runs the public arithmetic diagnostic without
+NVIDIA inputs. Its success means the reproducer executed correctly, not that
+the two instruction paths are equivalent; JSON retains `baselineEquivalent`
+and `gameOptimizationAccepted`. The second compiles the rejected experiment
+in a separate directory and generates no override manifest. Intrinsic API:
+[Clang gfx12 FP16 WMMA](https://clang.llvm.org/docs/AMDGPUBuiltinReference.html#builtin-amdgcn-wmma-f16-16x16x16-f16-w32-gfx12).
 
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes

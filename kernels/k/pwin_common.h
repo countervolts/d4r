@@ -80,6 +80,12 @@ __device__ __forceinline__ half_t l2_sum(const half_t* row)
 // PWIN_F32ACC: keep the accumulator in f32 through the chain (rounded to f16 where the values are used)
 __device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
 {
+#ifdef D4R_K_F16_WMMA
+#if !defined(__GFX12__) || D4R_WMMA_LAYOUT != 12 || !defined(D4R_K_FP16_BASELINE)
+#error "experimental packed F16 WMMA requires gfx12 native layout and strict K baseline"
+#endif
+    return wm_mma_f16_step(a, b, c);
+#else
     f8v d = wm_mma(a, b, c);
 #if !defined(PWIN_F32ACC) || defined(D4R_K_FP16_BASELINE)
 #pragma unroll
@@ -87,6 +93,7 @@ __device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
         d[i] = (float)(half_t)d[i];
 #endif
     return d;
+#endif
 }
 
 __device__ __forceinline__ f8v splat8(float v)
