@@ -209,8 +209,9 @@ def replace_rz_round(lines):
 
 
 ENC0_REF = "rrlite_enc0_4x4_mvhi_hdr_folded"
-# the other flag combinations of the kernels whose only native part is the surface-store rewrite
+# Surface-store and round-idiom recipes for the other flag combinations.
 SUST_ONLY_RE = re.compile(r"^(hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)(_max)?_v[12]_rel|"
+                          r"hiluma_engine_input_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)_v2_rel|"
                           r"rrlite_post_3_[12]_mv(hi|lo)_(hdr|ldr)(_folded)?|"
                           r"rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)|rrlite_dec0_4x4|"
                           r"rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr))$")
@@ -277,7 +278,7 @@ def kernel_spec(name):
     if ENC0_RE.match(name):
         return enc0_variant(name)
     if SUST_ONLY_RE.match(name):
-        return dict(file="", sust=True, extern="", rz_round=name.startswith("hiluma_engine_output"))
+        return dict(file="", sust=True, extern="", rz_round=name.startswith("hiluma_engine_"))
     sys.exit(f"make_ptx: no recipe for {name}")
 
 

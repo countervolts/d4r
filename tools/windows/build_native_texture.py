@@ -4,6 +4,7 @@ The resulting PTX/code object contains NVIDIA code and must remain local.
 No Wine, shell script, GPU, CUDA SDK or system installation is required.
 """
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -23,8 +24,9 @@ def main():
     parser.add_argument('--output-directory', type=pathlib.Path, required=True)
     parser.add_argument('--shader-mode', choices=['cu', 'wgp'], default='cu')
     args = parser.parse_args()
-    if not re.fullmatch(r'hiluma_engine_output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?_v2_rel', args.kernel):
-        parser.error('this initial validated build recipe supports K v2 output variants only')
+    if not re.fullmatch(r'hiluma_engine_(?:output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?|'
+                        r'input_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr))_v2_rel', args.kernel):
+        parser.error('this private experimental build recipe supports K v2 input/output variants only')
     repo = pathlib.Path(__file__).resolve().parents[2]
     output = args.output_directory.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,13 @@ def main():
     env['D4R_DLSS_PTX_DIR'] = str(ptx)
     edited = work / (args.kernel + '.ptx')
     run('make-ptx', [sys.executable, repo / 'kernels/tex/make_ptx.py', args.kernel, edited])
+    rewrite_match = re.search(r'surface stores replaced: (\{[^\n]+\})',
+                              (work / 'make-ptx.log').read_text(errors='replace'))
+    if not rewrite_match:
+        raise RuntimeError('PTX recipe did not report its changes')
+    rewrite_counts = ast.literal_eval(rewrite_match[1])
+    if not any(rewrite_counts.values()):
+        raise RuntimeError('PTX recipe made no changes; refuse a no-op override')
     raw, ir, extra = work / 'raw.bc', work / 'raw.ll', work / 'extra.bc'
     run('compile-helper', [tools['clang++'], '-x', 'hip', '-std=c++20', '-nogpuinc', '-nogpulib', '-O3',
                           '-mno-wavefrontsize64', '--offload-device-only', '--offload-arch=gfx1201',
@@ -87,13 +96,14 @@ def main():
     shutil.copyfile(work / 'emitted/module.hsaco', output / (args.kernel + '.hsaco'))
     run('manifest', [sys.executable, repo / 'kernels/tools/kernel_manifest.py', output, args.dlss_dll])
     metadata = dict(architecture='gfx1201', accuracy=True, nativeFP8=False, shaderMode=args.shader_mode,
+                    lastBuiltKernel=args.kernel, lastRecipeRewrites=rewrite_counts,
                     privateNvidiaDerivedCode=True, validation='not yet validated; do not install before comparison',
                     dlssSha256=hashlib.sha256(args.dlss_dll.read_bytes()).hexdigest(),
                     zludaBuild=json.loads((zluda / 'build-info.json').read_text(encoding='utf-8-sig')),
                     compiler=subprocess.check_output([str(tools['clang++']), '--version'], env=env).decode(errors='replace'),
                     objects={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output.glob('*.hsaco')})
     (output / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    print(f'Built PRIVATE gfx1201 output override: {output}; validation required before use')
+    print(f'Built PRIVATE gfx1201 texture override: {output}; validation required before use')
 
 
 if __name__ == '__main__':

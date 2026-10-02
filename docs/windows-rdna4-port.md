@@ -76,6 +76,15 @@ probe/game children so disabled diagnostic flags stay disabled; GPU comparisons
 now require actual valid timing samples. Commands, rejected experiments and
 the initial diagnostic/cache failures are recorded in `windows-performance.md`.
 
+A subsequent input-rounding CU/WGP experiment completes eighty finite frames
+with all forty candidate RGB images exact, holding the other thirteen objects
+identical. Neither input candidate improves standalone timing; the game keeps
+translated input. The private recipe/test tools retain these reproducible
+experiments, while the installer still accepts only the two validated output
+variants. Rebuilt output objects retain their SHA256 values, and the ordinary
+translated-output control comparison passes four further finite frames. See
+[windows-performance.md](windows-performance.md#rejected-k-input-rounding-overrides).
+
 The next diagnostics add `-ProfileCudaApi` (ZLUDA patch 0015): aggregate host
 CUDA API durations without HIP-event waits. Boundary stages now separate
 prepare, copy-list setup, input/output submission and output-copy drain.

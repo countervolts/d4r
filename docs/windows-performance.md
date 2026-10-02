@@ -601,6 +601,59 @@ the game's non-aligned input dimensions without inventing a larger output.
 An initial attempt using 4518x2542 output is rejected by the harness's existing
 range guard before GPU initialization; it is not a GPU or enc0 failure.
 
+### Rejected K input-rounding overrides
+
+The remaining translated K input is about 0.34-0.40 ms in the earlier
+game-sized standalone profile. The private builder now exposes the existing
+surface-store/rounding recipe for both tested input variants. These inputs
+have **zero surface stores**: the actual change replaces eight round-half-away
+idioms with the existing recipe, avoiding constrained arithmetic lowering.
+It is not a native surface-store saving. Build metadata records the recipe's
+counts and refuses a no-op override.
+
+CU and WGP input objects are built from the same clean `fb0adc8` ZLUDA source.
+Both retain accuracy mode and wave32; native FP8 remains disabled. The full
+pipeline control and candidate share all thirteen other code objects,
+including the same private WGP output tails. Only the two input overrides
+are added. Four frames per variant at 512x288, then eight per variant at
+2259x1271 -> 3840x2160 in CU mode, then eight in WGP mode with candidate-first
+order complete **80 finite control/candidate frames**. All forty candidate
+RGB images match exactly. Every expected input launch and valid serializing
+timing is checked; raw logs and module SHA256 values are retained.
+
+| Input median, ms | Translated, CU test | Native CU | Translated, WGP test | Native WGP |
+| --- | ---: | ---: | ---: | ---: |
+| LDR / regular depth / high-resolution MV | 0.350050 | 0.359425 | 0.351000 | 0.358800 |
+| HDR / inverted depth / low-resolution MV | 0.512300 | 0.556350 | 0.412650 | 0.552100 |
+
+These are separate-process diagnostic measurements with eight samples each;
+other unchanged kernels also vary between processes. Neither input candidate
+shows a saving. Both are rejected for game installation and default packaging;
+the validated game configuration keeps translated input. Results:
+`test-results/k-input-native-stores-small` (initial filename; no stores were
+replaced), `k-input-rounding-cu-game-input`,
+`k-input-rounding-wgp-game-input-reverse` and
+`k-input-rounding-experiment-summary.json`.
+
+The comparison script's `-KernelStage input` selects the input hit/timing gate.
+`-CommonTextureRoot` holds output objects identical in both processes; staged
+object hashes are recorded. The ordinary output gate now accepts a translated
+control when its object is absent, while still requiring a native candidate.
+Rebuilding the two original WGP output objects preserves their SHA256 values;
+the default translated-output comparison also passes four finite frames and
+two exact candidate RGB images
+(`k-output-recipe-translated-control-regression`). Input objects remain private
+and are excluded by the game's existing output-only installation allowlist.
+
+Reproduce the WGP experiment with locally built, validated output tails:
+
+```powershell
+foreach ($kernel in @('hiluma_engine_input_depthinv_mvlo_hdr_v2_rel', 'hiluma_engine_input_depthreg_mvhi_ldr_v2_rel')) {
+    .\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -ZludaRoot "$PWD\dist\zluda-windows-wgp-experiment" -ShaderMode wgp -Kernel $kernel -OutputDirectory "$PWD\build\private-input-textures-wgp-gfx1201"
+}
+.\scripts\windows\test-native-texture.ps1 -KernelStage input -TextureRoot "$PWD\build\private-input-textures-wgp-gfx1201" -CommonTextureRoot "$PWD\build\private-textures-wgp-gfx1201" -ZludaRoot "$PWD\dist\zluda-windows-deferred-profile" -InputResolution 2259x1271 -OutputResolution 3840x2160 -Iterations 8 -CandidateFirst -OutputDirectory "$PWD\test-results\k-input-rounding-wgp-retest"
+```
+
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
 4685 frames, all finite. Neither has a backend failure, CPU image copy or an
