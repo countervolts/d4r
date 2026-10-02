@@ -1,0 +1,34 @@
+diff --git a/OptiScaler/hooks/D3D12_Hooks.cpp b/OptiScaler/hooks/D3D12_Hooks.cpp
+index 3b757be..05fc194 100644
+--- a/OptiScaler/hooks/D3D12_Hooks.cpp
++++ b/OptiScaler/hooks/D3D12_Hooks.cpp
+@@ -2217,11 +2217,20 @@ static HRESULT hkD3D12GetInterface(REFCLSID rclsid, REFIID riid, void** ppvDebug
+     return result;
+ }
+ 
++// Device discovery and NGX initialization can overlap. Installing d4r's
++// command hooks can also create a device and re-enter this function. Never
++// overwrite live Detours trampolines from a second installation attempt.
++static std::recursive_mutex deviceHookMutex;
++static bool deviceHookInstalling = false;
+ static void HookToDevice(ID3D12Device* InDevice)
+ {
+-    if (o_CreateSampler != nullptr || InDevice == nullptr)
++    std::lock_guard<std::recursive_mutex> lock(deviceHookMutex);
++    if (o_CreateSampler != nullptr || InDevice == nullptr || deviceHookInstalling)
+         return;
+ 
++    deviceHookInstalling = true;
++    struct InstallationGuard { ~InstallationGuard() { deviceHookInstalling = false; } } installationGuard;
++
+     LOG_DEBUG("Dx12");
+ 
+     // Get the vtable pointer
+@@ -2334,6 +2343,7 @@ static void HookToDevice(ID3D12Device* InDevice)
+ 
+ static void UnhookDevice()
+ {
++    std::lock_guard<std::recursive_mutex> lock(deviceHookMutex);
+     LOG_FUNC();
+ 
+     DetourTransactionBegin();

@@ -1,0 +1,22 @@
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 1f723f1..ef5ec77 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -184,6 +184,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_Ext(unsigned long long InApp
+ 
+             if (result == NVSDK_NGX_Result_Success)
+                 NVNGXProxy::SetDx12Inited(true);
++            else if (State::Instance().dlssExternalBackend)
++                return result;
+         }
+         else
+         {
+@@ -254,6 +256,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init(unsigned long long InApplica
+ 
+             if (result == NVSDK_NGX_Result_Success)
+                 NVNGXProxy::SetDx12Inited(true);
++            else if (State::Instance().dlssExternalBackend)
++                return result;
+         }
+     }
+ 

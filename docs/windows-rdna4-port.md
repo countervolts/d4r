@@ -19,11 +19,64 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
+2026-10-02 issue #10 follow-up ([comment 5958769640](https://github.com/countervolts/d4r/issues/10#issuecomment-5958769640)):
+four new logs confirm that RX 9060 XT / gfx1200 HIP discovery succeeds. The
+Cyberpunk K/M runs never launch the transformer: numeric CUDA NGX capabilities
+report `available=0, feature_init=BAD00004` (FeatureNotFound). The unmatched
+adapter during enumeration is not the main Radeon: its runtime LUID matches.
+GetFeatureRequirements now returns success with AdapterUnsupported for Intel /
+WARP / another nonmatching adapter, while runtime initialization still requires
+the exact HIP architecture and D3D12 LUID.
+
+The feature discovery failure is reproduced on RX 9070 XT without a game,
+using Cyberpunk's unchanged numeric application ID `100152211`. Keeping the
+feature DLL only beside the official core in `d4r/vendor/` fails; placing it
+beside the calling shim in `d4r/` succeeds. Putting it beside the EXE alone is
+insufficient when the call originates in the shim. The installer now stages
+the local feature DLL beside the shim and sets `Libraries.NvngxDlssPath` to
+the directory, as required by OptiScaler's discovery logic. Project identity,
+DLL contents, numeric driver ABI and capability checks remain unchanged.
+
+The standalone reproduction also exposed concurrent/reentrant OptiScaler
+device hook installation: Detours error `0x10dd` clears a live trampoline and
+execution jumps to null. Source patch `0004` serializes installation/removal
+and guards recursion; `0005` forwards numeric NGX init failures instead of
+reporting success. The exact patched frontend source is
+`86b21ea` (base `45a2001`), with pinned submodules verified directly before build.
+
+The quick launcher no longer attaches a debugger by default: Assassin's Creed
+Black Flag Resynced refused the previous debugger launch (`DEADC0DE`). Empty
+stdout/stderr now parse correctly. A clean early process exit with zero DLSS
+frames is inconclusive, as in the SM2 log; an external Steam restart is not
+tracked and must not be reported as successful hardware validation.
+
+Validation on the available RX 9070 XT: all eleven target builds pass; CTest
+20/20; summary parser 9/9 including all four submitted logs. The layout
+regression passes two expected FeatureNotFound cases (direct + OptiScaler),
+then three finite frames each for direct K, OptiScaler K and OptiScaler M.
+Every required native layer executes; GPU NaN/Inf checks pass, CPU frame copies
+and frame age are zero. Direct/OptiScaler K RGB matches bit-for-bit for all
+three frames (max absolute/relative error 0). Reports are under
+`test-results/issue-10-5958769640/`, including `ctest.log`,
+`summary-parser.json`, `layout-final/` and `build-all-targets.json`.
+All five exported OptiScaler patches apply to the pinned upstream sources and
+reproduce its exact committed files (`optiScaler-patches.json`). Reproduce the
+standalone layout/error/coverage/RGB checks with:
+
+```powershell
+.\scripts\windows\test-ngx-feature-layout.ps1 -DiagnosticRoot .\dist\windows-gpu-coverage-gfx1201 -HipRoot .\.tools\therock-10.2.0a20260929\_rocm_sdk_core -ZludaRoot .\dist\zluda-windows-gpu-coverage -NativeRoot .\dist\windows-gpu-coverage-game-gfx1201\d4r\native -OptiScalerDll .\dist\optiscaler-windows-d4r\OptiScaler.dll -NgxCore .\_nvngx.dll -DlssDll .\nvngx_dlss.dll -OutputDirectory .\test-results\ngx-feature-layout
+```
+
+These tests do not validate the reporter's gfx1200 kernels or game image.
+The local Cyberpunk EXE is `D:\Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe`;
+it is located but is not launched or modified while the user is away.
+
 2026-10-02 quick-test packaging: one universal ZIP shares the identical
 OptiScaler/ZLUDA/HIP runtime and selects among all eleven previously compiled
 host/kernel targets using read-only HIP discovery. START-K.cmd / START-M.cmd
 use file pickers, remember validated game/DLL paths, back up replaced files,
-run synchronous output/crash diagnostics, and produce one report ZIP.
+run synchronous output diagnostics, and produce one report ZIP. The initial
+release attached a debugger; the issue #10 follow-up above removes that default.
 RESTORE-GAME.cmd works without HIP discovery or NVIDIA DLL selection. No
 runtime arithmetic changes or additional hardware-support claims are made.
 The short English instructions are in `windows-quick-test.txt`; developer

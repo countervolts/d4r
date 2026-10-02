@@ -51,7 +51,7 @@ foreach ($gpu in Get-D4RGpuTargets) {
     if (!$baseline) { $baseline=$metadata }
     if ($metadata.dlssSha256 -ne $baseline.dlssSha256 -or $metadata.zludaBuild.sourceCommit -ne $baseline.zludaBuild.sourceCommit) { throw 'Input packages do not use the same validated dependencies.' }
 }
-foreach ($name in @('windows-game.ps1','gpu-target.ps1','gpu-preflight.ps1')) {
+foreach ($name in @('windows-game.ps1','game-summary.ps1','gpu-target.ps1','gpu-preflight.ps1')) {
     $entry=Stage (Join-Path $PSScriptRoot $name) "files/common/$name"
     $common+=@{path=$name; sha256=$entry.sha256; version=$entry.version}
 }

@@ -122,6 +122,7 @@ struct Args {
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
+    unsigned long long ngx_app_id = 241534723ull;
     std::string ngx_frontend = "d4r";
     std::string ngx_mode = "init";
     unsigned preset = 11;
@@ -160,6 +161,12 @@ struct Args {
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;
             else if (key == "--ngx-abi") ngx_abi = value;
+            else if (key == "--ngx-app-id") {
+                size_t end = 0;
+                if (value.empty() || value[0] == '-') throw std::runtime_error("Invalid NGX application ID");
+                ngx_app_id = std::stoull(value, &end);
+                if (end != value.size()) throw std::runtime_error("Invalid NGX application ID");
+            }
             else if (key == "--ngx-frontend") {
                 if (value != "d4r" && value != "optiscaler") throw std::runtime_error("ngx-frontend must be d4r or optiscaler");
                 ngx_frontend = value;

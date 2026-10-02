@@ -28,6 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
 . (Join-Path $PSScriptRoot 'gpu-preflight.ps1')
+. (Join-Path $PSScriptRoot 'game-summary.ps1')
 if ($ProfileGpuBoundary -and !$AsyncInterop) { throw '-ProfileGpuBoundary requires -AsyncInterop.' }
 if ($ProfileKernels -and $ProfileKernelsDeferred) { throw 'Choose either serializing or deferred kernel profiling.' }
 if ($ProfileLegacyStream -and !$ProfileKernelsDeferred) { throw '-ProfileLegacyStream requires -ProfileKernelsDeferred.' }
@@ -144,7 +145,10 @@ if ($LocalTextureKernels) {
 }
 # Private local test copies only; these are never added to the public package.
 InstallFile $NgxCore 'd4r/vendor/_nvngx.dll'
-InstallFile $DlssDll 'd4r/vendor/nvngx_dlss.dll'
+# The numeric driver Init ABI searches the calling module's directory; it does
+# not accept FeatureCommonInfo. Keep the exact local feature DLL alongside the
+# d4r shim. Putting it only beside the core in vendor/ produces FeatureNotFound.
+InstallFile $DlssDll 'd4r/nvngx_dlss.dll'
 $bridge = GamePath 'd4r'
 $vendor = GamePath 'd4r/vendor'
 $ini = @"
@@ -162,8 +166,8 @@ RenderPresetForAll=$Preset
 UseGenericAppIdWithDlss=false
 [Libraries]
 NvngxPath=$bridge
-NvngxDlssPath=$vendor\nvngx_dlss.dll
-NvngxFeaturePath=$vendor
+NvngxDlssPath=$bridge
+NvngxFeaturePath=$bridge
 [Hotfix]
 RestoreComputeSignature=false
 RestoreGraphicSignature=false
@@ -187,7 +191,7 @@ $settings = @{
     D4R_HIP_ROOT=(GamePath 'd4r/hip'); HIP_PATH=(GamePath 'd4r/hip');
     D4R_NVCUDA_DLL=(GamePath 'd4r/zluda/nvcuda.dll'); ZLUDA_CUDA_LIB=(GamePath 'd4r/zluda/nvcuda.dll');
     D4R_NVAPI_DLL=(GamePath 'd4r/nvapi/nvapi64.dll'); D4R_NVAPI_BACKEND=(GamePath 'd4r/zluda/nvapi64.dll');
-    D4R_NGX_CORE=(GamePath 'd4r/vendor/_nvngx.dll'); D4R_DLSS_DLL=(GamePath 'd4r/vendor/nvngx_dlss.dll');
+    D4R_NGX_CORE=(GamePath 'd4r/vendor/_nvngx.dll'); D4R_DLSS_DLL=(GamePath 'd4r/nvngx_dlss.dll');
     D4R_FORMAT_MODULE=(GamePath "d4r/pixel_convert_${GpuArch}.hsaco");
     D4R_ZLUDA_NATIVE_DIR=(GamePath 'd4r/native'); D4R_D3D12_COMMAND_BACKEND='1'; D4R_ZLUDA_VERBOSE='1';
     D4R_ZLUDA_WMMA='1'; D4R_ZLUDA_WMMA_FP8='1'; D4R_ZLUDA_WMMA_FP8_NATIVE='0'; D4R_ZLUDA_WMMA_F16_REFERENCE='1';
@@ -288,9 +292,9 @@ try {
     [void]$outTask.GetAwaiter().GetResult(); [void]$errTask.GetAwaiter().GetResult()
     $outFile.Dispose(); $outFile = $null; $errFile.Dispose(); $errFile = $null
     foreach ($file in Get-ChildItem -LiteralPath $game -Filter 'OptiScaler*.log' -File) { Copy-Item -LiteralPath $file.FullName -Destination $OutputDirectory -Force }
-    $stderr = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stderr.log') -Raw
-    $stdout = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stdout.log') -Raw
-    $debugger = Get-Content -LiteralPath (Join-Path $OutputDirectory 'debugger.log') -Raw
+    $stderr = [IO.File]::ReadAllText((Join-Path $OutputDirectory 'd4r.stderr.log'))
+    $stdout = [IO.File]::ReadAllText((Join-Path $OutputDirectory 'd4r.stdout.log'))
+    $debugger = [IO.File]::ReadAllText((Join-Path $OutputDirectory 'debugger.log'))
     $gameExit = [regex]::Match($debugger, 'EXIT code=0x([0-9a-f]+)')
     $gameCrash = $null
     if ([IO.Path]::GetFileName($GameExe) -eq 'SHProto-Win64-Shipping.exe' -and $gameExit.Success -and $gameExit.Groups[1].Value -ne '0') {
@@ -305,21 +309,8 @@ try {
                 reason=[string]$context.FGenericCrashContext.RuntimeProperties.ErrorMessage}
         }
     }
-    # A bounded stop can interrupt the last printf; count only complete records.
-    $frames = [regex]::Matches($stdout, '(?m)^D4R_FRAME cpu_frame_copies=([0-9]+) frame_age=([0-9]+) interop_ngx_ms=([0-9.]+)\r?$')
-    $checks = [regex]::Matches($stdout, '(?m)^D4R_OUTPUT_VALIDATION elements=([0-9]+) nan=([0-9]+) inf=([0-9]+) diagnostics_cpu_bytes=8\r?$')
-    $nonfinite = @($checks | Where-Object { $_.Groups[2].Value -ne '0' -or $_.Groups[3].Value -ne '0' }).Count
-    $launches = [regex]::Matches($stderr, '\[d4r-launch\] kernel="([^"]+)" backend=(native|translated)')
-    $kernels = @($launches | ForEach-Object { $_.Groups[1].Value + ' ' + $_.Groups[2].Value } | Group-Object | ForEach-Object {
-        $parts=$_.Name.Split(' '); @{kernel=$parts[0]; backend=$parts[1]; launches=$_.Count}
-    })
-    @{exitCode=$(if ($gameExit.Success) { '0x' + $gameExit.Groups[1].Value } else { 'diagnostic_timeout' }); runSeconds=$timer.Elapsed.TotalSeconds; preset=$Preset; gameCrash=$gameCrash;
-        nativeLaunches=([regex]::Matches($stderr, '\[d4r-launch\].*backend=native')).Count;
-        completedFrames=$frames.Count; outputValidationRequested=[bool]$ValidateOutput;
-        outputGpuChecks=$checks.Count; nonfiniteOutputs=$nonfinite; kernels=$kernels;
-        previousFrameOutputs=@($frames | Where-Object { $_.Groups[2].Value -ne '0' }).Count;
-        cpuImageCopyFrames=@($frames | Where-Object { $_.Groups[1].Value -ne '0' }).Count;
-        failures=([regex]::Matches($stderr, 'D4R_[A-Z0-9_]*FAILURE\b')).Count} |
+    Get-D4RGameSummary -Stdout $stdout -Stderr $stderr -Debugger $debugger -Preset $Preset `
+        -RunSeconds $timer.Elapsed.TotalSeconds -ValidateOutput ([bool]$ValidateOutput) -GameCrash $gameCrash |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
     Compress-Archive -LiteralPath $OutputDirectory -DestinationPath ($OutputDirectory + '.zip') -Force
     Write-Host "Game diagnostic bundle: $OutputDirectory.zip"

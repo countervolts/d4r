@@ -2,7 +2,8 @@
 param(
     [ValidateSet('run','install','restore')][string]$Action='run',
     [ValidateSet(11,13)][int]$Preset=11,
-    [string]$GameExe, [string]$NgxCore, [string]$DlssDll
+    [string]$GameExe, [string]$NgxCore, [string]$DlssDll,
+    [switch]$CaptureExceptions
 )
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -126,7 +127,7 @@ try {
     Write-Host 'In the game: select DLSS if available; otherwise select FSR/XeSS to let OptiScaler intercept it.'
     Write-Host 'The first launch compiles shaders and can take several minutes. Then play for 30 seconds and EXIT the game normally.'
     & (Join-Path $selectedPackage 'windows-game.ps1') -Action $Action -GameExe $GameExe -NgxCore $NgxCore -DlssDll $DlssDll `
-        -Preset $Preset -ValidateOutput -CaptureExceptions -OutputDirectory $output
+        -Preset $Preset -ValidateOutput -CaptureExceptions:$CaptureExceptions -OutputDirectory $output
     if ($Action -eq 'install') { $status.status='installed-only' }
     else {
         $summary=Get-Content -LiteralPath (Join-Path $output 'summary.json') -Raw | ConvertFrom-Json
@@ -143,7 +144,13 @@ try {
             @($required).Count -eq $(if ($Preset -eq 11) { 11 } else { 5 }) -and
             $status.missingNativeKernels.Count -eq 0 -and $status.translatedNativeKernels.Count -eq 0
         $status.hardwareValidationCompleted=[bool]$passed
-        $status.status=if ($passed) { 'backend-checks-passed-image-still-needs-user-review' } else { 'backend-checks-failed-or-no-dlss-frames' }
+        $status.status=if ($passed) { 'backend-checks-passed-image-still-needs-user-review' }
+            elseif ($summary.completedFrames -eq 0 -and $summary.exitCode -eq '0x0' -and $summary.failures -eq 0) { 'inconclusive-process-exited-without-dlss-frames' }
+            else { 'backend-checks-failed-or-no-dlss-frames' }
+        $status.session=$summary.session
+        if ($status.status -eq 'inconclusive-process-exited-without-dlss-frames') {
+            Write-Host 'The launched process exited without a DLSS frame. A Steam/launcher restart is not tracked by this test. Keep Steam open and select the actual game executable. Send the ZIP if it restarts again.' -ForegroundColor Yellow
+        }
         Write-Host $(if ($passed) { 'Backend checks PASSED. Please also report whether the image looked correct.' } else { 'Test did not pass. Send the diagnostic ZIP; do not guess from the FPS.' }) -ForegroundColor $(if ($passed) { 'Green' } else { 'Yellow' })
     }
 } catch {
@@ -163,4 +170,4 @@ try {
     Write-Host 'Also tell us: GPU model, game name, K or M, and whether the image was correct.'
     Write-Host 'Close the game before running RESTORE-GAME.cmd.'
 }
-if ($status.status -eq 'failed' -or $status.status -eq 'backend-checks-failed-or-no-dlss-frames') { exit 1 }
+if ($status.status -eq 'failed' -or $status.status -eq 'backend-checks-failed-or-no-dlss-frames' -or $status.status.StartsWith('inconclusive-')) { exit 1 }

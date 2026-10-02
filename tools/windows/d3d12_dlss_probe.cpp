@@ -218,13 +218,21 @@ int main(int argc, char** argv) {
         using Requirements = unsigned(*)(IDXGIAdapter*,const d4r::ngx::FeatureDiscoveryInfo*,d4r::ngx::FeatureRequirement*);
         check(shim.symbol<Requirements>("NVSDK_NGX_D3D12_GetFeatureRequirements")(adapter.Get(),&discovery,&requirements),"D3D12 feature requirements");
         if (requirements.FeatureSupported != 0) throw std::runtime_error("D3D12 DLSS requirements unsupported");
+        if (args.ngx_frontend != "optiscaler") {
+            ComPtr<IDXGIAdapter> warp;
+            dx(factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf())), "Requirements WARP adapter");
+            d4r::ngx::FeatureRequirement unsupported{};
+            check(shim.symbol<Requirements>("NVSDK_NGX_D3D12_GetFeatureRequirements")(warp.Get(),&discovery,&unsupported),"WARP feature requirements");
+            if (unsupported.FeatureSupported != 4) throw std::runtime_error("WARP must report AdapterUnsupported without an initialization failure");
+            std::printf("D3D12_REQUIREMENTS warp_supported=0 enumeration_success=1\n");
+        }
         if (args.ngx_abi == "project-legacy") {
             using ProjectInit = unsigned(*)(const char*,int,const char*,const wchar_t*,ID3D12Device*,const void*,unsigned);
             check(shim.symbol<ProjectInit>("NVSDK_NGX_D3D12_Init_with_ProjectID")("24480451-f00d-face-1304-0308dabad187",0,"1.0",directory.c_str(),device.Get(),nullptr,0x15),"D3D12 legacy project Init");
         } else if (args.ngx_abi == "project") {
             using ProjectInit = unsigned(*)(const char*,int,const char*,const wchar_t*,ID3D12Device*,unsigned,const void*);
             check(shim.symbol<ProjectInit>("NVSDK_NGX_D3D12_Init_ProjectID")("24480451-f00d-face-1304-0308dabad187",0,"1.0",directory.c_str(),device.Get(),0x15,nullptr),"D3D12 project Init");
-        } else check(shim.symbol<Init>("NVSDK_NGX_D3D12_Init_Ext")(241534723ull, directory.c_str(), device.Get(), 0x15, nullptr), "D3D12 Init");
+        } else check(shim.symbol<Init>("NVSDK_NGX_D3D12_Init_Ext")(args.ngx_app_id, directory.c_str(), device.Get(), 0x15, nullptr), "D3D12 Init");
         auto shutdown = shim.symbol<Shutdown>("NVSDK_NGX_D3D12_Shutdown");
         struct ShutdownCleanup { Shutdown fn; ~ShutdownCleanup() { (void)fn(); } } shutdownCleanup{shutdown};
         void* parameters = nullptr; check(shim.symbol<Allocate>("NVSDK_NGX_D3D12_AllocateParameters")(&parameters), "AllocateParameters");

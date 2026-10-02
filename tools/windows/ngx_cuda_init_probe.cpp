@@ -88,8 +88,9 @@ int main(int argc, char** argv)
         common.LoggingInfo = {reinterpret_cast<void*>(&ngx_log), 2, false};
         loaded_modules();
         std::printf("STAGE NVSDK_NGX_CUDA_Init sdk=0x15 core=%s dlss=%s\n", args.ngx_core.c_str(), args.dlss_dll.c_str());
-        if (args.ngx_abi == "driver") check(driver_init(241534723ull, data_path.c_str(), 0x15), "NVSDK_NGX_CUDA_Init(driver ABI)");
-        else if (args.ngx_abi == "sdk") check(init(241534723ull, data_path.c_str(), &common, 0x15), "NVSDK_NGX_CUDA_Init(SDK ABI)");
+        std::printf("NGX_APPLICATION id=%llu\n", args.ngx_app_id);
+        if (args.ngx_abi == "driver") check(driver_init(args.ngx_app_id, data_path.c_str(), 0x15), "NVSDK_NGX_CUDA_Init(driver ABI)");
+        else if (args.ngx_abi == "sdk") check(init(args.ngx_app_id, data_path.c_str(), &common, 0x15), "NVSDK_NGX_CUDA_Init(SDK ABI)");
         else if (args.ngx_abi == "project") check(core.symbol<ProjectInit>("NVSDK_NGX_CUDA_Init_ProjectID")(
             "24480451-f00d-face-1304-0308dabad187", 0, "1.0", data_path.c_str(), 0x15, &common), "NVSDK_NGX_CUDA_Init_ProjectID");
         else throw std::runtime_error("--ngx-abi must be driver, sdk or project");

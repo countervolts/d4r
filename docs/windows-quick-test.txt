@@ -43,7 +43,9 @@ IF SOMETHING FAILS:
 - Do not start a second test while the first game is running.
 
 No HIP SDK installation is required; the isolated runtime is included.
-This uses synchronous interop, output checks and crash capture by default.
+This uses synchronous interop and output checks. No debugger is attached by default.
+Exit codes and loaded DLLs are logged. A debugger is only an explicit developer option.
+Your local DLSS DLL is staged beside the d4r shim automatically.
 It is a correctness diagnostic, NOT an FPS benchmark or an optimized daily-use build.
 Colour, depth, motion and output remain in VRAM in the runtime fast path.
 

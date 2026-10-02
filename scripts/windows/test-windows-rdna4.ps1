@@ -314,7 +314,7 @@ RenderPresetForAll=$Preset
 UseGenericAppIdWithDlss=false
 [Libraries]
 NvngxPath=$bridgeDirectory
-NvngxDlssPath=$localDlss
+NvngxDlssPath=$ngxRuntimeDirectory
 NvngxFeaturePath=$ngxRuntimeDirectory
 [Hotfix]
 RestoreComputeSignature=false

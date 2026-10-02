@@ -41,8 +41,23 @@ try {
             if ($LASTEXITCODE) { throw "Source patch failed: $($patch.Name)" }
         }
     }
-    & git -C $SourceRoot submodule update --init --depth 1
-    if ($LASTEXITCODE) { throw 'Pinned OptiScaler submodules failed.' }
+    # Verify existing checkouts directly. A complete local checkout does not
+    # need Git's shell-based submodule helper (or a network connection).
+    $submodulePaths=@(& git -C $SourceRoot config --file .gitmodules --get-regexp '\.path$' | ForEach-Object { ($_ -split ' ',2)[1] })
+    $submodules=@()
+    foreach ($path in $submodulePaths) {
+        $tree=(& git -C $SourceRoot ls-tree HEAD -- $path) -split '\s+',4
+        if ($tree.Count -lt 4 -or $tree[0] -ne '160000') { throw "Missing pinned submodule: $path" }
+        $checkout=Join-Path $SourceRoot $path
+        $actual=if (Test-Path -LiteralPath (Join-Path $checkout '.git')) { (& git -C $checkout rev-parse HEAD).Trim() } else { '' }
+        if ($actual -ne $tree[2]) {
+            & git -C $SourceRoot submodule update --init --depth 1 -- $path
+            if ($LASTEXITCODE) { throw "Pinned OptiScaler submodule failed: $path" }
+            $actual=(& git -C $checkout rev-parse HEAD).Trim()
+            if ($actual -ne $tree[2]) { throw "Wrong submodule revision: $path" }
+        }
+        $submodules+=(' '+$actual+' '+$path)
+    }
     if (!$BuildToolsRoot -and (Test-Path -LiteralPath (Join-Path $repo '.tools/vs2022/MSBuild/Current/Bin/MSBuild.exe'))) {
         $BuildToolsRoot = Join-Path $repo '.tools/vs2022'
     }
@@ -72,7 +87,7 @@ try {
         buildTools=$BuildToolsRoot; msbuildVersion=(& $msbuild -version -nologo | Select-Object -Last 1);
         patches=@($patches | ForEach-Object { @{name=$_.Name; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash} });
         dllSha256=(Get-FileHash -LiteralPath (Join-Path $InstallRoot 'OptiScaler.dll') -Algorithm SHA256).Hash;
-        submodules=@(& git -C $SourceRoot submodule status)}
+        submodules=$submodules}
     $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallRoot 'build-info.json') -Encoding UTF8
     Write-Host "Built OptiScaler with external Windows d4r backend: $InstallRoot"
 } finally { $env:PATH = $previousPath }

@@ -42,7 +42,8 @@ struct HipApi {
         if (result != hipSuccess) throw std::runtime_error(std::string(call) + ": " + hipGetErrorString(result));
     }
     static const char* target_arch() { return D4R_TARGET_ARCH; }
-    int select_architecture(int requested, hipDeviceProp_t& selected, const void* required_luid = nullptr) const {
+    int select_architecture(int requested, hipDeviceProp_t& selected, const void* required_luid = nullptr,
+        bool allow_no_match = false) const {
         // Architecture spoofing invalidates a gfx12 correctness test.
         for (const char* name : {"HSA_OVERRIDE_GFX_VERSION", "HSA_OVERRIDE_GFX_VERSION_0"})
             if (std::getenv(name)) throw std::runtime_error(std::string("Unset architecture override ") + name);
@@ -67,6 +68,7 @@ struct HipApi {
                 selected = props;
             }
         }
+        if (found < 0 && allow_no_match) return -1; // Capability enumeration can include Intel/WARP adapters.
         if (found < 0) throw std::runtime_error(std::string("No selected ") + target_arch() +
             " device for this adapter; use the package matching the actual HIP architecture (see GPU log)");
         require_gpu_target(selected.gcnArchName, target_arch());

@@ -1,6 +1,18 @@
 # Explicit Windows d4r backend
 
 Base: OptiScaler `45a2001303ddff632e279f77aef85ceede5832cb` (2026-09-30).
+
+`0004` serializes D3D12 device hook installation/removal and guards recursive
+device discovery while the d4r command backend installs. The previous frontend
+can start two installations, fail a Detours transaction with `0x10dd`, clear
+live original-function pointers and call null. This was reproduced in the
+numeric-ID standalone harness; no game was required.
+
+`0005` propagates numeric Init/Init_Ext failures for the explicitly selected
+external backend, matching the existing ProjectID behavior. FeatureNotFound
+must fail initialization instead of being hidden until repeated CreateFeature
+attempts. `Libraries.NvngxDlssPath` takes a directory, not the DLL filename;
+the Windows installer and standalone runner now use that directory.
 The modifications to OptiScaler are GPL-3.0, matching its upstream license.
 No NVIDIA DLL is supplied or patched.
 

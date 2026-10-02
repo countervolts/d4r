@@ -22,7 +22,15 @@ executing kernels. It rejects another architecture's package and a local
 D3D12 proxy identifying itself as vkd3d/Wine, producing one diagnostic ZIP.
 RX 9060 XT needs gfx1200: the old gfx1201-only package fails before DLSS
 initialization on it. Use native D3D12. On an untested GPU, start with
-synchronous K and output/exception diagnostics.
+synchronous K and output diagnostics. The ordinary launcher does not attach
+a debugger. `-CaptureExceptions` is an explicit developer option; games with
+anti-debug protection can refuse it.
+
+Numeric CUDA driver NGX initialization searches for `nvngx_dlss.dll` beside
+the calling d4r shim. The installer stages your local feature DLL in `d4r/`
+and the original NVIDIA core in `d4r/vendor/`. `Libraries.NvngxDlssPath` is
+the feature directory. Keeping the feature DLL only in `vendor/` causes
+`BAD00004` (FeatureNotFound) in numeric-ID games such as Cyberpunk.
 
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
 OptiScaler using the scripts in `scripts/windows`, then run:

@@ -13,7 +13,7 @@ transformer networks on Windows 11 / RX 9070 XT (gfx1201), using patched
 ZLUDA/HIP and VRAM buffers/shared fences directly. Inputs and output belong to
 the current frame; this path does not use Wine, Proton or CPU image staging.
 The Windows backend, command-list hooks and diagnostics live in `tools/windows`.
-All sixteen Windows hardware gates pass, and queued-frame/feature-recreation K
+All twenty Windows diagnostic gates pass, and queued-frame/feature-recreation K
 outputs match synchronous controls exactly. A five-minute K/4K Silent Hill 2
 run completes 16941 finite frames without backend errors. Performance remains
 under development; asynchronous interop is opt-in and requires one queue.
@@ -37,6 +37,12 @@ or START-M.cmd, select your game and local NVIDIA DLLs, then send the single
 diagnostic ZIP after exiting. RESTORE-GAME.cmd restores replaced files. Read
 [the short English instructions](docs/windows-quick-test.txt). Corresponding
 sources are a separate release asset; the test requires no SDK installation.
+The updated quick test launches without an attached debugger, stages the
+locally supplied DLSS DLL beside the shim for numeric CUDA NGX initialization,
+and reports a launcher exit with zero frames as inconclusive. Source fixes
+also serialize OptiScaler device-hook installation and forward numeric init
+errors. These fixes pass standalone direct/OptiScaler K and OptiScaler M on
+RX 9070 XT; other GPUs and the reported Cyberpunk game still need testing.
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

@@ -66,6 +66,7 @@ if ($entries.Count -ne 16) { throw "Expected 11 K and 5 M native objects; found 
     Set-Content -LiteralPath (Join-Path $PackageRoot 'd4r/native/d4r-kernels.txt') -Encoding ASCII
 $stagedFiles.Add('d4r/native/d4r-kernels.txt')
 Stage (Join-Path $repo 'scripts/windows/windows-game.ps1') 'windows-game.ps1'
+Stage (Join-Path $repo 'scripts/windows/game-summary.ps1') 'game-summary.ps1'
 Stage (Join-Path $repo 'scripts/windows/gpu-target.ps1') 'gpu-target.ps1'
 Stage (Join-Path $repo 'scripts/windows/gpu-preflight.ps1') 'gpu-preflight.ps1'
 Stage (Join-Path $repo 'tools/windows/gpu-targets.json') 'gpu-targets.json'
