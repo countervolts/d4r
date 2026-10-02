@@ -4,6 +4,9 @@ Validated hardware: Windows 11 x64 / Radeon RX 9070 XT / gfx1201. Native K and
 M transformer kernels pass standalone D3D12 + OptiScaler checks. Silent Hill 2
 K now renders real menu frames and M renders a saved gameplay level with
 GPU NaN/Inf checks. Both K and M pass 3840x2160 output on this machine.
+Cyberpunk 2077 2.31 also reaches saved gameplay with K and M at 3840x2160:
+all required native transformer layers execute and output checks pass.
+The [port notes](windows-rdna4-port.md) record session counts and limitations.
 Performance measurements and their controls are recorded in
 [windows-performance.md](windows-performance.md). This is a
 development package; no NVIDIA proprietary DLL is included.

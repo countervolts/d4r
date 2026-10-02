@@ -42,7 +42,12 @@ locally supplied DLSS DLL beside the shim for numeric CUDA NGX initialization,
 and reports a launcher exit with zero frames as inconclusive. Source fixes
 also serialize OptiScaler device-hook installation and forward numeric init
 errors. These fixes pass standalone direct/OptiScaler K and OptiScaler M on
-RX 9070 XT; other GPUs and the reported Cyberpunk game still need testing.
+RX 9070 XT. Cyberpunk 2077 2.31 also reaches saved 4K gameplay with K and M:
+13,145 K session frames and 5,268 M frames pass GPU output checks, every
+required native transformer layer executes, and no backend failures,
+previous-frame outputs or CPU image copies occur. Sessions include menus and
+loading; this synchronous diagnostic is not an FPS benchmark. Other GPUs,
+including the reporter's RX 9060 XT / gfx1200, still require hardware testing.
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

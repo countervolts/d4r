@@ -13,7 +13,7 @@ Windows branch is unprotected. Further validated Windows changes can go there
 directly. K performance remains a separate open gate.
 This file records current results followed by the dated development history. Standalone DLSS K/M
 works on the real Windows GPU, including the patched OptiScaler frontend.
-Silent Hill 2 now renders through the Windows backend; gameplay and output
+Silent Hill 2 and Cyberpunk 2077 now render through the Windows backend; gameplay and output
 validation coverage are recorded below. Performance and game coverage have
 explicit limits; the validated package keeps conservative arithmetic.
 
@@ -79,9 +79,56 @@ The follow-up compact release is `windows-quick-test-20261002-issue10` in the
 fork, with all eleven targets and a separate exact GPL corresponding-source
 asset. Native network arithmetic and conservative scheduling are unchanged.
 
-These tests do not validate the reporter's gfx1200 kernels or game image.
-The local Cyberpunk EXE is `D:\Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe`;
-it is located but is not launched or modified while the user is away.
+The published [issue #10 prerelease](https://github.com/xdfnx-dev/d4r/releases/tag/windows-quick-test-20261002-issue10)
+contains the fixes above. GitHub reports all three assets uploaded; their
+sizes and SHA256 digests match the locally checked archives. The runtime has
+283 files and 187 correctly targeted native code objects; exact corresponding
+GPL sources are a separate download. Package source is `52d9872`, host binaries
+are from `3d62b98`, and the patched frontend is `86b21ea`.
+
+2026-10-03 local Cyberpunk validation, after the user's explicit authorization
+to launch and enter gameplay: Cyberpunk 2077 **2.31** at
+`D:\Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe` loads a saved Night City
+street scene through OptiScaler and d4r for both K and M on RX 9070 XT.
+The game's existing FSR4 Performance selection is intercepted by OptiScaler's
+DLSS backend; native hit logs establish the actual K/M execution. Numeric
+application ID `100152211` is preserved. Input is **1920x1080**, output is
+**3840x2160**, ray tracing and frame generation are off. The fresh developer
+package uses the released binaries, synchronous interop, verbose logging and
+full GPU output validation, with no attached debugger or private kernels.
+
+| Session | Completed frames / GPU output checks | Native launches | Required native layers |
+| --- | --- | --- | --- |
+| K / preset 11 | 13,145 / 13,145 | 144,595 | All 11, each once per frame |
+| M / preset 13 | 5,268 / 5,268 | 52,680 | All 5; enc3 runs six times per frame |
+
+Both sessions exit normally (`0x0`), initialize the feature successfully
+(`0x00000001`) and record **zero NaN/Inf outputs, previous-frame outputs, CPU
+image-copy frames or backend failures**. Counts include menu/loading frames
+as well as actual gameplay; they are not gameplay-only counts. Expected
+translated input/output helpers remain in K, and M retains translated
+enc0/dec0/downsample/post kernels alongside its five native transformer layers.
+The visible street scene and saved screenshots confirm an image is produced;
+these checks do not establish visual equivalence to DLSS on a physical RTX.
+
+Separate 30-second stationary gameplay captures record **54.447 FPS / 94.800%
+mean AMD ADLX GPU usage for K**, and **25.717 FPS / 96.267% for M**. These are
+synchronous correctness diagnostics with verbose/output-check overhead,
+not optimization benchmarks. The two saves/camera positions differ slightly;
+do not treat this as a controlled K-versus-M performance comparison or compare
+it directly with the optimized Silent Hill 2 configuration below.
+
+Reports, stdout/stderr, loaded DLL/driver information, screenshots and diagnostic
+ZIPs are retained under `test-results/issue-10-5958769640/` in
+`cyberpunk-k-sync/`, `cyberpunk-m-sync/` and their `*-capture/` directories.
+`cyberpunk-validation.json` records the automated counter/native-hit acceptance
+checks and `cyberpunk-restore.json` records restoration. The game is closed and
+the original installation restored, including removal of the test `dxgi.dll`.
+Its existing game DLSS DLL was preserved with SHA256
+`AD3E9C07EE864E9702032459A59C6825166766C2CB75BD0318D5626595693BDB`.
+Existing graphics settings and progression saves were not edited by the test.
+The reporter's **RX 9060 XT / gfx1200** kernels and game image still require
+their own hardware retest; local gfx1201 results do not validate that card.
 
 2026-10-02 quick-test packaging: one universal ZIP shares the identical
 OptiScaler/ZLUDA/HIP runtime and selects among all eleven previously compiled
