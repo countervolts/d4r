@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--zluda-root', type=pathlib.Path, required=True)
     parser.add_argument('--kernel', required=True)
     parser.add_argument('--output-directory', type=pathlib.Path, required=True)
+    parser.add_argument('--shader-mode', choices=['cu', 'wgp'], default='cu')
     args = parser.parse_args()
     if not re.fullmatch(r'hiluma_engine_output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?_v2_rel', args.kernel):
         parser.error('this initial validated build recipe supports K v2 output variants only')
@@ -39,6 +40,7 @@ def main():
     env = os.environ.copy()
     env.update(D4R_PREFER_ACCURACY='1', D4R_ZLUDA_WMMA='1', D4R_ZLUDA_WMMA_FP8='1',
                D4R_ZLUDA_WMMA_FP8_NATIVE='0', D4R_ZLUDA_WMMA_F16_REFERENCE='1',
+               D4R_ZLUDA_WGP='1' if args.shader_mode == 'wgp' else '0',
                D4R_ZLUDA_IMPLICIT_MAX_BLOCK='256')
     for name in ('D4R_ZLUDA_IGNORE_DENORMAL', 'D4R_ZLUDA_FAST_MATH', 'D4R_ZLUDA_WMMA_F32ACC',
                  'D4R_ZLUDA_WAVE64', 'D4R_ZLUDA_PROFILE'):
@@ -74,9 +76,17 @@ def main():
     run('assemble', [tools['llvm-as'], ir, '-o', extra])
     env['D4R_ZLUDA_EXTRA_BC'] = str(extra)
     run('emit', [emitter, edited, work / 'emitted', 'gfx1201'])
+    optimized = (work / 'emitted/opt.ll').read_text()
+    definition = re.search(r'^define amdgpu_kernel .*@' + re.escape(args.kernel) + r'\(.*#(\d+)\s*\{', optimized, re.M)
+    if not definition:
+        raise RuntimeError('Cannot verify shader mode: kernel attributes are missing')
+    attributes = re.search(r'^attributes #' + definition[1] + r' = \{([^\n]+)\}', optimized, re.M)
+    expected_mode = '-cumode' if args.shader_mode == 'wgp' else '+cumode'
+    if not attributes or expected_mode not in attributes[1]:
+        raise RuntimeError(f'Emitter did not honor {args.shader_mode} mode; build the corresponding ZLUDA patch first')
     shutil.copyfile(work / 'emitted/module.hsaco', output / (args.kernel + '.hsaco'))
     run('manifest', [sys.executable, repo / 'kernels/tools/kernel_manifest.py', output, args.dlss_dll])
-    metadata = dict(architecture='gfx1201', accuracy=True, nativeFP8=False,
+    metadata = dict(architecture='gfx1201', accuracy=True, nativeFP8=False, shaderMode=args.shader_mode,
                     privateNvidiaDerivedCode=True, validation='not yet validated; do not install before comparison',
                     dlssSha256=hashlib.sha256(args.dlss_dll.read_bytes()).hexdigest(),
                     zludaBuild=json.loads((zluda / 'build-info.json').read_text(encoding='utf-8-sig')),

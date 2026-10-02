@@ -1,8 +1,11 @@
 [CmdletBinding()]
-param([string]$TextureRoot, [string]$OutputDirectory, [int]$Iterations=8, [string]$OutputResolution='512x288')
+param([string]$TextureRoot, [string]$ControlTextureRoot, [string]$ZludaRoot,
+    [string]$OutputDirectory, [int]$Iterations=8, [string]$OutputResolution='512x288', [string]$InputResolution,
+    [switch]$CandidateFirst)
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$TextureRoot) { $TextureRoot=Join-Path $repo 'build/private-textures-gfx1201' }
+if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo 'test-results/k-native-texture-reference' }
 if ($OutputResolution -notmatch '^([0-9]+)x([0-9]+)$') { throw 'OutputResolution must be WIDTHxHEIGHT.' }
 $outputWidth=[int]$Matches[1]; $outputHeight=[int]$Matches[2]
@@ -13,19 +16,34 @@ foreach ($directory in @((Join-Path $repo 'build/native-k-gfx1201'),$TextureRoot
 }
 & python (Join-Path $repo 'kernels/tools/kernel_manifest.py') $combined (Join-Path $repo 'nvngx_dlss.dll')
 if ($LASTEXITCODE) { throw 'Combined private manifest failed.' }
+$controlNative=Join-Path $repo 'build/native-k-gfx1201'
+if ($ControlTextureRoot) {
+    $controlNative=Join-Path $OutputDirectory 'control-private-native'
+    New-Item -ItemType Directory -Force $controlNative | Out-Null
+    foreach ($directory in @((Join-Path $repo 'build/native-k-gfx1201'),$ControlTextureRoot)) {
+        Get-ChildItem -LiteralPath $directory -Filter '*.hsaco' | Copy-Item -Destination $controlNative -Force
+    }
+    & python (Join-Path $repo 'kernels/tools/kernel_manifest.py') $controlNative (Join-Path $repo 'nvngx_dlss.dll')
+    if ($LASTEXITCODE) { throw 'Control private manifest failed.' }
+}
 $settings=@{D4R_VALIDATE_OUTPUT='1'; D4R_PROFILE_STAGES='1'; D4R_ZLUDA_PROFILE='1'; D4R_QUIET_API='1';
+    D4R_ZLUDA_WMMA='1'; D4R_ZLUDA_WMMA_FP8='1'; D4R_ZLUDA_WMMA_FP8_NATIVE='0';
+    D4R_ZLUDA_WMMA_F16_REFERENCE='1'; D4R_ZLUDA_PROFILE_DEFERRED=$null;
     ZLUDA_CACHE_DIR=(Join-Path $repo 'build/zluda-cache-windows'); PYTHONPATH=(Join-Path $repo '.tools/python/vendor');
     D4R_ZLUDA_NATIVE_DIR=$null}
 $old=@{}
 try {
     foreach ($key in $settings.Keys) { $old[$key]=[Environment]::GetEnvironmentVariable($key,'Process'); [Environment]::SetEnvironmentVariable($key,$settings[$key],'Process') }
     foreach ($flags in @(0,11)) {
-        foreach ($mode in @('control','candidate')) {
-            $env:D4R_ZLUDA_NATIVE_DIR=if ($mode -eq 'control') { Join-Path $repo 'build/native-k-gfx1201' } else { $combined }
-            $arguments=@{RuntimeProfile='therock'; ZludaRoot=(Join-Path $repo 'dist/zluda-windows-final');
+        $kernel=if ($flags -eq 11) { 'hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel' } else { 'hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel' }
+        $order=if ($CandidateFirst) { @('candidate','control') } else { @('control','candidate') }
+        foreach ($mode in $order) {
+            $env:D4R_ZLUDA_NATIVE_DIR=if ($mode -eq 'control') { $controlNative } else { $combined }
+            $arguments=@{RuntimeProfile='therock'; ZludaRoot=$ZludaRoot;
                 PackageRoot=(Join-Path $repo 'dist/windows-rdna4-command-list'); NgxCore=(Join-Path $repo '_nvngx.dll');
                 DlssDll=(Join-Path $repo 'nvngx_dlss.dll'); NgxMode='d3d12'; NgxAbi='project-legacy'; Preset=11;
                 NgxCreateFlags=$flags; NgxOutputResolution=$OutputResolution; NgxOnly=$true; RequireNativeNetwork=$true; CommandListBackend=$true;
+                NgxInputResolution=$InputResolution;
                 PixelProfile='depth-stencil'; BarrierMode='inherited-legacy'; CaptureExceptions=$true; EarlyIndirectProbe=$true;
                 Iterations=$Iterations; TimeoutSeconds=300; OptiScalerDll=(Join-Path $repo 'dist/optiscaler-windows-d4r/OptiScaler.dll');
                 OutputDirectory=(Join-Path $OutputDirectory "$mode-$flags")}
@@ -33,9 +51,13 @@ try {
             if ($LASTEXITCODE) { throw "Texture $mode flags=$flags workload failed." }
             & python (Join-Path $repo 'tools/windows/profile_report.py') $arguments.OutputDirectory --output (Join-Path $arguments.OutputDirectory 'profile.json')
             if ($LASTEXITCODE) { throw 'Texture profile report failed.' }
+            $profile=Get-Content -LiteralPath (Join-Path $arguments.OutputDirectory 'profile.json') -Raw | ConvertFrom-Json
+            $samples=@($profile.kernels | Where-Object { $_.kernel -eq $kernel -and $_.backend -eq 'native' -and $_.phase -eq 'main' -and $_.serializing })
+            if ($samples.Count -ne 1 -or $samples[0].gpuMs.samples -ne $Iterations) {
+                throw "Missing valid serializing output-kernel timings for $mode flags=$flags; retain this run as correctness evidence only."
+            }
         }
         $control=Join-Path $OutputDirectory "control-$flags"; $candidate=Join-Path $OutputDirectory "candidate-$flags"
-        $kernel=if ($flags -eq 11) { 'hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel' } else { 'hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel' }
         $stderr=Get-Content -LiteralPath (Join-Path $candidate 'd3d12-evaluate-preset-11.stderr.log') -Raw
         $hits=[regex]::Matches($stderr, ('\[d4r-launch\] kernel="' + $kernel + '" backend=native')).Count
         if ($hits -ne $Iterations) { throw "Texture override was not executed on every frame: $kernel hits=$hits" }
@@ -43,6 +65,9 @@ try {
         if ($LASTEXITCODE) { throw "Texture flags=$flags full-frame RGB mismatch; preserve baseline." }
     }
     @{passed=$true; architecture='gfx1201'; framesPerVariant=$Iterations; outputResolution=$OutputResolution; createFlags=@(0,11); strictRgb=$true;
+        inputResolution=$InputResolution;
+        serializingProfile=$true; candidateFirst=[bool]$CandidateFirst;
+        controlTextureRoot=$ControlTextureRoot;
         manifestSha256=(Get-FileHash -LiteralPath (Join-Path $TextureRoot 'd4r-kernels.txt') -Algorithm SHA256).Hash.ToLowerInvariant();
         privateNvidiaDerivedCode=$true; source=(Get-Content -LiteralPath (Join-Path $TextureRoot 'build-info.json') -Raw | ConvertFrom-Json)} |
         ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $TextureRoot 'validation.json') -Encoding UTF8

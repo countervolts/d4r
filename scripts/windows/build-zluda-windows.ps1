@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [switch]$CacheTestsOnly, [int]$Jobs = 4)
+param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [switch]$CacheTestsOnly, [switch]$CompilerTestsOnly, [int]$Jobs = 4)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$SourceRoot) { $SourceRoot = Join-Path $repo 'external/ZLUDA' }
@@ -33,6 +33,14 @@ Push-Location $SourceRoot
 try {
     $cargo = Join-Path $rust 'bin/cargo.exe'
     if (!(Test-Path $cargo)) { throw 'Run setup-rust-toolchain.ps1 first.' }
+    if ($CompilerTestsOnly) {
+        $ErrorActionPreference = 'Continue'
+        & $cargo test --locked --release --target x86_64-pc-windows-gnu -p llvm_zluda shader_mode_tests `
+            2>&1 | Tee-Object (Join-Path $target 'compiler-tests.log')
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE) { throw "ZLUDA compiler regression tests failed ($LASTEXITCODE)" }
+        return
+    }
     if ($CacheTestsOnly) {
         $ErrorActionPreference = 'Continue'
         & $cargo test --locked --release --target x86_64-pc-windows-gnu -p zluda_cache `

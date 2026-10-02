@@ -17,20 +17,51 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
-**Current milestone: K performance remains open.** Async submission improves
-the user's 4K Silent Hill 2 reading to 62 FPS / 63% GPU utilization. A subsequent
-controlled 30-second foreground-scene capture records 63.574 FPS, compared with roughly 80+
-FPS / 100% GPU utilization with FSR4 on this system. Functional K/M and the
-reproducible archive do not close this gate. Prioritize K queue scheduling and
-host synchronization; postpone further M/FP8 optimization. These user readings
-are not a controlled same-scene benchmark. Do not infer a hardware CPU limit
-from utilization alone.
+**Current milestone: K performance remains open.** The latest unprofiled 4K
+Silent Hill 2 scene capture records 64.661 FPS. Functional K/M and the
+reproducible archive do not close this gate. Prioritize measured K kernel cost
+and retain queue/synchronization checks; postpone further M/FP8 optimization.
+The user's approximately 80+ FPS with FSR4 is not a captured same-scene control.
 
 A subsequent unprofiled K/4K capture records **64.661 FPS** with direct AMD
 ADLX mean usage **93.183%**, core clock **3124.667 MHz** and board power
-**316.717 W**. The previous 63% reading is from a different sensor/window;
-its discrepancy remains unresolved. This new capture places GPU kernel cost
+**316.717 W**. The user identified the previous 63% reading as Task Manager,
+which is distinct from ADLX's device-wide metric. This capture places GPU kernel cost
 at the center of the next K investigation, while retaining queue measurements.
+
+Native replay benchmarks now compare fresh exact allocations before timing,
+support event/dispatch profiling and paired batches, retain independent host
+completion intervals, and reject invalid or incomplete timings. Eleven K
+same-module controls pass both timing modes. Real K/4K enc0/enc1/dec0 captures
+and CU/WGP, cache, token-tiling and packed-storage experiments are recorded in
+[windows-performance.md](windows-performance.md#controlled-native-replay-timings).
+Packed storage lowers enc1 VGPRs but does not speed it up. Enc0's shared-V
+implementation preserves every tested output and gives about a 5% isolated
+layer saving at both small and 4K workloads; the strict gfx12 baseline now
+selects it. Other K layers, M and arithmetic remain unchanged. The previous direct-F16 experiment's
+saved-control selection was corrected to the current strict-normalization
+baseline; it remains rejected. K performance is still an open gate.
+
+The private output-tail WGP candidate gives a lower event median in both
+control-first and candidate-first K/4K tests, with exact RGB across 96 finite
+control/candidate frames. This is a separate-process diagnostic result, not
+game FPS. ZLUDA source `fb0adc8714f57647320f0601533ec50331e378b0` is rebuilt
+cleanly in `dist/zluda-windows-wgp-experiment`; optional patch 0018 preserves
+CU defaults and wave/arithmetic semantics. All seventeen CTest gates pass
+with defaults, and all six ZLUDA gates also pass with WGP explicitly enabled.
+All seventeen patches (0002..0018) apply to clean base `ee2f25a`.
+
+Enc0 full-frame controls pass at 1920x1080 and the game's 2259x1271 input,
+both outputting 3840x2160: 28 frames finite, all 14 candidate RGB images exact.
+The exact CMake enc0 object passes a fresh replay/paired benchmark; the other
+fifteen ordinary K/M objects retain their prior SHA256. The combined enc0 +
+WGP-output async/burst/recreation gate passes twelve further game-sized frames
+with all six async RGB images exact (`k-enc0-shared-wgp-async-game-input`).
+`-InputResolution` exposes actual render dimensions without changing the
+harness's output bounds. Empty task environment variables are removed from
+probe/game children so disabled diagnostic flags stay disabled; GPU comparisons
+now require actual valid timing samples. Commands, rejected experiments and
+the initial diagnostic/cache failures are recorded in `windows-performance.md`.
 
 The next diagnostics add `-ProfileCudaApi` (ZLUDA patch 0015): aggregate host
 CUDA API durations without HIP-event waits. Boundary stages now separate

@@ -337,8 +337,8 @@ over 1935 presents. ADLX's sixty polls report mean usage **93.183%**, core
 clock **3124.667 MHz**, board power **316.717 W**, temperature 57 C and hotspot
 82.9 C. Mean PresentMon GPU busy/wait is 14.551/0.800 ms. All presents retain
 Independent Flip / SyncInterval 0. This records high device-wide driver usage
-in this run; the previous user-reported 63% has not been captured from the same
-sensor/window and its discrepancy is unresolved. Do not infer a physical CPU
+in this run; the user identified the earlier 63% reading as Task Manager.
+It is not the same measurement as ADLX device-wide usage. Do not infer a physical CPU
 limit, isolated shader occupancy or a FSR4 speed comparison. Query overhead
 is median 0.094 ms per 500 ms poll, with a roughly 12 ms first query. Results:
 `test-results/silent-hill2-k-telemetry-unprofiled-4k`. The game stability
@@ -355,10 +355,13 @@ removes most conversion instructions (1066 static F16/F32 conversions become
 two) and reduces main-kernel VGPRs from 218 to 201; LDS remains 24576 bytes,
 with zero spills. These are compiler/ISA counts, not GPU time or occupancy.
 The candidate is rejected before moving to another layer: its real replay
-changes 1182727 half codes in the output allocation, max absolute difference
+changes 1187603 half codes in the output allocation, max absolute difference
 0.0390625 from the validated baseline. All values are finite. Against the
-current twelve-window NumPy reference, PSNR drops from baseline 78.7702 dB
-to 69.2377 dB; max absolute error rises from 0.009765625 to 0.0390625.
+current twelve-window NumPy reference, PSNR drops from baseline 93.7527 dB
+to 69.2377 dB; max absolute error rises from 0.0078125 to 0.0390625.
+The original comparison incorrectly selected a pre-normalization-fix saved
+output (78.7702 dB); a fresh replay matches `k-real-strict-dual-reference/enc1`
+exactly and supplies the corrected baseline here. The rejection still holds.
 Two independent PTX windows give 70.4022/70.08 dB. These pass the existing
 coarse reference thresholds but do not satisfy this optimization's baseline
 preservation gate. No game installation or performance claim follows.
@@ -389,6 +392,173 @@ the two instruction paths are equivalent; JSON retains `baselineEquivalent`
 and `gameOptimizationAccepted`. The second compiles the rejected experiment
 in a separate directory and generates no override manifest. Intrinsic API:
 [Clang gfx12 FP16 WMMA](https://clang.llvm.org/docs/AMDGPUBuiltinReference.html#builtin-amdgcn-wmma-f16-16x16x16-f16-w32-gfx12).
+
+### Controlled native replay timings
+
+`native_replay_probe` now supports `--benchmark-timing events|dispatch` and
+`--benchmark-batch 1..256`. Dispatch mode uses the documented
+`hipExtModuleLaunchKernel` start/stop events, with work-item dimensions derived
+from each module's launch metadata and flags zero. It does not change wave
+order or arithmetic. Control/candidate can have different native block/grid
+metadata; each launch uses its own geometry. The default remains event markers.
+
+Each AB/BA sample restores captured inputs outside timing, submits a series,
+waits for its end event, and logs both the event interval and independent host
+launch-to-completion interval divided by launch count. These are isolated
+diagnostics: batch intervals include dispatch/queue gaps and are not exclusive
+instruction execution times, frame latency, or game FPS. Zero, negative,
+nonfinite or event intervals exceeding the enclosing host interval are retained
+as `D4R_REPLAY_PROFILE_INVALID` and excluded. Reports keep timing sources,
+batch counts and log files separate, retaining host statistics and invalid
+samples; no partially valid pair is accepted by the benchmark runner.
+
+The new runner first executes fresh ordinary control/candidate replays and
+compares every allocation's SHA256 before timing. It stops at any mismatch,
+then checks the control output again after every benchmark. A successful
+timing run does not replace the independent NumPy/PTX correctness gates.
+Captured weights/IR and GPU outputs remain private.
+
+```powershell
+.\scripts\windows\benchmark-native-replay.ps1 -Module "$PWD\build\native-k-gfx1201\dltss_pwin_enc1_layer.hsaco" -Candidate "$PWD\build\native-k-gfx1201\dltss_pwin_enc1_layer.hsaco" -FixtureDirectory "$PWD\test-results\ngx-k-fp16-fenced-capture\replay\replay-000001-dltss_pwin_enc1_layer"
+```
+
+The same-module enc1 control has all exact allocations and 32 valid pairs per
+mode. Median per-launch times at the captured 512x288 workload are 0.054850 ms
+with separate single-launch events and 0.089700 ms with single-launch dispatch
+events. At batch 64 they converge to 0.048213/0.048017 ms. Thus dispatch events
+alone do not remove timing overhead; use the batch/host cross-check. All eleven
+K same-module controls pass sixteen pairs at batch 64 in both modes, including
+dec4. This does not fix or explain the previously recorded negative ZLUDA
+timestamps. Results: `test-results/k-replay-timing-methods` and
+`test-results/k-all-layers-batch-profile`.
+
+One-frame standalone K/4K HDR captures provide actual enc0/enc1/dec0 inputs.
+Each harness run uses the eleven validated native layers and private output
+tail, passes the finite-output scan and completes without network fallback. At this
+synthetic resolution enc1 uses a 61x35 grid; this workload is distinct from
+the game's 2259x1271 input. Experiments retain F32 WMMA instructions and strict
+FP16 rounding. `build-native-k-experiment.ps1` builds separate objects and no
+override manifest; no experimental object is installed by the game runner.
+
+CU/WGP and non-temporal load/store/both on enc1 preserve every allocation but
+do not improve its paired 4K timings. Position-only token tiling also preserves
+outputs: enc1 with two tiles and shared V spills four VGPRs and is about 9%
+slower; one-tile shared V has no measured gain. The two-tile shared-V enc0 run
+initially has a roughly 4% lower median paired ratio amid scheduling variance.
+A repeat with 64 AB/BA pairs at batch 64 gives control/candidate medians
+0.297060/0.282559 ms (events) and 0.299988/0.285011 ms (dispatch), with median
+paired ratios 0.950863/0.952240. A 512x288 replay independently gives ratios
+0.950396/0.952582. Both tested dec0 shared-V variants are slower or indistinguishable.
+
+Enc0 now selects shared V for the gfx12 strict baseline, preserving the existing
+two-token tiles, F32 WMMA and FP16 rounding. Gfx11 and arithmetic experiments
+retain their prior selection. `D4R_K_PRIVATE_V` restores the previous enc0 for
+comparison; the build helper exposes `-PrivateValues`. The exact CMake-produced
+object also passes a fresh 4K replay and 32 paired batch-64 samples, with ratios
+0.955418/0.948494. Its ELF hash differs from the experimental object; `.text`
+and `.rodata` match exactly, and numerical validation is repeated on the actual
+object. The other fifteen ordinary K/M objects remain byte-identical.
+Gfx1101 enc0/enc1 compile-only controls retain identical code and constant
+sections to their original sources; no RDNA3 hardware execution is claimed.
+
+Full K controls/candidates complete sixteen 4K frames, and twelve more with
+the game's 2259x1271 input and 3840x2160 output. Every compared RGB half code
+matches, all RGBA scans are finite. Results: `test-results/k-enc0-shared-full-4k`,
+`k-enc0-shared-full-game-input`, `k-4k-enc0-pos2-shared-repeat`,
+`k-enc0-pos2-shared-small` and `k-enc0-default-shared-4k`. The saving is about
+0.015 ms for enc0 in the isolated 4K replay, not 5% application FPS.
+
+The separate `D4R_K_PACKED_ACC` experiment stores already-rounded accumulators
+as half vectors between steps, widening for each unchanged F32 WMMA and
+rounding its F32 output back to half. The ordinary `acc8v` alias remains F32.
+Enc0/enc1/dec0 4K replays match every allocation exactly. Enc1 main VGPRs fall
+218 -> 195, LDS remains 24576 bytes and spills stay zero, but paired GPU time
+does not improve; enc0 is about 4% slower and dec0 about 1% slower. Combining
+packed storage with enc1 two-tile shared V is about 13% slower. The flag remains
+off. Smaller register counts alone are not evidence of an optimization.
+Raw results are under `test-results/k-4k-*-packed-acc` and
+`test-results/k-4k-enc1-pos2-shared-packed`.
+
+A direct recompilation of the private output tail's optimized LLVM IR with
+TheRock Clang 24 fails in instruction selection with `unsupported library
+call operation` (driver exit 1, backend exit 70, exception 0xE0000046). The generated crash
+reproducer/log are retained locally; strict FP is not removed to work around
+this. The working LLVM 22 output object remains selected. The HDR tail's
+metadata is wave32, 133 VGPRs, 6912 LDS bytes and no spills; LDR uses 128 VGPRs
+with the same LDS and no spills. These are static resource counts, not actual
+occupancy. Compiler scheduling hints are documented in the
+[LLVM AMDGPU backend guide](https://llvm.org/docs/AMDGPUUsage.html#llvm-ir-attributes).
+
+### Private output-tail WGP experiment
+
+ZLUDA source `fb0adc8714f57647320f0601533ec50331e378b0`, patch 0018, adds
+opt-in `D4R_ZLUDA_WGP=1`. It changes only CU/WGP placement for gfx11/gfx12,
+preserving wave size and arithmetic. The ordinary runtime stays in CU mode.
+The offline texture builder accepts `-ShaderMode wgp` and verifies `-cumode`
+on the emitted kernel before accepting the object. The compiled output-tail
+objects carry this mode independently of the runtime's environment variable.
+These NVIDIA-derived objects remain private; the public package excludes them.
+
+The matched K/4K comparison uses identical public network objects and the
+existing validated CU output kernels as control. Both HDR and LDR complete
+eight frames per variant; repeating with candidate-first order completes
+sixteen frames per variant. All 96 control/candidate frames are finite, and
+all 48 candidate RGB outputs exactly match their fresh controls. Every frame
+has a native output-tail hit and a valid serializing event measurement.
+
+| Output-tail median, ms | CU, first run | WGP, first run | CU, reverse order | WGP, reverse order |
+| --- | ---: | ---: | ---: | ---: |
+| LDR | 1.864650 | 1.703100 | 1.840260 | 1.687500 |
+| HDR | 2.012301 | 1.883395 | 2.016020 | 1.869250 |
+
+These are separate-process serializing diagnostic measurements, not paired
+resident-module timings or game FPS. Unchanged network kernels also vary
+between processes. The repeat indicates a candidate worth testing in the
+game; it does not establish a frame-rate improvement. Results:
+`test-results/k-output-wgp-reference-4k-clean-env` and
+`k-output-wgp-reference-4k-reverse`.
+The game-sized WGP async burst/recreate gate completes twelve frames, all
+finite; all six async RGB outputs match fresh sync controls exactly, with
+no CPU image copy or aged output (`k-output-wgp-async-game-input`).
+The exact CMake shared-V enc0 and WGP output tails together also pass twelve
+game-sized async/burst/recreation frames, with all six async RGB images exact
+(`k-enc0-shared-wgp-async-game-input`). Default selection of private output
+objects remains CU until a game comparison establishes the candidate's effect.
+
+```powershell
+.\scripts\windows\build-zluda-windows.ps1 -InstallRoot "$PWD\dist\zluda-windows-wgp-experiment"
+.\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -ZludaRoot "$PWD\dist\zluda-windows-wgp-experiment" -ShaderMode wgp -OutputDirectory "$PWD\build\private-textures-wgp-gfx1201"
+.\scripts\windows\build-native-texture.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -ZludaRoot "$PWD\dist\zluda-windows-wgp-experiment" -ShaderMode wgp -Kernel hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel -OutputDirectory "$PWD\build\private-textures-wgp-gfx1201"
+.\scripts\windows\test-native-texture.ps1 -TextureRoot "$PWD\build\private-textures-wgp-gfx1201" -ControlTextureRoot "$PWD\build\private-textures-gfx1201" -ZludaRoot "$PWD\dist\zluda-windows-deferred-profile" -OutputResolution 3840x2160
+```
+
+The compiler placement unit passes, all seventeen hardware/software CTest gates
+pass on the clean source build with ordinary CU defaults, and the six ZLUDA
+gates also pass with WGP explicitly enabled. All seventeen patches (0002..0018)
+apply to the clean pinned base `ee2f25a`. The numerical benchmark's rejected
+F16 candidate stops after its two ordinary reference replays with differing
+output and no timing samples (`k-replay-rejected-f16-gate-fixed`).
+
+### Diagnostic environment and input dimensions
+
+Some PowerShell/.NET hosts preserve removed process variables as empty strings.
+Presence-based Rust diagnostic flags then select deferred profiling, while
+empty codegen values can disable WMMA. The probe/game child environments now
+omit empty `D4R_` keys; the probe restores codegen defaults for null or empty
+values. Disabled WGP is also omitted so older runtimes keep their warm cache.
+The texture test requires valid timing records instead of silently accepting
+a profiling-free comparison. The initial candidate attempt times out during
+NGX initialization with no accepted frame; later pre-fix comparisons have
+correct RGB but no accepted GPU timings. Their logs remain in
+`k-output-wgp-reference-small`, `k-output-wgp-reference-small-fixed` and
+`k-output-wgp-reference-4k-fixed`; they are excluded from the table above.
+
+The D3D12 harness now supports `--ngx-input-resolution WIDTHxHEIGHT`, exposed
+as `-NgxInputResolution` in the probe runner and `-InputResolution` in the
+texture/async gates. Output defaults and limits remain unchanged. This allows
+the game's non-aligned input dimensions without inventing a larger output.
+An initial attempt using 4518x2542 output is rejected by the harness's existing
+range guard before GPU initialization; it is not a GPU or enc0 failure.
 
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
