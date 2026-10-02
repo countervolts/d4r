@@ -15,6 +15,9 @@
 /traces/
 /build/
 /dist/
+/.tools/
+/external/
+/test-results/
 *.trace
 *.dump
 *.log

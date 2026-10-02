@@ -1,0 +1,93 @@
+diff --git a/zluda/src/impl/d4r_replay.rs b/zluda/src/impl/d4r_replay.rs
+index 875b2e3..d491ae2 100644
+--- a/zluda/src/impl/d4r_replay.rs
++++ b/zluda/src/impl/d4r_replay.rs
+@@ -7,6 +7,18 @@ struct Config { directory: PathBuf, filter: String, limit: u32 }
+ static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
+ static COUNTS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+ 
++fn parameter_size(name: &str) -> Option<usize> {
++    match name {
++        "dltss_pwin_enc0_layer" | "dltss_pwin_enc1_layer" | "dltss_pwin_enc2_layer" |
++        "dltss_pwin_enc3_layer" | "dltss_pwin_enc4_layer" | "dltss_pwin_dec5_layer" |
++        "dltss_pwin_dec4_layer" | "dltss_pwin_dec3_layer" | "dltss_pwin_dec2_layer" |
++        "dltss_pwin_dec1_layer" | "dltss_pwin_dec0_layer" => Some(176),
++        "rrlite_enc1_4x4" | "rrlite_enc2_4x4" | "rrlite_dec2_4x4" | "rrlite_dec1_4x4" => Some(56),
++        "rrlite_enc3_tube_4x4" => Some(88),
++        _ => None,
++    }
++}
++
+ pub(crate) struct Capture { directory: PathBuf, allocations: Vec<(usize, usize)> }
+ 
+ fn io_error(error: impl std::fmt::Display) -> hipErrorCode_t {
+@@ -43,8 +55,10 @@ pub(crate) unsafe fn begin(
+         limit: std::env::var("D4R_CUDA_REPLAY_DUMP_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1),
+     })) else { return Ok(None) };
+     let name = name.to_str().map_err(io_error)?;
+-    // Only the audited, single 176-byte K argument ABI is captured here.
+-    if !name.starts_with("dltss_pwin_") || !name.ends_with("_layer") || !name.contains(&config.filter) {
++    // Only audited single-by-value K/M argument blocks. Never infer the size
++    // from a prefix: reading a different kernel's parameters can overrun host memory.
++    let Some(parameter_bytes) = parameter_size(name) else { return Ok(None); };
++    if !name.contains(&config.filter) {
+         return Ok(None);
+     }
+     let mut block = std::ptr::null::<u8>();
+@@ -60,10 +74,10 @@ pub(crate) unsafe fn begin(
+         }
+     } else if !parameters.is_null() {
+         block = (*parameters).cast();
+-        bytes = Some(176);
++        bytes = Some(parameter_bytes);
+     }
+-    if block.is_null() || bytes != Some(176) {
+-        return Err(io_error(format!("unexpected K parameter ABI for {name}: {bytes:?}")));
++    if block.is_null() || bytes != Some(parameter_bytes) {
++        return Err(io_error(format!("unexpected parameter ABI for {name}: {bytes:?}, expected {parameter_bytes}")));
+     }
+     let sequence = {
+         let mut counts = COUNTS.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(io_error)?;
+@@ -73,14 +87,14 @@ pub(crate) unsafe fn begin(
+         *count
+     };
+     hipStreamSynchronize(stream)?;
+-    let arguments = std::slice::from_raw_parts(block, 176);
++    let arguments = std::slice::from_raw_parts(block, parameter_bytes);
+     let directory = config.directory.join(format!("replay-{sequence:06}-{name}"));
+     fs::create_dir_all(&directory).map_err(io_error)?;
+     fs::write(directory.join("args.bin"), arguments).map_err(io_error)?;
+-    let mut manifest = format!("kernel {name}\nlaunch {} {} {} {} {} {} {}\nargs 176\n",
++    let mut manifest = format!("kernel {name}\nlaunch {} {} {} {} {} {} {}\nargs {parameter_bytes}\n",
+         launch[0], launch[1], launch[2], launch[3], launch[4], launch[5], launch[6]);
+     let mut allocations = Vec::<(usize, usize)>::new();
+-    for offset in (0..176).step_by(8) {
++    for offset in (0..parameter_bytes).step_by(8) {
+         let pointer = u64::from_le_bytes(arguments[offset..offset + 8].try_into().unwrap()) as usize;
+         if pointer == 0 { continue; }
+         let mut base = hipDeviceptr_t(std::ptr::null_mut());
+@@ -100,10 +114,23 @@ pub(crate) unsafe fn begin(
+         };
+         manifest.push_str(&format!("pointer {offset} {id} {}\n", pointer - base));
+     }
+-    if allocations.is_empty() { return Err(io_error("no K allocation pointers resolved")); }
++    if allocations.is_empty() { return Err(io_error("no allocation pointers resolved")); }
+     fs::write(directory.join("manifest.txt"), manifest).map_err(io_error)?;
+     let capture = Capture { directory, allocations };
+     capture.save(&capture.directory)?;
+     eprintln!("[d4r-replay] begin kernel={name} allocations={} path={}", capture.allocations.len(), capture.directory.display());
+     Ok(Some(capture))
+ }
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn only_audited_argument_sizes() {
++        assert_eq!(super::parameter_size("dltss_pwin_enc0_layer"), Some(176));
++        assert_eq!(super::parameter_size("rrlite_dec2_4x4"), Some(56));
++        assert_eq!(super::parameter_size("rrlite_enc3_tube_4x4"), Some(88));
++        assert_eq!(super::parameter_size("dltss_pwin_enc0_layer_prep"), None);
++        assert_eq!(super::parameter_size("rrlite_enc3_tube_4x4_prep"), None);
++        assert_eq!(super::parameter_size("dltss_pwin_unknown_layer"), None);
++    }
++}

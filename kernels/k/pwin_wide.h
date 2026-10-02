@@ -38,17 +38,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
     half_t* hrow = hb[tok];
 
     // ---- L2 norm: h1 = x0 * (rsqrt(sum x0^2) * gamma1) -> hb (all groups of a token tile compute the sum)
-    float ss = 0.0f;
-    for (int kt = 0; kt < KT; ++kt)
-    {
-        const u8v xv = lds_row16(arow + 16 * kt);
-#pragma unroll
-        for (int c = 0; c < 16; ++c)
-        {
-            const half_t v = op_get(xv, c);
-            ss += (float)(half_t)(v * v);
-        }
-    }
+    const half_t ss = l2_sum<C>(arow);
     const half_t r16 = (half_t)__builtin_amdgcn_rsqf((float)(half_t)ss);
     for (int kt = 2 * g + (int)hf; kt < KT; kt += 2 * NG)
     {

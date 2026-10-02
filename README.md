@@ -8,6 +8,22 @@ Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set
 
 **Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It has been tested on one GPU in a handful of games and depends on unreleased patches to ZLUDA and vkd3d-proton.
 
+**Native Windows development:** an experimental D3D12 backend runs K and M
+transformer networks on Windows 11 / RX 9070 XT (gfx1201), using patched
+ZLUDA/HIP and VRAM buffers/shared fences directly. Inputs and output belong to
+the current frame; this path does not use Wine, Proton or CPU image staging.
+The Windows backend, command-list hooks and diagnostics live in `tools/windows`.
+All sixteen Windows hardware gates pass, and queued-frame/feature-recreation K
+outputs match synchronous controls exactly. A five-minute K/4K Silent Hill 2
+run completes 16941 finite frames without backend errors. Performance remains
+under development; asynchronous interop is opt-in and requires one queue.
+M retains the FP16-equivalent baseline; native FP8 has not established a
+full-network speedup. Windows preset L is not validated. See
+[Windows build and validation](docs/windows-rdna4-port.md),
+[OptiScaler installation](docs/windows-game.md) and
+[Windows measurements](docs/windows-performance.md). NVIDIA DLLs are supplied
+locally and excluded from packages.
+
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 > **Not affiliated with NVIDIA or AMD.**

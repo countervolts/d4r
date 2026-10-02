@@ -1,0 +1,148 @@
+From b0161a4166652eee86a8113a38d042b02403db6e Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 1 Oct 2026 18:07:07 +0300
+Subject: [PATCH] Add opt-in Windows HIP event and occupancy diagnostics
+
+---
+ zluda/src/impl/d4r_profile.rs | 60 +++++++++++++++++++++++++++++++++++
+ zluda/src/impl/function.rs    |  9 ++++++
+ zluda/src/impl/mod.rs         |  1 +
+ zluda/src/impl/module.rs      |  2 +-
+ 4 files changed, 71 insertions(+), 1 deletion(-)
+ create mode 100644 zluda/src/impl/d4r_profile.rs
+
+diff --git a/zluda/src/impl/d4r_profile.rs b/zluda/src/impl/d4r_profile.rs
+new file mode 100644
+index 0000000..33ba5f6
+--- /dev/null
++++ b/zluda/src/impl/d4r_profile.rs
+@@ -0,0 +1,60 @@
++//! Optional, deliberately serializing HIP-event diagnostics. Not a production
++//! scheduler or a claim about application FPS / measured hardware occupancy.
++use hip_runtime_sys::*;
++use std::{ffi::CStr, ptr, time::Instant};
++
++pub(super) struct Launch {
++    start: hipEvent_t,
++    end: hipEvent_t,
++    host: Instant,
++}
++
++impl Drop for Launch {
++    fn drop(&mut self) {
++        unsafe {
++            if !self.end.is_null() { let _ = hipEventDestroy(self.end); }
++            if !self.start.is_null() { let _ = hipEventDestroy(self.start); }
++        }
++    }
++}
++
++impl Launch {
++    pub(super) unsafe fn begin(stream: hipStream_t) -> Result<Option<Self>, hipErrorCode_t> {
++        if std::env::var_os("D4R_ZLUDA_PROFILE").is_none() { return Ok(None); }
++        let mut result = Self { start: ptr::null_mut(), end: ptr::null_mut(), host: Instant::now() };
++        hipEventCreateWithFlags(&mut result.start, 0)?;
++        hipEventCreateWithFlags(&mut result.end, 0)?;
++        hipEventRecord(result.start, stream)?;
++        result.host = Instant::now();
++        Ok(Some(result))
++    }
++
++    pub(super) unsafe fn finish(self, function: hipFunction_t, name: &CStr, backend: &str,
++        phase: &str, grid: [u32;3], block: [u32;3], shared: u32, stream: hipStream_t) -> hipError_t {
++        let enqueue_ms = self.host.elapsed().as_secs_f64() * 1000.;
++        hipEventRecord(self.end, stream)?;
++        hipEventSynchronize(self.end)?;
++        let completion_ms = self.host.elapsed().as_secs_f64() * 1000.;
++        let mut gpu_ms = 0.;
++        hipEventElapsedTime(&mut gpu_ms, self.start, self.end)?;
++        // Module function handles use the Driver API attribute query. The
++        // plural Runtime API expects a registered host function address.
++        let mut lds = 0;
++        let mut regs = 0;
++        let mut private = 0;
++        let mut max_threads = 0;
++        hipFuncGetAttribute(&mut lds, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function)?;
++        hipFuncGetAttribute(&mut regs, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_NUM_REGS, function)?;
++        hipFuncGetAttribute(&mut private, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function)?;
++        hipFuncGetAttribute(&mut max_threads, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function)?;
++        let threads = block.iter().try_fold(1u32, |a, b| a.checked_mul(*b))
++            .filter(|n| *n <= i32::MAX as u32).ok_or(hipErrorCode_t::InvalidValue)?;
++        let mut blocks_per_multiprocessor = 0;
++        hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&mut blocks_per_multiprocessor,
++            function, threads as i32, shared as usize)?;
++        eprintln!("D4R_KERNEL_PROFILE kernel={name:?} backend={backend} phase={phase} gpu_ms={gpu_ms:.6} enqueue_ms={enqueue_ms:.6} completion_ms={completion_ms:.6} grid={},{},{} block={},{},{} static_lds_bytes={} dynamic_lds_bytes={shared} regs={} private_bytes={} max_threads={} predicted_blocks_per_multiprocessor={blocks_per_multiprocessor} serializing=1",
++            grid[0], grid[1], grid[2], block[0], block[1], block[2], lds,
++            regs, private, max_threads);
++        Ok(())
++    }
++}
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index 7a7470a..c456dfe 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -191,6 +191,7 @@ pub(crate) fn launch_kernel(
+         }
+     };
+     if let (Some((prep, blocks)), true) = (f.prep, run_prep) {
++        let profile = unsafe { super::d4r_profile::Launch::begin(stream) }?;
+         unsafe {
+             hipModuleLaunchKernel(
+                 prep,
+@@ -206,6 +207,9 @@ pub(crate) fn launch_kernel(
+                 extra_for_hip,
+             )
+         }?;
++        if let Some(profile) = profile {
++            unsafe { profile.finish(prep, &f.name, "native", "prep", [blocks,1,1], [128,1,1], 0, stream) }?;
++        }
+         f.prep_last.store(prep_key, std::sync::atomic::Ordering::Relaxed);
+     }
+     let block_dim_z = if f.block_z != 0 { f.block_z } else { block_dim_z };
+@@ -214,6 +218,7 @@ pub(crate) fn launch_kernel(
+         eprintln!("[d4r-launch] kernel={:?} backend={} grid={grid_dim_x},{grid_dim_y},{grid_dim_z} block={block_dim_x},{block_dim_y},{block_dim_z}",
+             f.name, if f.native_owner.is_some() { "native" } else { "translated" });
+     }
++    let profile = unsafe { super::d4r_profile::Launch::begin(stream) }?;
+     let result = unsafe {
+         hipModuleLaunchKernel(
+             f.base,
+@@ -230,6 +235,10 @@ pub(crate) fn launch_kernel(
+         )
+     };
+     result?;
++    if let Some(profile) = profile {
++        unsafe { profile.finish(f.base, &f.name, if f.native_owner.is_some() { "native" } else { "translated" },
++            "main", [grid_dim_x, grid_dim_y, grid_dim_z], [block_dim_x, block_dim_y, block_dim_z], shared_mem_bytes, stream) }?;
++    }
+     if let Some(replay) = replay { replay.finish(stream)?; }
+     Ok(())
+ }
+diff --git a/zluda/src/impl/mod.rs b/zluda/src/impl/mod.rs
+index 14e0aee..380eb6e 100644
+--- a/zluda/src/impl/mod.rs
++++ b/zluda/src/impl/mod.rs
+@@ -6,6 +6,7 @@ pub(super) mod context;
+ pub(super) mod device;
+ pub(super) mod driver;
+ pub(super) mod d4r_replay;
++pub(super) mod d4r_profile;
+ pub(super) mod event;
+ pub(super) mod function;
+ pub(super) mod graph;
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 5a79368..232f7d4 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -502,7 +502,7 @@ fn zluda_build_version() -> &'static str {
+                 key.starts_with("D4R_ZLUDA_")
+                     && !matches!(
+                         key.as_str(),
+-                        "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA" | "D4R_ZLUDA_VERBOSE"
++                        "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA" | "D4R_ZLUDA_VERBOSE" | "D4R_ZLUDA_PROFILE"
+                             | "D4R_ZLUDA_WMMA_FP8_NATIVE" // keyed by effect (ExtraCacheAttributes)
+                     )
+             })
+-- 
+2.55.0.windows.5
+

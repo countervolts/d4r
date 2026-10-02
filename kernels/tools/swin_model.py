@@ -98,7 +98,7 @@ def layout(C, heads, pre=0):
     L['end'] = M0 + 66 * C + 64 + (64 * C + 64) * (NC - 1)
     return L
 
-def swin_block(P, x0, C, heads, pre=0):
+def swin_block(P, x0, C, heads, pre=0, stages=None):
     """x0: 64 x C natural (f16 values). Returns (x2 pair order, out natural fp8 values)."""
     fp8 = lambda T: E4M3[P.wbuf[T]]
     L = layout(C, heads, pre)
@@ -116,6 +116,8 @@ def swin_block(P, x0, C, heads, pre=0):
         Wo[32 * s:32 * s + 32] = woff_table(L['head'][s] + 64 * C + 512, 0, 512, 32, C)
     x1 = mma_chain(pair_to_nat(q8(O)), fp8(Wo), C0=f16(nat_to_pair(x0) + P.f16vec(L['bo'], C)[None, :]))
     h2 = pair_to_nat(rms_from_sum(x1, tree_norm2(x1), P.f16vec(L['g2'], C)))
+    if stages is not None:
+        stages.update(h1=h1, x1=pair_to_nat(x1), h2=h2, O=pair_to_nat(q8(O)))
     x2 = f16(x1 + P.f16vec(L['b2'], C)[None, :])
     idx = gp(np.arange(32))
     for c, B1 in enumerate(L['b1']):

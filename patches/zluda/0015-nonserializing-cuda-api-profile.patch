@@ -1,0 +1,83 @@
+From a1c506fc956cfc347c56c44311669700c0d500ac Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 1 Oct 2026 22:16:19 +0300
+Subject: [PATCH] Profile CUDA host API duration without serializing GPU
+ launches
+
+---
+ zluda/src/d4r_api_profile.rs | 34 ++++++++++++++++++++++++++++++++++
+ zluda/src/lib.rs             |  3 +++
+ 2 files changed, 37 insertions(+)
+ create mode 100644 zluda/src/d4r_api_profile.rs
+
+diff --git a/zluda/src/d4r_api_profile.rs b/zluda/src/d4r_api_profile.rs
+new file mode 100644
+index 0000000..ef2da1b
+--- /dev/null
++++ b/zluda/src/d4r_api_profile.rs
+@@ -0,0 +1,34 @@
++//! Host API timings only: no HIP events, stream waits, or altered scheduling.
++use std::{cell::RefCell, collections::BTreeMap, sync::OnceLock, time::Instant};
++
++#[derive(Default)]
++struct Row { calls: u64, total_ms: f64, max_ms: f64 }
++struct Samples { since: Instant, rows: BTreeMap<&'static str, Row> }
++thread_local! {
++    static SAMPLES: RefCell<Samples> = RefCell::new(Samples { since: Instant::now(), rows: BTreeMap::new() });
++}
++pub(crate) struct Call { name: &'static str, start: Instant }
++impl Call {
++    pub(crate) fn begin(name: &'static str) -> Option<Self> {
++        static ENABLED: OnceLock<bool> = OnceLock::new();
++        if !*ENABLED.get_or_init(|| std::env::var_os("D4R_ZLUDA_PROFILE_API").is_some()) { return None; }
++        Some(Self { name, start: Instant::now() })
++    }
++}
++impl Drop for Call {
++    fn drop(&mut self) {
++        let ms = self.start.elapsed().as_secs_f64() * 1000.;
++        SAMPLES.with(|samples| {
++            let mut samples = samples.borrow_mut();
++            let row = samples.rows.entry(self.name).or_default();
++            row.calls += 1; row.total_ms += ms; row.max_ms = row.max_ms.max(ms);
++            let period_ms = samples.since.elapsed().as_secs_f64() * 1000.;
++            if period_ms < 2000. { return; }
++            for (name, row) in &samples.rows {
++                eprintln!("D4R_CUDA_API_PROFILE thread={:?} api={name} calls={} total_ms={:.6} max_ms={:.6} period_ms={period_ms:.6} serializing=0",
++                    std::thread::current().id(), row.calls, row.total_ms, row.max_ms);
++            }
++            samples.rows.clear(); samples.since = Instant::now();
++        });
++    }
++}
+diff --git a/zluda/src/lib.rs b/zluda/src/lib.rs
+index ecdeb3e..31bfa42 100644
+--- a/zluda/src/lib.rs
++++ b/zluda/src/lib.rs
+@@ -2,6 +2,7 @@ use cuda_types::cuda::CUerror;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ pub(crate) mod r#impl;
++mod d4r_api_profile;
+ #[cfg_attr(windows, path = "os_win.rs")]
+ #[cfg_attr(not(windows), path = "os_unix.rs")]
+ mod os;
+@@ -40,6 +41,7 @@ macro_rules! implemented {
+                 if !initialized() {
+                     return Err(CUerror::DEINITIALIZED);
+                 }
++                let _profile = d4r_api_profile::Call::begin(stringify!($fn_name));
+                 cuda_macros::cuda_normalize_fn!( crate::r#impl::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*)?;
+                 Ok(())
+             }
+@@ -57,6 +59,7 @@ macro_rules! implemented_in_function {
+                 if !initialized() {
+                     return Err(CUerror::DEINITIALIZED);
+                 }
++                let _profile = d4r_api_profile::Call::begin(stringify!($fn_name));
+                 cuda_macros::cuda_normalize_fn!( crate::r#impl::function::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*)?;
+                 Ok(())
+             }
+-- 
+2.55.0.windows.5
+

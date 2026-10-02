@@ -1,0 +1,90 @@
+"""Build a private gfx1201 texture override from the user's local DLSS DLL.
+
+The resulting PTX/code object contains NVIDIA code and must remain local.
+No Wine, shell script, GPU, CUDA SDK or system installation is required.
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dlss-dll', type=pathlib.Path, required=True)
+    parser.add_argument('--hip-root', type=pathlib.Path, required=True)
+    parser.add_argument('--zluda-root', type=pathlib.Path, required=True)
+    parser.add_argument('--kernel', required=True)
+    parser.add_argument('--output-directory', type=pathlib.Path, required=True)
+    args = parser.parse_args()
+    if not re.fullmatch(r'hiluma_engine_output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?_v2_rel', args.kernel):
+        parser.error('this initial validated build recipe supports K v2 output variants only')
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    output = args.output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    work = output / ('work-' + args.kernel)
+    work.mkdir(exist_ok=True)
+    hip = args.hip_root.resolve()
+    zluda = args.zluda_root.resolve()
+    tools = {name: hip / 'bin' / (name + '.exe') for name in ('clang++', 'llvm-dis', 'llvm-as')}
+    emitter = zluda / 'd4r_emit.exe'
+    for path in [args.dlss_dll, emitter, *tools.values()]:
+        if not path.is_file():
+            parser.error(f'missing dependency: {path}')
+    env = os.environ.copy()
+    env.update(D4R_PREFER_ACCURACY='1', D4R_ZLUDA_WMMA='1', D4R_ZLUDA_WMMA_FP8='1',
+               D4R_ZLUDA_WMMA_FP8_NATIVE='0', D4R_ZLUDA_WMMA_F16_REFERENCE='1',
+               D4R_ZLUDA_IMPLICIT_MAX_BLOCK='256')
+    for name in ('D4R_ZLUDA_IGNORE_DENORMAL', 'D4R_ZLUDA_FAST_MATH', 'D4R_ZLUDA_WMMA_F32ACC',
+                 'D4R_ZLUDA_WAVE64', 'D4R_ZLUDA_PROFILE'):
+        env.pop(name, None)
+    env['PATH'] = str(zluda) + os.pathsep + str(hip / 'bin') + os.pathsep + env['PATH']
+
+    def run(label, command):
+        with (work / (label + '.log')).open('wb') as log:
+            result = subprocess.run([str(arg) for arg in command], env=env, stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode:
+            print((work / (label + '.log')).read_text(errors='replace')[-8000:], file=sys.stderr)
+            raise RuntimeError(f'{label} failed ({result.returncode}); see {work}')
+
+    ptx = work / 'ptx'
+    run('extract', [sys.executable, repo / 'kernels/tools/extract_dlss_ptx.py', args.dlss_dll, ptx])
+    env['D4R_DLSS_PTX_DIR'] = str(ptx)
+    edited = work / (args.kernel + '.ptx')
+    run('make-ptx', [sys.executable, repo / 'kernels/tex/make_ptx.py', args.kernel, edited])
+    raw, ir, extra = work / 'raw.bc', work / 'raw.ll', work / 'extra.bc'
+    run('compile-helper', [tools['clang++'], '-x', 'hip', '-std=c++20', '-nogpuinc', '-nogpulib', '-O3',
+                          '-mno-wavefrontsize64', '--offload-device-only', '--offload-arch=gfx1201',
+                          '-fgpu-rdc', '-emit-llvm', '-c', '-Xclang', '-fdenormal-fp-math=dynamic',
+                          '-DD4R_ACCURACY', '-DD4R_KERNEL_NAME=' + args.kernel,
+                          '-o', raw, repo / 'kernels/tex/sust_only.hip'])
+    run('disassemble', [tools['llvm-dis'], raw, '-o', ir])
+    lines = []
+    for line in ir.read_text().splitlines():
+        if re.search(r'@llvm.used|wchar_size|llvm.module.flags|__hip_cuid', line):
+            continue
+        line = line.replace('optnone', '').replace('"target-cpu"="gfx1201"', '')
+        lines.append(re.sub(r'"target-features"="[^"]+"', '', line))
+    ir.write_text('\n'.join(lines) + '\n')
+    run('assemble', [tools['llvm-as'], ir, '-o', extra])
+    env['D4R_ZLUDA_EXTRA_BC'] = str(extra)
+    run('emit', [emitter, edited, work / 'emitted', 'gfx1201'])
+    shutil.copyfile(work / 'emitted/module.hsaco', output / (args.kernel + '.hsaco'))
+    run('manifest', [sys.executable, repo / 'kernels/tools/kernel_manifest.py', output, args.dlss_dll])
+    metadata = dict(architecture='gfx1201', accuracy=True, nativeFP8=False,
+                    privateNvidiaDerivedCode=True, validation='not yet validated; do not install before comparison',
+                    dlssSha256=hashlib.sha256(args.dlss_dll.read_bytes()).hexdigest(),
+                    zludaBuild=json.loads((zluda / 'build-info.json').read_text(encoding='utf-8-sig')),
+                    compiler=subprocess.check_output([str(tools['clang++']), '--version'], env=env).decode(errors='replace'),
+                    objects={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output.glob('*.hsaco')})
+    (output / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    print(f'Built PRIVATE gfx1201 output override: {output}; validation required before use')
+
+
+if __name__ == '__main__':
+    main()

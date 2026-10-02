@@ -6,6 +6,38 @@ import numpy as np
 
 F16, F32, F64 = np.float16, np.float32, np.float64
 
+# Legacy replay reports retain their original approximate norm by default.
+# Windows strict K validation selects the PTX fragment's rounded reduction.
+NORM_FRAGMENT_ORDER = False
+
+
+def norm_rows(x):
+    if not NORM_FRAGMENT_ORDER:
+        return f16(np.sum(x.astype(F32).astype(F64) ** 2, axis=1))
+    tokens, channels = x.shape
+    assert channels in (32, 64, 96, 128, 160)
+    square = f16(x.astype(F64) ** 2)
+    partial = []
+    for lane in range(4):
+        halves = []
+        for parity in range(2):
+            pairs = [add16(square[:, 2 * lane + 8 * parity + 32 * g:2 * lane + 8 * parity + 32 * g + 2],
+                           square[:, 2 * lane + 8 * parity + 32 * g + 16:2 * lane + 8 * parity + 32 * g + 18])
+                     for g in range(channels // 32)]
+            value = pairs[0]
+            if channels >= 64:
+                value = add16(value, pairs[1])
+            if channels == 96:
+                value = add16(value, pairs[2])
+            if channels >= 128:
+                value = add16(value, add16(pairs[2], pairs[3]))
+            if channels == 160:
+                value = add16(value, pairs[4])
+            halves.append(value)
+        partial.append(add16(halves[0], halves[1]))
+    total = add16(add16(partial[0], partial[1]), add16(partial[2], partial[3]))
+    return add16(total[:, 0], total[:, 1])
+
 
 class Dump:
     def __init__(self, d):
@@ -181,7 +213,7 @@ def pwin_enc2(P, bx, by, pm_order=((0, 0), (0, 1), (1, 0), (1, 1)), b2_in_c0=Tru
     """logical enc2 layer (H 2, C 64 -> merged 96) for one window; returns (y [64 x 64], merged [16 x 96])"""
     C, H, Dh = 64, 2, 32
     x0 = load_window(P, bx, by, C)
-    s = f16(np.sum(x0.astype(F32).astype(F64) ** 2, axis=1))
+    s = norm_rows(x0)
     r = rsqrt16(s)
     h1 = mul16(x0, mul16(r[:, None], vec(P, 0, C)[None, :]))
     Os = []
@@ -248,7 +280,7 @@ def swin_core(P, L, x0, dbg=None, posattn=False):
     """norm -> attention -> Wo + residual -> MLP (+ residual): the block output y [64 x C]"""
     C, H = L.C, L.H
     NCH = C // 32
-    s = f16(np.sum(x0.astype(F32).astype(F64) ** 2, axis=1))
+    s = norm_rows(x0)
     r = rsqrt16(s)
     h1 = mul16(x0, mul16(r[:, None], vec(P, L.G1, C)[None, :]))
     Os = []

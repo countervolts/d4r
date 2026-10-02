@@ -1,0 +1,328 @@
+From 33bbac250ac7e2ca4eff67e8817ada9dad578208 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 1 Oct 2026 16:10:08 +0300
+Subject: [PATCH] Support explicitly selected Windows d4r DLSS backend on
+ physical AMD adapters
+
+---
+ OptiScaler/Config.cpp                         |  3 ++
+ OptiScaler/Config.h                           |  1 +
+ OptiScaler/OptiScaler.vcxproj                 |  4 +--
+ OptiScaler/State.h                            |  1 +
+ OptiScaler/Util.cpp                           | 12 +++++--
+ OptiScaler/dllmain.cpp                        | 33 +++++++++++++++++--
+ OptiScaler/hooks/LibraryLoad_Hooks.cpp        | 17 ++++++++++
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp         | 17 ++++++++++
+ OptiScaler/misc/IdentifyGpu.cpp               | 20 +++++++++++
+ OptiScaler/proxies/NVNGX_Proxy.h              |  5 ++-
+ OptiScaler/upscalers/FeatureProvider_Dx12.cpp | 10 ++++++
+ 11 files changed, 115 insertions(+), 8 deletions(-)
+
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index d8c62d3..f444387 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -323,6 +323,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         {
+             // Don't enable again if set false because of no nvngx found
+             DLSSEnabled.set_from_config(readBool("DLSS", "Enabled"));
++            DLSSAllowExternalBackend.set_from_config(readBool("DLSS", "AllowExternalBackend"));
+             UseGenericAppIdWithDlss.set_from_config(readBool("DLSS", "UseGenericAppIdWithDlss"));
+ 
+             RenderPresetOverride.set_from_config(readBool("DLSS", "RenderPresetOverride"));
+@@ -1168,6 +1169,8 @@ bool Config::SaveIni()
+     // DLSS
+     {
+         ini.SetValue("DLSS", "Enabled", GetBoolValue(Instance()->DLSSEnabled.value_for_config()).c_str());
++        ini.SetValue("DLSS", "AllowExternalBackend",
++                     GetBoolValue(Instance()->DLSSAllowExternalBackend.value_for_config()).c_str());
+         ini.SetValue("DLSS", "RenderPresetOverride",
+                      GetBoolValue(Instance()->RenderPresetOverride.value_for_config()).c_str());
+         ini.SetValue("DLSS", "RenderPresetForAll",
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 4ab62a4..0caf8c8 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -275,6 +275,7 @@ class Config
+ 
+     // DLSS
+     CustomOptional<bool> DLSSEnabled { true };
++    CustomOptional<bool> DLSSAllowExternalBackend { false };
+     CustomOptional<bool> RenderPresetOverride { false };
+     CustomOptional<uint32_t> RenderPresetForAll { 0 };
+     CustomOptional<uint32_t> RenderPresetDLAA { 0 };
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 24ca80b..dfbfc97 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -236,7 +236,7 @@
+       <SubSystem>Windows</SubSystem>
+       <EnableCOMDATFolding>true</EnableCOMDATFolding>
+       <OptimizeReferences>true</OptimizeReferences>
+-      <GenerateDebugInformation>false</GenerateDebugInformation>
++      <GenerateDebugInformation>true</GenerateDebugInformation>
+       <EnableUAC>false</EnableUAC>
+       <AdditionalDependencies>winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;ffx_fsr2_api_dx12_x64.lib;ffx_fsr2_api_vk_x64.lib;ffx_fsr2_212_api_dx12_x64.lib;ffx_fsr2_212_api_vk_x64.lib;ffx_fsr2_212_api_x64.lib;d3dcompiler.lib;ffx_backend_dx11_x64.lib;ffx_fsr3_x64.lib;ffx_frameinterpolation_x64.lib;ffx_fsr3upscaler_x64.lib;ffx_opticalflow_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+       <ModuleDefinitionFile>Source.def</ModuleDefinitionFile>
+@@ -873,4 +873,4 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <ImportGroup Label="ExtensionTargets">
+   </ImportGroup>
+-</Project>
+\ No newline at end of file
++</Project>
+diff --git a/OptiScaler/State.h b/OptiScaler/State.h
+index 42164de..84f8263 100644
+--- a/OptiScaler/State.h
++++ b/OptiScaler/State.h
+@@ -265,6 +265,7 @@ class State
+     int dlssgDetectedInterpolationCount = 0;
+ 
+     // DLSS
++    bool dlssExternalBackend = false;
+     bool dlssPresetsOverriddenExternally = false;
+     bool dlssPresetsOverridenByOpti = false;
+     uint32_t dlssRenderPresetExternal = 0;
+diff --git a/OptiScaler/Util.cpp b/OptiScaler/Util.cpp
+index f7ac6fa..7367a91 100644
+--- a/OptiScaler/Util.cpp
++++ b/OptiScaler/Util.cpp
+@@ -486,8 +486,16 @@ bool Util::GetFileVersion(std::wstring dllPath, version_t* fileVersionOut, versi
+ 
+ bool Util::IsSubpath(const std::filesystem::path& path, const std::filesystem::path& base)
+ {
+-    auto rel = std::filesystem::relative(path, base);
+-    auto first = *rel.begin();
++    // Called by LdrLoadDll hooks: relative()/weakly_canonical() perform file
++    // queries, can re-enter the hooks, and throw when an optional directory or
++    // a bare DLL search name cannot be resolved. This is a lexical routing
++    // check, not a filesystem access control decision.
++    auto normalizedPath = std::filesystem::path(ToLower(path.lexically_normal().wstring()));
++    auto normalizedBase = std::filesystem::path(ToLower(base.lexically_normal().wstring()));
++    auto rel = normalizedPath.lexically_relative(normalizedBase);
++    if (rel.empty())
++        return false;
++    const auto first = *rel.begin();
+     return first != "." && first != "..";
+ }
+ 
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index cba14b1..b4b786e 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -948,7 +948,7 @@ static void CheckWorkingMode()
+ 
+     // NVAPI
+     // Doesn't seem to like GetModuleHandle for some reason, so call our load to make sure
+-    if (GetDllNameWModule(&nvapiNamesW) != nullptr)
++    if (!State::Instance().dlssExternalBackend && GetDllNameWModule(&nvapiNamesW) != nullptr)
+     {
+         // This hooks nvapi as well when possible
+         auto nvapi64 = LibraryLoadHooks::LoadNvApi();
+@@ -1958,7 +1958,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             return nvidiaDetected;
+         };
+ 
+-        bool possibleNvidia = isNvidiaViaNvapi();
++        // Opt in only to a configured, versioned Windows d4r backend. The
++        // marker performs no HIP/NGX initialization under DLL_PROCESS_ATTACH.
++        // GPU support is still checked by its public NGX requirements API.
++        if (Config::Instance()->DLSSEnabled.value_or_default() &&
++            Config::Instance()->DLSSAllowExternalBackend.value_or_default() &&
++            Config::Instance()->NvngxPath.has_value())
++        {
++            auto backendPath = std::filesystem::path(Config::Instance()->NvngxPath.value()) / L"_nvngx.dll";
++            if (backendPath.is_absolute())
++            {
++                auto module = NtdllProxy::LoadLibraryExW_Ldr(backendPath.c_str(), nullptr,
++                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++                if (module)
++                {
++                    using BackendVersion = unsigned (*)();
++                    auto version = reinterpret_cast<BackendVersion>(
++                        KernelBaseProxy::GetProcAddress_()(module, "d4r_WindowsBackendVersion"));
++                    State::Instance().dlssExternalBackend = version && version() == 1;
++                    NtdllProxy::FreeLibrary_Ldr(module);
++                }
++            }
++            if (State::Instance().dlssExternalBackend)
++                spdlog::info("Validated external Windows d4r DLSS backend; retaining physical GPU identity");
++            else
++                spdlog::error("AllowExternalBackend requires an absolute NvngxPath containing Windows d4r ABI 1");
++        }
++        bool possibleNvidia = !State::Instance().dlssExternalBackend && isNvidiaViaNvapi();
+ 
+         spdlog::info("");
+         spdlog::info("Check for DLSS files");
+@@ -1992,7 +2018,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             State::Instance().NVNGX_DLSSG_Path = Util::FindFilePath(exePath, "nvngx_dlssg.dll");
+ 
+         // Not 100% accurate for Nvidia cards without DLSS
+-        if (Config::Instance()->DLSSEnabled.value_or_default() && possibleNvidia)
++        if (Config::Instance()->DLSSEnabled.value_or_default() &&
++            (possibleNvidia || State::Instance().dlssExternalBackend))
+         {
+             if (State::Instance().NVNGX_DLSS_Path.has_value())
+             {
+diff --git a/OptiScaler/hooks/LibraryLoad_Hooks.cpp b/OptiScaler/hooks/LibraryLoad_Hooks.cpp
+index 90bdb89..108ea5b 100644
+--- a/OptiScaler/hooks/LibraryLoad_Hooks.cpp
++++ b/OptiScaler/hooks/LibraryLoad_Hooks.cpp
+@@ -46,6 +46,18 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
+ {
+     auto libNameA = wstring_to_string(libName);
+ 
++    // The external D3D12 shim itself uses a locally supplied CUDA NGX core.
++    // Keep that exact absolute path distinct from game-facing NGX interception.
++    if (State::Instance().dlssExternalBackend)
++    {
++        wchar_t corePath[32768] {};
++        const auto length = GetEnvironmentVariableW(L"D4R_NGX_CORE", corePath, 32768);
++        if (length && length < 32768 &&
++            Util::ToLower(std::filesystem::path(libName).lexically_normal().wstring()) ==
++                Util::ToLower(std::filesystem::path(corePath).lexically_normal().wstring()))
++            return nullptr;
++    }
++
+ #ifdef LOG_LIB_OPERATIONS
+     LOG_TRACE("{}", libNameA);
+ #endif
+@@ -132,6 +144,11 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
+     // NvApi64.dll
+     if (CheckDllNameW(&libName, &nvapiNamesW))
+     {
++        // An explicit external CUDA backend owns its NVAPI topology provider.
++        // Returning OptiScaler's fake-NVAPI would replace that provider and can
++        // recurse into DXGI while the NGX loader holds the loader lock.
++        if (State::Instance().dlssExternalBackend)
++            return nullptr; // Continue through the original loader.
+         LOG_INFO("{} call!", libNameA);
+ 
+         return LibraryLoadHooks::LoadNvApi();
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 68e1b42..89c9ba8 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -687,6 +687,7 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
+     }
+ 
+     // Assign handle
++    const bool allocatedHandle = *OutHandle == nullptr;
+     if (*OutHandle == nullptr)
+         *OutHandle = new NVSDK_NGX_Handle { handleId };
+     else
+@@ -705,6 +706,16 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
+     }
+     else
+     {
++        if (state.dlssExternalBackend && upscalerBackend == Upscaler::DLSS)
++        {
++            LOG_ERROR("External DLSS initialization failed; refusing FSR fallback");
++            if (shouldRestoreSigs)
++                D3D12Hooks::RestoreRoot(InCmdList);
++            D3D12Hooks::SetRootSignatureTracking(true);
++            Dx12Contexts.erase(handleId);
++            if (allocatedHandle) { delete *OutHandle; *OutHandle = nullptr; }
++            return NVSDK_NGX_Result_Fail;
++        }
+         LOG_ERROR("Feature '{}' initialization failed falling back to FSR 2.1.2", UpscalerDisplayName(upscalerBackend));
+         state.newBackend = Upscaler::FSR21;
+         state.changeBackend[handleId] = true;
+@@ -1027,6 +1038,12 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+     // Fallback to FSR 2.1.2 if feature failed to initialize and user didn't explicitly request it
+     if (!feature->IsInited() && cfg.Dx12Upscaler.value_or_default() != Upscaler::FSR21)
+     {
++        if (state.dlssExternalBackend && cfg.Dx12Upscaler.value_or_default() == Upscaler::DLSS)
++        {
++            LOG_ERROR("External DLSS feature is not initialized; refusing FSR fallback");
++            D3D12Hooks::SetRootSignatureTracking(true);
++            return NVSDK_NGX_Result_Fail;
++        }
+         LOG_WARN("Feature '{}' failed to initialize. Falling back to FSR 2.1.2", feature->Name());
+         ImGui::InsertNotification({ ImGuiToastType::Warning, 10000, "Falling back to FSR 2.1.2" });
+ 
+diff --git a/OptiScaler/misc/IdentifyGpu.cpp b/OptiScaler/misc/IdentifyGpu.cpp
+index 3877f9f..6c05904 100644
+--- a/OptiScaler/misc/IdentifyGpu.cpp
++++ b/OptiScaler/misc/IdentifyGpu.cpp
+@@ -8,6 +8,7 @@
+ #include <proxies/D3d12_Proxy.h>
+ #include "nvapi/NvApiTypes.h"
+ #include <hooks/Amdxc64_Hooks.h>
++#include <proxies/NVNGX_Proxy.h>
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+@@ -187,6 +188,25 @@ std::vector<GpuInformation> IdentifyGpu::checkGpuInfo()
+ 
+     for (auto& gpuInfo : localCachedInfo)
+     {
++        if (State::Instance().dlssExternalBackend && !gpuInfo.softwareAdapter)
++        {
++            // Query the configured D3D12 backend outside DLL_PROCESS_ATTACH.
++            // Preserve vendor/device/architecture data obtained from DXGI.
++            auto requirements = NVNGXProxy::D3D12_GetFeatureRequirements();
++            ComPtr<IDXGIAdapter1> physicalAdapter;
++            if (requirements && SUCCEEDED(factory->EnumAdapterByLuid(gpuInfo.luid, IID_PPV_ARGS(&physicalAdapter))))
++            {
++                NVSDK_NGX_FeatureDiscoveryInfo discovery {};
++                discovery.SDKVersion = NVSDK_NGX_Version_API;
++                discovery.FeatureID = NVSDK_NGX_Feature_SuperSampling;
++                NVSDK_NGX_FeatureRequirement supported {};
++                const auto result = requirements(physicalAdapter.Get(), &discovery, &supported);
++                gpuInfo.dlssCapable = result == NVSDK_NGX_Result_Success &&
++                    supported.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
++                LOG_INFO("External D3D12 DLSS backend: {} support={} result={:X}",
++                         gpuInfo.name, gpuInfo.dlssCapable, (unsigned) result);
++            }
++        }
+         if (gpuInfo.vendorId == VendorId::Nvidia)
+         {
+             queryNvapi(gpuInfo);
+diff --git a/OptiScaler/proxies/NVNGX_Proxy.h b/OptiScaler/proxies/NVNGX_Proxy.h
+index f6c08e5..7892009 100644
+--- a/OptiScaler/proxies/NVNGX_Proxy.h
++++ b/OptiScaler/proxies/NVNGX_Proxy.h
+@@ -500,7 +500,10 @@ class NVNGXProxy
+         {
+             LOG_INFO("Getting nvngx method addresses");
+ 
+-            HookNgxApi(_module.dll);
++            // The external bridge reports physical adapter support itself.
++            // Do not overwrite its unsupported result with NVIDIA spoofing.
++            if (!State::Instance().dlssExternalBackend)
++                HookNgxApi(_module.dll);
+ 
+             _module.D3D11_Init =
+                 (PFN_D3D11_Init) KernelBaseProxy::GetProcAddress_()(_module.dll, "NVSDK_NGX_D3D11_Init");
+diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+index d738498..1191b29 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+@@ -42,6 +42,11 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
+         break;
+ 
+     case Upscaler::DLSS:
++        if (state.dlssExternalBackend && (!primaryGpu.dlssCapable || !state.NVNGX_DLSS_Path.has_value()))
++        {
++            LOG_ERROR("Configured external D3D12 DLSS backend is unavailable; refusing FSR fallback");
++            return false;
++        }
+         if (primaryGpu.dlssCapable && state.NVNGX_DLSS_Path.has_value())
+         {
+             *feature = std::make_unique<DLSSFeatureDx12>(handleId, parameters);
+@@ -77,6 +82,11 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
+ 
+     if (!loaded)
+     {
++        if (state.dlssExternalBackend && upscaler == Upscaler::DLSS)
++        {
++            LOG_ERROR("External D3D12 DLSS module failed to load; refusing FSR fallback");
++            return false;
++        }
+         // Fail after the constructor
+         ImGui::InsertNotification({ ImGuiToastType::Warning, 10000, "Falling back to FSR 2.1.2" });
+         *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
+-- 
+2.55.0.windows.5
+
