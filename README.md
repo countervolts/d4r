@@ -1,8 +1,15 @@
 # d4r (dlss 4 radeon)
 
+**This fork includes a native Windows 11 / RX 9070 XT (gfx1201) port.**
+Start with [Windows build and validation](docs/windows-rdna4-port.md) and
+[OptiScaler installation](docs/windows-game.md). K/M have hardware validation;
+K performance is still being improved. The Linux upstream description follows.
+
 d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 and RDNA4 code.
 
-**Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M). DLSS 5 is PURPOSELY not supported.
+**Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus experimental L). DLSS 5 is PURPOSELY not supported.
+
+Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set `[DLSS] Model = L` in `d4r.ini` and select Ultra Performance in game or OptiScaler; selecting L alone does not change the input resolution. L shares M's native Swin layers and has its own texture-kernel build. Its unfolded input/output arithmetic remains translated, so performance and image quality need game testing; the M benchmarks below do not apply to L.
 
 **Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It has been tested on one GPU in a handful of games and depends on unreleased patches to ZLUDA and vkd3d-proton.
 
@@ -14,15 +21,19 @@ submission, and returns output in the same frame without CPU image copies.
 RGBA16/32F, R11G11B10, RGBA/BGRA8, depth, exposure and motion formats have
 independent D3D12 typed SRV/UAV conversion tests. Four-frame K/M runs with packed
 output match the FP16 baseline exactly after resource-format quantisation.
-The build incorporates upstream updates through `f0d1a65`. Patched OptiScaler now
+The build incorporates upstream updates through `aa447b2`. Patched OptiScaler now
 passes standalone K/M native-network tests with exact RGB agreement against
 the direct-d4r baseline; see [the source patch](patches/optiscaler/README.md).
 Silent Hill 2 now renders K through the native Windows backend; M also renders
 a saved gameplay level with GPU output NaN/Inf checks. Startup depth/stencil
 and swap-chain lifetime issues found in the game have regression checks.
 Both K and M now pass 3840x2160 game output scans. K reaches a user-reported
-49-51 FPS in the measured scene after native output stores and command-hook
-lookup caching. Native M FP8 is separately replay/network validated; the
+62 FPS / 63% GPU with optional async interop, compared with the earlier
+49-51 FPS / 53% synchronous run. The fixed async build completes 16941 finite
+4K frames including feature recreation; queued-frame/recreation outputs match
+synchronous controls exactly. These user readings are not a controlled FSR4
+benchmark; the K performance gate remains open. Windows preset L is not yet
+validated. Native M FP8 is separately replay/network validated; the
 default keeps the FP16-equivalent baseline based on measured performance.
 All sixteen CTest gates pass with the final native Windows ZLUDA runtime. See
 [the reversible game package](docs/windows-game.md) and
@@ -67,7 +78,7 @@ d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and
 | RX 7900 GRE / XT / XTX, Radeon PRO W7800 / W7900 | gfx1100 | widened to f16 | RX 7900 XTX: [external video](https://www.youtube.com/watch?v=_GLjJ2Dn5pU) (DLSS 4.5); other cards untested |
 | RX 7600 / 7600 XT, RX 7650 GRE | gfx1102 | widened to f16 | untested |
 | RDNA3 integrated GPUs | gfx1103 | widened to f16 | untested |
-| RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700 | gfx1201 | native FP8 (`NativeFp8`, default on) | emulator only |
+| RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700 | gfx1201 | native FP8 (`NativeFp8`, default on) | RX 9070 XT: [external video](https://www.youtube.com/watch?v=lZ0BLYqAtCs), other cards untested |
 | RX 9060 XT / 9060 | gfx1200 | native FP8 (`NativeFp8`, default on) | compile only |
 | RDNA2 and older | | | unsupported |
 
@@ -105,6 +116,8 @@ The release zip works like an OptiScaler release: its contents go into the folde
    - the d4r-patched vkd3d-proton (`d3d12.dll`, `d3d12core.dll`);
    - an `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and NVIDIA's `nvngx_dlss.dll` (310.7) and `_nvngx.dll`.
 2. In Steam, select GE-Proton 11 for the game and set these launch options: `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
+
+When updating, replace `d3d12.dll` and `d3d12core.dll` together with `d4r/nvngx.dll`. The shim requires their matching resource-lifetime extension.
 
 ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubuntu 22.04 packages, which run under Steam's container runtime on any distribution). The zip's NVIDIA files and the kernels built from NVIDIA's code are not covered by this repository's license (see [NOTICE](NOTICE)). The Proton prefix and the system are not changed. [packaging/D4R_README.txt](packaging/D4R_README.txt) is the full guide that ships in the zip; `scripts/package_release.sh` builds the zip (see [docs/building.md](docs/building.md#7-package-a-release)).
 

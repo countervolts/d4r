@@ -133,18 +133,24 @@ def main(argv):
     # RDNA4's native FP8 WMMA (on unless set off; ZLUDA and the bridge ignore it on other GPUs)
     value = flag("Kernels", "NativeFp8")
     env["D4R_ZLUDA_WMMA_FP8_NATIVE"] = "0" if value is False else "1"
+    value = flag("Kernels", "NativeSwinEncoders")
+    env["D4R_NATIVE_SWIN_ENCODERS"] = "0" if value is False else "1"
     value = get("Kernels", "ImplicitMaxBlock")
     if value:
         env["D4R_ZLUDA_IMPLICIT_MAX_BLOCK"] = value
 
     for key, var in (("VramInterop", "D4R_SHIM_VRAM_INTEROP"), ("InputSync", "D4R_SHIM_INPUT_SYNC"),
-                     ("GpuWait", "D4R_SHIM_GPU_WAIT"), ("LinearInputs", "D4R_SHIM_LINEAR_INPUTS"),
+                     ("LinearInputs", "D4R_SHIM_LINEAR_INPUTS"),
                      ("DirectOutput", "D4R_SHIM_OUTPUT_DIRECT"), ("ElideNgxSync", "D4R_ELIDE_NGX_SYNC"),
                      ("EvalSync", "D4R_SHIM_EVAL_SYNC")):
         value = flag("Interop", key)
         if value is not None:
             env[var] = "1" if value else "0"
     value = get("Interop", "MarkerPollUs")
+    dilation = get("Interop", "MotionVectorDilation")
+    if dilation is not None and dilation not in ("0", "1", "2"):
+        fail("[Interop] MotionVectorDilation must be 0, 1 or 2")
+    env["D4R_MOTION_DILATION"] = dilation or "0"
     if value:
         if not value.isdigit():
             fail(f"[Interop] MarkerPollUs must be a number of microseconds, not {value!r}")

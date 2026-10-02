@@ -37,6 +37,7 @@ Install
 1. Extract everything in this zip into the folder that holds the game's main .exe. For Unreal
    Engine games that is <game>/<Project>/Binaries/Win64/, next to <Project>-Win64-Shipping.exe.
    You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, this file and an d4r folder.
+   When updating, replace both d3d12 DLLs with the shim: it requires their resource-lifetime extension.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those
    out of the way first. Also remove PROTON_USE_OPTISCALER from the game's launch options if you
    used GE-Proton's built-in OptiScaler: d4r brings its own.
@@ -65,10 +66,16 @@ Settings
   start may compile a separate cache. Missing accuracy variants use translated kernels, never the
   fast native set. The mode aims to match NVIDIA's output, but 1:1 RTX image quality is not proven.
 - d4r/d4r.ini: d4r's settings for this game. The main one is the DLSS model:
-  K (DLSS 4, default), E (DLSS 3 CNN, a little faster) or M (DLSS 4.5, slowest).
+  K (DLSS 4, default), E (DLSS 3 CNN, a little faster), M (DLSS 4.5), or L (DLSS 4.5
+  for Ultra Performance, especially 4K; experimental). Set Model = L and select Ultra Performance
+  in game or OptiScaler. Choosing the model does not change the render resolution.
 - On RDNA4, [Kernels] NativeFp8 is on by default. It selects native FP8 WMMA and the matching
   gfx12-fp8 kernel folder; set it to false to use f16 widening. The FP8 path has not been tested
   on a real RDNA4 GPU.
+- If L/M shows extra trails in motion, try [Kernels] NativeSwinEncoders = false with
+  PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
+  native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
+  some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
 

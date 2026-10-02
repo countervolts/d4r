@@ -5,6 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int d4r_native_swin_encoders_enabled(void)
+{
+    const char* value = getenv("D4R_NATIVE_SWIN_ENCODERS");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+static int d4r_native_kernel_allowed(const char* name)
+{
+    return d4r_native_swin_encoders_enabled() ||
+        (strcmp(name, "rrlite_enc1_4x4") != 0 && strcmp(name, "rrlite_enc2_4x4") != 0);
+}
+
 static int d4r_apply_accuracy_policy(void)
 {
     const char* prefer = getenv("D4R_PREFER_ACCURACY");

@@ -99,7 +99,11 @@ All sixteen CTest gates also pass with `D4R_ASYNC_INTEROP=1` after the release
 fix. The previously archived synchronous package described below remains a
 separate artifact; it does not contain this async scheduling change.
 
-Upstream refreshed and merged on 2026-10-01 through
+Upstream refreshed and merged on 2026-10-02 through `aa447b2` (experimental L,
+Linux resource lifetimes and event waits). Its Linux-only runtime helpers do
+not enter the native Windows build; K/M native sources and the Windows
+backend are unchanged by that update. Windows L remains outside the validated
+manifest and game runner. The prior refresh on 2026-10-01 incorporated
 [`f0d1a65`](https://github.com/countervolts/d4r/commit/f0d1a65e27aff6cbe7eeaa13227c80facb9056ab)
 and artifact fix `65dfc9f`. Windows retains strict f16 rounding and the exact
 M attention baseline. Upstream's optional denormal override now drops only

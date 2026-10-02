@@ -100,3 +100,4 @@
 @ stdcall d4rSetEnv(str str long) d4rSetEnv
 @ stdcall d4rLoadError() d4rLoadError
 @ stdcall d4rOutputKernelNative() d4rOutputKernelNative
+@ stdcall d4rDilateMotionVectors(ptr) d4rDilateMotionVectors

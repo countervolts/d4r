@@ -30,7 +30,7 @@
 #                    older builds
 #                    Accuracy texture sets go in accuracy/<target>/, built with D4R_PREFER_ACCURACY=1.
 #   D4R_ZLUDA_EMIT  d4r_emit from the patched ZLUDA build; required in full builds when an accuracy
-#                    texture set is not supplied in D4R_BUNDLE_TEX/accuracy/<target>.
+#                    texture set or L's unfolded texture variants are not supplied in D4R_BUNDLE_TEX.
 # D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
 set -euo pipefail
 
@@ -126,6 +126,24 @@ for arch in $ARCHS; do
   folders+=("$arch")
   [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
 done
+# Older texture bundles predate L. Complete them from the user's DLSS DLL rather
+# than silently shipping only M's folded variants under the new L support claim.
+ensure_l_textures() {
+  local dir="$1" accuracy="$2" missing=0 mv range v name
+  local names=(rrlite_dec0_4x4)
+  for mv in mvhi mvlo; do
+    for range in hdr ldr; do
+      names+=("rrlite_enc0_4x4_${mv}_${range}")
+      for v in 3_1 3_2; do names+=("rrlite_post_${v}_${mv}_${range}"); done
+    done
+  done
+  for name in "${names[@]}"; do [[ -f "$dir/$name.hsaco" ]] || missing=1; done
+  if [[ "$missing" == 1 ]]; then
+    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply the unfolded L texture variants in D4R_BUNDLE_TEX}"
+    D4R_PREFER_ACCURACY="$accuracy" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
+      D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" l "$dir" >/dev/null
+  fi
+}
 build_target() {
   local folder="$1" arch fp8 tex_dir accurate accurate_tex f
   arch="${folder%-fp8}"
@@ -148,6 +166,7 @@ build_target() {
       done
     fi
   fi
+  [[ "$VARIANT" != full ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
   python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
 
   # Every release target also gets conservative network and texture variants. Do not copy fast
@@ -169,6 +188,7 @@ build_target() {
     fi
   fi
   if [[ "$VARIANT" == full ]]; then
+    ensure_l_textures "$accurate" 1
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
       [[ -f "$accurate/$(basename "$f")" ]] || {
         echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;

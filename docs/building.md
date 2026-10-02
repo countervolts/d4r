@@ -5,7 +5,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 | Component | Tested version |
 |---|---|
 | ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0007` in order |
-| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` |
+| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` and `0002` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
 | DLSS | `nvngx_dlss.dll` 310.7.0 |
@@ -81,7 +81,7 @@ D4R_ZLUDA_EMIT=/path/to/zluda/target/release/examples/d4r_emit \
 kernels/build.sh all kernels/out/native
 ```
 
-`kernels/out/native` then holds one code object per replaced DLSS kernel; set `NativeKernelDirFast` in d4r.ini (or `D4R_ZLUDA_NATIVE_DIR`) to it. `kernels/build.sh k` or `m` builds only the network layers and needs neither the DLL nor ZLUDA. The texture kernels (`tex`) extract PTX from your DLL into `kernels/extracted/` and compile it offline for `D4R_GPU_ARCH` through `D4R_ZLUDA_EMIT`; that directory and the build output are git-ignored and must not be redistributed. On gfx12, build a second variant with `D4R_NATIVE_FP8=1` and place it in an `<arch>-fp8` folder.
+`kernels/out/native` then holds one code object per replaced DLSS kernel; set `NativeKernelDirFast` in d4r.ini (or `D4R_ZLUDA_NATIVE_DIR`) to it. `kernels/build.sh k` or `m` builds only the network layers and needs neither the DLL nor ZLUDA. `kernels/build.sh l` builds L's shared network layers and unfolded texture variants; it needs the DLL and emitter. The texture kernels (`tex`, including L) extract PTX from your DLL into `kernels/extracted/` and compile it offline for `D4R_GPU_ARCH` through `D4R_ZLUDA_EMIT`; that directory and the build output are git-ignored and must not be redistributed. On gfx12, build a second variant with `D4R_NATIVE_FP8=1` and place it in an `<arch>-fp8` folder.
 
 To add the accuracy option to a developer set, repeat the build with `D4R_PREFER_ACCURACY=1` and output `kernels/out/native/accuracy` (multi-target builds: `kernels/accuracy/<arch>` and `<arch>-fp8`). Use a separate empty directory; successfully built accuracy sets receive `d4r-accuracy.txt`. Enable `[Kernels] PreferAccuracy = true` and restart. The option defaults to false and never substitutes the fast set when accuracy binaries are absent.
 
@@ -132,7 +132,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
 | `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0007` applied |
-| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patch `0001` applied |
+| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001` and `0002` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
 | `D4R_ROCM_LINK_STUBS` | optional directory for additional ROCm link libraries |

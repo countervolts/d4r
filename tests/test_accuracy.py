@@ -31,6 +31,9 @@ int main(int argc, char** argv) {
         puts("");
         return 0;
     }
+    if (argc == 3 && strcmp(argv[1], "kernel") == 0) {
+        printf("%d\n", d4r_native_kernel_allowed(argv[2])); return 0;
+    }
     if (argc != 5) return 2;
     char path[1024] = {0};
     int kind = d4r_select_native_source(argv[1], argv[2], atoi(argv[3]), atoi(argv[4]), path, sizeof(path));
@@ -139,6 +142,37 @@ int main(int argc, char** argv) {
                          self.config("[Kernels]\nPreferAccuracy=true\n", {"D4R_PREFER_ACCURACY": "0"}).stdout)
         result = self.config("[Kernels]\nPreferAccuracy=perhaps\n", expected=2)
         self.assertIn("PreferAccuracy must be true or false", result.stderr)
+
+    def test_swin_encoder_fallback_keeps_other_layers(self):
+        encoders = ("rrlite_enc1_4x4", "rrlite_enc2_4x4")
+        others = ("rrlite_enc3_tube_4x4", "rrlite_dec1_4x4", "rrlite_dec2_4x4",
+                  "rrlite_enc0_4x4_mvhi_hdr", "rrlite_post_3_1_mvhi_hdr", "dltss_pwin_enc1_layer")
+        for value in ("0", "1", None):
+            env = {k: v for k, v in os.environ.items() if k != "D4R_NATIVE_SWIN_ENCODERS"}
+            if value is not None:
+                env["D4R_NATIVE_SWIN_ENCODERS"] = value
+            for name in encoders + others:
+                got = subprocess.check_output([str(self.runner), "kernel", name], env=env, text=True).strip()
+                self.assertEqual(got, "0" if value == "0" and name in encoders else "1")
+
+    def test_swin_encoder_config_and_environment_override(self):
+        for value, expected in (("false", "0"), ("true", "1"), ("auto", "1")):
+            self.assertIn(f"export D4R_NATIVE_SWIN_ENCODERS={expected}",
+                          self.config(f"[Kernels]\nNativeSwinEncoders = {value}\n").stdout)
+        result = self.config("[Kernels]\nNativeSwinEncoders = false\n",
+                             {"D4R_NATIVE_SWIN_ENCODERS": "1"})
+        self.assertNotIn("export D4R_NATIVE_SWIN_ENCODERS", result.stdout)
+        self.config("[Kernels]\nNativeSwinEncoders = maybe\n", expected=2)
+
+    def test_motion_dilation_config_bounds_and_environment_precedence(self):
+        for value, expected in (("0", "0"), ("1", "1"), ("2", "2"), ("auto", "0")):
+            self.assertIn(f"export D4R_MOTION_DILATION={expected}",
+                          self.config(f"[Interop]\nMotionVectorDilation = {value}\n").stdout)
+        for value in ("-1", "3", "true", "1.5"):
+            self.config(f"[Interop]\nMotionVectorDilation = {value}\n", expected=2)
+        self.assertNotIn("export D4R_MOTION_DILATION",
+                         self.config("[Interop]\nMotionVectorDilation = 2\n",
+                                     {"D4R_MOTION_DILATION": "0"}).stdout)
 
     def test_shipped_configs_default_off(self):
         for file in ("config/d4r.ini.default", "packaging/d4r.ini"):

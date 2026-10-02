@@ -35,11 +35,17 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
   - `pwin_wide.h`: the deep layers, which have only 6–77 windows per frame. It uses 4·NG waves per window, split by token tile and channel group, so the GPU stays busy.
 - **Weights:** prep kernels expand the weights into WMMA operand images once.
 
-**DLSS 4.5, preset M (`kernels/m`, `rrlite_*`).**
+**DLSS 4.5, presets L/M (`kernels/m`, `rrlite_*`).**
 - **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands, once per weight set.
 - **Template:** `swin_block.h` covers encoders, the tube-shaped enc3 and decoders.
 - **Output encoding:** the FP8 output is encoded two values at a time with packed 16-bit operations (`enc8x2`, exhaustively equal to the scalar encoder), and the 2×2 patch merge reads the rounded f16 values the codes decode to, from a row layout without LDS bank conflicts, instead of decoding the bytes again in every wave.
 - **Weight loads:** enc1 forms each weight tile's address in scalar registers (`SWIN_SCALAR_BLOAD`); the 8-wave layers are faster without it.
+
+**Preset L texture variants.** L uses unfolded `rrlite_enc0_4x4_*`, `rrlite_dec0_4x4`, and `rrlite_post_3_*` kernels. The L build keeps their full neural arithmetic and replaces surface stores with the existing native format-conversion functions. M's folded enc0 tail and dec0 head cannot be used for these variants. All four input flag combinations and all eight post variants are built, along with the shared downsample kernels. `all` and `tex` include these variants; `l` builds the shared Swin layers plus only the L texture set. L remains experimental; these replacements do not establish RTX parity or game performance.
+
+**Motion mitigation.** `[Kernels] NativeSwinEncoders = false` (`D4R_NATIVE_SWIN_ENCODERS=0`) bypasses only `rrlite_enc1_4x4` and `rrlite_enc2_4x4` in the native manifest. L/M then use the original translated PTX for those encoders, retaining native tube, decoder and texture kernels. Keep `PreferAccuracy = true` for the tested conservative path. It reduced the extra building-edge trails in a 64-frame moving Townfall capture at 853×480 → 2560×1440 on gfx1101; it does not recover detail absent from the low-resolution input or establish RTX parity. The default remains `true` for speed. Flat developer sets without manifests fall back entirely when this switch is off; add a manifest to keep selective acceleration.
+
+Initial validation: a gfx1101 fast L build completed two Ultra Performance harness frames (192×108 → 576×324, DLSS 310.7). Its finite, nonzero RGBA16F output matched the original translated L texture kernels byte for byte with the same native Swin layers. A gfx1201 FP8 accuracy L set compiled successfully; RDNA4 hardware and 4K game output have not been tested. Full packaging rebuilds missing L variants when given an older texture bundle.
 
 ## RDNA4
 
@@ -79,6 +85,7 @@ This mode aims to preserve NVIDIA's arithmetic, not to promise bit-identical RTX
 ```sh
 kernels/build.sh k          # DLSS 4 layers   (ROCm clang only)
 kernels/build.sh m          # DLSS 4.5 layers
+kernels/build.sh l          # L shared layers + unfolded textures (needs DLL and D4R_ZLUDA_EMIT)
 kernels/build.sh tex        # texture kernels (needs D4R_DLSS_DLL and D4R_ZLUDA_BUILD)
 kernels/build.sh all DIR    # everything into DIR (default kernels/out/native)
 D4R_PREFER_ACCURACY=1 kernels/build.sh all DIR/accuracy  # conservative versions of every family
@@ -119,3 +126,11 @@ Median GPU time per frame at Quality (1706×960 → 2560×1440, RX 7700 XT), fro
 | **total** | **3.10** | **2.97** | **total** | **9.04** | **8.23** |
 
 Runs of the same build vary by about ±3% per kernel. M additionally skips its output copy now (direct output through the downsample kernel), which is not a kernel and not in the table. Games whose flags differ from Townfall's (motion vectors at render resolution, LDR input, regular depth) gain more: those kernel variants used to run as plain ZLUDA compiles (K 3.6–4.6 ms → 2.8–3.0 ms, M −0.5 to −0.7 ms per frame).
+
+## Experimental thin-feature motion coverage
+
+`[Interop] MotionVectorDilation = 1` or `2` (`D4R_MOTION_DILATION`) extends nearby foreground motion into pixels whose depth otherwise belongs to the background. The value selects the opaque-surface radius in render pixels. Both enabled values also fill sky gaps using the nearest foreground pixel within an eight-render-pixel circle (far depth 0 for reversed Z, 1 for normal Z). This is the wider sky fill from the comparison; it can strengthen trails in some frames and remains opt-in through `MotionVectorDilation`. This is a depth-guided approximation to better thin-feature motion coverage, not engine-side conservative rasterization. It improved the captured Townfall rooftop where the earlier native-encoder fallback did not resolve the artifact.
+
+The d4r-owned GPU kernel preserves the original depth/motion buffers and writes a separate RG16F velocity texture. The worker waits for its completion before NGX evaluates. No per-frame CPU readback is needed. It requires same-frame linear VRAM inputs, full-resolution unjittered motion vectors and zero subrect bases. Unsupported features or unavailable kernels keep the original vectors. The default is `0` (off); larger radii can affect disocclusion and unrelated foreground edges. The method does not recreate geometry missing from every input frame or establish RTX parity.
+
+`scripts/build_wine_nvcuda_bridge.sh` embeds the support kernels when `D4R_ROCM_DIR` points to ROCm clang. All six gfx110x/gfx120x targets compile; physical validation is currently gfx1101 only. A bridge built without the support kernels reports the feature unavailable rather than changing inputs. Optional GPU regressions cover forward/reversed depth, two radii, jitter, padded rows and preservation of input buffers; see `tests/test_motion_kernel_gpu.py`.

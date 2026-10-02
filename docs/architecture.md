@@ -12,7 +12,7 @@ d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX 
 | CUDA bridge `nvcuda.dll` | `tools/wine_nvcuda_bridge.c` | A Wine builtin whose Windows exports forward to ZLUDA's Linux `libcuda.so`, plus d4r helpers (Vulkan memory import, asynchronous 2D copies, GPU-side waits, output redirect, linear textures) |
 | ZLUDA | `patches/zluda` | CUDA driver API on HIP; compiles NVIDIA's PTX to AMDGPU code; serves native kernels in place of PTX kernels |
 | Native kernels | `kernels/` | RDNA3 implementations of the DLSS network layers and parts of texture kernels |
-| vkd3d-proton patch | `patches/vkd3d-proton` | Lets the shim split a D3D12 command list around the DLSS call |
+| vkd3d-proton patch | `patches/vkd3d-proton` | Splits a D3D12 command list around DLSS and retains external resources through command allocator completion |
 | NVAPI identity | `tools/d4r_nvapi_identity.c` | Reports an Ada (sm_89) GPU so NGX selects the network weights matching the PTX ZLUDA compiles |
 
 ## One frame
@@ -24,23 +24,22 @@ With VRAM interop and split frames (the defaults when the patched vkd3d-proton i
    - A frame marker.
    - A split. vkd3d-proton submits everything the game records after the DLSS call separately, gated on a timeline semaphore reaching this frame's number.
    - At the start of that second part, a copy of the DLSS result into the game's output texture. Linear R11G11B10, RGB10A2, and RGBA8/BGRA8 outputs are converted from RGBA16F on the GPU. sRGB formats continue through host staging to preserve their existing byte interpretation.
-2. **The CUDA worker queues DLSS.** A worker thread owns the CUDA context. For each frame it queues on the GPU, without waiting on the CPU:
-   - a wait for the marker (`GpuWait`);
+2. **The CUDA worker queues DLSS.** The prep thread checks the GPU-written input marker with short CPU sleeps. It drops recorded-but-unsubmitted frames when they time out or their feature retires, before any DLSS work is queued. The CUDA worker then queues:
    - the input copies into CUDA arrays, or none when NGX samples the buffers in place (`LinearInputs`);
    - NGX's evaluation (NGX's own CPU synchronisations are elided with `ElideNgxSync`);
    - the result, written straight into the output buffer by the native output kernel (`DirectOutput`, preset K) or copied there.
 3. **Release.** When the GPU finishes, the worker signals the timeline semaphore and the rest of the game's frame runs, now with this frame's result.
 
-A watchdog releases any frame that never completes (for example a command list that is recorded but never executed), so the game cannot stall on DLSS.
+The watchdog reports delayed output but never signals an unfinished producer as ready. Retiring features remain registered until their CPU/CUDA jobs drain. The lifetime-aware vkd3d extension retains their staging buffers, imported buffers, conversion images and split semaphore through command-allocator reset or destruction after GPU completion. Discarded recordings are covered too; cleanup no longer relies on a 50 ms delay.
 
-Without the vkd3d-proton patch the shim shows the newest finished result instead (one or more frames old). Without VRAM interop, inputs and output are staged through host memory.
+The shim requires the matching lifetime-aware d3d12.dll and d3d12core.dll, even for host staging. It rejects older runtimes rather than recording references whose lifetime it cannot protect. FrameAge > 0 shows the newest finished result; without VRAM interop, inputs and output are staged through host memory.
 
 ## Why each piece exists
 
 - **CUDA NGX instead of D3D12 NGX.** NVIDIA's D3D12 path needs NVIDIA's driver. The CUDA path only needs a CUDA driver API, which ZLUDA provides.
 - **The Ada identity.** NGX picks network weights by GPU architecture. The weights have to match the PTX that ZLUDA compiles, which is sm_89 for DLSS 310.
 - **Native kernels.** Translating NVIDIA's warp-level matrix code is slow (register pressure, lane shuffles, per-instruction mode switches). Earlier translated K layers also produced non-finite outputs that the final kernel masked. Native layers avoid that path; the compiler now preserves FP16 denormal requirements too, which fixes the translated failure in recorded captures. Numerical and image-quality parity with RTX hardware remains unverified.
-- **The GPU-side hand-offs.** With DLSS itself fast, most of the remaining gap to FSR 4 was the GPU idling while CPU threads waited on each other. Moving the waits onto the GPU raised GPU utilisation from about 95% to 99%.
+- **Sleeping readiness checks.** Waiting for input submission before queueing DLSS avoids an uncancellable GPU wait. Explicit output event queries with short sleeps avoid HIP event/context waits that can consume a CPU core. Submillisecond waits use NtDelayExecution because MinGW std::sleep_for can truncate them to zero. Linear inputs and direct output remain available.
 
 ## Configuration
 
@@ -53,7 +52,6 @@ Without the vkd3d-proton patch the shim shows the newest finished result instead
 | `[Kernels] NativeKernels` | `D4R_ZLUDA_NATIVE_DIR` | native kernel directory (`fast` / `exact` / `off`) |
 | `[Kernels] PreferAccuracy` | `D4R_PREFER_ACCURACY` | default off; accuracy variants for every native family and conservative translation/synchronization settings |
 | `[Interop] VramInterop` | `D4R_SHIM_VRAM_INTEROP` | keep inputs and output in VRAM |
-| `[Interop] GpuWait` | `D4R_SHIM_GPU_WAIT` | GPU-side wait for the game's inputs |
 | `[Interop] LinearInputs` | `D4R_SHIM_LINEAR_INPUTS` | NGX samples the input buffers in place |
 | `[Interop] DirectOutput` | `D4R_SHIM_OUTPUT_DIRECT` | the output kernel writes the game-side buffer directly (preset K) |
 | `[Interop] ElideNgxSync` | `D4R_ELIDE_NGX_SYNC` | skip NGX's internal CPU waits |
@@ -90,11 +88,11 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 
 The launcher writes each run's logs to `~/.cache/d4r-dlss-captures/game-<exe>-<time>/`. `d4r_nvngx.log` holds the shim's log. With `[Debug] Profile = true` it also records one `D4R_PROFILE` line per frame, with the stage timings.
 
-For a CPU-use A/B check, set `D4R_SHIM_BLOCKING_SYNC = 1` under `[Env]` in the game's `d4r.ini`.
-The VRAM path then requests a blocking event wait for its null-stream output. If ZLUDA and HIP
-honour the event flag, the waiting thread yields the CPU; an unavailable or failed event falls back
-to the original context sync. This is opt-in because it changes the wait scope and may add wakeup
-latency. The profile reports `output_sync_wall`, `output_sync_cpu`, and `output_sync_blocking`;
-compare CPU use and frame rate in the same scene.
+Output completion uses event queries with 200 us NtDelayExecution sleeps by default. `D4R_SHIM_BLOCKING_SYNC = 0`
+under `[Env]` restores context synchronization for an A/B check. The profile records
+`output_sync_wall`, `output_sync_cpu`, and `output_sync_method=event_query_sleep` for the new path.
+An unavailable or failed event falls back to context synchronization. The old `GpuWait` setting
+is no longer used: input readiness is checked on the CPU before CUDA work is queued.
+
 The `d2h` field on this path includes the output synchronization wait, even when direct output
 skips the array-to-buffer copy.

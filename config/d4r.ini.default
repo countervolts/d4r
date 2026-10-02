@@ -17,14 +17,20 @@ CompatDataDir =
 GameExe =
 
 [DLSS]
-; Which DLSS network ("preset") to run. fps measured on an RX 7700 XT, Townfall 2560x1440, same street
-; walk, for Quality / Balanced / Performance / Ultra Performance (FSR 4: 76 / 85 / 94 / 107):
-;   E (or CNN)     = DLSS 3 CNN, the fastest at Quality..Performance  72 / 81 / 88 / 89
-;   K (or DLSS4)   = DLSS 4 transformer, sharper; best at Ultra Perf  69 / 77 / 84 / 95
-;   M (or DLSS4.5) = DLSS 4.5 transformer, best image, slowest        52 / 60 / 70 / 90
-;   F = the other CNN (same speed as E); A, B, C, D, G, J run the K network in this DLSS version;
-;   L (DLSS 4.5 Ultra Performance model) is not accelerated here and runs very slowly.
-;   auto = whatever the game/OptiScaler asks for
+; DLSS model recommendations:
+;
+; Model | DLSS  | Recommended modes               | Notes
+; ------+-------+---------------------------------+----------------------------------
+; K     | 4     | DLAA / Quality / Balanced       | Default; faster alternative to M/L
+; M     | 4.5   | Performance                     | More demanding on RDNA3
+; L     | 4.5   | Ultra Performance               | Especially 4K; experimental
+; E     | 3 CNN | Quality / Balanced / Performance | Legacy faster fallback
+; F     | 3 CNN | DLAA / Ultra Performance        | Deprecated; prefer K or L
+;
+; Select the upscaling mode separately in game/OptiScaler. These are recommendations;
+; other modes are allowed. L requires the L texture build.
+; Aliases: CNN = E, DLSS4 = K, DLSS4.5 = M. A/B/C/D/G/J use K in this DLL version.
+; auto = use the game/OptiScaler choice. Benchmarks: docs/performance.md.
 Model = K
 [Latency]
 ; How many frames old the upscaled image the game presents may be.
@@ -42,6 +48,11 @@ FrameAge = 0
 ; directory directly). Missing accuracy kernels use translated PTX, never the fast set. Slower; this
 ; aims for fidelity, but RTX image parity is not proven. (D4R_PREFER_ACCURACY)
 PreferAccuracy = false
+; false: use original translated enc1/enc2 layers for L/M, retaining other native kernels.
+; Reduces the native encoders' motion trails seen in Townfall; best paired with PreferAccuracy.
+; Costs some GPU time. Manifest required for selective fallback; flat sets fall back entirely.
+; (D4R_NATIVE_SWIN_ENCODERS)
+NativeSwinEncoders = true
 ; Native RDNA3 / RDNA4 kernels for the DLSS 4 and 4.5 network layers (replace ZLUDA's translated code).
 ;   fast  = native kernels with relaxed numerics (unless PreferAccuracy is true)
 ;   exact = a separately built directory with conservative FP8/f16 rounding; not an RTX parity guarantee
@@ -60,6 +71,12 @@ IgnoreDenormals = true
 ImplicitMaxBlock = 256
 
 [Interop]
+; Experimental foreground motion coverage for thin geometry. 0 = original vectors;
+; 1/2 = opaque-surface dilation radius in render pixels; both automatically fill sky gaps
+; from the nearest foreground within 8 render pixels. Needs render- or display-resolution, unjittered motion vectors
+; and same-frame linear VRAM inputs; unsupported features retain original vectors.
+; Default off. May affect disocclusion edges. (D4R_MOTION_DILATION)
+MotionVectorDilation = 0
 ; Keep DLSS inputs and output in VRAM (vkd3d-proton Vulkan interop) instead of copying through
 ; system memory. Falls back automatically when the game's resources do not qualify.
 VramInterop = true
@@ -67,19 +84,18 @@ VramInterop = true
 InputSync = true
 ; Faster hand-offs between the game and DLSS (same frame, same result). Need FrameAge = 0 and VRAM
 ; interop, and a runtime built from this checkout (scripts/install_d4r_runtime.sh).
-;   GpuWait: DLSS is queued ahead and starts on the GPU the moment the game's inputs are ready
-;   LinearInputs: DLSS reads the game's inputs in place (no input copies; needs GpuWait)
+; Input readiness is checked with CPU sleeps; recorded-but-discarded lists never queue GPU waits.
+;   LinearInputs: DLSS reads the game's inputs in place once the input marker is ready
 ;   DirectOutput: the result is written straight into the game-side buffer (preset K, and only while
 ;     NGX runs the native output kernel; drops NVIDIA's "DLSS SDK" watermark)
 ;   ElideNgxSync: removes NGX's internal CPU waits between its GPU stages
 ;   EvalSync = false: no CPU wait between DLSS and the output copy
-;   MarkerPollUs: how often (microseconds) the CPU checks for the game's inputs without GpuWait
-GpuWait = true
+;   MarkerPollUs: how often (microseconds) the CPU checks for the game's inputs
 LinearInputs = true
 DirectOutput = true
 ElideNgxSync = true
 EvalSync = false
-MarkerPollUs = 20
+MarkerPollUs = 200
 
 [Paths]
 ; auto = defaults of scripts/d4r_proton_env.sh
@@ -133,4 +149,4 @@ LogDir = auto
 [Env]
 ; Anything else, passed through as environment variables (one per line):
 ;   D4R_SHIM_SPLIT_TIMEOUT_MS = 200
-;   D4R_SHIM_BLOCKING_SYNC = 1  ; yield CPU while waiting for DLSS output
+;   D4R_SHIM_BLOCKING_SYNC = 0  ; A/B only: restore context waits instead of default event queries/sleeps

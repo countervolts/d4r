@@ -2,7 +2,7 @@
 # Builds the native replacements for DLSS kernels into one directory that ZLUDA serves them from
 # (D4R_ZLUDA_NATIVE_DIR, or NativeKernelDirFast in d4r.ini). See docs/native-kernels.md.
 #
-# usage: kernels/build.sh [all|k|m|tex] [OUT_DIR]      (default: all, kernels/out/native)
+# usage: kernels/build.sh [all|k|l|m|tex] [OUT_DIR]      (default: all, kernels/out/native)
 #
 #   D4R_ROCM_DIR    ROCm installation with clang and the HIP device libraries (default /opt/rocm)
 #   D4R_GPU_ARCH    target GPU (default gfx1101): an RDNA3 (gfx110x) or RDNA4 (gfx120x) target; the kernels
@@ -37,7 +37,7 @@ esac
 CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "clang++ not found in $ROCM/lib/llvm/bin (set D4R_ROCM_DIR)" >&2; exit 2; }
 mkdir -p "$OUT"
-case "$WHAT" in all|k|m|tex) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
+case "$WHAT" in all|k|l|m|tex) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
 # Never certify a directory containing older fast binaries as an accuracy set.
 if [[ "$ACCURACY" == 1 ]] && compgen -G "$OUT/*.hsaco" >/dev/null &&
     { [[ ! -f "$OUT/d4r-accuracy.txt" ]] || [[ "$(cat "$OUT/d4r-accuracy.txt")" != 1 ]]; }; then
@@ -67,11 +67,11 @@ if [[ "$WHAT" == all || "$WHAT" == k ]]; then
     echo "== DLSS 4 (preset K) transformer layers"
     for src in "$HERE"/k/dltss_pwin_*.hip; do build_hip "$src"; done
 fi
-if [[ "$WHAT" == all || "$WHAT" == m ]]; then
-    echo "== DLSS 4.5 (preset M) Swin layers"
+if [[ "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ]]; then
+    echo "== DLSS 4.5 (presets L/M) shared Swin layers"
     for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$([[ "$FP8" == 1 ]] && echo -DD4R_FP8_WMMA)"; done
 fi
-if [[ "$WHAT" == all || "$WHAT" == tex ]]; then
+if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     echo "== texture kernels (NVIDIA PTX with native parts)"
     : "${D4R_DLSS_DLL:?set D4R_DLSS_DLL to nvngx_dlss.dll (310.7)}"
     : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a ZLUDA build with patches/zluda}"
@@ -86,17 +86,29 @@ if [[ "$WHAT" == all || "$WHAT" == tex ]]; then
     # post 0.89 -> 0.77 ms, hiluma output 0.905 -> 0.887 ms (downsample was slower as wave64).]
     # Every flag combination DLSS selects (motion vectors hi/lo, HDR/LDR, depth inverted/regular, ...) gets
     # the same treatment, so games other than the one measured run the native versions too.
-    specs=(rrlite_dec0_4x4_folded:dec0_head)
-    for mv in mvhi mvlo; do
-        for range in hdr ldr; do
-            specs+=("rrlite_enc0_4x4_${mv}_${range}_folded:enc0_tail")
-            for v in 3_1 3_2; do specs+=("rrlite_post_${v}_${mv}_${range}_folded:sust_only:w64"); done
-            for depth in depthinv depthreg; do
-                for kind in "" _max; do
-                    [[ -z "$kind" ]] && specs+=("hiluma_engine_output_${depth}_${mv}_${range}_v1_rel:sust_only:w64")
-                    specs+=("hiluma_engine_output_${depth}_${mv}_${range}${kind}_v2_rel:sust_only:w64")
+    specs=()
+    if [[ "$WHAT" != l ]]; then
+        specs+=(rrlite_dec0_4x4_folded:dec0_head)
+        for mv in mvhi mvlo; do
+            for range in hdr ldr; do
+                specs+=("rrlite_enc0_4x4_${mv}_${range}_folded:enc0_tail")
+                for v in 3_1 3_2; do specs+=("rrlite_post_${v}_${mv}_${range}_folded:sust_only:w64"); done
+                for depth in depthinv depthreg; do
+                    for kind in "" _max; do
+                        [[ -z "$kind" ]] && specs+=("hiluma_engine_output_${depth}_${mv}_${range}_v1_rel:sust_only:w64")
+                        specs+=("hiluma_engine_output_${depth}_${mv}_${range}${kind}_v2_rel:sust_only:w64")
+                    done
                 done
             done
+        done
+    fi
+    # L's unfolded variants keep their complete neural arithmetic. The folded M
+    # GEMM heads/tails are incompatible; substitute only the surface stores.
+    specs+=(rrlite_dec0_4x4:sust_only)
+    for mv in mvhi mvlo; do
+        for range in hdr ldr; do
+            specs+=("rrlite_enc0_4x4_${mv}_${range}:sust_only")
+            for v in 3_1 3_2; do specs+=("rrlite_post_${v}_${mv}_${range}:sust_only:w64"); done
         done
     done
     for mode in static dynamic; do

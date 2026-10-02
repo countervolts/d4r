@@ -12,6 +12,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "d4r_native_selection.h"
+#include "d4r_motion_dilation.h"
+#ifdef D4R_MOTION_KERNELS
+#include "d4r_motion_kernels.h"
+#endif
 
 typedef int CUresult;
 typedef int CUdevice;
@@ -457,6 +461,15 @@ static void prepare_native_kernels(const char* cache_home)
     }
     if (kind == 2)
     {
+        /* A flat developer set has no per-kernel manifest to filter. Fail safely to
+           translated kernels rather than silently retaining the disabled encoders. */
+        if (!d4r_native_swin_encoders_enabled())
+        {
+            tracef("NativeSwinEncoders off: developer set needs d4r-kernels.txt for selective fallback; "
+                   "using translated kernels for this set");
+            unsetenv("D4R_ZLUDA_NATIVE_DIR");
+            return;
+        }
         setenv("D4R_ZLUDA_NATIVE_DIR", source, 1);
         tracef("native kernels: %sdeveloper set in %s", accuracy ? "accuracy " : "", source);
         return;
@@ -476,6 +489,8 @@ static void prepare_native_kernels(const char* cache_home)
         unsigned long long hash = 0;
         if (line[0] == '#' || sscanf(line, "%127s %llx", name, &hash) != 2)
             continue;
+        if (!d4r_native_kernel_allowed(name))
+            continue;
         if (native_kernel_count == capacity)
         {
             capacity = capacity != 0 ? capacity * 2 : 32;
@@ -490,6 +505,9 @@ static void prepare_native_kernels(const char* cache_home)
         kernel->linked = 0;
     }
     fclose(manifest);
+    if (!d4r_native_swin_encoders_enabled())
+        tracef("NativeSwinEncoders off: rrlite_enc1_4x4 and rrlite_enc2_4x4 use original translated PTX; "
+               "other native kernels retained");
 
     /* <cache>/d4r-native/<pid>; directories of processes that no longer exist are removed */
     char base[1024];
@@ -841,6 +859,57 @@ static void* find_zluda_symbol(const char* name)
 {
     pthread_once(&load_once, load_zluda);
     return cuda_library != NULL ? dlsym(cuda_library, name) : NULL;
+}
+
+/* d4r-owned, opt-in preprocessing. Runs on HIP's legacy/default stream, shared
+   with CUDA's null stream; the shim records and waits for completion before NGX. */
+CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters)
+{
+    if (parameters == NULL || parameters->depth == 0 || parameters->motion == 0 || parameters->output == 0 ||
+        parameters->radius < 1 || parameters->radius > 2 || parameters->render_width == 0 ||
+        parameters->render_height == 0 || parameters->motion_width == 0 || parameters->motion_height == 0 ||
+        parameters->depth_pitch < (uint64_t)parameters->render_width * 4 ||
+        parameters->motion_pitch < (uint64_t)parameters->motion_width * 4 ||
+        (uint64_t)parameters->motion_width * parameters->motion_height > 0x7fffffffull)
+        return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**, const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**, void*, const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*, unsigned, unsigned, unsigned,
+        unsigned, unsigned, unsigned, unsigned, void*, void**, void**);
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static void* module;
+    static void* function;
+    static HIP_LAUNCH launch;
+    static int initialized, result = CUDA_ERROR_NOT_SUPPORTED;
+    pthread_mutex_lock(&lock);
+    if (!initialized)
+    {
+        initialized = 1;
+        pthread_once(&load_once, load_zluda);
+        void* hip = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_LOCAL);
+        char architecture[32];
+        gpu_architecture(architecture, sizeof(architecture));
+        const void* image = d4r_motion_image(architecture);
+        HIP_LOAD load = hip != NULL ? (HIP_LOAD)dlsym(hip, "hipModuleLoadData") : NULL;
+        HIP_FUNCTION get = hip != NULL ? (HIP_FUNCTION)dlsym(hip, "hipModuleGetFunction") : NULL;
+        launch = hip != NULL ? (HIP_LAUNCH)dlsym(hip, "hipModuleLaunchKernel") : NULL;
+        if (image != NULL && load != NULL && get != NULL && launch != NULL &&
+            load(&module, image) == 0 && get(&function, module, "d4r_motion_dilate") == 0)
+            result = CUDA_SUCCESS;
+        tracef("motion-vector dilation: %s (%s)", result == 0 ? "GPU kernel ready" : "unavailable", architecture);
+    }
+    const int status = result;
+    pthread_mutex_unlock(&lock);
+    if (status != CUDA_SUCCESS)
+        return status;
+    D4rMotionDilationParams copy = *parameters;
+    void* arguments[] = {&copy};
+    const uint64_t pixels = (uint64_t)copy.motion_width * copy.motion_height;
+    return launch(function, (unsigned)((pixels + 127) / 128), 1, 1, 128, 1, 1, 0, NULL, arguments, NULL);
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
 }
 
 static void tracef(const char* format, ...)
@@ -2579,7 +2648,17 @@ CUresult WINAPI d4rEventSynchronize(D4rArg a0)
     TRACE_CALL(result, "d4rEventSynchronize result=%d", result);
     return result;
 }
-D4R_FORWARD(cuEventQuery, cuEventQuery, 1, (D4rArg a0), (a0))
+CUresult WINAPI cuEventQuery(D4rArg event)
+{
+    typedef CUresult(__attribute__((sysv_abi)) *function_type)(D4rArg);
+    function_type function = (function_type)find_zluda_symbol("cuEventQuery");
+    CUresult result = function != NULL ? function(event) : missing("cuEventQuery");
+    /* NOT_READY is the normal result while the shim sleeps between queries,
+       not an error to flush to the log on every poll. */
+    TRACE_CALL(result == CUDA_ERROR_NOT_READY ? CUDA_SUCCESS : result,
+               "cuEventQuery result=%d", result);
+    return result;
+}
 /* With elided event waits an event may still be pending: report 0 ms instead of CUDA_ERROR_NOT_READY. */
 CUresult WINAPI cuEventElapsedTime(D4rArg a0, D4rArg a1, D4rArg a2)
 {

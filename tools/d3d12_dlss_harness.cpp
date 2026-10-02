@@ -20,6 +20,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include "d4r_vkd3d_interop.h"
 
 using NgxResult = unsigned int;
 constexpr NgxResult NGX_SUCCESS = 1;
@@ -101,6 +104,90 @@ static void submit_and_wait()
     }
     g_allocator->Reset();
     g_list->Reset(g_allocator, nullptr);
+}
+
+class LifetimeProbe final : public IUnknown
+{
+public:
+    explicit LifetimeProbe(std::atomic<bool>& destroyed) : destroyed_(destroyed) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this; AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG refs = --refs_;
+        if (!refs) { destroyed_ = true; delete this; }
+        return refs;
+    }
+private:
+    std::atomic<ULONG> refs_{1};
+    std::atomic<bool>& destroyed_;
+};
+
+static void lifecycle_report(const char* message)
+{
+    std::printf("%s\n", message);
+    std::fflush(stdout);
+    if (const char* path = std::getenv("D4R_HARNESS_TEST_REPORT"))
+        if (FILE* file = std::fopen(path, "a"))
+        {
+            std::fprintf(file, "%s\n", message);
+            std::fclose(file);
+        }
+}
+
+static bool test_external_lifetime()
+{
+    ID3D12DXVKInteropDeviceD4R2* interop = nullptr;
+    if (!check(g_device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R2),
+                                       reinterpret_cast<void**>(&interop)), "lifetime interface"))
+        return false;
+    for (bool submitted : {false, true})
+    {
+        std::atomic<bool> destroyed{false};
+        auto* owner = new LifetimeProbe(destroyed);
+        const HRESULT retained = interop->RetainExternalResources(g_list, owner);
+        const HRESULT repeated = interop->RetainExternalResources(g_list, owner);
+        owner->Release();
+        if (!check(retained, "retain resources") || !check(repeated, "deduplicate resources") || destroyed)
+            return false;
+        g_list->Close();
+        ID3D12Fence* gate = nullptr;
+        if (submitted)
+        {
+            if (!check(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                            reinterpret_cast<void**>(&gate)), "lifetime gate")) return false;
+            g_queue->Wait(gate, 1);
+            ID3D12CommandList* lists[] = {g_list};
+            g_queue->ExecuteCommandLists(1, lists);
+            Sleep(20);
+            g_allocator->Reset(); // Pending submissions must keep their external owners.
+            if (destroyed) { gate->Signal(1); return false; }
+            gate->Signal(1);
+            g_queue->Signal(g_fence, ++g_fenceValue);
+            if (g_fence->GetCompletedValue() < g_fenceValue)
+            {
+                g_fence->SetEventOnCompletion(g_fenceValue, g_event);
+                if (WaitForSingleObject(g_event, 5000) != WAIT_OBJECT_0) return false;
+            }
+            gate->Release();
+        }
+        // The fence callback may take a moment to drop the submission's allocator ref.
+        const ULONGLONG start = GetTickCount64();
+        do { g_allocator->Reset(); if (!destroyed) Sleep(1); }
+        while (!destroyed && GetTickCount64() - start < 5000);
+        if (!destroyed) return false;
+        if (!check(g_list->Reset(g_allocator, nullptr), "lifetime list reset")) return false;
+        lifecycle_report(submitted ? "LIFETIME submitted: retained until safe allocator reset"
+                                   : "LIFETIME discarded: retained until safe allocator reset");
+    }
+    interop->Release();
+    return true;
 }
 
 static ID3D12Resource* create_buffer(D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_STATES state)
@@ -606,6 +693,8 @@ int main(int argc, char** argv)
     d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags",
                     createFlags != nullptr ? static_cast<int>(std::strtol(createFlags, nullptr, 0)) : 0);
     NgxHandle* feature = nullptr;
+    if (std::getenv("D4R_HARNESS_LIFETIME_TEST") != nullptr && !test_external_lifetime())
+        return 1;
     result = createFeature(g_list, 1, parameters, &feature);
     std::printf("CreateFeature -> 0x%08x handle=%p\n", result, static_cast<void*>(feature));
     if (result != NGX_SUCCESS)
@@ -785,6 +874,8 @@ int main(int argc, char** argv)
             d4r_ngx_set_int(parameters, "Reset", forceReset || frame == 1 ? 1 : 0);
         const DWORD start = GetTickCount();
         result = evaluate(g_list, feature, parameters, nullptr);
+        if (const char* delay = std::getenv("D4R_HARNESS_DELAY_SUBMIT_MS"))
+            Sleep(static_cast<DWORD>(std::clamp(std::atoi(delay), 0, 4000)));
         submit_and_wait();
         std::printf("frame %d: EvaluateFeature -> 0x%08x (%lu ms incl. submit)\n", frame, result, GetTickCount() - start);
         Sleep(frameWaitMs); // let the CUDA worker finish before the next presentation
@@ -884,6 +975,25 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+
+    if (std::getenv("D4R_HARNESS_DISCARD_EVALUATION") != nullptr)
+    {
+        const NgxResult queued = evaluate(g_list, feature, parameters, nullptr);
+        const ULONGLONG start = GetTickCount64();
+        const NgxResult retired = release(feature);
+        feature = nullptr;
+        if (queued != NGX_SUCCESS || retired != NGX_SUCCESS || GetTickCount64() - start > 2000)
+        {
+            std::fprintf(stderr, "DISCARD evaluation release failed or blocked\n");
+            return 1;
+        }
+        g_list->Close();
+        g_allocator->Reset();
+        g_list->Reset(g_allocator, nullptr);
+        result = createFeature(g_list, 1, parameters, &feature);
+        if (result != NGX_SUCCESS) return 1;
+        lifecycle_report("DISCARD evaluation: release completed without submitting inputs");
+    }
 
     // D4R_HARNESS_RECREATE=N: N more release/create cycles at alternating render sizes (as when a game's DLSS
     // quality setting changes), a few evaluations each, logging this process's VRAM to find leaks per cycle.

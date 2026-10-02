@@ -211,7 +211,9 @@ def replace_rz_round(lines):
 ENC0_REF = "rrlite_enc0_4x4_mvhi_hdr_folded"
 # the other flag combinations of the kernels whose only native part is the surface-store rewrite
 SUST_ONLY_RE = re.compile(r"^(hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)(_max)?_v[12]_rel|"
-                          r"rrlite_post_3_[12]_mv(hi|lo)_(hdr|ldr)_folded|rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr))$")
+                          r"rrlite_post_3_[12]_mv(hi|lo)_(hdr|ldr)(_folded)?|"
+                          r"rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)|rrlite_dec0_4x4|"
+                          r"rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr))$")
 ENC0_RE = re.compile(r"^rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)_folded$")
 
 
