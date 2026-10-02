@@ -72,6 +72,64 @@ and compiler spill counts. Reports and proprietary workload inputs remain local.
 Native FP8 remains a separate optional experiment; the package uses the
 validated FP16-equivalent baseline. Its later checks and timings are below.
 
+## K host synchronization and asynchronous submission
+
+Current priority is K performance. The user's synchronous 4K reading is
+49–51 FPS / 53% GPU utilization, versus approximately 80+ FPS / 100% with
+FSR4. These readings do not identify a CPU hardware limit or provide a
+controlled same-scene comparison. M/FP8 optimization is deferred.
+
+ZLUDA candidate `a1c506f` adds `D4R_ZLUDA_PROFILE_API`, enabled by the game
+runner's `-ProfileCudaApi`. It measures existing API host durations, aggregates
+per thread and logs every two seconds without HIP events or additional waits.
+The synchronous control shows five `cuCtxSynchronize` calls per frame with
+about 3.9 ms aggregate host time. CUDA launch host overhead is approximately
+0.46 ms per frame. Cached copy-list setup is only 0.011 ms median. These host
+measurements include GPU waits and must not be added to GPU kernel times.
+
+| K/4K command submission, CPU median | Synchronous | First async | Async without CUDA mutex |
+| --- | ---: | ---: | ---: |
+| Entire submission, ms | 10.512 | 2.676 | 0.181 |
+| DLSS boundary, ms | 10.083 | 2.604 | 0.124 |
+| Consumer suffix completion, ms | 0.350 | 0.005 | 0.004 |
+
+The first async game run completes 9481 finite frames; the user reports
+60 FPS / 63% GPU. The mutex-free run crashes during feature recreation after
+366 finite frames, so its submission timing is not a successful gameplay
+benchmark. The standalone burst/recreate reproducer subsequently identifies
+caller-owned GPU backing freed after ReleaseFeature returns. Waiting for
+pending D3D12 consumers in ReleaseFeature fixes the reproducer: all twelve
+sync/async test frames pass, and corresponding RGB outputs are exact. Game
+stability and FPS must be checked separately on the fixed build.
+
+The fixed game retest on 2026-10-02 completes 16941 K/4K frames, all finite,
+including feature recreation and color-format reimports, with zero backend
+failures. The user reports 62 FPS / 63% GPU. Median CPU submission is
+0.197 ms, NGX host completion on the worker is 4.400 ms and output validation
+is 0.380 ms. The 10.162 ms median worker input wait includes queued game
+rendering. These results establish a stable five-minute test of this fix,
+not a conclusion about the remaining GPU idle time or FSR4 performance.
+
+`-AsyncInterop` is opt-in. It queues input/output fences on the submission
+thread, executes CUDA on a worker and retires owned command memory by GPU
+completion. Three copy slots bound outstanding ownership. The queue consumes
+the output of the same frame, with no CPU image copy. The worker's input wait
+includes its lead behind submitted rendering and is not a CPU submission
+stall. Neither that duration nor the NGX recording interval measures Present
+latency. Reconfiguration waits for all consumers; ordinary submission does not
+hold the CUDA mutex. The experimental runtime currently supports one queue.
+
+```powershell
+.\scripts\windows\test-async-k.ps1
+```
+
+The test generates fresh synchronous controls, submits three frames without
+intermediate CPU completion, and repeats while releasing/recreating the DLSS
+feature with work pending. Results include exact RGB comparisons, finite GPU
+scans, stdout/stderr, exceptions and runtime provenance. To include the local
+validated output-store optimization, pass its combined native directory with
+`-NativeRoot`; proprietary objects remain local.
+
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
 4685 frames, all finite. Neither has a backend failure, CPU image copy or an

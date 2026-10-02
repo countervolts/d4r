@@ -281,7 +281,63 @@ int main(int argc, char** argv) {
                 IID_PPV_ARGS(list.ReleaseAndGetAddressOf())), "Create game-style command list");
             dx(list->Close(), "Close initial game-style list");
         }
+        const bool burst = std::getenv("D4R_DIAG_BURST") != nullptr;
+        const bool recreate = std::getenv("D4R_DIAG_RECREATE") != nullptr;
+        if (burst && (!commandBackend || args.iterations > 8)) throw std::runtime_error("Burst requires command-list backend and at most 8 frames");
+        struct SubmittedFrame {
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> list;
+            ComPtr<ID3D12Resource> readback;
+        };
+        std::vector<SubmittedFrame> submitted;
+        std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> creation_owners;
+        auto validate_output = [&](ID3D12Resource* image_readback, unsigned frame) {
+            void* raw = nullptr; D3D12_RANGE range{0, size_t(textures[3].bytes)};
+            dx(image_readback->Map(0, &range, &raw), "Map(verification only)");
+            std::vector<uint16_t> pixels(size_t(outWidth) * outHeight * 4);
+            const auto format = resource_desc(textures[3].image.Get()).Format;
+            if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                for (unsigned y = 0; y < outHeight; ++y) std::memcpy(pixels.data() + size_t(y) * outWidth * 4,
+                    static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch, outWidth * 8);
+            } else {
+                std::ofstream native(directory / ("output-" + std::to_string(frame) + (args.pixel_profile == "packed" ? ".r11g11b10f" : ".bgra8")), std::ios::binary);
+                // Independently decode the diagnostic readback for previews and
+                // frame comparisons. No CPU image copies are in the backend.
+                static const auto unormHalf = [] {
+                    std::array<uint16_t, 256> lut{};
+                    for (unsigned b = 0; b < 256; ++b) { double best = INFINITY; for (unsigned h = 0; h <= 0x3c00; ++h) { double error = std::abs(double(half_value(uint16_t(h))) - double(b)/255.); if (error < best || (error == best && !(h & 1))) { best = error; lut[b] = uint16_t(h); } } }
+                    return lut;
+                }();
+                for (unsigned y = 0; y < outHeight; ++y) {
+                    const auto* row = static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch;
+                    native.write(reinterpret_cast<const char*>(row), outWidth * 4);
+                    for (unsigned x = 0; x < outWidth; ++x) {
+                        auto* p = pixels.data() + (size_t(y) * outWidth + x) * 4;
+                        if (format == DXGI_FORMAT_R11G11B10_FLOAT) { uint32_t value = 0; std::memcpy(&value,row + x * 4,4); p[0] = uint16_t((value & 2047) << 4); p[1] = uint16_t(((value >> 11) & 2047) << 4); p[2] = uint16_t((value >> 22) << 5); p[3] = 0x3c00; }
+                        else for (unsigned c = 0; c < 4; ++c) p[c] = unormHalf[row[x * 4 + (c == 0 ? 2 : c == 2 ? 0 : c)]];
+                    }
+                }
+                if (!native) throw std::runtime_error("Saving native output format failed");
+            }
+            D3D12_RANGE noWrite{}; image_readback->Unmap(0, &noWrite);
+            double sum = 0, square = 0;
+            for (size_t i = 0; i < pixels.size(); ++i) {
+                const float value = half_value(pixels[i]);
+                if (!std::isfinite(value)) throw std::runtime_error("D3D12 output contains NaN/Inf or unwritten pixels");
+                if ((i & 3) < 3) { sum += value; square += double(value) * value; }
+            }
+            const double count = outWidth * outHeight * 3, variance = square / count - (sum / count) * (sum / count);
+            save_output(directory, pixels, outWidth, outHeight, frame);
+            std::printf("D3D12_OUTPUT preset=%u frame=%u finite=1 mean=%.9g variance=%.9g frame_age=0\n", args.preset, frame, sum/count, variance);
+            if (variance < 1e-6) throw std::runtime_error("D3D12 output lost the synthetic pattern");
+        };
         for (unsigned frame = 0; frame < args.iterations; ++frame) {
+            if (burst) {
+                dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.ReleaseAndGetAddressOf())), "Burst allocator");
+                dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.ReleaseAndGetAddressOf())), "Burst list");
+                dx(list->Close(), "Burst initial Close");
+                readback = make_buffer(device.Get(), textures[3].bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            }
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
             if (commandBackend) {
                 dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
@@ -312,46 +368,33 @@ int main(int argc, char** argv) {
             if (commandBackend && frame == 0) {
                 ID3D12CommandList* batch[] = {predecessor.Get(), list.Get()}; queue->ExecuteCommandLists(2, batch);
             } else { ID3D12CommandList* verify[] = {list.Get()}; queue->ExecuteCommandLists(1, verify); }
-            drain();
+            if (!burst) drain(); else submitted.push_back({allocator, list, readback});
             if (commandBackend) d4r_ngx_set_d3d12_resource(parameters, "Color", textures[0].image.Get());
-            void* raw = nullptr; D3D12_RANGE range{0, size_t(textures[3].bytes)};
-            dx(readback->Map(0, &range, &raw), "Map(verification only)");
-            std::vector<uint16_t> pixels(size_t(outWidth) * outHeight * 4);
-            const auto format = resource_desc(textures[3].image.Get()).Format;
-            if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-                for (unsigned y = 0; y < outHeight; ++y) std::memcpy(pixels.data() + size_t(y) * outWidth * 4,
-                    static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch, outWidth * 8);
-            } else {
-                std::ofstream native(directory / ("output-" + std::to_string(frame) + (args.pixel_profile == "packed" ? ".r11g11b10f" : ".bgra8")), std::ios::binary);
-                // Independently decode the diagnostic readback for previews and
-                // frame comparisons. No CPU image copies are in the backend.
-                static const auto unormHalf = [] {
-                    std::array<uint16_t, 256> lut{};
-                    for (unsigned b = 0; b < 256; ++b) { double best = INFINITY; for (unsigned h = 0; h <= 0x3c00; ++h) { double error = std::abs(double(half_value(uint16_t(h))) - double(b)/255.); if (error < best || (error == best && !(h & 1))) { best = error; lut[b] = uint16_t(h); } } }
-                    return lut;
-                }();
-                for (unsigned y = 0; y < outHeight; ++y) {
-                    const auto* row = static_cast<uint8_t*>(raw) + y * textures[3].footprint.Footprint.RowPitch;
-                    native.write(reinterpret_cast<const char*>(row), outWidth * 4);
-                    for (unsigned x = 0; x < outWidth; ++x) {
-                        auto* p = pixels.data() + (size_t(y) * outWidth + x) * 4;
-                        if (format == DXGI_FORMAT_R11G11B10_FLOAT) { uint32_t value = 0; std::memcpy(&value,row + x * 4,4); p[0] = uint16_t((value & 2047) << 4); p[1] = uint16_t(((value >> 11) & 2047) << 4); p[2] = uint16_t((value >> 22) << 5); p[3] = 0x3c00; }
-                        else for (unsigned c = 0; c < 4; ++c) p[c] = unormHalf[row[x * 4 + (c == 0 ? 2 : c == 2 ? 0 : c)]];
-                    }
-                }
-                if (!native) throw std::runtime_error("Saving native output format failed");
+            if (!burst) validate_output(readback.Get(), frame);
+            if (recreate && frame + 1 < args.iterations) {
+                // Release/create without an explicit harness drain. In burst
+                // mode earlier frames can still be using the old feature.
+                check(release(handle), "Recreate ReleaseFeature"); featureCleanup.h = nullptr;
+                dx(creationAllocator->Reset(), "Recreate allocator Reset");
+                dx(creationList->Reset(creationAllocator.Get(), nullptr), "Recreate list Reset");
+                handle = nullptr;
+                check(shim.symbol<Create>("NVSDK_NGX_D3D12_CreateFeature")(creationList.Get(), 1, parameters, &handle), "Recreate CreateFeature");
+                featureCleanup.h = handle;
+                dx(creationList->Close(), "Recreate list Close");
+                ID3D12CommandList* created[] = {creationList.Get()}; queue->ExecuteCommandLists(1, created);
+                creation_owners.emplace_back(creationAllocator, creationList);
+                // This empty creation list owns no work; the next recreation
+                // allocates independent command memory without waiting on GPU.
+                dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(creationAllocator.ReleaseAndGetAddressOf())), "Next recreate allocator");
+                dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, creationAllocator.Get(), nullptr, IID_PPV_ARGS(creationList.ReleaseAndGetAddressOf())), "Next recreate list");
+                dx(creationList->Close(), "Next recreate initial Close");
+                std::printf("D4R_RECREATE_VALIDATION submitted_frame=%u next_feature_created=1\n", frame);
             }
-            D3D12_RANGE noWrite{}; readback->Unmap(0, &noWrite);
-            double sum = 0, square = 0;
-            for (size_t i = 0; i < pixels.size(); ++i) {
-                const float value = half_value(pixels[i]);
-                if (!std::isfinite(value)) throw std::runtime_error("D3D12 output contains NaN/Inf or unwritten pixels");
-                if ((i & 3) < 3) { sum += value; square += double(value) * value; }
-            }
-            const double count = outWidth * outHeight * 3, variance = square / count - (sum / count) * (sum / count);
-            save_output(directory, pixels, outWidth, outHeight, frame);
-            std::printf("D3D12_OUTPUT preset=%u frame=%u finite=1 mean=%.9g variance=%.9g frame_age=0\n", args.preset, frame, sum/count, variance);
-            if (variance < 1e-6) throw std::runtime_error("D3D12 output lost the synthetic pattern");
+        }
+        if (burst) {
+            drain();
+            for (unsigned frame = 0; frame < submitted.size(); ++frame) validate_output(submitted[frame].readback.Get(), frame);
+            std::printf("D4R_BURST_VALIDATION frames=%zu cpu_readback_after_all_submissions=1\n", submitted.size());
         }
         loaded_modules();
         std::printf("PASS D3D12_DLSS architecture=gfx1201 preset=%u frames=%u fast_path_cpu_copies=0 frame_age=0 enhanced=%u queue_integration=%s\n",

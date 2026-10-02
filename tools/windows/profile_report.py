@@ -42,6 +42,7 @@ def report(directory, metadata_directory=None):
     commands = collections.defaultdict(list)
     kernels = collections.defaultdict(list)
     hook_threads = collections.defaultdict(list)
+    apis = collections.defaultdict(list)
     replay = collections.defaultdict(lambda: collections.defaultdict(dict))
     for path in sorted(directory.glob('*.log')):
         data = path.read_bytes()
@@ -57,6 +58,10 @@ def report(directory, metadata_directory=None):
                 if name != 'interval_ms' or number > 0:
                     commands[kind.lower() + '.' + name].append(number)
         for line in text.splitlines():
+            if line.startswith('D4R_CUDA_API_PROFILE '):
+                fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                if all(key in fields for key in ('api', 'calls', 'total_ms', 'max_ms', 'period_ms', 'thread')):
+                    apis[(fields['thread'], fields['api'])].append(fields)
             if line.startswith('D4R_COMMAND_HOOK_SAMPLE '):
                 fields = dict(re.findall(r'(\w+)=(\S+)', line))
                 if all(name in fields for name in ('thread', 'period_ms', 'calls', 'samples', 'marked',
@@ -69,9 +74,11 @@ def report(directory, metadata_directory=None):
     result = dict(cpuStages={name: stats(values) for name, values in stages.items()},
                   commandStages={name: stats(values) for name, values in commands.items()},
                   commandHookSamples=[],
+                  cudaApi=[],
                   replayPairs=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
+                      'CUDA API profiles measure host call duration without GPU events or added synchronization; they still include existing waits.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
@@ -85,6 +92,13 @@ def report(directory, metadata_directory=None):
                 controlGpuMs=stats([row['control'] for row in complete]),
                 candidateGpuMs=stats([row['candidate'] for row in complete]),
                 candidateToControl=stats([row['candidate'] / row['control'] for row in complete if row['control'] > 0])))
+    for (thread, api), rows in apis.items():
+        calls = sum(int(row['calls']) for row in rows)
+        total = sum(float(row['total_ms']) for row in rows)
+        result['cudaApi'].append(dict(thread=thread, api=api, calls=calls, totalMs=total,
+            meanMs=total / calls, maxMs=max(float(row['max_ms']) for row in rows),
+            periodMs=sum(float(row['period_ms']) for row in rows)))
+    result['cudaApi'].sort(key=lambda row: row['totalMs'], reverse=True)
     for thread, rows in hook_threads.items():
         sums = {name: sum(float(row[name]) for row in rows) for name in
                 ('period_ms', 'calls', 'samples', 'marked', 'access_sum_ms', 'capture_sum_ms', 'driver_sum_ms')}
@@ -118,7 +132,7 @@ def main():
     parser.add_argument('--metadata-directory', type=pathlib.Path, help='llvm-readobj --notes output for native code objects')
     args = parser.parse_args()
     result = report(args.directory, args.metadata_directory)
-    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs')):
+    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi')):
         parser.error('no complete stage or HIP-event records found')
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -126,6 +140,8 @@ def main():
         print(f"CPU {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for name, row in result['commandStages'].items():
         print(f"COMMAND {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for row in result['cudaApi'][:20]:
+        print(f"CUDA API {row['api']} {row['thread']}: n={row['calls']} mean={row['meanMs']:.6f} ms total={row['totalMs']:.3f} ms max={row['maxMs']:.3f} ms")
     for row in result['commandHookSamples']:
         print(f"HOOK thread={row['thread']} samples={int(row['samples'])} access={row['accessMeanUs']:.3f} us "
               f"capture={row['captureMeanUsPerSample']:.3f} us estimated_cpu={row['estimatedAccessCaptureMsPerSecond']:.3f} ms/s")

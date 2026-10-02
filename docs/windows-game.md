@@ -61,10 +61,22 @@ The recording interval measures NGX calls on the recording thread, not Present.
 frame scheduling; use it separately from a production FPS measurement.
 `-ProfileCommandHooks` samples one in 64 D3D12 interceptions to distinguish
 tracking/lock waits from driver calls. It is disabled in ordinary runs.
+`-ProfileCudaApi` aggregates existing CUDA API host durations without adding
+HIP events or synchronization. `-UncachedInteropLists` restores per-frame
+copy-list allocation for comparison with the normal safely reused lists.
 The runner drains stdout/stderr concurrently as raw bytes; the earlier
 line-oriented PowerShell collector imposed large per-frame delays. The optional
 ZLUDA kernel profiler is for diagnostics only. Measurements and reproduction
 commands are in [windows-performance.md](windows-performance.md).
+
+`-AsyncInterop` enables the experimental K scheduling path. Submission queues
+the current frame's input/output dependencies and returns while a CUDA worker
+executes DLSS. Owned command memory is retained until GPU completion; feature
+release and resource reconfiguration wait for pending consumers. It passes
+the standalone queued-frame and Release/CreateFeature exact-output regression,
+but remains opt-in while game stability and performance are checked. It
+currently requires one D3D12 command queue. This switch is independent of
+profiling and output scans; omit those diagnostics for a production FPS run.
 
 Ordinary runs use OptiScaler info logging and suppress successful HIP/CUDA API
 messages. Errors, GPU identity, imports, frame records and native/translated

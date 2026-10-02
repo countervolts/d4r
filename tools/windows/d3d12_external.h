@@ -178,6 +178,7 @@ class SharedTimeline {
     Handle event_;
     uint64_t value_ = 0;
 public:
+    struct Ticket { uint64_t input, output; };
     ComPtr<ID3D12Fence> fence;
     SharedTimeline(ExternalApi& api, ID3D12Device* device) : api_(api) {
         dx(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence.GetAddressOf())), "CreateFence(D3D12/HIP)");
@@ -200,6 +201,17 @@ public:
     void wait_input(ID3D12CommandQueue* queue) {
         const uint64_t ready = ++value_;
         dx(queue->Signal(fence.Get(), ready), "Queue Signal(input)");
+        wait_ready(ready);
+    }
+    // Reserve both dependencies on the submission thread. The CUDA worker
+    // never submits to the D3D12 queue, so later game Signal/Wait calls retain
+    // their original ordering without waiting on a CPU callback.
+    Ticket reserve() { return {++value_, ++value_}; }
+    void enqueue(ID3D12CommandQueue* queue, Ticket ticket) {
+        dx(queue->Signal(fence.Get(), ticket.input), "Queue Signal(async input)");
+        dx(queue->Wait(fence.Get(), ticket.output), "Queue Wait(async output)");
+    }
+    void wait_ready(uint64_t ready) {
         hipExternalSemaphoreWaitParams wait{}; wait.params.fence.value = ready;
         api_.hip.check(api_.hipWaitExternalSemaphoresAsync(&semaphore_, &wait, 1, stream_), "HIP wait(D3D12 input)");
         api_.hip.check(api_.hip.hipStreamSynchronize(stream_), "HIP input wait completion");
@@ -214,9 +226,12 @@ public:
     }
     void signal_output(ID3D12CommandQueue* queue) {
         const uint64_t done = ++value_;
+        signal_ready(done);
+        dx(queue->Wait(fence.Get(), done), "Queue Wait(HIP output)");
+    }
+    void signal_ready(uint64_t done) {
         hipExternalSemaphoreSignalParams signal{}; signal.params.fence.value = done;
         api_.hip.check(api_.hipSignalExternalSemaphoresAsync(&semaphore_, &signal, 1, stream_), "HIP signal(output)");
-        dx(queue->Wait(fence.Get(), done), "Queue Wait(HIP output)");
     }
     void drain(ID3D12CommandQueue* queue) {
         const uint64_t done = ++value_;

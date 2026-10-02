@@ -10,6 +10,87 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
+**Current milestone: K performance remains open.** The user reports 49–51 FPS
+and about 53% GPU utilization in 4K Silent Hill 2, compared with roughly 80+
+FPS / 100% GPU utilization with FSR4 on this system. Functional K/M and the
+reproducible archive do not close this gate. Prioritize K queue scheduling and
+host synchronization; postpone further M/FP8 optimization. These user readings
+are not a controlled same-scene benchmark. Do not infer a hardware CPU limit
+from utilization alone.
+
+The next diagnostics add `-ProfileCudaApi` (ZLUDA patch 0015): aggregate host
+CUDA API durations without HIP-event waits. Boundary stages now separate
+prepare, copy-list setup, input/output submission and output-copy drain.
+Feature-owned input/output command lists and allocators are reused only after
+the existing completion fence; `-UncachedInteropLists` restores per-frame
+allocation for an A/B control. Submission drain fences/events are queue-owned
+and reused. No completion dependency or current-frame output is removed.
+
+The opt-in `-AsyncInterop` experiment reserves D3D12 input/output dependencies
+at submission, runs CUDA on a feature worker, and retires owned suffix command
+memory on a separate fence-completion service. Worker order is shared across
+features using the context; this experimental runtime requires one D3D12 queue.
+Three reusable copy contexts bound outstanding ownership. Every consumer waits
+for **its own** output; no previous-image selection or CPU image staging occurs.
+Steady-state submission uses immutable allocation metadata and per-frame
+resource/parameter snapshots, avoiding the CUDA mutex. Resize/reimport and
+feature creation/release drain D3D12 outside that mutex, keeping workers able to signal
+already-published waits. Worker failures poison the context and are logged.
+
+First async game run: 9481 K/4K frames and finite GPU scans, zero backend failures;
+the user reports **60 FPS / 63% GPU**. Median command submission drops from
+10.512 ms (synchronous control) to 2.676 ms. The next mutex-free candidate
+submits in median 0.181 ms, but its initial game test exits with UE
+`DXGI_ERROR_DEVICE_HUNG` during resource/feature recreation after 366 finite
+frames. Its crash context and dump are in
+`test-results/silent-hill2-k-async-nolock-4k/ue-crash`. Do not classify this as
+success or enable the experiment by default until the game reconfiguration gate
+passes. The new standalone burst + Release/CreateFeature mode reproduces the
+GPU hang without the game. Retaining the d4r Feature through completion does
+not retain OptiScaler's caller-owned root-CBV buffers: OptiScaler frees its
+shader backing immediately after NGX ReleaseFeature returns. ReleaseFeature
+now waits for pending workers, copy contexts and all submitted D3D12 consumers
+before returning, outside the CUDA mutex. The fixed four-way regression
+(sync/async x burst/recreate) completes twelve K/4K frames; all six async RGB
+outputs exactly match their corresponding fresh synchronous controls, with
+no NaN/Inf or GPU hang. Results:
+`test-results/k-async-release-drain-4k/validation.json`. The fixed game retest
+on 2026-10-02 completes **16941 K/4K frames**, 16941 finite GPU scans and
+203292 native launches, with zero backend failures/CPU image copies/previous
+frame outputs. It includes two feature creations and color-format reimports;
+the previous recreation crash does not recur in this five-minute run. The
+user reports **62 FPS / 63% GPU** in the comparison scene. Median command
+submission is 0.197 ms; DLSS worker NGX completion is 4.400 ms and output
+scan is 0.380 ms. Logs:
+`test-results/silent-hill2-k-async-release-fix-4k`. The runner deliberately
+stops at its bound (`diagnostic_timeout`); there is no recorded game crash.
+The K performance gate remains open.
+
+Three ordinary K/4K async frames and three queued together without intermediate
+CPU completion all match their corresponding prior synchronous RGB exactly;
+the temporal controls differ between frames. One burst attempt times out during
+NGX creation before submitting a frame after the game GPU crash; HIP/D3D12
+sanity probes pass and the 600-second retry completes and matches all frames.
+`test-async-k.ps1` generates fresh synchronous controls and checks burst and
+Release/CreateFeature with pending work, rather than depending on saved fixtures:
+
+```powershell
+.\scripts\windows\test-async-k.ps1
+```
+
+New game crashes are automatically copied from the current Silent Hill 2 UE
+crash directory into the diagnostic bundle, including its error reason and
+minidump; proprietary/private artifacts remain excluded from public packaging.
+
+The profiling candidate is ZLUDA
+`a1c506fc956cfc347c56c44311669700c0d500ac` in
+`dist/zluda-windows-api-profile`. Patch 0015 adds optional per-thread host API
+aggregates without extra synchronization; ordinary runs leave it disabled.
+All fourteen patches (0002 through 0015) apply to pinned base `ee2f25a`.
+All sixteen CTest gates also pass with `D4R_ASYNC_INTEROP=1` after the release
+fix. The previously archived synchronous package described below remains a
+separate artifact; it does not contain this async scheduling change.
+
 Upstream refreshed and merged on 2026-10-01 through
 [`f0d1a65`](https://github.com/countervolts/d4r/commit/f0d1a65e27aff6cbe7eeaa13227c80facb9056ab)
 and artifact fix `65dfc9f`. Windows retains strict f16 rounding and the exact

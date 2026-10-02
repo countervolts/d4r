@@ -12,6 +12,9 @@ param(
     [switch]$ProfileStages,
     [switch]$ProfileKernels,
     [switch]$ProfileCommandHooks,
+    [switch]$ProfileCudaApi,
+    [switch]$UncachedInteropLists,
+    [switch]$AsyncInterop,
     [switch]$VerboseRuntime,
     [switch]$CaptureExceptions,
     [string[]]$GameArguments = @('-dx12'),
@@ -178,6 +181,9 @@ $settings = @{
     D4R_PROFILE_STAGES=$(if ($ProfileStages) { '1' } else { $null });
     D4R_ZLUDA_PROFILE=$(if ($ProfileKernels) { '1' } else { $null });
     D4R_PROFILE_COMMAND_HOOKS=$(if ($ProfileCommandHooks) { '1' } else { $null });
+    D4R_ZLUDA_PROFILE_API=$(if ($ProfileCudaApi) { '1' } else { $null });
+    D4R_DISABLE_INTEROP_LIST_CACHE=$(if ($UncachedInteropLists) { '1' } else { $null });
+    D4R_ASYNC_INTEROP=$(if ($AsyncInterop) { '1' } else { $null });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
@@ -246,6 +252,19 @@ try {
     $stdout = Get-Content -LiteralPath (Join-Path $OutputDirectory 'd4r.stdout.log') -Raw
     $debugger = Get-Content -LiteralPath (Join-Path $OutputDirectory 'debugger.log') -Raw
     $gameExit = [regex]::Match($debugger, 'EXIT code=0x([0-9a-f]+)')
+    $gameCrash = $null
+    if ([IO.Path]::GetFileName($GameExe) -eq 'SHProto-Win64-Shipping.exe' -and $gameExit.Success -and $gameExit.Groups[1].Value -ne '0') {
+        $crashRoot = Join-Path $env:LOCALAPPDATA 'SilentHill2/Saved/Crashes'
+        $latest = Get-ChildItem -LiteralPath $crashRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge (Get-Date).AddSeconds(-$timer.Elapsed.TotalSeconds-5) } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latest) {
+            Copy-Item -LiteralPath $latest.FullName -Destination (Join-Path $OutputDirectory 'ue-crash') -Recurse
+            [xml]$context = Get-Content -LiteralPath (Join-Path $latest.FullName 'CrashContext.runtime-xml') -Raw
+            $gameCrash = @{type=[string]$context.FGenericCrashContext.RuntimeProperties.CrashType;
+                reason=[string]$context.FGenericCrashContext.RuntimeProperties.ErrorMessage}
+        }
+    }
     # A bounded stop can interrupt the last printf; count only complete records.
     $frames = [regex]::Matches($stdout, '(?m)^D4R_FRAME cpu_frame_copies=([0-9]+) frame_age=([0-9]+) interop_ngx_ms=([0-9.]+)\r?$')
     $checks = [regex]::Matches($stdout, '(?m)^D4R_OUTPUT_VALIDATION elements=([0-9]+) nan=([0-9]+) inf=([0-9]+) diagnostics_cpu_bytes=8\r?$')
@@ -254,7 +273,7 @@ try {
     $kernels = @($launches | ForEach-Object { $_.Groups[1].Value + ' ' + $_.Groups[2].Value } | Group-Object | ForEach-Object {
         $parts=$_.Name.Split(' '); @{kernel=$parts[0]; backend=$parts[1]; launches=$_.Count}
     })
-    @{exitCode=$(if ($gameExit.Success) { '0x' + $gameExit.Groups[1].Value } else { 'diagnostic_timeout' }); runSeconds=$timer.Elapsed.TotalSeconds; preset=$Preset;
+    @{exitCode=$(if ($gameExit.Success) { '0x' + $gameExit.Groups[1].Value } else { 'diagnostic_timeout' }); runSeconds=$timer.Elapsed.TotalSeconds; preset=$Preset; gameCrash=$gameCrash;
         nativeLaunches=([regex]::Matches($stderr, '\[d4r-launch\].*backend=native')).Count;
         completedFrames=$frames.Count; outputValidationRequested=[bool]$ValidateOutput;
         outputGpuChecks=$checks.Count; nonfiniteOutputs=$nonfinite; kernels=$kernels;

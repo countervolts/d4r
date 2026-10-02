@@ -5,6 +5,10 @@
 #include "ngx_parameters.h"
 #include "ngx_public_abi.h"
 #include "d3d12_command_hooks.h"
+#include "d3d12_retirement.h"
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -55,6 +59,14 @@ struct Runtime {
     std::unique_ptr<SharedTimeline> timeline;
     std::unique_ptr<PixelProgram> pixels;
     std::mutex mutex;
+    // Features share one CUDA context. Follow submission order even when
+    // separate feature workers wake in a different order; otherwise a worker
+    // could hold the context while waiting for an earlier worker's output.
+    std::mutex async_mutex;
+    std::condition_variable async_changed;
+    std::deque<uint64_t> async_tickets;
+    std::string async_failure;
+    ComPtr<ID3D12CommandQueue> async_queue;
     ngx::ProjectIdentity project;
     ngx::FeatureCommonInfo common{};
     std::vector<std::wstring> featurePaths;
@@ -146,6 +158,24 @@ struct Runtime {
     Runtime(const Runtime&) = delete;
     ~Runtime() { cleanup(); }
     void current() { cuda.check(cuda.cuCtxSetCurrent(context), "cuCtxSetCurrent(runtime)"); }
+    void drain_async_queue() {
+        ComPtr<ID3D12CommandQueue> queue;
+        { std::lock_guard<std::mutex> lock(async_mutex); queue = async_queue; }
+        if (!queue) return;
+        // Creation/free/import may synchronize the AMD device internally.
+        // Drain queued D3D12 consumers before taking the CUDA mutex: workers
+        // must remain able to satisfy any already-published output waits.
+        ComPtr<ID3D12Fence> completion;
+        dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(completion.GetAddressOf())), "Reconfigure fence");
+        Handle event; event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event.value) throw std::runtime_error("Reconfigure event");
+        dx(queue->Signal(completion.Get(), 1), "Reconfigure queue Signal");
+        if (completion->GetCompletedValue() < 1) {
+            dx(completion->SetEventOnCompletion(1, event.value), "Reconfigure completion event");
+            if (WaitForSingleObject(event.value, 30000) != WAIT_OBJECT_0) throw std::runtime_error("Reconfigure GPU timeout");
+        }
+        dx(device->GetDeviceRemovedReason(), "Reconfigure device status");
+    }
     void cleanup() noexcept {
         if (context) (void)cuda.cuCtxSetCurrent(context);
         if (initialized) { (void)shutdown(); initialized = false; }
@@ -164,6 +194,32 @@ class Feature {
     void* handle_ = nullptr;
     CUdeviceptr scratch_ = 0;
     ComPtr<ID3D12CommandQueue> queue_;
+    // A boundary drains both copies before returning. Reuse their allocators
+    // only after that completion; no game allocator is retained here.
+    ComPtr<ID3D12CommandAllocator> input_allocator_, output_allocator_;
+    ComPtr<ID3D12GraphicsCommandList> input_list_, output_list_;
+    struct CopySlot {
+        ComPtr<ID3D12CommandAllocator> input_allocator, output_allocator;
+        ComPtr<ID3D12GraphicsCommandList> input, output;
+        uint64_t done = 0;
+    };
+    struct AsyncFrame {
+        void* parameters = d4r_ngx_parameters_create();
+        std::vector<ComPtr<ID3D12Resource>> resources;
+        SharedTimeline::Ticket ticket{};
+        ~AsyncFrame() { if (parameters) d4r_ngx_parameters_destroy(parameters); }
+    };
+    std::vector<std::unique_ptr<CopySlot>> copy_slots_;
+    ComPtr<ID3D12Fence> copy_completion_;
+    Handle copy_event_;
+    uint64_t copy_value_ = 0;
+    std::mutex jobs_mutex_;
+    std::mutex submit_mutex_;
+    std::condition_variable jobs_changed_;
+    std::deque<std::shared_ptr<AsyncFrame>> jobs_;
+    std::thread worker_;
+    bool worker_stop_ = false, worker_active_ = false;
+    std::string worker_failure_;
     struct Plane {
         ComPtr<ID3D12Resource> texture;
         D3D12_RESOURCE_DESC desc{};
@@ -185,6 +241,7 @@ class Feature {
 public:
     unsigned width = 0, height = 0;
     explicit Feature(std::shared_ptr<Runtime> runtime, void* parameters) : rt_(std::move(runtime)) {
+        if (std::getenv("D4R_ASYNC_INTEROP")) rt_->drain_async_queue();
         std::lock_guard<std::mutex> lock(rt_->mutex);
         rt_->current();
         try {
@@ -203,12 +260,38 @@ public:
             ngx_check(rt_->create(1, parameters_, &handle_), "CUDA CreateFeature");
         } catch (...) { cleanup(); throw; }
     }
-    ~Feature() { std::lock_guard<std::mutex> lock(rt_->mutex); cleanup(); }
+    ~Feature() {
+        { std::lock_guard<std::mutex> lock(jobs_mutex_); worker_stop_ = true; }
+        jobs_changed_.notify_all();
+        if (worker_.joinable()) worker_.join();
+        if (copy_completion_) {
+            try { wait_copies(copy_value_); }
+            catch (const std::exception& e) { std::fprintf(stderr, "D4R_ASYNC_CLEANUP_FAILURE %s\n", e.what()); }
+        }
+        std::lock_guard<std::mutex> lock(rt_->mutex); cleanup();
+    }
     Feature(const Feature&) = delete;
+    void drain() {
+        if (!std::getenv("D4R_ASYNC_INTEROP")) return;
+        wait_worker();
+        if (copy_value_) wait_copies(copy_value_);
+        rt_->drain_async_queue();
+    }
 
     // Explicit harness boundary: all earlier producers must already be queued.
     // The forthcoming command-list backend calls the same stages at queue submit.
     void evaluate_boundary(ID3D12CommandQueue* queue, void* parameters) {
+        if (std::getenv("D4R_ASYNC_INTEROP")) { evaluate_async(queue, parameters); return; }
+        const auto boundaryBegin = std::chrono::steady_clock::now();
+        auto boundaryStage = boundaryBegin;
+        const bool profile = std::getenv("D4R_PROFILE_STAGES") != nullptr;
+        auto mark = [&](const char* name) {
+            if (!profile) return;
+            const auto now = std::chrono::steady_clock::now();
+            std::printf("D4R_STAGE name=%s cpu_ms=%.6f\n", name,
+                std::chrono::duration<double, std::milli>(now - boundaryStage).count());
+            boundaryStage = std::chrono::steady_clock::now();
+        };
         commands::InternalScope internal;
         std::lock_guard<std::mutex> lock(rt_->mutex);
         if (!queue) throw std::runtime_error("Null D3D12 queue");
@@ -222,6 +305,7 @@ public:
         if (queueIdentity.Get() != runtimeIdentity.Get()) throw std::runtime_error("Queue belongs to a different D3D12 device");
         rt_->current();
         prepare(parameters);
+        mark("boundary_prepare");
         ComPtr<ID3D12CommandAllocator> inputAllocator, outputAllocator;
         ComPtr<ID3D12GraphicsCommandList> inputList, outputList;
         auto list = [&](ComPtr<ID3D12CommandAllocator>& allocator, ComPtr<ID3D12GraphicsCommandList>& commandList) {
@@ -229,20 +313,191 @@ public:
             dx(rt_->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                 IID_PPV_ARGS(commandList.GetAddressOf())), "CreateCommandList(interop)");
         };
-        list(inputAllocator, inputList); list(outputAllocator, outputList);
+        const bool cached = !std::getenv("D4R_DISABLE_INTEROP_LIST_CACHE");
+        if (cached) {
+            if (!input_list_) {
+                // Publish the pair only after both creations succeed.
+                list(inputAllocator, inputList); list(outputAllocator, outputList);
+                input_allocator_ = inputAllocator; output_allocator_ = outputAllocator;
+                input_list_ = inputList; output_list_ = outputList;
+            } else {
+                dx(input_allocator_->Reset(), "Reset(input interop allocator)");
+                dx(output_allocator_->Reset(), "Reset(output interop allocator)");
+                dx(input_list_->Reset(input_allocator_.Get(), nullptr), "Reset(input interop list)");
+                dx(output_list_->Reset(output_allocator_.Get(), nullptr), "Reset(output interop list)");
+            }
+            inputAllocator = input_allocator_; outputAllocator = output_allocator_;
+            inputList = input_list_; outputList = output_list_;
+        } else { list(inputAllocator, inputList); list(outputAllocator, outputList); }
+        mark("boundary_copy_list_setup");
         record_inputs(inputList.Get(), parameters); dx(inputList->Close(), "Close(input copies)");
         ID3D12CommandList* before[] = {inputList.Get()}; queue->ExecuteCommandLists(1, before);
+        mark("boundary_input_copy_submit");
         try {
             execute_cuda(queue);
+            mark("boundary_cuda_transaction");
             record_output(outputList.Get(), parameters); dx(outputList->Close(), "Close(output copy)");
             ID3D12CommandList* after[] = {outputList.Get()}; queue->ExecuteCommandLists(1, after);
+            mark("boundary_output_copy_submit");
             rt_->timeline->drain(queue);
+            mark("boundary_output_copy_drain");
         } catch (...) {
             // Keep all recorded resources alive until submitted work is complete.
             rt_->timeline->drain(queue); throw;
         }
     }
 private:
+    void wait_copies(uint64_t value) {
+        if (copy_completion_->GetCompletedValue() >= value) return;
+        dx(copy_completion_->SetEventOnCompletion(value, copy_event_.value), "Async copy completion event");
+        if (WaitForSingleObject(copy_event_.value, 30000) != WAIT_OBJECT_0)
+            throw std::runtime_error("Async interop copy completion timeout");
+    }
+    void wait_worker() {
+        std::unique_lock<std::mutex> lock(jobs_mutex_);
+        jobs_changed_.wait(lock, [&] { return jobs_.empty() && !worker_active_; });
+        if (!worker_failure_.empty()) throw std::runtime_error(worker_failure_);
+    }
+    CopySlot& copy_slot() {
+        if (!copy_completion_) {
+            dx(rt_->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(copy_completion_.GetAddressOf())), "Async copy fence");
+            copy_event_.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!copy_event_.value) throw std::runtime_error("Async copy event");
+        }
+        CopySlot* selected = nullptr;
+        const auto completed = copy_completion_->GetCompletedValue();
+        for (auto& slot : copy_slots_) if (slot->done <= completed) { selected = slot.get(); break; }
+        if (!selected && copy_slots_.size() == 3) {
+            selected = copy_slots_.front().get();
+            for (auto& slot : copy_slots_) if (slot->done < selected->done) selected = slot.get();
+            // Bounded ownership; this wait is outside the runtime mutex.
+            wait_copies(selected->done);
+        }
+        if (selected) {
+            dx(selected->input_allocator->Reset(), "Async input allocator Reset");
+            dx(selected->output_allocator->Reset(), "Async output allocator Reset");
+            dx(selected->input->Reset(selected->input_allocator.Get(), nullptr), "Async input list Reset");
+            dx(selected->output->Reset(selected->output_allocator.Get(), nullptr), "Async output list Reset");
+            return *selected;
+        }
+        auto slot = std::make_unique<CopySlot>();
+        auto create = [&](auto& allocator, auto& list) {
+            dx(rt_->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf())), "Async copy allocator");
+            dx(rt_->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf())), "Async copy list");
+        };
+        create(slot->input_allocator, slot->input); create(slot->output_allocator, slot->output);
+        copy_slots_.push_back(std::move(slot)); return *copy_slots_.back();
+    }
+    bool resize_needed(void* parameters) {
+        const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
+        for (unsigned i = 0; i < 5; ++i) {
+            ID3D12Resource* texture = nullptr; (void)d4r_ngx_get_d3d12_resource(parameters, names[i], &texture);
+            if (!texture) {
+                if (i < 4) throw std::runtime_error(std::string("Missing async resource ") + names[i]);
+                continue;
+            }
+            const auto desc = resource_desc(texture);
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1)
+                throw std::runtime_error("Async interop requires single-sample 2D textures");
+            if (!planes_[i].shared || planes_[i].desc.Width != desc.Width || planes_[i].desc.Height != desc.Height || planes_[i].desc.Format != desc.Format) return true;
+        }
+        return false;
+    }
+    void evaluate_async(ID3D12CommandQueue* queue, void* parameters) {
+        commands::InternalScope internal;
+        std::lock_guard<std::mutex> submitted(submit_mutex_);
+        if (!queue || (queue_ && queue_.Get() != queue)) throw std::runtime_error("Async interop requires one feature queue");
+        ComPtr<ID3D12Device> queueDevice; dx(queue->GetDevice(IID_PPV_ARGS(queueDevice.GetAddressOf())), "Async queue device");
+        ComPtr<IUnknown> a, b;
+        dx(queueDevice->QueryInterface(IID_PPV_ARGS(a.GetAddressOf())), "Async queue identity");
+        dx(rt_->device->QueryInterface(IID_PPV_ARGS(b.GetAddressOf())), "Async runtime identity");
+        if (a.Get() != b.Get()) throw std::runtime_error("Async queue device mismatch");
+        { std::lock_guard<std::mutex> lock(jobs_mutex_);
+          if (!worker_failure_.empty()) throw std::runtime_error(worker_failure_); }
+        { std::lock_guard<std::mutex> lock(rt_->async_mutex);
+          if (!rt_->async_failure.empty()) throw std::runtime_error(rt_->async_failure);
+          if (rt_->async_queue && rt_->async_queue.Get() != queue) throw std::runtime_error("Async runtime features must share one D3D12 queue");
+          rt_->async_queue = queue; }
+        auto& slot = copy_slot();
+        if (resize_needed(parameters)) {
+            wait_worker(); if (copy_value_) wait_copies(copy_value_);
+            rt_->drain_async_queue();
+            std::lock_guard<std::mutex> lock(rt_->mutex);
+            rt_->current(); prepare(parameters);
+        }
+        // Steady-state recording touches immutable allocation metadata and the
+        // caller's resource snapshot. It does not contend with CUDA or mutate
+        // the worker's NGX parameters / texture references.
+        queue_ = queue;
+        auto frame = std::make_shared<AsyncFrame>();
+        if (!frame->parameters) throw std::runtime_error("Async frame parameters allocation");
+        ngx::copy_create(parameters, frame->parameters); ngx::copy_frame(parameters, frame->parameters);
+        const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
+        for (unsigned i = 0; i < 5; ++i) {
+            ID3D12Resource* resource = nullptr; (void)d4r_ngx_get_d3d12_resource(parameters, names[i], &resource);
+            frame->resources.emplace_back(resource);
+            d4r_ngx_set_d3d12_resource(frame->parameters, names[i], resource);
+        }
+        record_inputs(slot.input.Get(), parameters); dx(slot.input->Close(), "Async input Close");
+        record_output(slot.output.Get(), parameters); dx(slot.output->Close(), "Async output Close");
+        if (!worker_.joinable()) worker_ = std::thread([this] { work(); });
+        ID3D12CommandList* input[] = {slot.input.Get()}, *output[] = {slot.output.Get()};
+        // Allocate the job before any GPU wait is published. Worker cannot
+        // acquire the runtime mutex until every queue dependency is enqueued.
+        std::lock_guard<std::mutex> pending(jobs_mutex_);
+        { std::lock_guard<std::mutex> order(rt_->async_mutex);
+          frame->ticket = rt_->timeline->reserve(); rt_->async_tickets.push_back(frame->ticket.output); }
+        try { jobs_.push_back(frame); }
+        catch (...) {
+            std::lock_guard<std::mutex> order(rt_->async_mutex); rt_->async_tickets.pop_back(); throw;
+        }
+        try {
+            queue->ExecuteCommandLists(1, input);
+            rt_->timeline->enqueue(queue, frame->ticket);
+            queue->ExecuteCommandLists(1, output);
+            slot.done = ++copy_value_;
+            dx(queue->Signal(copy_completion_.Get(), slot.done), "Async output-copy retirement Signal");
+        } catch (const std::exception& e) {
+            jobs_.pop_back(); worker_failure_ = e.what();
+            { std::lock_guard<std::mutex> order(rt_->async_mutex);
+              rt_->async_tickets.pop_back(); rt_->async_failure = e.what(); }
+            (void)rt_->timeline->fence->Signal(frame->ticket.output);
+            jobs_changed_.notify_all(); rt_->async_changed.notify_all(); throw;
+        }
+        jobs_changed_.notify_one();
+        std::printf("D4R_ASYNC_SUBMIT ticket=%llu copy_slots=%zu cpu_frame_copies=0 frame_age=0\n",
+            (unsigned long long)frame->ticket.output, copy_slots_.size());
+    }
+    void work() noexcept {
+        commands::InternalScope internal;
+        for (;;) {
+            std::shared_ptr<AsyncFrame> frame;
+            { std::unique_lock<std::mutex> lock(jobs_mutex_);
+              jobs_changed_.wait(lock, [&] { return worker_stop_ || !jobs_.empty(); });
+              if (jobs_.empty()) return;
+              frame = std::move(jobs_.front()); jobs_.pop_front(); worker_active_ = true; }
+            { std::unique_lock<std::mutex> order(rt_->async_mutex);
+              rt_->async_changed.wait(order, [&] { return !rt_->async_tickets.empty() && rt_->async_tickets.front() == frame->ticket.output; }); }
+            try {
+                std::lock_guard<std::mutex> lock(rt_->mutex);
+                { std::lock_guard<std::mutex> pending(jobs_mutex_);
+                  if (!worker_failure_.empty()) throw std::runtime_error(worker_failure_); }
+                rt_->current(); prepare(frame->parameters); execute_cuda(nullptr, &frame->ticket);
+            } catch (const std::exception& e) {
+                { std::lock_guard<std::mutex> lock(jobs_mutex_); worker_failure_ = e.what(); }
+                { std::lock_guard<std::mutex> order(rt_->async_mutex); rt_->async_failure = e.what(); }
+                std::fprintf(stderr, "D4R_ASYNC_INTEROP_FAILURE %s\n", e.what());
+                // Poison the feature and release the queue for error handling;
+                // subsequent evaluates fail explicitly, never reuse an old frame.
+                (void)rt_->timeline->fence->Signal(frame->ticket.output);
+            }
+            { std::lock_guard<std::mutex> order(rt_->async_mutex); rt_->async_tickets.pop_front(); }
+            rt_->async_changed.notify_all();
+            frame.reset();
+            { std::lock_guard<std::mutex> lock(jobs_mutex_); worker_active_ = false; }
+            jobs_changed_.notify_all();
+        }
+    }
     void prepare(void* parameters) {
         static const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
         for (unsigned i = 0; i < 5; ++i) {
@@ -283,12 +538,15 @@ private:
         for (const char* name : {"TransparencyMask", "DLSS.Input.Bias.Current.Color.Mask"}) d4r_ngx_set_void(parameters_, name, nullptr);
     }
     void record_inputs(ID3D12GraphicsCommandList* list, void* parameters) {
-        for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
+        const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
+        for (unsigned i : {0u, 1u, 2u, 4u}) {
+            ID3D12Resource* texture = nullptr; (void)d4r_ngx_get_d3d12_resource(parameters, names[i], &texture);
+            if (!texture) continue;
             static const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
-            planes_[i].shared->copy_input(list, planes_[i].texture.Get(), ngx_resource_access(parameters, states[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            planes_[i].shared->copy_input(list, texture, ngx_resource_access(parameters, states[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
         }
     }
-    void execute_cuda(ID3D12CommandQueue* queue) {
+    void execute_cuda(ID3D12CommandQueue* queue, const SharedTimeline::Ticket* ticket = nullptr) {
         const auto begin = std::chrono::steady_clock::now();
         auto stage = begin;
         const bool profileStages = std::getenv("D4R_PROFILE_STAGES") != nullptr;
@@ -299,7 +557,7 @@ private:
                 std::chrono::duration<double, std::milli>(now - stage).count());
             stage = std::chrono::steady_clock::now();
         };
-        rt_->timeline->wait_input(queue);
+        if (ticket) rt_->timeline->wait_ready(ticket->input); else rt_->timeline->wait_input(queue);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Interop input producer completion");
         mark("input_fence_wait");
         for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
@@ -347,13 +605,15 @@ private:
         mark("output_diagnostic");
         if (output.canonical) rt_->pixels->convert(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
             output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height, output.spec.storage, 3);
-        rt_->timeline->signal_output(queue);
+        if (ticket) rt_->timeline->signal_ready(ticket->output); else rt_->timeline->signal_output(queue);
         mark("output_conversion_fence_signal");
         std::printf("D4R_FRAME cpu_frame_copies=%u frame_age=0 interop_ngx_ms=%.3f\n", std::getenv("D4R_INTEROP_VERIFY") ? 1u : 0u,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
     }
     void record_output(ID3D12GraphicsCommandList* list, void* parameters) {
-        planes_[3].shared->copy_output(list, planes_[3].texture.Get(), ngx_resource_access(parameters, "D4R.Output.State", D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        ID3D12Resource* texture = nullptr; (void)d4r_ngx_get_d3d12_resource(parameters, "Output", &texture);
+        if (!texture) throw std::runtime_error("Missing output resource");
+        planes_[3].shared->copy_output(list, texture, ngx_resource_access(parameters, "D4R.Output.State", D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     }
 };
 }

@@ -184,11 +184,14 @@ API unsigned NVSDK_NGX_D3D12_ReleaseFeature(Handle* handle) {
     { std::lock_guard<std::mutex> lock(apiMutex);
       auto it = features.find(handle); if (it == features.end()) return invalid;
       feature = std::move(it->second); features.erase(it); delete handle; }
-    return call([&] { feature.reset(); return 1u; });
+    // OptiScaler frees its root-CBV/descriptor backing after Release returns.
+    // A retained C++ Feature alone does not keep that caller-owned memory alive.
+    return call([&] { feature->drain(); feature.reset(); return 1u; });
 }
 API unsigned NVSDK_NGX_D3D12_Shutdown() {
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
+        if (runtime && std::getenv("D4R_ASYNC_INTEROP")) runtime->drain_async_queue();
         for (auto& pair : features) delete pair.first;
         features.clear();
         for (auto& pair : parameters) d4r_ngx_parameters_destroy(pair.first);

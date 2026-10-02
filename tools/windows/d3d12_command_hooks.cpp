@@ -1,5 +1,6 @@
 #include "d3d12_command_hooks.h"
 #include "d3d12_newer_commands.h"
+#include "d3d12_retirement.h"
 #include <MinHook.h>
 #include <atomic>
 #include <memory>
@@ -406,6 +407,9 @@ std::mutex queue_metadata_mutex;
 struct SubmissionLock final : IUnknown {
     std::atomic<ULONG> references{1};
     std::recursive_mutex mutex;
+    ComPtr<ID3D12Fence> completion_fence;
+    Handle completion_event;
+    uint64_t completion_value = 0;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         if (!out) return E_POINTER; *out = nullptr;
         if (iid != IID_IUnknown) return E_NOINTERFACE;
@@ -442,15 +446,31 @@ HRESULT STDMETHODCALLTYPE hook_queue_wait(ID3D12CommandQueue* queue, ID3D12Fence
     return queue_fence(original_queue_wait, queue, fence, value);
 }
 void complete(ID3D12CommandQueue* queue) {
-    ComPtr<ID3D12Device> device; dx(queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf())), "Queue device(submit drain)");
-    ComPtr<ID3D12Fence> fence; dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())), "Queue fence(submit drain)");
-    Handle event; event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event.value) throw std::runtime_error("CreateEvent(submit drain)");
-    dx(queue->Signal(fence.Get(), 1), "Queue Signal(submit drain)");
-    if (fence->GetCompletedValue() < 1) {
-        dx(fence->SetEventOnCompletion(1, event.value), "Queue event(submit drain)");
-        if (WaitForSingleObject(event.value, 30000) != WAIT_OBJECT_0) throw std::runtime_error("GPU submit boundary timed out");
+    auto owner = submission_lock(queue);
+    std::lock_guard<std::recursive_mutex> ordered(owner->mutex);
+    if (!owner->completion_fence) {
+        ComPtr<ID3D12Device> device; dx(queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf())), "Queue device(submit drain)");
+        dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(owner->completion_fence.GetAddressOf())), "Queue fence(submit drain)");
     }
+    if (!owner->completion_event.value) owner->completion_event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!owner->completion_event.value) throw std::runtime_error("CreateEvent(submit drain)");
+    const auto value = ++owner->completion_value;
+    dx(queue->Signal(owner->completion_fence.Get(), value), "Queue Signal(submit drain)");
+    if (owner->completion_fence->GetCompletedValue() < value) {
+        dx(owner->completion_fence->SetEventOnCompletion(value, owner->completion_event.value), "Queue event(submit drain)");
+        if (WaitForSingleObject(owner->completion_event.value, 30000) != WAIT_OBJECT_0) throw std::runtime_error("GPU submit boundary timed out");
+    }
+}
+void retire(ID3D12CommandQueue* queue, std::vector<std::shared_ptr<Recording>> owners) {
+    auto owner = submission_lock(queue);
+    if (!owner->completion_fence) {
+        ComPtr<ID3D12Device> device; dx(queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf())), "Retirement device");
+        dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(owner->completion_fence.GetAddressOf())), "Retirement fence");
+    }
+    const auto value = ++owner->completion_value;
+    dx(queue->Signal(owner->completion_fence.Get(), value), "Queue Signal(retirement)");
+    GpuRetirement::instance().submit(owner->completion_fence.Get(), value,
+        std::make_shared<std::vector<std::shared_ptr<Recording>>>(std::move(owners)));
 }
 void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
     if (internal) { original_execute(queue, count, lists); return; }
@@ -498,7 +518,9 @@ void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D1
         }
         flush();
         if (boundaries) {
-            const auto drainStart = Clock::now(); complete(queue); drainMs = milliseconds(drainStart);
+            const auto drainStart = Clock::now();
+            if (std::getenv("D4R_ASYNC_INTEROP")) retire(queue, std::move(owners)); else complete(queue);
+            drainMs = milliseconds(drainStart);
             if (profile_commands()) std::printf("D4R_COMMAND_SUBMIT total_ms=%.3f boundary_ms=%.3f publish_ms=%.3f suffix_drain_ms=%.3f\n",
                 milliseconds(submitStart), boundaryMs, publishMs, drainMs);
         }
