@@ -67,6 +67,18 @@ standalone layout/error/coverage/RGB checks with:
 .\scripts\windows\test-ngx-feature-layout.ps1 -DiagnosticRoot .\dist\windows-gpu-coverage-gfx1201 -HipRoot .\.tools\therock-10.2.0a20260929\_rocm_sdk_core -ZludaRoot .\dist\zluda-windows-gpu-coverage -NativeRoot .\dist\windows-gpu-coverage-game-gfx1201\d4r\native -OptiScalerDll .\dist\optiscaler-windows-d4r\OptiScaler.dll -NgxCore .\_nvngx.dll -DlssDll .\nvngx_dlss.dll -OutputDirectory .\test-results\ngx-feature-layout
 ```
 
+The rebuilt compact installer passes six isolated Windows PowerShell 5
+fixtures (`quick-fixtures-final/summary.json`): exact backup/restore with the
+original game DLSS DLL preserved, automatic gfx1201 selection, a child that
+refuses debugging with empty stderr, and four negative input/package gates.
+The child exits normally with no debugger and is classified as inconclusive,
+with hardwareValidationCompleted=false. No installed game is changed by the
+fixtures. Run `test-windows-quick-test.ps1` with the package and the local DLL
+paths to reproduce them; it selects Windows PowerShell 5 when called from 7.
+The follow-up compact release is `windows-quick-test-20261002-issue10` in the
+fork, with all eleven targets and a separate exact GPL corresponding-source
+asset. Native network arithmetic and conservative scheduling are unchanged.
+
 These tests do not validate the reporter's gfx1200 kernels or game image.
 The local Cyberpunk EXE is `D:\Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe`;
 it is located but is not launched or modified while the user is away.

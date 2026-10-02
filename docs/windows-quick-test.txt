@@ -6,6 +6,8 @@ The package detects the real GPU automatically. Do not rename any DLLs.
 
 1. EXTRACT THE WHOLE ZIP to a normal writable folder, e.g. Desktop\d4r-test.
    Do not run it inside the ZIP. Do not copy files into the game manually.
+   Already installed an older test? Close the game and run RESTORE-GAME.cmd
+   from that old package first, then extract this version to a new folder.
 
 2. CLOSE YOUR GAME. Have these TWO ORIGINAL NVIDIA files ready:
    _nvngx.dll       version 32.0.16.1714

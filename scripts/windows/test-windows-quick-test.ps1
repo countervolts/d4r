@@ -7,6 +7,15 @@ param(
     [string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    # The fixture uses the .NET Framework C# compiler; the shipped launcher
+    # also runs Windows PowerShell 5. PowerShell 7 cannot emit an EXE via Add-Type.
+    $arguments=@('-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
+        '-PackageRoot',$PackageRoot,'-NgxCore',$NgxCore,'-DlssDll',$DlssDll)
+    if ($OutputDirectory) { $arguments+=@('-OutputDirectory',$OutputDirectory) }
+    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" @arguments
+    exit $LASTEXITCODE
+}
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $PackageRoot=(Get-Item -LiteralPath $PackageRoot).FullName
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo ('test-results/windows-quick-test/'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
