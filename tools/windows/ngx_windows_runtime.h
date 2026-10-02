@@ -94,9 +94,9 @@ struct Runtime {
         if (!d3d) throw std::runtime_error("Null D3D12 device");
         try {
             hipDeviceProp_t props{};
-            hip.select_architecture(-1, props);
-            hip.verbose = cuda.verbose = !std::getenv("D4R_QUIET_API");
             const auto luid = adapter_luid(d3d);
+            hip.select_architecture(-1, props, &luid);
+            hip.verbose = cuda.verbose = !std::getenv("D4R_QUIET_API");
             if (std::memcmp(&luid, props.luid, sizeof(luid))) throw std::runtime_error("D3D12/HIP LUID mismatch");
             cuda.check(cuda.cuInit(0), "cuInit(Windows runtime)");
             int count = 0; cuda.check(cuda.cuDeviceGetCount(&count), "cuDeviceGetCount");

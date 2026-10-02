@@ -4,7 +4,7 @@ param(
     [ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable',
     [string]$ZludaRoot,
     [string]$PackageRoot,
-    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch,
+    [string]$GpuArch,
     [string]$OutputDirectory,
     [string]$NgxCore = $env:D4R_NGX_CORE,
     [string]$DlssDll = $env:D4R_DLSS_DLL,

@@ -153,7 +153,7 @@ def validate(layer, directory, output, block_count, real_capture, exact=False):
     maximum, peak, psnr, steps = metrics(expected, actual, f'M_REPLAY_REFERENCE kernel={layer}')
     if ((exact or not real_capture) and maximum != 0) or (real_capture and (steps.max() > 1 or psnr < 50)):
         raise RuntimeError(f'M mismatch: exact synthetic / <=1 FP8 step and >=50 dB real gate; peak={peak}')
-    print(f'PASS M_REPLAY_REFERENCE kernel={layer} blocks={len(pairs)} reference_layout=gfx12 nan_inf=0')
+    print(f'PASS M_REPLAY_REFERENCE kernel={layer} blocks={len(pairs)} reference=logical nan_inf=0')
 
 
 if __name__ == '__main__':

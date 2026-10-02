@@ -18,6 +18,7 @@
 // Only clang builtins are used (the texture tails compile with -nogpuinc -nogpulib).
 #pragma once
 #include <stdint.h>
+#include "wave32_exchange.h"
 
 #ifndef D4R_WMMA_LAYOUT
 #if defined(__GFX12__)
@@ -56,7 +57,7 @@ WM_FN uint32_t wm_half()
 // value of the lane with the same index in the other half of the wave
 WM_FN uint32_t wm_other_half(uint32_t v)
 {
-    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
+    return d4r_wave32_other_half(v);
 }
 WM_FN float wm_other_half_f(float v)
 {

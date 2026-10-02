@@ -1,6 +1,7 @@
 # Windows / RDNA4 port
 
-Branch: `windows-rdna4`. Native Windows build targets: **gfx1200 / gfx1201**.
+Branch: `windows-rdna4`. Experimental Windows build targets: **gfx1100..gfx1103,
+gfx1150..gfx1154, gfx1200 / gfx1201**.
 Validated physical hardware: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
 Upstream integration: [PR #11](https://github.com/countervolts/d4r/pull/11)
@@ -18,15 +19,38 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
-2026-10-02 target coverage: gfx1200 and gfx1201 now have separate host/device
-builds and guarded packages. Both compile; gfx1201 passes 20 CTest gates on
-RX 9070 XT, and gfx1200 passes four software-only gates. No physical gfx1200
-test is available. K's new host build passes twelve finite 4K burst/recreation
-frames with all six async RGB images exact. M's four new-build 4K RGB images
-exactly match the previous build. The fork audit, adopted MSVC fixes,
-per-target commands, validation limits and first hardware gate are maintained
-in [windows-gpu-support.md](windows-gpu-support.md). RDNA3 runtime/layout changes
-from the reviewed fork are not imported. K performance remains open.
+2026-10-02 coverage: all eleven listed RDNA3 / RDNA3.5 / RDNA4 targets compile
+with separate host/device objects and guarded packages. Only RX 9070 XT has
+physical validation here; no other-target GPU workloads are executed. The
+newest realdody correction informs a Windows-only gfx11 LDS half-wave exchange
+preserving native gfx11 WMMA layout. gfx12 and Linux keep their original
+instruction path. A shared registry drives build, runtime, ELF checks and
+scripts. HIP selection matches the D3D12 LUID before selecting an ordinal,
+including same-target multi-GPU systems.
+
+Issue #10 comment 5952822115 contains 32 logs / eight attempts: all discover
+RX 9060 XT / gfx1200 but reject the old gfx1201 package before NGX runtime
+initialization. Three also load a vkd3d-proton D3D12 proxy. The installer now
+catches these conditions before changing game files and prints one diagnostic
+ZIP. The next community gate is the gfx1200 package on native D3D12; those logs
+do not establish a native K/M crash. Coverage, sources, fork credit, commands
+and hardware limits are in [windows-gpu-support.md](windows-gpu-support.md).
+
+The rebuilt gfx1201 passes 20/20 CTest gates on RX 9070 XT. K completes twelve
+finite 4K burst/recreation frames at 2259x1271 input, with all six async RGB
+images exactly matching sync. M completes eight finite control/candidate 4K
+frames, with all four candidate RGB images matching the prior build exactly.
+Both log every required native layer, zero CPU frame copies and frame age 0.
+All 209 compiled objects have the correct ELF target. For all nineteen gfx1201
+objects, instruction/constant sections match the previous validated build.
+
+All eleven game directories stage strict K/M baselines without NVIDIA DLLs.
+An isolated gfx1201 install/restore fixture preserves original bytes; wrong
+gfx1200-on-gfx1201 and dummy vkd3d-proxy fixtures refuse before game changes
+and produce one diagnostic ZIP each. The real game installation is untouched.
+Results: `test-results/windows-gpu-coverage`; build logs and the compile-only
+matrix report: `build/windows-gpu-coverage`. No physical multi-GPU, APU or
+other-target validation is claimed. K performance remains open.
 
 **Current milestone: K performance remains open.** The latest unprofiled 4K
 Silent Hill 2 scene capture records 65.250 FPS. Functional K/M and the

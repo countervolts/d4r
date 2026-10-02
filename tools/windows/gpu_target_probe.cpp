@@ -5,10 +5,11 @@ int main(int argc, char** argv) {
     using namespace d4r::diag;
     try {
         unsigned rejected = 0, objects = 0;
-        for (const char* target : {"gfx1200", "gfx1201"}) {
+        for (const auto& info : gpu_targets) {
+            const char* target = info.architecture;
             require_gpu_target(target, target);
             require_gpu_target(std::string(target) + ":xnack-:sramecc-", target);
-            for (const char* invalid : {"gfx1101", "gfx12000", "gfx1202", "gfx1250", ""}) {
+            for (const char* invalid : {"gfx1030", "gfx1104", "gfx1155", "gfx1170", "gfx12000", "gfx1202", "gfx1250", ""}) {
                 try { require_gpu_target(invalid, target); }
                 catch (const std::exception&) { ++rejected; continue; }
                 throw std::runtime_error("Invalid GPU target accepted");

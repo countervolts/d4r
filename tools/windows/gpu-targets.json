@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "targets": [
+    {"architecture":"gfx1100","elfMachine":65,"isaMajor":11,"family":"RDNA3"},
+    {"architecture":"gfx1101","elfMachine":70,"isaMajor":11,"family":"RDNA3"},
+    {"architecture":"gfx1102","elfMachine":71,"isaMajor":11,"family":"RDNA3"},
+    {"architecture":"gfx1103","elfMachine":68,"isaMajor":11,"family":"RDNA3"},
+    {"architecture":"gfx1150","elfMachine":67,"isaMajor":11,"family":"RDNA3.5"},
+    {"architecture":"gfx1151","elfMachine":74,"isaMajor":11,"family":"RDNA3.5"},
+    {"architecture":"gfx1152","elfMachine":85,"isaMajor":11,"family":"RDNA3.5"},
+    {"architecture":"gfx1153","elfMachine":88,"isaMajor":11,"family":"RDNA3.5"},
+    {"architecture":"gfx1154","elfMachine":87,"isaMajor":11,"family":"RDNA3.5"},
+    {"architecture":"gfx1200","elfMachine":72,"isaMajor":12,"family":"RDNA4"},
+    {"architecture":"gfx1201","elfMachine":78,"isaMajor":12,"family":"RDNA4"}
+  ]
+}

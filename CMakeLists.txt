@@ -15,15 +15,36 @@ endif()
 find_program(D4R_HIP_CLANG NAMES clang++.exe PATHS "${D4R_HIP_ROOT}/bin" "${D4R_HIP_ROOT}/lib/llvm/bin" NO_DEFAULT_PATH REQUIRED)
 # Architecture parameterization adapted from realdody/d4r ae530b0.
 # Keep explicit subtargets: no gfx11 substitution or untested future gfx12 ISA.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/gpu-targets.json" d4r_target_json)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tools/windows/gpu-targets.json)
+string(JSON d4r_target_count LENGTH "${d4r_target_json}" targets)
+math(EXPR d4r_target_last "${d4r_target_count} - 1")
+set(d4r_supported_targets)
+set(d4r_target_cpp_entries "")
+foreach(index RANGE ${d4r_target_last})
+  foreach(field architecture elfMachine isaMajor family)
+    string(JSON target_${field} GET "${d4r_target_json}" targets ${index} ${field})
+  endforeach()
+  list(APPEND d4r_supported_targets "${target_architecture}")
+  string(APPEND d4r_target_cpp_entries "  GpuTarget{\"${target_architecture}\", ${target_elfMachine}, ${target_isaMajor}, \"${target_family}\"},\n")
+endforeach()
+configure_file(tools/windows/gpu_targets.generated.h.in gpu_targets.generated.h @ONLY)
+include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 set(D4R_GPU_ARCH "gfx1201" CACHE STRING "Native Windows package GPU target")
-set_property(CACHE D4R_GPU_ARCH PROPERTY STRINGS gfx1201 gfx1200)
-set(d4r_supported_targets gfx1200 gfx1201)
+set_property(CACHE D4R_GPU_ARCH PROPERTY STRINGS ${d4r_supported_targets})
 if(NOT D4R_GPU_ARCH IN_LIST d4r_supported_targets)
-  message(FATAL_ERROR "D4R_GPU_ARCH must be gfx1200 or gfx1201")
+  message(FATAL_ERROR "D4R_GPU_ARCH must be one of: ${d4r_supported_targets}")
 endif()
 add_compile_definitions(D4R_TARGET_ARCH="${D4R_GPU_ARCH}")
 configure_file(tools/windows/gpu-target.json.in gpu-target.json @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/gpu-target.json" DESTINATION .)
+install(FILES tools/windows/gpu-targets.json DESTINATION .)
+set(d4r_device_flags)
+if(D4R_GPU_ARCH MATCHES "^gfx11")
+  # Windows-only workaround informed by realdody/d4r 1897b4a. Keep the real
+  # gfx11 layout; do not route RDNA3 through gfx12 fragments.
+  list(APPEND d4r_device_flags -DD4R_WINDOWS_GFX11_LANE_EXCHANGE)
+endif()
 set(probe_object "${CMAKE_CURRENT_BINARY_DIR}/probe_${D4R_GPU_ARCH}.hsaco")
 add_custom_command(OUTPUT "${probe_object}"
   COMMAND "${D4R_HIP_CLANG}" -x hip --offload-arch=${D4R_GPU_ARCH}
@@ -44,10 +65,10 @@ set(wmma_object "${CMAKE_CURRENT_BINARY_DIR}/wmma_${D4R_GPU_ARCH}.hsaco")
 add_custom_command(OUTPUT "${wmma_object}"
   COMMAND "${D4R_HIP_CLANG}" -x hip --offload-arch=${D4R_GPU_ARCH}
     --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
-    -nogpuinc -nogpulib -O2 "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/wmma_gfx1201.hip"
+    -nogpuinc -nogpulib -O2 ${d4r_device_flags} "${CMAKE_CURRENT_SOURCE_DIR}/tools/windows/wmma_gfx1201.hip"
     -o "${wmma_object}"
   DEPENDS tools/windows/wmma_gfx1201.hip kernels/common/wmma_backend.h
-    kernels/common/wmma_layout.h VERBATIM)
+    kernels/common/wmma_layout.h kernels/common/wave32_exchange.h VERBATIM)
 add_custom_target(d4r_wmma_code_object ALL DEPENDS "${wmma_object}")
 # K/M objects stay in experimental/, outside the ZLUDA native override
 # directory, until each layer and then the complete network pass replay.
@@ -78,9 +99,9 @@ foreach(family k m)
     add_custom_command(OUTPUT "${native_object}"
       COMMAND "${D4R_HIP_CLANG}" -x hip -std=c++17 --offload-arch=${D4R_GPU_ARCH}
         --offload-device-only --no-gpu-bundle-output -mno-wavefrontsize64
-        -nogpuinc -nogpulib -O3 -DD4R_DEVICE_ONLY_MINIMAL ${native_flags}
+        -nogpuinc -nogpulib -O3 -DD4R_DEVICE_ONLY_MINIMAL ${d4r_device_flags} ${native_flags}
         "${source}" -o "${native_object}"
-      DEPENDS "${source}" ${native_headers} kernels/common/wmma_layout.h
+      DEPENDS "${source}" ${native_headers} kernels/common/wmma_layout.h kernels/common/wave32_exchange.h
         kernels/common/hip_device_minimal.h VERBATIM)
     list(APPEND native_objects "${native_object}")
     install(FILES "${native_object}" DESTINATION "experimental/${family}")
@@ -89,7 +110,7 @@ endforeach()
 add_custom_target(d4r_native_compile ALL DEPENDS ${native_objects})
 # Retain the old manual build target for existing scripts.
 add_custom_target(d4r_native_gfx1201_compile DEPENDS d4r_native_compile)
-foreach(probe hip_gfx1201_probe gfx12_wmma_probe k_module_probe native_replay_probe cuda_driver_probe cuda_mma_probe cuda_image_probe d3d12_command_probe d3d12_pixel_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe d3d12_dlss_probe)
+foreach(probe gpu_inventory hip_gfx1201_probe gfx12_wmma_probe k_module_probe native_replay_probe cuda_driver_probe cuda_mma_probe cuda_image_probe d3d12_command_probe d3d12_pixel_probe d3d12_hip_interop_probe hip_stream_lifecycle_probe ngx_cuda_init_probe d3d12_dlss_probe)
   add_executable(d4r_${probe} tools/windows/${probe}.cpp)
   target_compile_definitions(d4r_${probe} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX __HIP_PLATFORM_AMD__)
   target_include_directories(d4r_${probe} PRIVATE "${D4R_HIP_ROOT}/include")
@@ -200,6 +221,7 @@ install(FILES "${pixel_object}" DESTINATION bin)
 install(FILES "${wmma_object}" DESTINATION bin)
 install(FILES scripts/windows/test-windows-rdna4.ps1 DESTINATION .)
 install(FILES scripts/windows/gpu-target.ps1 DESTINATION .)
+install(FILES scripts/windows/gpu-preflight.ps1 DESTINATION .)
 install(FILES scripts/windows/test-gpu-target-contract.ps1 DESTINATION .)
 install(FILES scripts/windows/test-k-replay.ps1 DESTINATION .)
 install(FILES scripts/windows/test-k-captures.ps1 DESTINATION .)

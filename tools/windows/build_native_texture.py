@@ -1,4 +1,4 @@
-"""Build a private RDNA4 texture override from the user's local DLSS DLL.
+"""Build a private target-specific texture override from the user's local DLSS DLL.
 
 The resulting PTX/code object contains NVIDIA code and must remain local.
 No Wine, shell script, GPU, CUDA SDK or system installation is required.
@@ -13,13 +13,14 @@ import re
 import shutil
 import subprocess
 import sys
+from gpu_targets import TARGETS
 
 
 def require_code_object_target(path, target):
     with path.open('rb') as file:
         header = file.read(64)
     if (len(header) != 64 or header[:6] != b'\x7fELF\x02\x01' or
-            header[18:20] != b'\xe0\x00' or header[48] != {'gfx1200': 0x48, 'gfx1201': 0x4e}[target]):
+            header[18:20] != b'\xe0\x00' or header[48] != TARGETS[target]['elfMachine']):
         raise RuntimeError(f'Code object does not target {target}: {path}')
 
 
@@ -30,7 +31,7 @@ def main():
     parser.add_argument('--zluda-root', type=pathlib.Path, required=True)
     parser.add_argument('--kernel', required=True)
     parser.add_argument('--output-directory', type=pathlib.Path, required=True)
-    parser.add_argument('--gpu-arch', choices=['gfx1200', 'gfx1201'], default='gfx1201')
+    parser.add_argument('--gpu-arch', choices=tuple(TARGETS), default='gfx1201')
     parser.add_argument('--shader-mode', choices=['cu', 'wgp'], default='cu')
     args = parser.parse_args()
     if not re.fullmatch(r'hiluma_engine_(?:output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?|'

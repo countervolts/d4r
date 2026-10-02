@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include "gpu_targets.generated.h"
 
 #ifndef D4R_TARGET_ARCH
 #define D4R_TARGET_ARCH "gfx1201"
@@ -11,7 +12,8 @@
 
 namespace d4r::diag {
 inline bool supported_gpu_target(const std::string& target) {
-    return target == "gfx1200" || target == "gfx1201";
+    for (const auto& row : gpu_targets) if (target == row.architecture) return true;
+    return false;
 }
 inline std::string gpu_architecture(const std::string& name) {
     return name.substr(0, name.find(':'));
@@ -29,11 +31,8 @@ inline std::string code_object_target(const std::filesystem::path& path) {
         header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F' ||
         header[4] != 2 || header[5] != 1 || header[18] != 0xe0 || header[19] != 0)
         throw std::runtime_error("Invalid AMDGPU ELF64 code object: " + path.string());
-    switch (header[48]) {
-        case 0x48: return "gfx1200";
-        case 0x4e: return "gfx1201";
-        default: throw std::runtime_error("Unsupported AMDGPU code-object target: " + path.string());
-    }
+    for (const auto& row : gpu_targets) if (header[48] == row.elf_machine) return row.architecture;
+    throw std::runtime_error("Unsupported AMDGPU code-object target: " + path.string());
 }
 inline void require_code_object_target(const std::filesystem::path& path, const std::string& expected) {
     require_gpu_target(code_object_target(path), expected);

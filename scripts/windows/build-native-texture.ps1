@@ -5,10 +5,12 @@ param(
     [string]$HipRoot = 'C:\Program Files\AMD\ROCm\7.2',
     [string]$ZludaRoot,
     [ValidateSet('cu','wgp')][string]$ShaderMode='cu',
-    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch='gfx1201',
+    [string]$GpuArch='gfx1201',
     [string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
+[void](Get-D4RGpuTargetInfo $GpuArch)
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/private-textures-$GpuArch" }

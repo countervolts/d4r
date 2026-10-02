@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "wave32_exchange.h"
 
 // d4r's gfx11 interface: each lane supplies 16 FP16 K operands. The 8 FP32
 // outputs have logical row 2*i + lane/16 and logical column lane%16.
@@ -13,8 +14,7 @@ using d4r_wmma_f8 = float __attribute__((ext_vector_type(8)));
 __attribute__((device, always_inline)) static inline float d4r_wmma_other_half(float value)
 {
     const uint32_t bits = __builtin_bit_cast(uint32_t, value);
-    const uint32_t swapped = __builtin_amdgcn_permlanex16(
-        bits, bits, 0x76543210u, 0xfedcba98u, false, false);
+    const uint32_t swapped = d4r_wave32_other_half(bits);
     return __builtin_bit_cast(float, swapped);
 }
 
@@ -49,7 +49,7 @@ d4r_wmma_legacy_layout(d4r_wmma_h16 a, d4r_wmma_h16 b, d4r_wmma_f8 c)
         result[i] = (row >> 3) == group ? d12[new_index] : remote_d[new_index];
     }
     return result;
-#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#elif defined(__GFX11__)
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
 #error "d4r WMMA backend requires a validated gfx11 or gfx12 target"

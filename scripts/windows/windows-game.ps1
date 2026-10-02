@@ -27,6 +27,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
+. (Join-Path $PSScriptRoot 'gpu-preflight.ps1')
 if ($ProfileGpuBoundary -and !$AsyncInterop) { throw '-ProfileGpuBoundary requires -AsyncInterop.' }
 if ($ProfileKernels -and $ProfileKernelsDeferred) { throw 'Choose either serializing or deferred kernel profiling.' }
 if ($ProfileLegacyStream -and !$ProfileKernelsDeferred) { throw '-ProfileLegacyStream requires -ProfileKernelsDeferred.' }
@@ -74,6 +75,7 @@ foreach ($file in $metadata.files) {
     if ((Get-FileHash -LiteralPath (Join-Path $package $file.path) -Algorithm SHA256).Hash -ne $file.sha256) { throw "Package file changed; rebuild package: $($file.path)" }
 }
 if ((Get-FileHash -LiteralPath $DlssDll -Algorithm SHA256).Hash -ne $metadata.dlssSha256) { throw 'DLSS DLL does not match the validated 310.9.1 native manifest. Rebuild and validate native manifests for this DLL first.' }
+Invoke-D4RGpuPreflight $package $game $GpuArch (Join-Path $package ('results/preflight-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')))
 $textureFiles=@(); $textureManifest=@()
 if ($LocalTextureKernels) {
     $LocalTextureKernels=(Get-Item -LiteralPath $LocalTextureKernels -ErrorAction Stop).FullName
@@ -193,6 +195,7 @@ $settings = @{
     # false have the same numerical effect; unset reuses the validated cache.
     D4R_ZLUDA_IGNORE_DENORMAL=$null; D4R_ZLUDA_FAST_MATH=$null;
     D4R_ZLUDA_WMMA_F32ACC=$null; D4R_ZLUDA_WAVE64=$null;
+    D4R_ZLUDA_WMMA_LAYOUT=$null;
     D4R_QUIET_API=$(if ($VerboseRuntime) { $null } else { '1' });
     D4R_VALIDATE_OUTPUT=$(if ($ValidateOutput) { '1' } else { $null });
     D4R_PROFILE_STAGES=$(if ($ProfileStages) { '1' } else { $null });

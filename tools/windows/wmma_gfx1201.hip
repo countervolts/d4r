@@ -25,6 +25,7 @@ extern "C" __attribute__((global)) void d4r_wmma_gfx1201(
     const unsigned int group = lane >> 4;
     const _Float16* a = reinterpret_cast<const _Float16*>(a_bits);
     const _Float16* b = reinterpret_cast<const _Float16*>(b_bits);
+#if defined(__GFX12__)
     h8 a_frag, b_frag;
     f8 c_frag;
     for (unsigned int i = 0; i < 8u; ++i) {
@@ -39,6 +40,23 @@ extern "C" __attribute__((global)) void d4r_wmma_gfx1201(
             b_frag, a_frag, result);
     for (unsigned int i = 0; i < 8u; ++i)
         output[row * 16u + group * 8u + i] = result[i];
+#else
+    // Adapted from realdody/d4r ae530b0: real gfx11 operands/accumulators,
+    // independent of the shared layout abstraction.
+    d4r_wmma_h16 a_frag, b_frag;
+    d4r_wmma_f8 c_frag;
+    for (unsigned int i = 0; i < 16u; ++i) {
+        a_frag[i] = a[row * 16u + i];
+        b_frag[i] = b[row * 16u + i];
+    }
+    for (unsigned int i = 0; i < 8u; ++i)
+        c_frag[i] = initial_c[(2u * i + group) * 16u + row];
+    d4r_wmma_f8 result = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
+    if (steps == 2u)
+        result = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, result);
+    for (unsigned int i = 0; i < 8u; ++i)
+        output[(2u * i + group) * 16u + row] = result[i];
+#endif
 }
 
 // d4r's original gfx11 fragment contract, exercised independently of K/M.

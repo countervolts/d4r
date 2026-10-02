@@ -2,13 +2,15 @@
 param(
     [string]$HipRoot = $env:HIP_PATH,
     [ValidateSet('stable', 'therock')][string]$RuntimeProfile = 'stable',
-    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch = 'gfx1201',
+    [string]$GpuArch = 'gfx1201',
     [string]$ZludaRoot,
     [string]$ToolchainRoot,
     [string]$BuildDirectory,
     [string]$InstallDirectory
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'gpu-target.ps1')
+[void](Get-D4RGpuTargetInfo $GpuArch)
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($RuntimeProfile -eq 'therock') {
     if (!$PSBoundParameters.ContainsKey('HipRoot')) { $HipRoot = Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }

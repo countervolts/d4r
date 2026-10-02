@@ -2,7 +2,7 @@
 param(
     [string]$PackageRoot, [string]$DiagnosticRoot, [string]$OptiScalerRoot,
     [string]$ZludaRoot, [string]$HipRoot, [string]$KernelKRoot, [string]$KernelMRoot,
-    [ValidateSet('gfx1200','gfx1201')][string]$GpuArch,
+    [string]$GpuArch,
     [string]$ArchivePath
 )
 $ErrorActionPreference = 'Stop'
@@ -15,7 +15,7 @@ foreach ($name in $defaults.Keys) {
     if (!(Get-Variable -Name $name -ValueOnly)) { Set-Variable -Name $name -Value (Join-Path $repo $defaults[$name]) }
 }
 $GpuArch=Get-D4RGpuTarget $DiagnosticRoot $GpuArch
-if ($GpuArch -eq 'gfx1200' -and !$PSBoundParameters.ContainsKey('PackageRoot')) { $PackageRoot += '-gfx1200' }
+if ($GpuArch -ne 'gfx1201' -and !$PSBoundParameters.ContainsKey('PackageRoot')) { $PackageRoot += "-$GpuArch" }
 if (!$KernelKRoot) { $KernelKRoot=Join-Path $repo "build/native-k-$GpuArch" }
 if (!$KernelMRoot) { $KernelMRoot=Join-Path $repo "build/native-m-$GpuArch" }
 foreach ($directory in @($KernelKRoot,$KernelMRoot)) {
@@ -46,6 +46,7 @@ Stage (Join-Path $DiagnosticRoot 'bin/d4r_nvngx.dll') 'd4r/_nvngx.dll'
 Stage (Join-Path $DiagnosticRoot "bin/pixel_convert_${GpuArch}.hsaco") "d4r/pixel_convert_${GpuArch}.hsaco"
 Stage (Join-Path $DiagnosticRoot 'nvapi-compat/nvapi64.dll') 'd4r/nvapi/nvapi64.dll'
 Stage (Join-Path $DiagnosticRoot 'bin/d4r_debug_launcher.exe') 'd4r/d4r_debug_launcher.exe'
+Stage (Join-Path $DiagnosticRoot 'bin/d4r_gpu_inventory.exe') 'd4r/d4r_gpu_inventory.exe'
 foreach ($file in @('nvcuda.dll','nvapi64.dll','libc++.dll','libunwind.dll')) { Stage (Join-Path $ZludaRoot $file) "d4r/zluda/$file" }
 foreach ($file in @('amdhip64_7.dll','amd_comgr.dll','hiprtc0717.dll','hiprtc-builtins0717.dll','rocm_kpack.dll','AMD.ROCM.Comgr.MANIFEST','.hipVersion')) {
     Stage (Join-Path $HipRoot "bin/$file") "d4r/hip/bin/$file"
@@ -66,6 +67,8 @@ if ($entries.Count -ne 16) { throw "Expected 11 K and 5 M native objects; found 
 $stagedFiles.Add('d4r/native/d4r-kernels.txt')
 Stage (Join-Path $repo 'scripts/windows/windows-game.ps1') 'windows-game.ps1'
 Stage (Join-Path $repo 'scripts/windows/gpu-target.ps1') 'gpu-target.ps1'
+Stage (Join-Path $repo 'scripts/windows/gpu-preflight.ps1') 'gpu-preflight.ps1'
+Stage (Join-Path $repo 'tools/windows/gpu-targets.json') 'gpu-targets.json'
 if (Test-Path -LiteralPath (Join-Path $DiagnosticRoot 'gpu-target.json')) {
     Stage (Join-Path $DiagnosticRoot 'gpu-target.json') 'gpu-target.json'
 } else {

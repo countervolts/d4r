@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$DlssDll, [string]$PackageRoot, [string]$OutputDirectory, [ValidateSet('gfx1200','gfx1201')][string]$GpuArch)
+param([Parameter(Mandatory=$true)][string]$DlssDll, [string]$PackageRoot, [string]$OutputDirectory, [string]$GpuArch)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))

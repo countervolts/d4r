@@ -122,7 +122,7 @@ __device__ __forceinline__ acc8v splat8(float v)
 
 __device__ __forceinline__ uint32_t other_half(uint32_t v)
 {
-    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
+    return wm_other_half(v);
 }
 
 __device__ __forceinline__ uint32_t pack2(half_t lo, half_t hi)

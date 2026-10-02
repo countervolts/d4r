@@ -1,40 +1,80 @@
-# Windows GPU targets
+# Experimental Windows RDNA3 / RDNA4 coverage
 
-The native Windows build accepts **gfx1200** and **gfx1201**. It builds a
-separate shim, diagnostics and code objects for each target. The default stays
-gfx1201. GPU selection uses HIP's real `gcnArchName`, followed by D3D12/HIP
-adapter LUID matching; it does not depend on a marketing name or overridden
-DXGI vendor ID.
+The shim, diagnostics, native K/M kernels and game installer accept the
+targets below, with one package per actual ISA. **Only RX 9070 XT has physical
+validation here.** All other targets are experimental and compile-tested;
+working DLSS, interop and performance on them remain unverified.
 
-| Target | Examples in LLVM's processor table | This project's validation |
+| Family | Target | Examples / scope |
 | --- | --- | --- |
-| gfx1201 | RX 9070, RX 9070 XT | RX 9070 XT: hardware, K/M and game tests. Other cards untested. |
-| gfx1200 | RX 9060, RX 9060 XT | Host/device compilation and software tests only. No physical gfx1200 available. |
+| RDNA3 | gfx1100 | RX 7900 family; same-target workstation GPUs |
+| RDNA3 | gfx1101 | RX 7700 / 7700 XT / 7800 XT; same-target mobile/workstation GPUs |
+| RDNA3 | gfx1102 | RX 7600 / 7600 XT; same-target mobile/workstation GPUs |
+| RDNA3 | gfx1103 | RDNA3 integrated graphics |
+| RDNA3.5 | gfx1150, gfx1151, gfx1152, gfx1153, gfx1154 | Corresponding integrated graphics targets |
+| RDNA4 | gfx1200 | RX 9060 / 9060 XT; same-target GPUs |
+| RDNA4 | gfx1201 | RX 9070 / 9070 XT / 9070 GRE; same-target GPUs |
 
-Sources: [LLVM AMDGPU processors](https://llvm.org/docs/AMDGPUUsage.html#processors)
-and [AMD's Windows compatibility matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/windows/windows_compatibility.html).
-AMD's matrix is dependency information, not evidence that d4r's K/M or external
-memory path works on an untested card. Other RDNA4 SKUs are eligible only when
-HIP reports one of these exact targets and exposes the required Windows APIs.
-Device-specific drivers, performance and memory capacity still need testing.
-gfx1250/gfx1251 are a separate ISA group and are not enabled by this change.
+Names and IDs follow [LLVM processors](https://llvm.org/docs/AMDGPUUsage.html#processors)
+and [ELF ABI](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-elf-header-e-flags).
+`tools/windows/gpu-targets.json` supplies CMake-generated C++, PowerShell and
+the private texture builder. Selection uses HIP's real `gcnArchName` and the
+D3D12 adapter LUID, including systems with several GPUs sharing a target.
+Marketing names do not control eligibility.
 
-Do not rename a gfx1201 package to gfx1200. `gpu-target.json`, the compiled
-host target and each ELF code-object target must agree. Runtime selection
-rejects another architecture before launching kernels. Staging, packaging and
-installation inspect the documented AMDGPU ELF machine ID and reject mixed
-objects. They never rewrite a binary target or set `HSA_OVERRIDE_GFX_VERSION`.
-Legacy packages without target metadata remain gfx1201 only.
+All listed RDNA3/RDNA3.5/RDNA4 targets with existing gfx11/gfx12 WMMA contracts
+are included. TBD RDNA4m gfx1170..gfx1172 and gfx12.5 gfx1250/gfx1251 are
+different ISA groups and excluded. Unknown future targets need explicit review.
+Check [AMD's Windows matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/windows/windows_compatibility.html)
+for driver/runtime eligibility. Compiler support cannot supply missing Windows
+driver support or external-memory APIs, especially on APUs.
 
-## Build and package
+## Installation and diagnostics
 
-Prepare the pinned dependencies as described in `windows-rdna4-port.md`.
-Select a target explicitly; this example creates the experimental gfx1200
-package. Use gfx1201 for a 9070/9070 XT. Keep separate output directories when
-building both targets.
+Use the actual target's archive: **gfx1200 for RX 9060 XT**, for example.
+Metadata, host target and every ELF target must agree. Runtime/scripts reject
+mixed targets and never rename targets, rewrite ELF IDs or set
+`HSA_OVERRIDE_GFX_VERSION`. Legacy metadata-free packages remain gfx1201 only.
+
+Before changing game files, `windows-game.ps1` now runs a read-only HIP
+inventory and checks the target and wave32. Inventory allocates no GPU buffers
+and runs no kernels; success is discovery, not validation. Failure prints one
+ZIP containing stdout/stderr, exit code, runtime/DLL and driver details. A local
+`d3d12.dll` identifying itself as vkd3d/Wine is rejected before install. Restore
+the game's native D3D12 installation; the script never loads or removes that
+proxy itself. Begin synchronously on an untested GPU:
 
 ```powershell
-$arch = 'gfx1200'
+.\windows-game.ps1 -GameExe "D:\Games\Example\Game.exe" -NgxCore "C:\LocalDLLs\_nvngx.dll" -DlssDll "C:\LocalDLLs\nvngx_dlss.dll" -Preset 11 -ValidateOutput -CaptureExceptions
+```
+
+The local DLLs must match the documented NGX version and DLSS 310.9.1 SHA256
+in `package.json`. NVIDIA DLLs are never distributed. Retain the printed ZIP
+on failure. Async K and performance are subsequent gates; gfx1201-specific
+FP8, arithmetic and tuning experiments remain separate.
+
+## Issue #10 review, 2026-10-02
+
+Reviewed [comment 5952822115](https://github.com/countervolts/d4r/issues/10#issuecomment-5952822115),
+including all 32 attached text logs from eight attempts. HIP discovers
+**RX 9060 XT / gfx1200** successfully. Every attempt fails with the old shim's
+**"No selected gfx1201 device"** rejection; OptiScaler reports `support=false`
+/ `BAD00002`. None reaches `D4R_RUNTIME` initialization or native transformer
+execution. These logs do not demonstrate a K/M kernel crash. Use the gfx1200
+package instead of overriding architecture. Three attempts also load
+vkd3d-proton 3.1.0 from a local D3D12 proxy, outside this Windows backend.
+
+The new packages/preflight address the identified failures. They do not prove
+those games work on RX 9060 XT; a new native-D3D12 run on that GPU is required.
+Raw community logs and personal directory paths stay local.
+
+## Build
+
+Prepare dependencies following `windows-rdna4-port.md`. Default: gfx1201.
+Select another target explicitly and keep separate directories:
+
+```powershell
+$arch = 'gfx1101'  # for example RX 7800 XT
 $diag = "$PWD\dist\windows-$arch-diagnostics"
 .\scripts\windows\build-windows-rdna4.ps1 -RuntimeProfile therock -GpuArch $arch -ZludaRoot "$PWD\dist\zluda-windows-final" -BuildDirectory "$PWD\build\windows-$arch" -InstallDirectory $diag
 .\scripts\windows\stage-native-k.ps1 -DlssDll "$PWD\nvngx_dlss.dll" -PackageRoot $diag
@@ -42,89 +82,60 @@ $diag = "$PWD\dist\windows-$arch-diagnostics"
 .\scripts\windows\package-windows-game.ps1 -DiagnosticRoot $diag -GpuArch $arch -PackageRoot "$PWD\dist\windows-$arch-game" -ArchivePath "$PWD\dist\windows-$arch-game.zip"
 ```
 
-ZLUDA, HIP and OptiScaler must already be built/prepared. The package contains
-the strict K FP16 and M FP16-equivalent baseline; native FP8 stays disabled.
-The architecture does not change arithmetic or the existing WMMA layout.
-Private NVIDIA-derived texture overrides remain optional local experiments;
-their builder accepts `-GpuArch`, and their validation must match the target
-package before installation. Existing gfx1201 performance measurements are
-not measurements of gfx1200.
-The separate experimental FP8/F16 arithmetic and tuning recipes remain
-gfx1201-specific; this change enables the conservative production baseline
-on both build targets.
+Rebuild diagnostics for the new inventory executable. The package keeps strict
+K FP16 and M FP16-equivalent baselines; native M FP8 remains disabled. CMake:
+`-DD4R_GPU_ARCH=gfx1101`. Some source/executable names retain gfx1201/gfx12 for
+compatibility; actual targets follow the selected architecture.
 
-Equivalent CMake selection is `-DD4R_GPU_ARCH=gfx1200`. Unknown targets fail
-configuration. Some diagnostic executable names and source filenames retain
-`gfx1201` for compatibility; the logged architecture and compiled code objects
-use the selected target.
-
-## First hardware gate on another card
-
-From the repository root, with the matching diagnostic package above and the
-pinned dependencies, run this single command:
+One command compiles all eleven targets without GPU workloads:
 
 ```powershell
-.\scripts\windows\test-windows-rdna4.ps1 -RuntimeProfile therock -PackageRoot "$PWD\dist\windows-gfx1200-diagnostics" -ZludaRoot "$PWD\dist\zluda-windows-final"
+.\scripts\windows\build-windows-gpu-matrix.ps1 -ZludaRoot "$PWD\dist\zluda-windows-final"
 ```
 
-Success requires exit 0, all selected tests passed in `summary.json`, the
-correct actual GPU/target in stdout, exact HIP/PTX/WMMA/pixel-format checks and
-stable interop lifetime. On failure, retain the single printed diagnostic ZIP;
-it includes stdout/stderr, exit code, runtime/driver inventory and DLL identity.
-No NVIDIA DLL is required for this first gate. Full K/M reference, temporal,
-standalone DLSS and game validation are subsequent gates on that hardware;
-passing the first gate alone does not close them.
+Add `-PackageGames -DlssDll "$PWD\nvngx_dlss.dll" -ArchiveDirectory "$PWD\dist\windows-gpu-archives"`
+to stage/archive all packages after committing source and preparing OptiScaler.
+Use `-GpuArchitectures gfx1100,gfx1101,gfx1102,gfx1200,gfx1201` for a subset.
+Per-target logs and `matrix-build.json` distinguish compilation from execution.
+The supplied DLL generates manifests locally and is never copied into archives.
 
-Without that GPU, run `ctest --test-dir build/windows-gfx1200 -L software
---output-on-failure`. These CPU/WARP checks do not execute gfx1200 kernels.
+## Fork adaptation
 
-## Fork review
+Reviewed [realdody's branch](https://github.com/realdody/d4r/tree/windows-rdna3)
+at `ae530b0f53ed5c0bb87558dd7c20f619e014e4fd` and the newer
+[`1897b4a` correction](https://github.com/realdody/d4r/commit/1897b4afa79832bd879234cfb37e7c1468db5cde).
+Earlier MSVC binary16 and generated `BOOL` fixes remain. The earlier forced
+gfx12 fragment layout is not used.
 
-Reviewed [realdody's windows-rdna3 branch](https://github.com/realdody/d4r/tree/windows-rdna3)
-at `ae530b0f53ed5c0bb87558dd7c20f619e014e4fd`, on 2026-10-02. Adapted:
+The newer fork reports Windows gfx1101 `permlanex16` returning its own lane,
+duplicating even K values into odd slots. This port adapts that finding into
+`kernels/common/wave32_exchange.h`: a Windows/gfx11-only per-wave LDS exchange,
+with native gfx11 layout, generic x/y/z indexing, 2 KiB scratch (512 threads
+maximum), volatile accesses and wave fences/barriers protecting scratch reuse.
+It covers K/M fragment conversions and other K half-wave exchanges. gfx12 and
+Linux keep the original instruction path. The raw gfx11 probe uses its actual
+intrinsic/layout, without a forced gfx12 shim.
 
-- Per-target build configuration and actual-target diagnostics, narrowed here
-  to the two documented RDNA4 subtargets, with package/ELF guards added.
-- MSVC binary16 conversion in the synthetic CUDA MMA reference. An exhaustive
-  CPU test covers 63,490 finite/infinity encodings and 31,743 rounding
-  boundaries; LLVM also checks it against native `_Float16` conversion.
-- `WINBOOL` to `BOOL` normalization in generated D3D12 hooks, so the generated
-  header works with the Microsoft SDK as well as MinGW headers.
+The fork reports RX 7800 XT enc1/enc2 identity/nonzero/reference checks. Those
+are **the author's results**, not validation of this adaptation or full K/M
+here. LDS exchange, full network, translated CUDA, accuracy, interop and speed
+still need physical gfx11 testing. Credit: realdody <dodobozicek@gmail.com>.
 
-The fork's RDNA3 implementation forces `D4R_WMMA_LAYOUT=12` for gfx11. That
-kernel-layout change, the raw gfx11 probe and the expanded gfx11 runtime
-allowlist are not imported. Its reported RX 7800 XT/K result has not been
-independently reproduced here; its M/translated-path limitations still require
-separate checks. This change does not advertise native Windows RDNA3 readiness.
-The existing upstream Linux/RDNA3 implementation is unchanged. Credit for
-the adapted portability fixes: realdody <dodobozicek@gmail.com>.
+## Results and next hardware gate
 
-## Local results, 2026-10-02
+All eleven targets compile the complete MinGW host build and 19 device objects
+with TheRock `10.2.0a20260929`, HIP `7.17.26386`, Clang 24. Software target
+contracts inspect actual ELF objects without other-target GPU launches.
+RX 9070 XT passes all 20 CTest gates after these changes. K/M full-frame and
+package checks are recorded in `windows-rdna4-port.md`. Local logs are in
+`build/windows-gpu-coverage` and `test-results/windows-gpu-coverage`.
 
-- Both targets: complete MinGW host build and 19 device code objects using
-  TheRock `10.2.0a20260929`, HIP `7.17.26386`, Clang 24. The runtime, driver,
-  patched ZLUDA and OptiScaler versions are unchanged from the validated port.
-- gfx1201/RX 9070 XT: 20/20 CTest gates, including 16 physical-GPU gates.
-- gfx1200: 4/4 software gates; no gfx1200 kernel execution.
-- MSVC v143 `14.44.35207`: binary16 CPU test passes; CUDA MMA probe and D3D12
-  hook translation units compile. This is not a complete MSVC build claim.
-- K: 12 finite 4K frames at 2259x1271 input, burst and feature recreation;
-  all six async RGB images exactly match their synchronous controls.
-- M: eight finite 4K control/candidate frames at the same input dimensions;
-  all four new-build RGB images exactly match the prior validated build.
-  Both presets log every required native layer, zero CPU image copies and
-  current-frame output.
-- Original gfx1201 objects remain byte-identical on disk. In fresh builds,
-  `.text` and `.rodata*` match the prior gfx1201 objects for all 19 kernels;
-  fresh ELF files have different overall hashes. gfx1200 and gfx1201 have
-  distinct correct ELF targets. Matching instruction sections are compile
-  evidence, not a substitute for testing gfx1200 hardware.
-- A gfx1200 HIP probe on the physical gfx1201 fails cleanly with exit 4 before
-  any GPU allocation/kernel execution. This tests refusal, not gfx1200 support.
-- Both target packages pass install/restore checks in isolated workspace
-  fixtures; no game is launched. Only manifest-listed runtime files install.
-  Packaging rejects a mismatched destination or native kernel directory before
-  writing files. Every packaged code object has the expected ELF target.
+The first hardware gate on another GPU needs no NVIDIA DLL:
 
-Logs are local in `test-results/rdna4-targets-*` and
-`test-results/rdna4-target-objects.json`; they contain no public NVIDIA DLLs.
+```powershell
+.\scripts\windows\test-windows-rdna4.ps1 -RuntimeProfile therock -PackageRoot "$PWD\dist\windows-gfx1101-diagnostics" -ZludaRoot "$PWD\dist\zluda-windows-final"
+```
+
+Success requires exit 0, correct actual target, exact HIP/PTX/WMMA/pixel checks
+and stable interop lifetime. Failure prints one ZIP. Full K/M reference,
+temporal, DLSS and game validation remain subsequent gates.

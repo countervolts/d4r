@@ -1,20 +1,28 @@
-# Native Windows RDNA4 game development package
+# Native Windows RDNA3 / RDNA4 game development package
 
 Validated hardware: Windows 11 x64 / Radeon RX 9070 XT / gfx1201. Native K and
 M transformer kernels pass standalone D3D12 + OptiScaler checks. Silent Hill 2
 K now renders real menu frames and M renders a saved gameplay level with
 GPU NaN/Inf checks. Both K and M pass 3840x2160 output on this machine.
-The user reports 49-51 FPS for K in the measured scene after the command-hook
-fix and locally built output-store optimization. This is a local
+Performance measurements and their controls are recorded in
+[windows-performance.md](windows-performance.md). This is a
 development package; no NVIDIA proprietary DLL is included.
 
-Builds also accept gfx1200 (for example RX 9060/9060 XT). This target is
-**compile-tested only**; no physical gfx1200 validation has been performed.
+Experimental builds also accept gfx1100..gfx1103 (RDNA3), gfx1150..gfx1154
+(RDNA3.5) and gfx1200 (for example RX 9060/9060 XT). These targets are
+**compile-tested only**; no physical validation here has been performed.
 RX 9070 and other gfx1201 cards also remain untested. Use a package built for
 the GPU's actual HIP architecture: its `gpu-target.json`, host shim and ELF
 code objects must agree. Installation/runtime reject mixed targets. See
 [windows-gpu-support.md](windows-gpu-support.md) for separate-target build
 commands, the fork review and the first hardware diagnostic gate.
+
+Before changing game files, the runner inventories HIP devices without
+executing kernels. It rejects another architecture's package and a local
+D3D12 proxy identifying itself as vkd3d/Wine, producing one diagnostic ZIP.
+RX 9060 XT needs gfx1200: the old gfx1201-only package fails before DLSS
+initialization on it. Use native D3D12. On an untested GPU, start with
+synchronous K and output/exception diagnostics.
 
 Build the shim/diagnostics, corrected ZLUDA, K/M native objects and patched
 OptiScaler using the scripts in `scripts/windows`, then run:
