@@ -3,6 +3,7 @@ param(
     [string]$NgxCore, [string]$DlssDll, [string]$NativeRoot,
     [string]$ZludaRoot, [string]$PackageRoot,
     [string]$Resolution = '3840x2160',
+    [switch]$ProfileGpuBoundary,
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,7 @@ New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $settings = @{D4R_DIAG_BURST='1'; D4R_DIAG_RECREATE=$null; D4R_ASYNC_INTEROP=$null;
     D4R_ZLUDA_NATIVE_DIR=$NativeRoot; D4R_QUIET_API='1'; D4R_VALIDATE_OUTPUT='1';
     D4R_PROFILE_STAGES='1'; D4R_ZLUDA_PROFILE=$null; D4R_ZLUDA_PROFILE_API=$null;
+    D4R_PROFILE_GPU_BOUNDARY=$(if ($ProfileGpuBoundary) { '1' } else { $null });
     ZLUDA_CACHE_DIR=(Join-Path $repo 'build/zluda-cache-windows');
     PYTHONPATH=(Join-Path $repo '.tools/python/vendor')}
 $old=@{}
@@ -40,13 +42,18 @@ try {
                 OptiScalerDll=(Join-Path $repo 'dist/optiscaler-windows-d4r/OptiScaler.dll'); OutputDirectory=$output}
             & (Join-Path $PSScriptRoot 'test-windows-rdna4.ps1') @arguments
             if ($LASTEXITCODE) { throw "Failed $variant-$mode; logs: $output" }
+            if ($ProfileGpuBoundary -and $variant -eq 'async') {
+                $stdout=Get-Content -LiteralPath (Join-Path $output 'd3d12-evaluate-preset-11.stdout.log') -Raw
+                $timings=[regex]::Matches($stdout, '(?m)^D4R_GPU_BOUNDARY [^\r\n]*diagnostics_cpu_bytes=32 serializing=0\r?$')
+                if ($timings.Count -ne 3) { throw "Expected three completed GPU timing records for $variant-$mode, found $($timings.Count)." }
+            }
         }
         & python.exe (Join-Path $repo 'tools/windows/frame_compare.py') --reference (Join-Path $OutputDirectory "sync-$mode") --actual (Join-Path $OutputDirectory "async-$mode") --width $width --height $height --exact |
             Tee-Object -FilePath (Join-Path $OutputDirectory "$mode-comparison.log")
         if ($LASTEXITCODE) { throw "Async $mode output mismatch" }
     }
     @{passed=$true; architecture='gfx1201'; preset=11; resolution=$Resolution;
-        modes=@('burst','recreate'); framesPerMode=3; exactRgb=$true} |
+        modes=@('burst','recreate'); framesPerMode=3; exactRgb=$true; gpuBoundaryTiming=[bool]$ProfileGpuBoundary} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'validation.json') -Encoding UTF8
     Write-Host "PASS asynchronous K burst/recreate: $OutputDirectory"
 } finally {

@@ -1,5 +1,6 @@
 #pragma once
 #include "d3d12_external.h"
+#include "d3d12_boundary_timing.h"
 #include "pixel_conversion.h"
 #include "cuda_image_api.h"
 #include "ngx_parameters.h"
@@ -201,6 +202,7 @@ class Feature {
     struct CopySlot {
         ComPtr<ID3D12CommandAllocator> input_allocator, output_allocator;
         ComPtr<ID3D12GraphicsCommandList> input, output;
+        std::unique_ptr<BoundaryTiming> timing;
         uint64_t done = 0;
     };
     struct AsyncFrame {
@@ -265,7 +267,7 @@ public:
         jobs_changed_.notify_all();
         if (worker_.joinable()) worker_.join();
         if (copy_completion_) {
-            try { wait_copies(copy_value_); }
+            try { wait_copies(copy_value_); report_completed_copies(); }
             catch (const std::exception& e) { std::fprintf(stderr, "D4R_ASYNC_CLEANUP_FAILURE %s\n", e.what()); }
         }
         std::lock_guard<std::mutex> lock(rt_->mutex); cleanup();
@@ -275,6 +277,7 @@ public:
         if (!std::getenv("D4R_ASYNC_INTEROP")) return;
         wait_worker();
         if (copy_value_) wait_copies(copy_value_);
+        report_completed_copies();
         rt_->drain_async_queue();
     }
 
@@ -347,6 +350,13 @@ public:
         }
     }
 private:
+    void report_completed_copies() {
+        if (!copy_completion_ || !queue_) return;
+        const auto completed = copy_completion_->GetCompletedValue();
+        if (completed == UINT64_MAX) throw std::runtime_error("Device removed during boundary timing");
+        for (auto& slot : copy_slots_) if (slot->timing && slot->done && slot->done <= completed)
+            slot->timing->report(queue_.Get(), this);
+    }
     void wait_copies(uint64_t value) {
         if (copy_completion_->GetCompletedValue() >= value) return;
         dx(copy_completion_->SetEventOnCompletion(value, copy_event_.value), "Async copy completion event");
@@ -359,6 +369,7 @@ private:
         if (!worker_failure_.empty()) throw std::runtime_error(worker_failure_);
     }
     CopySlot& copy_slot() {
+        report_completed_copies();
         if (!copy_completion_) {
             dx(rt_->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(copy_completion_.GetAddressOf())), "Async copy fence");
             copy_event_.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -372,6 +383,7 @@ private:
             for (auto& slot : copy_slots_) if (slot->done < selected->done) selected = slot.get();
             // Bounded ownership; this wait is outside the runtime mutex.
             wait_copies(selected->done);
+            report_completed_copies();
         }
         if (selected) {
             dx(selected->input_allocator->Reset(), "Async input allocator Reset");
@@ -386,6 +398,7 @@ private:
             dx(rt_->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf())), "Async copy list");
         };
         create(slot->input_allocator, slot->input); create(slot->output_allocator, slot->output);
+        if (std::getenv("D4R_PROFILE_GPU_BOUNDARY")) slot->timing = std::make_unique<BoundaryTiming>(rt_->device.Get());
         copy_slots_.push_back(std::move(slot)); return *copy_slots_.back();
     }
     bool resize_needed(void* parameters) {
@@ -438,8 +451,14 @@ private:
             frame->resources.emplace_back(resource);
             d4r_ngx_set_d3d12_resource(frame->parameters, names[i], resource);
         }
-        record_inputs(slot.input.Get(), parameters); dx(slot.input->Close(), "Async input Close");
-        record_output(slot.output.Get(), parameters); dx(slot.output->Close(), "Async output Close");
+        if (slot.timing) slot.timing->input_begin(slot.input.Get());
+        record_inputs(slot.input.Get(), parameters);
+        if (slot.timing) slot.timing->input_end(slot.input.Get());
+        dx(slot.input->Close(), "Async input Close");
+        if (slot.timing) slot.timing->output_begin(slot.output.Get());
+        record_output(slot.output.Get(), parameters);
+        if (slot.timing) slot.timing->output_end(slot.output.Get());
+        dx(slot.output->Close(), "Async output Close");
         if (!worker_.joinable()) worker_ = std::thread([this] { work(); });
         ID3D12CommandList* input[] = {slot.input.Get()}, *output[] = {slot.output.Get()};
         // Allocate the job before any GPU wait is published. Worker cannot
@@ -457,6 +476,7 @@ private:
             queue->ExecuteCommandLists(1, output);
             slot.done = ++copy_value_;
             dx(queue->Signal(copy_completion_.Get(), slot.done), "Async output-copy retirement Signal");
+            if (slot.timing) slot.timing->submitted(frame->ticket.output);
         } catch (const std::exception& e) {
             jobs_.pop_back(); worker_failure_ = e.what();
             { std::lock_guard<std::mutex> order(rt_->async_mutex);

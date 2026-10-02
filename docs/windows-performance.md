@@ -130,6 +130,27 @@ scans, stdout/stderr, exceptions and runtime provenance. To include the local
 validated output-store optimization, pass its combined native directory with
 `-NativeRoot`; proprietary objects remain local.
 
+`-ProfileGpuBoundary` (requires `-AsyncInterop`) adds D3D12 timestamps before
+and after the VRAM input/output copies. Resolved results are read only once
+the copy slot's existing fence completes; 32 diagnostic bytes per frame are
+read and no new completion wait is added. `external_span_ms` spans HIP and
+host/driver scheduling across the external fence. `between_boundaries_ms`
+also includes game rendering, and `input_interval_ms` is not Present timing.
+These queries obey the queue's timestamp ordering and add GPU commands; they
+are disabled for an ordinary FPS run. GPU clock behavior during idle can
+affect intervals; no hardware occupancy is inferred. Timestamp semantics:
+[Microsoft D3D12 timing](https://learn.microsoft.com/en-us/windows/win32/direct3d12/timing).
+
+The timestamp-enabled 4K burst/recreation gate completes twelve frames, all
+finite; all six async RGB outputs still match their fresh controls exactly.
+Each async mode emits all three timing records, including the final frame
+at feature release. Results: `test-results/k-async-gpu-boundary-4k`.
+All sixteen CTest gates pass on the rebuilt shim. Reproduce with:
+
+```powershell
+.\scripts\windows\test-async-k.ps1 -ProfileGpuBoundary
+```
+
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes
 4685 frames, all finite. Neither has a backend failure, CPU image copy or an

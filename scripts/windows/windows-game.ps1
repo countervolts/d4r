@@ -13,6 +13,7 @@ param(
     [switch]$ProfileKernels,
     [switch]$ProfileCommandHooks,
     [switch]$ProfileCudaApi,
+    [switch]$ProfileGpuBoundary,
     [switch]$UncachedInteropLists,
     [switch]$AsyncInterop,
     [switch]$VerboseRuntime,
@@ -21,6 +22,7 @@ param(
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
+if ($ProfileGpuBoundary -and !$AsyncInterop) { throw '-ProfileGpuBoundary requires -AsyncInterop.' }
 $package = [IO.Path]::GetFullPath($PSScriptRoot)
 $GameExe = (Get-Item -LiteralPath $GameExe -ErrorAction Stop).FullName
 $game = Split-Path $GameExe
@@ -182,6 +184,7 @@ $settings = @{
     D4R_ZLUDA_PROFILE=$(if ($ProfileKernels) { '1' } else { $null });
     D4R_PROFILE_COMMAND_HOOKS=$(if ($ProfileCommandHooks) { '1' } else { $null });
     D4R_ZLUDA_PROFILE_API=$(if ($ProfileCudaApi) { '1' } else { $null });
+    D4R_PROFILE_GPU_BOUNDARY=$(if ($ProfileGpuBoundary) { '1' } else { $null });
     D4R_DISABLE_INTEROP_LIST_CACHE=$(if ($UncachedInteropLists) { '1' } else { $null });
     D4R_ASYNC_INTEROP=$(if ($AsyncInterop) { '1' } else { $null });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');

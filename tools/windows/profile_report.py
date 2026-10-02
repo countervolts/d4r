@@ -43,6 +43,7 @@ def report(directory, metadata_directory=None):
     kernels = collections.defaultdict(list)
     hook_threads = collections.defaultdict(list)
     apis = collections.defaultdict(list)
+    boundaries = collections.defaultdict(list)
     replay = collections.defaultdict(lambda: collections.defaultdict(dict))
     for path in sorted(directory.glob('*.log')):
         data = path.read_bytes()
@@ -58,6 +59,12 @@ def report(directory, metadata_directory=None):
                 if name != 'interval_ms' or number > 0:
                     commands[kind.lower() + '.' + name].append(number)
         for line in text.splitlines():
+            if line.startswith('D4R_GPU_BOUNDARY '):
+                fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                if all(key in fields for key in ('feature', 'ticket', 'input_copy_ms', 'external_span_ms',
+                                                 'output_copy_ms', 'total_ms', 'input_start_ticks',
+                                                 'output_end_ticks', 'frequency')):
+                    boundaries[fields['feature']].append(fields)
             if line.startswith('D4R_CUDA_API_PROFILE '):
                 fields = dict(re.findall(r'(\w+)=(\S+)', line))
                 if all(key in fields for key in ('api', 'calls', 'total_ms', 'max_ms', 'period_ms', 'thread')):
@@ -75,16 +82,35 @@ def report(directory, metadata_directory=None):
                   commandStages={name: stats(values) for name, values in commands.items()},
                   commandHookSamples=[],
                   cudaApi=[],
+                  gpuBoundaryStages={},
                   replayPairs=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
                       'CUDA API profiles measure host call duration without GPU events or added synchronization; they still include existing waits.',
+                      'D3D12 boundary timestamps span copies and HIP/scheduling across the external fence; they do not isolate kernel execution or measure Present.',
+                      'Boundary timestamps are read after existing completion fences; only 32 timing bytes are read, with no extra completion wait. GPU clock idle behavior can affect intervals.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
                       'HIP-event profiling synchronizes every sampled launch and changes scheduling.',
                       'Occupancy is an API prediction, not a measured hardware counter.',
                       'Bandwidth and WMMA utilization require additional supported hardware tooling.'])
+    boundary_stages = collections.defaultdict(list)
+    for rows in boundaries.values():
+        rows.sort(key=lambda row: int(row['ticket']))
+        for row in rows:
+            for key in ('input_copy_ms', 'external_span_ms', 'output_copy_ms', 'total_ms'):
+                boundary_stages[key].append(float(row[key]))
+        for previous, current in zip(rows, rows[1:]):
+            if int(current['ticket']) != int(previous['ticket']) + 2 or current['frequency'] != previous['frequency']:
+                continue
+            frequency = int(current['frequency'])
+            before = int(current['input_start_ticks']) - int(previous['output_end_ticks'])
+            interval = int(current['input_start_ticks']) - int(previous['input_start_ticks'])
+            if frequency > 0 and before >= 0 and interval > 0:
+                boundary_stages['between_boundaries_ms'].append(before * 1000. / frequency)
+                boundary_stages['input_interval_ms'].append(interval * 1000. / frequency)
+    result['gpuBoundaryStages'] = {name: stats(values) for name, values in boundary_stages.items()}
     for name, pairs in replay.items():
         complete = [row for row in pairs.values() if set(row) == {'control', 'candidate'}]
         if complete:
@@ -132,7 +158,7 @@ def main():
     parser.add_argument('--metadata-directory', type=pathlib.Path, help='llvm-readobj --notes output for native code objects')
     args = parser.parse_args()
     result = report(args.directory, args.metadata_directory)
-    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi')):
+    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi', 'gpuBoundaryStages')):
         parser.error('no complete stage or HIP-event records found')
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -140,6 +166,8 @@ def main():
         print(f"CPU {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for name, row in result['commandStages'].items():
         print(f"COMMAND {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for name, row in result['gpuBoundaryStages'].items():
+        print(f"GPU BOUNDARY {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
     for row in result['cudaApi'][:20]:
         print(f"CUDA API {row['api']} {row['thread']}: n={row['calls']} mean={row['meanMs']:.6f} ms total={row['totalMs']:.3f} ms max={row['maxMs']:.3f} ms")
     for row in result['commandHookSamples']:

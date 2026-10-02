@@ -66,6 +66,14 @@ scan is 0.380 ms. Logs:
 stops at its bound (`diagnostic_timeout`); there is no recorded game crash.
 The K performance gate remains open.
 
+Optional `-ProfileGpuBoundary` now records D3D12 GPU timestamps around input
+copies, the external-fence span and output copies. Copy-slot completion
+controls query reuse/readback; only 32 timing bytes are read, with no extra
+completion wait. The timestamp-enabled burst/recreate gate passes all twelve
+K/4K frames with exact candidate RGB (`test-results/k-async-gpu-boundary-4k`),
+and all sixteen CTest gates pass on the rebuilt shim. Game timestamps remain
+the next performance diagnostic; their span includes scheduling as well as HIP.
+
 Three ordinary K/4K async frames and three queued together without intermediate
 CPU completion all match their corresponding prior synchronous RGB exactly;
 the temporal controls differ between frames. One burst attempt times out during

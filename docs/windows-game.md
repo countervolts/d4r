@@ -64,6 +64,10 @@ tracking/lock waits from driver calls. It is disabled in ordinary runs.
 `-ProfileCudaApi` aggregates existing CUDA API host durations without adding
 HIP events or synchronization. `-UncachedInteropLists` restores per-frame
 copy-list allocation for comparison with the normal safely reused lists.
+`-ProfileGpuBoundary` requires `-AsyncInterop` and measures D3D12 GPU intervals
+around the input/output copies and external fence. It reads 32 timestamp bytes
+only after existing completion, with no extra CPU wait. Its external interval
+includes HIP and scheduling; it is not an isolated transformer kernel time.
 The runner drains stdout/stderr concurrently as raw bytes; the earlier
 line-oriented PowerShell collector imposed large per-frame delays. The optional
 ZLUDA kernel profiler is for diagnostics only. Measurements and reproduction
