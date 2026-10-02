@@ -163,7 +163,7 @@ __device__ __forceinline__ half_t gelu(half_t x)
 }
 
 // gelu of 8 accumulator values as 4 packed f16 pairs (the same f16 operations as gelu(), element-wise)
-__device__ __forceinline__ void gelu8(const f8v& d, half_t g[8])
+__device__ __forceinline__ void gelu8(const acc8v& d, half_t g[8])
 {
     const hv2 k1 = (hv2)(half_t)__builtin_bit_cast(float, 0x3ED306EBu), k2 = (hv2)(half_t)__builtin_bit_cast(float, 0x3DA60DD6u);
 #pragma unroll
@@ -283,7 +283,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         block_sync(); // V of all 64 tokens is computed by every wave from hb
     STAMP(2);
     // ---- attention, one head at a time; the output projection accumulates head by head
-    f8v acc[KT];
+    acc8v acc[KT];
 #pragma unroll
     for (int nt = 0; nt < KT; ++nt)
 {
@@ -310,7 +310,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                f8v d = splat8(0.0f);
+                acc8v d = splat8(0.0f);
                 for (int ks = 0; ks < KT; ++ks)
                     d = mma16(op_lds(&hb[16 * wv + m][16 * ks]), op_img(img, (L::T_QKV + ((h * 3 + 2) * KT + ks) * 2 + nt) * 16 + m), d);
                 op_img_store(&vsh[h][nt][0][0], wv * 16 + m, operand_from_f8(d));
@@ -333,7 +333,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         {
         op_t qop[2];
         // six independent chains (Q, K, V x 2 n-tiles), each over kt in order
-        f8v dq[6];
+        acc8v dq[6];
 #pragma unroll
         for (int u = 0; u < 6; ++u)
             dq[u] = splat8(0.0f);
@@ -349,7 +349,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                const f8v d = dq[2 * j + nt];
+                const acc8v d = dq[2 * j + nt];
                 if (j == 0)
                     qop[nt] = operand_from_f8(d);
                 else if (j == 1)
@@ -370,7 +370,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         for (int kt = 0; kt < 4; ++kt)
         {
             const u4v bi = bias[((h * 4 + wv) * 4 + kt) * 32 + l];
-            f8v d;
+            acc8v d;
 #pragma unroll
             for (int i = 0; i < 4; ++i)
             {
@@ -404,7 +404,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
         {
-            f8v d = splat8(0.0f);
+            acc8v d = splat8(0.0f);
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt)
             {
@@ -462,7 +462,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
         for (int hn = 0; hn < 2; ++hn)
         {
-            f8v d;
+            acc8v d;
 {
 
     half_t vv_[8];
@@ -555,7 +555,7 @@ __device__ void pwin_encoder(const PwinParams& p0, const u8v* __restrict__ img, 
 #pragma unroll
             for (int nt = 0; nt < C / 16; ++nt)
             {
-                f8v d;
+                acc8v d;
                 {
                     half_t vv_[8];
                     dvec8(p0.w, 32 * nt, vv_);
@@ -603,7 +603,7 @@ __device__ void pwin_encoder(const PwinParams& p0, const u8v* __restrict__ img, 
     const uint8_t* w = p.w;
     for (int vt = wv; vt < L::PMT; vt += 4)
     {
-        f8v d;
+        acc8v d;
 {
 
     half_t vv_[8];
@@ -753,7 +753,7 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
         for (int nt = 0; nt < C / 16; ++nt)
         {
             const int gnt = wv * (C / 16) + nt; // expand output column tile
-            f8v d;
+            acc8v d;
 {
 
     half_t vv_[8];
@@ -790,7 +790,7 @@ __device__ void pwin_decoder(const PwinParams& p, const u8v* __restrict__ img, c
 #pragma unroll
         for (int nt = 0; nt < L::NOUTA / 16; ++nt)
         {
-            f8v d;
+            acc8v d;
 {
 
     half_t vv_[8];

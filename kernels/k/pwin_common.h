@@ -23,6 +23,16 @@ typedef _Float16 half_t;
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8v __attribute__((ext_vector_type(8)));
+#ifdef D4R_K_PACKED_ACC
+#if !defined(__GFX12__) || !defined(D4R_K_FP16_BASELINE) || defined(D4R_K_F16_WMMA)
+#error "packed accumulator storage requires gfx12 strict F32 WMMA baseline"
+#endif
+// Keep already-rounded values packed between steps. Every matrix instruction
+// still uses F32 C/D and rounds once to half afterwards, like the baseline.
+typedef _Float16 acc8v __attribute__((ext_vector_type(8)));
+#else
+typedef f8v acc8v;
+#endif
 typedef uint32_t u8v __attribute__((ext_vector_type(8)));
 typedef uint32_t u4v __attribute__((ext_vector_type(4)));
 
@@ -78,9 +88,13 @@ __device__ __forceinline__ half_t l2_sum(const half_t* row)
 
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)
 // PWIN_F32ACC: keep the accumulator in f32 through the chain (rounded to f16 where the values are used)
-__device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
+__device__ __forceinline__ acc8v mma16(const op_t& a, const op_t& b, acc8v c)
 {
-#ifdef D4R_K_F16_WMMA
+#ifdef D4R_K_PACKED_ACC
+    const f8v fc = __builtin_convertvector(c, f8v);
+    const f8v d = wm_mma(a, b, fc);
+    return __builtin_convertvector(d, acc8v);
+#elif defined(D4R_K_F16_WMMA)
 #if !defined(__GFX12__) || D4R_WMMA_LAYOUT != 12 || !defined(D4R_K_FP16_BASELINE)
 #error "experimental packed F16 WMMA requires gfx12 native layout and strict K baseline"
 #endif
@@ -96,9 +110,14 @@ __device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
 #endif
 }
 
-__device__ __forceinline__ f8v splat8(float v)
+__device__ __forceinline__ acc8v splat8(float v)
 {
-    return (f8v){v, v, v, v, v, v, v, v};
+#ifdef D4R_K_PACKED_ACC
+    const half_t h = (half_t)v;
+    return (acc8v){h, h, h, h, h, h, h, h};
+#else
+    return (acc8v){v, v, v, v, v, v, v, v};
+#endif
 }
 
 __device__ __forceinline__ uint32_t other_half(uint32_t v)
@@ -127,9 +146,14 @@ __device__ __forceinline__ op_t operand_from_dt(const half_t own[8])
     return wm_op_from_acc(own);
 }
 
-__device__ __forceinline__ op_t operand_from_f8(f8v d)
+__device__ __forceinline__ op_t operand_from_f8(acc8v d)
 {
+#ifdef D4R_K_PACKED_ACC
+    const half_t h[8] = {d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]};
+    return wm_op_from_acc(h);
+#else
     return wm_op_from_f8(d);
+#endif
 }
 
 // element c (0..15) of a row of 16 halves (VALU code; not a WMMA operand)

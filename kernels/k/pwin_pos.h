@@ -8,6 +8,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
                          half_t (*act)[L::C], half_t (*hb)[L::C])
 {
     constexpr int C = L::C, KT = L::KT, H = L::H, NW = 4 / MT;
+    static_assert(MT == 1 || MT == 2 || MT == 4, "position token tiles per wave");
     static_assert(L::POS, "position-only attention layers");
     const uint32_t l = lane_id(), m = l & 15, hf = l >> 4;
     const int wv = threadIdx.z;
@@ -37,7 +38,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
     STAMP(2);
 
     // ---- attention: O = P V per head (P from the table), output projection accumulated head by head
-    f8v acc[MT][KT];
+    acc8v acc[MT][KT];
 #pragma unroll
     for (int nt = 0; nt < KT; ++nt)
     {
@@ -64,7 +65,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
             for (int mi = 0; mi < MT; ++mi)
             {
                 const int kt = wv * MT + mi;
-                f8v d = splat8(0.0f);
+                acc8v d = splat8(0.0f);
 #pragma unroll
                 for (int ks = 0; ks < KT; ++ks)
                     d = mma16(op_lds(&hb[16 * kt + m][16 * ks]), op_img(img, (L::T_QKV + ((h * 3 + 2) * KT + ks) * 2 + nt) * 16 + m), d);
@@ -82,7 +83,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt)
             {
-                f8v d = splat8(0.0f);
+                acc8v d = splat8(0.0f);
 #pragma unroll
                 for (int ks = 0; ks < KT; ++ks)
                     d = mma16(op_lds(&hb[16 * kt + m][16 * ks]), op_img(img, (L::T_QKV + ((h * 3 + 2) * KT + ks) * 2 + nt) * 16 + m), d);
@@ -101,7 +102,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                f8v d = splat8(0.0f);
+                acc8v d = splat8(0.0f);
 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt)
                     d = mma16(vtop[nt][kt], pop[kt], d);
@@ -156,7 +157,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
         {
             half_t bb[8];
             dvec8(w, L::B1 + 64 * c + 32 * hn, bb);
-            f8v d[MT];
+            acc8v d[MT];
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi)
 #pragma unroll
@@ -231,7 +232,7 @@ __device__ void pos_encoder(const PwinParams& p0, const u8v* __restrict__ img, c
             {
                 half_t vv[8];
                 dvec8(p0.w, 32 * nt, vv);
-                f8v d;
+                acc8v d;
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                     d[i] = (float)vv[i];
@@ -278,7 +279,7 @@ __device__ void pos_encoder(const PwinParams& p0, const u8v* __restrict__ img, c
     {
         half_t vv[8];
         dvec8(p.w, L::PMB + 32 * vt, vv);
-        f8v d;
+        acc8v d;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
             d[i] = (float)vv[i];
@@ -322,7 +323,7 @@ __device__ void pos_decoder(const PwinParams& p, const u8v* __restrict__ img, co
                 const int gnt = q * (C / 16) + nt;
                 half_t vv[8];
                 dvec8(p.w, L::EXPB + 32 * gnt, vv);
-                f8v d;
+                acc8v d;
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                     d[i] = (float)vv[i];
@@ -353,7 +354,7 @@ __device__ void pos_decoder(const PwinParams& p, const u8v* __restrict__ img, co
         {
             half_t vv[8];
             dvec8(q.w, L::HB + 32 * nt, vv);
-            f8v d;
+            acc8v d;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
                 d[i] = (float)vv[i];

@@ -68,7 +68,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
     block_sync(); // hb complete, R free
 
     // ---- attention: NG heads per round; the output projection accumulates head by head
-    f8v acc[NTL];
+    acc8v acc[NTL];
 #pragma unroll
     for (int j = 0; j < NTL; ++j)
     {
@@ -93,7 +93,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
         if (h < H)
         {
             // six independent chains (Q, K, V x 2 n-tiles), each over kt in order
-            f8v dq[6];
+            acc8v dq[6];
 #pragma unroll
             for (int u = 0; u < 6; ++u)
                 dq[u] = splat8(0.0f);
@@ -109,7 +109,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt)
                 {
-                    const f8v d = dq[2 * j + nt];
+                    const acc8v d = dq[2 * j + nt];
                     if (j == 0)
                         qop[nt] = operand_from_f8(d);
                     else if (j == 1)
@@ -133,7 +133,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
             for (int kt = 0; kt < 4; ++kt)
             {
                 const u4v bi = bias[((h * 4 + t) * 4 + kt) * 32 + l];
-                f8v d;
+                acc8v d;
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
                 {
@@ -166,7 +166,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                f8v d = splat8(0.0f);
+                acc8v d = splat8(0.0f);
 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt)
                     d = mma16(op_lds(&vt[g][16 * nt + m][16 * kt]), pop[kt], d);
@@ -233,7 +233,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
         {
             if (c >= L::NMLP)
                 break;
-            f8v d;
+            acc8v d;
             {
                 half_t vv[8];
                 dvec8(w, L::B1 + 64 * c + 32 * hn, vv);
@@ -329,7 +329,7 @@ __device__ void wide_encoder(const PwinParams& p, const u8v* __restrict__ img, c
     const uint8_t* w = p.w;
     for (int vt = wv; vt < L::PMT; vt += 4 * NG)
     {
-        f8v d;
+        acc8v d;
         {
             half_t vv[8];
             dvec8(w, L::PMB + 32 * vt, vv);
@@ -382,7 +382,7 @@ __device__ void wide_decoder(const PwinParams& p, const u8v* __restrict__ img, c
         for (int nt = g; nt < C / 16; nt += NG)
         {
             const int gnt = q * (C / 16) + nt;
-            f8v d;
+            acc8v d;
             {
                 half_t vv[8];
                 dvec8(p.w, L::EXPB + 32 * gnt, vv);
