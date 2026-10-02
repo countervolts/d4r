@@ -112,6 +112,8 @@ struct Runtime {
             cuda.check(cuda.cuDevicePrimaryCtxRetain(&context, ordinal), "cuDevicePrimaryCtxRetain");
             current();
             timeline = std::make_unique<SharedTimeline>(external, d3d);
+            std::printf("D4R_INTEROP async=%u batch_inputs=%u cpu_image_copies=0\n",
+                unsigned(std::getenv("D4R_ASYNC_INTEROP") != nullptr), unsigned(std::getenv("D4R_BATCH_INPUT_COPIES") != nullptr));
             // NGX's loader can probe CUDA during DLL initialization: establish
             // the correct primary context before loading either NVIDIA DLL.
             nvapi = std::make_unique<diag::Library>(diag::wide(env_path("D4R_NVAPI_DLL")));
@@ -386,6 +388,10 @@ private:
             report_completed_copies();
         }
         if (selected) {
+            // The fence can advance between report_completed_copies() and
+            // slot selection. Collect that now-complete ticket before Reset
+            // and before submitted() overwrites its timing identity.
+            if (selected->timing) selected->timing->report(queue_.Get(), this);
             dx(selected->input_allocator->Reset(), "Async input allocator Reset");
             dx(selected->output_allocator->Reset(), "Async output allocator Reset");
             dx(selected->input->Reset(selected->input_allocator.Get(), nullptr), "Async input list Reset");
@@ -580,16 +586,23 @@ private:
         if (ticket) rt_->timeline->wait_ready(ticket->input); else rt_->timeline->wait_input(queue);
         rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Interop input producer completion");
         mark("input_fence_wait");
+        const bool batchInputs = std::getenv("D4R_BATCH_INPUT_COPIES") != nullptr;
         for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {
             auto& plane = planes_[i];
             void* data = plane.shared->mapped; uint64_t pitch = plane.shared->footprint.Footprint.RowPitch;
             if (plane.canonical) {
-                rt_->pixels->convert(false, data, pitch, plane.canonical->data, plane.canonical->pitch,
+                if (batchInputs) rt_->pixels->convert_deferred(false, data, pitch, plane.canonical->data, plane.canonical->pitch,
+                    unsigned(plane.desc.Width), plane.desc.Height, plane.spec.storage, i);
+                else rt_->pixels->convert(false, data, pitch, plane.canonical->data, plane.canonical->pitch,
                     unsigned(plane.desc.Width), plane.desc.Height, plane.spec.storage, i);
                 data = plane.canonical->data; pitch = plane.canonical->pitch;
             }
-            plane.image->upload_device(reinterpret_cast<uintptr_t>(data), pitch);
+            plane.image->upload_device(reinterpret_cast<uintptr_t>(data), pitch, batchInputs);
         }
+        // HIP conversion and CUDA array copies are ordered on the shared
+        // legacy default stream. Retain an all-stream completion before NGX,
+        // including any internal nonblocking streams it might choose to use.
+        if (batchInputs) rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "Interop input batch completion");
         mark("input_conversion_array_upload");
         if (std::getenv("D4R_INTEROP_VERIFY")) {
             for (unsigned i : {0u, 1u, 2u, 4u}) if (planes_[i].texture) {

@@ -11,11 +11,15 @@ param(
     [switch]$ValidateOutput,
     [switch]$ProfileStages,
     [switch]$ProfileKernels,
+    [switch]$ProfileKernelsDeferred,
+    [switch]$ProfileLegacyStream,
+    [ValidateRange(1,1000000)][int]$KernelProfileEvery = 17,
     [switch]$ProfileCommandHooks,
     [switch]$ProfileCudaApi,
     [switch]$ProfileGpuBoundary,
     [switch]$UncachedInteropLists,
     [switch]$AsyncInterop,
+    [switch]$BatchInputCopies,
     [switch]$VerboseRuntime,
     [switch]$CaptureExceptions,
     [string[]]$GameArguments = @('-dx12'),
@@ -23,6 +27,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($ProfileGpuBoundary -and !$AsyncInterop) { throw '-ProfileGpuBoundary requires -AsyncInterop.' }
+if ($ProfileKernels -and $ProfileKernelsDeferred) { throw 'Choose either serializing or deferred kernel profiling.' }
+if ($ProfileLegacyStream -and !$ProfileKernelsDeferred) { throw '-ProfileLegacyStream requires -ProfileKernelsDeferred.' }
 $package = [IO.Path]::GetFullPath($PSScriptRoot)
 $GameExe = (Get-Item -LiteralPath $GameExe -ErrorAction Stop).FullName
 $game = Split-Path $GameExe
@@ -182,11 +188,15 @@ $settings = @{
     D4R_VALIDATE_OUTPUT=$(if ($ValidateOutput) { '1' } else { $null });
     D4R_PROFILE_STAGES=$(if ($ProfileStages) { '1' } else { $null });
     D4R_ZLUDA_PROFILE=$(if ($ProfileKernels) { '1' } else { $null });
+    D4R_ZLUDA_PROFILE_DEFERRED=$(if ($ProfileKernelsDeferred) { '1' } else { $null });
+    D4R_ZLUDA_PROFILE_ALLOW_LEGACY=$(if ($ProfileLegacyStream) { '1' } else { $null });
+    D4R_ZLUDA_PROFILE_EVERY=$(if ($ProfileKernelsDeferred) { "$KernelProfileEvery" } else { $null });
     D4R_PROFILE_COMMAND_HOOKS=$(if ($ProfileCommandHooks) { '1' } else { $null });
     D4R_ZLUDA_PROFILE_API=$(if ($ProfileCudaApi) { '1' } else { $null });
     D4R_PROFILE_GPU_BOUNDARY=$(if ($ProfileGpuBoundary) { '1' } else { $null });
     D4R_DISABLE_INTEROP_LIST_CACHE=$(if ($UncachedInteropLists) { '1' } else { $null });
     D4R_ASYNC_INTEROP=$(if ($AsyncInterop) { '1' } else { $null });
+    D4R_BATCH_INPUT_COPIES=$(if ($BatchInputCopies) { '1' } else { $null });
     D4R_DIAG_DIR=$OutputDirectory; ZLUDA_LOG_DIR=(Join-Path $OutputDirectory 'zluda-trace');
     ZLUDA_CACHE_DIR=$CacheDirectory; PATH=((GamePath 'd4r/hip/bin') + ';' + (GamePath 'd4r/zluda') + ';' + $env:PATH)
 }
@@ -222,7 +232,12 @@ try {
         Write-Host "Temporary diagnostic resolution: $DiagnosticResolution; original settings restore at exit."
     }
     foreach ($key in $settings.Keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key,'Process'); [Environment]::SetEnvironmentVariable($key,$settings[$key],'Process') }
-    @{preset=$Preset; game=$GameExe; package=$metadata; attachedDebugger=[bool]$CaptureExceptions; driver=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate); arguments=$GameArguments} |
+    @{preset=$Preset; game=$GameExe; package=$metadata; attachedDebugger=[bool]$CaptureExceptions;
+      diagnostics=@{asyncInterop=[bool]$AsyncInterop; batchInputCopies=[bool]$BatchInputCopies; validateOutput=[bool]$ValidateOutput;
+        profileGpuBoundary=[bool]$ProfileGpuBoundary; profileStages=[bool]$ProfileStages; profileCudaApi=[bool]$ProfileCudaApi;
+        profileKernels=[bool]$ProfileKernels; profileKernelsDeferred=[bool]$ProfileKernelsDeferred;
+        profileLegacyStream=[bool]$ProfileLegacyStream; kernelProfileEvery=$KernelProfileEvery};
+      driver=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate); arguments=$GameArguments} |
         ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'environment.json') -Encoding UTF8
     function Quote([string]$value) { if ($value.Contains('"')) { throw 'A command argument contains an unsupported quote.' }; return '"' + $value + '"' }
     $arguments = @('--output-directory', (Quote $OutputDirectory))

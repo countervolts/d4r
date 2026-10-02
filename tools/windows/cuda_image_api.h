@@ -47,6 +47,7 @@ struct ImageApi {
     D4R_IMAGE(cuArray3DGetDescriptor_v2, Array3DDescriptor*, Array);
     D4R_IMAGE(cuArrayDestroy, Array);
     D4R_IMAGE(cuMemcpy2D_v2, const Copy2D*);
+    D4R_IMAGE(cuMemcpy2DAsync_v2, const Copy2D*, void*);
     D4R_IMAGE(cuTexObjectCreate, Texture*, const ResourceDescriptor*, const TextureDescriptor*, const void*);
     D4R_IMAGE(cuTexObjectDestroy, Texture);
     D4R_IMAGE(cuTexObjectGetResourceDesc, ResourceDescriptor*, Texture);
@@ -131,13 +132,18 @@ public:
         copy.widthBytes = rowBytes_; copy.height = height_;
         api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(diagnostic array to host)");
     }
-    void upload_device(CUdeviceptr source, size_t pitch) {
+    void upload_device(CUdeviceptr source, size_t pitch, bool deferred = false) {
         if (pitch < rowBytes_) throw std::runtime_error("Device input pitch is smaller than its row");
         Copy2D copy{};
         copy.srcType = 2; copy.srcDevice = source; copy.srcPitch = pitch;
         copy.dstType = 3; copy.dstArray = array_;
         copy.widthBytes = rowBytes_; copy.height = height_;
-        api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(external VRAM to array)");
+        if (deferred) {
+            // The Windows ZLUDA backend and HIP conversion use the same
+            // legacy default stream. Caller must complete the whole input
+            // batch before NGX may consume arrays on its own streams.
+            api_.cuda.check(api_.cuMemcpy2DAsync_v2(&copy, nullptr), "cuMemcpy2DAsync_v2(external VRAM to array)");
+        } else api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(external VRAM to array)");
     }
     void download_device(CUdeviceptr destination, size_t pitch) {
         if (pitch < rowBytes_) throw std::runtime_error("Device output pitch is smaller than its row");

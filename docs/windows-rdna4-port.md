@@ -2,11 +2,13 @@
 
 Branch: `windows-rdna4`. Target: Windows 11 x64, RX 9070 XT, **gfx1201**.
 Priority: correct K, correct M, native Windows, same-frame output, then speed.
-Upstream integration: [draft PR #11](https://github.com/countervolts/d4r/pull/11)
-targets `countervolts/d4r:windows` from `xdfnx-dev/d4r:upstream-windows`.
+Upstream integration: [PR #11](https://github.com/countervolts/d4r/pull/11)
+is merged into `countervolts/d4r:windows` at `c522101`.
 The integration branch retains upstream's README with a Windows status section;
-the fork's `main` keeps the dedicated English Windows README. The PR is open,
-mergeable and allows maintainer edits. K performance remains a separate open gate.
+the fork's `main` keeps the dedicated English Windows README. The maintainer
+invitation is accepted; GitHub confirms `xdfnx-dev` has push access and the
+Windows branch is unprotected. Further validated Windows changes can go there
+directly. K performance remains a separate open gate.
 This file records current results followed by the dated development history. Standalone DLSS K/M
 works on the real Windows GPU, including the patched OptiScaler frontend.
 Silent Hill 2 now renders through the Windows backend; gameplay and output
@@ -15,8 +17,9 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
-**Current milestone: K performance remains open.** The user reports 49–51 FPS
-and about 53% GPU utilization in 4K Silent Hill 2, compared with roughly 80+
+**Current milestone: K performance remains open.** Async submission improves
+the user's 4K Silent Hill 2 reading to 62 FPS / 63% GPU utilization. A subsequent
+controlled 30-second foreground-scene capture records 63.574 FPS, compared with roughly 80+
 FPS / 100% GPU utilization with FSR4 on this system. Functional K/M and the
 reproducible archive do not close this gate. Prioritize K queue scheduling and
 host synchronization; postpone further M/FP8 optimization. These user readings
@@ -82,7 +85,38 @@ measures median input/output copies at 0.061/0.208 ms and external span at
 as HIP. PresentMon 2.6.0 capture/report tooling is added; its first trace
 contains changing presentation modes and is not a controlled capture of
 the user's 62 FPS scene. See `windows-performance.md` for exact metrics and
-the stable foreground-scene gate that remains open.
+the initial capture limitations. A subsequent user-confirmed foreground-scene
+capture completes 1902 presents at 63.574 FPS, all Independent Flip / SyncInterval
+0. PresentMon mean GPU busy/wait is 14.504/1.110 ms; this is not sensor
+utilization. The containing ten-minute run completes 36591 K frames without
+backend errors; median external span is 5.399 ms. Log bundle:
+`test-results/silent-hill2-k-steady-profile-4k`.
+
+The next candidate adds bounded, deferred HIP-event sampling and opt-in batched
+GPU input conversion/array copies. It retains one all-stream input completion
+before NGX and every D3D12/output dependency. All seventeen CTest gates pass,
+including asynchronous pitched FP16/FP32 array copies and guard checks.
+The deferred profiler's tiny PTX diagnostic verifies 516 launches and safe
+default-stream skipping; negative HIP elapsed times are retained as invalid
+samples, with cause unresolved. This DLSS K binary uses the legacy default
+stream, which needs explicit opt-in for timestamp sampling. The depth/stencil
+and packed-format burst/recreation gates pass 24 full K/4K frames: all twelve
+candidate RGB images match their fresh unbatched synchronous controls exactly,
+with finite RGBA. Results: `test-results/k-batch-deferred-4k` and
+`test-results/k-batch-packed-4k`. The game performance gate is pending. The candidate remains
+disabled by default; see `windows-performance.md` for semantics and commands.
+
+Current candidate source is ZLUDA `67127dde599879ada022d6439383d682e09e0b36`
+in `dist/zluda-windows-deferred-profile`, containing patches 0016/0017.
+All sixteen patches (0002 through 0017) apply to clean pinned base `ee2f25a`.
+The committed ZLUDA is rebuilt with a clean worktree and the four-way K/4K
+gate is repeated: twelve frames pass, all six candidate RGB outputs match
+their controls exactly, and all six async boundary timestamp records survive
+slot reuse/release. Results: `test-results/k-batch-committed-source-4k`.
+The same negative HIP event-timing issue reproduces with stable SDK 7.2 as
+well as TheRock; PTX output/guards remain correct. It also affects a native K
+dec4 timing sample, so valid-looking events alone are not a timing-accuracy
+gate. No hardware utilization or kernel speedup is inferred from these samples.
 
 The public prerelease `windows-rdna4-dev-20261002-a346d76` is published to
 `xdfnx-dev/d4r`, containing source commit `a346d76` and ZLUDA `a1c506f`.

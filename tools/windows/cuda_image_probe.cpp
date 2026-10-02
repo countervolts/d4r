@@ -30,22 +30,25 @@ int main(int argc, char** argv) {
         struct Cleanup { CudaApi& api; CUcontext context; ~Cleanup() { (void)api.cuCtxDestroy_v2(context); } } cleanup{cuda, context};
         d4r::cuda::ImageApi images(cuda);
         for (unsigned iteration = 0; iteration < args.iterations; ++iteration) {
-            for (unsigned channels : {1u, 2u, 4u}) for (bool surface : {false, true}) {
-                d4r::cuda::Image image(images, 17, 9, 16, channels, surface);
+            for (unsigned format : {16u, 32u}) for (unsigned channels : {1u, 2u, 4u}) for (bool surface : {false, true}) {
+                const unsigned halvesPerPixel = channels * (format == 16 ? 1 : 2);
+                d4r::cuda::Image image(images, 17, 9, format, channels, surface);
                 image.verify_wrong_object_kind();
-                std::vector<uint16_t> input(17 * 9 * channels), output(input.size());
+                std::vector<uint16_t> input(17 * 9 * halvesPerPixel), output(input.size());
                 for (size_t i = 0; i < input.size(); ++i) input[i] = uint16_t((i + iteration) % 8 * 0x100);
                 image.upload(input.data());
                 image.download(output.data());
                 if (input != output) throw std::runtime_error("CUDA array storage roundtrip mismatch");
-                const size_t rowBytes = 17 * channels * sizeof(uint16_t), pitch = (rowBytes + 255) & ~size_t(255);
+                const size_t rowBytes = 17 * halvesPerPixel * sizeof(uint16_t), pitch = (rowBytes + 255) & ~size_t(255);
                 CUdeviceptr devicePixels = 0;
                 cuda.check(cuda.cuMemAlloc_v2(&devicePixels, pitch * 9), "cuMemAlloc_v2(pitched image regression)");
                 struct PixelsCleanup { CudaApi& cuda; CUdeviceptr pointer; ~PixelsCleanup() { (void)cuda.cuMemFree_v2(pointer); } } pixelsCleanup{cuda, devicePixels};
                 std::vector<uint8_t> padded(pitch * 9, 0xcd);
-                for (unsigned y = 0; y < 9; ++y) std::memcpy(padded.data() + y * pitch, input.data() + y * 17 * channels, rowBytes);
+                for (unsigned y = 0; y < 9; ++y) std::memcpy(padded.data() + y * pitch, input.data() + y * 17 * halvesPerPixel, rowBytes);
                 cuda.check(cuda.cuMemcpyHtoD_v2(devicePixels, padded.data(), padded.size()), "cuMemcpyHtoD_v2(pitched pattern)");
-                image.upload_device(devicePixels, pitch);
+                const bool deferred = std::getenv("D4R_DIAG_ASYNC_ARRAY_COPY") != nullptr;
+                image.upload_device(devicePixels, pitch, deferred);
+                if (deferred) cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize(input batch regression)");
                 image.download(output.data());
                 if (input != output) throw std::runtime_error("CUDA device-to-array pitched copy mismatch");
                 std::fill(padded.begin(), padded.end(), 0xee);
@@ -53,7 +56,7 @@ int main(int argc, char** argv) {
                 image.download_device(devicePixels, pitch);
                 cuda.check(cuda.cuMemcpyDtoH_v2(padded.data(), devicePixels, padded.size()), "cuMemcpyDtoH_v2(device array output)");
                 for (unsigned y = 0; y < 9; ++y) {
-                    if (std::memcmp(padded.data() + y * pitch, input.data() + y * 17 * channels, rowBytes))
+                    if (std::memcmp(padded.data() + y * pitch, input.data() + y * 17 * halvesPerPixel, rowBytes))
                         throw std::runtime_error("CUDA array-to-device pitched copy mismatch");
                     if (!std::all_of(padded.begin() + y * pitch + rowBytes, padded.begin() + (y + 1) * pitch, [](uint8_t value) { return value == 0xee; }))
                         throw std::runtime_error("CUDA array-to-device copy overwrote pitch padding");
@@ -61,7 +64,8 @@ int main(int argc, char** argv) {
             }
         }
         cuda.check(cuda.cuCtxSynchronize(), "cuCtxSynchronize");
-        std::printf("PASS CUDA_IMAGES architecture=gfx1201 iterations=%u descriptor_and_storage=1 pitched_device_copies=1\n", args.iterations);
+        std::printf("PASS CUDA_IMAGES architecture=gfx1201 iterations=%u descriptor_and_storage=1 pitched_device_copies=1 fp16_fp32=1 async_array_copy=%u\n",
+            args.iterations, unsigned(std::getenv("D4R_DIAG_ASYNC_ARRAY_COPY") != nullptr));
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL CUDA_IMAGES %s\n", e.what());

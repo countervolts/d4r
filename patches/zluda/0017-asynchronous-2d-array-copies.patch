@@ -1,0 +1,50 @@
+From 67127dde599879ada022d6439383d682e09e0b36 Mon Sep 17 00:00:00 2001
+From: xdfnx-dev <b99814152@gmail.com>
+Date: Fri, 2 Oct 2026 11:50:45 +0300
+Subject: [PATCH 17/17] Implement asynchronous 2D array copies for Windows
+ input batching
+
+---
+ zluda/src/impl/memory.rs | 13 +++++++++++++
+ zluda/src/lib.rs         |  1 +
+ 2 files changed, 14 insertions(+)
+
+diff --git a/zluda/src/impl/memory.rs b/zluda/src/impl/memory.rs
+index b724942..42facb3 100644
+--- a/zluda/src/impl/memory.rs
++++ b/zluda/src/impl/memory.rs
+@@ -469,6 +469,19 @@ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
+     Ok(())
+ }
+ 
++pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t) -> CUresult {
++    // The format-80 emulation in copy_2d_v2 uses temporary CPU storage.
++    // Reject it explicitly here: an asynchronous copy cannot outlive those
++    // temporaries, and the Windows fast path uses canonical float arrays.
++    let src_packed = memcpy.srcMemoryType == hipMemoryType::hipMemoryTypeArray
++        && array::original_format(memcpy.srcArray)? == Some(80);
++    let dst_packed = memcpy.dstMemoryType == hipMemoryType::hipMemoryTypeArray
++        && array::original_format(memcpy.dstArray)? == Some(80);
++    if src_packed || dst_packed { return Err(CUerror::NOT_SUPPORTED); }
++    hipMemcpyParam2DAsync(&memcpy, stream)?;
++    Ok(())
++}
++
+ pub(crate) unsafe fn copy_2d_unaligned_v2(memcpy: hip_Memcpy2D) -> CUresult {
+     hipDrvMemcpy2DUnaligned(&memcpy)?;
+     Ok(())
+diff --git a/zluda/src/lib.rs b/zluda/src/lib.rs
+index 31bfa42..939981e 100644
+--- a/zluda/src/lib.rs
++++ b/zluda/src/lib.rs
+@@ -150,6 +150,7 @@ cuda_macros::cuda_function_declarations!(
+             cuMemAlloc_v2,
+             cuMemAllocPitch_v2,
+             cuMemcpy2D_v2,
++            cuMemcpy2DAsync_v2,
+             cuMemcpy2DUnaligned_v2,
+             cuMemcpy3D_v2,
+             cuMemcpyAsync,
+-- 
+2.55.0.windows.5
+

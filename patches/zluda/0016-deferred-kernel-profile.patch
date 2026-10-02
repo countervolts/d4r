@@ -1,0 +1,282 @@
+From 26a43f7047ab933a4afb5ebdd26d5ba9e51e58a3 Mon Sep 17 00:00:00 2001
+From: xdfnx-dev <b99814152@gmail.com>
+Date: Fri, 2 Oct 2026 11:50:45 +0300
+Subject: [PATCH 16/17] Sample HIP kernel events without per-launch completion
+ waits
+
+---
+ zluda/src/impl/context.rs     |   4 +-
+ zluda/src/impl/d4r_profile.rs | 204 ++++++++++++++++++++++++++++------
+ zluda/src/impl/module.rs      |   1 +
+ 3 files changed, 171 insertions(+), 38 deletions(-)
+
+diff --git a/zluda/src/impl/context.rs b/zluda/src/impl/context.rs
+index 9ccb372..374d383 100644
+--- a/zluda/src/impl/context.rs
++++ b/zluda/src/impl/context.rs
+@@ -165,7 +165,7 @@ pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
+ }
+ 
+ pub(crate) fn synchronize() -> hipError_t {
+-    unsafe { hipDeviceSynchronize() }
++    unsafe { hipDeviceSynchronize()?; super::d4r_profile::collect_completed() }
+ }
+ 
+ pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
+@@ -177,7 +177,7 @@ pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
+     } else {
+         None
+     };
+-    unsafe { hipDeviceSynchronize() }
++    unsafe { hipDeviceSynchronize()?; super::d4r_profile::collect_completed() }
+ }
+ 
+ struct SetDeviceOnDrop(i32);
+diff --git a/zluda/src/impl/d4r_profile.rs b/zluda/src/impl/d4r_profile.rs
+index 33ba5f6..1b9d248 100644
+--- a/zluda/src/impl/d4r_profile.rs
++++ b/zluda/src/impl/d4r_profile.rs
+@@ -1,15 +1,29 @@
+-//! Optional, deliberately serializing HIP-event diagnostics. Not a production
+-//! scheduler or a claim about application FPS / measured hardware occupancy.
++//! Optional HIP-event diagnostics. Deferred mode never waits for its events,
++//! skips the legacy default stream and bounds outstanding events per thread.
++//! Timestamp insertion still adds overhead; this is not a production scheduler.
+ use hip_runtime_sys::*;
+-use std::{ffi::CStr, ptr, time::Instant};
++use std::{cell::RefCell, ffi::{CStr, CString}, ptr, sync::OnceLock, time::Instant};
+ 
+-pub(super) struct Launch {
+-    start: hipEvent_t,
+-    end: hipEvent_t,
+-    host: Instant,
++#[derive(Clone, Copy)]
++enum Mode { Off, Serial, Deferred(u64) }
++fn mode() -> Mode {
++    static MODE: OnceLock<Mode> = OnceLock::new();
++    *MODE.get_or_init(|| {
++        if std::env::var_os("D4R_ZLUDA_PROFILE_DEFERRED").is_some() {
++            let every = std::env::var("D4R_ZLUDA_PROFILE_EVERY").ok()
++                .and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(17);
++            Mode::Deferred(every)
++        } else if std::env::var_os("D4R_ZLUDA_PROFILE").is_some() { Mode::Serial }
++        else { Mode::Off }
++    })
++}
++fn allow_legacy() -> bool {
++    static ALLOW: OnceLock<bool> = OnceLock::new();
++    *ALLOW.get_or_init(|| std::env::var_os("D4R_ZLUDA_PROFILE_ALLOW_LEGACY").is_some())
+ }
+ 
+-impl Drop for Launch {
++struct Events { start: hipEvent_t, end: hipEvent_t }
++impl Drop for Events {
+     fn drop(&mut self) {
+         unsafe {
+             if !self.end.is_null() { let _ = hipEventDestroy(self.end); }
+@@ -17,44 +31,162 @@ impl Drop for Launch {
+         }
+     }
+ }
++impl Events {
++    unsafe fn new() -> Result<Self, hipErrorCode_t> {
++        let mut result = Self { start: ptr::null_mut(), end: ptr::null_mut() };
++        hipEventCreateWithFlags(&mut result.start, 0)?;
++        hipEventCreateWithFlags(&mut result.end, 0)?;
++        Ok(result)
++    }
++}
++
++struct Description {
++    name: CString, backend: String, phase: String, grid: [u32;3], block: [u32;3],
++    shared: u32, lds: i32, regs: i32, private: i32, max_threads: i32, blocks_per_multiprocessor: i32,
++}
++impl Description {
++    unsafe fn new(function: hipFunction_t, name: &CStr, backend: &str, phase: &str,
++        grid: [u32;3], block: [u32;3], shared: u32) -> Result<Self, hipErrorCode_t> {
++        let mut d = Self { name: name.to_owned(), backend: backend.to_owned(), phase: phase.to_owned(),
++            grid, block, shared, lds: 0, regs: 0, private: 0, max_threads: 0, blocks_per_multiprocessor: 0 };
++        // Copy metadata while the function/module is alive. Collection never
++        // dereferences a function handle that the application may have unloaded.
++        hipFuncGetAttribute(&mut d.lds, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function)?;
++        hipFuncGetAttribute(&mut d.regs, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_NUM_REGS, function)?;
++        hipFuncGetAttribute(&mut d.private, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function)?;
++        hipFuncGetAttribute(&mut d.max_threads, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function)?;
++        let threads = block.iter().try_fold(1u32, |a, b| a.checked_mul(*b))
++            .filter(|n| *n <= i32::MAX as u32).ok_or(hipErrorCode_t::InvalidValue)?;
++        hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&mut d.blocks_per_multiprocessor,
++            function, threads as i32, shared as usize)?;
++        Ok(d)
++    }
++    fn print(&self, gpu_ms: f32, enqueue_ms: f64, completion_ms: f64, serializing: bool, stream: usize) {
++        if !gpu_ms.is_finite() || gpu_ms < 0. {
++            eprintln!("D4R_KERNEL_PROFILE_INVALID kernel={:?} backend={} phase={} gpu_ms={gpu_ms:.6} reason=invalid_elapsed_time serializing={} deferred={} stream=0x{stream:x}",
++                self.name, self.backend, self.phase, u32::from(serializing), u32::from(!serializing));
++            return;
++        }
++        eprintln!("D4R_KERNEL_PROFILE kernel={:?} backend={} phase={} gpu_ms={gpu_ms:.6} enqueue_ms={enqueue_ms:.6} completion_ms={completion_ms:.6} grid={},{},{} block={},{},{} static_lds_bytes={} dynamic_lds_bytes={} regs={} private_bytes={} max_threads={} predicted_blocks_per_multiprocessor={} serializing={} deferred={} stream=0x{stream:x} legacy_stream={}",
++            self.name, self.backend, self.phase, self.grid[0], self.grid[1], self.grid[2],
++            self.block[0], self.block[1], self.block[2], self.lds, self.shared, self.regs,
++            self.private, self.max_threads, self.blocks_per_multiprocessor,
++            u32::from(serializing), u32::from(!serializing), u32::from(stream <= 1));
++    }
++}
++
++struct Pending { launch: Launch, description: Description, enqueue_ms: f64, stream: usize }
++const CAPACITY: usize = 64;
++struct Deferred {
++    calls: u64, skipped: u64, pending: Vec<Pending>, free: Vec<(i32, Events)>,
++}
++thread_local! {
++    static DEFERRED: RefCell<Deferred> = RefCell::new(Deferred {
++        calls: 0, skipped: 0, pending: Vec::new(), free: Vec::new(),
++    });
++}
++
++impl Deferred {
++    unsafe fn collect(&mut self, device: i32) -> hipError_t {
++        let mut index = 0;
++        while index < self.pending.len() {
++            let p = &self.pending[index];
++            if p.launch.device != device { index += 1; continue; }
++            match hipEventQuery(p.launch.events.end) {
++                Err(e) if e == hipErrorCode_t::NotReady => { index += 1; continue; }
++                result => result?,
++            }
++            let mut gpu_ms = 0.;
++            hipEventElapsedTime(&mut gpu_ms, p.launch.events.start, p.launch.events.end)?;
++            p.description.print(gpu_ms, p.enqueue_ms, p.launch.host.elapsed().as_secs_f64() * 1000., false, p.stream);
++            let p = self.pending.swap_remove(index);
++            // Re-record only after the old timestamps have been collected.
++            self.free.push((device, p.launch.events));
++        }
++        Ok(())
++    }
++}
++
++/// Called only after the application's existing context synchronization, or
++/// before a selected launch. No event/stream/device wait is added here.
++pub(super) unsafe fn collect_completed() -> hipError_t {
++    if !matches!(mode(), Mode::Deferred(_)) { return Ok(()); }
++    DEFERRED.with(|state| {
++        let mut state = state.borrow_mut();
++        if state.pending.is_empty() { return Ok(()); }
++        let mut device = 0; hipGetDevice(&mut device)?;
++        state.collect(device)
++    })
++}
++
++pub(super) struct Launch {
++    events: Events,
++    host: Instant,
++    device: i32,
++    deferred: bool,
++}
+ 
+ impl Launch {
+     pub(super) unsafe fn begin(stream: hipStream_t) -> Result<Option<Self>, hipErrorCode_t> {
+-        if std::env::var_os("D4R_ZLUDA_PROFILE").is_none() { return Ok(None); }
+-        let mut result = Self { start: ptr::null_mut(), end: ptr::null_mut(), host: Instant::now() };
+-        hipEventCreateWithFlags(&mut result.start, 0)?;
+-        hipEventCreateWithFlags(&mut result.end, 0)?;
+-        hipEventRecord(result.start, stream)?;
+-        result.host = Instant::now();
+-        Ok(Some(result))
++        let mode = mode();
++        if matches!(mode, Mode::Off) { return Ok(None); }
++        if let Mode::Deferred(every) = mode {
++            return DEFERRED.with(|state| {
++                let mut state = state.borrow_mut();
++                state.calls = state.calls.wrapping_add(1);
++                if (state.calls - 1) % every != 0 { return Ok(None); }
++                // HIP timing events on the legacy default stream can order
++                // other streams. Do not introduce that dependency in this mode.
++                if stream.0 as usize <= 1 && !allow_legacy() {
++                    state.skipped += 1;
++                    if state.skipped.is_power_of_two() {
++                        eprintln!("D4R_KERNEL_PROFILE_SKIPPED reason=legacy_default_stream count={} serializing=0", state.skipped);
++                    }
++                    return Ok(None);
++                }
++                let mut device = 0; hipGetDevice(&mut device)?;
++                state.collect(device)?;
++                let mut capture = hipStreamCaptureStatus::hipStreamCaptureStatusNone;
++                hipStreamIsCapturing(stream, &mut capture)?;
++                if capture != hipStreamCaptureStatus::hipStreamCaptureStatusNone {
++                    state.skipped += 1;
++                    eprintln!("D4R_KERNEL_PROFILE_SKIPPED reason=stream_capture count={} serializing=0", state.skipped);
++                    return Ok(None);
++                }
++                let events = if let Some(index) = state.free.iter().position(|(d, _)| *d == device) {
++                    state.free.swap_remove(index).1
++                } else if state.pending.len() + state.free.len() < CAPACITY {
++                    Events::new()?
++                } else {
++                    state.skipped += 1;
++                    eprintln!("D4R_KERNEL_PROFILE_SKIPPED reason=capacity count={} capacity={CAPACITY} serializing=0", state.skipped);
++                    return Ok(None);
++                };
++                hipEventRecord(events.start, stream)?;
++                Ok(Some(Self { events, host: Instant::now(), device, deferred: true }))
++            });
++        }
++        let events = Events::new()?;
++        hipEventRecord(events.start, stream)?;
++        Ok(Some(Self { events, host: Instant::now(), device: -1, deferred: false }))
+     }
+ 
+     pub(super) unsafe fn finish(self, function: hipFunction_t, name: &CStr, backend: &str,
+         phase: &str, grid: [u32;3], block: [u32;3], shared: u32, stream: hipStream_t) -> hipError_t {
+         let enqueue_ms = self.host.elapsed().as_secs_f64() * 1000.;
+-        hipEventRecord(self.end, stream)?;
+-        hipEventSynchronize(self.end)?;
++        hipEventRecord(self.events.end, stream)?;
++        let description = Description::new(function, name, backend, phase, grid, block, shared)?;
++        if self.deferred {
++            DEFERRED.with(|state| state.borrow_mut().pending.push(Pending {
++                launch: self, description, enqueue_ms, stream: stream.0 as usize,
++            }));
++            return Ok(());
++        }
++        hipEventSynchronize(self.events.end)?;
+         let completion_ms = self.host.elapsed().as_secs_f64() * 1000.;
+         let mut gpu_ms = 0.;
+-        hipEventElapsedTime(&mut gpu_ms, self.start, self.end)?;
+-        // Module function handles use the Driver API attribute query. The
+-        // plural Runtime API expects a registered host function address.
+-        let mut lds = 0;
+-        let mut regs = 0;
+-        let mut private = 0;
+-        let mut max_threads = 0;
+-        hipFuncGetAttribute(&mut lds, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function)?;
+-        hipFuncGetAttribute(&mut regs, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_NUM_REGS, function)?;
+-        hipFuncGetAttribute(&mut private, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function)?;
+-        hipFuncGetAttribute(&mut max_threads, hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function)?;
+-        let threads = block.iter().try_fold(1u32, |a, b| a.checked_mul(*b))
+-            .filter(|n| *n <= i32::MAX as u32).ok_or(hipErrorCode_t::InvalidValue)?;
+-        let mut blocks_per_multiprocessor = 0;
+-        hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&mut blocks_per_multiprocessor,
+-            function, threads as i32, shared as usize)?;
+-        eprintln!("D4R_KERNEL_PROFILE kernel={name:?} backend={backend} phase={phase} gpu_ms={gpu_ms:.6} enqueue_ms={enqueue_ms:.6} completion_ms={completion_ms:.6} grid={},{},{} block={},{},{} static_lds_bytes={} dynamic_lds_bytes={shared} regs={} private_bytes={} max_threads={} predicted_blocks_per_multiprocessor={blocks_per_multiprocessor} serializing=1",
+-            grid[0], grid[1], grid[2], block[0], block[1], block[2], lds,
+-            regs, private, max_threads);
++        hipEventElapsedTime(&mut gpu_ms, self.events.start, self.events.end)?;
++        description.print(gpu_ms, enqueue_ms, completion_ms, true, stream.0 as usize);
+         Ok(())
+     }
+ }
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 232f7d4..8d43abf 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -503,6 +503,7 @@ fn zluda_build_version() -> &'static str {
+                     && !matches!(
+                         key.as_str(),
+                         "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA" | "D4R_ZLUDA_VERBOSE" | "D4R_ZLUDA_PROFILE"
++                            | "D4R_ZLUDA_PROFILE_API" | "D4R_ZLUDA_PROFILE_DEFERRED" | "D4R_ZLUDA_PROFILE_EVERY" | "D4R_ZLUDA_PROFILE_ALLOW_LEGACY"
+                             | "D4R_ZLUDA_WMMA_FP8_NATIVE" // keyed by effect (ExtraCacheAttributes)
+                     )
+             })
+-- 
+2.55.0.windows.5
+

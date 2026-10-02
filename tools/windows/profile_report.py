@@ -1,4 +1,4 @@
-"""Summarize native Windows d4r CPU stages and optional serializing HIP events.
+"""Summarize native Windows d4r CPU stages and optional HIP event diagnostics.
 
 CPU completion time is not GPU execution time. HIP occupancy API predictions
 are not hardware counters. No bandwidth / WMMA utilization is inferred here.
@@ -83,6 +83,8 @@ def report(directory, metadata_directory=None):
     kernels = collections.defaultdict(list)
     hook_threads = collections.defaultdict(list)
     apis = collections.defaultdict(list)
+    sample_skips = []
+    invalid_samples = []
     boundaries = collections.defaultdict(list)
     replay = collections.defaultdict(lambda: collections.defaultdict(dict))
     for path in sorted(directory.glob('*.log')):
@@ -115,13 +117,25 @@ def report(directory, metadata_directory=None):
                                                    'access_sum_ms', 'capture_sum_ms', 'driver_sum_ms')):
                     hook_threads[fields['thread']].append(fields)
             if not line.startswith('D4R_KERNEL_PROFILE '):
+                if line.startswith('D4R_KERNEL_PROFILE_SKIPPED '):
+                    sample_skips.append(dict(re.findall(r'(\w+)=(\S+)', line)))
+                if line.startswith('D4R_KERNEL_PROFILE_INVALID '):
+                    invalid_samples.append(dict(re.findall(r'(\w+)=("[^"]+"|\S+)', line)))
                 continue
             fields = dict(re.findall(r'(\w+)=("[^"]+"|\S+)', line))
-            kernels[(fields['kernel'].strip('"'), fields['backend'], fields['phase'])].append(fields)
+            required = ('kernel', 'backend', 'phase', 'gpu_ms', 'enqueue_ms', 'completion_ms',
+                        'grid', 'block', 'static_lds_bytes', 'dynamic_lds_bytes', 'regs', 'private_bytes',
+                        'max_threads', 'predicted_blocks_per_multiprocessor', 'serializing')
+            if not all(key in fields for key in required):
+                continue  # A bounded process stop can leave a partial final line.
+            kernels[(fields['kernel'].strip('"'), fields['backend'], fields['phase'],
+                     fields['serializing'])].append(fields)
     result = dict(cpuStages={name: stats(values) for name, values in stages.items()},
                   commandStages={name: stats(values) for name, values in commands.items()},
                   commandHookSamples=[],
                   cudaApi=[],
+                  kernelSampleSkips=sample_skips,
+                  invalidKernelSamples=invalid_samples,
                   gpuBoundaryStages={},
                   presentMon=presentmon(directory),
                   replayPairs=[],
@@ -134,7 +148,8 @@ def report(directory, metadata_directory=None):
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
-                      'HIP-event profiling synchronizes every sampled launch and changes scheduling.',
+                      'Serializing HIP-event profiles wait after every launch. Deferred profiles query ready events and never add completion waits; timing events still add overhead.',
+                      'Deferred completionMs is host collection lag, not kernel completion latency. Legacy-stream sampling requires an opt-in because its timing markers retain legacy cross-stream ordering.',
                       'Occupancy is an API prediction, not a measured hardware counter.',
                       'Bandwidth and WMMA utilization require additional supported hardware tooling.'])
     boundary_stages = collections.defaultdict(list)
@@ -178,8 +193,11 @@ def report(directory, metadata_directory=None):
             accessMeanUs=1000 * sums['access_sum_ms'] / sums['samples'],
             captureMeanUsPerSample=1000 * sums['capture_sum_ms'] / sums['samples'],
             estimatedAccessCaptureMs=estimate, estimatedAccessCaptureMsPerSecond=1000 * estimate / sums['period_ms']))
-    for (name, backend, phase), rows in kernels.items():
+    for (name, backend, phase, serializing), rows in kernels.items():
         item = dict(kernel=name, backend=backend, phase=phase,
+                    serializing=serializing == '1',
+                    legacyStream=any(row.get('legacy_stream') == '1' for row in rows),
+                    completionMeaning='host_completion_wait' if serializing == '1' else 'host_collection_lag',
                     gpuMs=stats([float(row['gpu_ms']) for row in rows]),
                     enqueueMs=stats([float(row['enqueue_ms']) for row in rows]),
                     completionMs=stats([float(row['completion_ms']) for row in rows]),
@@ -224,7 +242,7 @@ def main():
               f"candidate_median={row['candidateGpuMs']['median']:.6f} ms ratio_median={row['candidateToControl']['median']:.6f}")
     for row in result['kernels']:
         times = row['gpuMs']
-        print(f"GPU {row['kernel']} {row['backend']} {row['phase']}: n={times['samples']} mean={times['mean']:.6f} ms total={times['total']:.3f} ms")
+        print(f"GPU {row['kernel']} {row['backend']} {row['phase']} serializing={int(row['serializing'])}: n={times['samples']} mean={times['mean']:.6f} ms total={times['total']:.3f} ms")
 
 
 if __name__ == '__main__':

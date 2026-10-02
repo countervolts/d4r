@@ -80,6 +80,21 @@ int main(int argc, char** argv)
                 if (primary) api.cuDevicePrimaryCtxRelease_v2(device); else api.cuCtxDestroy_v2(context); } }
         } cleanup{api, context, device, primary};
         api.check(api.cuCtxSetCurrent(context), "cuCtxSetCurrent");
+        void* stream = nullptr;
+        using CreateStream = int(WINAPI*)(void**, unsigned);
+        using DestroyStream = int(WINAPI*)(void*);
+        DestroyStream destroyStream = nullptr;
+        if (std::getenv("D4R_DIAG_NONBLOCKING_STREAM")) {
+            const auto createStream = api.library.symbol<CreateStream>("cuStreamCreate");
+            destroyStream = api.library.symbol<DestroyStream>("cuStreamDestroy_v2");
+            api.check(createStream(&stream, 1), "cuStreamCreate(NON_BLOCKING)");
+        }
+        struct StreamCleanup {
+            void*& stream; DestroyStream destroy;
+            ~StreamCleanup() { if (stream && destroy) destroy(stream); }
+        } streamCleanup{stream, destroyStream};
+        const bool queued = std::getenv("D4R_DIAG_QUEUE_PTX") != nullptr;
+        if (queued && !stream) throw std::runtime_error("Queued PTX diagnostic requires D4R_DIAG_NONBLOCKING_STREAM=1");
         CUmodule module = nullptr;
         std::printf("STAGE cuModuleLoadData (PTX JIT)\n");
         api.check(api.cuModuleLoadData(&module, ptx), "cuModuleLoadData");
@@ -93,25 +108,30 @@ int main(int argc, char** argv)
         CUdeviceptr pointer = 0;
         api.check(api.cuMemAlloc_v2(&pointer, bytes), "cuMemAlloc_v2");
         struct MemCleanup { CudaApi& api; CUdeviceptr p; ~MemCleanup() { if (p) api.cuMemFree_v2(p); } } ac{api, pointer};
+        if (queued) api.check(api.cuMemcpyHtoD_v2(pointer, result.data(), bytes), "cuMemcpyHtoD_v2(queued sentinel)");
         for (unsigned i = 0; i < args.iterations; ++i) {
-            uint32_t n = nmax - i % 129u, seed = 0x12345678u + i * 31u;
-            std::fill(result.begin(), result.end(), 0xdeadbeefu);
-            api.check(api.cuMemcpyHtoD_v2(pointer, result.data(), bytes), "cuMemcpyHtoD_v2(sentinel)");
+            uint32_t n = queued ? nmax : nmax - i % 129u, seed = 0x12345678u + i * 31u;
+            if (!queued) {
+                std::fill(result.begin(), result.end(), 0xdeadbeefu);
+                api.check(api.cuMemcpyHtoD_v2(pointer, result.data(), bytes), "cuMemcpyHtoD_v2(sentinel)");
+            }
             void* parameters[] = {&pointer, &n, &seed};
             api.check(api.cuLaunchKernel(function, (n + 127u) / 128u, 1, 1, 128, 1, 1,
-                0, nullptr, parameters, nullptr), "cuLaunchKernel");
+                0, stream, parameters, nullptr), "cuLaunchKernel");
+            if (queued && i + 1 != args.iterations) continue;
             api.check(api.cuCtxSynchronize(), "cuCtxSynchronize");
             api.check(api.cuMemcpyDtoH_v2(result.data(), pointer, bytes), "cuMemcpyDtoH_v2");
             if (!verify(result, n, seed)) return 5;
         }
         api.check(api.cuMemFree_v2(pointer), "cuMemFree_v2"); ac.p = 0;
         api.check(api.cuModuleUnload(module), "cuModuleUnload"); mc.m = nullptr;
+        if (stream) { api.check(destroyStream(stream), "cuStreamDestroy_v2"); stream = nullptr; }
         api.check(api.cuCtxSetCurrent(nullptr), "cuCtxSetCurrent(NULL)");
         if (primary) api.check(api.cuDevicePrimaryCtxRelease_v2(device), "cuDevicePrimaryCtxRelease_v2");
         else api.check(api.cuCtxDestroy_v2(context), "cuCtxDestroy_v2");
         cleanup.context = nullptr;
-        std::printf("PASS CUDA architecture=gfx1201 context=%s iterations=%u guard_verified=1\n",
-            args.context.c_str(), args.iterations);
+        std::printf("PASS CUDA architecture=gfx1201 context=%s iterations=%u guard_verified=1 queued=%u\n",
+            args.context.c_str(), args.iterations, unsigned(queued));
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL CUDA %s\n", e.what());

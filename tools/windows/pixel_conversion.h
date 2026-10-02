@@ -77,15 +77,19 @@ public:
         hip_.check(hip_.hipMemcpy(result.data(), counters_, sizeof(result), hipMemcpyDeviceToHost), "Read validation counters");
         return result;
     }
-    void convert(bool encode, const void* source, uint64_t sourcePitch, void* dest, uint64_t destPitch,
+    void convert_deferred(bool encode, const void* source, uint64_t sourcePitch, void* dest, uint64_t destPitch,
         unsigned width, unsigned height, pixel::Storage format, unsigned plane) {
         if (!width || !height || uint64_t(width) * height > UINT32_MAX) throw std::runtime_error("Invalid GPU conversion dimensions");
         unsigned storage = unsigned(format);
         void* args[] = {&source, &sourcePitch, &dest, &destPitch, &width, &height, &storage, &plane};
         hip_.check(hip_.hipModuleLaunchKernel(encode ? encode_ : decode_, unsigned((uint64_t(width) * height + 255) / 256), 1, 1,
             256, 1, 1, 0, nullptr, args, nullptr), encode ? "GPU pixel encode" : "GPU pixel decode");
-        // CUDA may use other nonblocking streams. Establish completion before
-        // giving the converted allocation to that API; images remain in VRAM.
+    }
+    void convert(bool encode, const void* source, uint64_t sourcePitch, void* dest, uint64_t destPitch,
+        unsigned width, unsigned height, pixel::Storage format, unsigned plane) {
+        convert_deferred(encode, source, sourcePitch, dest, destPitch, width, height, format, plane);
+        // CUDA may use other nonblocking streams. Standalone conversions must
+        // establish completion before handing the allocation to that API.
         hip_.check(hip_.hipDeviceSynchronize(), "GPU conversion completion");
     }
 };

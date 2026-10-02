@@ -4,7 +4,7 @@ Hardware: RX 9070 XT / gfx1201, Windows 11, display driver 32.0.31041.1004.
 Runtime: TheRock 10.2.0a20260929, HIP 7.17.26386; ZLUDA b0161a4 with
 `D4R_ZLUDA_WMMA=1`, FP8 widening, native FP8 disabled, f16 reference rounding.
 
-The optional profiler uses HIP events on the actual launch stream, including
+The original serializing profiler uses HIP events on the actual launch stream, including
 separate measurements of one-time weight preparation. It synchronizes each
 sampled launch and changes scheduling: these numbers are not application FPS.
 HIP occupancy predictions are not measured hardware occupancy. The native
@@ -191,6 +191,91 @@ from speedup conclusions. Its containing game run completes 9627 K/4K frames
 without backend errors; ordinary recording intervals later return to about
 16 ms. A stable foreground-scene capture is needed before optimizing from
 the ETW metrics. Raw files: `test-results/silent-hill2-k-presentmon-4k`.
+
+The following 30-second capture starts after the user confirms the same
+foreground scene is ready. All 1902 presents use Hardware Independent Flip
+and SyncInterval 0; input/output resolution remains 2259x1271 -> 3840x2160.
+The mean present interval is 15.730 ms (**63.574 FPS**). PresentMon estimates
+mean GPU busy/wait at 14.504/1.110 ms, GPU time at 15.614 ms and CPU wait at
+0.052 ms. These frame-attributed metrics do not equal a hardware utilization
+sensor and do not establish a physical CPU limit. FSR4 has not been captured
+in this same scene, so its previously reported 80+ FPS remains a user reading.
+Raw files: `test-results/silent-hill2-k-steady-profile-4k`.
+
+The containing ten-minute diagnostic completes 36591 K frames, with zero
+backend failures, CPU image copies, previous-frame outputs or recorded game
+crashes. It deliberately stops at its time bound. Output scans and serializing
+kernel events are off. Whole-run median boundary timestamps measure input
+copies 0.063 ms, external span 5.399 ms and output copies 0.212 ms. The external
+span includes HIP execution and host/driver scheduling, not only transformer
+arithmetic. These medians cover the whole run; the PresentMon numbers above
+come from the explicitly selected 30-second scene.
+
+### Deferred kernel events and batched inputs
+
+The new optional `-ProfileKernelsDeferred` samples every seventeenth launch
+by default (`-KernelProfileEvery`). Its thread-local pool is bounded to 64
+event pairs. It queries ready events before selected launches and after the
+application's existing context synchronization, reusing a pair only after
+reading its old timestamps. It adds no explicit event/stream/device completion
+wait; timestamps, queries and logging still add overhead. Stream capture and
+legacy default-stream launches are skipped by default. `-ProfileLegacyStream`
+allows the latter explicitly, retaining their legacy cross-stream ordering.
+This opt-in is necessary to profile this DLSS K binary, whose measured launches
+use the legacy default stream. `completion_ms` now denotes collection lag for
+deferred records. The report separates serializing/deferred records and retains
+invalid timestamps and skipped samples outside kernel timing statistics.
+
+HIP 7.17.26386 reports some negative elapsed times in the tiny queued PTX
+diagnostic, including intervals exceeding one microsecond. These are logged as
+`D4R_KERNEL_PROFILE_INVALID`; they are not clamped or used as valid GPU samples.
+The cause is not established, and nonnegative samples alone cannot prove a
+runtime's timestamp accuracy. The diagnostic verifies all 516 PTX launches
+across primary/created contexts and individual/queued submission, checks final
+device output and guards, accounts for every collected event and verifies safe
+default-stream skipping. Results: `test-results/zluda-deferred-profile-final-ptx`.
+The same diagnostic with stable HIP SDK 7.2 also verifies all 516 outputs and
+reproduces negative intervals (`test-results/zluda-deferred-profile-stable-ptx`).
+A native K dec4 sample is negative too; this is not confined to tiny PTX kernels.
+Do not infer hardware/kernel utilization or a speedup from these event samples.
+HIP event semantics: [AMD event management](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/hip_runtime_api/modules/event_management.html).
+
+The opt-in `-BatchInputCopies` (`D4R_BATCH_INPUT_COPIES=1`) enqueues native
+pixel decoding and device-to-array input copies on the shared HIP/ZLUDA legacy
+default stream. One all-stream completion remains before NGX can use any input
+on its own streams. The independent D3D12 input-fence check, NGX completion and
+same-frame output dependency remain. Output transfers retain their existing
+completion. Every image stays in VRAM. The ZLUDA implementation adds
+`cuMemcpy2DAsync_v2` using `hipMemcpyParam2DAsync`; format-80 array emulation
+is explicitly rejected because its synchronous implementation uses temporary
+host storage. The Windows path supplies canonical FP16/FP32 arrays instead.
+This experiment is disabled by default until the correctness and game timing
+gates below pass; there is no claimed FPS improvement yet.
+
+```powershell
+.\scripts\windows\test-deferred-kernel-profile.ps1
+.\scripts\windows\test-async-k.ps1 -BatchInputCopies -ProfileGpuBoundary -ZludaRoot "$PWD\dist\zluda-windows-deferred-profile"
+```
+
+The rebuilt Windows shim and new ZLUDA pass all seventeen CTest gates,
+including the added asynchronous pitched FP16/FP32 array-copy test and
+padding checks. Completed boundary timestamps are also read before reuse if
+the copy fence advances between the first completion scan and slot selection;
+this prevents diagnostic records being overwritten without adding a wait.
+
+The depth/stencil and packed-format burst/recreation gates pass 24 full K/4K
+frames. All twelve candidate RGB outputs match fresh unbatched synchronous
+controls exactly, with finite RGBA. The former also enables deferred legacy
+events; invalid timestamps remain separate. These short correctness fixtures
+include initialization and do not establish steady-state FPS or a copy-stage
+speedup. Raw results: `test-results/k-batch-deferred-4k` and
+`test-results/k-batch-packed-4k`. ZLUDA candidate source is `67127dd`, isolated
+in `dist/zluda-windows-deferred-profile`; patches 0016/0017 and all preceding
+patches apply to the clean pinned base. The public prerelease is unchanged.
+After committing/rebuilding ZLUDA with a clean worktree, the twelve-frame
+four-way K/4K gate passes again with exact candidate RGB and finite RGBA
+(`test-results/k-batch-committed-source-4k`). This warms the committed runtime's
+JIT cache before the game comparison.
 
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes

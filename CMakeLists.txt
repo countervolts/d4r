@@ -245,6 +245,10 @@ if(EXISTS "${D4R_ZLUDA_ROOT}/nvcuda.dll")
     add_test(NAME cuda_images COMMAND d4r_cuda_image_probe
       --hip-root "${D4R_HIP_ROOT}" --cuda-dll "${D4R_ZLUDA_ROOT}/nvcuda.dll" --iterations 32)
     set_tests_properties(cuda_images PROPERTIES TIMEOUT 90 LABELS "hardware;zluda;descriptors")
+    add_test(NAME cuda_images_async COMMAND d4r_cuda_image_probe
+      --hip-root "${D4R_HIP_ROOT}" --cuda-dll "${D4R_ZLUDA_ROOT}/nvcuda.dll" --iterations 32)
+    set_tests_properties(cuda_images_async PROPERTIES TIMEOUT 90 LABELS "hardware;zluda;descriptors;async"
+      ENVIRONMENT "D4R_DIAG_ASYNC_ARRAY_COPY=1")
     add_test(NAME d3d12_cuda_images COMMAND d4r_d3d12_dlss_probe
       --hip-root "${D4R_HIP_ROOT}" --cuda-dll "${D4R_ZLUDA_ROOT}/nvcuda.dll" --interop-mode images --iterations 1)
     set_tests_properties(d3d12_cuda_images PROPERTIES TIMEOUT 90 LABELS "hardware;interop;zluda;descriptors")
