@@ -34,3 +34,5 @@ videos/
 *.hsaco
 *.ptx
 /kernels/extracted/
+# nvngx_dlss, nvngx_dlssd, nvngx_dlssg
+/vendor

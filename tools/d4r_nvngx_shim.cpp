@@ -73,6 +73,9 @@ constexpr NgxResult NGX_FAIL_INVALID_PARAMETER = NGX_FAIL | 5;
 constexpr NgxResult NGX_FAIL_NOT_INITIALIZED = NGX_FAIL | 7;
 constexpr NgxResult NGX_FAIL_UNSUPPORTED_FORMAT = NGX_FAIL | 14;
 constexpr unsigned int NGX_FEATURE_SUPER_SAMPLING = 1;
+constexpr unsigned int NGX_FEATURE_FRAME_GENERATION = 11;
+constexpr unsigned int NGX_FEATURE_RAY_RECONSTRUCTION = 13;
+constexpr int kMaxInputPlanes = 16; // Было 4, расширяем под G-Buffer
 
 struct NgxHandle
 {
@@ -834,12 +837,19 @@ static uint32_t float_to_small_float(float value, int mantissaBits)
 
 // Canonical CUDA-side layouts: color RGBA16F, depth R32F, motion RG16F,
 // exposure R32F, output RGBA16F.
+// added: also data for ray reconstruction
 enum class Plane
 {
     Color,
     Depth,
     Motion,
-    Exposure
+    Exposure,
+    Normals,
+    Roughness,
+    Albedo,
+    Specular,
+    HitDistance,
+    SpecularAlbedo
 };
 
 static bool supported_input(Plane plane, DXGI_FORMAT format)
@@ -869,6 +879,18 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
         return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS ||
                format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_TYPELESS ||
                format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case Plane::Normals:
+    case Plane::Albedo:
+    case Plane::Specular:
+    case Plane::SpecularAlbedo:
+        return format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+               format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+               format == DXGI_FORMAT_R8G8B8A8_SNORM || format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+               format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_R11G11B10_FLOAT;
+    case Plane::Roughness:
+    case Plane::HitDistance:
+        return format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R32_FLOAT ||
+               format == DXGI_FORMAT_R8_UNORM || format == DXGI_FORMAT_R16_UNORM;
     }
     return false;
 }
@@ -903,6 +925,10 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
         switch (plane)
         {
         case Plane::Color:
+        case Plane::Normals:
+        case Plane::Albedo:
+        case Plane::Specular:
+        case Plane::SpecularAlbedo:
         {
             float rgba[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             switch (format)
@@ -1034,7 +1060,15 @@ static bool canonical_input(Plane plane, DXGI_FORMAT format)
     switch (plane)
     {
     case Plane::Color:
+    case Plane::Normals:
+    case Plane::Albedo:
+    case Plane::Specular:
+    case Plane::SpecularAlbedo:
         return format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    case Plane::Roughness:
+    case Plane::HitDistance:
+        return format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_TYPELESS ||
+               format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS;
     case Plane::Depth:
         return format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_R32_FLOAT ||
                format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
@@ -1570,12 +1604,11 @@ struct HostPlane
 struct InputSlot
 {
     Staging color, depth, motion, exposure;
-    VramBuffer vram[4]; // VRAM interop: the planes in canonical layout
-    // D4R_SHIM_LINEAR_INPUTS: pitch-linear texture objects on vram[] handed to NGX (worker only)
-    CudaObject linearTexture[4] = {};
-    CudaDevicePtr linearPointer[4] = {};
-    UINT linearWidth[4] = {}, linearHeight[4] = {};
-    size_t linearPitch[4] = {};
+    VramBuffer vram[kMaxInputPlanes]; // расширено до 16
+    CudaObject linearTexture[kMaxInputPlanes] = {};
+    CudaDevicePtr linearPointer[kMaxInputPlanes] = {};
+    UINT linearWidth[kMaxInputPlanes] = {}, linearHeight[kMaxInputPlanes] = {};
+    size_t linearPitch[kMaxInputPlanes] = {};
     CudaDevicePtr dilatedMotion = 0;
     size_t dilatedBytes = 0;
     CudaObject dilatedTexture = 0;
@@ -1597,6 +1630,7 @@ struct OutputSlot
 struct Feature
 {
     NgxHandle handle = {}; // returned to the caller
+    unsigned int featureId = 0;
     std::atomic<bool> retiring{false};
     IUnknown* resources = nullptr; // main reference plus command-allocator references
     NgxHandle* cudaHandle = nullptr;
@@ -1611,6 +1645,8 @@ struct Feature
 
     CudaImage color, depth, motion, exposure, output;
     CudaObject colorHandle = 0, depthHandle = 0, motionHandle = 0, exposureHandle = 0, outputHandle = 0;
+    CudaObject normalsHandle = 0, roughnessHandle = 0, albedoHandle = 0;
+    CudaObject specularHandle = 0, hitDistHandle = 0, specAlbedoHandle = 0;
 
     InputSlot inputs[kSlots];
     OutputSlot outputs[kOutputSlots];
@@ -1619,8 +1655,8 @@ struct Feature
     unsigned int nextOutputHost = 0; // worker only
     // Overlapped staging (worker only): linear device buffers the async copies
     // target, moved to/from the CUDA arrays with device-to-device copies.
-    CudaDevicePtr planeLinear[4] = {}, outputLinear = 0;
-    size_t planeLinearBytes[4] = {}, outputLinearBytes = 0;
+    CudaDevicePtr planeLinear[kMaxInputPlanes] = {}, outputLinear = 0;
+    size_t planeLinearBytes[kMaxInputPlanes] = {}, outputLinearBytes = 0;
     // Frames queued but not yet published (or dropped). evaluate() blocks the
     // game at D4R_SHIM_MAX_IN_FLIGHT (default 3) so a backlog cannot build up
     // between pipeline stages and age the presented result.
@@ -3884,7 +3920,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     // here, in evaluation order, so it does not depend on thread timing.
     if (feature->evaluatedFrames++ == 0)
         params.reset = 1;
-    set_evaluation_parameters(*feature, params);
+set_evaluation_parameters(*feature, params);
     if (linearInputs)
     {
         // the parameters point at these variables
@@ -3892,6 +3928,17 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         feature->depthHandle = slot.linearTexture[1];
         feature->motionHandle = dilatedMotion != 0 ? dilatedMotion : slot.linearTexture[2];
         feature->exposureHandle = params.hasExposure ? slot.linearTexture[3] : feature->exposureHandle;
+
+        if (feature->featureId == NGX_FEATURE_RAY_RECONSTRUCTION)
+        {
+            // Передаём дескрипторы текстур G-Buffer в официальный nvngx_dlssd.dll
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.Normals", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[4])));
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.Roughness", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[5])));
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.Albedo", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[6])));
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.Specular", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[7])));
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.SpecularHitDistance", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[8])));
+            d4r_ngx_set_void(feature->cudaParams, "DLSS.Input.SpecularAlbedo", reinterpret_cast<void*>(static_cast<uintptr_t>(slot.linearTexture[9])));
+        }
     }
     static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
     // The redirect is carried out by the native output kernel's stores (ZLUDA's compile of NVIDIA's kernel
@@ -4264,8 +4311,11 @@ static NgxResult fill_capabilities(void* parameters)
         const NgxResult result = g.ngx.getCapabilityParameters(&official);
         if (result != NGX_SUCCESS || official == nullptr)
             return result;
-        const char* integers[] = {"SuperSampling.Available", "SuperSampling.NeedsUpdatedDriver",
-                                  "SuperSampling.FeatureInitResult"};
+        const char* integers[] = {
+    "SuperSampling.Available", "SuperSampling.NeedsUpdatedDriver", "SuperSampling.FeatureInitResult",
+    "RayReconstruction.Available", "RayReconstruction.NeedsUpdatedDriver", "RayReconstruction.FeatureInitResult",
+    "FrameGeneration.Available", "FrameGeneration.NeedsUpdatedDriver", "FrameGeneration.FeatureInitResult"
+};
         for (const char* name : integers)
         {
             int value = 0;
@@ -4286,6 +4336,25 @@ static NgxResult fill_capabilities(void* parameters)
             if (d4r_ngx_get_void(official, name, &value) == NGX_SUCCESS && value != nullptr)
                 d4r_ngx_set_void(parameters, name, value);
         }
+
+        d4r_ngx_set_int(parameters, "SuperSamplingDenoising.Available", 1);
+        d4r_ngx_set_int(parameters, "SuperSamplingDenoising.NeedsUpdatedDriver", 0);
+        d4r_ngx_set_int(parameters, "SuperSamplingDenoising.FeatureInitResult", 1);
+        d4r_ngx_set_uint(parameters, "SuperSamplingDenoising.MinDriverVersionMajor", 0);
+        d4r_ngx_set_uint(parameters, "SuperSamplingDenoising.MinDriverVersionMinor", 0);
+
+        d4r_ngx_set_int(parameters, "RayReconstruction.Available", 1);
+        d4r_ngx_set_int(parameters, "RayReconstruction.NeedsUpdatedDriver", 0);
+        d4r_ngx_set_int(parameters, "RayReconstruction.FeatureInitResult", 1);
+        d4r_ngx_set_uint(parameters, "RayReconstruction.MinDriverVersionMajor", 0);
+        d4r_ngx_set_uint(parameters, "RayReconstruction.MinDriverVersionMinor", 0);
+
+        d4r_ngx_set_int(parameters, "FrameGeneration.Available", 1);
+        d4r_ngx_set_int(parameters, "FrameGeneration.NeedsUpdatedDriver", 0);
+        d4r_ngx_set_int(parameters, "FrameGeneration.FeatureInitResult", 1);
+        d4r_ngx_set_uint(parameters, "FrameGeneration.MinDriverVersionMajor", 0);
+        d4r_ngx_set_uint(parameters, "FrameGeneration.MinDriverVersionMinor", 0);
+
         g.ngx.destroyParameters(official);
         return NGX_SUCCESS;
     });
@@ -4297,6 +4366,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetParameters(void** parameters)
         return NGX_FAIL_NOT_INITIALIZED;
     *parameters = new_parameters();
     return fill_capabilities(*parameters);
+    
 }
 
 D4R_EXPORT NgxResult NVSDK_NGX_D3D12_AllocateParameters(void** parameters)
@@ -4317,9 +4387,13 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetCapabilityParameters(void** parameters)
     d4r_ngx_get_int(*parameters, "SuperSampling.Available", &available);
     d4r_ngx_get_int(*parameters, "SuperSampling.FeatureInitResult", &initResult);
     d4r_ngx_get_int(*parameters, "SuperSampling.NeedsUpdatedDriver", &needsDriver);
-    logf("NVSDK_NGX_D3D12_GetCapabilityParameters -> 0x%08x, SuperSampling.Available=%d FeatureInitResult=0x%08x "
-         "NeedsUpdatedDriver=%d",
-         result, available, static_cast<unsigned int>(initResult), needsDriver);
+    
+    // Вот сюда вставляем проверку для лога:
+    int rrAvailable = -1;
+    d4r_ngx_get_int(*parameters, "SuperSamplingDenoising.Available", &rrAvailable);
+
+    logf("NVSDK_NGX_D3D12_GetCapabilityParameters -> 0x%08x, SuperSampling.Available=%d SuperSamplingDenoising.Available=%d",
+         result, available, rrAvailable);
     return result;
 }
 
@@ -4402,12 +4476,15 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         logf("DLSS requires lifetime-aware d4r d3d12.dll/d3d12core.dll; update both files with the shim");
         return NGX_FAIL_PLATFORM_ERROR;
     }
-    if (featureId != NGX_FEATURE_SUPER_SAMPLING || parameters == nullptr || handle == nullptr)
+    if ((featureId != NGX_FEATURE_SUPER_SAMPLING &&
+         featureId != NGX_FEATURE_RAY_RECONSTRUCTION &&
+         featureId != NGX_FEATURE_FRAME_GENERATION) || parameters == nullptr || handle == nullptr)
     {
         logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unsupported", featureId);
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
     }
     auto* feature = new Feature();
+    feature->featureId = featureId;
     feature->width = get_uint_or(parameters, "Width", 0);
     feature->height = get_uint_or(parameters, "Height", 0);
     feature->outWidth = get_uint_or(parameters, "OutWidth", 0);
@@ -4423,8 +4500,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     unsigned int presets[6];
     for (int index = 0; index < 6; ++index)
         presets[index] = get_uint_or(parameters, presetNames[index], 0);
-    // D4R_DLSS_PRESET forces one render preset (NVSDK_NGX_DLSS_Hint_Render_Preset
-    // value, e.g. 5 = E) for every quality mode.
+
     const std::string forced = env_string("D4R_DLSS_PRESET");
     if (!forced.empty())
     {
@@ -4433,9 +4509,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
             preset = value;
     }
     feature->preset = presets[1];
-    // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
-    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced
-    // preset qualifies.
+
     if (!forced.empty())
     {
         char allowed[128] = "11,13";
@@ -4463,20 +4537,45 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         d4r_ngx_set_uint(p, "VisibilityNodeMask", 1);
         for (int index = 0; index < 6; ++index)
             d4r_ngx_set_uint(p, presetNames[index], presets[index]);
-        if (g.cu.memAlloc(&feature->scratch, 64ull * 1024 * 1024) == 0)
+
+        // Выделяем честный Scratch-буфер (512 МБ для Ray Reconstruction, 64 МБ для SR)
+        const size_t scratchBytes = (featureId == NGX_FEATURE_RAY_RECONSTRUCTION) 
+                                        ? (512ull * 1024 * 1024) 
+                                        : (64ull * 1024 * 1024);
+        if (g.cu.memAlloc != nullptr && g.cu.memAlloc(&feature->scratch, scratchBytes) == 0)
         {
             d4r_ngx_set_void(p, "Scratch", reinterpret_cast<void*>(static_cast<uintptr_t>(feature->scratch)));
-            d4r_ngx_set_ull(p, "Scratch.SizeInBytes", 64ull * 1024 * 1024);
+            d4r_ngx_set_ull(p, "Scratch.SizeInBytes", scratchBytes);
         }
         else
+        {
             feature->scratch = 0;
-        const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature->cudaHandle);
+            logf("WARNING: Failed to allocate scratch buffer (%zu bytes)", scratchBytes);
+        }
+
+        // Параметры Ray Reconstruction
+        if (featureId == NGX_FEATURE_RAY_RECONSTRUCTION)
+        {
+            d4r_ngx_set_int(p, "DLSS.Denoise.Mode", 1);
+            d4r_ngx_set_uint(p, "RayReconstruction.Hint.Render.Preset", 1);
+
+            int normalRoughnessMode = 1;
+            d4r_ngx_get_int(parameters, "DLSS.NormalRoughness.Mode", &normalRoughnessMode);
+            d4r_ngx_set_int(p, "DLSS.NormalRoughness.Mode", normalRoughnessMode);
+
+            d4r_ngx_set_int(p, "DLSS.Roughness.Channel", 3);
+            d4r_ngx_set_int(p, "DLSS.SpecularHitDistance.Channel", 3);
+
+            int subrectsVal = 1;
+            d4r_ngx_get_int(parameters, "DLSS.Enable.Output.Subrects", &subrectsVal);
+            d4r_ngx_set_int(p, "DLSS.Enable.Output.Subrects", subrectsVal);
+        }
+
+        const NgxResult created = g.ngx.createFeature(featureId, p, &feature->cudaHandle);
         if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
             g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
             g.cu.eventSynchronize != nullptr && g.cu.eventQuery != nullptr && g.cu.eventDestroy != nullptr)
         {
-            // Explicit query/sleep waits avoid HIP's spinning event-sync path.
-            // Timing is unnecessary for this completion event.
             constexpr unsigned int kBlockingSyncNoTiming = 0x1u | 0x2u;
             const int eventResult = g.cu.eventCreate(&feature->outputReadyEvent, kBlockingSyncNoTiming);
             if (eventResult != 0)
@@ -4505,6 +4604,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         }
         return created;
     });
+
     logf("NVSDK_NGX_CUDA_CreateFeature -> 0x%08x", result);
     if (result != NGX_SUCCESS)
     {
@@ -4674,10 +4774,38 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     }
 
     // VRAM interop when every resource qualifies (decided once per feature).
-    ID3D12Resource* const inputs[4] = {color, depth, motion, exposure};
-    const Plane planes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
-    const int inputCount = exposure != nullptr ? 4 : 3;
-    VramCopy vramInputs[4], vramOutput;
+    // VRAM interop when every resource qualifies (decided once per feature).
+    ID3D12Resource* inputs[kMaxInputPlanes] = {};
+    Plane planes[kMaxInputPlanes] = {};
+    int inputCount = 0;
+
+    inputs[inputCount] = color;  planes[inputCount++] = Plane::Color;
+    inputs[inputCount] = depth;  planes[inputCount++] = Plane::Depth;
+    inputs[inputCount] = motion; planes[inputCount++] = Plane::Motion;
+    if (exposure != nullptr) {
+        inputs[inputCount] = exposure; planes[inputCount++] = Plane::Exposure;
+    }
+
+    // Если это Ray Reconstruction, забираем G-Buffer Киберпанка:
+    if (feature->featureId == NGX_FEATURE_RAY_RECONSTRUCTION)
+    {
+        ID3D12Resource* res = nullptr;
+        if ((res = get_resource(parameters, "DLSS.Input.Normals")) || (res = get_resource(parameters, "Normals")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::Normals;
+        if ((res = get_resource(parameters, "DLSS.Input.Roughness")) || (res = get_resource(parameters, "Roughness")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::Roughness;
+        if ((res = get_resource(parameters, "DLSS.Input.Albedo")) || (res = get_resource(parameters, "Albedo")) ||
+            (res = get_resource(parameters, "DLSS.Input.DiffuseAlbedo")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::Albedo;
+        if ((res = get_resource(parameters, "DLSS.Input.Specular")) || (res = get_resource(parameters, "SpecularRadiance")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::Specular;
+        if ((res = get_resource(parameters, "DLSS.Input.SpecularHitDistance")) || (res = get_resource(parameters, "SpecularHitDistance")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::HitDistance;
+        if ((res = get_resource(parameters, "DLSS.Input.SpecularAlbedo")) || (res = get_resource(parameters, "SpecularAlbedo")))
+            inputs[inputCount] = res, planes[inputCount++] = Plane::SpecularAlbedo;
+    }
+
+    VramCopy vramInputs[kMaxInputPlanes], vramOutput;
     if ((!feature->vramDecided || feature->vram) && vram_interop_available())
     {
         p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
@@ -4772,9 +4900,12 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
     const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
     const auto inputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
-    if (p.vram)
+if (p.vram)
     {
-        const D3D12_RESOURCE_STATES states[4] = {inputState, depthState, inputState, inputState};
+        D3D12_RESOURCE_STATES states[kMaxInputPlanes];
+        for (int i = 0; i < inputCount; ++i)
+            states[i] = (planes[i] == Plane::Depth) ? depthState : inputState;
+
         for (int index = 0; index < inputCount; ++index)
             transition(list, inputs[index], states[index], D3D12_RESOURCE_STATE_COPY_SOURCE);
         const bool recorded = record_vram_inputs(*feature, list, slot, vramInputs, inputCount);
