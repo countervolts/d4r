@@ -13,6 +13,7 @@ param(
     [ValidateSet(5, 11, 13)][int]$Preset = 11,
     [ValidateSet(0,11)][int]$NgxCreateFlags = 0,
     [string]$NgxOutputResolution = '512x288',
+    [string]$NgxInputResolution,
     [switch]$NgxOnly,
     [switch]$Trace,
     [switch]$RequireNativeNetwork,
@@ -90,6 +91,19 @@ function Invoke-Probe([string]$Name, [string]$Exe, [string[]]$Arguments) {
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    # Some PowerShell/.NET hosts restore a removed variable as an empty value.
+    # These task switches/paths use an empty value to mean unset, whereas Rust
+    # presence-based diagnostic flags would otherwise enable profiling.
+    foreach ($key in @($info.EnvironmentVariables.Keys)) {
+        if ($key.StartsWith('D4R_') -and [string]::IsNullOrWhiteSpace($info.EnvironmentVariables[$key])) {
+            $info.EnvironmentVariables.Remove($key)
+        }
+    }
+    # Disabled WGP has the ordinary CU semantics. Omit a disabled/empty switch
+    # from child environments so older ZLUDA builds keep their existing cache.
+    if ([Environment]::GetEnvironmentVariable('D4R_ZLUDA_WGP','Process') -ne '1') {
+        $info.EnvironmentVariables.Remove('D4R_ZLUDA_WGP')
+    }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $info
     if (!$process.Start()) { throw "Process start failed: $Exe" }
@@ -118,7 +132,7 @@ try {
     if (!$env:ZLUDA_CACHE_DIR) { $env:ZLUDA_CACHE_DIR = Join-Path $repoRoot 'build/zluda-cache-windows' }
     $summary.zludaCacheDirectory = $env:ZLUDA_CACHE_DIR
     foreach ($setting in @('D4R_ZLUDA_WMMA','D4R_ZLUDA_WMMA_FP8','D4R_ZLUDA_WMMA_FP8_NATIVE','D4R_ZLUDA_WMMA_F16_REFERENCE')) {
-        if ($null -eq $originalCodegen[$setting]) {
+        if ([string]::IsNullOrWhiteSpace($originalCodegen[$setting])) {
             [Environment]::SetEnvironmentVariable($setting, $(if ($setting -eq 'D4R_ZLUDA_WMMA_FP8_NATIVE') { '0' } else { '1' }), 'Process')
         }
     }
@@ -315,6 +329,7 @@ DisableSplash=true
                     }
                     $ngxArguments += @('--module', $localShim, '--pixel-profile', $PixelProfile, '--barrier-mode', $BarrierMode,
                         '--ngx-create-flags', "$NgxCreateFlags", '--ngx-output-resolution', $NgxOutputResolution)
+                    if ($NgxInputResolution) { $ngxArguments += @('--ngx-input-resolution', $NgxInputResolution) }
                     if ($EarlyIndirectProbe) {
                         if (!$CommandListBackend) { throw '-EarlyIndirectProbe requires -CommandListBackend' }
                         $ngxArguments += @('--early-indirect', '1')

@@ -127,8 +127,11 @@ struct Args {
     unsigned preset = 11;
     unsigned ngx_create_flags = 0;
     unsigned output_width = 512, output_height = 288;
+    unsigned input_width = 0, input_height = 0;
     std::string fixture_dir;
     std::string benchmark_module;
+    std::string benchmark_timing = "events";
+    unsigned benchmark_batch = 1;
     std::string output_dir;
     std::string kernel_name = "enc1";
     unsigned iterations = 32;
@@ -178,6 +181,17 @@ struct Args {
                     output_height < 128 || output_height > 2160 || output_width % 2 || output_height % 2)
                     throw std::runtime_error("Output resolution must be even and within 128x128..4096x2160");
             }
+            else if (key == "--ngx-input-resolution") {
+                const auto separator = value.find('x');
+                if (separator == std::string::npos) throw std::runtime_error("Input resolution must be WIDTHxHEIGHT");
+                size_t wend = 0, hend = 0;
+                const auto width = std::stoul(value.substr(0, separator), &wend);
+                const auto height = std::stoul(value.substr(separator + 1), &hend);
+                if (wend != separator || hend != value.size() - separator - 1 || width < 64 || width > 4096 ||
+                    height < 64 || height > 2160)
+                    throw std::runtime_error("Input resolution must be within 64x64..4096x2160");
+                input_width = static_cast<unsigned>(width); input_height = static_cast<unsigned>(height);
+            }
             else if (key == "--preset") {
                 size_t end = 0;
                 preset = static_cast<unsigned>(std::stoul(value, &end));
@@ -186,6 +200,18 @@ struct Args {
             }
             else if (key == "--fixture-dir") fixture_dir = value;
             else if (key == "--benchmark-module") benchmark_module = value;
+            else if (key == "--benchmark-timing") {
+                if (value != "events" && value != "dispatch")
+                    throw std::runtime_error("benchmark-timing must be events or dispatch");
+                benchmark_timing = value;
+            }
+            else if (key == "--benchmark-batch") {
+                size_t end = 0;
+                const auto parsed = std::stoul(value, &end);
+                if (end != value.size() || parsed < 1 || parsed > 256)
+                    throw std::runtime_error("benchmark-batch must be 1..256");
+                benchmark_batch = static_cast<unsigned>(parsed);
+            }
             else if (key == "--output-dir") output_dir = value;
             else if (key == "--kernel-name") kernel_name = value;
             else if (key == "--iterations") {
@@ -200,6 +226,8 @@ struct Args {
             } else throw std::runtime_error("Unknown option " + key);
         }
         if (hip_root.empty()) throw std::runtime_error("--hip-root is required");
+        if (input_width > output_width || input_height > output_height)
+            throw std::runtime_error("Input resolution cannot exceed output resolution");
     }
 };
 class Library {

@@ -74,7 +74,8 @@ int main(int argc, char** argv) {
         dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf())), "CreateCommandAllocator");
         dx(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(list.GetAddressOf())), "CreateCommandList");
         const unsigned outWidth = args.output_width, outHeight = args.output_height;
-        const unsigned width = outWidth / 2, height = outHeight / 2;
+        const unsigned width = args.input_width ? args.input_width : outWidth / 2;
+        const unsigned height = args.input_height ? args.input_height : outHeight / 2;
         std::printf("D3D12_NGX_DIMENSIONS input=%ux%u output=%ux%u\n", width, height, outWidth, outHeight);
         struct Texture { ComPtr<ID3D12Resource> image, upload; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes; } textures[5];
         for (unsigned i = 0; i < 5; ++i) {

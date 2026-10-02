@@ -3,6 +3,7 @@ param(
     [string]$NgxCore, [string]$DlssDll, [string]$NativeRoot,
     [string]$ZludaRoot, [string]$PackageRoot,
     [string]$Resolution = '3840x2160',
+    [string]$InputResolution,
     [switch]$ProfileGpuBoundary,
     [switch]$ProfileKernelsDeferred,
     [switch]$BatchInputCopies,
@@ -45,6 +46,7 @@ try {
             $arguments=@{RuntimeProfile='therock'; ZludaRoot=$ZludaRoot; PackageRoot=$PackageRoot;
                 NgxCore=$NgxCore; DlssDll=$DlssDll; NgxOnly=$true; NgxMode='d3d12'; NgxAbi='project-legacy';
                 Preset=11; NgxCreateFlags=11; NgxOutputResolution=$Resolution; RequireNativeNetwork=$true;
+                NgxInputResolution=$InputResolution;
                 CommandListBackend=$true; EarlyIndirectProbe=$true; PixelProfile=$PixelProfile;
                 BarrierMode='inherited-legacy'; Iterations=3; CaptureExceptions=$true; TimeoutSeconds=600;
                 OptiScalerDll=(Join-Path $repo 'dist/optiscaler-windows-d4r/OptiScaler.dll'); OutputDirectory=$output}
@@ -70,6 +72,7 @@ try {
         if ($LASTEXITCODE) { throw "Async $mode output mismatch" }
     }
     @{passed=$true; architecture='gfx1201'; preset=11; resolution=$Resolution;
+        inputResolution=$InputResolution;
         modes=@('burst','recreate'); framesPerMode=3; exactRgb=$true; gpuBoundaryTiming=[bool]$ProfileGpuBoundary;
         deferredKernelTiming=[bool]$ProfileKernelsDeferred; batchInputs=[bool]$BatchInputCopies; pixelProfile=$PixelProfile} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'validation.json') -Encoding UTF8

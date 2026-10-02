@@ -251,6 +251,16 @@ try {
     $info.WorkingDirectory = $game
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    # Empty task switches mean unset. Some PowerShell/.NET hosts preserve empty
+    # values, which would enable Rust's presence-based diagnostic flags.
+    foreach ($key in @($info.EnvironmentVariables.Keys)) {
+        if ($key.StartsWith('D4R_') -and [string]::IsNullOrWhiteSpace($info.EnvironmentVariables[$key])) {
+            $info.EnvironmentVariables.Remove($key)
+        }
+    }
+    if ([Environment]::GetEnvironmentVariable('D4R_ZLUDA_WGP','Process') -ne '1') {
+        $info.EnvironmentVariables.Remove('D4R_ZLUDA_WGP')
+    }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
     if (!$process.Start()) { throw 'Game diagnostic launch failed.' }
     $outFile = [IO.File]::Open((Join-Path $OutputDirectory 'd4r.stdout.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)

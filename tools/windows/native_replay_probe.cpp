@@ -2,6 +2,9 @@
 #include <fstream>
 #include <sstream>
 #include <memory>
+#include <chrono>
+#include <cmath>
+#include <limits>
 
 namespace {
 std::vector<uint8_t> read_file(const std::filesystem::path& path) {
@@ -100,6 +103,8 @@ int main(int argc, char** argv) {
             return value ? value : fallback;
         };
         auto scalar = [&](const char* name, unsigned fallback) { return module_scalar(module, name, fallback); };
+        const std::vector<unsigned> captured_grid{grid[0], grid[1], grid[2]};
+        const unsigned captured_block_z = block[2];
         block[2] = scalar("d4r_block_z", block[2]);
         const unsigned persistentGrid = scalar("d4r_grid_x", 0);
         if (persistentGrid) { grid[0] = persistentGrid; grid[1] = grid[2] = 1; }
@@ -117,9 +122,16 @@ int main(int argc, char** argv) {
             hipModule_t candidate = nullptr;
             hip.check(hip.hipModuleLoad(&candidate, args.benchmark_module.c_str()), "Load paired benchmark candidate");
             Cleanup candidate_cleanup{hip, candidate};
-            if (module_scalar(candidate, "d4r_block_z", block[2]) != block[2] ||
-                module_scalar(candidate, "d4r_grid_x", 0) != persistentGrid)
-                throw std::runtime_error("Paired modules require identical launch geometry");
+            unsigned grids[2][3] = {{grid[0], grid[1], grid[2]},
+                {captured_grid[0], captured_grid[1], captured_grid[2]}};
+            unsigned blocks[2][3] = {{block[0], block[1], block[2]},
+                {block[0], block[1], module_scalar(candidate, "d4r_block_z", captured_block_z)}};
+            const unsigned candidate_persistent = module_scalar(candidate, "d4r_grid_x", 0);
+            if (candidate_persistent) { grids[1][0] = candidate_persistent; grids[1][1] = grids[1][2] = 1; }
+            for (unsigned variant = 0; variant < 2; ++variant)
+                std::printf("D4R_REPLAY_MODULE variant=%s grid=%u,%u,%u block=%u,%u,%u geometry_source=native_metadata\n",
+                    variant ? "candidate" : "control", grids[variant][0], grids[variant][1], grids[variant][2],
+                    blocks[variant][0], blocks[variant][1], blocks[variant][2]);
             hipFunction_t other = nullptr, other_prep = nullptr;
             hip.check(hip.hipModuleGetFunction(&other, candidate, kernel.c_str()), "Find paired benchmark function");
             if (hip.hipModuleGetFunction(&other_prep, candidate, (kernel + "_prep").c_str()) == hipSuccess) {
@@ -133,6 +145,22 @@ int main(int argc, char** argv) {
             auto record = hip.library.symbol<decltype(&::hipEventRecord)>("hipEventRecord");
             auto synchronize = hip.library.symbol<decltype(&::hipEventSynchronize)>("hipEventSynchronize");
             auto elapsed = hip.library.symbol<decltype(&::hipEventElapsedTime)>("hipEventElapsedTime");
+            // Documented hip/hip_ext.h ABI. Resolve dynamically like the other
+            // HIP APIs so the host probe does not depend on HIP host linking.
+            using DispatchFn = hipError_t (*)(hipFunction_t, uint32_t, uint32_t, uint32_t,
+                uint32_t, uint32_t, uint32_t, size_t, hipStream_t, void**, void**,
+                hipEvent_t, hipEvent_t, uint32_t);
+            DispatchFn dispatch = nullptr;
+            uint32_t global[2][3]{};
+            if (args.benchmark_timing == "dispatch") {
+                dispatch = hip.library.symbol<DispatchFn>("hipExtModuleLaunchKernel");
+                for (unsigned variant = 0; variant < 2; ++variant) for (unsigned axis = 0; axis < 3; ++axis) {
+                    const auto items = uint64_t(grids[variant][axis]) * blocks[variant][axis];
+                    if (!items || items > std::numeric_limits<uint32_t>::max())
+                        throw std::runtime_error("Dispatch profiling work-item dimension overflow");
+                    global[variant][axis] = static_cast<uint32_t>(items);
+                }
+            }
             struct Event {
                 decltype(destroy) release; hipEvent_t value = nullptr;
                 ~Event() { if (value) (void)release(value); }
@@ -140,7 +168,9 @@ int main(int argc, char** argv) {
             hip.check(create(&begin.value), "Create paired start event");
             hip.check(create(&end.value), "Create paired end event");
             auto launch = [&](hipFunction_t fn) {
-                hip.check(hip.hipModuleLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                const unsigned variant = fn == other;
+                hip.check(hip.hipModuleLaunchKernel(fn, grids[variant][0], grids[variant][1], grids[variant][2],
+                    blocks[variant][0], blocks[variant][1], blocks[variant][2],
                     shared, nullptr, launchArguments, nullptr), "Paired benchmark launch");
             };
             // Both modules and weight images stay resident on the same GPU.
@@ -156,13 +186,31 @@ int main(int argc, char** argv) {
                 for (const auto& allocation : allocations)
                     hip.check(hip.hipMemcpy(allocation->device, allocation->initial.data(), allocation->size,
                         hipMemcpyHostToDevice), "Restore paired captured input");
-                hip.check(record(begin.value, nullptr), "Record paired start");
-                launch(variant ? other : function);
-                hip.check(record(end.value, nullptr), "Record paired end");
+                const auto host_begin = std::chrono::steady_clock::now();
+                if (!dispatch) hip.check(record(begin.value, nullptr), "Record paired start");
+                for (unsigned batch = 0; batch < args.benchmark_batch; ++batch) {
+                    if (dispatch) {
+                        // Flags zero preserve stream order. Global sizes are
+                        // work-items, unlike hipModuleLaunchKernel's blocks.
+                        hip.check(dispatch(variant ? other : function, global[variant][0], global[variant][1], global[variant][2],
+                            blocks[variant][0], blocks[variant][1], blocks[variant][2], shared, nullptr, launchArguments, nullptr,
+                            batch == 0 ? begin.value : nullptr,
+                            batch + 1 == args.benchmark_batch ? end.value : nullptr, 0),
+                            "Paired dispatch-profiled launch");
+                    } else launch(variant ? other : function);
+                }
+                if (!dispatch) hip.check(record(end.value, nullptr), "Record paired end");
                 hip.check(synchronize(end.value), "Complete paired sample");
+                const auto host_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - host_begin).count();
                 float ms = 0; hip.check(elapsed(&ms, begin.value, end.value), "Paired GPU elapsed time");
-                std::printf("D4R_REPLAY_PROFILE kernel=%s variant=%s pair=%u gpu_ms=%.6f warmup_launches=512 paired=1 input_restore_outside_event=1\n",
-                    kernel.c_str(), variant ? "candidate" : "control", pair, double(ms));
+                const bool valid = std::isfinite(ms) && ms > 0 && double(ms) <= host_ms;
+                std::printf("D4R_REPLAY_PROFILE%s kernel=%s variant=%s pair=%u gpu_ms=%.6f "
+                    "host_ms=%.6f timing_source=%s launches=%u warmup_launches=512 paired=1 "
+                    "input_restore_outside_event=1\n", valid ? "" : "_INVALID",
+                    kernel.c_str(), variant ? "candidate" : "control", pair,
+                    double(ms) / args.benchmark_batch, host_ms / args.benchmark_batch,
+                    args.benchmark_timing.c_str(), args.benchmark_batch);
             }
             hip.verbose = verbose;
             // Leave a single ordinary control replay for numerical checking.

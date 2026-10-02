@@ -119,12 +119,24 @@ def report(directory, metadata_directory=None):
     invalid_samples = []
     boundaries = collections.defaultdict(list)
     replay = collections.defaultdict(lambda: collections.defaultdict(dict))
+    invalid_replay = []
     for path in sorted(directory.glob('*.log')):
         data = path.read_bytes()
         text = data.decode('utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig', errors='replace')
-        for name, variant, pair, value in re.findall(
-                r'D4R_REPLAY_PROFILE kernel=(\S+) variant=(control|candidate) pair=([0-9]+) gpu_ms=([0-9.]+)', text):
-            replay[name][int(pair)][variant] = float(value)
+        for line in text.splitlines():
+            if line.startswith('D4R_REPLAY_PROFILE_INVALID '):
+                invalid_replay.append(dict(file=path.name, **dict(re.findall(r'(\w+)=(\S+)', line))))
+            if not line.startswith('D4R_REPLAY_PROFILE '):
+                continue
+            fields = dict(re.findall(r'(\w+)=(\S+)', line))
+            if not all(key in fields for key in ('kernel', 'variant', 'pair', 'gpu_ms')):
+                continue
+            value = float(fields['gpu_ms'])
+            if fields['variant'] not in ('control', 'candidate') or not math.isfinite(value) or value <= 0:
+                invalid_replay.append(dict(file=path.name, **fields))
+                continue
+            key = (path.name, fields['kernel'], fields.get('timing_source', 'events'), int(fields.get('launches', 1)))
+            replay[key][int(fields['pair'])][fields['variant']] = fields
         for name, value in re.findall(r'D4R_STAGE name=(\S+) cpu_ms=([0-9.]+)', text):
             stages[name].append(float(value))
         for kind, fields in re.findall(r'(?m)^D4R_COMMAND_(RECORD|SUBMIT) ([^\r\n]+)', text):
@@ -172,6 +184,7 @@ def report(directory, metadata_directory=None):
                   presentMon=presentmon(directory),
                   gpuTelemetry=gpu_telemetry(directory),
                   replayPairs=[],
+                  invalidReplaySamples=invalid_replay,
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
                       'CUDA API profiles measure host call duration without GPU events or added synchronization; they still include existing waits.',
@@ -179,6 +192,7 @@ def report(directory, metadata_directory=None):
                       'Boundary timestamps are read after existing completion fences; only 32 timing bytes are read, with no extra completion wait. GPU clock idle behavior can affect intervals.',
                       'PresentMon ETW GPU busy/wait are per-process frame estimates, not hardware sensor utilization. HWS and cross-API context attribution can affect them.',
                       'ADLX telemetry is driver-reported device-wide utilization/clocks/power, sampled in a separate read-only process. It does not isolate DLSS or WMMA occupancy.',
+                      'Replay GPU/host intervals are normalized per launch; multi-launch batches include queue/dispatch gaps and are not isolated instruction time or application FPS.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
@@ -202,13 +216,18 @@ def report(directory, metadata_directory=None):
                 boundary_stages['between_boundaries_ms'].append(before * 1000. / frequency)
                 boundary_stages['input_interval_ms'].append(interval * 1000. / frequency)
     result['gpuBoundaryStages'] = {name: stats(values) for name, values in boundary_stages.items()}
-    for name, pairs in replay.items():
+    for (file, name, timing, launches), pairs in replay.items():
         complete = [row for row in pairs.values() if set(row) == {'control', 'candidate'}]
         if complete:
-            result['replayPairs'].append(dict(kernel=name,
-                controlGpuMs=stats([row['control'] for row in complete]),
-                candidateGpuMs=stats([row['candidate'] for row in complete]),
-                candidateToControl=stats([row['candidate'] / row['control'] for row in complete if row['control'] > 0])))
+            values = {variant: [float(row[variant]['gpu_ms']) for row in complete] for variant in ('control', 'candidate')}
+            item = dict(file=file, kernel=name, timingSource=timing, launchesPerSample=launches,
+                controlGpuMs=stats(values['control']), candidateGpuMs=stats(values['candidate']),
+                candidateToControl=stats([candidate / control for control, candidate in zip(values['control'], values['candidate'])]))
+            for variant in ('control', 'candidate'):
+                host = [float(row[variant]['host_ms']) for row in complete if 'host_ms' in row[variant]]
+                if host:
+                    item[variant + 'HostCompletionMs'] = stats(host)
+            result['replayPairs'].append(item)
     for (thread, api), rows in apis.items():
         calls = sum(int(row['calls']) for row in rows)
         total = sum(float(row['total_ms']) for row in rows)
@@ -276,7 +295,7 @@ def main():
         print(f"HOOK thread={row['thread']} samples={int(row['samples'])} access={row['accessMeanUs']:.3f} us "
               f"capture={row['captureMeanUsPerSample']:.3f} us estimated_cpu={row['estimatedAccessCaptureMsPerSecond']:.3f} ms/s")
     for row in result['replayPairs']:
-        print(f"PAIRED {row['kernel']}: n={row['controlGpuMs']['samples']} control_median={row['controlGpuMs']['median']:.6f} ms "
+        print(f"PAIRED {row['kernel']} timing={row['timingSource']} batch={row['launchesPerSample']}: n={row['controlGpuMs']['samples']} control_median={row['controlGpuMs']['median']:.6f} ms "
               f"candidate_median={row['candidateGpuMs']['median']:.6f} ms ratio_median={row['candidateToControl']['median']:.6f}")
     for row in result['kernels']:
         times = row['gpuMs']
