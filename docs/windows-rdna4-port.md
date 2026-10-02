@@ -26,6 +26,12 @@ host synchronization; postpone further M/FP8 optimization. These user readings
 are not a controlled same-scene benchmark. Do not infer a hardware CPU limit
 from utilization alone.
 
+A subsequent unprofiled K/4K capture records **64.661 FPS** with direct AMD
+ADLX mean usage **93.183%**, core clock **3124.667 MHz** and board power
+**316.717 W**. The previous 63% reading is from a different sensor/window;
+its discrepancy remains unresolved. This new capture places GPU kernel cost
+at the center of the next K investigation, while retaining queue measurements.
+
 The next diagnostics add `-ProfileCudaApi` (ZLUDA patch 0015): aggregate host
 CUDA API durations without HIP-event waits. Boundary stages now separate
 prepare, copy-list setup, input/output submission and output-copy drain.
@@ -103,7 +109,7 @@ stream, which needs explicit opt-in for timestamp sampling. The depth/stencil
 and packed-format burst/recreation gates pass 24 full K/4K frames: all twelve
 candidate RGB images match their fresh unbatched synchronous controls exactly,
 with finite RGBA. Results: `test-results/k-batch-deferred-4k` and
-`test-results/k-batch-packed-4k`. The game performance gate is pending. The candidate remains
+`test-results/k-batch-packed-4k`. The candidate remains
 disabled by default; see `windows-performance.md` for semantics and commands.
 
 Current candidate source is ZLUDA `67127dde599879ada022d6439383d682e09e0b36`
@@ -117,6 +123,23 @@ The same negative HIP event-timing issue reproduces with stable SDK 7.2 as
 well as TheRock; PTX output/guards remain correct. It also affects a native K
 dec4 timing sample, so valid-looking events alone are not a timing-accuracy
 gate. No hardware utilization or kernel speedup is inferred from these samples.
+
+The committed batched-input game run completes **35673 K/4K frames** without
+backend errors, CPU image copies, previous-frame output or recorded crashes.
+The user-confirmed 30-second PresentMon window records **64.265 FPS** (1925
+presents), compared with the prior unbatched 63.574 FPS. Both keep Independent
+Flip / SyncInterval 0 and 2259x1271 -> 3840x2160. This small single-pair
+difference is not a repeatable speedup gate. Whole-run median input preparation
+falls from 0.482 to 0.332 ms, while median external span is 5.438 versus
+5.399 ms. Results: `test-results/silent-hill2-k-batch-inputs-4k`.
+K performance remains open and batching remains opt-in. The next diagnostic
+adds a separate read-only AMD ADLX usage/clock/power capture alongside
+PresentMon. Its local RX 9070 XT smoke test passes, retaining unsupported
+metrics as absent and preserving the driver's raw timestamp. See
+`windows-performance.md` for build/capture commands and SDK packaging limits.
+The combined capture smoke test passes, followed by the user-confirmed
+1935-present/60-poll measurement recorded at the top of this document. Logs
+and runtime/DLL hashes: `test-results/silent-hill2-k-telemetry-unprofiled-4k`.
 
 The public prerelease `windows-rdna4-dev-20261002-a346d76` is published to
 `xdfnx-dev/d4r`, containing source commit `a346d76` and ZLUDA `a1c506f`.

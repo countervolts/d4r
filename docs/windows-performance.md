@@ -249,8 +249,8 @@ completion. Every image stays in VRAM. The ZLUDA implementation adds
 `cuMemcpy2DAsync_v2` using `hipMemcpyParam2DAsync`; format-80 array emulation
 is explicitly rejected because its synchronous implementation uses temporary
 host storage. The Windows path supplies canonical FP16/FP32 arrays instead.
-This experiment is disabled by default until the correctness and game timing
-gates below pass; there is no claimed FPS improvement yet.
+This experiment remains disabled by default. Correctness checks pass, but the
+controlled game comparison below shows only a small frame-time difference.
 
 ```powershell
 .\scripts\windows\test-deferred-kernel-profile.ps1
@@ -276,6 +276,74 @@ After committing/rebuilding ZLUDA with a clean worktree, the twelve-frame
 four-way K/4K gate passes again with exact candidate RGB and finite RGBA
 (`test-results/k-batch-committed-source-4k`). This warms the committed runtime's
 JIT cache before the game comparison.
+
+The following user-confirmed 30-second foreground-scene capture contains 1925
+presents at **64.265 FPS**, versus the previous unbatched run's 63.574 FPS.
+Both use 2259x1271 -> 3840x2160, Independent Flip and SyncInterval 0, without
+kernel-event profiling, output scans or attached debuggers. Mean present time
+is 15.561 versus 15.730 ms, a 0.169 ms difference. This single pair does not
+establish repeatability or a large performance improvement. The containing
+ten-minute candidate run completes 35673 K frames with zero backend failures,
+CPU image copies, previous-frame outputs or recorded game crashes. Whole-run
+median input preparation drops from 0.482 to 0.332 ms; median external span
+is 5.438 versus 5.399 ms. Whole-run stages are not the selected PresentMon
+window. No GPU utilization conclusion is drawn from ETW estimates. Results:
+`test-results/silent-hill2-k-batch-inputs-4k`. The K performance gate stays open.
+
+### AMD driver telemetry
+
+A separate read-only diagnostic polls the installed driver's ADLX base C
+interfaces for device-wide usage, core/VRAM clocks, board power and temperatures.
+It adds no work to game queues and changes no tuning setting. Build it locally
+using the official SDK pinned at `32b5a740d42295c5dfe9026b9f52683da0f3af91`:
+
+```powershell
+.\scripts\windows\build-gpu-telemetry.ps1
+.\scripts\windows\capture-presentmon.ps1 -Seconds 30 -GpuTelemetry
+```
+
+The SDK retains its own AMD license; SDK headers, implementations, driver DLLs
+and the SDK-dependent executable are excluded from public game packages.
+The probe is independently written and uses the documented C ABI, including
+with LLVM-MinGW. It loads `amdadlx64.dll` only from Windows System32 and
+releases acquired interfaces before ADLX termination/unload. GPU selection
+must match exactly one device (`-GpuName` selects a different name substring).
+The process exits at its bound or target process exit. The capture retains
+CSV, raw stderr, exit/timeout, driver DLL version/hash and SDK build identity.
+No optional telemetry failure is silently converted to a valid measurement.
+
+CSV records independent host UTC/QPC timestamps and the driver's raw sample
+timestamp. On this installed ADLX 1.5.0.124, the latter is uptime despite the
+SDK description of epoch time; do not interpret it as UTC. Unsupported metrics
+are blank, zero utilization/clock remains valid, and the report uses each
+driver timestamp once. Device-wide usage is distinct from PresentMon's
+per-process frame attribution and is not measured WMMA occupancy. ADLX API:
+[AMD GPU metrics sample](https://gpuopen.com/manuals/adlx/adlx-c__perf_g_p_u_metrics/).
+
+The initial idle-device smoke test captures six valid polls, selects the real
+RX 9070 XT and terminates ADLX successfully. Board power/core clock/usage
+and temperatures are available; `GPUPower` is unsupported and stays absent
+from the report. The first poll costs roughly 10 ms for initialization;
+subsequent polls are about 0.08 ms at 500 ms intervals. This idle smoke test
+does not establish game clocks, utilization or an overhead-free benchmark.
+Results: `test-results/gpu-telemetry-smoke`.
+
+The subsequent combined-capture smoke test collects 246 presents and ten
+ADLX polls and exits cleanly (`test-results/gpu-telemetry-capture-smoke`).
+It includes startup/scene changes and is excluded from FPS comparisons.
+After the user confirms the foreground comparison scene, the 30-second run
+with detailed d4r stages/boundary timestamps disabled records **64.661 FPS**
+over 1935 presents. ADLX's sixty polls report mean usage **93.183%**, core
+clock **3124.667 MHz**, board power **316.717 W**, temperature 57 C and hotspot
+82.9 C. Mean PresentMon GPU busy/wait is 14.551/0.800 ms. All presents retain
+Independent Flip / SyncInterval 0. This records high device-wide driver usage
+in this run; the previous user-reported 63% has not been captured from the same
+sensor/window and its discrepancy is unresolved. Do not infer a physical CPU
+limit, isolated shader occupancy or a FSR4 speed comparison. Query overhead
+is median 0.094 ms per 500 ms poll, with a roughly 12 ms first query. Results:
+`test-results/silent-hill2-k-telemetry-unprofiled-4k`. The game stability
+summary is still pending its existing ten-minute bound. Remaining K work now
+prioritizes transformer/output-kernel cost; frame scheduling remains measured.
 
 Further game coverage (HIP kernel profiling disabled, GPU output checks enabled):
 M at 1920x1080 completes 4833 frames, all finite. K at 3840x2160 completes

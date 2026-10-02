@@ -76,6 +76,38 @@ def presentmon(directory):
     return captures
 
 
+def gpu_telemetry(directory):
+    captures = []
+    for path in sorted(directory.glob('gpu-telemetry*.csv')):
+        unique = {}
+        with path.open(encoding='utf-8-sig', newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        # Driver telemetry may repeat a cached measurement. Count polls but
+        # use each sensor timestamp once; missing/unsupported values stay absent.
+        for row in rows:
+            try:
+                timestamp = int(row.get('sensor_timestamp_ms', ''))
+            except (ValueError, TypeError):
+                continue
+            if timestamp > 0:
+                unique.setdefault(timestamp, row)
+        metrics = {}
+        for name in ('gpu_usage_pct', 'gpu_clock_mhz', 'vram_clock_mhz', 'gpu_power_w',
+                     'board_power_w', 'temperature_c', 'hotspot_c', 'poll_ms'):
+            values = []
+            for row in unique.values():
+                try:
+                    value = float(row.get(name, ''))
+                except (ValueError, TypeError):
+                    continue
+                if math.isfinite(value) and value >= 0 and (name != 'gpu_usage_pct' or value <= 100):
+                    values.append(value)
+            if values:
+                metrics[name] = stats(values)
+        captures.append(dict(file=path.name, polls=len(rows), uniqueSamples=len(unique), metrics=metrics))
+    return captures
+
+
 def report(directory, metadata_directory=None):
     kernel_metadata = metadata(metadata_directory)
     stages = collections.defaultdict(list)
@@ -138,6 +170,7 @@ def report(directory, metadata_directory=None):
                   invalidKernelSamples=invalid_samples,
                   gpuBoundaryStages={},
                   presentMon=presentmon(directory),
+                  gpuTelemetry=gpu_telemetry(directory),
                   replayPairs=[],
                   kernels=[], notes=[
                       'CPU stage times include waits and host work; they are not isolated GPU timings.',
@@ -145,6 +178,7 @@ def report(directory, metadata_directory=None):
                       'D3D12 boundary timestamps span copies and HIP/scheduling across the external fence; they do not isolate kernel execution or measure Present.',
                       'Boundary timestamps are read after existing completion fences; only 32 timing bytes are read, with no extra completion wait. GPU clock idle behavior can affect intervals.',
                       'PresentMon ETW GPU busy/wait are per-process frame estimates, not hardware sensor utilization. HWS and cross-API context attribution can affect them.',
+                      'ADLX telemetry is driver-reported device-wide utilization/clocks/power, sampled in a separate read-only process. It does not isolate DLSS or WMMA occupancy.',
                       'Command record intervals are between NGX recording calls on one thread, not Present/FPS.',
                       'Hook estimates use random one-in-64 samples; driver timing covers generated forwarding methods only.',
                       'Hook access includes lock waits; summing threads does not measure serial frame latency or CPU execution time.',
@@ -218,7 +252,7 @@ def main():
     parser.add_argument('--metadata-directory', type=pathlib.Path, help='llvm-readobj --notes output for native code objects')
     args = parser.parse_args()
     result = report(args.directory, args.metadata_directory)
-    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi', 'gpuBoundaryStages', 'presentMon')):
+    if not any(result[key] for key in ('cpuStages', 'kernels', 'commandStages', 'commandHookSamples', 'replayPairs', 'cudaApi', 'gpuBoundaryStages', 'presentMon', 'gpuTelemetry')):
         parser.error('no complete stage or HIP-event records found')
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -232,6 +266,10 @@ def main():
         print(f"PRESENT {capture['file']} process={capture['processId']} swapchain={capture['swapchain']} frames={capture['frames']} fps={capture.get('presentFps', float('nan')):.3f}")
         for name, row in capture['metrics'].items():
             print(f"  {name}: n={row['samples']} mean={row['mean']:.3f} ms median={row['median']:.3f} ms p95={row['p95']:.3f} ms")
+    for capture in result['gpuTelemetry']:
+        print(f"ADLX {capture['file']}: polls={capture['polls']} unique_samples={capture['uniqueSamples']}")
+        for name, row in capture['metrics'].items():
+            print(f"  {name}: n={row['samples']} mean={row['mean']:.3f} median={row['median']:.3f} p95={row['p95']:.3f}")
     for row in result['cudaApi'][:20]:
         print(f"CUDA API {row['api']} {row['thread']}: n={row['calls']} mean={row['meanMs']:.6f} ms total={row['totalMs']:.3f} ms max={row['maxMs']:.3f} ms")
     for row in result['commandHookSamples']:
