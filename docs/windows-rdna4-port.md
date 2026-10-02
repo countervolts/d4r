@@ -52,6 +52,22 @@ Results: `test-results/windows-gpu-coverage`; build logs and the compile-only
 matrix report: `build/windows-gpu-coverage`. No physical multi-GPU, APU or
 other-target validation is claimed. K performance remains open.
 
+The final translator gate exposed a separate dependency gap: pinned LLVM 22
+rejects `gfx1154` and aborts (`0xC0000409`) on a public PTX pattern. A minimal
+source backport of official LLVM `7a0829e41228` adds the processor's real
+11.5.4 features, parser and ELF identity. It is exported under
+`patches/zluda-llvm`, applied idempotently by the LLVM builder and included with
+its base/hash in package metadata. LLVM and ZLUDA are rebuilt; all 33 offline
+pattern/F16-reference/WMMA compilations pass across the eleven targets without
+GPU execution. The existing strict gfx12 F16 reference lowering remains intact.
+The rebuilt ZLUDA passes 20/20 RX 9070 XT CTest gates. Its twelve further K
+4K burst/recreation frames are finite and all six async RGB images are exact;
+three sync RGB images also exactly match the previous compiler's captures.
+Four further M 4K frames are finite and match all four previous-compiler RGB
+images exactly. Both require native transformer hits, zero CPU frame copies
+and frame age 0. Results: `k-new-zluda`, `m-new-zluda` and compiler comparison
+logs under `test-results/windows-gpu-coverage`. Other GPUs remain unverified.
+
 **Current milestone: K performance remains open.** The latest unprofiled 4K
 Silent Hill 2 scene capture records 65.250 FPS. Functional K/M and the
 reproducible archive do not close this gate. Prioritize measured K kernel cost
@@ -1219,7 +1235,10 @@ Pinned additional build dependencies:
   rust-std and rust-mingw archives and installs only under `.tools`.
 * ZLUDA LLVM submodule `ff4dc1f7c9e1c64d4d69e40f4ed30c2280a96dfd`,
   `llvm-config` reports `22.0.0git`. AMDGPU/LLVM/LLD are built with LLVM-MinGW
-  `20260922`; no Linux build host or runtime is used.
+  `20260922`; no Linux build host or runtime is used. The Windows builder adds
+  `patches/zluda-llvm/0001-backport-gfx1154.patch`, adapted from official LLVM
+  `7a0829e41228513299c5108685b0bc127463c6a1`. Rebuild and relink ZLUDA when
+  updating; native Clang 24 target support alone does not cover translated PTX.
 * HiGHS submodule `364c83a51e44ba6c27def9c8fc1a49b1daf5ad5c`.
 * The LLVM IR helper producer is stable HIP 7.2/LLVM 21. The final target is
   selected by the translator from HIP `gfx1201`; generic helper generation

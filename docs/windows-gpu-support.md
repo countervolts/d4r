@@ -99,6 +99,29 @@ Use `-GpuArchitectures gfx1100,gfx1101,gfx1102,gfx1200,gfx1201` for a subset.
 Per-target logs and `matrix-build.json` distinguish compilation from execution.
 The supplied DLL generates manifests locally and is never copied into archives.
 
+Rebuild LLVM/ZLUDA when updating from an older package: the old LLVM 22 backend
+does not recognize gfx1154 even though Clang 24 compiles native objects for it.
+`build-zluda-llvm.ps1` now applies the source backport in `patches/zluda-llvm`
+automatically; relink with `build-zluda-windows.ps1` afterward. Compiler base
+and patch hashes are recorded in the ZLUDA build metadata and included in game
+packages. The expected patched LLVM submodule appears modified in its parent
+checkout; its complete source delta is exported, not a binary target override.
+
+For a compilation gate requiring neither a GPU nor NVIDIA DLLs, run:
+
+```powershell
+.\scripts\windows\test-zluda-target-compilation.ps1 -ZludaRoot "$PWD\dist\zluda-windows-final"
+```
+
+All 33 public PTX compilations pass for the eleven targets: Driver API pattern,
+FP16 MMA strict reference and explicit WMMA modes, with correct ELF targets
+and wave32. The gfx12 strict F16 reference intentionally retains its existing
+double-precision helper; the separate WMMA mode checks code generation only.
+It does not enable relaxed arithmetic in game packages or validate numerical
+results on other GPUs. The original gfx1154 compiler abort is preserved locally
+in `build/llvm-gfx1154/before.log`; the regression results are in
+`test-results/windows-gpu-coverage/zluda-offline`.
+
 ## Fork adaptation
 
 Reviewed [realdody's branch](https://github.com/realdody/d4r/tree/windows-rdna3)

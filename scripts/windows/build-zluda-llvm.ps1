@@ -12,6 +12,7 @@ if (!(Test-Path (Join-Path $SourceRoot 'ext/llvm-project/llvm/CMakeLists.txt')))
     throw 'Run git submodule update --init --depth 1 ext/llvm-project in the ZLUDA checkout.'
 }
 New-Item -ItemType Directory -Force $BuildRoot | Out-Null
+& (Join-Path $PSScriptRoot 'prepare-zluda-llvm-source.ps1') -LlvmSourceRoot (Join-Path $SourceRoot 'ext/llvm-project')
 $oldPath = $env:PATH
 try {
     $env:PATH = "$(Join-Path $toolchain 'bin');$oldPath"
@@ -36,5 +37,9 @@ try {
     if ($LASTEXITCODE) { throw "LLVM build failed ($LASTEXITCODE)" }
     & (Join-Path $BuildRoot 'bin/llvm-config.exe') --version
     if ($LASTEXITCODE) { throw 'llvm-config verification failed' }
+    @{sourceBase=(& git -C (Join-Path $SourceRoot 'ext/llvm-project') rev-parse HEAD).Trim(); fullSourceDeltaVerified=$true;
+      sourcePatches=@(Get-ChildItem (Join-Path $repo 'patches/zluda-llvm') -Filter *.patch | ForEach-Object {
+        @{name=$_.Name; sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}})} |
+        ConvertTo-Json -Depth 5 | Set-Content (Join-Path $BuildRoot 'd4r-llvm-build-info.json') -Encoding UTF8
     Write-Host "Native Windows LLVM: $BuildRoot"
 } finally { $env:PATH = $oldPath }

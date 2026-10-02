@@ -94,6 +94,7 @@ Stage (Join-Path $HipRoot 'share/doc/amd_comgr/LICENSE.txt') 'licenses/amd_comgr
 Stage (Join-Path $repo 'external/clr/LICENSE.md') 'licenses/HIP-CLR.txt'
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/optiscaler') -Filter '*.patch') { Stage $patch.FullName ('source-patches/optiscaler/' + $patch.Name) }
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/zluda') -Filter '*.patch') { Stage $patch.FullName ('source-patches/zluda/' + $patch.Name) }
+foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $repo 'patches/zluda-llvm') -Filter '*.patch') { Stage $patch.FullName ('source-patches/zluda-llvm/' + $patch.Name) }
 $sourceArchive=Join-Path $repo 'build/d4r-windows-rdna4-source.zip'
 New-Item -ItemType Directory -Force (Split-Path $sourceArchive) | Out-Null
 & git -C $repo archive --format=zip --output $sourceArchive $sourceCommit

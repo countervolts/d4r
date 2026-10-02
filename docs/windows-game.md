@@ -128,4 +128,5 @@ uses a previous-frame fallback.
 
 OptiScaler source modifications are GPL-3.0 and exported under
 `source-patches/optiscaler`. ZLUDA source modifications are exported under
-`source-patches/zluda`. Dependency license texts and build hashes are included.
+`source-patches/zluda`; the LLVM gfx1154 backport is under
+`source-patches/zluda-llvm`. Dependency license texts and build hashes are included.
