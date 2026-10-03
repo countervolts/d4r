@@ -1,3 +1,28 @@
+<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
+# Unreleased
+
+## Ray Reconstruction
+
+- Run the signed CUDA-capable 3.10.7 DLSS-Denoiser through the NGX core's feature-13 lifecycle.
+  Presets D and E select distinct network weights independently of the Super Resolution preset.
+- Preserve per-frame guide resources, camera matrices, subrects, and stable CUDA texture handles.
+  Support normalized 8-bit albedo guides with the CUDA array-format ABI and stage full guide rows.
+- Support pre-Init feature discovery through the denoiser's requirements export without initializing
+  NGX with a provisional application identity. Initialized capability checks remain authoritative.
+- Keep separate alpha and RGB outputs paired, including padded output subrects; consume alpha
+  readback synchronously before CPU conversion.
+- Bound R8_UINT alpha stores to one byte and balance guide/alpha references when evaluation
+  cannot place its frame marker. Publish cached denoiser capabilities as a coherent snapshot.
+- Extend the ZLUDA patch stack for real denoiser PTX, LLVM lowering, half texture/store operations,
+  and release/acquire ordering around workgroup barriers.
+- Verified D/E temporal evaluation and separate alpha on RX 9070 XT (gfx1201) with native FP8 WMMA.
+  Scalar FP8 temporal RR produced nonfinite output and is not validated. Cold compilation can stall
+  initial rendering; other GPU targets and image-quality parity with RTX hardware remain unverified.
+- Cyberpunk 2077 2.31 rendered loaded local saves with path tracing and RR preset D enabled at
+  1920×1080 and 3840×2160 Ultra Performance on gfx1201. The actual overlay reported DLSSD 310.7.0,
+  and CUDA feature-13 evaluations completed. The observed ~53 FPS at 1080p and ~20 FPS at 4K are
+  snapshots, not comparative benchmarks. Newer DLSS 4.5 RR preset F is not implemented or validated.
+
 # d4r 0.1.3
 
 This release adds an optional accuracy mode and fixes the GLIBC compatibility failure, DLSS artifacts, and stale output-buffer redirects reported after 0.1.2. Accuracy mode is **off by default**.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Builds the drag-in release: a zip whose contents are extracted into the folder that holds a game's
 # main .exe, like an OptiScaler release. packaging/D4R_README.txt describes the result.
 #
@@ -25,6 +26,7 @@
 # The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
+#   D4R_BUNDLE_DLSSD optional nvngx_dlssd.dll to include for Ray Reconstruction
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
@@ -99,6 +101,9 @@ if [[ "$VARIANT" == full ]]; then
   : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
   cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
   cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+  if [[ -n "${D4R_BUNDLE_DLSSD:-}" ]]; then
+    cp "$D4R_BUNDLE_DLSSD" "$STAGE/d4r/nvngx_dlssd.dll"
+  fi
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Run inside packaging/build/Dockerfile.glibc241 with a recent official Rust toolchain and ROCm mounted.
 # Supply isolated, patched ZLUDA/vkd3d checkouts and the usual package_release.sh inputs.
 set -euo pipefail

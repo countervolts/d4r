@@ -1,3 +1,4 @@
+// Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 // d4r_nvngx.dll: an NGX core replacement that implements the D3D12 DLSS
 // entry points on top of the official NGX core's CUDA path (which runs on AMD
 // through the Wine nvcuda bridge and ZLUDA). OptiScaler loads it through its
@@ -34,6 +35,16 @@
 //   D4R_SHIM_VRAM_INTEROP=1 keep inputs and output in VRAM (see "VRAM interop")
 //   D4R_SHIM_SPLIT_FRAME=1 with VRAM interop and the d4r vkd3d-proton patch,
 //                       present each frame's own DLSS result (see "Split frames")
+//   (the DLSS-Denoiser library nvngx_dlssd.dll, which serves Ray Reconstruction, must sit
+//                       next to this DLL: that is where the NGX core looks for it. It needs
+//                       a build exporting NVSDK_NGX_CUDA_* (3.10.7); without it Ray
+//                       Reconstruction reports itself unavailable and Super Sampling is
+//                       unaffected.)
+//   D4R_RR_ENABLE=1/0    Ask for Ray Reconstruction / forbid it. Unset (auto) offers it
+//                       exactly when the denoiser loaded and initialised.
+//   D4R_RR_PRESET        Force the Ray Reconstruction render preset
+//                       (NVSDK_NGX_RayReconstruction_Hint_Render_Preset: 4 = D, 5 = E).
+//                       Independent of D4R_DLSS_PRESET, which only affects Super Sampling.
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -53,6 +64,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <list>
 #include <future>
 #include <mutex>
 #include <string>
@@ -74,6 +86,9 @@ constexpr NgxResult NGX_FAIL_INVALID_PARAMETER = NGX_FAIL | 5;
 constexpr NgxResult NGX_FAIL_NOT_INITIALIZED = NGX_FAIL | 7;
 constexpr NgxResult NGX_FAIL_UNSUPPORTED_FORMAT = NGX_FAIL | 14;
 constexpr unsigned int NGX_FEATURE_SUPER_SAMPLING = 1;
+
+// nvngx_dlssd.dll (DLSS-Denoiser / Ray Reconstruction), NVSDK_NGX_Feature.
+constexpr unsigned int NGX_FEATURE_RAY_RECONSTRUCTION = 13;
 
 struct NgxHandle
 {
@@ -224,6 +239,7 @@ struct CudaApi
     int(WINAPI* surfObjectCreate)(CudaObject*, const CudaResourceDesc*) = nullptr;
     int(WINAPI* surfObjectDestroy)(CudaObject) = nullptr;
     int(WINAPI* ctxSynchronize)() = nullptr;
+    int(WINAPI* ctxGetDevice)(int*) = nullptr;
     int(WINAPI* eventCreate)(CudaEvent*, unsigned int) = nullptr;
     int(WINAPI* eventRecord)(CudaEvent, void*) = nullptr;
     int(WINAPI* eventQuery)(CudaEvent) = nullptr;
@@ -265,6 +281,33 @@ struct CoreApi
     NgxResult (*createFeature)(unsigned int, void*, NgxHandle**) = nullptr;
     NgxResult (*releaseFeature)(NgxHandle*) = nullptr;
     NgxResult (*evaluateFeature)(const NgxHandle*, void*, void*) = nullptr;
+    // The core's CUDA entry point takes a CUdevice ordinal, not an IDXGIAdapter* (its
+    // disassembly rejects a negative value in the first argument, which is the ordinal
+    // check). The D3D12 export this file implements takes an adapter and must translate.
+    NgxResult (*getFeatureRequirements)(int, const void*, NgxFeatureRequirement*) = nullptr;
+};
+
+// --- DLSS-Denoiser (Ray Reconstruction) ----------------------------------------
+//
+// nvngx_dlssd.dll carries the Ray Reconstruction models, and the NGX core loads and
+// dispatches it itself: the core is the only thing that knows the denoiser's module name,
+// its kernel map and its lifetime. So both features are created, evaluated and released
+// through g.ngx, with feature id 13 for Ray Reconstruction, and this file's job is only to
+// answer honestly whether that route exists.
+//
+// Existence is decided by loading the denoiser and looking for its CUDA entry points, the
+// only reliable external evidence - builds genuinely differ. The 3.10.7 build exports the
+// whole NVSDK_NGX_CUDA_* set; the DLAA-only build exports D3D11/D3D12/Vulkan/DirectSR and
+// no CUDA entry points, and cannot serve Ray Reconstruction however it is loaded.
+//
+// The pointers here are resolved only as that evidence and are never called. In particular
+// NVSDK_NGX_CUDA_Init in the 310.7 build is `mov eax, 0xBAD00001; ret` (RVA 0x22b80), a stub
+// that only ever reports "not supported"; the core's own init is what brings the denoiser up.
+// A single yes/no, not a table of entry points: nothing here is ever called. The denoiser is
+// loaded by the NGX core, which is the only thing that may drive it.
+struct DenoiserProbe
+{
+    bool cudaCapable = false;
 };
 
 // --- logging -----------------------------------------------------------------
@@ -520,6 +563,45 @@ static void load_portable_config()
     if (!model.empty())
         portable_set("D4R_DLSS_PRESET", model);
 
+    // Ray Reconstruction is configured on its own section and drives its own feature, so
+    // nothing here reaches [DLSS] Model and nothing there reaches this.
+    //
+    // Enable: true -> D4R_RR_ENABLE=1, false -> 0, auto/unset -> the variable is left alone,
+    // which is the same thing as auto here: Ray Reconstruction is offered exactly when a
+    // CUDA-capable denoiser really loaded and initialised.
+    const std::string rrEnable = ascii_lower(ini_value(ini, "rayreconstruction", "Enable"));
+    if (rrEnable == "true" || rrEnable == "on" || rrEnable == "1")
+        portable_set("D4R_RR_ENABLE", "1");
+    else if (rrEnable == "false" || rrEnable == "off" || rrEnable == "0")
+        portable_set("D4R_RR_ENABLE", "0");
+    else if (!rrEnable.empty() && rrEnable != "auto")
+        g_portable.notes.push_back("d4r.ini: [RayReconstruction] Enable must be true, false or auto, not '" +
+                                   rrEnable + "'; treating it as auto");
+
+    // Model: auto/unset leaves the choice to the game; "default" is the SDK's Default preset
+    // (0); D (4) and E (5) are the two the SDK gives a meaning to. F and above are
+    // documented as reverting to default behaviour, so they are not offered. E is the model
+    // to pick when the depth-of-field guide is in use. These are the same values
+    // scripts/d4r_config.py accepts, so both ways of reading d4r.ini agree.
+    const std::string rrModel = ascii_lower(ini_value(ini, "rayreconstruction", "Model"));
+    if (!rrModel.empty() && rrModel != "auto" && rrModel != "game")
+    {
+        std::string upper = rrModel;
+        for (char& c : upper)
+            c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+        if (upper == "DEFAULT")
+            portable_set("D4R_RR_PRESET", "0");
+        else if (upper == "D")
+            portable_set("D4R_RR_PRESET", "4");
+        else if (upper == "E")
+            portable_set("D4R_RR_PRESET", "5");
+        else if (upper == "0" || upper == "4" || upper == "5")
+            portable_set("D4R_RR_PRESET", upper);
+        else
+            g_portable.notes.push_back("d4r.ini: [RayReconstruction] Model must be auto, default, D or E, not '" +
+                                       rrModel + "'; leaving the model to the game");
+    }
+
     const std::string age = ini_value(ini, "latency", "FrameAge");
     if (age.empty() || age == "0")
     {
@@ -591,6 +673,12 @@ static void load_portable_config()
     if (!file_exists(dir + L"\\nvngx_dlss.dll"))
         g_portable.notes.push_back("nvngx_dlss.dll is missing: copy NVIDIA's DLSS library (310.7 or 310.9 recommended) "
                                    "into the d4r folder");
+    // Only a note: without the denoiser Super Sampling is unaffected and Ray Reconstruction
+    // simply reports itself unavailable, which is the same thing the capability answer says.
+    if (ini_flag(ini, "rayreconstruction", "Enable", 1) && !file_exists(dir + L"\\nvngx_dlssd.dll"))
+        g_portable.notes.push_back("nvngx_dlssd.dll is missing: copy NVIDIA's DLSS-Denoiser library (3.10.7, the "
+                                   "build that exports NVSDK_NGX_CUDA_*) into the d4r folder to get Ray "
+                                   "Reconstruction");
     wchar_t corePath[MAX_PATH] = {};
     const DWORD coreLength = GetEnvironmentVariableW(L"D4R_NGX_CORE", corePath, MAX_PATH);
     if (coreLength > 0 && coreLength < MAX_PATH && !file_exists(corePath))
@@ -1215,6 +1303,11 @@ struct Global
     NgxFeatureCommonInfo featureInfo = {};
     std::wstring dataPath;
     std::atomic<unsigned int> nextHandleId{0x7200};
+    // Ray Reconstruction: nvngx_dlssd.dll, loaded and initialised only when asked for.
+    HMODULE denoiserModule = nullptr;
+    DenoiserProbe denoiser;
+    bool denoiserAttempted = false;
+    std::wstring denoiserPath;
 };
 
 static Global g;
@@ -1343,6 +1436,9 @@ static bool load_libraries()
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_CreateFeature", g.ngx.createFeature);
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_ReleaseFeature", g.ngx.releaseFeature);
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_EvaluateFeature", g.ngx.evaluateFeature);
+    // Optional: the core answers feature 13 by consulting the denoiser it loaded.
+    if (!load_export(g.core, "NVSDK_NGX_CUDA_GetFeatureRequirements", g.ngx.getFeatureRequirements))
+        g.ngx.getFeatureRequirements = nullptr;
 
     g.cuda = LoadLibraryA("nvcuda.dll");
     if (g.cuda == nullptr)
@@ -1361,6 +1457,8 @@ static bool load_libraries()
     ok &= load_export(g.cuda, "cuSurfObjectCreate", g.cu.surfObjectCreate);
     ok &= load_export(g.cuda, "cuSurfObjectDestroy", g.cu.surfObjectDestroy);
     ok &= load_export(g.cuda, "cuCtxSynchronize", g.cu.ctxSynchronize);
+    if (!load_export(g.cuda, "cuCtxGetDevice", g.cu.ctxGetDevice))
+        g.cu.ctxGetDevice = nullptr;
     // The d4r bridge's own export keeps waiting when the application's syncs are elided
     // (D4R_ELIDE_NGX_SYNC); cuCtxSynchronize above stays the fallback.
     {
@@ -1409,6 +1507,131 @@ static bool load_libraries()
     return ok;
 }
 
+// Loads nvngx_dlssd.dll and looks for the CUDA entry points that mark a build able to serve
+// Ray Reconstruction. Nothing here calls into the denoiser: the NGX core loads and
+// dispatches it, so this is a presence-and-capability check, not a second lifecycle.
+// Without it Super Sampling is unaffected and Ray Reconstruction reports itself unavailable.
+//
+// The 3.10.7 build of this library carries the whole snippet stack and exports
+// NVSDK_NGX_CUDA_*. Other builds - notably the DLAA-only "rel_tot" one, which ships D3D11,
+// D3D12, Vulkan and DirectSR and nothing else - do not, and are rejected here rather than
+// half-supported: a missing entry point means there is no CUDA path to bridge to.
+static bool load_denoiser_library()
+{
+    if (g.denoiserAttempted)
+        return g.denoiser.cudaCapable;
+    g.denoiserAttempted = true;
+    ensure_portable_config();
+
+    // The core finds nvngx_dlssd.dll beside the DLL that called into it and ignores the
+    // feature search paths, so the only place worth looking is here: offering a path that
+    // could not redirect the core's own load would be claiming a selection it does not have.
+    wchar_t self[MAX_PATH] = {};
+    const DWORD selfLength = GetModuleFileNameW(g_selfModule, self, MAX_PATH);
+    if (selfLength == 0 || selfLength >= MAX_PATH)
+    {
+        logf("Ray Reconstruction: cannot locate this DLL, so the denoiser cannot be found");
+        return false;
+    }
+    std::wstring directory(self, selfLength);
+    directory.resize(directory.find_last_of(L"\\/"));
+    g.denoiserPath = directory + L"\\nvngx_dlssd.dll";
+    if (!file_exists(g.denoiserPath))
+    {
+        logf("Ray Reconstruction: no denoiser at %ls; the NGX core loads it from beside this DLL, so copy "
+             "NVIDIA's nvngx_dlssd.dll (3.10.7) there",
+             g.denoiserPath.c_str());
+        return false;
+    }
+    g.denoiserModule = load_library_below_hooks(g.denoiserPath.c_str());
+    if (g.denoiserModule == nullptr)
+    {
+        logf("Ray Reconstruction: loading %ls failed: %lu", g.denoiserPath.c_str(), GetLastError());
+        return false;
+    }
+    // Which entry points exist is only ever evidence - none of them is called from here.
+    // Create/Evaluate/Release is what "can serve Ray Reconstruction" means. NVSDK_NGX_CUDA_Init
+    // is deliberately not required and is never called: in the 310.7 build it is a stub that
+    // always reports 0xBAD00001.
+    void* create = nullptr, *evaluate = nullptr, *release = nullptr;
+    load_export(g.denoiserModule, "NVSDK_NGX_CUDA_CreateFeature", create);
+    load_export(g.denoiserModule, "NVSDK_NGX_CUDA_EvaluateFeature", evaluate);
+    load_export(g.denoiserModule, "NVSDK_NGX_CUDA_ReleaseFeature", release);
+    g.denoiser.cudaCapable = create != nullptr && evaluate != nullptr && release != nullptr;
+    wchar_t mapped[MAX_PATH] = {};
+    GetModuleFileNameW(g.denoiserModule, mapped, MAX_PATH);
+    logf("found the DLSS-Denoiser library %ls (mapped as %ls): %s", g.denoiserPath.c_str(), mapped,
+         g.denoiser.cudaCapable ? "CUDA entry points present"
+                                : "no CUDA entry points - not a CUDA-capable denoiser build");
+    return g.denoiser.cudaCapable;
+}
+
+// D4R_RR_ENABLE: 1 asks for Ray Reconstruction, 0 forbids it, and unset (auto) offers it
+// exactly when the denoiser really loaded. Auto is the default because the only honest answer
+// to a game asking whether Ray Reconstruction is available is what this process can actually
+// run - never a fixed yes.
+static bool rr_enabled()
+{
+    return env_uint("D4R_RR_ENABLE", 1) != 0;
+}
+
+// What the NGX core last said about the denoiser it loaded. The core brings the denoiser up
+// during its own init and reports the outcome here; a file merely existing on disk proves
+// nothing, because the core can come up perfectly well for Super Sampling with a denoiser
+// that failed to initialise.
+struct DenoiserCapability
+{
+    bool known = false;
+    int available = 0;
+    int initResult = NGX_FAIL_NOT_INITIALIZED;
+};
+static DenoiserCapability g_denoiserCapability;
+static std::mutex g_denoiserCapabilityMutex;
+
+static DenoiserCapability denoiser_capability()
+{
+    std::lock_guard<std::mutex> lock(g_denoiserCapabilityMutex);
+    return g_denoiserCapability;
+}
+
+// Whether a Ray Reconstruction feature can be created right now: the switch is on, a
+// CUDA-capable denoiser build is present, and the core itself reported that denoiser
+// initialised. Anything less is reported as unavailable rather than discovered at
+// CreateFeature, where a game has already committed to the mode.
+// Asks the core what it made of the denoiser. Must run on the worker, like every other core
+// call, and must not be called from inside one.
+static void refresh_denoiser_capability();
+
+static bool ray_reconstruction_available()
+{
+    const DenoiserCapability capability = denoiser_capability();
+    return rr_enabled() && g.ngxInitialized && g.denoiser.cudaCapable &&
+           capability.known && capability.available != 0;
+}
+
+// Why the route is not on offer, for the log and for the capability answer.
+static const char* rr_denial_reason()
+{
+    if (!rr_enabled())
+        return "disabled by D4R_RR_ENABLE=0";
+    if (!g.ngxInitialized)
+        return "the NGX core is not initialised";
+    if (!g.denoiser.cudaCapable)
+        return g.denoiserAttempted ? "nvngx_dlssd.dll has no NVSDK_NGX_CUDA_* entry points (needs a 3.10.7 build)"
+                                   : "no nvngx_dlssd.dll was found next to this DLL";
+    const DenoiserCapability capability = denoiser_capability();
+    if (!capability.known)
+        return "the NGX core has not reported the denoiser's state yet";
+    if (capability.available == 0)
+    {
+        thread_local char text[160];
+        snprintf(text, sizeof(text), "the NGX core reports the denoiser unavailable (init 0x%08x)",
+                 static_cast<unsigned int>(capability.initResult));
+        return text;
+    }
+    return "available";
+}
+
 // A game that initialises NGX with its project ID (engine integrations such as Unreal's) is identified
 // to the NGX core the same way.
 struct ProjectIdentity
@@ -1418,18 +1641,13 @@ struct ProjectIdentity
     std::string engineVersion;
 };
 
-static NgxResult initialize(unsigned long long applicationId, const wchar_t* dataPath, ID3D12Device* device,
-                            const NgxFeatureCommonInfo* featureInfo, unsigned int sdkVersion,
-                            const ProjectIdentity* project = nullptr)
+// Discovery is legal before NGX Init; use the same pinned worker for both entry points.
+// The caller holds g.mutex.
+static NgxResult ensure_workers_started()
 {
-    std::lock_guard<std::mutex> lock(g.mutex);
-    g.shutdownPending = false;
-    if (g.ngxInitialized)
-        return NGX_SUCCESS;
     if (!g.started)
     {
-        // Allocators can retain COM callbacks and detached workers past NGX
-        // shutdown. Keep their code loaded until process exit.
+        // Allocators can retain COM callbacks and detached workers past NGX shutdown.
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(g_selfModule), &pinned))
@@ -1441,6 +1659,19 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         g.cleanup.start();
         g.started = true;
     }
+    return NGX_SUCCESS;
+}
+
+static NgxResult initialize(unsigned long long applicationId, const wchar_t* dataPath, ID3D12Device* device,
+                            const NgxFeatureCommonInfo* featureInfo, unsigned int sdkVersion,
+                            const ProjectIdentity* project = nullptr)
+{
+    std::lock_guard<std::mutex> lock(g.mutex);
+    g.shutdownPending = false;
+    if (g.ngxInitialized)
+        return NGX_SUCCESS;
+    if (ensure_workers_started() != NGX_SUCCESS)
+        return NGX_FAIL_PLATFORM_ERROR;
     ensure_portable_config();
     if (g_portable.active && !g.core)
     {
@@ -1520,6 +1751,19 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     if (loadError != nullptr && loadError()[0] != '\0')
         logf("nvcuda bridge: %s", loadError());
     g.ngxInitialized = result == NGX_SUCCESS;
+
+    // The denoiser is not initialised here. The NGX core loads and dispatches
+    // nvngx_dlssd.dll itself, so a second init would duplicate that state rather than add
+    // anything; this only looks for the library and checks it is a build that can serve
+    // Ray Reconstruction. Its own NVSDK_NGX_CUDA_Init is a stub that always fails, so
+    // calling it would report "unavailable" for a denoiser that is in fact working.
+    if (rr_enabled())
+    {
+        load_denoiser_library();
+        logf("Ray Reconstruction: %s", rr_denial_reason());
+    }
+    else
+        logf("Ray Reconstruction: disabled by D4R_RR_ENABLE=0");
     return result;
 }
 
@@ -1587,8 +1831,363 @@ struct CudaImage
 {
     CudaArray array = nullptr;
     CudaObject object = 0; // texture or surface object
+    uint32_t format = 0, channels = 0; // the layout the array carries, so a format change
+                                      // recreates it rather than only reacting to a resize
     UINT width = 0;
     UINT height = 0;
+};
+
+// --- Ray Reconstruction auxiliary inputs --------------------------------------
+//
+// Super Sampling needs four surfaces (colour, depth, motion vectors, exposure) and the
+// file above already moves those. Ray Reconstruction additionally runs a denoiser network
+// over the ray-traced G-buffer, so a game that enables it registers a further set of
+// surfaces: normals, roughness, diffuse and specular albedo, emissive, the ray hit
+// distances and directions, and the effect guides for particles, transparency, fog and
+// depth of field.
+//
+// Those surfaces are read in whatever format the game renders them in, and the denoiser
+// samples them through texture objects minted by this file. Rather than force them
+// through the canonical planes above - which would re-encode a UNORM normal as half and
+// silently change the values the network sees - each is copied with its own format and
+// channel count, so the texture object describes exactly what the game drew.
+
+// CUarray_format values beyond the two above (nvsdk: CU_AD_FORMAT_*).
+constexpr uint32_t CUDA_FORMAT_UNSIGNED_INT8 = 0x01;
+constexpr uint32_t CUDA_FORMAT_SIGNED_INT8 = 0x08;
+constexpr uint32_t CUDA_FORMAT_UNSIGNED_INT16 = 0x2;
+constexpr uint32_t CUDA_FORMAT_SIGNED_INT16 = 0x09;
+constexpr uint32_t CUDA_FORMAT_UNSIGNED_INT32 = 0x03;
+constexpr uint32_t CUDA_FORMAT_SIGNED_INT32 = 0x0a;
+
+// How one denoiser input reaches the GPU.
+enum class AuxLayout
+{
+    Verbatim, // the bytes are already exactly what the CUDA array must hold
+    Converted // the bytes must be unpacked into floats first (see convert_aux_row)
+};
+
+// The CUDA array a denoiser input uses.
+//
+// Only formats that are byte-for-byte correct go down the verbatim path, and that is a
+// shorter list than it looks. A CUDA array stores element_size * channels bytes per texel
+// and only ever has 1, 2 or 4 channels, so a packed format has no verbatim layout at all:
+// R10G10B10A2_UNORM is 4 bytes per texel, but a 4-channel uint array is 16, and copying
+// "4 channels' worth" would read four times past the end of every row. R11G11B10_FLOAT has
+// three channels, which no CUDA array has.
+//
+// Nor is memory layout the only question. Sampling an integer-typed CUDA array normalizes it,
+// which is right for a UNORM or SNORM surface and wrong for a UINT one, where a D3D12 shader
+// reads the raw integer. And B8G8R8A8_UNORM has RGBA bytes in BGRA order, so a verbatim copy
+// would hand the denoiser a texture whose red and blue channels are swapped.
+//
+// Everything that is not in this table is converted to a float array instead, which is
+// correct for all of those cases at the cost of a per-row unpack.
+static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t& channels, AuxLayout& how)
+{
+    struct Entry
+    {
+        DXGI_FORMAT format;
+        uint32_t arrayFormat;
+        uint32_t channels;
+    };
+    // UNORM and SNORM map onto signed/unsigned integer arrays of the same width: sampling
+    // normalizes them, which is exactly how a D3D12 shader reads the resource.
+    static const Entry entries[] = {
+        {DXGI_FORMAT_R8_UNORM, CUDA_FORMAT_UNSIGNED_INT8, 1},
+        {DXGI_FORMAT_R8_SNORM, CUDA_FORMAT_SIGNED_INT8, 1},
+        {DXGI_FORMAT_R8G8_UNORM, CUDA_FORMAT_UNSIGNED_INT8, 2},
+        {DXGI_FORMAT_R8G8_SNORM, CUDA_FORMAT_SIGNED_INT8, 2},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, CUDA_FORMAT_UNSIGNED_INT8, 4},
+        {DXGI_FORMAT_R8G8B8A8_SNORM, CUDA_FORMAT_SIGNED_INT8, 4},
+        {DXGI_FORMAT_R16_UNORM, CUDA_FORMAT_UNSIGNED_INT16, 1},
+        {DXGI_FORMAT_R16_SNORM, CUDA_FORMAT_SIGNED_INT16, 1},
+        {DXGI_FORMAT_R16_FLOAT, CUDA_FORMAT_HALF, 1},
+        {DXGI_FORMAT_R16G16_UNORM, CUDA_FORMAT_UNSIGNED_INT16, 2},
+        {DXGI_FORMAT_R16G16_SNORM, CUDA_FORMAT_SIGNED_INT16, 2},
+        {DXGI_FORMAT_R16G16_FLOAT, CUDA_FORMAT_HALF, 2},
+        {DXGI_FORMAT_R16G16B16A16_UNORM, CUDA_FORMAT_UNSIGNED_INT16, 4},
+        {DXGI_FORMAT_R16G16B16A16_SNORM, CUDA_FORMAT_SIGNED_INT16, 4},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, CUDA_FORMAT_HALF, 4},
+        {DXGI_FORMAT_R32_FLOAT, CUDA_FORMAT_FLOAT, 1},
+        {DXGI_FORMAT_R32G32_FLOAT, CUDA_FORMAT_FLOAT, 2},
+        {DXGI_FORMAT_R32G32B32A32_FLOAT, CUDA_FORMAT_FLOAT, 4},
+    };
+    for (const Entry& entry : entries)
+        if (entry.format == format)
+        {
+            arrayFormat = entry.arrayFormat;
+            channels = entry.channels;
+            how = AuxLayout::Verbatim;
+            return true;
+        }
+    // Converted formats all end up as float arrays, so a shader read of the denoiser's
+    // texture returns the same numbers a D3D12 read of the caller's resource would.
+    struct Converted
+    {
+        DXGI_FORMAT format;
+        uint32_t channels;
+    };
+    static const Converted converted[] = {
+        {DXGI_FORMAT_R8_UINT, 1},
+        {DXGI_FORMAT_R8G8_UINT, 2},
+        {DXGI_FORMAT_R8G8B8A8_UINT, 4},
+        {DXGI_FORMAT_R16_UINT, 1},
+        {DXGI_FORMAT_R32_UINT, 1},
+        {DXGI_FORMAT_R32_SINT, 1},
+        {DXGI_FORMAT_R32G32_UINT, 2},
+        {DXGI_FORMAT_R32G32_SINT, 2},
+        {DXGI_FORMAT_R32G32B32A32_UINT, 4},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, 4},
+        {DXGI_FORMAT_R10G10B10A2_UNORM, 4},
+        {DXGI_FORMAT_R11G11B10_FLOAT, 3},
+    };
+    for (const Converted& entry : converted)
+        if (entry.format == format)
+        {
+            arrayFormat = CUDA_FORMAT_FLOAT;
+            channels = entry.channels;
+            how = AuxLayout::Converted;
+            return true;
+        }
+    return false;
+}
+
+// Unpacks one row of a converted denoiser input into `channels` floats per texel. Every
+// branch reads exactly the bytes of one texel and no more.
+static void convert_aux_row(DXGI_FORMAT format, const uint8_t* source, float* destination, UINT width,
+                            uint32_t channels)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8_UINT:
+        for (UINT x = 0; x < width; ++x)
+            destination[x] = static_cast<float>(source[x]);
+        return;
+    case DXGI_FORMAT_R8G8_UINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            destination[x * 2] = static_cast<float>(source[x * 2]);
+            destination[x * 2 + 1] = static_cast<float>(source[x * 2 + 1]);
+        }
+        return;
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+        for (UINT x = 0; x < width; ++x)
+            for (uint32_t c = 0; c < 4; ++c)
+                destination[x * 4 + c] = static_cast<float>(source[x * 4 + c]);
+        return;
+    case DXGI_FORMAT_R16_UINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            uint16_t value;
+            std::memcpy(&value, source + x * 2, sizeof(value));
+            destination[x] = static_cast<float>(value);
+        }
+        return;
+    case DXGI_FORMAT_R32_UINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            uint32_t value;
+            std::memcpy(&value, source + x * 4, sizeof(value));
+            destination[x] = static_cast<float>(value);
+        }
+        return;
+    case DXGI_FORMAT_R32_SINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            int32_t value;
+            std::memcpy(&value, source + x * 4, sizeof(value));
+            destination[x] = static_cast<float>(value);
+        }
+        return;
+    case DXGI_FORMAT_R32G32_UINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            uint32_t value[2];
+            std::memcpy(value, source + x * 8, sizeof(value));
+            destination[x * 2] = static_cast<float>(value[0]);
+            destination[x * 2 + 1] = static_cast<float>(value[1]);
+        }
+        return;
+    case DXGI_FORMAT_R32G32_SINT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            int32_t value[2];
+            std::memcpy(value, source + x * 8, sizeof(value));
+            destination[x * 2] = static_cast<float>(value[0]);
+            destination[x * 2 + 1] = static_cast<float>(value[1]);
+        }
+        return;
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+        for (UINT x = 0; x < width; ++x)
+            for (uint32_t c = 0; c < 4; ++c)
+            {
+                uint32_t value;
+                std::memcpy(&value, source + x * 16 + c * 4, sizeof(value));
+                destination[x * 4 + c] = static_cast<float>(value);
+            }
+        return;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        // Stored B, G, R, A; the denoiser's texture is read as R, G, B, A.
+        for (UINT x = 0; x < width; ++x)
+        {
+            const uint8_t* texel = source + x * 4;
+            destination[x * 4] = unorm(texel[2], 8);
+            destination[x * 4 + 1] = unorm(texel[1], 8);
+            destination[x * 4 + 2] = unorm(texel[0], 8);
+            destination[x * 4 + 3] = unorm(texel[3], 8);
+        }
+        return;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        for (UINT x = 0; x < width; ++x)
+        {
+            uint32_t packed;
+            std::memcpy(&packed, source + x * 4, sizeof(packed));
+            destination[x * 4] = unorm(packed & 0x3FF, 10);
+            destination[x * 4 + 1] = unorm((packed >> 10) & 0x3FF, 10);
+            destination[x * 4 + 2] = unorm((packed >> 20) & 0x3FF, 10);
+            destination[x * 4 + 3] = unorm((packed >> 30) & 0x3, 2);
+        }
+        return;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        for (UINT x = 0; x < width; ++x)
+        {
+            uint32_t packed;
+            std::memcpy(&packed, source + x * 4, sizeof(packed));
+            destination[x * 3] = small_float_to_float(packed & 0x7FF, 6);
+            destination[x * 3 + 1] = small_float_to_float((packed >> 11) & 0x7FF, 6);
+            destination[x * 3 + 2] = small_float_to_float((packed >> 22) & 0x3FF, 5);
+        }
+        return;
+    default:
+        break;
+    }
+    // Unreachable: aux_array_layout only marks a format Converted when this switch handles it.
+    for (UINT x = 0; x < width * channels; ++x)
+        destination[x] = 0.0f;
+}
+
+// The texel size `format` occupies, for the pitch of an interop buffer holding it verbatim.
+static size_t aux_texel_bytes(uint32_t arrayFormat, uint32_t channels)
+{
+    const size_t element = arrayFormat == CUDA_FORMAT_FLOAT || arrayFormat == CUDA_FORMAT_UNSIGNED_INT32 ||
+                                   arrayFormat == CUDA_FORMAT_SIGNED_INT32
+                               ? 4
+                               : (arrayFormat == CUDA_FORMAT_HALF || arrayFormat == CUDA_FORMAT_UNSIGNED_INT16 ||
+                                  arrayFormat == CUDA_FORMAT_SIGNED_INT16)
+                                     ? 2
+                                     : 1;
+    return element * channels;
+}
+
+// One auxiliary surface: the name to ask the caller for, and the name the denoiser reads
+// it under. They differ for the two albedos, which the SDK and the shipped library spell
+// differently, in which case `source` names the caller's parameter and `publish` the
+// denoiser's.
+struct AuxInput
+{
+    const char* source;
+    const char* publish;
+};
+
+// Every auxiliary read name nvngx_dlssd.dll looks up, verified against the names in the
+// shipped library and the SDK's nvsdk_ngx_defs_dlssd.h. A caller may bind several of these
+// to one texture, so surfaces are keyed on the resource and carry every name bound to it.
+//
+// The publish column is the name the denoiser reads, taken from the shipped library's own
+// lookup table (its .rdata strings, each referenced exactly once from
+// NGXDLSSD::EvaluateFeature). It is not always the SDK's spelling: nvngx_dlssd.dll declares
+// DLSS.Input.Normals.Subrect.Base.X/Y and DLSS.Input.Roughness.Subrect.Base.X/Y, but it reads
+// the normals and roughness textures themselves as GBuffer.Normals and GBuffer.Roughness. It
+// does read the two albedos as DLSS.Input.DiffuseAlbedo and DLSS.Input.SpecularAlbedo, which a
+// caller may instead supply as GBuffer.DiffuseAlbedo / GBuffer.SpecularAlbedo - the SDK defines
+// both spellings, so both are accepted and both publish the name the denoiser asks for. The
+// subrect origins in kAuxSubrectNames are a separate matter and keep the SDK's own names.
+static const AuxInput kAuxInputs[] = {
+    // Ray-traced G-buffer
+    {"GBuffer.Normals", "GBuffer.Normals"},
+    {"GBuffer.Roughness", "GBuffer.Roughness"},
+    {"DLSS.Input.DiffuseAlbedo", "DLSS.Input.DiffuseAlbedo"},
+    {"GBuffer.DiffuseAlbedo", "DLSS.Input.DiffuseAlbedo"},
+    {"GBuffer.IndirectAlbedo", "GBuffer.IndirectAlbedo"},
+    {"DLSS.Input.SpecularAlbedo", "DLSS.Input.SpecularAlbedo"},
+    {"GBuffer.SpecularAlbedo", "DLSS.Input.SpecularAlbedo"},
+    {"GBuffer.Emissive", "GBuffer.Emissive"},
+    {"GBuffer.SpecularMvec", "GBuffer.SpecularMvec"},
+    // Ray-tracing noise hints
+    {"RayTracingHitDistance", "RayTracingHitDistance"},
+    {"DLSSD.DiffuseHitDistance", "DLSSD.DiffuseHitDistance"},
+    {"DLSSD.SpecularHitDistance", "DLSSD.SpecularHitDistance"},
+    {"DLSSD.DiffuseRayDirection", "DLSSD.DiffuseRayDirection"},
+    {"DLSSD.SpecularRayDirection", "DLSSD.SpecularRayDirection"},
+    {"DLSSD.DiffuseRayDirectionHitDistance", "DLSSD.DiffuseRayDirectionHitDistance"},
+    {"DLSSD.SpecularRayDirectionHitDistance", "DLSSD.SpecularRayDirectionHitDistance"},
+    {"DLSSD.ReflectedAlbedo", "DLSSD.ReflectedAlbedo"},
+    // Per-effect guides, read only when the game preserves that effect
+    {"DLSSD.ColorBeforeParticles", "DLSSD.ColorBeforeParticles"},
+    {"DLSSD.ColorAfterParticles", "DLSSD.ColorAfterParticles"},
+    {"DLSSD.ColorBeforeTransparency", "DLSSD.ColorBeforeTransparency"},
+    {"DLSSD.ColorAfterTransparency", "DLSSD.ColorAfterTransparency"},
+    {"DLSSD.ColorBeforeFog", "DLSSD.ColorBeforeFog"},
+    {"DLSSD.ColorAfterFog", "DLSSD.ColorAfterFog"},
+    {"DLSSD.DepthOfFieldGuide", "DLSSD.DepthOfFieldGuide"},
+    {"DLSSD.ColorBeforeDepthOfField", "DLSSD.ColorBeforeDepthOfField"},
+    {"DLSSD.ColorAfterDepthOfField", "DLSSD.ColorAfterDepthOfField"},
+    {"DLSSD.ScreenSpaceRefractionGuide", "DLSSD.ScreenSpaceRefractionGuide"},
+    {"DLSSD.ColorBeforeScreenSpaceRefraction", "DLSSD.ColorBeforeScreenSpaceRefraction"},
+    {"DLSSD.ColorAfterScreenSpaceRefraction", "DLSSD.ColorAfterScreenSpaceRefraction"},
+    {"DLSSD.ScreenSpaceSubsurfaceScatteringGuide", "DLSSD.ScreenSpaceSubsurfaceScatteringGuide"},
+    {"DLSSD.ColorBeforeScreenSpaceSubsurfaceScattering", "DLSSD.ColorBeforeScreenSpaceSubsurfaceScattering"},
+    {"DLSSD.ColorAfterScreenSpaceSubsurfaceScattering", "DLSSD.ColorAfterScreenSpaceSubsurfaceScattering"},
+    {"DLSSD.Alpha", "DLSSD.Alpha"},
+    // Masks and secondary motion
+    {"DLSS.DisocclusionMask", "DLSS.DisocclusionMask"},
+    {"DLSS.Input.Reduce.Ghost.Mask", "DLSS.Input.Reduce.Ghost.Mask"},
+    {"DLSSD.ResponsivityMask", "DLSSD.ResponsivityMask"},
+    {"MotionVectorsReflection", "MotionVectorsReflection"},
+    {"TransparencyMask", "TransparencyMask"},
+    {"DepthHighRes", "DepthHighRes"},
+};
+
+// Scalars the denoiser reads per frame, forwarded from the caller's own parameters.
+struct AuxScalar
+{
+    const char* name;
+};
+
+static const AuxScalar kAuxScalars[] = {
+    {"DLSS.Denoise.Mode"},
+    {"DLSS.Roughness.Mode"},
+    {"DLSS.Use.HW.Depth"},
+    {"DLSS.Use.Folded.Network"},
+    {"DLSSD.IndicatorLevel"},
+    {"DLSS.Translucency.Type"},
+    {"DLSS.Subsurface.Type"},
+    {"DLSS.Specular.Type"},
+};
+
+// The camera matrices the denoiser reprojects with, forwarded as the float[16] the caller
+// registered (the SDK passes matrices by pointer, not as sixteen scalars).
+static const char* const kAuxMatrices[] = {"WorldToViewMatrix", "ViewToClipMatrix"};
+
+static unsigned int get_uint_or(void* parameters, const char* name, unsigned int fallback);
+
+// The Subrect origins nvngx_dlssd.dll declares for its auxiliary inputs
+// (nvsdk_ngx_defs_dlssd.h:60-67 and 99-146). A name here has both a .Subrect.Base.X and a
+// .Subrect.Base.Y parameter; the parallel FrameParams array holds one origin per entry, and
+// the strings are static so no per-frame allocation is needed to forward them.
+static const char* const kAuxSubrectNames[] = {
+    "DLSS.Input.DiffuseAlbedo",       "DLSS.Input.SpecularAlbedo", "DLSS.Input.Normals",
+    "DLSS.Input.Roughness",           "DLSSD.Alpha",               "DLSSD.ReflectedAlbedo",
+    "DLSSD.ColorBeforeParticles",     "DLSSD.ColorAfterParticles", "DLSSD.ColorBeforeTransparency",
+    "DLSSD.ColorAfterTransparency",   "DLSSD.ColorBeforeFog",      "DLSSD.ColorAfterFog",
+    "DLSSD.ScreenSpaceRefractionGuide", "DLSSD.ColorBeforeScreenSpaceRefraction",
+    "DLSSD.ColorAfterScreenSpaceRefraction", "DLSSD.ScreenSpaceSubsurfaceScatteringGuide",
+    "DLSSD.ColorBeforeScreenSpaceSubsurfaceScattering",
+    "DLSSD.ColorAfterScreenSpaceSubsurfaceScattering", "DLSSD.DepthOfFieldGuide",
+    "DLSSD.ColorBeforeDepthOfField",  "DLSSD.ColorAfterDepthOfField", "DLSSD.DiffuseHitDistance",
+    "DLSSD.SpecularHitDistance",      "DLSSD.DiffuseRayDirection", "DLSSD.SpecularRayDirection",
+    "DLSSD.DiffuseRayDirectionHitDistance", "DLSSD.SpecularRayDirectionHitDistance",
 };
 
 struct FrameParams
@@ -1603,6 +2202,19 @@ struct FrameParams
     bool vram = false; // inputs and output stay in VRAM (VRAM interop)
     bool split = false; // this frame presents its own result (split frames)
     unsigned motionDilation = 0; // actually applied, worker only
+    // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices, copied
+    // off the caller's parameter object on the game thread so the worker never reads an
+    // object the game may have destroyed by then. A scalar the caller did not set this frame
+    // carries the creation-time value, not an invented one and not last frame's override; a
+    // matrix the caller did not set is published as absent, because the pointer names this
+    // frame's storage and nothing outlives it.
+    int auxScalar[sizeof(kAuxScalars) / sizeof(kAuxScalars[0])] = {};
+    bool auxScalarSet[sizeof(kAuxScalars) / sizeof(kAuxScalars[0])] = {};
+    float auxMatrix[sizeof(kAuxMatrices) / sizeof(kAuxMatrices[0])][16] = {};
+    bool auxMatrixSet[sizeof(kAuxMatrices) / sizeof(kAuxMatrices[0])] = {};
+    // One Subrect origin per entry of kAuxSubrectNames, snapshotted per frame. Zero means the
+    // caller did not register one, and zero is what is forwarded - never the previous frame's.
+    unsigned int auxSubrect[sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0])][2] = {};
 };
 
 struct FrameTiming
@@ -1638,6 +2250,41 @@ struct HostPlane
     size_t size() const { return rowBytes * height; }
 };
 
+// Ray Reconstruction auxiliary surface: one per distinct D3D12Resource the caller registers,
+// keyed on the resource because several names routinely resolve to one texture. The surface
+// carries the caller's own DXGI format - it is never converted to a canonical plane - so the
+// texture object the denoiser samples describes exactly what was rendered.
+//
+// The surface outlives the frames that name it: `holds` counts queued frames still referring
+// to it, and the resource is AddRef'd so a caller that releases it while a frame is in flight
+// cannot pull it out from under the copy recorded on its command list.
+struct AuxSurface
+{
+    ID3D12Resource* resource = nullptr;
+    std::vector<const char*> publish;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT width = 0, height = 0;
+    uint32_t arrayFormat = 0, channels = 0;
+    AuxLayout how = AuxLayout::Verbatim; // whether the bytes reach the array as they are
+    uint32_t lastSeen = 0;  // frame the caller last registered this resource
+    unsigned int holds = 0; // queued frames still naming this surface
+    bool dropping = false;  // no longer registered; freed once holds reaches zero
+    CudaImage image;        // worker only
+    CudaObject handle = 0;  // what the parameters point at; its address must stay put
+    Staging staging[kSlots];
+    HostPlane host[kSlots]; // unpacked floats, only for a converted surface (worker only)
+};
+
+// What one frame's slot bound: which surface answered which denoiser name, for that frame
+// only. Publish reads this, never the live surface list, so a surface the caller registered
+// last frame is never handed to the denoiser for a frame that did not register it.
+struct AuxBinding
+{
+    AuxSurface* surface = nullptr;
+    std::vector<const char*> names;
+    uint32_t frame = 0;
+};
+
 struct InputSlot
 {
     Staging color, depth, motion, exposure;
@@ -1652,9 +2299,34 @@ struct InputSlot
     CudaObject dilatedTexture = 0;
     UINT dilatedWidth = 0, dilatedHeight = 0;
     size_t dilatedPitch = 0;
+    std::vector<AuxBinding> auxBindings; // this slot's denoiser inputs, for one frame
+    // The DLSSD.OutputAlpha texture the caller asked for on this frame, held until the frame
+    // retires. Present only on a frame that actually registered it.
+    ID3D12Resource* alphaResource = nullptr;
+    UINT alphaWidth = 0, alphaHeight = 0, alphaBaseX = 0, alphaBaseY = 0;
+    UINT alphaExtentW = 0, alphaExtentH = 0;
+    DXGI_FORMAT alphaFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t alphaWriteback = 0;
+    bool alphaRequested = false;
     std::atomic<bool> busy{false}; // readback staging owned by the pipeline
     HostPlane host[4];
     std::atomic<bool> hostBusy{false}; // host planes not yet uploaded by the worker
+};
+
+// DLSSD.OutputAlpha is an OUTPUT the denoiser writes (nvsdk_ngx_defs_dlssd.h:98, with its own
+// Subrect base at 101/102). It is delivered back through its own ring of slots, modelled on
+// OutputSlot above, because it has exactly the same lifetime problem as the colour output: a
+// result staged for one frame is read by a later frame's command list, so it must not be
+// rewritten until every reader has passed.
+struct AlphaSlot
+{
+    Staging staging;                            // upload buffer holding one result
+    std::atomic<uint32_t> lastReadFrame{0};     // reserved/last-read frame, as OutputSlot's
+    std::atomic<uint32_t> producedFrame{0};     // frame that filled it
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT baseX = 0, baseY = 0;                  // where this result sits in the staging buffer
+    UINT width = 0, height = 0;                 // the region it covers
+    uint32_t writeback = 0;                     // destination texel kind (see alpha_output_layout)
 };
 
 struct OutputSlot
@@ -1736,6 +2408,34 @@ struct Feature
     // Serializes picking the slot to present (game thread) against picking
     // the slot to overwrite (worker).
     std::mutex outputMutex;
+    // Ray Reconstruction: feature 13, which the NGX core dispatches to the denoiser it
+    // loaded. Super Sampling features leave this false and differ only in their feature id
+    // and their preset names.
+    bool rayReconstruction = false;
+    // The denoiser's settings as the caller stated them at creation time. A setting the
+    // caller varies per frame must fall back to this, not to the previous frame's value:
+    // the parameter object outlives the frame, so an untouched one would silently carry
+    // over an override that is no longer being asked for.
+    int auxScalarBaseline[sizeof(kAuxScalars) / sizeof(kAuxScalars[0])] = {};
+
+    // The denoiser's alpha output. Its CUDA surface is float32 single channel: the vendor's
+    // transformer output kernel stores it as a nullable scalar float32 pixel
+    // (sust.p.2d.b32.zero at param+248), so that is what the surface is created as.
+    CudaImage alphaImage;
+    HostPlane alphaHost; // worker: the read-back float32 result
+    AlphaSlot alpha[kOutputSlots];
+    std::atomic<int> latestAlpha{-1}; // the slot holding the newest unpresented result
+
+    // A list, not a vector or a deque: the parameter object holds &AuxSurface.handle for the
+    // duration of the denoiser's evaluate, so every element must keep its address. A vector
+    // moves elements on growth and a deque invalidates *all* references when an element is
+    // erased from the middle - which is exactly what dropping a surface does while other
+    // surfaces are still queued. A list's erase touches only the element removed.
+    std::list<AuxSurface> aux; // the caller's registered surfaces, under auxMutex
+    // The game thread rewrites this list from the caller's parameter object while the worker
+    // reads it, and the parameter object holds &aux.handle for the duration of the
+    // denoiser's evaluate, so every aux access is under this lock.
+    std::mutex auxMutex;
 };
 
 static std::mutex g_featuresMutex;
@@ -1850,7 +2550,8 @@ static CudaTextureDesc input_sampler(UINT width, uint32_t channels, bool linear)
 static bool ensure_cuda_image(CudaImage& image, UINT width, UINT height, uint32_t format, uint32_t channels,
                               bool surface, bool linear)
 {
-    if (image.array != nullptr && image.width == width && image.height == height)
+    if (image.array != nullptr && image.width == width && image.height == height &&
+        image.format == format && image.channels == channels)
         return true;
     if (image.object != 0)
         surface ? g.cu.surfObjectDestroy(image.object) : g.cu.texObjectDestroy(image.object);
@@ -1904,6 +2605,8 @@ static bool ensure_cuda_image(CudaImage& image, UINT width, UINT height, uint32_
     }
     image.width = width;
     image.height = height;
+    image.format = format;
+    image.channels = channels;
     return true;
 }
 
@@ -3298,6 +4001,635 @@ static void write_output(Staging& staging, const HostPlane& host, FrameTiming* t
         timing->outputConvert = profile_ms(conversionStart, ProfileClock::now());
 }
 
+static ID3D12Resource* get_resource(void* parameters, const char* name)
+{
+    ID3D12Resource* resource = nullptr;
+    if (d4r_ngx_get_d3d12_resource(parameters, name, &resource) == NGX_SUCCESS && resource != nullptr)
+        return resource;
+    void* raw = nullptr;
+    if (d4r_ngx_get_void(parameters, name, &raw) == NGX_SUCCESS)
+        return static_cast<ID3D12Resource*>(raw);
+    return nullptr;
+}
+
+// --- DLSSD.OutputAlpha: the denoiser's own output ---------------------------------
+//
+// nvsdk_ngx_defs_dlssd.h:98 makes this an OUTPUT the denoiser writes, not another G-buffer
+// input, and it carries its own Subrect base (101/102), so it has to come back to the caller
+// rather than be read from it.
+//
+// The surface is float32, single channel: the vendor's transformer output kernel stores this
+// value as a nullable scalar float32 pixel (sust.p.2d.b32.zero against param+248), so the
+// surface object is created over a 1-channel float array and converted once on the way out.
+//
+// Everything else is borrowed from the colour output's proven lifecycle - a ring of slots, a
+// claim so a staged result is not overwritten while a recorded command list still reads it,
+// and the result presented a frame later - rather than being a second, asymmetric mechanism.
+
+// The single-channel formats a caller may register, and how to write each back.
+static bool alpha_output_layout(DXGI_FORMAT format, uint32_t& writeback)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8_UNORM: writeback = 1; return true;
+    case DXGI_FORMAT_R8_UINT: writeback = 2; return true;
+    case DXGI_FORMAT_R16_FLOAT: writeback = 3; return true;
+    case DXGI_FORMAT_R16_UNORM: writeback = 4; return true;
+    case DXGI_FORMAT_R16_UINT: writeback = 5; return true;
+    case DXGI_FORMAT_R32_FLOAT: writeback = 6; return true;
+    default: return false;
+    }
+}
+
+static size_t alpha_texel_bytes(uint32_t writeback)
+{
+    return writeback <= 2 ? 1 : (writeback <= 5 ? 2 : 4);
+}
+
+static void write_alpha_texel(uint32_t writeback, uint8_t* destination, float value)
+{
+    switch (writeback)
+    {
+    case 1:
+    {
+        const uint32_t v = to_unorm(value, 8);
+        std::memcpy(destination, &v, 1);
+        return;
+    }
+    case 2:
+    {
+        const uint8_t v = value <= 0.0f ? 0u : (value >= 255.0f ? 255u : static_cast<uint8_t>(value));
+        std::memcpy(destination, &v, sizeof(v));
+        return;
+    }
+    case 3:
+    {
+        const uint16_t v = float_to_half(value);
+        std::memcpy(destination, &v, sizeof(v));
+        return;
+    }
+    case 4:
+    {
+        const uint16_t v = static_cast<uint16_t>(to_unorm(value, 16));
+        std::memcpy(destination, &v, sizeof(v));
+        return;
+    }
+    case 5:
+    {
+        const uint32_t v = value <= 0.0f ? 0u : (value >= 65535.0f ? 65535u : static_cast<uint32_t>(value));
+        const uint16_t narrow = static_cast<uint16_t>(v);
+        std::memcpy(destination, &narrow, sizeof(narrow));
+        return;
+    }
+    default:
+    {
+        std::memcpy(destination, &value, sizeof(value));
+        return;
+    }
+    }
+}
+
+// Game thread. Records which DLSSD.OutputAlpha texture this frame wants written, and holds a
+// reference on it until the frame retires. Refuses loudly a texture this file cannot fill:
+// accepting the frame and leaving the caller's surface untouched is exactly the silent wrong
+// answer this whole route exists to avoid. Sets nothing on the CUDA parameter object - that is
+// the worker's, and this runs on the game thread.
+static bool capture_alpha_output(Feature& feature, void* parameters, int slotIndex, uint32_t frame)
+{
+    InputSlot& slot = feature.inputs[slotIndex];
+    ID3D12Resource* const resource = get_resource(parameters, "DLSSD.OutputAlpha");
+    if (resource == nullptr)
+    {
+        slot.alphaRequested = false;
+        return true;
+    }
+    D3D12_RESOURCE_DESC desc;
+    resource->GetDesc(&desc);
+    uint32_t writeback = 0;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+        desc.Width == 0 || desc.Height == 0 || desc.Width > 0xFFFFFFFFull || desc.SampleDesc.Count != 1 ||
+        !alpha_output_layout(desc.Format, writeback))
+    {
+        logf("Ray Reconstruction: DLSSD.OutputAlpha is %s %llux%u array=%u samples=%u fmt=0x%x, which this "
+             "file cannot write back; this frame's evaluation is refused rather than accepted with the "
+             "texture left untouched",
+             desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ? "a texture" : "not a texture", desc.Width,
+             desc.Height, desc.DepthOrArraySize, desc.SampleDesc.Count, desc.Format);
+        return false;
+    }
+    // The caller's Subrect. The surface is allocated at the texture's FULL extent and the base
+    // is forwarded, so the denoiser stores where the caller expects; only the evaluated region
+    // is copied back, leaving the caller's pixels outside it untouched.
+    const UINT baseX = get_uint_or(parameters, "DLSSD.OutputAlpha.Subrect.Base.X", 0);
+    const UINT baseY = get_uint_or(parameters, "DLSSD.OutputAlpha.Subrect.Base.Y", 0);
+    // Guard the subtractions themselves: a base outside the texture underflows below.
+    if (baseX > desc.Width || baseY > desc.Height)
+    {
+        logf("Ray Reconstruction: DLSSD.OutputAlpha subrect origin (%u,%u) is outside its %llux%u texture; "
+             "this frame's evaluation is refused",
+             baseX, baseY, desc.Width, desc.Height);
+        return false;
+    }
+    // The evaluated region is the output size placed at that origin, and it must fit; it is not
+    // clamped silently into whatever happens to fit.
+    const UINT remainingW = static_cast<UINT>(desc.Width) - baseX;
+    const UINT remainingH = desc.Height - baseY;
+    UINT extentW = get_uint_or(parameters, "OutWidth", feature.outWidth);
+    UINT extentH = get_uint_or(parameters, "OutHeight", feature.outHeight);
+    if (extentW == 0 || extentW > remainingW || extentH == 0 || extentH > remainingH)
+    {
+        logf("Ray Reconstruction: DLSSD.OutputAlpha needs a %ux%u region at (%u,%u) inside a %llux%u texture, "
+             "which does not fit; this frame's evaluation is refused",
+             extentW, extentH, baseX, baseY, desc.Width, desc.Height);
+        return false;
+    }
+    if (slot.alphaResource != nullptr && slot.alphaResource != resource)
+    {
+        slot.alphaResource->Release();
+        slot.alphaResource = nullptr; // so the new resource is always AddRef'd below
+    }
+    if (slot.alphaResource == nullptr)
+        resource->AddRef();
+    slot.alphaResource = resource;
+    slot.alphaFormat = desc.Format;
+    slot.alphaWidth = static_cast<UINT>(desc.Width); // full extent: where the vendor stores
+    slot.alphaHeight = desc.Height;
+    slot.alphaBaseX = baseX;
+    slot.alphaBaseY = baseY;
+    slot.alphaExtentW = extentW;                    // what is actually copied back
+    slot.alphaExtentH = extentH;
+    slot.alphaWriteback = writeback;
+    slot.alphaRequested = true;
+    if (frame <= 2)
+        logf("Ray Reconstruction: DLSSD.OutputAlpha %ux%u fmt=0x%x, subrect (%u,%u) region %ux%u", desc.Width,
+             desc.Height, desc.Format, baseX, baseY, extentW, extentH);
+    return true;
+}
+
+// Worker. Gives the denoiser a float32 single-channel CUDA surface object for this frame's
+// alpha and forwards the subrect origin, so its stores land where the caller expects. Clearing
+// the parameter when no texture was registered keeps the denoiser from writing into a surface
+// belonging to a frame that no longer wants one; the image itself is kept, since dropping it
+// would mean a fresh GPU allocation on the next frame that does ask.
+static bool publish_alpha_output(Feature& feature, const InputSlot& slot)
+{
+    if (!slot.alphaRequested)
+    {
+        d4r_ngx_set_void(feature.cudaParams, "DLSSD.OutputAlpha", nullptr);
+        return true;
+    }
+    if (!ensure_cuda_image(feature.alphaImage, slot.alphaWidth, slot.alphaHeight, CUDA_FORMAT_FLOAT, 1, true, false))
+        return false;
+    d4r_ngx_set_void(feature.cudaParams, "DLSSD.OutputAlpha", &feature.alphaImage.object);
+    d4r_ngx_set_uint(feature.cudaParams, "DLSSD.OutputAlpha.Subrect.Base.X", slot.alphaBaseX);
+    d4r_ngx_set_uint(feature.cudaParams, "DLSSD.OutputAlpha.Subrect.Base.Y", slot.alphaBaseY);
+    return true;
+}
+
+// Worker. The colour output's exact claim: the GPU marker is the only thing that proves a
+// recorded copy has run, so a slot is reusable only once the GPU is past the frame that last
+// read it, and the newest result is never taken from under a reader.
+static int claim_alpha_slot(Feature& feature)
+{
+    const auto start = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        {
+            std::lock_guard<std::mutex> lock(feature.outputMutex);
+            const uint32_t gpuFrame = *feature.markerValue;
+            for (int index = 0; index < kOutputSlots; ++index)
+            {
+                if (index == feature.latestAlpha.load())
+                    continue;
+                if (static_cast<int32_t>(gpuFrame - feature.alpha[index].lastReadFrame.load()) > 0)
+                {
+                    feature.alpha[index].lastReadFrame = 0x7fffffffu + gpuFrame;
+                    return index;
+                }
+            }
+        }
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(50))
+            return -1;
+        d4r_sleep_us(200);
+    }
+}
+
+// Worker. Reads back the surface the denoiser just wrote and converts the evaluated region into
+// the claimed slot's upload buffer. A failure fails the frame: an accepted frame with a missing
+// alpha would leave the caller believing it was written.
+static bool download_alpha_output(Feature& feature, uint32_t frame)
+{
+    const InputSlot& slot = feature.inputs[frame % kSlots];
+    if (!slot.alphaRequested)
+        return true;
+    if (feature.alphaImage.array == nullptr)
+        return false;
+    const int index = claim_alpha_slot(feature);
+    if (index < 0)
+    {
+        logf("frame %u: no free DLSSD.OutputAlpha result slot; the evaluation is dropped", frame);
+        return false;
+    }
+    AlphaSlot& target = feature.alpha[index];
+    if (!ensure_staging(target.staging, slot.alphaResource, D3D12_HEAP_TYPE_UPLOAD))
+    {
+        logf("frame %u: no upload buffer for the DLSSD.OutputAlpha result; the evaluation is dropped", frame);
+        return false;
+    }
+    reserve_host(feature.alphaHost, sizeof(float) * slot.alphaWidth * slot.alphaHeight);
+    if (feature.alphaHost.bytes == nullptr ||
+        feature.alphaHost.capacity < sizeof(float) * slot.alphaWidth * slot.alphaHeight)
+    {
+        logf("frame %u: no room to read the DLSSD.OutputAlpha surface back; the evaluation is dropped", frame);
+        return false;
+    }
+    CudaMemcpy2D copy = {};
+    copy.srcMemoryType = CUDA_MEMORY_ARRAY;
+    copy.srcArray = feature.alphaImage.array;
+    copy.dstMemoryType = CUDA_MEMORY_HOST;
+    copy.dstHost = feature.alphaHost.bytes;
+    copy.dstPitch = sizeof(float) * slot.alphaWidth;
+    copy.WidthInBytes = sizeof(float) * slot.alphaWidth;
+    copy.Height = slot.alphaHeight;
+    // Conversion reads the host bytes immediately, so this transfer must complete on return.
+    if (g.cu.memcpy2D(&copy) != 0)
+    {
+        logf("frame %u: reading the DLSSD.OutputAlpha surface back failed; the evaluation is dropped", frame);
+        return false;
+    }
+    // Only the evaluated rectangle is written, at its position in the buffer. The footprint
+    // offset from GetCopyableFootprints is left alone - it must stay 512-byte aligned - and the
+    // region is instead selected by the source box of the copy below.
+    const float* const source = reinterpret_cast<const float*>(feature.alphaHost.bytes);
+    uint8_t* const destination = target.staging.mapped + target.staging.layout.Offset;
+    const size_t rowPitch = target.staging.layout.Footprint.RowPitch;
+    const size_t texel = alpha_texel_bytes(slot.alphaWriteback);
+    for (UINT row = 0; row < slot.alphaExtentH; ++row)
+        for (UINT x = 0; x < slot.alphaExtentW; ++x)
+            write_alpha_texel(slot.alphaWriteback,
+                              destination + static_cast<size_t>(slot.alphaBaseY + row) * rowPitch +
+                                  static_cast<size_t>(slot.alphaBaseX) * texel + x * texel,
+                              source[static_cast<size_t>(slot.alphaBaseY + row) * slot.alphaWidth + slot.alphaBaseX + x]);
+    {
+        // Published under the same lock the claim uses, exactly as the colour output publishes.
+        std::lock_guard<std::mutex> lock(feature.outputMutex);
+        target.format = slot.alphaFormat;
+        target.baseX = slot.alphaBaseX;
+        target.baseY = slot.alphaBaseY;
+        target.width = slot.alphaExtentW;
+        target.height = slot.alphaExtentH;
+        target.writeback = slot.alphaWriteback;
+        target.lastReadFrame = 0;
+        target.producedFrame = frame;
+        feature.latestAlpha = index;
+    }
+    return true;
+}
+
+// Game thread. Presents the newest finished alpha result into the caller's texture. The slot's
+// lastReadFrame is stamped before the copy is recorded and producedFrame is NOT cleared: the
+// colour output's claim relies on both, and clearing here would let the worker overwrite a
+// result whose command list has not run yet.
+static bool record_alpha_copyback(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot,
+                                  D3D12_RESOURCE_STATES outputState, uint32_t colorFrame)
+{
+    if (!slot.alphaRequested || slot.alphaResource == nullptr)
+        return true;
+    if (colorFrame == 0)
+        return true; // no colour result to pair with this frame
+    int index = -1;
+    {
+        std::lock_guard<std::mutex> lock(feature.outputMutex);
+        // The frame whose colour is about to be presented is `colorFrame`; only an alpha result
+        // produced by that very same frame may go with it. Picking "the newest alpha" instead
+        // would pair alpha N with colour N-1, since the alpha read-back completes before the
+        // colour's, and the caller would composite two different frames. No match, no copy: the
+        // colour is presented on its own and the alpha waits for its own frame to come round.
+        for (int candidate = 0; candidate < kOutputSlots; ++candidate)
+            if (feature.alpha[candidate].producedFrame.load() == colorFrame)
+            {
+                index = candidate;
+                break;
+            }
+        if (index < 0)
+            return true; // the matching frame has not been read back yet; colour goes alone
+        AlphaSlot& chosen = feature.alpha[index];
+        if (chosen.staging.buffer == nullptr || chosen.producedFrame.load() == 0)
+            return true;
+        if (chosen.width != slot.alphaExtentW || chosen.height != slot.alphaExtentH ||
+            chosen.format != slot.alphaFormat || chosen.baseX != slot.alphaBaseX ||
+            chosen.baseY != slot.alphaBaseY)
+        {
+            // The caller's rectangle changed under a result already in flight; presenting it
+            // would write where the caller no longer expects. Leave it for the next result.
+            chosen.producedFrame = 0;
+            return true;
+        }
+        chosen.lastReadFrame = feature.frame;
+    }
+    AlphaSlot& chosen = feature.alpha[index];
+    transition(list, slot.alphaResource, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = slot.alphaResource;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = chosen.staging.buffer;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = chosen.staging.layout;
+    // The source box picks out the evaluated rectangle inside the full-extent staging buffer,
+    // and the destination origin places it at the caller's subrect. Together they leave every
+    // pixel of the caller's texture outside the rectangle untouched.
+    D3D12_BOX box = {};
+    box.left = chosen.baseX;
+    box.top = chosen.baseY;
+    box.right = chosen.baseX + chosen.width;
+    box.bottom = chosen.baseY + chosen.height;
+    box.back = 1;
+    list->CopyTextureRegion(&destination, chosen.baseX, chosen.baseY, 0, &source, &box);
+    transition(list, slot.alphaResource, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
+    return true;
+}
+
+// --- Ray Reconstruction: moving the auxiliary surfaces --------------------------
+
+// How long a caller may stop registering a surface before it is treated as dropped. Long
+// enough that a game which registers its G-buffer lazily, or only on the frames where it
+// changes, keeps it; short enough that a resolution change - which reallocates every resource
+// and can reuse a freed address - does not leave a surface bound to somebody else's texture.
+constexpr uint32_t kAuxStaleFrames = 300;
+
+static AuxSurface* find_aux_surface(Feature& feature, ID3D12Resource* resource)
+{
+    for (AuxSurface& surface : feature.aux)
+        if (surface.resource == resource)
+            return &surface;
+    return nullptr;
+}
+
+static std::string join_aux_names(const std::vector<const char*>& names)
+{
+    std::string joined;
+    for (const char* name : names)
+        joined += std::string(joined.empty() ? "" : ", ") + name;
+    return joined;
+}
+
+// Worker. Frees the CUDA objects of a surface and the caller's reference to its resource.
+// Only ever called once no queued frame names it any more.
+static void destroy_aux_surface(AuxSurface& surface)
+{
+    if (surface.image.object != 0)
+        g.cu.texObjectDestroy(surface.image.object);
+    if (surface.image.array != nullptr)
+        g.cu.arrayDestroy(surface.image.array);
+    for (Staging& staging : surface.staging)
+        staging.release();
+    if (surface.resource != nullptr)
+        surface.resource->Release();
+    logf("Ray Reconstruction: released denoiser input %s (%ux%u fmt=0x%x)", join_aux_names(surface.publish).c_str(),
+         surface.width, surface.height, surface.format);
+}
+
+// Game thread. Finds the auxiliary surfaces the caller registered this frame and records a
+// readback copy of each into this frame's slot, ahead of the frame marker so the worker can
+// read them as soon as that marker is in. The result is this slot's binding snapshot: the
+// worker publishes exactly these, so a surface the caller did not register this frame is
+// neither sampled nor named, whatever it did last frame.
+//
+// A texture the caller did supply but this file cannot hand to the denoiser (a shape or a
+// format with no CUDA layout) fails the evaluation. Silently omitting a guide the denoiser
+// expects is exactly the failure that produces a plausible-looking wrong image, so the frame
+// is refused and the reason named instead.
+static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list, void* parameters, int slotIndex,
+                              D3D12_RESOURCE_STATES inputState, uint32_t frame)
+{
+    InputSlot& slot = feature.inputs[slotIndex];
+    std::lock_guard<std::mutex> lock(feature.auxMutex);
+    std::vector<AuxBinding> bindings;
+    for (const AuxInput& input : kAuxInputs)
+    {
+        ID3D12Resource* const resource = get_resource(parameters, input.source);
+        if (resource == nullptr)
+            continue;
+        AuxSurface* surface = find_aux_surface(feature, resource);
+        if (surface == nullptr)
+        {
+            feature.aux.emplace_back();
+            surface = &feature.aux.back();
+            surface->resource = resource;
+            resource->AddRef(); // held until every frame naming it has retired
+            logf("Ray Reconstruction: denoiser input %s is resource %p", input.source, static_cast<void*>(resource));
+        }
+        surface->dropping = false;
+        surface->lastSeen = frame;
+        // One binding per name: two names for the same texture are two denoiser parameters.
+        AuxBinding* binding = nullptr;
+        for (AuxBinding& candidate : bindings)
+            if (candidate.surface == surface)
+            {
+                binding = &candidate;
+                break;
+            }
+        if (binding == nullptr)
+        {
+            bindings.emplace_back();
+            binding = &bindings.back();
+            binding->surface = surface;
+            binding->frame = frame;
+        }
+        bool listed = false;
+        for (const char* name : surface->publish)
+            listed = listed || strcmp(name, input.publish) == 0;
+        if (!listed)
+            surface->publish.push_back(input.publish);
+        bool bound = false;
+        for (const char* name : binding->names)
+            bound = bound || strcmp(name, input.publish) == 0;
+        if (!bound)
+            binding->names.push_back(input.publish);
+
+        D3D12_RESOURCE_DESC desc;
+        resource->GetDesc(&desc);
+        uint32_t arrayFormat = 0, channels = 0;
+        AuxLayout how = AuxLayout::Verbatim;
+        if (desc.DepthOrArraySize != 1 || desc.Width > 0xFFFFFFFFull ||
+            !aux_array_layout(desc.Format, arrayFormat, channels, how))
+        {
+            logf("Ray Reconstruction: denoiser input %s is %llux%u array=%u fmt=0x%x, which has no single-plane "
+                 "CUDA layout; this frame's evaluation is refused rather than run without it",
+                 join_aux_names(binding->names).c_str(), desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format);
+            return false;
+        }
+        surface->format = desc.Format;
+        surface->arrayFormat = arrayFormat;
+        surface->channels = channels;
+        surface->how = how;
+        surface->width = static_cast<UINT>(desc.Width);
+        surface->height = static_cast<UINT>(desc.Height);
+        if (!ensure_staging(surface->staging[slotIndex], resource, D3D12_HEAP_TYPE_READBACK))
+            return false;
+        copy_to_staging(list, resource, surface->staging[slotIndex], inputState);
+    }
+    // Drop surfaces the caller stopped registering, but only once no queued frame names one:
+    // erasing a surface whose handle is still in a parameter object would leave the denoiser
+    // sampling a freed texture object.
+    for (AuxSurface& surface : feature.aux)
+    {
+        if (surface.holds != 0 || frame - surface.lastSeen < kAuxStaleFrames)
+            continue;
+        surface.dropping = true;
+        logf("Ray Reconstruction: denoiser input %s was not registered for %u frames",
+             join_aux_names(surface.publish).c_str(), kAuxStaleFrames);
+    }
+    // Committed only now. An earlier failure path returns from this function with `bindings`
+    // half-built, and a hold taken there would never be given back - the surface could then
+    // never be dropped, and its reference to the caller's resource would never be released.
+    for (const AuxBinding& binding : bindings)
+        ++binding.surface->holds; // given back by retire_aux_bindings when this frame passes
+    slot.auxBindings = std::move(bindings);
+    return true;
+}
+
+// Worker. Copies this frame's bound surfaces into their CUDA arrays verbatim - same bytes,
+// same row order, only the destination is the GPU - and mints the texture objects the
+// denoiser samples. A failure fails the evaluation: a denoiser handed fewer guides than the
+// caller registered produces a wrong image, not a visible error.
+static bool upload_aux_inputs(Feature& feature, int slotIndex, uint32_t frame)
+{
+    for (const AuxBinding& binding : feature.inputs[slotIndex].auxBindings)
+    {
+        AuxSurface& surface = *binding.surface;
+        const Staging& staging = surface.staging[slotIndex];
+        if (!ensure_cuda_image(surface.image, surface.width, surface.height, surface.arrayFormat,
+                               surface.channels, false, false))
+        {
+            logf("frame %u: Ray Reconstruction input %s: a CUDA texture object over %ux%u fmt=0x%x could not be "
+                 "created",
+                 frame, join_aux_names(binding.names).c_str(), surface.width, surface.height, surface.format);
+            return false;
+        }
+        CudaMemcpy2D copy = {};
+        copy.srcMemoryType = CUDA_MEMORY_HOST;
+        if (surface.how == AuxLayout::Verbatim)
+        {
+            // Use HostPlane staging: direct ROCm image copies from Vulkan-mapped memory
+            // truncate guide rows on gfx1201, even when the source footprint is tightly packed.
+            HostPlane& host = surface.host[slotIndex];
+            const size_t rowBytes = aux_texel_bytes(surface.arrayFormat, surface.channels) * surface.width;
+            reserve_host(host, rowBytes * surface.height);
+            if (host.bytes == nullptr || host.capacity < rowBytes * surface.height)
+                return false;
+            host.width = surface.width;
+            host.height = surface.height;
+            host.rowBytes = rowBytes;
+            for (UINT row = 0; row < surface.height; ++row)
+                memcpy(host.bytes + static_cast<size_t>(row) * rowBytes,
+                       staging.mapped + staging.layout.Offset +
+                           static_cast<size_t>(row) * staging.layout.Footprint.RowPitch, rowBytes);
+            copy.srcHost = host.bytes;
+            copy.srcPitch = rowBytes;
+        }
+        else
+        {
+            // Packed, integer and BGRA inputs are unpacked into floats first: a CUDA array
+            // has no three-channel layout, a uint array is sampled normalized, and BGRA bytes
+            // are in the wrong order for a read as RGBA.
+            HostPlane& host = surface.host[slotIndex];
+            const size_t rowBytes = sizeof(float) * surface.channels * surface.width;
+            reserve_host(host, rowBytes * surface.height);
+            if (host.bytes == nullptr || host.capacity < rowBytes * surface.height)
+            {
+                logf("frame %u: Ray Reconstruction input %s: no room for %zu unpacked bytes",
+                     frame, join_aux_names(binding.names).c_str(), rowBytes * surface.height);
+                return false;
+            }
+            host.width = surface.width;
+            host.height = surface.height;
+            host.rowBytes = rowBytes;
+            const uint8_t* const base = staging.mapped + staging.layout.Offset;
+            for (UINT row = 0; row < surface.height; ++row)
+                convert_aux_row(surface.format, base + static_cast<size_t>(row) * staging.layout.Footprint.RowPitch,
+                                reinterpret_cast<float*>(host.bytes + static_cast<size_t>(row) * rowBytes),
+                                surface.width, surface.channels);
+            copy.srcHost = host.bytes;
+            copy.srcPitch = rowBytes;
+        }
+        copy.dstMemoryType = CUDA_MEMORY_ARRAY;
+        copy.dstArray = surface.image.array;
+        copy.WidthInBytes = aux_texel_bytes(surface.arrayFormat, surface.channels) * surface.width;
+        copy.Height = surface.height;
+        if (copy_2d(copy) != 0)
+        {
+            logf("frame %u: Ray Reconstruction input %s: the upload of %ux%u failed", frame,
+                 join_aux_names(binding.names).c_str(), surface.width, surface.height);
+            return false;
+        }
+        surface.handle = surface.image.object;
+    }
+    return true;
+}
+
+// Worker. Points the denoiser's parameters at this frame's texture objects and forwards the
+// settings and camera matrices the caller registered for this frame. Every name this file
+// ever published is cleared first: the parameter object outlives the frame, so a name left
+// holding last frame's handle would be read as a live texture.
+static void publish_aux_parameters(Feature& feature, FrameParams& p, const InputSlot& slot)
+{
+    void* params = feature.cudaParams;
+    for (size_t index = 0; index < sizeof(kAuxScalars) / sizeof(kAuxScalars[0]); ++index)
+        if (p.auxScalarSet[index])
+            d4r_ngx_set_int(params, kAuxScalars[index].name, p.auxScalar[index]);
+    // Always written, never conditionally: the parameter object outlives this frame, so a
+    // matrix pointer left over from the previous one would dangle the moment this frame's
+    // FrameParams goes out of scope. Absent, it is cleared - the denoiser then knows the
+    // caller supplied none, rather than reading a stale one.
+    for (size_t index = 0; index < sizeof(kAuxMatrices) / sizeof(kAuxMatrices[0]); ++index)
+        d4r_ngx_set_void(params, kAuxMatrices[index],
+                         p.auxMatrixSet[index] ? static_cast<void*>(p.auxMatrix[index]) : nullptr);
+    for (size_t index = 0; index < sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0]); ++index)
+    {
+        static std::string nameX, nameY;
+        nameX.assign(kAuxSubrectNames[index]).append(".Subrect.Base.X");
+        nameY.assign(kAuxSubrectNames[index]).append(".Subrect.Base.Y");
+        d4r_ngx_set_uint(params, nameX.c_str(), p.auxSubrect[index][0]);
+        d4r_ngx_set_uint(params, nameY.c_str(), p.auxSubrect[index][1]);
+    }
+    for (const AuxSurface& surface : feature.aux)
+        for (const char* name : surface.publish)
+            d4r_ngx_set_void(params, name, nullptr);
+    // Pointers to the handles, which is what a CUDA resource parameter is: a variable holding
+    // the object, not the object itself. Two surfaces naming one denoiser input (a caller that
+    // binds GBuffer.DiffuseAlbedo and DLSS.Input.DiffuseAlbedo to different textures) leave the
+    // later one winning, which is the caller's ambiguity to resolve, not this file's.
+    for (const AuxBinding& binding : slot.auxBindings)
+        if (binding.surface->handle != 0)
+            for (const char* name : binding.names)
+                d4r_ngx_set_void(params, name, &binding.surface->handle);
+}
+
+// Worker, once the frame this slot was gathering for has passed. Each bound surface keeps the
+// caller's resource alive until here, and a dropped surface is freed only once its last frame
+// is gone.
+static void retire_aux_bindings(Feature& feature, int slotIndex)
+{
+    std::lock_guard<std::mutex> lock(feature.auxMutex);
+    for (AuxBinding& binding : feature.inputs[slotIndex].auxBindings)
+        if (binding.surface->holds > 0)
+            --binding.surface->holds;
+    feature.inputs[slotIndex].auxBindings.clear();
+    for (auto it = feature.aux.begin(); it != feature.aux.end();)
+    {
+        if (!it->dropping || it->holds != 0)
+        {
+            ++it;
+            continue;
+        }
+        destroy_aux_surface(*it);
+        it = feature.aux.erase(it);
+    }
+}
+
 static void set_evaluation_parameters(Feature& feature, const FrameParams& p)
 {
     void* params = feature.cudaParams;
@@ -3380,6 +4712,12 @@ static void frame_retired(Feature* feature, uint32_t frame)
 {
     if (feature->split)
         release_split_frame(feature, frame);
+    // The denoiser inputs this frame bound belong to the slot it used, and the caller stops
+    // owing them a reference only now that its evaluate has returned.
+    if (feature->rayReconstruction)
+    {
+        retire_aux_bindings(*feature, static_cast<int>(frame % kSlots));
+    }
     feature->inFlight.fetch_sub(1);
 }
 
@@ -3914,7 +5252,9 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
     void* p = feature.cudaParams;
     d4r_ngx_set_uint(p, "Width", params.renderWidth);
     d4r_ngx_set_uint(p, "Height", params.renderHeight);
-    NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+    const unsigned int featureId =
+        feature.rayReconstruction ? NGX_FEATURE_RAY_RECONSTRUCTION : NGX_FEATURE_SUPER_SAMPLING;
+    NgxResult created = g.ngx.createFeature(featureId, p, &feature.cudaHandle);
     unsigned int width = params.renderWidth, height = params.renderHeight;
     if (created != NGX_SUCCESS)
     {
@@ -3925,7 +5265,7 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
         d4r_ngx_set_uint(p, "Width", width);
         d4r_ngx_set_uint(p, "Height", height);
         if (width != 0 && height != 0)
-            created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+            created = g.ngx.createFeature(featureId, p, &feature.cudaHandle);
         feature.refusedWidth = created == NGX_SUCCESS ? params.renderWidth : 0;
         feature.refusedHeight = created == NGX_SUCCESS ? params.renderHeight : 0;
         if (created != NGX_SUCCESS)
@@ -3967,6 +5307,24 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                                  true, false);
     const auto dilationStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     const CudaObject dilatedMotion = ok ? prepare_dilated_motion(*feature, slot, params) : 0;
+    // Ray Reconstruction: the auxiliary surfaces are copied in the same window as the four
+    // main planes, so the one synchronize below covers them as well. The lock is taken only
+    // around the copies and, later, around the evaluate - never across the synchronize, which
+    // is the one long wait here and would otherwise stall the game thread's next gather.
+    bool auxUploaded = false;
+    if (ok && feature->rayReconstruction)
+    {
+        {
+            std::lock_guard<std::mutex> lock(feature->auxMutex);
+            auxUploaded = upload_aux_inputs(*feature, slotIndex, frame);
+        }
+        if (!auxUploaded)
+        {
+            slot.busy = false;
+            frame_retired(feature, frame);
+            return;
+        }
+    }
     // Device-to-array copies (VRAM interop, staged uploads) return before they
     // finish, and NGX does not evaluate on the stream they were issued on, so
     // without this DLSS can sample a mix of this frame's and the previous
@@ -3974,7 +5332,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     // thin geometry in motion. D4R_SHIM_INPUT_SYNC=0 restores the old behaviour.
     static const bool inputSync = env_uint("D4R_SHIM_INPUT_SYNC", 1) != 0;
     // Linear inputs are already ready; other copies need completion before NGX samples them.
-    if (ok && (dilatedMotion != 0 || (inputSync && !linearInputs)))
+    if (ok && (dilatedMotion != 0 || auxUploaded || (inputSync && !linearInputs)))
     {
         const int syncResult = synchronize_default_stream(*feature);
         if (syncResult != 0)
@@ -4004,6 +5362,21 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if (feature->evaluatedFrames++ == 0)
         params.reset = 1;
     set_evaluation_parameters(*feature, params);
+    // Held across the denoiser's evaluate too: the parameter object it is reading names
+    // &auxSurface.handle, which the game thread must not be able to move or erase meanwhile.
+    std::unique_lock<std::mutex> auxLock(feature->auxMutex, std::defer_lock);
+    if (feature->rayReconstruction)
+    {
+        auxLock.lock();
+        publish_aux_parameters(*feature, params, slot);
+        if (!publish_alpha_output(*feature, slot))
+        {
+            auxLock.unlock();
+            slot.busy = false;
+            frame_retired(feature, frame);
+            return;
+        }
+    }
     if (linearInputs)
     {
         // the parameters point at these variables
@@ -4042,9 +5415,13 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     const int eventStartResult = timing.enabled && feature->profileEventsReady
                                      ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
     const auto evalStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
+    // The core dispatches feature 13 to the denoiser it loaded, so this call is the same
+    // either way; only the feature id that created it differs.
     NgxResult result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
     if (result == NGX_FAIL_INVALID_PARAMETER && recreate_for_render_size(*feature, params, frame))
         result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
+    if (auxLock.owns_lock())
+        auxLock.unlock();
     if (feature->outputRedirected && g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1)
     {
         // this frame's output kernel ignored the redirect: publish from the array as usual
@@ -4068,6 +5445,15 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if (result != NGX_SUCCESS || syncResult != 0)
     {
         logf("frame %u: CUDA_EvaluateFeature -> 0x%08x, sync %d", frame, result, syncResult);
+        slot.busy = false;
+        frame_retired(feature, frame);
+        return;
+    }
+    // The alpha surface is complete once the synchronize above has passed. A failure here drops
+    // the whole frame, exactly as a failed synchronize does: an accepted frame with an unwritten
+    // alpha would leave the caller believing it was written.
+    if (feature->rayReconstruction && !download_alpha_output(*feature, frame))
+    {
         slot.busy = false;
         frame_retired(feature, frame);
         return;
@@ -4388,6 +5774,28 @@ static void* new_parameters()
 // Copies the official capability values (availability, driver requirements,
 // and the optimal-settings/stats callbacks, which work on any parameter
 // implementation) into one of our parameter objects.
+// Reads the denoising family out of the core's own capability parameters. Worker only.
+static void refresh_denoiser_capability()
+{
+    void* official = nullptr;
+    if (g.ngx.getCapabilityParameters == nullptr || g.ngx.getCapabilityParameters(&official) != NGX_SUCCESS ||
+        official == nullptr)
+        return;
+    DenoiserCapability capability;
+    int available = 0;
+    capability.available =
+        d4r_ngx_get_int(official, "SuperSamplingDenoising.Available", &available) == NGX_SUCCESS ? available : 0;
+    int initResult = 0;
+    capability.initResult =
+        d4r_ngx_get_int(official, "SuperSamplingDenoising.FeatureInitResult", &initResult) == NGX_SUCCESS
+            ? initResult
+            : static_cast<int>(NGX_FAIL_NOT_INITIALIZED);
+    capability.known = true;
+    g.ngx.destroyParameters(official);
+    std::lock_guard<std::mutex> lock(g_denoiserCapabilityMutex);
+    g_denoiserCapability = capability;
+}
+
 static NgxResult fill_capabilities(void* parameters)
 {
     return g.worker.call([&]() -> NgxResult {
@@ -4410,17 +5818,59 @@ static NgxResult fill_capabilities(void* parameters)
             if (d4r_ngx_get_uint(official, name, &value) == NGX_SUCCESS)
                 d4r_ngx_set_uint(parameters, name, value);
         }
-        const char* pointers[] = {"DLSSOptimalSettingsCallback", "DLSSGetStatsCallback"};
+        // DLSSDOptimalSettingsCallback is not optional decoration: the SDK's helpers call it to
+        // work out the render dimensions, so a Ray Reconstruction route that dropped it would
+        // misbehave in a way that looks like a game bug. Forwarded exactly as the Super
+        // Sampling pair already is - no new ABI is invented here.
+        const char* pointers[] = {"DLSSOptimalSettingsCallback", "DLSSGetStatsCallback",
+                                  "DLSSDOptimalSettingsCallback", "DLSSDGetStatsCallback"};
         for (const char* name : pointers)
         {
             void* value = nullptr;
             if (d4r_ngx_get_void(official, name, &value) == NGX_SUCCESS && value != nullptr)
                 d4r_ngx_set_void(parameters, name, value);
         }
+        // The denoising family is the core's own account of the denoiser it loaded, so it is
+        // passed through rather than re-derived here - and cached, because it is also what
+        // decides whether Ray Reconstruction may be created at all.
+        refresh_denoiser_capability();
+        const char* denoisingInts[] = {"SuperSamplingDenoising.Available",
+                                       "SuperSamplingDenoising.NeedsUpdatedDriver",
+                                       "SuperSamplingDenoising.FeatureInitResult"};
+        for (const char* name : denoisingInts)
+        {
+            int value = 0;
+            if (d4r_ngx_get_int(official, name, &value) == NGX_SUCCESS)
+                d4r_ngx_set_int(parameters, name, value);
+        }
+        const char* denoisingUnsigned[] = {"SuperSamplingDenoising.MinDriverVersionMajor",
+                                           "SuperSamplingDenoising.MinDriverVersionMinor"};
+        for (const char* name : denoisingUnsigned)
+        {
+            unsigned int value = 0;
+            if (d4r_ngx_get_uint(official, name, &value) == NGX_SUCCESS)
+                d4r_ngx_set_uint(parameters, name, value);
+        }
+        // D4R_RR_ENABLE=0 is this file's decision and outranks what the core reports: with the
+        // route switched off, availability reads 0 and the callbacks are cleared, so a game
+        // cannot reach a denoiser route that is not being offered.
+        if (!rr_enabled())
+        {
+            d4r_ngx_set_int(parameters, "SuperSamplingDenoising.Available", 0);
+            d4r_ngx_set_int(parameters, "SuperSamplingDenoising.FeatureInitResult",
+                            static_cast<int>(NGX_FAIL_FEATURE_NOT_SUPPORTED));
+            d4r_ngx_set_void(parameters, "DLSSDOptimalSettingsCallback", nullptr);
+            d4r_ngx_set_void(parameters, "DLSSDGetStatsCallback", nullptr);
+        }
+        const DenoiserCapability capability = denoiser_capability();
+        logf("denoiser capabilities from the core: available=%d init=0x%08x (Ray Reconstruction %s)",
+             capability.available, static_cast<unsigned int>(capability.initResult),
+             rr_denial_reason());
         g.ngx.destroyParameters(official);
         return NGX_SUCCESS;
     });
 }
+
 
 D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetParameters(void** parameters)
 {
@@ -4444,13 +5894,16 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetCapabilityParameters(void** parameters)
         return NGX_FAIL_NOT_INITIALIZED;
     *parameters = new_parameters();
     const NgxResult result = fill_capabilities(*parameters);
-    int available = -1, initResult = -1, needsDriver = -1;
+    int available = -1, initResult = -1, needsDriver = -1, denoising = -1, denoisingInit = -1;
     d4r_ngx_get_int(*parameters, "SuperSampling.Available", &available);
     d4r_ngx_get_int(*parameters, "SuperSampling.FeatureInitResult", &initResult);
     d4r_ngx_get_int(*parameters, "SuperSampling.NeedsUpdatedDriver", &needsDriver);
+    d4r_ngx_get_int(*parameters, "SuperSamplingDenoising.Available", &denoising);
+    d4r_ngx_get_int(*parameters, "SuperSamplingDenoising.FeatureInitResult", &denoisingInit);
     logf("NVSDK_NGX_D3D12_GetCapabilityParameters -> 0x%08x, SuperSampling.Available=%d FeatureInitResult=0x%08x "
-         "NeedsUpdatedDriver=%d",
-         result, available, static_cast<unsigned int>(initResult), needsDriver);
+         "NeedsUpdatedDriver=%d, SuperSamplingDenoising.Available=%d FeatureInitResult=0x%08x",
+         result, available, static_cast<unsigned int>(initResult), needsDriver, denoising,
+         static_cast<unsigned int>(denoisingInit));
     return result;
 }
 
@@ -4477,14 +5930,99 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int, const vo
     return NGX_SUCCESS;
 }
 
-D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(IUnknown*, const void*, NgxFeatureRequirement* requirement)
+// nvsdk_ngx.h: NVSDK_NGX_D3D12_GetFeatureRequirements(IDXGIAdapter *Adapter,
+//   const NVSDK_NGX_FeatureDiscoveryInfo *FeatureDiscoveryInfo,
+//   NVSDK_NGX_FeatureRequirement *OutSupported). The feature is NOT a separate argument: it is
+// FeatureDiscoveryInfo->FeatureID (defs.h, the field after SDKVersion), and the first argument
+// is the display adapter, which must never be read as a feature id.
+D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const void* discovery,
+                                                          NgxFeatureRequirement* requirement)
 {
-    if (requirement != nullptr)
+    if (requirement == nullptr)
+        return NGX_SUCCESS;
+    // NVSDK_NGX_FeatureDiscoveryInfo: { NVSDK_NGX_Version SDKVersion; NVSDK_NGX_Feature FeatureID; ... },
+    // both enums, so FeatureID is the unsigned int at offset 4.
+    unsigned int feature = 0;
+    if (discovery != nullptr)
+        std::memcpy(&feature, static_cast<const char*>(discovery) + sizeof(unsigned int), sizeof(feature));
+    std::memset(requirement, 0, sizeof(*requirement));
+    ensure_portable_config();
+    // The local switch is checked before the core is asked: with D4R_RR_ENABLE=0 this process
+    // is not offering Ray Reconstruction, and the core's authoritative "supported" must not
+    // be passed on to a game that would then create a feature this shim would refuse.
+    if (feature == NGX_FEATURE_RAY_RECONSTRUCTION && !rr_enabled())
     {
-        std::memset(requirement, 0, sizeof(*requirement));
-        requirement->FeatureSupported = 0; // supported
-        requirement->MinHWArchitecture = 0x160;
+        requirement->FeatureSupported = 1; // not supported
+        logf("Ray Reconstruction is not supported: %s", rr_denial_reason());
+        return NGX_SUCCESS;
     }
+    {
+        std::lock_guard<std::mutex> lock(g.mutex);
+        // Requirements must not depend on a prior Init. Load the provider without
+        // initializing NGX here: the later Init retains the game's identity and device.
+        if (ensure_workers_started() != NGX_SUCCESS || (g.core == nullptr && !load_libraries()))
+            return NGX_FAIL_PLATFORM_ERROR;
+        if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
+            load_denoiser_library();
+    }
+    // Otherwise the core's answer is authoritative - it consulted the denoiser it loaded - and
+    // this file only steps in when the core declines.
+    if (g.ngx.getFeatureRequirements != nullptr)
+    {
+        // The adapter this export receives is not what the core's CUDA entry point wants: it
+        // takes a CUdevice ordinal. Passing the adapter pointer through would read its low 32
+        // bits as an ordinal, so the current context's device is asked for instead.
+        int device = 0;
+        const NgxResult result = g.worker.call([&] {
+            if (g.cu.ctxGetDevice != nullptr && g.cu.ctxGetDevice(&device) != 0)
+                device = 0; // no current context: device 0 is this process's only CUDA device
+            return g.ngx.getFeatureRequirements(device, discovery, requirement);
+        });
+        if (result == NGX_SUCCESS)
+        {
+            logf("GetFeatureRequirements(feature=%u, cuda device %d) from the NGX core: supported=%u minHW=0x%x "
+                 "'%s'",
+                 feature, device, requirement->FeatureSupported, requirement->MinHWArchitecture,
+                 requirement->MinOSVersion);
+            return result;
+        }
+        logf("GetFeatureRequirements(feature=%u) from the NGX core -> 0x%08x; answering here instead", feature,
+             result);
+    }
+    if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
+    {
+        // Requirements are legal before Init. Ask the denoiser's discovery export,
+        // not its Init stub, without binding NGX to an application prematurely.
+        if (!g.ngxInitialized && g.denoiser.cudaCapable)
+        {
+            using RequirementsFn = NgxResult (*)(void*, const void*, NgxFeatureRequirement*);
+            RequirementsFn denoiserRequirements = nullptr;
+            if (load_export(g.denoiserModule, "NVSDK_NGX_D3D12_GetFeatureRequirements", denoiserRequirements))
+            {
+                const NgxResult result = g.worker.call([&] {
+                    return denoiserRequirements(adapter, discovery, requirement);
+                });
+                logf("GetFeatureRequirements before Init from DLSS-Denoiser -> 0x%08x, supported=%u",
+                     result, requirement->FeatureSupported);
+                return result;
+            }
+        }
+        const bool supported = ray_reconstruction_available();
+        if (!supported)
+        {
+            requirement->FeatureSupported = 1;
+            logf("Ray Reconstruction is not supported: %s",
+                 g.ngxInitialized ? rr_denial_reason() : "no CUDA-capable DLSS-Denoiser for pre-Init discovery");
+            return NGX_SUCCESS;
+        }
+    }
+    if (feature != NGX_FEATURE_SUPER_SAMPLING && feature != NGX_FEATURE_RAY_RECONSTRUCTION)
+    {
+        requirement->FeatureSupported = 1; // not supported
+        return NGX_SUCCESS;
+    }
+    requirement->FeatureSupported = 0; // supported
+    requirement->MinHWArchitecture = 0x160;
     return NGX_SUCCESS;
 }
 
@@ -4533,10 +6071,30 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         logf("DLSS requires lifetime-aware d4r d3d12.dll/d3d12core.dll; update both files with the shim");
         return NGX_FAIL_PLATFORM_ERROR;
     }
-    if (featureId != NGX_FEATURE_SUPER_SAMPLING || parameters == nullptr || handle == nullptr)
+    // Two features are served here. Super Sampling is feature 1 and Ray Reconstruction
+    // feature 13; the NGX core dispatches the second to the denoiser it loaded, and is
+    // offered feature 13 only once it has reported that denoiser working.
+    const bool rayReconstruction = featureId == NGX_FEATURE_RAY_RECONSTRUCTION;
+    if (featureId != NGX_FEATURE_SUPER_SAMPLING && !rayReconstruction)
     {
         logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unsupported", featureId);
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
+    }
+    if (rayReconstruction)
+    {
+        // A game may create feature 13 without ever asking for capabilities, so the core's
+        // account of the denoiser is fetched here if it has not been already.
+        g.worker.call([] { refresh_denoiser_capability(); return 0; });
+    }
+    if (rayReconstruction && !ray_reconstruction_available())
+    {
+        logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unavailable: %s", featureId, rr_denial_reason());
+        return NGX_FAIL_FEATURE_NOT_SUPPORTED;
+    }
+    if (parameters == nullptr || handle == nullptr)
+    {
+        logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u): no parameters or handle", featureId);
+        return NGX_FAIL_INVALID_PARAMETER;
     }
     auto* feature = new Feature();
     feature->width = get_uint_or(parameters, "Width", 0);
@@ -4548,15 +6106,24 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     feature->quality = quality;
     feature->flags = flags;
     const int subrects = get_int_or(parameters, "DLSS.Enable.Output.Subrects", 0);
-    const char* presetNames[] = {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
-                                 "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
-                                 "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"};
+    // The render preset is chosen by two independent knobs. D4R_DLSS_PRESET forces the
+    // Super Sampling model (NVSDK_NGX_DLSS_Hint_Render_Preset, e.g. 5 = E) and touches only
+    // Super Sampling features; D4R_RR_PRESET forces the Ray Reconstruction model
+    // (NVSDK_NGX_RayReconstruction_Hint_Render_Preset, D = 4, E = 5) and touches only
+    // Ray Reconstruction features. Neither one silently becomes the other.
+    static const char* const kSuperSamplingPresets[] = {
+        "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
+        "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance",
+        "DLSS.Hint.Render.Preset.UltraQuality"};
+    static const char* const kRayReconstructionPresets[] = {
+        "RayReconstruction.Hint.Render.Preset.DLAA", "RayReconstruction.Hint.Render.Preset.Quality",
+        "RayReconstruction.Hint.Render.Preset.Balanced", "RayReconstruction.Hint.Render.Preset.Performance",
+        "RayReconstruction.Hint.Render.Preset.UltraPerformance", "RayReconstruction.Hint.Render.Preset.UltraQuality"};
+    const char* const* presetNames = rayReconstruction ? kRayReconstructionPresets : kSuperSamplingPresets;
     unsigned int presets[6];
     for (int index = 0; index < 6; ++index)
         presets[index] = get_uint_or(parameters, presetNames[index], 0);
-    // D4R_DLSS_PRESET forces one render preset (NVSDK_NGX_DLSS_Hint_Render_Preset
-    // value, e.g. 5 = E) for every quality mode.
-    const std::string forced = env_string("D4R_DLSS_PRESET");
+    const std::string forced = env_string(rayReconstruction ? "D4R_RR_PRESET" : "D4R_DLSS_PRESET");
     if (!forced.empty())
     {
         const unsigned int value = static_cast<unsigned int>(strtoul(forced.c_str(), nullptr, 0));
@@ -4571,8 +6138,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     feature->preset = presets[1];
     // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
     // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced
-    // preset qualifies.
-    if (!forced.empty())
+    // Super Sampling preset qualifies; a Ray Reconstruction preset never does here.
+    if (!forced.empty() && !rayReconstruction)
     {
         char allowed[128] = "11,13";
         if (const std::string list = env_string("D4R_SHIM_OUTPUT_DIRECT_PRESETS"); !list.empty())
@@ -4580,18 +6147,35 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         for (char* token = strtok(allowed, ","); token != nullptr; token = strtok(nullptr, ","))
             feature->outputDirectAllowed |= strtoul(token, nullptr, 0) == presets[1];
     }
-    logf("NVSDK_NGX_D3D12_CreateFeature: %ux%u -> %ux%u quality=%d flags=0x%x subrects=%d preset=%u", feature->width,
-         feature->height, feature->outWidth, feature->outHeight, quality, flags, subrects, presets[1]);
+    feature->rayReconstruction = rayReconstruction;
+    if (rayReconstruction)
+        for (size_t index = 0; index < sizeof(kAuxScalars) / sizeof(kAuxScalars[0]); ++index)
+            feature->auxScalarBaseline[index] = get_int_or(parameters, kAuxScalars[index].name, 0);
+    logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u%s): %ux%u -> %ux%u quality=%d flags=0x%x subrects=%d preset=%u",
+         featureId, rayReconstruction ? ", Ray Reconstruction" : "", feature->width, feature->height,
+         feature->outWidth, feature->outHeight, quality, flags, subrects, presets[1]);
 
     const NgxResult result = g.worker.call([&]() -> NgxResult {
         NgxResult allocation = g.ngx.allocateParameters(&feature->cudaParams);
         if (allocation != NGX_SUCCESS)
             return allocation;
         void* p = feature->cudaParams;
-        d4r_ngx_set_uint(p, "Width", feature->width);
-        d4r_ngx_set_uint(p, "Height", feature->height);
-        d4r_ngx_set_uint(p, "OutWidth", feature->outWidth);
-        d4r_ngx_set_uint(p, "OutHeight", feature->outHeight);
+        if (rayReconstruction)
+        {
+            // The CUDA denoiser reads creation dimensions through Get(int*),
+            // unlike Super Sampling's Get(unsigned int*) contract.
+            d4r_ngx_set_int(p, "Width", static_cast<int>(feature->width));
+            d4r_ngx_set_int(p, "Height", static_cast<int>(feature->height));
+            d4r_ngx_set_int(p, "OutWidth", static_cast<int>(feature->outWidth));
+            d4r_ngx_set_int(p, "OutHeight", static_cast<int>(feature->outHeight));
+        }
+        else
+        {
+            d4r_ngx_set_uint(p, "Width", feature->width);
+            d4r_ngx_set_uint(p, "Height", feature->height);
+            d4r_ngx_set_uint(p, "OutWidth", feature->outWidth);
+            d4r_ngx_set_uint(p, "OutHeight", feature->outHeight);
+        }
         d4r_ngx_set_int(p, "PerfQualityValue", quality);
         d4r_ngx_set_int(p, "DLSS.Feature.Create.Flags", flags);
         d4r_ngx_set_int(p, "DLSS.Enable.Output.Subrects", subrects);
@@ -4599,6 +6183,9 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         d4r_ngx_set_uint(p, "VisibilityNodeMask", 1);
         for (int index = 0; index < 6; ++index)
             d4r_ngx_set_uint(p, presetNames[index], presets[index]);
+        if (rayReconstruction)
+            for (size_t index = 0; index < sizeof(kAuxScalars) / sizeof(kAuxScalars[0]); ++index)
+                d4r_ngx_set_int(p, kAuxScalars[index].name, feature->auxScalarBaseline[index]);
         if (g.cu.memAlloc(&feature->scratch, 64ull * 1024 * 1024) == 0)
         {
             d4r_ngx_set_void(p, "Scratch", reinterpret_cast<void*>(static_cast<uintptr_t>(feature->scratch)));
@@ -4606,7 +6193,11 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         }
         else
             feature->scratch = 0;
-        const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature->cudaHandle);
+        // The core owns the denoiser: it loads nvngx_dlssd.dll, knows its kernel map, and
+        // dispatches feature 13 to it. Only the feature id differs from Super Sampling.
+        const NgxResult created = g.ngx.createFeature(
+            rayReconstruction ? NGX_FEATURE_RAY_RECONSTRUCTION : NGX_FEATURE_SUPER_SAMPLING, p,
+            &feature->cudaHandle);
         feature->cudaWidth = feature->width;
         feature->cudaHeight = feature->height;
         if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
@@ -4643,7 +6234,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         }
         return created;
     });
-    logf("NVSDK_NGX_CUDA_CreateFeature -> 0x%08x", result);
+    logf("NVSDK_NGX_CUDA_CreateFeature(feature=%u) -> 0x%08x", featureId, result);
     if (result != NGX_SUCCESS)
     {
         release_feature(feature);
@@ -4676,16 +6267,6 @@ static Feature* find_feature(const NgxHandle* handle)
     return nullptr;
 }
 
-static ID3D12Resource* get_resource(void* parameters, const char* name)
-{
-    ID3D12Resource* resource = nullptr;
-    if (d4r_ngx_get_d3d12_resource(parameters, name, &resource) == NGX_SUCCESS && resource != nullptr)
-        return resource;
-    void* raw = nullptr;
-    if (d4r_ngx_get_void(parameters, name, &raw) == NGX_SUCCESS)
-        return static_cast<ID3D12Resource*>(raw);
-    return nullptr;
-}
 
 static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters)
 {
@@ -4784,6 +6365,42 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     p.outputBaseY = get_uint_or(parameters, "DLSS.Output.Subrect.Base.Y", 0);
     p.hasExposure = exposure != nullptr;
 
+    // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices are read
+    // here, on the game thread, while the caller's parameter object is certainly alive, and
+    // carried to the worker by value.
+    if (feature->rayReconstruction)
+    {
+        for (size_t index = 0; index < sizeof(kAuxScalars) / sizeof(kAuxScalars[0]); ++index)
+        {
+            int value = 0;
+            const bool given = d4r_ngx_get_int(parameters, kAuxScalars[index].name, &value) == NGX_SUCCESS;
+            // Not given this frame: back to what the caller asked for at creation, so a
+            // setting it has stopped varying does not keep an old per-frame override.
+            p.auxScalar[index] = given ? value : feature->auxScalarBaseline[index];
+            p.auxScalarSet[index] = true;
+        }
+        // Each guide's Subrect origin, read here while the caller's object is alive. An origin
+        // the caller stops registering resets to zero rather than lingering.
+        for (size_t index = 0; index < sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0]); ++index)
+        {
+            static std::string nameX, nameY;
+            nameX.assign(kAuxSubrectNames[index]).append(".Subrect.Base.X");
+            nameY.assign(kAuxSubrectNames[index]).append(".Subrect.Base.Y");
+            p.auxSubrect[index][0] = get_uint_or(parameters, nameX.c_str(), 0);
+            p.auxSubrect[index][1] = get_uint_or(parameters, nameY.c_str(), 0);
+        }
+        for (size_t index = 0; index < sizeof(kAuxMatrices) / sizeof(kAuxMatrices[0]); ++index)
+        {
+            // A matrix is registered as a pointer to float[16] (nvsdk: the SDK's helpers
+            // set these with SetVoidPointer), never as sixteen separate scalars.
+            void* value = nullptr;
+            p.auxMatrixSet[index] =
+                d4r_ngx_get_void(parameters, kAuxMatrices[index], &value) == NGX_SUCCESS && value != nullptr;
+            if (p.auxMatrixSet[index])
+                std::memcpy(p.auxMatrix[index], value, sizeof(p.auxMatrix[index]));
+        }
+    }
+
     const int slotIndex = static_cast<int>(frame % kSlots);
     InputSlot& slot = feature->inputs[slotIndex];
     // Throttle the game to DLSS speed when the pipeline still owns this slot
@@ -4817,7 +6434,11 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     const Plane planes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
     const int inputCount = exposure != nullptr ? 4 : 3;
     VramCopy vramInputs[4], vramOutput;
-    if ((!feature->vramDecided || feature->vram) && vram_interop_available())
+    // Alpha readback uses the host result ring; color must use the same pipeline so both
+    // outputs can present one produced frame. The existing cutover below drains VRAM work.
+    const bool alphaOutputRequested =
+        feature->rayReconstruction && get_resource(parameters, "DLSSD.OutputAlpha") != nullptr;
+    if (!alphaOutputRequested && (!feature->vramDecided || feature->vram) && vram_interop_available())
     {
         p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
         for (int index = 0; index < inputCount && p.vram; ++index)
@@ -4933,8 +6554,6 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         if (exposure != nullptr)
             copy_to_staging(list, exposure, slot.exposure, inputState);
     }
-    if (timing.enabled)
-        timing.inputRecord = profile_ms(inputRecordStart, ProfileClock::now());
 
     // Frame marker, written once the copies above have completed.
     ID3D12GraphicsCommandList2* list2 = nullptr;
@@ -4943,6 +6562,29 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         logf("ID3D12GraphicsCommandList2 unavailable; cannot place frame marker");
         return NGX_FAIL_PLATFORM_ERROR;
     }
+    // Ray Reconstruction's auxiliary surfaces go into their own readback buffers here, still
+    // ahead of the frame marker so the worker can read them the moment that marker lands.
+    if (feature->rayReconstruction)
+    {
+        if (!capture_alpha_output(*feature, parameters, slotIndex, frame) ||
+            !gather_aux_inputs(*feature, list, parameters, slotIndex, inputState, frame))
+        {
+            // capture_alpha_output may already have taken a reference on the caller's texture,
+            // and this frame is never queued, so nothing else would release it.
+            InputSlot& failed = feature->inputs[slotIndex];
+            if (failed.alphaResource != nullptr)
+            {
+                failed.alphaResource->Release();
+                failed.alphaResource = nullptr;
+                failed.alphaRequested = false;
+            }
+            list2->Release();
+            return NGX_FAIL_PLATFORM_ERROR;
+        }
+    }
+    if (timing.enabled)
+        timing.inputRecord = profile_ms(inputRecordStart, ProfileClock::now());
+
     const D3D12_GPU_VIRTUAL_ADDRESS markerAddress = feature->marker->GetGPUVirtualAddress();
     D3D12_WRITEBUFFERIMMEDIATE_PARAMETER markers[] = {
         {markerAddress + sizeof(uint32_t) * (1 + slotIndex), frame},
@@ -4956,14 +6598,16 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
 
     // Present the most recent finished DLSS result.
     int latest;
+    uint32_t colorFrame = 0; // the frame whose colour is presented below, 0 if none
     {
         std::lock_guard<std::mutex> lock(feature->outputMutex);
         latest = feature->latestOutput.load();
         if (latest >= 0)
         {
             feature->outputs[latest].lastReadFrame = frame;
+            colorFrame = feature->outputs[latest].producedFrame.load();
             if (timing.enabled)
-                timing.presentedFrame = feature->outputs[latest].producedFrame.load();
+                timing.presentedFrame = colorFrame;
         }
     }
     const auto outputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -4972,8 +6616,14 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
     if (p.split)
     {
-        // Runs in the second half of the list, once frame's result is in place.
+        // Runs in the second half of the list, once frame's result is in place. Split frames
+        // present their own result rather than the newest one, so the alpha must pair with
+        // that one instead.
         const int target = static_cast<int>(frame % kOutputSlots);
+        {
+            std::lock_guard<std::mutex> lock(feature->outputMutex);
+            colorFrame = feature->outputs[target].producedFrame.load();
+        }
         transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
@@ -5003,6 +6653,8 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
     }
+    if (feature->rayReconstruction)
+        record_alpha_copyback(*feature, list, slot, outputState, colorFrame);
     if (timing.enabled)
     {
         timing.outputRecord = profile_ms(outputRecordStart, ProfileClock::now());
@@ -5048,6 +6700,20 @@ static void release_feature(Feature* feature)
             g.ngx.releaseFeature(feature->cudaHandle);
         if (feature->cudaParams != nullptr)
             g.ngx.destroyParameters(feature->cudaParams);
+        // Every denoiser input dies with its feature, drains to nothing first.
+        for (AuxSurface& surface : feature->aux)
+            destroy_aux_surface(surface);
+        feature->aux.clear();
+        if (feature->alphaImage.object != 0)
+            g.cu.surfObjectDestroy(feature->alphaImage.object);
+        if (feature->alphaImage.array != nullptr)
+            g.cu.arrayDestroy(feature->alphaImage.array);
+        release_host(feature->alphaHost);
+        for (AlphaSlot& slot : feature->alpha)
+            slot.staging.release();
+        for (InputSlot& slot : feature->inputs)
+            if (slot.alphaResource != nullptr)
+                slot.alphaResource->Release();
         for (InputSlot& slot : feature->inputs)
         {
             for (CudaObject& texture : slot.linearTexture)
@@ -5149,6 +6815,7 @@ static void finish_shutdown()
         drain_pipeline();
         g.worker.call([] { return g.ngx.shutdown(); });
     }
+    // No separate denoiser shutdown: the core loaded it and the core's shutdown releases it.
     g.ngxInitialized = false;
     g.shutdownPending = false;
     if (g.device != nullptr)
