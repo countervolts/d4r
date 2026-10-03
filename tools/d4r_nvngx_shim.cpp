@@ -70,6 +70,7 @@
 #include <vector>
 #include "d4r_event_wait.h"
 #include "d4r_frame_completion.h"
+#include "d4r_render_presets.h"
 #include "d4r_win32_wait.h"
 #include "d4r_vkd3d_interop.h"
 
@@ -6668,18 +6669,18 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     unsigned int presets[6];
     for (int index = 0; index < 6; ++index)
         presets[index] = get_uint_or(parameters, presetNames[index], 0);
-    const std::string forced = env_string(rayReconstruction ? "D4R_RR_PRESET" : "D4R_DLSS_PRESET");
-    if (!forced.empty())
+    const std::string forced = env_string(d4r_render_preset_variable(rayReconstruction));
+    const auto presetOverride = d4r_parse_render_preset_override(forced.c_str());
+    if (presetOverride.enabled)
     {
-        const unsigned int value = static_cast<unsigned int>(strtoul(forced.c_str(), nullptr, 0));
+        const unsigned int value = presetOverride.value;
         const char* model = value == 5 ? "E" : value == 11 ? "K" : value == 12 ? "L" : value == 13 ? "M" : "custom";
         logf("DLSS model override: D4R_DLSS_PRESET=%s (model %s) overrides game/OptiScaler presets "
              "[DLAA=%u Quality=%u Balanced=%u Performance=%u UltraPerformance=%u UltraQuality=%u]; "
              "using preset=%u for all quality modes",
              forced.c_str(), model, presets[0], presets[1], presets[2], presets[3], presets[4], presets[5], value);
-        for (unsigned int& preset : presets)
-            preset = value;
     }
+    presetOverride.apply(presets);
     feature->preset = presets[1];
     // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
     // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced
