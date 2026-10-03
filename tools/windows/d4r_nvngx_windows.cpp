@@ -1,5 +1,6 @@
 // Native Windows backend. The Linux/Wine implementation remains separate.
 #include "ngx_windows_runtime.h"
+#include "player_config.h"
 #include <dxgi.h>
 #include <unordered_map>
 #include <functional>
@@ -59,6 +60,7 @@ API unsigned d4r_WindowsBackendVersion() { return 1; }
 API unsigned NVSDK_NGX_D3D12_Init_Ext(unsigned long long app, const wchar_t* data, ID3D12Device* device, unsigned sdk, const void* info) {
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
+        d4r::win::player::ensure_environment();
         if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, app, data, sdk, static_cast<const d4r::ngx::FeatureCommonInfo*>(info));
         if (const char* backend = std::getenv("D4R_D3D12_COMMAND_BACKEND"); backend && std::string(backend) == "1")
             d4r::win::commands::install(device);
@@ -72,6 +74,7 @@ API unsigned NVSDK_NGX_D3D12_Init_ProjectID(const char* project, int engine, con
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
         if (!project || !*project) return invalid;
+        d4r::win::player::ensure_environment();
         d4r::ngx::ProjectIdentity identity{project, engine, version ? version : ""};
         if (!runtime) runtime = std::make_shared<d4r::win::Runtime>(device, 0, data, sdk, static_cast<const d4r::ngx::FeatureCommonInfo*>(info), &identity);
         if (const char* backend = std::getenv("D4R_D3D12_COMMAND_BACKEND"); backend && std::string(backend) == "1") d4r::win::commands::install(device);
@@ -84,6 +87,7 @@ API unsigned NVSDK_NGX_D3D12_GetFeatureRequirements(IDXGIAdapter* adapter, const
     return call([&] {
         *requirements = {}; requirements->FeatureSupported = 16; // Unsupported feature.
         if (info->FeatureID != 1) return 1u;
+        d4r::win::player::ensure_environment();
         DXGI_ADAPTER_DESC desc{}; d4r::win::dx(adapter->GetDesc(&desc), "NGX requirements adapter");
         // OptiScaler can override the DXGI vendor ID. The physical HIP
         // architecture and full adapter LUID are the authoritative identity.
@@ -116,6 +120,7 @@ API unsigned NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, unsigned 
     std::lock_guard<std::mutex> lock(apiMutex);
     return call([&] {
         if (!runtime || feature != 1 || !p || !out) return invalid;
+        d4r::win::player::apply_preset(p);
         auto value = std::make_shared<d4r::win::Feature>(runtime, p);
         auto handle = std::make_unique<Handle>(); handle->Id = nextId++;
         features.emplace(handle.get(), std::move(value)); *out = handle.release(); return 1u;
@@ -141,6 +146,7 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
         };
         auto snapshot = std::make_shared<Snapshot>();
         if (!snapshot->parameters) return failure;
+        d4r::win::player::apply_preset(p);
         d4r::ngx::copy_create(p, snapshot->parameters); d4r::ngx::copy_frame(p, snapshot->parameters);
         const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
         const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};

@@ -1,0 +1,9 @@
+# NVIDIA DLLs the Windows backend accepts, by exact SHA256. NVIDIA DLLs are
+# never shipped or committed; players copy their own.
+#   dlss = nvngx_dlss.dll (d4r\nvngx_dlss.dll)
+#   ngx  = _nvngx.dll, NVIDIA's NGX core from a display driver (d4r\ngx\_nvngx.dll)
+# status: validated = tested on Windows hardware; anything else is accepted
+# but reported as unvalidated in d4r\d4r_nvngx.log.
+# kind sha256                                                           version       status
+dlss 3975567B8943C53ACCE397F2B72380092F84F162D00B0D2C7D08A1025C563983 310.9.1      validated
+ngx  66767018C36B3BAB46398DADE3ADF173DAA3730FDA75965689EA848C9BC4E79B 32.0.16.1714 validated

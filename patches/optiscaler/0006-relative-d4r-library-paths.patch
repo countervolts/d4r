@@ -1,0 +1,30 @@
+Subject: [PATCH] Resolve relative d4r library paths against the OptiScaler folder
+
+Lets a drag-in d4r install ship OptiScaler.ini with NvngxPath=d4r instead of
+an absolute path that only an installer could know. Absolute paths behave
+exactly as before.
+---
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -787,9 +787,17 @@
+         {
+             MainDllPath.set_from_config(readWString("Libraries", "OptiDllPath"));
+ 
+-            NvngxPath.set_from_config(readWString("Libraries", "NvngxPath"));
+-            NVNGX_DLSS_Library.set_from_config(readWString("Libraries", "NvngxDlssPath"));
+-            DLSSFeaturePath.set_from_config(readWString("Libraries", "NvngxFeaturePath"));
++            // A relative library folder (d4r drag-in installs use "d4r") is resolved
++            // against this DLL's folder, as LogFileName is. Absolute paths are unchanged.
++            auto libraryPath = [](std::optional<std::wstring> value) -> std::optional<std::wstring>
++            {
++                if (!value.has_value() || value->empty() || std::filesystem::path(*value).is_absolute())
++                    return value;
++                return (Util::DllPath().parent_path() / *value).lexically_normal().wstring();
++            };
++            NvngxPath.set_from_config(libraryPath(readWString("Libraries", "NvngxPath")));
++            NVNGX_DLSS_Library.set_from_config(libraryPath(readWString("Libraries", "NvngxDlssPath")));
++            DLSSFeaturePath.set_from_config(libraryPath(readWString("Libraries", "NvngxFeaturePath")));
+             NvapiDllPath.set_from_config(readWString("Libraries", "NvapiPath"));
+ 
+             FfxDx12Path.set_from_config(readWString("Libraries", "FfxDx12Path"));
