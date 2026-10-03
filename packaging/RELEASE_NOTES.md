@@ -39,6 +39,10 @@
   frame retirement. Rebuilt shim/bridge and rechecked a loaded Cyberpunk scene with camera
   motion, RR E and path tracing at 1080p Ultra Performance on gfx1201.
   Removed brittle source-text/wording tests; configuration validation remains covered.
+- Restore behavioral preset-override coverage through a shared, allocation-free policy used by
+  feature creation: SR/RR isolation, every quality mode, unset/empty overrides, and explicit
+  default-preset selection. Tests compile the helper directly without extracting shim source
+  or matching diagnostic wording; polling configuration validation and precedence remain covered.
 
 # d4r 0.1.3
 
