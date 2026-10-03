@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 """Translate d4r.ini (see config/d4r.ini.default) into shell exports for the game launcher.
 
 usage: d4r_config.py [--config PATH] [--print | --launch]
@@ -85,6 +86,20 @@ def main(argv):
             env["D4R_DLSS_PRESET"] = str(PRESETS[MODEL_ALIASES.get(model.upper(), model.upper())])
         else:
             fail(f"[DLSS] Model {model!r}: use one of {', '.join(list(PRESETS) + list(MODEL_ALIASES))} or a preset number")
+
+    rr_enabled = flag("RayReconstruction", "Enable")
+    if rr_enabled is not None:
+        env["D4R_RR_ENABLE"] = "1" if rr_enabled else "0"
+    rr_model = get("RayReconstruction", "Model")
+    if rr_model is not None:
+        rr_presets = {"DEFAULT": 0, "D": 4, "E": 5}
+        rr_model = rr_model.upper()
+        if rr_model in rr_presets:
+            env["D4R_RR_PRESET"] = str(rr_presets[rr_model])
+        elif rr_model in ("0", "4", "5"):
+            env["D4R_RR_PRESET"] = rr_model
+        else:
+            fail(f"[RayReconstruction] Model {rr_model!r}: use auto, default, D or E")
 
     age = get("Latency", "FrameAge")
     if age is not None:

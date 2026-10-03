@@ -1,5 +1,6 @@
 d4r
 Copyright 2026 countervolts and the d4r contributors
+Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 
 This product is licensed under the GNU General Public License, version 3 only
 (GPL-3.0-only; see LICENSE), except for the files
@@ -7,7 +8,9 @@ listed below.
 
 patches/zluda/*.patch
     Changes to ZLUDA (https://github.com/vosen/ZLUDA). ZLUDA is dual-licensed under the Apache
-    License, Version 2.0 and the MIT license; these patches are offered under the same terms.
+    License, Version 2.0 and the MIT license; the ZLUDA portions of these patches are offered
+    under the same terms. Changes to LLVM within these patches retain the Apache License,
+    Version 2.0 with LLVM exceptions.
 
 patches/vkd3d-proton/*.patch
     Changes to vkd3d-proton (https://github.com/HansKristian-Work/vkd3d-proton), which is licensed
@@ -19,12 +22,12 @@ LLVM under Apache-2.0 with LLVM exceptions), the patched vkd3d-proton (LGPL-2.1)
 (https://github.com/optiscaler/OptiScaler, GPL-3.0, unmodified). Each zip carries their license
 texts in d4r/licenses and says where every file comes from in d4r/source/SOURCES.txt.
 Release zips include install.sh to download NVIDIA's nvngx_dlss.dll and _nvngx.dll separately.
-Optional builds may bundle those DLLs. Release zips also include DLSS kernels compiled from NVIDIA's
+Optional builds may bundle those DLLs and nvngx_dlssd.dll. Release zips also include DLSS kernels compiled from NVIDIA's
 PTX. Those are NVIDIA's property, are not covered by this repository's license, and are included
 by whoever publishes the zip. Downloaded DLLs remain governed by NVIDIA's license terms.
 
-This repository contains no NVIDIA software. The NVIDIA DLSS feature library (nvngx_dlss.dll) and
-the NGX core (_nvngx.dll) are NVIDIA's; you supply your own copies, and their use is governed by
+This repository contains no NVIDIA software. The NVIDIA DLSS feature libraries (nvngx_dlss.dll and
+nvngx_dlssd.dll) and the NGX core (_nvngx.dll) are NVIDIA's; you supply your own copies, and their use is governed by
 NVIDIA's license terms. At build time, kernels/tools/extract_dlss_ptx.py reads PTX from your copy
 of nvngx_dlss.dll into kernels/extracted/, which is not part of the repository and must not be
 redistributed. The same holds for the model files the native engine's tools write (engine/README.md):

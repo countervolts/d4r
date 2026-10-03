@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Builds the drag-in release: a zip whose contents are extracted into the folder that holds a game's
 # main .exe, like an OptiScaler release. packaging/D4R_README.txt describes the result.
 #
@@ -26,6 +27,7 @@
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  local nvngx_dlss.dll for texture builds (pinned by install.sh in installer mode)
 #   D4R_BUNDLE_NGX   local _nvngx.dll (only required for D4R_BUNDLE_NVIDIA=1)
+#   D4R_BUNDLE_DLSSD optional nvngx_dlssd.dll to include for Ray Reconstruction (full variant only)
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
@@ -111,6 +113,7 @@ if [[ "$VARIANT" != clean ]]; then
     cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
     : "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}"
     cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+    [[ -z "${D4R_BUNDLE_DLSSD:-}" ]] || cp "$D4R_BUNDLE_DLSSD" "$STAGE/d4r/nvngx_dlssd.dll"
   else
     cp "$ROOT/install.sh" "$STAGE/install.sh"
     chmod +x "$STAGE/install.sh"

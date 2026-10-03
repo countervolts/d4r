@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 set -euo pipefail
 
 # Stages the pieces a Proton game needs under D4R_RUNTIME_DIR
@@ -7,6 +8,7 @@ set -euo pipefail
 #   bin/d4r_nvngx.dll   D3D12-to-CUDA NGX core shim (OptiScaler NvngxPath target)
 #   ngx/_nvngx.dll      official NGX core
 #   dlss/nvngx_dlss.dll official DLSS SR feature DLL (also copied into bin/)
+#   dlss/nvngx_dlssd.dll optional DLSS Ray Reconstruction feature DLL (also in bin/)
 #   engine/k/, k-ldr/   models of preset K for the native engine ([Engine] in d4r.ini), when D4R_ENGINE_MODEL /
 #                       D4R_ENGINE_MODEL_LDR name the folders engine/compile_k.py wrote (--ldr for the second)
 #   engine/m/, m-ldr/   models of preset M, when D4R_ENGINE_MODEL_M / D4R_ENGINE_MODEL_M_LDR name the folders
@@ -14,9 +16,9 @@ set -euo pipefail
 #   engine/l/, l-ldr/   models of preset L, when D4R_ENGINE_MODEL_L / D4R_ENGINE_MODEL_L_LDR name the folders
 #                       engine/compile_m.py wrote from a capture of preset L
 # Each model folder is copied whole, with the native HIP network's hipnet.bin and hip/ when built with --hip.
-# usage: install_d4r_runtime.sh PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL
-if [[ $# -ne 2 ]]; then
-  printf 'usage: %s PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL\n' "$0" >&2
+# usage: install_d4r_runtime.sh PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL [PATH_TO_NVNGX_DLSSD_DLL]
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  printf 'usage: %s PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL [PATH_TO_NVNGX_DLSSD_DLL]\n' "$0" >&2
   exit 2
 fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,5 +53,10 @@ for variant in k k-ldr m m-ldr l l-ldr; do
   cp -r "$source_dir" "$RUNTIME/engine/$variant"
   printf 'Installed the native engine model in %s\n' "$RUNTIME/engine/$variant"
 done
+if [[ $# == 3 ]]; then
+  copy_unless_same "$3" "$RUNTIME/dlss/nvngx_dlssd.dll"
+  copy_unless_same "$3" "$RUNTIME/bin/nvngx_dlssd.dll"
+  sha256sum "$RUNTIME/dlss/nvngx_dlssd.dll"
+fi
 sha256sum "$RUNTIME"/ngx/_nvngx.dll "$RUNTIME"/dlss/nvngx_dlss.dll
 printf 'Installed d4r runtime in %s\n' "$RUNTIME"
