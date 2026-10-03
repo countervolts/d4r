@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 set -euo pipefail
 
 # Stages the pieces a Proton game needs under D4R_RUNTIME_DIR
@@ -7,9 +8,10 @@ set -euo pipefail
 #   bin/d4r_nvngx.dll   D3D12-to-CUDA NGX core shim (OptiScaler NvngxPath target)
 #   ngx/_nvngx.dll      official NGX core
 #   dlss/nvngx_dlss.dll official DLSS SR feature DLL (also copied into bin/)
-# usage: install_d4r_runtime.sh PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL
-if [[ $# -ne 2 ]]; then
-  printf 'usage: %s PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL\n' "$0" >&2
+#   dlss/nvngx_dlssd.dll optional DLSS Ray Reconstruction feature DLL (also in bin/)
+# usage: install_d4r_runtime.sh PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL [PATH_TO_NVNGX_DLSSD_DLL]
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  printf 'usage: %s PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL [PATH_TO_NVNGX_DLSSD_DLL]\n' "$0" >&2
   exit 2
 fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,5 +27,10 @@ copy_unless_same "$2" "$RUNTIME/dlss/nvngx_dlss.dll"
 # The NGX core's CUDA init ignores the feature search paths it is given and
 # scans the directory of the module that calls it, i.e. the shim's.
 cp -f "$RUNTIME/dlss/nvngx_dlss.dll" "$RUNTIME/bin/nvngx_dlss.dll"
+if [[ $# == 3 ]]; then
+  copy_unless_same "$3" "$RUNTIME/dlss/nvngx_dlssd.dll"
+  copy_unless_same "$3" "$RUNTIME/bin/nvngx_dlssd.dll"
+  sha256sum "$RUNTIME/dlss/nvngx_dlssd.dll"
+fi
 sha256sum "$RUNTIME"/ngx/_nvngx.dll "$RUNTIME"/dlss/nvngx_dlss.dll
 printf 'Installed d4r runtime in %s\n' "$RUNTIME"

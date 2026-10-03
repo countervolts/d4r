@@ -1,14 +1,17 @@
+Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
+
 d4r @VERSION@: NVIDIA DLSS on AMD Radeon RDNA3 and RDNA4 under Linux and Proton
 =====================================================================
 
-d4r runs NVIDIA's own DLSS Super Resolution (DLSS 4 by default) on AMD Radeon RDNA3 and RDNA4 GPUs in
-DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS calls and hands them to
-d4r. d4r then runs NVIDIA's DLSS on the Radeon through ZLUDA, with the heaviest parts replaced by
-kernels written for RDNA3 and RDNA4.
+d4r runs NVIDIA's own DLSS Super Resolution (DLSS 4 by default), plus experimental Ray Reconstruction,
+on AMD Radeon GPUs in DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS calls
+and hands them to d4r. d4r runs NVIDIA's DLSS through ZLUDA; the heaviest Super Resolution kernels are
+replaced by kernels written for RDNA3 and RDNA4.
 
-This is an early release, tested on one GPU (Radeon RX 7700 XT) in about a dozen DirectX 12 games.
-SUPPORTED_GAMES.md in the source repository lists them, with per-game setup notes. Expect problems
-in other games.
+This is an early release. Super Resolution game testing primarily uses Radeon RX 7700 XT.
+Ray Reconstruction presets D/E, temporal history, and separate alpha were validated on RX 9070 XT
+(gfx1201) with native FP8 WMMA enabled. Other RR GPU targets and RTX image-quality parity are unverified.
+SUPPORTED_GAMES.md in the source repository lists per-game setup notes. Expect problems in other games.
 
 
 What you need
@@ -124,7 +127,9 @@ If something goes wrong
   can be expected with the shim under d4r/; do not move it into the game root to silence that check.
 - A wrong image: try Model = E in d4r/d4r.ini, and report the problem with both logs.
 - Do not use d4r in games with anti-cheat. OptiScaler's DLL injection can get an account banned.
-- Not supported: DLSS Frame Generation, DLSS Ray Reconstruction, DirectX 11 and Vulkan games.
+- Ray Reconstruction requires the CUDA-capable 3.10.7 nvngx_dlssd.dll beside the shim and the matching
+  patched d3d12.dll/d3d12core.dll. Enable [Kernels] NativeFp8; the scalar FP8 RR path is not validated.
+- Not supported: DLSS Frame Generation, DirectX 11 and Vulkan games.
 
 
 Uninstall

@@ -1,3 +1,4 @@
+; Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 ; d4r configuration: official NVIDIA DLSS on AMD (ZLUDA + Wine CUDA bridge + NGX shim)
 ;
 ; Read by scripts/run_game_d4r_optiscaler_proton.sh at every game launch. The first launch copies
@@ -32,6 +33,18 @@ GameExe =
 ; Aliases: CNN = E, DLSS4 = K, DLSS4.5 = M. A/B/C/D/G/J use K in this DLL version.
 ; auto = use the game/OptiScaler choice. Benchmarks: docs/performance.md.
 Model = K
+
+[RayReconstruction]
+; Runs NVIDIA's nvngx_dlssd.dll denoiser, separate from Super Resolution.
+; auto enables the CUDA route when the NGX core reports the denoiser initialized and available.
+; false disables it. Select Ray Reconstruction and ray tracing in the game.
+; RR D/E temporal validation on gfx1201 requires native FP8 WMMA ([Kernels] NativeFp8 = true).
+; The scalar FP8 RR path is not validated.
+Enable = auto
+; auto preserves the game's choice; default = NVIDIA's default, D/E = transformer models.
+; These presets are independent of [DLSS] Model. E requires a DLL that contains that model.
+Model = auto
+
 [Latency]
 ; How many frames old the upscaled image the game presents may be.
 ;   0 = same frame (no added latency, no trailing artefacts; needs VkD3DDir below)
@@ -103,7 +116,7 @@ RuntimeDir = auto
 ; ZLUDA build (directory with libcuda.so / libnvcuda.so)
 ZludaDir = auto
 RocmDir = auto
-; d4r-patched vkd3d-proton (d3d12.dll + d3d12core.dll); required for FrameAge = 0
+; Matching lifetime-aware d4r vkd3d-proton (both d3d12.dll + d3d12core.dll); required for all shim paths.
 VkD3DDir = auto
 ; JIT cache directory (XDG_CACHE_HOME): auto = the default ~/.cache; per-zluda = one per ZLUDA build,
 ; ~/.cache/d4r-perf-game-jit-<ZludaDir name> (a new ZLUDA build compiles every kernel once on first use)

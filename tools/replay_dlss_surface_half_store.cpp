@@ -1,3 +1,4 @@
+// Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 #include <dlfcn.h>
 
 #include <cstddef>
@@ -85,10 +86,8 @@ static CUresult report(const char* stage, CUresult result,
     return result;
 }
 
-// One unformatted 4-byte store (sust.b.2d.v2.b16.zero, and the same bytes via
-// sust.b.2d.b32.zero) into a surface of the given CUDA array format. X is a byte offset (unformatted surface addressing). The expected
-// result is the fill pattern with the four stored bytes replaced at X, or the
-// untouched fill pattern when X is out of bounds.
+// Unformatted packed stores address X in bytes. Check every byte, including the
+// untouched pixels around a write and row boundaries.
 struct StoreCase
 {
     const char* name;
@@ -100,6 +99,10 @@ struct StoreCase
     uint16_t value0;
     uint16_t value1;
     uint8_t fill[16];     // one pixel of initial contents
+    uint32_t bytes = 4;
+    uint16_t value2 = 0;
+    uint16_t value3 = 0;
+    bool byteVector = false;
 };
 
 int main()
@@ -146,6 +149,44 @@ int main()
     sust.b.2d.b32.zero [%rd1, {%r0,%r1}], %r2;
     ret;
 }
+
+.visible .entry d4r_surface_v4_half_store_probe(
+.param .b64 surface,
+.param .b32 x,
+.param .b32 y,
+.param .b64 packed
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b16 %rs<4>;
+    .reg .b32 %r<4>;
+    ld.param.b64 %rd1, [surface];
+    ld.param.b32 %r0, [x];
+    ld.param.b32 %r1, [y];
+    ld.param.b64 %rd2, [packed];
+    mov.b64 {%rs0, %rs1, %rs2, %rs3}, %rd2;
+    sust.b.2d.v4.b16.zero [%rd1, {%r0,%r1}], {%rs0,%rs1,%rs2,%rs3};
+    ret;
+}
+
+.visible .entry d4r_surface_wide_byte_store_probe(
+.param .b64 surface,
+.param .b32 x,
+.param .b32 y,
+.param .b64 packed
+)
+{
+    .reg .b64 %rd<3>;
+    .reg .b16 %rs<4>;
+    .reg .b32 %r<2>;
+    ld.param.b64 %rd1, [surface];
+    ld.param.b32 %r0, [x];
+    ld.param.b32 %r1, [y];
+    ld.param.b64 %rd2, [packed];
+    mov.b64 {%rs0, %rs1, %rs2, %rs3}, %rd2;
+    sust.b.2d.v4.b8.trap [%rd1, {%r0,%r1}], {%rs0,%rs1,%rs2,%rs3};
+    ret;
+}
 )PTX";
 
     // Fill values: 0x3400 is half 0.25, 0x3e800000 is float 0.25.
@@ -180,6 +221,18 @@ int main()
          {0x00, 0x00, 0x80, 0x3e}},
         {"RG16F infinity/quiet NaN", 0x10, 2, 2, 13 * 4, 13, 0xfc00, 0x7e00,
          {0x00, 0x34, 0x00, 0x34}},
+        {"RGBA16F four distinct halves", 0x10, 4, 2, 3 * 8, 2, 0x3555, 0xc248,
+         {0x00, 0x34, 0x00, 0x34, 0x00, 0x34, 0x00, 0x34}, 8, 0x4900, 0xbc00},
+        {"R16F four-pixel row end", 0x10, 1, 2, width * 2 - 8, height - 1, 0x0001, 0x7bff,
+         {0x00, 0x34}, 8, 0x8000, 0x0400},
+        {"RGBA16 uint full packed word", 0x02, 4, 2, 0, 0, 0xfffe, 0x1234,
+         {0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44}, 8, 0xabcd, 0x8001},
+        {"RGBA16F eight-byte out-of-bounds", 0x10, 4, 2, width * 8, 7, 0x3555, 0xc248,
+         {0x00, 0x34, 0x00, 0x34, 0x00, 0x34, 0x00, 0x34}, 8, 0x4900, 0xbc00},
+        {"R8 low bytes from wide registers at row end", 0x01, 1, 1, width - 4, height - 1, 0xaaff, 0xbb80,
+         {0x5a}, 4, 0xcc01, 0xdd7f, true},
+        {"RGBA8 low bytes from wide registers", 0x01, 4, 1, 3 * 4, 2, 0x1200, 0x347f,
+         {0x11, 0x22, 0x33, 0x44}, 4, 0x5680, 0x78ff, true},
     };
 
     void* library = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL);
@@ -234,8 +287,9 @@ int main()
 
     CUcontext context = nullptr;
     CUmodule module = nullptr;
-    CUfunction functions[2] = {};
-    const char* functionNames[2] = {"sust.b.2d.v2.b16", "sust.b.2d.b32"};
+    CUfunction functions[4] = {};
+    const char* functionNames[4] = {"sust.b.2d.v2.b16", "sust.b.2d.b32", "sust.b.2d.v4.b16", "sust.b.2d.v4.b8.trap"};
+    const uint32_t storeBytes[4] = {4, 4, 8, 4};
     CUresult result = report("cuInit", init(0), getErrorString);
     CUdevice device = 0;
     if (result == 0)
@@ -250,12 +304,21 @@ int main()
     if (result == 0)
         result = report("cuModuleGetFunction(d4r_surface_b32_store_probe)",
                         moduleGetFunction(&functions[1], module, "d4r_surface_b32_store_probe"), getErrorString);
+    if (result == 0)
+        result = report("cuModuleGetFunction(d4r_surface_v4_half_store_probe)",
+                        moduleGetFunction(&functions[2], module, "d4r_surface_v4_half_store_probe"), getErrorString);
+    if (result == 0)
+        result = report("cuModuleGetFunction(d4r_surface_wide_byte_store_probe)",
+                        moduleGetFunction(&functions[3], module, "d4r_surface_wide_byte_store_probe"), getErrorString);
 
     size_t passed = 0;
-    size_t total = 2 * sizeof(cases) / sizeof(cases[0]);
-    for (size_t functionIndex = 0; functionIndex < 2; ++functionIndex)
+    size_t total = 0;
+    for (size_t functionIndex = 0; functionIndex < 4; ++functionIndex)
     for (const StoreCase& storeCase : cases)
     {
+        if (storeCase.bytes != storeBytes[functionIndex] || storeCase.byteVector != (functionIndex == 3))
+            continue;
+        ++total;
         CUfunction function = functions[functionIndex];
         if (result != 0)
             break;
@@ -265,11 +328,20 @@ int main()
         for (size_t offset = 0; offset < expected.size(); ++offset)
             expected[offset] = storeCase.fill[offset % pixelBytes];
         std::vector<uint8_t> surfaceBytes = expected;
-        const uint8_t stored[4] = {
+        uint8_t stored[8] = {
             static_cast<uint8_t>(storeCase.value0), static_cast<uint8_t>(storeCase.value0 >> 8),
-            static_cast<uint8_t>(storeCase.value1), static_cast<uint8_t>(storeCase.value1 >> 8)};
-        if (storeCase.x + 4 <= rowBytes && storeCase.y < height)
-            std::memcpy(expected.data() + storeCase.y * rowBytes + storeCase.x, stored, 4);
+            static_cast<uint8_t>(storeCase.value1), static_cast<uint8_t>(storeCase.value1 >> 8),
+            static_cast<uint8_t>(storeCase.value2), static_cast<uint8_t>(storeCase.value2 >> 8),
+            static_cast<uint8_t>(storeCase.value3), static_cast<uint8_t>(storeCase.value3 >> 8)};
+        if (storeCase.byteVector)
+        {
+            stored[0] = static_cast<uint8_t>(storeCase.value0);
+            stored[1] = static_cast<uint8_t>(storeCase.value1);
+            stored[2] = static_cast<uint8_t>(storeCase.value2);
+            stored[3] = static_cast<uint8_t>(storeCase.value3);
+        }
+        if (static_cast<uint64_t>(storeCase.x) + storeCase.bytes <= rowBytes && storeCase.y < height)
+            std::memcpy(expected.data() + storeCase.y * rowBytes + storeCase.x, stored, storeCase.bytes);
 
         CUarray array = nullptr;
         CUsurfObject surface = 0;
@@ -300,7 +372,10 @@ int main()
             uint64_t surfaceArgument = surface;
             uint32_t x = storeCase.x;
             uint32_t y = storeCase.y;
-            uint32_t packed = storeCase.value0 | (static_cast<uint32_t>(storeCase.value1) << 16);
+            uint64_t packed = static_cast<uint64_t>(storeCase.value0) |
+                              (static_cast<uint64_t>(storeCase.value1) << 16) |
+                              (static_cast<uint64_t>(storeCase.value2) << 32) |
+                              (static_cast<uint64_t>(storeCase.value3) << 48);
             void* arguments[] = {&surfaceArgument, &x, &y, &packed};
             caseResult = launchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr);
             if (caseResult == 0)
@@ -344,7 +419,7 @@ int main()
     }
 
     if (result == 0)
-        std::printf("sust.b.2d unformatted 4-byte surface store tests: %zu/%zu passed\n", passed, total);
+        std::printf("sust.b.2d unformatted surface store tests: %zu/%zu passed\n", passed, total);
     const int exitCode = result == 0 && passed == total ? 0 : 1;
     if (module != nullptr)
         moduleUnload(module);
