@@ -104,6 +104,25 @@ scripts/d4r_play.sh
 
 In the game, pick DLSS as the upscaler (OptiScaler intercepts it). Every setting in the file can also be given as an environment variable, which takes precedence; `D4R_NO_CONFIG=1` ignores the file.
 
+### Cyberpunk 2077 RR launch notes
+
+The optimized RR route was exercised in a loaded Cyberpunk 2077 2.31 save on RX 9070 XT (gfx1201), with preset E, path tracing and Ultra Performance (640×360 → 1920×1080). The user also verified gameplay. This is a functional check, not a comparative FPS benchmark.
+
+On the tested GE-Proton11-3 setup, Wine's builtin ICU aborted on `icuuc.dll.u_setMemoryFunctions_65`. Use the game's native ICU DLLs for that setup:
+
+```sh
+WINEDLLOVERRIDES='icuuc=n,b;icuin=n,b;icudt=n,b;d3d12=n,b;d3d12core=n,b' \
+  D4R_RR_ENABLE=1 D4R_RR_PRESET=5 \
+  D4R_SHIM_VRAM_INTEROP=1 D4R_SHIM_SPLIT_FRAME=1 D4R_SHIM_LINEAR_INPUTS=1 \
+  D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 D4R_ZLUDA_WMMA_FP8_NATIVE=1 \
+  scripts/d4r_play.sh
+```
+
+Merge these overrides with any existing `WINEDLLOVERRIDES`; do not discard overrides needed by other mods. Keep the patched vkd3d DLLs current, including game-local copies as described above. Select DLSS, Ray Reconstruction and path tracing in the game. `D4R_SHIM_RR_VRAM_GUIDES` defaults to `1` with VRAM interop; `0` selects host guide staging for A/B diagnostics.
+
+Leave `D4R_SHIM_VRAM_VERIFY`, `D4R_SHIM_ALPHA_VERIFY` and output capture disabled for normal play or benchmarking. The in-game diagnostic run enabled verification and reported zero differing bytes for all six supplied RR guides: normals, diffuse/specular albedo, specular hit distance, pre-particle color and the subsurface-scattering guide. Verification itself downloads GPU data.
+
+
 ## 7. Package a release
 
 ```sh
@@ -156,3 +175,29 @@ Run `bash scripts/build_release_glibc241.sh` inside the container. The script ch
 - `scripts/check_environment.sh` lists the tools, GPU and Proton builds it finds.
 - The D3D12 harness (`scripts/run_d3d12_dlss_harness_proton.sh`) drives DLSS outside a game.
 - Native kernels have their own validation path; see [native-kernels.md](native-kernels.md).
+
+### Ray Reconstruction VRAM comparison
+
+On the validated gfx1201/native-FP8 runtime, build the harness and shim, then compare host and GPU guide transport:
+
+```sh
+scripts/build_d3d12_dlss_harness.sh
+D4R_SHIM_SPLIT_FRAME=1 D4R_SHIM_LINEAR_INPUTS=1 \
+  D4R_SHIM_VRAM_VERIFY=1 D4R_SHIM_ALPHA_VERIFY=1 \
+  D4R_RR_ALPHA=1 D4R_RR_GUIDE_PROBE=1 \
+  D4R_HARNESS_TEMPORAL=1 \
+  D4R_HARNESS_SIZE='193 109 288 162' \
+  scripts/run_rr_guide_compare.sh /tmp/rr-compare \
+    rgba16f,rgba16f,rgba8unorm,rgba8unorm \
+    rgba8snorm,rgba16unorm,bgra8unorm,rgb10a2unorm \
+    rgba32f,r32f,rgb11b10float,rgba8unorm \
+    rgba16f,r32uint,bgra8unorm,rgba16f
+```
+
+The script stages the matching vkd3d DLLs, real DXVK-NVAPI, shim, and feature libraries together. It defaults to RR preset E and enables the required native-FP8 flags. Override `D4R_RUNTIME_DIR`, `D4R_PROTON_DIR`, or `D4R_VKD3D_DIR` for an isolated runtime. Neither feature discovery nor failed evaluation is bypassed.
+
+Every saved RGB and alpha frame is compared. The reset guide probe requires an image response, not spatial confinement: transformer attention may legitimately change both halves. `D4R_HARNESS_RR_ALPHA_FORMAT` selects `r32f`, `r16f`, `r8unorm`, or `r16unorm`; alpha captures are always decoded float32, with format-appropriate outside-subrect sentinels.
+
+Verification intentionally downloads GPU data. Unset `D4R_SHIM_VRAM_VERIFY` and `D4R_SHIM_ALPHA_VERIFY` for performance measurements and games. For same-frame conversion checks, combine alpha verification with `D4R_SHIM_OUTPUT_DUMP_DIR` and the existing dump frame selectors; compare each saved alpha region with the corresponding presented alpha capture, allowing one destination quantization step for blit rounding.
+
+`python3 -m unittest discover -s tests -v` includes output-comparator regressions for channel swaps, nonfinite pixels, missing/truncated captures, alpha frame mismatches, and writes outside the output subrect.

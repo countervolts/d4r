@@ -1265,7 +1265,6 @@ static const char* find_function_name(CUfunction function)
     pthread_mutex_unlock(&instrumentation_lock);
     return name;
 }
-
 /* Opt-in per-kernel GPU elapsed time. Event pairs are recorded on the same
    stream as each launch, then read only after an existing context sync. This
    adds profiling overhead and must never be used as the FPS baseline. */
@@ -2022,11 +2021,18 @@ CUresult WINAPI cuDeviceGetLuid(char* luid, unsigned int* device_node_mask, CUde
     if (function == NULL)
         return missing("cuDeviceGetLuid");
     CUresult result = function(luid, device_node_mask, device);
-    if (result == CUDA_SUCCESS && luid != NULL && device_node_mask != NULL)
+    if ((result == CUDA_SUCCESS || result == CUDA_ERROR_NOT_SUPPORTED) &&
+        luid != NULL && device_node_mask != NULL)
     {
         unsigned int low = get_process_u32("D4R_CUDA_LUID_LOW", 0xffffffffu);
         unsigned int high = get_process_u32("D4R_CUDA_LUID_HIGH", 0xffffffffu);
         unsigned int node_mask = get_process_u32("D4R_CUDA_NODE_MASK", 0xffffffffu);
+        // Linux NVIDIA cannot report a Windows LUID. The shim supplies the actual
+        // D3D12 adapter mapping; only a complete mapping can replace NOT_SUPPORTED.
+        if (result == CUDA_ERROR_NOT_SUPPORTED &&
+            (low == 0xffffffffu || high == 0xffffffffu || node_mask == 0xffffffffu))
+            return result;
+        result = CUDA_SUCCESS;
         if (low != 0xffffffffu)
             memcpy(luid, &low, sizeof(low));
         if (high != 0xffffffffu)
