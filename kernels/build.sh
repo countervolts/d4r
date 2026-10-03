@@ -38,7 +38,7 @@ fi
 [[ -x "$CLANG" ]] || { echo "clang++ not found (set D4R_ROCM_DIR)" >&2; exit 2; }
 
 mkdir -p "$OUT"
-case "$WHAT" in all|k|l|m|tex) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
+case "$WHAT" in all|k|l|m|rr|tex) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
 
 # Never certify a directory containing older fast binaries as an accuracy set.
 if [[ "$ACCURACY" == 1 ]] && compgen -G "$OUT/*.hsaco" >/dev/null &&
@@ -80,6 +80,13 @@ fi
 if [[ "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ]]; then
     echo "== DLSS 4.5 (presets L/M) shared Swin layers"
     for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$([[ "$FP8" == 1 ]] && echo -DD4R_FP8_WMMA)"; done
+fi
+
+if [[ "$WHAT" = all || "$WHAT" = rr ]]; then
+    echo "== DLSS Ray Reconstruction (presets D, E, F) kernels"
+    for src in "$HERE"/rr/*.hip; do
+        [[ -f "$src" ]] && build_hip "$src"
+    done
 fi
 
 if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then

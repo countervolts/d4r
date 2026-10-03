@@ -113,6 +113,38 @@ public:
     D4rNgxResult Get(const char* name, void** value) const override { return pointer(name, value); }
     void Reset() override { count_ = 0; }
 
+    void CopyTo(D4rNgxParameterAbi* dst, void (*logger)(const char* name, int type, unsigned long long val)) const
+    {
+        for (unsigned index = 0; index < count_; ++index)
+        {
+            const Entry& e = entries_[index];
+            if (logger != nullptr)
+                logger(e.name, static_cast<int>(e.type), e.value.u);
+
+            switch (e.type)
+            {
+            case TypeULL:
+                dst->Set(e.name, e.value.u);
+                break;
+            case TypeFloat:
+                dst->Set(e.name, static_cast<float>(e.value.d));
+                break;
+            case TypeDouble:
+                dst->Set(e.name, e.value.d);
+                break;
+            case TypeUInt:
+                dst->Set(e.name, static_cast<unsigned int>(e.value.u));
+                break;
+            case TypeInt:
+                dst->Set(e.name, static_cast<int>(e.value.i));
+                break;
+            case TypePointer:
+                // Указатели на ресурсы D3D12 в CUDA-параметры не копируем
+                break;
+            }
+        }
+    }
+
 private:
     const Entry* find(const char* name) const
     {
@@ -188,4 +220,13 @@ extern "C" void* d4r_ngx_parameters_create()
 extern "C" void d4r_ngx_parameters_destroy(void* parameters)
 {
     d4r_host_free(parameters);
+}
+
+extern "C" void d4r_ngx_parameters_copy_all(void* src_raw, void* dst_raw, void (*logger)(const char*, int, unsigned long long))
+{
+    if (src_raw == nullptr || dst_raw == nullptr)
+        return;
+    auto* src = static_cast<Parameters*>(src_raw);
+    auto* dst = static_cast<D4rNgxParameterAbi*>(dst_raw);
+    src->CopyTo(dst, logger);
 }

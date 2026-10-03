@@ -542,6 +542,26 @@ static void prepare_native_kernels(const char* cache_home)
     snprintf(native_source, sizeof(native_source), "%s", source);
     setenv("D4R_ZLUDA_NATIVE_DIR", native_served, 1);
     atexit(native_cleanup);
+    // d4r: безусловно линкуем ВСЕ нативные ядра из native_source в native_served
+    // d4r: безусловно пробрасываем ВСЕ .hsaco ядра в папку процесса ZLUDA
+    DIR* dir_all = opendir(native_source);
+    if (dir_all != NULL)
+    {
+        struct dirent* ent;
+        while ((ent = readdir(dir_all)) != NULL)
+        {
+            if (strstr(ent->d_name, ".hsaco") != NULL)
+            {
+                char target[1024], link_path[1024];
+                snprintf(target, sizeof(target), "%s/%s", native_source, ent->d_name);
+                snprintf(link_path, sizeof(link_path), "%s/%s", native_served, ent->d_name);
+                unlink(link_path);
+                if (symlink(target, link_path) == 0 || errno == EEXIST)
+                    tracef("FORCE LINKED native kernel: %s", ent->d_name);
+            }
+        }
+        closedir(dir_all);
+    }
     tracef("native kernels: %zu in %s, each served from %s once DLSS's PTX for it matches",
            native_kernel_count, native_source, native_served);
 }
@@ -921,6 +941,12 @@ static void tracef(const char* format, ...)
     va_end(args);
 
     pthread_mutex_lock(&trace_lock);
+    FILE* f = fopen("d4r_nvcuda.log", "a");
+    if (f)
+    {
+        fprintf(f, "[d4r nvcuda] %s\n", line);
+        fclose(f);
+    }
     fprintf(stderr, "[d4r nvcuda] %s\n", line);
     fflush(stderr);
 
