@@ -54,6 +54,36 @@ Invoke-Child 'restore' @('-Action','restore')
 foreach ($name in $before.Keys) { if ((Get-FileHash -LiteralPath (Join-Path $game $name)).Hash -ne $before[$name]) { throw 'Original game bytes not restored.' } }
 if (Test-Path -LiteralPath (Join-Path $game 'd4r')) { throw 'Runtime directory remains after restore.' }
 $results+=@{case='auto-gfx1201-install-remember-restore'; passed=$true; gpuKernelsExecuted=$false}
+$manifest=Get-Content -LiteralPath (Join-Path $PackageRoot 'files/package.json') -Raw | ConvertFrom-Json
+if ($manifest.bundledNvidia) {
+    # Bundled originals take precedence over stale remembered shim selections;
+    # explicit overrides still go through the existing strict negative gates.
+    $exe=Fixture 'bundled auto selection'
+    $saved.ngxCore=Join-Path $PackageRoot 'files/targets/gfx1201/d4r/_nvngx.dll'
+    $saved.dlssDll=$saved.ngxCore
+    $saved | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PackageRoot 'work/settings.json') -Encoding UTF8
+    Invoke-Child 'bundled-install' @('-Action','install','-GameExe',$exe)
+    $game=Split-Path $exe
+    foreach ($pair in @(@{path='d4r/vendor/_nvngx.dll'; expected=$NgxCore},@{path='d4r/nvngx_dlss.dll'; expected=$DlssDll})) {
+        if ((Get-FileHash -LiteralPath (Join-Path $game $pair.path)).Hash -ne (Get-FileHash -LiteralPath $pair.expected).Hash) { throw 'Bundled original DLL selection failed.' }
+    }
+    $report=Get-ChildItem -LiteralPath (Join-Path $PackageRoot 'results') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    $status=Get-Content -LiteralPath (Join-Path $report.FullName 'quick-test.json') -Raw | ConvertFrom-Json
+    if ($status.nvidiaDllSource.core -ne 'bundled' -or $status.nvidiaDllSource.dlss -ne 'bundled') { throw 'Bundled DLL provenance is missing.' }
+    Invoke-Child 'bundled-restore' @('-Action','restore','-GameExe',$exe)
+    if (Test-Path -LiteralPath (Join-Path $game 'd4r')) { throw 'Bundled runtime directory remains after restore.' }
+    $results+=@{case='bundled-auto-selection-ignores-stale-choices'; passed=$true; gpuKernelsExecuted=$false}
+    $core=Join-Path (Join-Path $PackageRoot 'files') $manifest.bundledNvidia.ngxCore
+    $original=[IO.File]::ReadAllBytes($core)
+    try {
+        [IO.File]::AppendAllText($core,'tampered bundled fixture')
+        $exe=Fixture 'tampered bundled core'
+        Invoke-Child 'tampered-bundled-core' @('-Action','install','-GameExe',$exe) 1
+        $game=Split-Path $exe
+        if ((Test-Path -LiteralPath (Join-Path $game '.d4r-backup')) -or (Test-Path -LiteralPath (Join-Path $game 'dxgi.dll'))) { throw 'Tampered bundled DLL changed game files.' }
+        $results+=@{case='tampered-bundled-core'; passed=$true; rejectedBeforeGameChanges=$true; gpuKernelsExecuted=$false}
+    } finally { [IO.File]::WriteAllBytes($core,$original) }
+}
 # A harmless child refuses attached debuggers and produces an empty stderr.
 # The default launcher must allow it to exit and must report no DLSS session.
 $exe=Join-Path (Join-Path $OutputDirectory 'launcher-fixture') 'Fixture.exe'

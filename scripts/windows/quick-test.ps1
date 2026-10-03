@@ -32,6 +32,13 @@ function Copy-Payload([string]$Source, [string]$Destination, [string]$Relative) 
     New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
     Copy-Item -LiteralPath (Join-Path $Source $Relative) -Destination $path -Force
 }
+function Get-BundledNvidiaFile([string]$Relative) {
+    $directory=Join-Path $PSScriptRoot 'nvidia'
+    $path=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $Relative))
+    if (!$path.StartsWith($directory+'\',[StringComparison]::OrdinalIgnoreCase) -or
+        !(Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Invalid bundled NVIDIA file. Extract the complete package again.' }
+    return $path
+}
 if ($Action -eq 'restore') {
     $GameExe=Select-LocalFile 'Select the SAME game executable used for the test' '*.exe' $(if ($GameExe) { $GameExe } elseif ($saved) { $saved.game })
     & (Join-Path $PSScriptRoot 'common/windows-game.ps1') -Action restore -GameExe $GameExe
@@ -96,8 +103,16 @@ try {
         elseif ($reuse) { throw 'Invalid choice. Press Enter or type C on the next run.' }
     }
     $GameExe=Select-LocalFile 'Select the actual D3D12 game .exe (not Steam or a launcher)' '*.exe' $(if ($GameExe) { $GameExe } else { $previousGame })
-    $NgxCore=Select-LocalFile 'Select your ORIGINAL NVIDIA _nvngx.dll (32.0.16.1714)' '_nvngx.dll' $(if ($NgxCore) { $NgxCore } elseif ($saved) { $saved.ngxCore })
-    $DlssDll=Select-LocalFile 'Select your NVIDIA nvngx_dlss.dll (310.9.1)' 'nvngx_dlss.dll' $(if ($DlssDll) { $DlssDll } elseif ($saved) { $saved.dlssDll })
+    $bundledCore=$null; $bundledDlss=$null
+    if ($manifest.bundledNvidia) {
+        $bundledCore=Get-BundledNvidiaFile $manifest.bundledNvidia.ngxCore
+        $bundledDlss=Get-BundledNvidiaFile $manifest.bundledNvidia.dlssDll
+    }
+    $status.nvidiaDllSource=@{core=$(if ($NgxCore) { 'explicit' } elseif ($bundledCore) { 'bundled' } else { 'user-supplied' });
+        dlss=$(if ($DlssDll) { 'explicit' } elseif ($bundledDlss) { 'bundled' } else { 'user-supplied' })}
+    if ($bundledCore -and !$NgxCore -and !$DlssDll) { Write-Host 'Using the validated NVIDIA DLL pair included by this package distributor.' }
+    $NgxCore=Select-LocalFile 'Select your ORIGINAL NVIDIA _nvngx.dll (32.0.16.1714)' '_nvngx.dll' $(if ($NgxCore) { $NgxCore } elseif ($bundledCore) { $bundledCore } elseif ($saved) { $saved.ngxCore })
+    $DlssDll=Select-LocalFile 'Select your NVIDIA nvngx_dlss.dll (310.9.1)' 'nvngx_dlss.dll' $(if ($DlssDll) { $DlssDll } elseif ($bundledDlss) { $bundledDlss } elseif ($saved) { $saved.dlssDll })
     $status.game=$GameExe
     $status.localDlls=@($NgxCore,$DlssDll | ForEach-Object { $item=Get-Item -LiteralPath $_; @{path=$item.FullName; version=$item.VersionInfo.FileVersion; sha256=(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash} })
     if ((Get-FileHash -LiteralPath $NgxCore -Algorithm SHA256).Hash -ne $manifest.ngxCoreSha256) {

@@ -2,8 +2,11 @@
 
 The shim, diagnostics, native K/M kernels and game installer accept the
 targets below, with one package per actual ISA. **Only RX 9070 XT has physical
-validation here.** All other targets are experimental and compile-tested;
-working DLSS, interop and performance on them remain unverified.
+validation here.** Community RX 9060 XT / gfx1200 logs now show K/M backend
+execution in Cyberpunk and Dawnwalker with all required native layers and
+finite output. Visual issues remain reported and are not resolved by those
+checks. All other targets are experimental and compile-tested; their DLSS,
+interop and performance remain unverified.
 
 | Family | Target | Examples / scope |
 | --- | --- | --- |
@@ -67,6 +70,28 @@ vkd3d-proton 3.1.0 from a local D3D12 proxy, outside this Windows backend.
 The new packages/preflight address the identified failures. They do not prove
 those games work on RX 9060 XT; a new native-D3D12 run on that GPU is required.
 Raw community logs and personal directory paths stay local.
+
+## Community retest, 2026-10-03
+
+[Comment 5962444244](https://github.com/countervolts/d4r/issues/10#issuecomment-5962444244)
+uses the corrected `52d9872` package / `3d62b98` binaries on RX 9060 XT
+(`gfx1200`, 16 GB). Cyberpunk K/M complete 4,365 / 1,751 session frames;
+Dawnwalker K/M complete 6,713 / 1,690. Every frame has a finite-output GPU
+check, all required native layers execute and all four sessions exit normally.
+The logs record zero backend failures, previous-frame outputs and CPU image
+copies. This is community backend coverage, not a reference-image comparison:
+the tester reports texture/LOD and motion-related artifacts. All four runs use
+the HDR network input/output path, unlike the local Cyberpunk LDR validation.
+
+Spider-Man 2 crashes with `0xc0000005` before any completed DLSS frame;
+its nonstandard launch is not evidence of a transformer kernel failure.
+Assassin's Creed exits with zero frames and Streamline logs repeated internal
+minidumps; its clean process exit is still inconclusive. Their causes remain
+open without a stack trace. The Witcher 3 log in
+[comment 5962808629](https://github.com/countervolts/d4r/issues/10#issuecomment-5962808629)
+selects the gfx1200 d4r shim instead of the original NGX core (its SHA256
+matches the shipped shim exactly), and the installer correctly refuses
+before modifying the game. It does not establish a Witcher runtime failure.
 
 ## Build
 

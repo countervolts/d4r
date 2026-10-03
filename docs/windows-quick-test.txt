@@ -9,14 +9,16 @@ The package detects the real GPU automatically. Do not rename any DLLs.
    Already installed an older test? Close the game and run RESTORE-GAME.cmd
    from that old package first, then extract this version to a new folder.
 
-2. CLOSE YOUR GAME. Have these TWO ORIGINAL NVIDIA files ready:
+2. CLOSE YOUR GAME. If your distributor included the validated NVIDIA DLL pair,
+   it is selected automatically; you only need to choose the game executable.
+   Otherwise have these TWO ORIGINAL NVIDIA files ready:
    _nvngx.dll       version 32.0.16.1714
    nvngx_dlss.dll   version 310.9.1
-   NVIDIA DLLs are not included. Other versions are rejected.
+   The xdfnx-dev public test ZIP does not include them. Other versions are rejected.
    The small _nvngx.dll inside this package is d4r, NOT the original NVIDIA file.
 
 3. DOUBLE-CLICK START-K.cmd. Pick the actual game .exe when asked.
-   Pick your two NVIDIA DLLs. These choices are remembered for the next run.
+   If asked, pick your two NVIDIA DLLs. These choices are remembered for the next run.
    Next time, press Enter for the same game, or C to choose another.
    If Steam/Epic is needed, keep it open. Choose a D3D12 game without anti-cheat.
    If a launcher opens, type C and choose the real game executable next time.
@@ -53,7 +55,8 @@ Colour, depth, motion and output remain in VRAM in the runtime fast path.
 
 Runtime files are in files/. Cache/settings are created in work/.
 Licenses are in licenses/. Corresponding sources are a SEPARATE release download;
-testers do not need to download or build them. No NVIDIA proprietary DLLs are shipped.
+testers do not need to download or build them. NVIDIA DLLs, when supplied by a
+distributor, keep their separate license and are not part of the GPL source archive.
 
 Report: https://github.com/countervolts/d4r/issues/10
 Source: https://github.com/xdfnx-dev/d4r

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$GamePackagePrefix, [Parameter(Mandatory=$true)][string]$PackageRoot,
-    [string]$ArchivePath
+    [string]$ArchivePath,
+    [string]$NvidiaDirectory, [string]$NvidiaLicensePath
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
@@ -65,9 +66,27 @@ foreach ($launch in @(@{name='START-K.cmd'; arguments='-Preset 11'},@{name='STAR
         Set-Content -LiteralPath $path -Encoding ASCII
     $files.Add(@{path=$launch.name; sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash; version=$null})
 }
-# Publicly supplied original identity, never the binary itself.
+$ngxCoreSha256='66767018C36B3BAB46398DADE3ADF173DAA3730FDA75965689EA848C9BC4E79B'
+$bundledNvidia=$null
+if ($NvidiaDirectory) {
+    # Opt-in for local testing or a distributor with appropriate permission.
+    # A matching hash establishes binary identity, not redistribution rights.
+    if (!$NvidiaLicensePath -or !(Test-Path -LiteralPath $NvidiaLicensePath -PathType Leaf)) {
+        throw 'Bundled NVIDIA files require -NvidiaLicensePath with their applicable license. This option does not establish redistribution permission.'
+    }
+    $core=Join-Path $NvidiaDirectory '_nvngx.dll'
+    $dlss=Join-Path $NvidiaDirectory 'nvngx_dlss.dll'
+    if ((Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash -ne $ngxCoreSha256 -or
+        (Get-FileHash -LiteralPath $dlss -Algorithm SHA256).Hash -ne $baseline.dlssSha256) {
+        throw 'Bundled NVIDIA files must match the validated original NGX and DLSS hashes.'
+    }
+    [void](Stage $core 'files/nvidia/_nvngx.dll')
+    [void](Stage $dlss 'files/nvidia/nvngx_dlss.dll')
+    [void](Stage $NvidiaLicensePath 'licenses/NVIDIA-RTX.txt')
+    $bundledNvidia=@{ngxCore='nvidia/_nvngx.dll'; dlssDll='nvidia/nvngx_dlss.dll'; license='licenses/NVIDIA-RTX.txt'}
+} elseif ($NvidiaLicensePath) { throw '-NvidiaLicensePath requires -NvidiaDirectory.' }
 $metadata=[ordered]@{schema=1; packageCommit=$commit; binarySourceCommit=$baseline.d4rCommit;
-    ngxCoreSha256='66767018C36B3BAB46398DADE3ADF173DAA3730FDA75965689EA848C9BC4E79B';
+    ngxCoreSha256=$ngxCoreSha256; bundledNvidia=$bundledNvidia;
     dependencies=@{optiScalerSourceCommit=$baseline.optiScaler.sourceCommit; zludaSourceCommit=$baseline.zludaBuild.sourceCommit;
         llvmSource=$baseline.zludaBuild.llvmSource; hipRuntime=$baseline.hipRuntime};
     commonFiles=$common; targets=$targets; files=$files}
@@ -86,4 +105,5 @@ if ($ArchivePath) {
         }
     } finally { if ($archive) { $archive.Dispose() }; $stream.Dispose() }
 }
-Write-Host "Quick-test package: $PackageRoot (11 targets, automatic GPU selection, no NVIDIA DLLs)"
+$nvidiaMode=if ($bundledNvidia) { 'bundled NVIDIA files; distributor must have appropriate permission' } else { 'user-supplied NVIDIA files' }
+Write-Host "Quick-test package: $PackageRoot (11 targets, automatic GPU selection, $nvidiaMode)"

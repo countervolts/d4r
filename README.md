@@ -26,7 +26,10 @@ locally and excluded from packages.
 
 Experimental Windows builds also cover RDNA3 `gfx1100..gfx1103`, RDNA3.5
 `gfx1150..gfx1154` and RDNA4 `gfx1200/gfx1201`, with separate guarded packages.
-Only RX 9070 XT has physical validation here; all other targets are compile-tested.
+Only RX 9070 XT has physical validation here; other targets are compile-tested.
+Community RX 9060 XT / gfx1200 logs now show native K/M execution and finite
+output in Cyberpunk and Dawnwalker. Visual issues are still reported, so this
+is backend coverage rather than completed image-quality validation.
 The installer checks the real HIP target before changing game files. See
 [Windows GPU coverage and issue #10 diagnostics](docs/windows-gpu-support.md).
 
@@ -47,7 +50,12 @@ RX 9070 XT. Cyberpunk 2077 2.31 also reaches saved 4K gameplay with K and M:
 required native transformer layer executes, and no backend failures,
 previous-frame outputs or CPU image copies occur. Sessions include menus and
 loading; this synchronous diagnostic is not an FPS benchmark. Other GPUs,
-including the reporter's RX 9060 XT / gfx1200, still require hardware testing.
+including the reporter's RX 9060 XT / gfx1200, required further testing at that point.
+The subsequent RX 9060 XT retest passes all required native-layer/output
+checks in Cyberpunk and Dawnwalker; texture/LOD and motion artifacts remain
+open. Distributor-supplied DLL pairs can now be selected automatically by the
+quick launcher. The public fork ZIP still uses locally supplied NVIDIA files;
+packaging support does not establish redistribution permission.
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

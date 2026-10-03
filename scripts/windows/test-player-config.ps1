@@ -36,8 +36,12 @@ function Invoke-Native([string]$Log,[string]$Exe,[string[]]$Arguments) {
 }
 function Build([string]$Name,[string[]]$Arguments) {
     $log=Join-Path $OutputDirectory "build-$Name.log"
-    # PowerShell 5 strips embedded quotes from native arguments; escape them.
-    if (Invoke-Native $log $cxx @($Arguments | ForEach-Object { $_.Replace('"','\"') })) { throw "Build failed: $Name; see $log" }
+    # PowerShell 5 / Legacy native passing strips embedded quotes. PowerShell
+    # 7's Standard/Windows passing preserves them and must not double-escape.
+    if ($PSVersionTable.PSVersion.Major -le 5 -or $PSNativeCommandArgumentPassing -eq 'Legacy') {
+        $Arguments=@($Arguments | ForEach-Object { $_.Replace('"','\"') })
+    }
+    if (Invoke-Native $log $cxx $Arguments) { throw "Build failed: $Name; see $log" }
 }
 $results=@()
 
