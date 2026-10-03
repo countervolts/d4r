@@ -35,6 +35,10 @@
   The tested GE-Proton11-3 setup required native ICU overrides
   (`icuuc=n,b;icuin=n,b;icudt=n,b`) to avoid Wine's unimplemented `u_setMemoryFunctions_65`.
   Keep guide/alpha verification off for normal play; it intentionally adds GPU readbacks.
+- Rebased RR onto the latest `linux` branch, preserving per-slot input markers and ordered
+  frame retirement. Rebuilt shim/bridge and rechecked a loaded Cyberpunk scene with camera
+  motion, RR E and path tracing at 1080p Ultra Performance on gfx1201.
+  Removed brittle source-text/wording tests; configuration validation remains covered.
 
 # d4r 0.1.3
 
