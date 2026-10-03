@@ -343,6 +343,37 @@ static std::vector<uint8_t> read_back(ID3D12Resource* texture, D3D12_RESOURCE_ST
     return result;
 }
 
+static UINT alpha_texel_bytes(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R32_FLOAT ? 4 : (format == DXGI_FORMAT_R8_UNORM ? 1 : 2);
+}
+
+// Saved alpha stays float32 regardless of the caller's texture format.
+static std::vector<uint8_t> read_alpha(ID3D12Resource* texture, DXGI_FORMAT format, UINT width, UINT height)
+{
+    const UINT texel = alpha_texel_bytes(format);
+    auto raw = read_back(texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, width * texel);
+    if (format == DXGI_FORMAT_R32_FLOAT)
+        return raw;
+    const size_t pixels = static_cast<size_t>(width) * height;
+    raw.resize(pixels * sizeof(float));
+    for (size_t pixel = pixels; pixel-- > 0;)
+    {
+        float value;
+        if (texel == 1)
+            value = raw[pixel] / 255.0f;
+        else
+        {
+            uint16_t packed;
+            std::memcpy(&packed, raw.data() + pixel * texel, sizeof(packed));
+            value = format == DXGI_FORMAT_R16_FLOAT ? static_cast<float>(std::bit_cast<_Float16>(packed))
+                                                   : packed / 65535.0f;
+        }
+        std::memcpy(raw.data() + pixel * sizeof(float), &value, sizeof(value));
+    }
+    return raw;
+}
+
 static void trace_stage(const char* stage)
 {
     const char* path = std::getenv("D4R_HARNESS_TRACE");
@@ -426,6 +457,240 @@ static float pole_scene(float x, float y, UINT outWidth, UINT outHeight)
         return 0.04f;
     return 0.46f + 0.03f * v;
 }
+
+// --- Ray Reconstruction guide inputs ------------------------------------------
+//
+// A denoiser guide only proves it reached the network when its content changes the
+// result, and only proves its layout when a transposed, channel-swapped,
+// half-a-row-off or previous frame's copy changes it differently again. The guides
+// are therefore filled with deterministic nonuniform patterns that depend on the
+// texel's position, its channel, the plane it belongs to and the frame's phase, and
+// the harness can perturb exactly one of those per probe evaluation.
+struct GuideFormat
+{
+    DXGI_FORMAT format;
+    unsigned channels;
+    unsigned bytes;      // per texel
+    const char* token;
+};
+
+// The formats a game plausibly passes, one per path the shim treats differently:
+// verbatim GPU copies (rgba16f, rgba8unorm, rgba16unorm), Vulkan blits of packed
+// or byte-swapped images (bgra8unorm, rgb10a2unorm, rgb11b10float) and the integer
+// guides Vulkan cannot blit into floats, which stay on the host (r32uint, r32sint).
+static bool guide_format(const char* token, GuideFormat& format)
+{
+    static const GuideFormat table[] = {
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, 4, 8, "rgba16f"},
+        {DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 16, "rgba32f"},
+        {DXGI_FORMAT_R16G16B16A16_UNORM, 4, 8, "rgba16unorm"},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, "rgba8unorm"},
+        {DXGI_FORMAT_R8G8B8A8_SNORM, 4, 4, "rgba8snorm"},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, 4, 4, "bgra8unorm"},
+        {DXGI_FORMAT_R10G10B10A2_UNORM, 4, 4, "rgb10a2unorm"},
+        {DXGI_FORMAT_R11G11B10_FLOAT, 4, 4, "rgb11b10float"},
+        {DXGI_FORMAT_R16G16_FLOAT, 2, 4, "rg16f"},
+        {DXGI_FORMAT_R32_FLOAT, 1, 4, "r32f"},
+        {DXGI_FORMAT_R32_UINT, 1, 4, "r32uint"},
+        {DXGI_FORMAT_R32_SINT, 1, 4, "r32sint"},
+    };
+    for (const GuideFormat& entry : table)
+        if (std::strcmp(entry.token, token) == 0)
+        {
+            format = entry;
+            return true;
+        }
+    return false;
+}
+
+// One guide texel's value. Plane, channel and phase each shift it, and every plane
+// ramps along a different axis with its own checker period, so a guide that arrives
+// transposed, from the wrong channel, from another plane or from another frame is a
+// visibly different image rather than an indistinguishable one.
+static float guide_value(unsigned plane, unsigned channel, UINT x, UINT y, UINT width, UINT height,
+                         unsigned phase)
+{
+    if (channel == 3)
+        return 1.0f;
+    const float u = width > 1 ? static_cast<float>(x) / static_cast<float>(width - 1) : 0.0f;
+    const float v = height > 1 ? static_cast<float>(y) / static_cast<float>(height - 1) : 0.0f;
+    const float offset = 0.37f * static_cast<float>(plane) + 0.19f * static_cast<float>(channel) +
+                         0.5f * static_cast<float>(phase);
+    const float ramp = (plane % 2u) != 0 ? v : u;
+    const float wave = 0.22f * std::sin(6.2831853f * (2.0f * u + 3.0f * v + offset));
+    const unsigned shift = plane % 4u;
+    const float checker = ((((x >> shift) ^ (y >> shift)) & 1u) != 0) ? 0.05f : -0.05f;
+    const float value = 0.45f + 0.25f * ramp + wave + checker;
+    if (plane == 0) // normals: keep a unit-length, position-dependent normal
+    {
+        const float nx = 2.0f * value - 1.0f, ny = 2.0f * (0.45f + 0.25f * v + wave + checker) - 1.0f;
+        const float nzSquared = std::max(0.0f, 1.0f - nx * nx - ny * ny);
+        if (channel == 2)
+            return std::sqrt(nzSquared);
+        return 0.5f * (nx + 1.0f);
+    }
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
+// Packs one value into a small float field: 6 mantissa bits for R11G11B10_FLOAT's
+// two 11-bit channels, 5 for its 10-bit channel. Values are clamped into range
+// first, so everything this writes the format can represent.
+static uint16_t pack_small_float(float value, unsigned mantissaBits)
+{
+    if (!(value > 0.0f))
+        return 0;
+    constexpr int bias = 15;
+    const unsigned mantissaScale = 1u << mantissaBits;
+    const float limit = std::ldexp(1.0f, (1 << 5) - 2 - bias);
+    value = std::min(value, limit);
+    int exponent = 0;
+    std::frexp(value, &exponent);
+    --exponent; // floor(log2(value))
+    const int clamped = std::clamp(exponent + bias, 1, (1 << 5) - 2);
+    const float scaled = std::ldexp(value, static_cast<int>(mantissaBits) - clamped + bias);
+    const int mantissa = std::clamp(static_cast<int>(std::lround(scaled)) - static_cast<int>(mantissaScale), 0,
+                                    static_cast<int>(mantissaScale) - 1);
+    return static_cast<uint16_t>((static_cast<unsigned>(clamped) << mantissaBits) |
+                                 static_cast<unsigned>(mantissa));
+}
+
+static void encode_guide_texel(const GuideFormat& format, const float* values, uint8_t* destination)
+{
+    switch (format.format)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16_FLOAT:
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+        {
+            const uint16_t packed = std::bit_cast<uint16_t>(static_cast<_Float16>(values[channel]));
+            std::memcpy(destination + channel * 2, &packed, sizeof(packed));
+        }
+        return;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+            std::memcpy(destination + channel * 4, &values[channel], sizeof(float));
+        return;
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+        {
+            const uint16_t packed =
+                static_cast<uint16_t>(std::lround(std::clamp(values[channel], 0.0f, 1.0f) * 65535.0f));
+            std::memcpy(destination + channel * 2, &packed, sizeof(packed));
+        }
+        return;
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+            destination[channel] = static_cast<uint8_t>(
+                static_cast<int8_t>(std::clamp(std::lround(values[channel] * 127.0f), -127L, 127L)));
+        return;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        // Stored B, G, R, A: a verbatim copy would hand the denoiser swapped channels.
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+            destination[channel < 3 ? 2 - channel : 3] =
+                static_cast<uint8_t>(std::lround(std::clamp(values[channel], 0.0f, 1.0f) * 255.0f));
+        return;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+            destination[channel] = static_cast<uint8_t>(std::lround(std::clamp(values[channel], 0.0f, 1.0f) * 255.0f));
+        return;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: {
+        uint32_t packed = 0;
+        for (unsigned channel = 0; channel < format.channels; ++channel)
+        {
+            const unsigned bits = channel == 3 ? 2u : 10u;
+            const unsigned maximum = (1u << bits) - 1u;
+            const unsigned value =
+                static_cast<unsigned>(std::lround(std::clamp(values[channel], 0.0f, 1.0f) * maximum));
+            packed |= (value & maximum) << (channel * 10u);
+        }
+        std::memcpy(destination, &packed, sizeof(packed));
+        return;
+    }
+    case DXGI_FORMAT_R11G11B10_FLOAT: {
+        const uint32_t packed = static_cast<uint32_t>(pack_small_float(values[0], 6)) |
+                                (static_cast<uint32_t>(pack_small_float(values[1], 6)) << 11u) |
+                                (static_cast<uint32_t>(pack_small_float(values[2], 5)) << 22u);
+        std::memcpy(destination, &packed, sizeof(packed));
+        return;
+    }
+    case DXGI_FORMAT_R32_UINT: {
+        const uint32_t packed = static_cast<uint32_t>(std::lround(values[0] * 4096.0f));
+        std::memcpy(destination, &packed, sizeof(packed));
+        return;
+    }
+    case DXGI_FORMAT_R32_SINT: {
+        const int32_t packed =
+            static_cast<int32_t>(std::lround((values[0] - 0.5f) * 8192.0f)); // roughly [-4096, 4096]
+        std::memcpy(destination, &packed, sizeof(packed));
+        return;
+    }
+    default:
+        break;
+    }
+    std::memset(destination, 0, format.bytes);
+}
+
+// --- comparing rendered frames ------------------------------------------------
+static float luma_of(const uint8_t* pixel, bool rgba8)
+{
+    float sum = 0.0f;
+    for (int channel = 0; channel < 3; ++channel)
+        sum += rgba8 ? static_cast<float>(pixel[channel]) / 255.0f
+                     : static_cast<float>(std::bit_cast<_Float16>(
+                           *reinterpret_cast<const uint16_t*>(pixel + channel * 2)));
+    return std::clamp(sum / 3.0f, 0.0f, 1.0f);
+}
+
+// True once a guide plane has been uploaded, so later phases update rather than create.
+static bool g_uploadedGuides = false;
+
+static std::string join_guide_formats(const std::array<std::string, 4>& names)
+{
+    std::string joined;
+    for (const std::string& name : names)
+        joined += joined.empty() ? name : ", " + name;
+    return joined;
+}
+
+// Writes each guide plane's nonuniform pattern for one phase. With `push` set the content
+// also goes to the plane's texture: the first write creates it, later ones are copy updates,
+// exactly as a game re-renders its G-buffer every frame. `leftBias` adds a constant to every
+// texel of the left half only, which is what the guide response probe needs: a change the
+// denoiser can only reproduce if that texel's guide value reached it, in that place.
+template <size_t Planes>
+static void fill_guide_planes(std::array<ID3D12Resource*, Planes>& planes,
+                              const std::array<GuideFormat, Planes>& specs,
+                              std::array<std::vector<uint8_t>, Planes>& data, UINT width, UINT height,
+                              unsigned phase, bool push, D3D12_RESOURCE_STATES srv, float leftBias = 0.0f)
+{
+    for (size_t input = 0; input < Planes; ++input)
+    {
+        const GuideFormat& spec = specs[input];
+        data[input].assign(static_cast<size_t>(width) * height * spec.bytes, 0);
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x)
+            {
+                float values[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                for (unsigned channel = 0; channel < spec.channels; ++channel)
+                    values[channel] = std::clamp(
+                        guide_value(static_cast<unsigned>(input), channel, x, y, width, height, phase) +
+                            (leftBias != 0.0f && x < width / 2 ? leftBias : 0.0f),
+                        channel == 3 ? 1.0f : 0.0f, 1.0f);
+                encode_guide_texel(spec, values,
+                                    data[input].data() +
+                                        (static_cast<size_t>(y) * width + x) * spec.bytes);
+            }
+        if (!push || planes[input] == nullptr)
+            continue;
+        if (g_uploadedGuides)
+            update_texture(planes[input], data[input].data(), width * spec.bytes, srv);
+        else
+            upload(planes[input], data[input].data(), width * spec.bytes, srv);
+    }
+    g_uploadedGuides = true;
+}
+
 
 // D4R_HARNESS_REPLAY_DIR=<dir> replays frames captured in a game by the shim
 // (D4R_SHIM_INPUT_DUMP_DIR + D4R_SHIM_CAPTURE_COUNT): frame-NNNNNN-color.rgba16f,
@@ -636,39 +901,73 @@ int main(int argc, char** argv)
     const char* featureSetting = std::getenv("D4R_HARNESS_FEATURE_ID");
     const unsigned int featureId = featureSetting ? static_cast<unsigned int>(std::strtoul(featureSetting, nullptr, 0)) : 1;
     const bool reconstruction = featureId == 13;
+    // The four G-buffer planes a game registers, one per parameter. D4R_HARNESS_GUIDE_FORMATS
+    // picks the format each is passed in, one token per plane in registration order
+    // (GBuffer.Normals, GBuffer.Roughness, GBuffer.DiffuseAlbedo, GBuffer.SpecularAlbedo),
+    // so a single run can cover the paths the shim treats differently. The default keeps
+    // the formats games actually pass for these planes.
+    const char* guideFormatSetting = std::getenv("D4R_HARNESS_GUIDE_FORMATS");
+    static const char* const kDefaultGuideFormats[] = {"rgba16f", "rgba16f", "rgba8unorm", "rgba8unorm"};
+    std::vector<std::string> guideTokens;
+    if (guideFormatSetting != nullptr && guideFormatSetting[0] != '\0')
+    {
+        std::string rest = guideFormatSetting;
+        while (!rest.empty())
+        {
+            const size_t comma = rest.find(',');
+            guideTokens.push_back(comma == std::string::npos ? rest : rest.substr(0, comma));
+            rest = comma == std::string::npos ? std::string() : rest.substr(comma + 1);
+        }
+    }
+    std::array<GuideFormat, 4> guideSpecs{};
+    std::array<std::string, 4> guideNames{};
+    for (size_t input = 0; input < guideSpecs.size(); ++input)
+    {
+        guideNames[input] = input < guideTokens.size() ? guideTokens[input] : kDefaultGuideFormats[input];
+        if (!guide_format(guideNames[input].c_str(), guideSpecs[input]))
+        {
+            std::fprintf(stderr, "Unknown guide format '%s' for guide %zu of 4\n",
+                         guideNames[input].c_str(), input);
+            return 2;
+        }
+    }
+    // D4R_HARNESS_RR_GUIDE_PHASE=1 rewrites the guides with the next pattern phase on every
+    // frame, so a stale or one-frame-late guide upload shows up as an output whose guides
+    // belong to a different frame.
+    const bool guidePhase = std::getenv("D4R_HARNESS_RR_GUIDE_PHASE") != nullptr;
+    std::array<std::vector<uint8_t>, 4> guideData{};
     std::array<ID3D12Resource*, 4> guides{};
     if (reconstruction)
     {
-        // Planar synthetic scene: world-space +Z normals, rough diffuse material.
-        // Distinct guides exercise denoising inputs rather than aliasing the noisy colour.
-        std::vector<uint16_t> guide(static_cast<size_t>(resourceWidth) * inHeight * 4);
-        const std::array<std::array<float, 4>, 4> values{{
-            {0.0f, 0.0f, 1.0f, 0.0f}, {0.5f, 0.0f, 0.0f, 0.0f},
-            {0.7f, 0.4f, 0.2f, 1.0f}, {0.04f, 0.04f, 0.04f, 1.0f}}};
         for (size_t input = 0; input < guides.size(); ++input)
         {
-            // Cyberpunk supplies UNORM8 albedos, while normals remain floating point.
-            const bool unorm = input >= 2;
-            guides[input] = create_texture(resourceWidth, inHeight,
-                                           unorm ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
+            guides[input] = create_texture(resourceWidth, inHeight, guideSpecs[input].format,
                                            D3D12_RESOURCE_FLAG_NONE);
             if (!guides[input]) return 1;
-            for (size_t pixel = 0; pixel < guide.size() / 4; ++pixel)
-                for (size_t component = 0; component < 4; ++component)
-                    if (unorm)
-                        reinterpret_cast<uint8_t*>(guide.data())[pixel * 4 + component] =
-                            static_cast<uint8_t>(std::lround(values[input][component] * 255.0f));
-                    else
-                        guide[pixel * 4 + component] =
-                            std::bit_cast<uint16_t>(static_cast<_Float16>(values[input][component]));
-            upload(guides[input], guide.data(), resourceWidth * (unorm ? 4 : 8), srv);
         }
+        fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight, 0, true, srv);
+        std::printf("Ray Reconstruction guides: %s%s\n", join_guide_formats(guideNames).c_str(),
+                    guidePhase ? " (rewritten every frame)" : "");
     }
     const bool alphaScenario = reconstruction && std::getenv("D4R_HARNESS_RR_ALPHA") != nullptr;
     const UINT alphaBaseX = 4, alphaBaseY = 2;
     const UINT alphaWidth = outWidth + 8, alphaHeight = outHeight + 4;
     ID3D12Resource* alphaInput = nullptr;
     ID3D12Resource* alphaOutput = nullptr;
+    DXGI_FORMAT alphaFormat = DXGI_FORMAT_R32_FLOAT;
+    if (const char* format = std::getenv("D4R_HARNESS_RR_ALPHA_FORMAT"))
+    {
+        if (std::strcmp(format, "r16f") == 0) alphaFormat = DXGI_FORMAT_R16_FLOAT;
+        else if (std::strcmp(format, "r8unorm") == 0) alphaFormat = DXGI_FORMAT_R8_UNORM;
+        else if (std::strcmp(format, "r16unorm") == 0) alphaFormat = DXGI_FORMAT_R16_UNORM;
+        else if (std::strcmp(format, "r32f") != 0)
+        {
+            std::fprintf(stderr, "Unknown RR alpha output format: %s\n", format);
+            return 1;
+        }
+    }
+    const bool alphaUnorm = alphaFormat == DXGI_FORMAT_R8_UNORM || alphaFormat == DXGI_FORMAT_R16_UNORM;
+    const float alphaSentinel = alphaUnorm ? 0.0f : -2.0f;
     if (alphaScenario)
     {
         // A varying coverage guide and a padded destination expose dropped alpha writes and
@@ -679,12 +978,24 @@ int main(int argc, char** argv)
                 coverage[static_cast<size_t>(y) * resourceWidth + x] =
                     0.25f + 0.5f * static_cast<float>(x) / std::max(1u, resourceWidth - 1);
         alphaInput = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
-        alphaOutput = create_texture(alphaWidth, alphaHeight, DXGI_FORMAT_R32_FLOAT,
+        alphaOutput = create_texture(alphaWidth, alphaHeight, alphaFormat,
                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         if (!alphaInput || !alphaOutput) return 1;
         upload(alphaInput, coverage.data(), resourceWidth * sizeof(float), srv);
-        std::vector<float> sentinel(static_cast<size_t>(alphaWidth) * alphaHeight, -2.0f);
-        upload(alphaOutput, sentinel.data(), alphaWidth * sizeof(float), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const UINT texel = alpha_texel_bytes(alphaFormat);
+        std::vector<uint8_t> sentinel(static_cast<size_t>(alphaWidth) * alphaHeight * texel, 0);
+        if (!alphaUnorm)
+            for (size_t pixel = 0; pixel < static_cast<size_t>(alphaWidth) * alphaHeight; ++pixel)
+            {
+                if (texel == 4)
+                    std::memcpy(sentinel.data() + pixel * texel, &alphaSentinel, sizeof(alphaSentinel));
+                else
+                {
+                    const uint16_t packed = std::bit_cast<uint16_t>(static_cast<_Float16>(alphaSentinel));
+                    std::memcpy(sentinel.data() + pixel * texel, &packed, sizeof(packed));
+                }
+            }
+        upload(alphaOutput, sentinel.data(), alphaWidth * texel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
@@ -917,6 +1228,13 @@ int main(int argc, char** argv)
 
     for (int frame = 1; frame <= frames; ++frame)
     {
+        if (reconstruction && guidePhase && frame > 1)
+        {
+            // The guides this frame are a different pattern, so the output can only be right
+            // if this frame's own guides were the ones the denoiser read.
+            fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight,
+                              static_cast<unsigned>(frame), true, srv);
+        }
         if (qualityScene)
         {
             // Halton(2,3) jitter in render pixels, [-0.5, 0.5); a render pixel
@@ -1129,6 +1447,18 @@ int main(int argc, char** argv)
                 std::fclose(frameFile);
             }
         }
+        // The alpha the denoiser produced for this frame, so a host and a GPU guide run can be
+        // compared frame by frame and not only on the last one.
+        if (saveFrames && alphaScenario)
+        {
+            const std::vector<uint8_t> alphaFrame = read_alpha(alphaOutput, alphaFormat, alphaWidth, alphaHeight);
+            const std::string alphaPath = std::string(argv[2]) + ".alpha" + std::to_string(frame);
+            if (FILE* alphaFile = std::fopen(alphaPath.c_str(), "wb"))
+            {
+                std::fwrite(alphaFrame.data(), 1, alphaFrame.size(), alphaFile);
+                std::fclose(alphaFile);
+            }
+        }
     }
 
     const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1143,6 +1473,82 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+    // Two reset evaluations with identical colour and depth, perturbing only the
+    // left-half guides, check that guide changes affect the rendered scene.
+    // Transformer attention can spread the response beyond the changed half;
+    // exact plane identity and layout are checked separately by VRAM verification.
+    if (reconstruction && std::getenv("D4R_HARNESS_RR_GUIDE_PROBE") != nullptr)
+    {
+        auto evaluate_reset_once = [&]() {
+            d4r_ngx_set_int(parameters, "Reset", 1);
+            const NgxResult evaluated = evaluate(g_list, feature, parameters, nullptr);
+            submit_and_wait();
+            Sleep(frameWaitMs);
+            return evaluated;
+        };
+        fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight, 0, true, srv);
+        if (evaluate_reset_once() != NGX_SUCCESS)
+        {
+            std::fprintf(stderr, "Guide probe: the baseline evaluation was refused\n");
+            return 1;
+        }
+        const std::vector<uint8_t> baseline =
+            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+        fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight, 0, true, srv, 0.4f);
+        if (evaluate_reset_once() != NGX_SUCCESS)
+        {
+            std::fprintf(stderr, "Guide probe: the left-half evaluation was refused\n");
+            return 1;
+        }
+        const std::vector<uint8_t> shifted =
+            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+        const size_t texel = rgba8 ? 4u : 8u;
+        double left = 0.0, right = 0.0;
+        size_t leftCount = 0, rightCount = 0, nonfinite = 0;
+        for (UINT y = 0; y < outHeight; ++y)
+            for (UINT x = 0; x < outWidth; ++x)
+            {
+                const size_t pixel = (static_cast<size_t>(y) * outWidth + x) * texel;
+                const float first = luma_of(baseline.data() + pixel, rgba8);
+                const float second = luma_of(shifted.data() + pixel, rgba8);
+                nonfinite += !std::isfinite(first) || !std::isfinite(second);
+                const double delta = std::fabs(static_cast<double>(first) - static_cast<double>(second));
+                if (x < outWidth / 2)
+                {
+                    left += delta;
+                    ++leftCount;
+                }
+                else
+                {
+                    right += delta;
+                    ++rightCount;
+                }
+            }
+        const double leftMean = leftCount ? left / leftCount : 0.0;
+        const double rightMean = rightCount ? right / rightCount : 0.0;
+        auto report_probe = [&](FILE* report) {
+            std::fprintf(report, "Guide probe: left-half mean |delta| %.6f, right-half %.6f, ratio %.4f, "
+                         "nonfinite %zu\n",
+                         leftMean, rightMean, leftMean > 0.0 ? rightMean / leftMean : 0.0, nonfinite);
+        };
+        report_probe(stdout);
+        const std::string probePath = std::string(argv[2]) + ".probe.txt";
+        if (FILE* report = std::fopen(probePath.c_str(), "w"))
+        {
+            report_probe(report);
+            std::fclose(report);
+        }
+        // Require a visible response, not locality: transformer attention can
+        // legitimately change both halves even when only one guide half changes.
+        if (!(leftMean + rightMean > 0.002) || nonfinite != 0)
+        {
+            std::fprintf(stderr,
+                         "Ray Reconstruction guide changes did not affect the rendered image: "
+                         "left-half mean |delta| %.6f, right-half %.6f\n",
+                         leftMean, rightMean);
+            return 1;
+        }
+    }
     // The shim queues each evaluation on its own worker, so a failure inside the denoiser is
     // invisible in this thread's EvaluateFeature return value: the frame is accepted and the
     // output texture is simply never written. The image is the only observable. On the static
@@ -1215,8 +1621,7 @@ int main(int argc, char** argv)
     }
     if (alphaScenario)
     {
-        const std::vector<uint8_t> raw =
-            read_back(alphaOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, alphaWidth * sizeof(float));
+        const std::vector<uint8_t> raw = read_alpha(alphaOutput, alphaFormat, alphaWidth, alphaHeight);
         const float* values = reinterpret_cast<const float*>(raw.data());
         size_t invalid = 0, overwritten = 0, leftCount = 0, rightCount = 0;
         double left = 0, right = 0;
@@ -1228,7 +1633,7 @@ int main(int argc, char** argv)
                                     y >= alphaBaseY && y < alphaBaseY + outHeight;
                 if (!inside)
                 {
-                    overwritten += value != -2.0f;
+                    overwritten += value != alphaSentinel;
                     continue;
                 }
                 invalid += !std::isfinite(value) || value < -0.001f || value > 1.001f;

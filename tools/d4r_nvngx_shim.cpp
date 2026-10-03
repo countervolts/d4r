@@ -6,14 +6,11 @@
 //
 // A D3D12 EvaluateFeature call only records into the game's still-open command
 // list, while DLSS runs on a separate CUDA context. Each evaluation therefore:
-//   1. records copies of the inputs into readback buffers plus a GPU-written
-//      frame marker (WriteBufferImmediate) on the game's command list,
-//   2. records a copy of the most recent finished DLSS result from an upload
-//      buffer into the output texture,
-//   3. queues a CUDA job that waits for the marker, uploads the inputs into
-//      CUDA arrays, runs the official DLSS evaluation, and stores the result
-//      into an upload buffer for a later frame.
-// The output is therefore one or more frames behind the game's other passes.
+//   1. records input copies into shared VRAM buffers (host readback fallback)
+//      and a GPU-written frame marker on the game's command list,
+//   2. queues CUDA work after that marker, evaluates NGX, and writes a result slot,
+//   3. copies that slot into the output texture. Split command lists present
+//      the current frame; without splitting the latest finished frame is used.
 //
 // Environment:
 //   D4R_NGX_CORE        Windows path of the official _nvngx.dll (required)
@@ -48,6 +45,7 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <vulkan/vulkan_core.h>
 #include "d4r_motion_dilation.h"
 
@@ -1595,6 +1593,17 @@ static NgxResult ensure_workers_started()
     return NGX_SUCCESS;
 }
 
+static void set_cuda_adapter_luid(const LUID& luid)
+{
+    char low[24], high[24];
+    std::snprintf(low, sizeof(low), "0x%08lx", static_cast<unsigned long>(luid.LowPart));
+    std::snprintf(high, sizeof(high), "0x%08lx", static_cast<unsigned long>(luid.HighPart));
+    SetEnvironmentVariableA("D4R_CUDA_LUID_LOW", low);
+    SetEnvironmentVariableA("D4R_CUDA_LUID_HIGH", high);
+    SetEnvironmentVariableA("D4R_CUDA_NODE_MASK", "1");
+    logf("CUDA device LUID set to the D3D12 adapter LUID %s:%s", high, low);
+}
+
 static NgxResult initialize(unsigned long long applicationId, const wchar_t* dataPath, ID3D12Device* device,
                             const NgxFeatureCommonInfo* featureInfo, unsigned int sdkVersion,
                             const ProjectIdentity* project = nullptr)
@@ -1623,13 +1632,7 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         // the nvcuda bridge reports this LUID from cuDeviceGetLuid.
         LUID luid;
         device->GetAdapterLuid(&luid);
-        char low[24], high[24];
-        std::snprintf(low, sizeof(low), "0x%08lx", static_cast<unsigned long>(luid.LowPart));
-        std::snprintf(high, sizeof(high), "0x%08lx", static_cast<unsigned long>(luid.HighPart));
-        SetEnvironmentVariableA("D4R_CUDA_LUID_LOW", low);
-        SetEnvironmentVariableA("D4R_CUDA_LUID_HIGH", high);
-        SetEnvironmentVariableA("D4R_CUDA_NODE_MASK", "1");
-        logf("CUDA device LUID set to the D3D12 adapter LUID %s:%s", high, low);
+        set_cuda_adapter_luid(luid);
     }
 
     g.paths.clear();
@@ -1870,7 +1873,7 @@ static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t
         {DXGI_FORMAT_R32G32B32A32_UINT, 4},
         {DXGI_FORMAT_B8G8R8A8_UNORM, 4},
         {DXGI_FORMAT_R10G10B10A2_UNORM, 4},
-        {DXGI_FORMAT_R11G11B10_FLOAT, 3},
+        {DXGI_FORMAT_R11G11B10_FLOAT, 4},
     };
     for (const Converted& entry : converted)
         if (entry.format == format)
@@ -1984,9 +1987,10 @@ static void convert_aux_row(DXGI_FORMAT format, const uint8_t* source, float* de
         {
             uint32_t packed;
             std::memcpy(&packed, source + x * 4, sizeof(packed));
-            destination[x * 3] = small_float_to_float(packed & 0x7FF, 6);
-            destination[x * 3 + 1] = small_float_to_float((packed >> 11) & 0x7FF, 6);
-            destination[x * 3 + 2] = small_float_to_float((packed >> 22) & 0x3FF, 5);
+            destination[x * 4] = small_float_to_float(packed & 0x7FF, 6);
+            destination[x * 4 + 1] = small_float_to_float((packed >> 11) & 0x7FF, 6);
+            destination[x * 4 + 2] = small_float_to_float((packed >> 22) & 0x3FF, 5);
+            destination[x * 4 + 3] = 1.0f; // missing alpha follows shader texture reads
         }
         return;
     default:
@@ -2202,7 +2206,10 @@ struct AuxSurface
     CudaImage image;        // worker only
     CudaObject handle = 0;  // what the parameters point at; its address must stay put
     Staging staging[kSlots];
-    HostPlane host[kSlots]; // unpacked floats, only for a converted surface (worker only)
+    HostPlane host[kSlots]; // stable upload bytes for host fallback (worker only)
+    VramBuffer vram[kSlots]; // per-frame guide bytes; imported lazily on the CUDA worker
+    VramImage conversion;   // packed/BGRA guides converted by Vulkan, not the CPU
+    bool gpu[kSlots] = {};
 };
 
 // What one frame's slot bound: which surface answered which denoiser name, for that frame
@@ -2238,6 +2245,12 @@ struct InputSlot
     DXGI_FORMAT alphaFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t alphaWriteback = 0;
     bool alphaRequested = false;
+    // GPU-resident alpha (VRAM interop): the caller's image and whether this frame's result can be
+    // blitted into it, so the float32 result never has to come back through host memory. Set with
+    // the rest of the alpha capture, on the game thread, before the frame is queued.
+    VkImage alphaImageHandle = VK_NULL_HANDLE;
+    bool alphaConvert = false;
+    bool alphaGpu = false;
     std::atomic<bool> busy{false}; // readback staging owned by the pipeline
     HostPlane host[4];
     std::atomic<bool> hostBusy{false}; // host planes not yet uploaded by the worker
@@ -2251,6 +2264,9 @@ struct InputSlot
 struct AlphaSlot
 {
     Staging staging;                            // upload buffer holding one result
+    VramBuffer vram;                            // VRAM interop: the evaluated region as float32
+    VramImage conversion;                       // the R32F image that result is blitted from
+    bool gpu = false;                           // filled in vram, presented from it; else staging
     std::atomic<uint32_t> lastReadFrame{0};     // reserved/last-read frame, as OutputSlot's
     std::atomic<uint32_t> producedFrame{0};     // frame that filled it
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -2913,7 +2929,7 @@ static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes)
 }
 
 // Game thread. The CUDA import runs on the worker, which owns the context.
-static bool create_vram_buffer(VramBuffer& target, size_t bytes)
+static bool create_vram_buffer(VramBuffer& target, size_t bytes, bool importNow = true)
 {
     if (take_pooled_vram_buffer(target, bytes))
         return true;
@@ -2942,8 +2958,8 @@ static bool create_vram_buffer(VramBuffer& target, size_t bytes)
         result = g_vk.allocate(g_vk.device, &allocation, nullptr, &buffer.memory);
     if (result == VK_SUCCESS)
         result = g_vk.bindBuffer(g_vk.device, buffer.buffer, buffer.memory, 0);
-    int imported = -1;
-    if (result == VK_SUCCESS)
+    int imported = 0;
+    if (result == VK_SUCCESS && importNow)
         imported = g.worker.call([&] {
             return g_vk.import(g_vk.device, reinterpret_cast<uint64_t>(buffer.memory), requirements.size,
                                &buffer.device, &buffer.external);
@@ -3427,6 +3443,11 @@ static void release_vram(Feature& feature)
             recycle_vram_buffer(buffer);
     for (OutputSlot& slot : feature.outputs)
         recycle_vram_buffer(slot.vram);
+    for (AlphaSlot& slot : feature.alpha)
+    {
+        recycle_vram_buffer(slot.vram);
+        destroy_vram_image(slot.conversion);
+    }
     for (VramBuffer& buffer : feature.retiredBuffers)
         recycle_vram_buffer(buffer);
     feature.retiredBuffers.clear();
@@ -3440,20 +3461,22 @@ static void release_vram(Feature& feature)
 }
 
 // Prep stage: converts one readback staging buffer into the canonical layout.
-static void stage_plane(Plane plane, const Staging& staging, HostPlane& host, FrameTiming* timing, int timingIndex)
+static void stage_plane(Plane plane, const Staging& staging, HostPlane& host, FrameTiming* timing, int timingIndex,
+                        size_t rowPitch)
 {
     const size_t texelBytes = (plane_format(plane) == CUDA_FORMAT_HALF ? 2 : 4) * plane_channels(plane);
-    reserve_host(host, texelBytes * staging.width * staging.height);
+    const size_t packedRowBytes = texelBytes * staging.width;
+    host.rowBytes = std::max(rowPitch, packedRowBytes);
+    reserve_host(host, host.rowBytes * staging.height);
     host.width = staging.width;
     host.height = staging.height;
-    host.rowBytes = texelBytes * staging.width;
     uint8_t* rows = host.bytes;
     const size_t rowBytes = host.rowBytes;
     const uint8_t* source = staging.mapped + staging.layout.Offset;
     const size_t sourcePitch = staging.layout.Footprint.RowPitch;
     const auto conversionStart = timing != nullptr ? ProfileClock::now() : ProfileClock::time_point{};
     if (canonical_input(plane, staging.format))
-        copy_rows(g_inputRows, rows, rowBytes, source, sourcePitch, rowBytes, staging.height);
+        copy_rows(g_inputRows, rows, rowBytes, source, sourcePitch, packedRowBytes, staging.height);
     else
         g_inputRows.run(staging.height, rowBytes * staging.height, [&](UINT begin, UINT end) {
             for (UINT y = begin; y < end; ++y)
@@ -4015,6 +4038,169 @@ static void write_alpha_texel(uint32_t writeback, uint8_t* destination, float va
     }
 }
 
+// --- GPU-resident alpha -----------------------------------------------------------
+//
+// Separate alpha no longer forces RGB through host memory. R32F is copied
+// verbatim through an imported result buffer; half/UNORM destinations use a
+// Vulkan blit. Integer destinations retain the existing host conversion.
+// Blit rounding is hardware-dependent: gfx1201 rounds half toward zero, and
+// half/UNORM output can differ from the CPU quantizer by one destination step.
+
+// The destination image's Vulkan format, and whether reaching it from the float32 result needs a
+// conversion at all (an R32F destination is copied verbatim).
+static bool alpha_vram_format(DXGI_FORMAT format, VkFormat& vulkan, bool& convert)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R32_FLOAT:
+        vulkan = VK_FORMAT_R32_SFLOAT;
+        convert = false;
+        return true;
+    case DXGI_FORMAT_R16_FLOAT:
+        vulkan = VK_FORMAT_R16_SFLOAT;
+        convert = true;
+        return true;
+    case DXGI_FORMAT_R16_UNORM:
+        vulkan = VK_FORMAT_R16_UNORM;
+        convert = true;
+        return true;
+    case DXGI_FORMAT_R8_UNORM:
+        vulkan = VK_FORMAT_R8_UNORM;
+        convert = true;
+        return true;
+    // R8_UINT and R16_UINT deliberately do not qualify. Vulkan will not blit a float image into an
+    // integer one, and the host conversion of those is not a value conversion at all: it truncates
+    // the float toward zero (write_alpha_texel, cases 2 and 5), so an alpha of 3.9 must land on 3,
+    // not on the 0 a normalized blit would give. Only the host route can express that.
+    default:
+        return false;
+    }
+}
+
+// The R32F image a converted destination is blitted from is an ordinary conversion image, shared
+// with the rest of the file only in kind: one per alpha result slot, since a recorded copy reads
+// it a frame or more later.
+
+// Game thread. Decides whether this frame's alpha result stays on the GPU: the colour output's
+// VRAM interop has to be on, the caller's texture has to support the conversion,
+// and every result slot needs a buffer (and, for a converted format, an R32F image)
+// big enough for the evaluated region. Anything short of that uses the host route,
+// which needs none of it, so a caller with an exotic alpha format still gets its alpha.
+static void prepare_alpha_vram(Feature& feature, InputSlot& slot, bool vram)
+{
+    slot.alphaImageHandle = VK_NULL_HANDLE;
+    slot.alphaConvert = false;
+    slot.alphaGpu = false;
+    if (!slot.alphaRequested || !vram || g_vk.interop == nullptr)
+        return;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool convert = false;
+    if (!alpha_vram_format(slot.alphaFormat, format, convert) ||
+        !vram_blit_supported(VK_FORMAT_R32_SFLOAT, format))
+        return;
+    UINT64 handle = 0, offset = 0;
+    VkFormat actual = VK_FORMAT_UNDEFINED;
+    if (FAILED(g_vk.interop->GetVulkanResourceInfo1(slot.alphaResource, &handle, &offset, &actual)) ||
+        handle == 0 || actual != format)
+        return;
+    // Only the evaluated region travels, not the whole extent the denoiser stores into: the result
+    // is read back as the caller's rectangle and blitted into the caller's rectangle.
+    const size_t bytes = sizeof(float) * static_cast<size_t>(slot.alphaExtentW) * slot.alphaExtentH;
+    for (AlphaSlot& alpha : feature.alpha)
+    {
+        if (!ensure_vram_buffer(feature, alpha.vram, bytes))
+        {
+            logf("DLSSD.OutputAlpha: no VRAM result buffer of %zu bytes; this frame's alpha is read back "
+                 "through host memory",
+                 bytes);
+            return;
+        }
+        if (convert &&
+            !ensure_conversion_image(feature, alpha.conversion, slot.alphaExtentW, slot.alphaExtentH,
+                                     VK_FORMAT_R32_SFLOAT))
+        {
+            logf("DLSSD.OutputAlpha: no R32F conversion image of %ux%u; this frame's alpha is read back "
+                 "through host memory",
+                 slot.alphaExtentW, slot.alphaExtentH);
+            return;
+        }
+    }
+    slot.alphaImageHandle = reinterpret_cast<VkImage>(handle);
+    slot.alphaConvert = convert;
+    slot.alphaGpu = true;
+}
+
+// One frame's evaluated alpha rectangle: where the caller's subrect starts and how much of it
+// the denoiser filled. Taken from a published result when a later frame presents it, and from the
+// current frame's own capture when a split frame presents the result the worker is about to make.
+struct AlphaRegion
+{
+    UINT baseX = 0, baseY = 0;
+    UINT width = 0, height = 0;
+};
+
+// Records the copy of a GPU-resident alpha result into the caller's texture, which is in COPY_DEST
+// state already. The result buffer holds the evaluated region as float32, so an R32F destination is
+// copied verbatim at the caller's subrect origin and a converted one is blitted there.
+static bool record_alpha_vram(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, VkImage image,
+                              const VramBuffer& buffer, const VramImage& conversion, const AlphaRegion& region,
+                              bool convert)
+{
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
+        return false;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    g_vk.interop->GetVulkanImageLayout(resource, D3D12_RESOURCE_STATE_COPY_DEST, &layout);
+    VkBufferImageCopy regionCopy = {};
+    regionCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    regionCopy.imageSubresource.layerCount = 1;
+    regionCopy.imageOffset = {static_cast<int32_t>(region.baseX), static_cast<int32_t>(region.baseY), 0};
+    regionCopy.imageExtent = {region.width, region.height, 1};
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kBeforeTransfer, 0,
+                 nullptr, 0, nullptr);
+    if (!convert)
+        g_vk.copyBufferToImage(cmd, buffer.buffer, image, layout, 1, &regionCopy);
+    else
+    {
+        VkImageMemoryBarrier toDestination = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDestination.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toDestination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDestination.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDestination.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDestination.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDestination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDestination.image = conversion.image;
+        toDestination.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                     &toDestination);
+        regionCopy.imageOffset = {0, 0, 0};
+        g_vk.copyBufferToImage(cmd, buffer.buffer, conversion.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                              &regionCopy);
+        VkImageMemoryBarrier toSource = toDestination;
+        toSource.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSource.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                     &toSource);
+        // Source offsets are the region's own origin, destination offsets the caller's subrect, so
+        // every texel of the caller's texture outside the rectangle is left as it was.
+        VkImageBlit blit = {};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstSubresource = blit.srcSubresource;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(region.width), static_cast<int32_t>(region.height), 1};
+        blit.dstOffsets[0] = {static_cast<int32_t>(region.baseX), static_cast<int32_t>(region.baseY), 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(region.baseX + region.width),
+                               static_cast<int32_t>(region.baseY + region.height), 1};
+        g_vk.blit(cmd, conversion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, layout, 1, &blit,
+                  VK_FILTER_NEAREST);
+    }
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &kAfterTransfer, 0,
+                 nullptr, 0, nullptr);
+    return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+}
+
 // Game thread. Records which DLSSD.OutputAlpha texture this frame wants written, and holds a
 // reference on it until the frame retires. Refuses loudly a texture this file cannot fill:
 // accepting the frame and leaving the caller's surface untouched is exactly the silent wrong
@@ -4140,62 +4326,175 @@ static int claim_alpha_slot(Feature& feature)
     }
 }
 
-// Worker. Reads back the surface the denoiser just wrote and converts the evaluated region into
-// the claimed slot's upload buffer. A failure fails the frame: an accepted frame with a missing
-// alpha would leave the caller believing it was written.
-static bool download_alpha_output(Feature& feature, uint32_t frame)
+// Defined with the worker's other synchronization helpers, below; the alpha read-back needs it.
+static int synchronize_default_stream(Feature& feature, bool* querySleep);
+
+// D4R_SHIM_EVAL_SYNC: whether the worker waits for NGX's kernels before it reads a result back.
+// With VRAM interop the wait is deferred to publish_vram, which releases the colour result only
+// after it - so anything that reads the arrays earlier, such as the alpha copy below, has to
+// bring the wait forward for itself.
+static bool eval_sync_enabled()
+{
+    static const bool sync = env_uint("D4R_SHIM_EVAL_SYNC", 1) != 0;
+    return sync;
+}
+
+// Worker. Reads the surface the denoiser just wrote and puts the evaluated region in the claimed
+// slot: straight into that slot's imported buffer when the game thread qualified the GPU route,
+// otherwise into an upload buffer as converted texels. A failure fails the frame: an accepted
+// frame with a missing alpha would leave the caller believing it was written.
+static bool download_alpha_output(Feature& feature, uint32_t frame, const FrameParams& params)
 {
     const InputSlot& slot = feature.inputs[frame % kSlots];
     if (!slot.alphaRequested)
         return true;
     if (feature.alphaImage.array == nullptr)
         return false;
-    const int index = claim_alpha_slot(feature);
+    // A split frame presents its own result in the second half of its own command list, so it takes
+    // the slot that frame's colour takes rather than claiming one: a claim would be free to pick a
+    // slot whose reader - frame N's own second half - the GPU marker has passed but whose copy has
+    // not run yet, and overwrite it underneath that copy. Frames in flight are capped below
+    // kOutputSlots, so frame N's slot is not reachable again until its second half has run.
+    const int index = params.split ? static_cast<int>(frame % kOutputSlots) : claim_alpha_slot(feature);
     if (index < 0)
     {
         logf("frame %u: no free DLSSD.OutputAlpha result slot; the evaluation is dropped", frame);
         return false;
     }
     AlphaSlot& target = feature.alpha[index];
-    if (!ensure_staging(target.staging, slot.alphaResource, D3D12_HEAP_TYPE_UPLOAD))
+    const size_t regionBytes = sizeof(float) * static_cast<size_t>(slot.alphaExtentW) * slot.alphaExtentH;
+    // Only the evaluated region moves, from either route: the denoiser stores into the whole
+    // extent its surface was created over, and the rest of the caller's texture is not its to
+    // touch.
+    // `params.vram` is the worker's copy of this frame's decision, because the colour output's
+    // interop can be cut back to host staging between the capture and the evaluation.
+    // With VRAM interop run_evaluation skipped its own wait (publish_vram takes it before releasing
+    // the colour result), but the alpha is read out of that array here, on either route: the GPU
+    // one copies it, the host one converts the bytes the moment they land. Bring the wait forward
+    // or the denoiser's alpha would be read while it is still being written.
+    if (params.vram && !eval_sync_enabled())
     {
-        logf("frame %u: no upload buffer for the DLSSD.OutputAlpha result; the evaluation is dropped", frame);
-        return false;
+        const int synced = synchronize_default_stream(feature, nullptr);
+        if (synced != 0)
+        {
+            logf("frame %u: DLSSD.OutputAlpha copy synchronize failed: %d; the evaluation is dropped", frame,
+                 synced);
+            return false;
+        }
     }
-    reserve_host(feature.alphaHost, sizeof(float) * slot.alphaWidth * slot.alphaHeight);
-    if (feature.alphaHost.bytes == nullptr ||
-        feature.alphaHost.capacity < sizeof(float) * slot.alphaWidth * slot.alphaHeight)
+    if (slot.alphaGpu && params.vram && target.vram.device != 0 && target.vram.bytes >= regionBytes)
     {
-        logf("frame %u: no room to read the DLSSD.OutputAlpha surface back; the evaluation is dropped", frame);
-        return false;
+        CudaMemcpy2D copy = {};
+        // The source origin is a byte offset: the surface is float32 single channel, so the
+        // caller's subrect origin in pixels is that many bytes into each row. The result buffer
+        // holds the region alone, which is why the destination offsets stay at zero.
+        copy.srcXInBytes = slot.alphaBaseX * sizeof(float);
+        copy.srcY = slot.alphaBaseY;
+        copy.srcMemoryType = CUDA_MEMORY_ARRAY;
+        copy.srcArray = feature.alphaImage.array;
+        copy.srcPitch = sizeof(float) * slot.alphaWidth;
+        copy.dstMemoryType = CUDA_MEMORY_DEVICE;
+        copy.dstDevice = target.vram.device;
+        copy.dstPitch = sizeof(float) * slot.alphaExtentW;
+        copy.WidthInBytes = copy.dstPitch;
+        copy.Height = slot.alphaExtentH;
+        // Queued on the null stream, where the colour result's copy is queued too, and picked up by
+        // the Vulkan transfer that blits this buffer into the caller's texture.
+        if (copy_2d(copy) != 0)
+        {
+            logf("frame %u: copying the DLSSD.OutputAlpha result into VRAM failed; the evaluation is dropped",
+                 frame);
+            return false;
+        }
+        if (env_uint("D4R_SHIM_ALPHA_VERIFY", 0) != 0)
+        {
+            // The region as the denoiser left it in its array, against the buffer the Vulkan blit
+            // reads it from: the two must be the same float32 the host route would have converted.
+            std::vector<uint8_t> fromArray(regionBytes), fromBuffer(regionBytes);
+            CudaMemcpy2D readArray = copy;
+            readArray.dstMemoryType = CUDA_MEMORY_HOST;
+            readArray.dstHost = fromArray.data();
+            CudaMemcpy2D readBuffer = {};
+            readBuffer.srcMemoryType = CUDA_MEMORY_DEVICE;
+            readBuffer.srcDevice = target.vram.device;
+            readBuffer.srcPitch = copy.dstPitch;
+            readBuffer.dstMemoryType = CUDA_MEMORY_HOST;
+            readBuffer.dstHost = fromBuffer.data();
+            readBuffer.dstPitch = copy.dstPitch;
+            readBuffer.WidthInBytes = copy.WidthInBytes;
+            readBuffer.Height = copy.Height;
+            if (g.cu.memcpy2D(&readArray) == 0 && g.cu.memcpy2D(&readBuffer) == 0)
+            {
+                size_t differing = 0;
+                for (size_t byte = 0; byte < fromArray.size(); ++byte)
+                    differing += fromArray[byte] != fromBuffer[byte];
+                if (differing != 0 || frame <= 3 || frame % 120 == 0)
+                    logf("frame %u VRAM alpha verify: %zu of %zu bytes differ between the result array and "
+                         "the buffer",
+                         frame, differing, fromArray.size());
+                if (differing != 0)
+                    return false;
+                char dumpPath[MAX_PATH], alphaPath[MAX_PATH];
+                if (output_dump_path(frame, dumpPath))
+                {
+                    const int written = std::snprintf(alphaPath, sizeof(alphaPath), "%s.alpha.f32", dumpPath);
+                    if (written > 0 && written < static_cast<int>(sizeof(alphaPath)))
+                        write_capture_file(frame, "raw DLSS alpha region", alphaPath, fromArray.data(),
+                                           fromArray.size());
+                }
+            }
+            else
+            {
+                logf("frame %u: reading DLSSD.OutputAlpha verification data failed", frame);
+                return false;
+            }
+        }
+        target.gpu = true;
     }
-    CudaMemcpy2D copy = {};
-    copy.srcMemoryType = CUDA_MEMORY_ARRAY;
-    copy.srcArray = feature.alphaImage.array;
-    copy.dstMemoryType = CUDA_MEMORY_HOST;
-    copy.dstHost = feature.alphaHost.bytes;
-    copy.dstPitch = sizeof(float) * slot.alphaWidth;
-    copy.WidthInBytes = sizeof(float) * slot.alphaWidth;
-    copy.Height = slot.alphaHeight;
-    // Conversion reads the host bytes immediately, so this transfer must complete on return.
-    if (g.cu.memcpy2D(&copy) != 0)
+    else
     {
-        logf("frame %u: reading the DLSSD.OutputAlpha surface back failed; the evaluation is dropped", frame);
-        return false;
+        target.gpu = false;
+        if (!ensure_staging(target.staging, slot.alphaResource, D3D12_HEAP_TYPE_UPLOAD))
+        {
+            logf("frame %u: no upload buffer for the DLSSD.OutputAlpha result; the evaluation is dropped", frame);
+            return false;
+        }
+        reserve_host(feature.alphaHost, sizeof(float) * slot.alphaWidth * slot.alphaHeight);
+        if (feature.alphaHost.bytes == nullptr ||
+            feature.alphaHost.capacity < sizeof(float) * slot.alphaWidth * slot.alphaHeight)
+        {
+            logf("frame %u: no room to read the DLSSD.OutputAlpha surface back; the evaluation is dropped", frame);
+            return false;
+        }
+        CudaMemcpy2D copy = {};
+        copy.srcMemoryType = CUDA_MEMORY_ARRAY;
+        copy.srcArray = feature.alphaImage.array;
+        copy.dstMemoryType = CUDA_MEMORY_HOST;
+        copy.dstHost = feature.alphaHost.bytes;
+        copy.dstPitch = sizeof(float) * slot.alphaWidth;
+        copy.WidthInBytes = sizeof(float) * slot.alphaWidth;
+        copy.Height = slot.alphaHeight;
+        // Conversion reads the host bytes immediately, so this transfer must complete on return.
+        if (g.cu.memcpy2D(&copy) != 0)
+        {
+            logf("frame %u: reading the DLSSD.OutputAlpha surface back failed; the evaluation is dropped", frame);
+            return false;
+        }
+        // Only the evaluated rectangle is written, at its position in the buffer. The footprint
+        // offset from GetCopyableFootprints is left alone - it must stay 512-byte aligned - and the
+        // region is instead selected by the source box of the copy below.
+        const float* const source = reinterpret_cast<const float*>(feature.alphaHost.bytes);
+        uint8_t* const destination = target.staging.mapped + target.staging.layout.Offset;
+        const size_t rowPitch = target.staging.layout.Footprint.RowPitch;
+        const size_t texel = alpha_texel_bytes(slot.alphaWriteback);
+        for (UINT row = 0; row < slot.alphaExtentH; ++row)
+            for (UINT x = 0; x < slot.alphaExtentW; ++x)
+                write_alpha_texel(
+                    slot.alphaWriteback,
+                    destination + static_cast<size_t>(slot.alphaBaseY + row) * rowPitch +
+                        static_cast<size_t>(slot.alphaBaseX) * texel + x * texel,
+                    source[static_cast<size_t>(slot.alphaBaseY + row) * slot.alphaWidth + slot.alphaBaseX + x]);
     }
-    // Only the evaluated rectangle is written, at its position in the buffer. The footprint
-    // offset from GetCopyableFootprints is left alone - it must stay 512-byte aligned - and the
-    // region is instead selected by the source box of the copy below.
-    const float* const source = reinterpret_cast<const float*>(feature.alphaHost.bytes);
-    uint8_t* const destination = target.staging.mapped + target.staging.layout.Offset;
-    const size_t rowPitch = target.staging.layout.Footprint.RowPitch;
-    const size_t texel = alpha_texel_bytes(slot.alphaWriteback);
-    for (UINT row = 0; row < slot.alphaExtentH; ++row)
-        for (UINT x = 0; x < slot.alphaExtentW; ++x)
-            write_alpha_texel(slot.alphaWriteback,
-                              destination + static_cast<size_t>(slot.alphaBaseY + row) * rowPitch +
-                                  static_cast<size_t>(slot.alphaBaseX) * texel + x * texel,
-                              source[static_cast<size_t>(slot.alphaBaseY + row) * slot.alphaWidth + slot.alphaBaseX + x]);
     {
         // Published under the same lock the claim uses, exactly as the colour output publishes.
         std::lock_guard<std::mutex> lock(feature.outputMutex);
@@ -4212,67 +4511,124 @@ static bool download_alpha_output(Feature& feature, uint32_t frame)
     return true;
 }
 
-// Game thread. Presents the newest finished alpha result into the caller's texture. The slot's
-// lastReadFrame is stamped before the copy is recorded and producedFrame is NOT cleared: the
-// colour output's claim relies on both, and clearing here would let the worker overwrite a
-// result whose command list has not run yet.
+// Game thread. Presents the alpha result that goes with the colour result about to be presented.
+// The slot's lastReadFrame is stamped before the copy is recorded and producedFrame is NOT
+// cleared: the colour output's claim relies on both, and clearing here would let the worker
+// overwrite a result whose command list has not run yet.
 static bool record_alpha_copyback(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot,
-                                  D3D12_RESOURCE_STATES outputState, uint32_t colorFrame)
+                                  D3D12_RESOURCE_STATES outputState, uint32_t colorFrame, bool split)
 {
     if (!slot.alphaRequested || slot.alphaResource == nullptr)
         return true;
-    if (colorFrame == 0)
-        return true; // no colour result to pair with this frame
+    AlphaRegion region = {slot.alphaBaseX, slot.alphaBaseY, slot.alphaExtentW, slot.alphaExtentH};
     int index = -1;
+    if (split)
     {
-        std::lock_guard<std::mutex> lock(feature.outputMutex);
-        // The frame whose colour is about to be presented is `colorFrame`; only an alpha result
-        // produced by that very same frame may go with it. Picking "the newest alpha" instead
-        // would pair alpha N with colour N-1, since the alpha read-back completes before the
-        // colour's, and the caller would composite two different frames. No match, no copy: the
-        // colour is presented on its own and the alpha waits for its own frame to come round.
-        for (int candidate = 0; candidate < kOutputSlots; ++candidate)
-            if (feature.alpha[candidate].producedFrame.load() == colorFrame)
-            {
-                index = candidate;
-                break;
-            }
-        if (index < 0)
-            return true; // the matching frame has not been read back yet; colour goes alone
+        // A split frame presents its own colour result in the second half of its own command list,
+        // so it presents its own alpha result: the very slot the worker is about to fill for this
+        // frame, which does not exist yet. The copy is recorded now and runs after the split
+        // semaphore, by which time the worker has written it - the same ordering the colour copy
+        // above relies on, and the reason the region comes from this frame's capture rather than
+        // from a published result.
+        index = static_cast<int>(feature.frame % kOutputSlots);
         AlphaSlot& chosen = feature.alpha[index];
-        if (chosen.staging.buffer == nullptr || chosen.producedFrame.load() == 0)
-            return true;
-        if (chosen.width != slot.alphaExtentW || chosen.height != slot.alphaExtentH ||
-            chosen.format != slot.alphaFormat || chosen.baseX != slot.alphaBaseX ||
-            chosen.baseY != slot.alphaBaseY)
+        if (slot.alphaGpu)
         {
-            // The caller's rectangle changed under a result already in flight; presenting it
-            // would write where the caller no longer expects. Leave it for the next result.
-            chosen.producedFrame = 0;
-            return true;
+            if (chosen.vram.buffer == VK_NULL_HANDLE)
+                return false;
         }
-        chosen.lastReadFrame = feature.frame;
+        else if (!ensure_staging(chosen.staging, slot.alphaResource, D3D12_HEAP_TYPE_UPLOAD))
+        {
+            logf("frame %u: no upload buffer for the DLSSD.OutputAlpha result", feature.frame);
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(feature.outputMutex);
+            chosen.lastReadFrame = feature.frame;
+        }
+    }
+    else
+    {
+        if (colorFrame == 0)
+            return true; // no colour result to pair with this frame
+        {
+            std::lock_guard<std::mutex> lock(feature.outputMutex);
+            // The frame whose colour is about to be presented is `colorFrame`; only an alpha result
+            // produced by that very same frame may go with it. Picking "the newest alpha" instead
+            // would pair alpha N with colour N-1, since the alpha read-back completes before the
+            // colour's, and the caller would composite two different frames. No match, no copy: the
+            // colour is presented on its own and the alpha waits for its own frame to come round.
+            for (int candidate = 0; candidate < kOutputSlots; ++candidate)
+                if (feature.alpha[candidate].producedFrame.load() == colorFrame)
+                {
+                    index = candidate;
+                    break;
+                }
+            if (index < 0)
+                return true; // the matching frame has not been read back yet; colour goes alone
+            AlphaSlot& chosen = feature.alpha[index];
+            if ((chosen.gpu && chosen.vram.buffer == VK_NULL_HANDLE) ||
+                (!chosen.gpu && chosen.staging.buffer == nullptr) || chosen.producedFrame.load() == 0)
+                return true;
+            // A result the worker left on the GPU can only be presented by a frame that qualified
+            // the GPU route itself: that frame's capture is what recorded the caller's image and
+            // whether its format needs the conversion blit. Anything else discards the result,
+            // exactly as a result whose rectangle no longer matches is discarded below.
+            if (chosen.gpu && !slot.alphaGpu)
+            {
+                chosen.producedFrame = 0;
+                return true;
+            }
+            if (chosen.width != slot.alphaExtentW || chosen.height != slot.alphaExtentH ||
+                chosen.format != slot.alphaFormat || chosen.baseX != slot.alphaBaseX ||
+                chosen.baseY != slot.alphaBaseY)
+            {
+                // The caller's rectangle changed under a result already in flight; presenting it
+                // would write where the caller no longer expects. Leave it for the next result.
+                chosen.producedFrame = 0;
+                return true;
+            }
+            chosen.lastReadFrame = feature.frame;
+            region = {chosen.baseX, chosen.baseY, chosen.width, chosen.height};
+        }
     }
     AlphaSlot& chosen = feature.alpha[index];
+    const bool gpu = split ? slot.alphaGpu : chosen.gpu;
     transition(list, slot.alphaResource, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_TEXTURE_COPY_LOCATION destination = {};
-    destination.pResource = slot.alphaResource;
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION source = {};
-    source.pResource = chosen.staging.buffer;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    source.PlacedFootprint = chosen.staging.layout;
-    // The source box picks out the evaluated rectangle inside the full-extent staging buffer,
-    // and the destination origin places it at the caller's subrect. Together they leave every
-    // pixel of the caller's texture outside the rectangle untouched.
-    D3D12_BOX box = {};
-    box.left = chosen.baseX;
-    box.top = chosen.baseY;
-    box.right = chosen.baseX + chosen.width;
-    box.bottom = chosen.baseY + chosen.height;
-    box.back = 1;
-    list->CopyTextureRegion(&destination, chosen.baseX, chosen.baseY, 0, &source, &box);
+    if (gpu)
+    {
+        // The result is still the float32 the denoiser wrote, so it becomes the caller's texels
+        // here rather than on the CPU. The region lands at the caller's subrect, and the
+        // transitions around it are the same ones the host copy below records.
+        if (!record_alpha_vram(list, slot.alphaResource, slot.alphaImageHandle, chosen.vram, chosen.conversion,
+                               region, slot.alphaConvert))
+        {
+            transition(list, slot.alphaResource, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
+            logf("frame %u: recording DLSSD.OutputAlpha GPU copy failed", feature.frame);
+            return false;
+        }
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION destination = {};
+        destination.pResource = slot.alphaResource;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = chosen.staging.buffer;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = chosen.staging.layout;
+        // The source box picks out the evaluated rectangle inside the full-extent staging buffer,
+        // and the destination origin places it at the caller's subrect. Together they leave every
+        // pixel of the caller's texture outside the rectangle untouched.
+        D3D12_BOX box = {};
+        box.left = region.baseX;
+        box.top = region.baseY;
+        box.right = region.baseX + region.width;
+        box.bottom = region.baseY + region.height;
+        box.back = 1;
+        list->CopyTextureRegion(&destination, region.baseX, region.baseY, 0, &source, &box);
+    }
     transition(list, slot.alphaResource, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
     return true;
 }
@@ -4311,10 +4667,112 @@ static void destroy_aux_surface(AuxSurface& surface)
         g.cu.arrayDestroy(surface.image.array);
     for (Staging& staging : surface.staging)
         staging.release();
+    for (HostPlane& host : surface.host)
+        release_host(host);
+    for (VramBuffer& buffer : surface.vram)
+    {
+        if (buffer.buffer == VK_NULL_HANDLE)
+            continue;
+        // Retirement can run on the finish thread. Release imports on the CUDA worker
+        // without a nested worker.call when retirement itself runs there.
+        g.worker.post([buffer] {
+            if (buffer.external != nullptr)
+            {
+                g.cu.memFree(buffer.device);
+                g_vk.release(buffer.external);
+            }
+            g_vk.destroyBuffer(g_vk.device, buffer.buffer, nullptr);
+            g_vk.free(g_vk.device, buffer.memory, nullptr);
+        });
+        buffer = {};
+    }
+    destroy_vram_image(surface.conversion);
     if (surface.resource != nullptr)
         surface.resource->Release();
     logf("Ray Reconstruction: released denoiser input %s (%ux%u fmt=0x%x)", join_aux_names(surface.publish).c_str(),
          surface.width, surface.height, surface.format);
+}
+
+// Vulkan blits cannot convert integer images to float. Raw UINT/SINT guides
+// retain host staging; other formats preserve the host path's sampled values.
+static bool describe_aux_vram(AuxSurface& surface, VramCopy& copy)
+{
+    if (!vram_interop_available() || env_uint("D4R_SHIM_RR_VRAM_GUIDES", 1) == 0)
+        return false;
+    UINT64 handle = 0, offset = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    if (FAILED(g_vk.interop->GetVulkanResourceInfo1(surface.resource, &handle, &offset, &format)) || handle == 0)
+        return false;
+    copy.resource = surface.resource;
+    copy.image = reinterpret_cast<VkImage>(handle);
+    copy.width = surface.width;
+    copy.height = surface.height;
+    if (surface.how == AuxLayout::Verbatim)
+        return true;
+    if (surface.format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        surface.format != DXGI_FORMAT_R10G10B10A2_UNORM &&
+        surface.format != DXGI_FORMAT_R11G11B10_FLOAT)
+        return false;
+    copy.convert = true;
+    return vram_blit_supported(format, VK_FORMAT_R32G32B32A32_SFLOAT);
+}
+
+static bool record_aux_vram(ID3D12GraphicsCommandList* list, AuxSurface& surface, int slotIndex,
+                            const VramCopy& copy, D3D12_RESOURCE_STATES state)
+{
+    const size_t bytes = aux_texel_bytes(surface.arrayFormat, surface.channels) * surface.width * surface.height;
+    VramBuffer& buffer = surface.vram[slotIndex];
+    // Resource geometry is immutable. Never worker.call under auxMutex: the
+    // worker could be waiting for this lock to upload an earlier frame.
+    if (buffer.buffer == VK_NULL_HANDLE && !create_vram_buffer(buffer, bytes, false))
+        return false;
+    if (copy.convert && surface.conversion.image == VK_NULL_HANDLE &&
+        !create_vram_image(surface.conversion, surface.width, surface.height, VK_FORMAT_R32G32B32A32_SFLOAT))
+        return false;
+    transition(list, copy.resource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
+    {
+        transition(list, copy.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+        return false;
+    }
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                 &kBeforeTransfer, 0, nullptr, 0, nullptr);
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    g_vk.interop->GetVulkanImageLayout(copy.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, &layout);
+    VkImage image = copy.image;
+    if (copy.convert)
+    {
+        image = surface.conversion.image;
+        VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                     0, nullptr, 1, &barrier);
+        VkImageBlit blit = {};
+        blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = blit.dstOffsets[1] =
+            {static_cast<int32_t>(copy.width), static_cast<int32_t>(copy.height), 1};
+        g_vk.blit(cmd, copy.image, layout, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                     0, nullptr, 1, &barrier);
+        layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+    const VkBufferImageCopy region = full_region(copy);
+    g_vk.copyImageToBuffer(cmd, image, layout, buffer.buffer, 1, &region);
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                 &kAfterTransfer, 0, nullptr, 0, nullptr);
+    const bool recorded = SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+    transition(list, copy.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+    return recorded;
 }
 
 // Game thread. Finds the auxiliary surfaces the caller registered this frame and records a
@@ -4357,6 +4815,7 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
                 binding = &candidate;
                 break;
             }
+        const bool firstBinding = binding == nullptr;
         if (binding == nullptr)
         {
             bindings.emplace_back();
@@ -4374,6 +4833,8 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
             bound = bound || strcmp(name, input.publish) == 0;
         if (!bound)
             binding->names.push_back(input.publish);
+        if (!firstBinding)
+            continue; // aliases share one captured plane and one upload
 
         D3D12_RESOURCE_DESC desc;
         resource->GetDesc(&desc);
@@ -4393,9 +4854,19 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
         surface->how = how;
         surface->width = static_cast<UINT>(desc.Width);
         surface->height = static_cast<UINT>(desc.Height);
-        if (!ensure_staging(surface->staging[slotIndex], resource, D3D12_HEAP_TYPE_READBACK))
-            return false;
-        copy_to_staging(list, resource, surface->staging[slotIndex], inputState);
+        VramCopy gpuCopy;
+        surface->gpu[slotIndex] = describe_aux_vram(*surface, gpuCopy);
+        if (surface->gpu[slotIndex])
+        {
+            if (!record_aux_vram(list, *surface, slotIndex, gpuCopy, inputState))
+                return false;
+        }
+        if (!surface->gpu[slotIndex] || env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0)
+        {
+            if (!ensure_staging(surface->staging[slotIndex], resource, D3D12_HEAP_TYPE_READBACK))
+                return false;
+            copy_to_staging(list, resource, surface->staging[slotIndex], inputState);
+        }
     }
     // Drop surfaces the caller stopped registering, but only once no queued frame names one:
     // erasing a surface whose handle is still in a parameter object would leave the denoiser
@@ -4436,9 +4907,28 @@ static bool upload_aux_inputs(Feature& feature, int slotIndex, uint32_t frame)
             return false;
         }
         CudaMemcpy2D copy = {};
-        copy.srcMemoryType = CUDA_MEMORY_HOST;
-        if (surface.how == AuxLayout::Verbatim)
+        if (surface.gpu[slotIndex])
         {
+            VramBuffer& buffer = surface.vram[slotIndex];
+            if (buffer.external == nullptr)
+            {
+                VkMemoryRequirements requirements = {};
+                g_vk.bufferRequirements(g_vk.device, buffer.buffer, &requirements);
+                const int result = g_vk.import(g_vk.device, reinterpret_cast<uint64_t>(buffer.memory),
+                                               requirements.size, &buffer.device, &buffer.external);
+                if (result != 0)
+                {
+                    logf("frame %u: Ray Reconstruction guide import failed: %d", frame, result);
+                    return false;
+                }
+            }
+            copy.srcMemoryType = CUDA_MEMORY_DEVICE;
+            copy.srcDevice = buffer.device;
+            copy.srcPitch = aux_texel_bytes(surface.arrayFormat, surface.channels) * surface.width;
+        }
+        else if (surface.how == AuxLayout::Verbatim)
+        {
+            copy.srcMemoryType = CUDA_MEMORY_HOST;
             // Use HostPlane staging: direct ROCm image copies from Vulkan-mapped memory
             // truncate guide rows on gfx1201, even when the source footprint is tightly packed.
             HostPlane& host = surface.host[slotIndex];
@@ -4458,6 +4948,7 @@ static bool upload_aux_inputs(Feature& feature, int slotIndex, uint32_t frame)
         }
         else
         {
+            copy.srcMemoryType = CUDA_MEMORY_HOST;
             // Packed, integer and BGRA inputs are unpacked into floats first: a CUDA array
             // has no three-channel layout, a uint array is sampled normalized, and BGRA bytes
             // are in the wrong order for a read as RGBA.
@@ -4490,6 +4981,51 @@ static bool upload_aux_inputs(Feature& feature, int slotIndex, uint32_t frame)
             logf("frame %u: Ray Reconstruction input %s: the upload of %ux%u failed", frame,
                  join_aux_names(binding.names).c_str(), surface.width, surface.height);
             return false;
+        }
+        if (surface.gpu[slotIndex] && env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0)
+        {
+            // Compare the array NGX actually samples, not just the imported buffer.
+            const size_t rowBytes = copy.WidthInBytes;
+            std::vector<uint8_t> expected(rowBytes * surface.height), actual(expected.size());
+            for (UINT row = 0; row < surface.height; ++row)
+            {
+                const uint8_t* source = staging.mapped + staging.layout.Offset +
+                                        static_cast<size_t>(row) * staging.layout.Footprint.RowPitch;
+                uint8_t* destination = expected.data() + static_cast<size_t>(row) * rowBytes;
+                if (surface.how == AuxLayout::Verbatim)
+                    memcpy(destination, source, rowBytes);
+                else
+                    convert_aux_row(surface.format, source, reinterpret_cast<float*>(destination),
+                                    surface.width, surface.channels);
+            }
+            CudaMemcpy2D read = {};
+            read.srcMemoryType = CUDA_MEMORY_ARRAY;
+            read.srcArray = surface.image.array;
+            read.dstMemoryType = CUDA_MEMORY_HOST;
+            read.dstHost = actual.data();
+            read.dstPitch = read.WidthInBytes = rowBytes;
+            read.Height = surface.height;
+            if (g.cu.ctxSynchronize() != 0 || g.cu.memcpy2D(&read) != 0)
+                return false;
+            size_t differing = 0;
+            if (surface.how == AuxLayout::Verbatim)
+            {
+                for (size_t byte = 0; byte < expected.size(); ++byte)
+                    differing += actual[byte] != expected[byte];
+            }
+            else
+            {
+                const float* a = reinterpret_cast<const float*>(actual.data());
+                const float* e = reinterpret_cast<const float*>(expected.data());
+                for (size_t i = 0; i < expected.size() / sizeof(float); ++i)
+                    differing += !(a[i] == e[i] || (std::isnan(a[i]) && std::isnan(e[i])) ||
+                                   std::abs(a[i] - e[i]) <= 1e-6f * std::max(1.0f, std::abs(e[i])));
+            }
+            logf("frame %u RR VRAM verify %s: %zu differing %s", frame,
+                 join_aux_names(binding.names).c_str(), differing,
+                 surface.how == AuxLayout::Verbatim ? "bytes" : "components");
+            if (differing != 0)
+                return false;
         }
         surface.handle = surface.image.object;
     }
@@ -5307,12 +5843,11 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     // D4R_SHIM_EVAL_SYNC=0 (VRAM interop): no wait between NGX's kernels and the output copy queued
     // behind them on the same stream; publish_vram synchronises before the result is released.
-    static const bool evalSync = env_uint("D4R_SHIM_EVAL_SYNC", 1) != 0;
-    const int syncResult = params.vram && !evalSync ? 0 : synchronize_default_stream(*feature);
+    const int syncResult = params.vram && !eval_sync_enabled() ? 0 : synchronize_default_stream(*feature);
     const auto evaluated = ProfileClock::now();
     const bool gpuEventsRecorded = eventStartResult == 0 && eventEndResult == 0;
     float gpuEvalMs = -1.0f;
-    if (gpuEventsRecorded && syncResult == 0 && (!params.vram || evalSync) &&
+    if (gpuEventsRecorded && syncResult == 0 && (!params.vram || eval_sync_enabled()) &&
         g.cu.eventElapsedTime(&gpuEvalMs, feature->profileStart, feature->profileEnd) != 0)
         gpuEvalMs = -1.0f;
     // Keep the input slot owned until output completion, including linear reads.
@@ -5326,7 +5861,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     // The alpha surface is complete once the synchronize above has passed. A failure here drops
     // the whole frame, exactly as a failed synchronize does: an accepted frame with an unwritten
     // alpha would leave the caller believing it was written.
-    if (feature->rayReconstruction && !download_alpha_output(*feature, frame))
+    if (feature->rayReconstruction && !download_alpha_output(*feature, frame, params))
     {
         slot.busy = false;
         frame_retired(feature, frame);
@@ -5337,7 +5872,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         timing.ngxHost = profile_ms(evalStart, evalReturned);
         timing.ctxSync = profile_ms(syncStart, evaluated);
         timing.gpuEval = gpuEvalMs;
-        timing.gpuEventsRecorded = gpuEventsRecorded && params.vram && !evalSync;
+        timing.gpuEventsRecorded = gpuEventsRecorded && params.vram && !eval_sync_enabled();
     }
     if (params.vram)
     {
@@ -5425,12 +5960,15 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
             return;
         }
         FrameTiming* stages = timing.enabled ? &timing : nullptr;
-        stage_plane(Plane::Color, slot.color, slot.host[0], stages, 0);
-        stage_plane(Plane::Depth, slot.depth, slot.host[1], stages, 1);
-        stage_plane(Plane::Motion, slot.motion, slot.host[2], stages, 2);
+        // Verification must not replace a pitch-linear texture's padded GPU stride
+        // with the tightly packed host stride.
+        stage_plane(Plane::Color, slot.color, slot.host[0], stages, 0, params.vram ? slot.host[0].rowBytes : 0);
+        stage_plane(Plane::Depth, slot.depth, slot.host[1], stages, 1, params.vram ? slot.host[1].rowBytes : 0);
+        stage_plane(Plane::Motion, slot.motion, slot.host[2], stages, 2, params.vram ? slot.host[2].rowBytes : 0);
         log_motion_stats(slot.host[2], slot.host[0], frame);
         if (params.hasExposure)
-            stage_plane(Plane::Exposure, slot.exposure, slot.host[3], stages, 3);
+            stage_plane(Plane::Exposure, slot.exposure, slot.host[3], stages, 3,
+                        params.vram ? slot.host[3].rowBytes : 0);
         char dumpDirectory[MAX_PATH];
         if (input_dump_directory(frame, dumpDirectory))
             dump_input_planes(slot.host, frame, params, dumpDirectory);
@@ -5831,6 +6369,13 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const
     }
     {
         std::lock_guard<std::mutex> lock(g.mutex);
+        // Discovery can precede Init; CUDA still needs the caller's adapter identity.
+        if (adapter != nullptr && !g.ngxInitialized)
+        {
+            DXGI_ADAPTER_DESC desc = {};
+            if (SUCCEEDED(static_cast<IDXGIAdapter*>(adapter)->GetDesc(&desc)))
+                set_cuda_adapter_luid(desc.AdapterLuid);
+        }
         // Requirements must not depend on a prior Init. Load the provider without
         // initializing NGX here: the later Init retains the game's identity and device.
         if (ensure_workers_started() != NGX_SUCCESS || (g.core == nullptr && !load_libraries()))
@@ -6305,11 +6850,13 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     const Plane planes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
     const int inputCount = exposure != nullptr ? 4 : 3;
     VramCopy vramInputs[4], vramOutput;
-    // Alpha readback uses the host result ring; color must use the same pipeline so both
-    // outputs can present one produced frame. The existing cutover below drains VRAM work.
-    const bool alphaOutputRequested =
-        feature->rayReconstruction && get_resource(parameters, "DLSSD.OutputAlpha") != nullptr;
-    if (!alphaOutputRequested && (!feature->vramDecided || feature->vram) && vram_interop_available())
+    // A separate alpha output no longer holds the feature off VRAM interop: the float32 result
+    // stays on the GPU and is blitted into the caller's texture when that texture's format
+    // supports the conversion (see prepare_alpha_vram). A format that does not - or a texture Vulkan
+    // cannot hand over - keeps the alpha on the host route for that frame alone, without the
+    // colour output having to fall back with it. The existing cutover below still drains VRAM
+    // work if the colour output itself stops qualifying.
+    if ((!feature->vramDecided || feature->vram) && vram_interop_available())
     {
         p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
         for (int index = 0; index < inputCount && p.vram; ++index)
@@ -6452,6 +6999,10 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             list2->Release();
             return NGX_FAIL_PLATFORM_ERROR;
         }
+        // The alpha's own route is decided here, on the game thread, next to the capture that
+        // named the texture: allocating on the worker is not an option (the CUDA import runs on
+        // the worker) and this is the same place that already knows the region and the format.
+        prepare_alpha_vram(*feature, slot, p.vram);
     }
     if (timing.enabled)
         timing.inputRecord = profile_ms(inputRecordStart, ProfileClock::now());
@@ -6524,8 +7075,9 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
     }
-    if (feature->rayReconstruction)
-        record_alpha_copyback(*feature, list, slot, outputState, colorFrame);
+    if (feature->rayReconstruction &&
+        !record_alpha_copyback(*feature, list, slot, outputState, colorFrame, p.split))
+        return NGX_FAIL_PLATFORM_ERROR;
     if (timing.enabled)
     {
         timing.outputRecord = profile_ms(outputRecordStart, ProfileClock::now());
