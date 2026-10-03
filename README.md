@@ -1,12 +1,15 @@
+<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
 # d4r (dlss 4 radeon)
 
-d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 and RDNA4 code.
+d4r runs NVIDIA's official DLSS Super Resolution (`nvngx_dlss.dll`) and experimental Ray Reconstruction (`nvngx_dlssd.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest Super Resolution kernels replaced by hand-written RDNA3 and RDNA4 code.
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus experimental L). DLSS 5 is PURPOSELY not supported.
 
 Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set `[DLSS] Model = L` in `d4r.ini` and select Ultra Performance in game or OptiScaler; selecting L alone does not change the input resolution. L shares M's native Swin layers and has its own texture-kernel build. Its unfolded input/output arithmetic remains translated, so performance and image quality need game testing; the M benchmarks below do not apply to L.
 
-**Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It has been tested on one GPU in a handful of games and depends on unreleased patches to ZLUDA and vkd3d-proton.
+Ray Reconstruction presets D and E use the signed CUDA-capable 3.10.7 denoiser and the translated NVIDIA network, independently of the Super Resolution model. Temporal reconstruction and separate alpha output have been verified on Radeon RX 9070 XT (gfx1201) with native FP8 WMMA enabled. Newer DLSS 4.5 RR preset F is not implemented or validated. The scalar FP8 path produced nonfinite temporal RR output and is not validated; other GPU targets and image-quality parity with RTX hardware remain unverified. See [building](docs/building.md) for the required runtime, denoiser placement, and FP8 settings.
+
+**Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. Super Resolution game testing primarily uses Radeon RX 7700 XT; Ray Reconstruction validation additionally uses RX 9070 XT. It depends on unreleased patches to ZLUDA and vkd3d-proton.
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
@@ -120,7 +123,7 @@ ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubu
 
 The full sequence is in [docs/building.md](docs/building.md). In short:
 
-1. Build ZLUDA `ee2f25a` with `patches/zluda/0002`–`0007` applied, including its `d4r_emit` example for offline texture builds.
+1. Build ZLUDA `ee2f25a` with `patches/zluda/0002`–`0008` applied, including its `d4r_emit` example for offline texture builds.
 2. Build the patched vkd3d-proton: `scripts/build_vkd3d_proton_d4r.sh OUT_DIR`.
 3. Build the shim and bridge: `scripts/build_d4r_nvngx_shim.sh`, `scripts/build_wine_nvcuda_bridge.sh`.
 4. Stage the runtime with your NVIDIA files: `scripts/install_d4r_runtime.sh _nvngx.dll nvngx_dlss.dll`.

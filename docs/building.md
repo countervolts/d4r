@@ -1,10 +1,11 @@
+<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
 # Building d4r
 
 These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vkd3d-proton, the NGX shim and CUDA bridge, a staged runtime directory with your NVIDIA files, and the native kernels. The versions below are the ones that were tested; others may need changes.
 
 | Component | Tested version |
 |---|---|
-| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0007` in order |
+| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0008` in order |
 | vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` and `0002` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
@@ -17,7 +18,7 @@ git clone https://github.com/vosen/ZLUDA zluda && cd zluda
 git checkout ee2f25a
 git submodule update --init --recursive
 git lfs pull
-for p in 0002 0003 0004 0005 0006 0007; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
+for p in 0002 0003 0004 0005 0006 0007 0008; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
 # rebuild the device helpers the patches changed (ptx/lib/zluda_ptx_impl*.bc)
 ZLUDA_SOURCE_ROOT=$PWD ROCM_ROOT=/opt/rocm /path/to/d4r/scripts/build_zluda_ptx_helpers.sh
 LIBRARY_PATH=/opt/rocm/lib cargo build --release -p zluda
@@ -44,6 +45,7 @@ What the patches add:
 - **0005**: a null texture object (CUDA handle 0) reads as zeros, as on NVIDIA GPUs, instead of faulting the GPU. DLSS samples absent optional inputs that way in some configurations (low-resolution motion vectors without HDR, as in Ghost of Tsushima).
 - **0006**: `m16n8k8` f16 MMAs (DLSS 3 CNN, presets E/F) on RDNA3 WMMA like the k16 ones (`D4R_ZLUDA_WMMA_K8=0` disables it); weight-image slots for native prep kernels (`d4r_prep_key_at`, `d4r_prep_key_slots`); and wave64 compilation for offline texture-kernel builds (`D4R_ZLUDA_WAVE64=1`, with wave64 builds of the helper bitcode). `scripts/build_zluda_ptx_helpers.sh` now writes the `_w64` helper variants too.
 - **0007**: gfx12 WMMA layout lowering, optional native e4m3 FP8 WMMA (`D4R_ZLUDA_WMMA_FP8_NATIVE=1`), and an architecture argument for `d4r_emit`. `D4R_ZLUDA_WMMA_LAYOUT=12` on gfx11 is a validation shim, not a release setting.
+- **0008**: CUDA denoiser PTX support: four-half surface stores, floating-coordinate half texture sampling, streaming-cache store spellings, byte-vector trapping stores (including low-byte truncation from wider registers), finite-saturating half conversion, correctly typed half exponentiation, half unordered comparisons, and atomic reductions. CUDA block barriers use a workgroup release fence before the hardware barrier and an acquire fence afterward. It also fixes strict floating-point division operand selection in the LLVM AMDGPU backend and Cargo build-profile detection. Two LLVM sinking fixes remove repeated instruction-order rebuilding and avoid alias scans when no sink target exists; write tracking and memory-dependency checks remain intact. Initialize the LLVM submodule before applying this patch; rebuild device helpers and ZLUDA afterward.
 
 When linking on a system with ROCm libraries outside the default search path, include their library directory in `LIBRARY_PATH`. The build also needs the appropriate ROCm link libraries. `CARGO_BUILD_JOBS=8` caps parallel Rust compilation if memory is limited.
 
@@ -53,7 +55,9 @@ When linking on a system with ROCm libraries outside the default search path, in
 scripts/build_vkd3d_proton_d4r.sh ~/.cache/d4r-vkd3d-d4r
 ```
 
-The patch lets the shim split the game's command list at the DLSS call, so the rest of the frame waits (at queue level) for DLSS instead of showing the previous frame's result. Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output. Without it the shim falls back to showing a one-frame-old result.
+Both patches are required: `0001` supplies command-list splitting for same-frame output; `0002` keeps external resources alive until asynchronous CUDA work retires. Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output. The shim rejects feature creation without the lifetime interface, even when CPU staging or previous-frame output is selected.
+
+Game-local `d3d12.dll` and `d3d12core.dll` override the prefix's copies. Update both if the game already contains an older d4r runtime; changing only `D4R_VKD3D_DIR` does not replace those local overrides.
 
 ## 3. Shim, bridge and NVAPI identity
 
@@ -68,9 +72,13 @@ The launcher builds the small NVAPI identity bridge (`scripts/build_d4r_nvapi_id
 
 ```sh
 scripts/install_d4r_runtime.sh /path/to/_nvngx.dll /path/to/nvngx_dlss.dll
+# With the CUDA-capable Ray Reconstruction feature library:
+scripts/install_d4r_runtime.sh /path/to/_nvngx.dll /path/to/nvngx_dlss.dll /path/to/nvngx_dlssd.dll
 ```
 
-This stages the shim, the bridge, the NGX core and the DLSS feature library in `D4R_RUNTIME_DIR` (default `~/.local/share/d4r-dlss`, or `RuntimeDir` in d4r.ini). The NVIDIA files come from your own sources, for example an NVIDIA driver package (NGX core) and a game or the DLSS SDK (feature library).
+This stages the shim, the bridge, the NGX core and the DLSS feature libraries in `D4R_RUNTIME_DIR` (default `~/.local/share/d4r-dlss`, or `RuntimeDir` in d4r.ini). The NVIDIA files come from your own sources, for example an NVIDIA driver package (NGX core) and a game or the DLSS SDK (feature libraries). Ray Reconstruction requires a CUDA-capable `nvngx_dlssd.dll`, such as 310.7; the older D3D12-only denoiser is not a replacement. The installer also places the denoiser beside the calling shim, where the NGX core discovers it.
+
+RR D/E temporal evaluation and separate alpha output have been verified on gfx1201 with native FP8 WMMA (`[Kernels] NativeFp8 = true`). For developer launches without an INI, set `D4R_ZLUDA_WMMA=1`, `D4R_ZLUDA_WMMA_FP8=1` and `D4R_ZLUDA_WMMA_FP8_NATIVE=1`. The scalar FP8 fallback produced nonfinite temporal RR output and is not a validated RR path. Other GPU targets and image-quality parity with RTX hardware remain unverified.
 
 ## 5. Native kernels
 
@@ -111,7 +119,7 @@ The script:
 - builds the shim, the bridge and both fast and accuracy network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`, applied by `scripts/configure_optiscaler.py`; both full and clean ZIPs set `NvngxPath=d4r\nvngx.dll` explicitly, retaining `OptiDllPath=d4r` for other libraries;
-- adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
+- adds NVIDIA's core and Super Resolution DLLs, optional `nvngx_dlssd.dll` supplied through `D4R_BUNDLE_DLSSD`, and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
 The NVIDIA files are not covered by d4r's license; redistributing them is up to whoever publishes the zip. `D4R_BUNDLE_NVIDIA=0` builds `d4r-<version>-nonvidia.zip` without them and without the texture kernels. [architecture.md](architecture.md#portable-installs-the-release-zip) describes how the installed files work together.
@@ -131,7 +139,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 | Variable | Input |
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
-| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0007` applied |
+| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0008` applied |
 | `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001` and `0002` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
@@ -139,7 +147,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 
 Run `bash scripts/build_release_glibc241.sh` inside the container. The script checks that the build system actually reports `glibc 2.41`, rejects external source-cache checkouts, builds with the locked Cargo dependencies offline, and runs the configuration tests before packaging. The ZIP and checksum go in `$D4R_RELEASE_BUILD_ROOT/dist/`; logs and `toolchain.txt` remain in the build directory. AMD's bundled ROCm runtime, OptiScaler and NVIDIA's libraries remain supplied binaries; the Linux ABI check covers the bundled ROCm libraries too.
 
-`D4R_BUNDLE_TEX` accepts the older flat directory for gfx1101, or a directory with per-target subdirectories (`gfx1100/`–`gfx1103/`, `gfx1200/`, `gfx1201/`, plus `gfx1200-fp8/` and `gfx1201-fp8/`). Build each texture set with `D4R_GPU_ARCH` and `D4R_ZLUDA_EMIT`; the `-fp8` sets also need `D4R_NATIVE_FP8=1`. `d4r_emit` targets those GPUs offline. Missing texture kernels fall back to ZLUDA on that target; the network-layer kernels are still included. Only the RX 7700 XT has been tested on real hardware.
+`D4R_BUNDLE_TEX` accepts the older flat directory for gfx1101, or a directory with per-target subdirectories (`gfx1100/`–`gfx1103/`, `gfx1200/`, `gfx1201/`, plus `gfx1200-fp8/` and `gfx1201-fp8/`). Build each texture set with `D4R_GPU_ARCH` and `D4R_ZLUDA_EMIT`; the `-fp8` sets also need `D4R_NATIVE_FP8=1`. `d4r_emit` targets those GPUs offline. Missing texture kernels fall back to ZLUDA on that target; the network-layer kernels are still included. The published Super Resolution benchmarks use RX 7700 XT; separate native-FP8 Ray Reconstruction D/E temporal validation and Cyberpunk gameplay use RX 9070 XT (gfx1201). This does not validate every packaged native-kernel target.
 
 ## Checks
 

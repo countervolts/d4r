@@ -1,3 +1,4 @@
+// Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 // Drives d4r_nvngx.dll through the NGX D3D12 API the way a game (or
 // OptiScaler's DLSS backend) does: a D3D12 device and command queue, input
 // textures in NON_PIXEL_SHADER_RESOURCE, an output UAV, and one
@@ -9,6 +10,7 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include <algorithm>
 #include <array>
@@ -37,6 +39,7 @@ extern "C"
     void d4r_ngx_set_uint(void* parameters, const char* name, unsigned int value);
     void d4r_ngx_set_int(void* parameters, const char* name, int value);
     void d4r_ngx_set_d3d12_resource(void* parameters, const char* name, ID3D12Resource* value);
+    void d4r_ngx_set_void(void* parameters, const char* name, void* value);
     NgxResult d4r_ngx_get_int(void* parameters, const char* name, int* value);
 }
 
@@ -46,6 +49,36 @@ using PFN_CreateFeature = NgxResult (*)(ID3D12GraphicsCommandList*, unsigned int
 using PFN_Evaluate = NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, void*, void*);
 using PFN_Release = NgxResult (*)(NgxHandle*);
 using PFN_Shutdown = NgxResult (*)();
+
+struct NgxApplicationIdentifier
+{
+    unsigned int type;
+    union
+    {
+        unsigned long long applicationId;
+        struct
+        {
+            const char* id;
+            int engineType;
+            const char* engineVersion;
+        } project;
+    } value;
+};
+struct NgxFeatureDiscovery
+{
+    unsigned int sdkVersion;
+    unsigned int feature;
+    NgxApplicationIdentifier identifier;
+    const wchar_t* dataPath;
+    const void* featureInfo;
+};
+struct NgxFeatureRequirement
+{
+    unsigned int supported;
+    unsigned int minArchitecture;
+    char minOsVersion[255];
+};
+using PFN_Requirements = NgxResult (*)(void*, const NgxFeatureDiscovery*, NgxFeatureRequirement*);
 
 static ID3D12Device* g_device;
 static ID3D12CommandQueue* g_queue;
@@ -600,6 +633,59 @@ int main(int argc, char** argv)
     }
 
     const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const char* featureSetting = std::getenv("D4R_HARNESS_FEATURE_ID");
+    const unsigned int featureId = featureSetting ? static_cast<unsigned int>(std::strtoul(featureSetting, nullptr, 0)) : 1;
+    const bool reconstruction = featureId == 13;
+    std::array<ID3D12Resource*, 4> guides{};
+    if (reconstruction)
+    {
+        // Planar synthetic scene: world-space +Z normals, rough diffuse material.
+        // Distinct guides exercise denoising inputs rather than aliasing the noisy colour.
+        std::vector<uint16_t> guide(static_cast<size_t>(resourceWidth) * inHeight * 4);
+        const std::array<std::array<float, 4>, 4> values{{
+            {0.0f, 0.0f, 1.0f, 0.0f}, {0.5f, 0.0f, 0.0f, 0.0f},
+            {0.7f, 0.4f, 0.2f, 1.0f}, {0.04f, 0.04f, 0.04f, 1.0f}}};
+        for (size_t input = 0; input < guides.size(); ++input)
+        {
+            // Cyberpunk supplies UNORM8 albedos, while normals remain floating point.
+            const bool unorm = input >= 2;
+            guides[input] = create_texture(resourceWidth, inHeight,
+                                           unorm ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                           D3D12_RESOURCE_FLAG_NONE);
+            if (!guides[input]) return 1;
+            for (size_t pixel = 0; pixel < guide.size() / 4; ++pixel)
+                for (size_t component = 0; component < 4; ++component)
+                    if (unorm)
+                        reinterpret_cast<uint8_t*>(guide.data())[pixel * 4 + component] =
+                            static_cast<uint8_t>(std::lround(values[input][component] * 255.0f));
+                    else
+                        guide[pixel * 4 + component] =
+                            std::bit_cast<uint16_t>(static_cast<_Float16>(values[input][component]));
+            upload(guides[input], guide.data(), resourceWidth * (unorm ? 4 : 8), srv);
+        }
+    }
+    const bool alphaScenario = reconstruction && std::getenv("D4R_HARNESS_RR_ALPHA") != nullptr;
+    const UINT alphaBaseX = 4, alphaBaseY = 2;
+    const UINT alphaWidth = outWidth + 8, alphaHeight = outHeight + 4;
+    ID3D12Resource* alphaInput = nullptr;
+    ID3D12Resource* alphaOutput = nullptr;
+    if (alphaScenario)
+    {
+        // A varying coverage guide and a padded destination expose dropped alpha writes and
+        // copies that overwrite pixels outside the caller's nonzero output subrect.
+        std::vector<float> coverage(static_cast<size_t>(resourceWidth) * inHeight);
+        for (UINT y = 0; y < inHeight; ++y)
+            for (UINT x = 0; x < resourceWidth; ++x)
+                coverage[static_cast<size_t>(y) * resourceWidth + x] =
+                    0.25f + 0.5f * static_cast<float>(x) / std::max(1u, resourceWidth - 1);
+        alphaInput = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+        alphaOutput = create_texture(alphaWidth, alphaHeight, DXGI_FORMAT_R32_FLOAT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (!alphaInput || !alphaOutput) return 1;
+        upload(alphaInput, coverage.data(), resourceWidth * sizeof(float), srv);
+        std::vector<float> sentinel(static_cast<size_t>(alphaWidth) * alphaHeight, -2.0f);
+        upload(alphaOutput, sentinel.data(), alphaWidth * sizeof(float), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
@@ -664,6 +750,32 @@ int main(int argc, char** argv)
     GetTempPathW(MAX_PATH, dataPath);
     const char* appIdSetting = std::getenv("D4R_HARNESS_APP_ID");
     const unsigned long long appId = appIdSetting != nullptr ? std::strtoull(appIdSetting, nullptr, 10) : 241534723ULL;
+    // Games discover RR before Init; an initialized-only capability answer hides the mode.
+    auto requirements = reinterpret_cast<PFN_Requirements>(
+        reinterpret_cast<void*>(GetProcAddress(shim, "NVSDK_NGX_D3D12_GetFeatureRequirements")));
+    NgxFeatureDiscovery discovery{};
+    discovery.sdkVersion = 0x15;
+    discovery.feature = reconstruction ? 13 : 1;
+    discovery.identifier.value.applicationId = appId;
+    discovery.dataPath = dataPath;
+    NgxFeatureRequirement requirement{};
+    using CreateFactoryFn = HRESULT (*)(REFIID, void**);
+    const auto createFactory = reinterpret_cast<CreateFactoryFn>(
+        reinterpret_cast<void*>(GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory1")));
+    IDXGIFactory4* factory = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    LUID adapterLuid{};
+    g_device->GetAdapterLuid(&adapterLuid);
+    if (FAILED(createFactory(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(adapterLuid, __uuidof(IDXGIAdapter), reinterpret_cast<void**>(&adapter))))
+        return 1;
+    const NgxResult discoveryResult = requirements(adapter, &discovery, &requirement);
+    adapter->Release();
+    factory->Release();
+    std::printf("GetFeatureRequirements before Init -> 0x%08x, feature=%u supported=%u\n",
+                discoveryResult, discovery.feature, requirement.supported);
+    if (discoveryResult != NGX_SUCCESS || requirement.supported != 0)
+        return 1;
     NgxResult result = init(appId, dataPath, g_device, 0x15, nullptr);
     trace_stage(result == NGX_SUCCESS ? "NGX init succeeded" : "NGX init failed");
     std::printf("NVSDK_NGX_D3D12_Init_Ext -> 0x%08x\n", result);
@@ -672,9 +784,10 @@ int main(int argc, char** argv)
     void* capabilities = nullptr;
     result = capability(&capabilities);
     int available = -1;
+    const char* availabilityKey = reconstruction ? "SuperSamplingDenoising.Available" : "SuperSampling.Available";
     if (result == NGX_SUCCESS)
-        d4r_ngx_get_int(capabilities, "SuperSampling.Available", &available);
-    std::printf("GetCapabilityParameters -> 0x%08x, SuperSampling.Available=%d\n", result, available);
+        d4r_ngx_get_int(capabilities, availabilityKey, &available);
+    std::printf("GetCapabilityParameters -> 0x%08x, %s=%d\n", result, availabilityKey, available);
 
     void* parameters = nullptr;
     result = allocate(&parameters);
@@ -689,13 +802,32 @@ int main(int argc, char** argv)
     d4r_ngx_set_int(parameters, "PerfQualityValue", quality != nullptr && *quality != '\0' ? std::atoi(quality) : 2);
     // D4R_HARNESS_CREATE_FLAGS mirrors a game's NVSDK_NGX_DLSS_Feature_Flags
     // (e.g. 0x49 = HDR | DepthInverted | AutoExposure).
+    // Transformer RR requires HDR color and low-resolution motion vectors.
     const char* createFlags = std::getenv("D4R_HARNESS_CREATE_FLAGS");
     d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags",
-                    createFlags != nullptr ? static_cast<int>(std::strtol(createFlags, nullptr, 0)) : 0);
+                    (createFlags != nullptr ? static_cast<int>(std::strtol(createFlags, nullptr, 0)) :
+                                             (reconstruction ? (motionHighRes ? 1 : 3) : 0)) |
+                    (alphaScenario ? 0x80 : 0));
+    if (alphaScenario)
+        d4r_ngx_set_int(parameters, "DLSS.Enable.Output.Subrects", 1);
+    std::array<float, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    if (reconstruction)
+    {
+        d4r_ngx_set_int(parameters, "DLSS.Denoise.Mode", 1);
+        d4r_ngx_set_int(parameters, "DLSS.Roughness.Mode", 0);
+        d4r_ngx_set_int(parameters, "DLSS.Use.HW.Depth", 0);
+        d4r_ngx_set_void(parameters, "WorldToViewMatrix", identity.data());
+        d4r_ngx_set_void(parameters, "ViewToClipMatrix", identity.data());
+        const char* preset = std::getenv("D4R_HARNESS_RR_PRESET");
+        if (preset)
+            for (const char* mode : {"DLAA", "Quality", "Balanced", "Performance", "UltraPerformance", "UltraQuality"})
+                d4r_ngx_set_uint(parameters, (std::string("RayReconstruction.Hint.Render.Preset.") + mode).c_str(),
+                                 static_cast<unsigned int>(std::strtoul(preset, nullptr, 0)));
+    }
     NgxHandle* feature = nullptr;
     if (std::getenv("D4R_HARNESS_LIFETIME_TEST") != nullptr && !test_external_lifetime())
         return 1;
-    result = createFeature(g_list, 1, parameters, &feature);
+    result = createFeature(g_list, featureId, parameters, &feature);
     std::printf("CreateFeature -> 0x%08x handle=%p\n", result, static_cast<void*>(feature));
     if (result != NGX_SUCCESS)
         return 1;
@@ -705,6 +837,23 @@ int main(int argc, char** argv)
     d4r_ngx_set_d3d12_resource(parameters, "MotionVectors", motionTexture);
     d4r_ngx_set_d3d12_resource(parameters, "Output", outputTexture);
     d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", exposureTexture);
+    if (reconstruction)
+    {
+        // The SDK's caller-facing names (nvsdk_ngx_defs.h: NVSDK_NGX_Parameter_GBuffer_Normals,
+        // _Roughness, _DiffuseAlbedo, _SpecularAlbedo), which is what a game registers. The
+        // shim republishes the two albedos under the names the denoiser reads.
+        const char* names[] = {"GBuffer.Normals", "GBuffer.Roughness",
+                               "GBuffer.DiffuseAlbedo", "GBuffer.SpecularAlbedo"};
+        for (size_t input = 0; input < guides.size(); ++input)
+            d4r_ngx_set_d3d12_resource(parameters, names[input], guides[input]);
+    }
+    if (alphaScenario)
+    {
+        d4r_ngx_set_d3d12_resource(parameters, "DLSSD.Alpha", alphaInput);
+        d4r_ngx_set_d3d12_resource(parameters, "DLSSD.OutputAlpha", alphaOutput);
+        d4r_ngx_set_uint(parameters, "DLSSD.OutputAlpha.Subrect.Base.X", alphaBaseX);
+        d4r_ngx_set_uint(parameters, "DLSSD.OutputAlpha.Subrect.Base.Y", alphaBaseY);
+    }
     d4r_ngx_set_float(parameters, "Jitter.Offset.X", 0.0f);
     d4r_ngx_set_float(parameters, "Jitter.Offset.Y", 0.0f);
     d4r_ngx_set_float(parameters, "MV.Scale.X", 1.0f);
@@ -890,6 +1039,13 @@ int main(int argc, char** argv)
             Sleep(static_cast<DWORD>(std::clamp(std::atoi(delay), 0, 4000)));
         submit_and_wait();
         std::printf("frame %d: EvaluateFeature -> 0x%08x (%lu ms incl. submit)\n", frame, result, GetTickCount() - start);
+        // NGX rejecting an evaluation outright is reported here; only a failure raised later,
+        // on the shim's worker, is invisible in this return value and shows up in the image.
+        if (result != NGX_SUCCESS)
+        {
+            std::fprintf(stderr, "EvaluateFeature rejected frame %d: 0x%08x\n", frame, result);
+            return 1;
+        }
         Sleep(frameWaitMs); // let the CUDA worker finish before the next presentation
         if (qualityScene && !poleScene && frame > frames - 17)
         {
@@ -987,6 +1143,122 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+    // The shim queues each evaluation on its own worker, so a failure inside the denoiser is
+    // invisible in this thread's EvaluateFeature return value: the frame is accepted and the
+    // output texture is simply never written. The image is the only observable. On the static
+    // scene the denoiser reconstructs, so the output must carry that scene's structure:
+    // compare block-averaged luma against the same average of the input. Averaging first makes
+    // this about scene structure rather than per-pixel detail a denoiser is free to change. An
+    // untouched output buffer (the initial fill) has no variance and cannot correlate.
+    // Temporal scenes move content between the input and the frame presented, and replay
+    // frames come from a capture, so neither is checked here.
+    if (reconstruction && !rgba8 && replayDir == nullptr && !motionScene && !jitterScene && !qualityScene)
+    {
+        const uint16_t* const halves = reinterpret_cast<const uint16_t*>(output.data());
+        constexpr UINT block = 8;
+        const UINT blocksX = (outWidth + block - 1) / block, blocksY = (outHeight + block - 1) / block;
+        std::vector<double> outBlocks, inBlocks;
+        outBlocks.reserve(static_cast<size_t>(blocksX) * blocksY);
+        inBlocks.reserve(static_cast<size_t>(blocksX) * blocksY);
+        for (UINT by = 0; by < blocksY; ++by)
+            for (UINT bx = 0; bx < blocksX; ++bx)
+            {
+                double outSum = 0.0, inSum = 0.0;
+                size_t count = 0;
+                for (UINT y = by * block; y < std::min(by * block + block, outHeight); ++y)
+                    for (UINT x = bx * block; x < std::min(bx * block + block, outWidth); ++x)
+                    {
+                        const size_t outPixel = (static_cast<size_t>(y) * outWidth + x) * 4;
+                        // The same output block mapped back onto the render grid: the denoiser
+                        // upsamples exactly this scene, so no filter assumption is needed.
+                        const UINT sourceY = static_cast<UINT>(static_cast<uint64_t>(y) * inHeight / outHeight);
+                        const UINT sourceX = static_cast<UINT>(static_cast<uint64_t>(x) * inWidth / outWidth);
+                        const size_t inPixel = (static_cast<size_t>(sourceY) * resourceWidth + sourceX) * 4;
+                        for (int channel = 0; channel < 3; ++channel)
+                        {
+                            outSum += static_cast<double>(std::bit_cast<_Float16>(halves[outPixel + channel]));
+                            inSum += static_cast<double>(std::bit_cast<_Float16>(color[inPixel + channel]));
+                        }
+                        ++count;
+                    }
+                outBlocks.push_back(outSum / (3.0 * static_cast<double>(count)));
+                inBlocks.push_back(inSum / (3.0 * static_cast<double>(count)));
+            }
+        const double n = static_cast<double>(outBlocks.size());
+        double sumOut = 0.0, sumIn = 0.0, sumOutOut = 0.0, sumInIn = 0.0, sumProduct = 0.0;
+        for (size_t index = 0; index < outBlocks.size(); ++index)
+        {
+            sumOut += outBlocks[index];
+            sumIn += inBlocks[index];
+            sumOutOut += outBlocks[index] * outBlocks[index];
+            sumInIn += inBlocks[index] * inBlocks[index];
+            sumProduct += outBlocks[index] * inBlocks[index];
+        }
+        const double outVariance = sumOutOut - sumOut * sumOut / n;
+        const double inVariance = sumInIn - sumIn * sumIn / n;
+        const double correlation = (sumProduct - sumOut * sumIn / n) /
+                                   (std::sqrt(outVariance) * std::sqrt(inVariance));
+        std::printf("RR output block correlation with the input scene: %.6f over %zu blocks "
+                    "(mean luma %.6f vs %.6f)\n",
+                    correlation, outBlocks.size(), sumOut / n, sumIn / n);
+        // A scene-structure floor, not a quality comparison with NVIDIA output. Unwritten
+        // output has zero variance and produces NaN here; nonfinite or unrelated output also
+        // fails. Denoising may change individual pixels without losing the scene's structure.
+        if (!(correlation >= 0.5))
+        {
+            std::fprintf(stderr,
+                         "Ray Reconstruction produced no usable image: block correlation with the "
+                         "input scene is %.6f (unwritten, unrelated, or nonfinite output)\n",
+                         correlation);
+            return 1;
+        }
+    }
+    if (alphaScenario)
+    {
+        const std::vector<uint8_t> raw =
+            read_back(alphaOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, alphaWidth * sizeof(float));
+        const float* values = reinterpret_cast<const float*>(raw.data());
+        size_t invalid = 0, overwritten = 0, leftCount = 0, rightCount = 0;
+        double left = 0, right = 0;
+        for (UINT y = 0; y < alphaHeight; ++y)
+            for (UINT x = 0; x < alphaWidth; ++x)
+            {
+                const float value = values[static_cast<size_t>(y) * alphaWidth + x];
+                const bool inside = x >= alphaBaseX && x < alphaBaseX + outWidth &&
+                                    y >= alphaBaseY && y < alphaBaseY + outHeight;
+                if (!inside)
+                {
+                    overwritten += value != -2.0f;
+                    continue;
+                }
+                invalid += !std::isfinite(value) || value < -0.001f || value > 1.001f;
+                const UINT localX = x - alphaBaseX;
+                if (localX < outWidth / 4)
+                {
+                    left += value;
+                    ++leftCount;
+                }
+                if (localX >= outWidth * 3 / 4)
+                {
+                    right += value;
+                    ++rightCount;
+                }
+            }
+        const double leftMean = leftCount ? left / leftCount : 0;
+        const double rightMean = rightCount ? right / rightCount : 0;
+        std::printf("RR alpha: invalid=%zu outside-overwritten=%zu left=%.6f right=%.6f\n",
+                    invalid, overwritten, leftMean, rightMean);
+        if (FILE* alphaFile = std::fopen((std::string(argv[2]) + ".alpha.raw").c_str(), "wb"))
+        {
+            std::fwrite(raw.data(), 1, raw.size(), alphaFile);
+            std::fclose(alphaFile);
+        }
+        if (invalid || overwritten || !leftCount || !rightCount || !(rightMean - leftMean > 0.1))
+        {
+            std::fprintf(stderr, "RR alpha coverage or subrect preservation failed\n");
+            return 1;
+        }
+    }
 
     if (std::getenv("D4R_HARNESS_DISCARD_EVALUATION") != nullptr)
     {
@@ -1002,7 +1274,7 @@ int main(int argc, char** argv)
         g_list->Close();
         g_allocator->Reset();
         g_list->Reset(g_allocator, nullptr);
-        result = createFeature(g_list, 1, parameters, &feature);
+        result = createFeature(g_list, featureId, parameters, &feature);
         if (result != NGX_SUCCESS) return 1;
         lifecycle_report("DISCARD evaluation: release completed without submitting inputs");
     }
@@ -1022,7 +1294,7 @@ int main(int argc, char** argv)
         d4r_ngx_set_uint(parameters, "Height", height);
         d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", width);
         d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", height);
-        result = createFeature(g_list, 1, parameters, &feature);
+        result = createFeature(g_list, featureId, parameters, &feature);
         if (result != NGX_SUCCESS)
         {
             std::printf("RECREATE cycle %d: CreateFeature -> 0x%08x\n", cycle, result);
@@ -1068,5 +1340,9 @@ int main(int argc, char** argv)
 
     release(feature);
     shutdown();
+    for (ID3D12Resource* guide : guides)
+        if (guide) guide->Release();
+    if (alphaInput) alphaInput->Release();
+    if (alphaOutput) alphaOutput->Release();
     return 0;
 }
