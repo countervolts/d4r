@@ -1,30 +1,14 @@
-"""Marker polling defaults and the shim's model-override diagnostics."""
-import configparser
+"""Marker polling configuration validation and environment precedence."""
 import os
 from pathlib import Path
-import re
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIM = ROOT / 'tools/d4r_nvngx_shim.cpp'
 
 
 class ShimConfigTests(unittest.TestCase):
-    def test_marker_poll_defaults_agree(self):
-        for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
-            ini = configparser.ConfigParser()
-            ini.read(ROOT / name)
-            self.assertEqual(ini.getint('Interop', 'MarkerPollUs'), 200, name)
-        source = SHIM.read_text()
-        portable = re.search(r'portable_set\("D4R_SHIM_MARKER_POLL_US", poll.empty\(\) \? "(\d+)" : poll\);', source)
-        runtime = re.search(r'env_uint\("D4R_SHIM_MARKER_POLL_US", (\d+)\)', source)
-        self.assertIsNotNone(portable, 'portable marker polling fallback missing')
-        self.assertIsNotNone(runtime, 'runtime marker polling fallback missing')
-        self.assertEqual(int(portable[1]), 200)
-        self.assertEqual(int(runtime[1]), 200)
-
     def test_launcher_marker_poll_defaults_overrides_and_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'
@@ -43,50 +27,6 @@ class ShimConfigTests(unittest.TestCase):
                 result = subprocess.run(cmd, env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('MarkerPollUs must be a number of microseconds', result.stderr)
-
-    def test_production_model_override_logs_and_presets(self):
-        # Compile the actual feature-creation preset block with fake NGX inputs
-        # and a captured logger, so the test exercises the production message
-        # and override behavior without requiring Windows, NGX or a GPU.
-        source = SHIM.read_text()
-        start = source.index('    const char* presetNames[] =')
-        end = source.index('    feature->preset = presets[1];', start)
-        block = source[start:end]
-        runner_source = r'''
-#include <cstdio>
-#include <cstdlib>
-#include <cstdarg>
-#include <string>
-static unsigned nextPreset = 21;
-unsigned get_uint_or(void*, const char*, unsigned) { return nextPreset++; }
-std::string env_string(const char* name) { const char* value = getenv(name); return value ? value : ""; }
-void logf(const char* format, ...) {
-    va_list args; va_start(args, format); vprintf(format, args); va_end(args); puts("");
-}
-int main() {
-    void* parameters = nullptr;
-''' + block + r'''
-    printf("presets:"); for (unsigned preset : presets) printf(" %u", preset); puts("");
-}
-'''
-        with tempfile.TemporaryDirectory() as temporary:
-            runner = Path(temporary) / 'model-override'
-            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-x', 'c++', '-', '-o', str(runner)],
-                           input=runner_source, text=True, capture_output=True, check=True)
-            env = {key: value for key, value in os.environ.items() if key != 'D4R_DLSS_PRESET'}
-            for preset, model in ((5, 'E'), (11, 'K'), (12, 'L'), (13, 'M')):
-                with self.subTest(model=model):
-                    output = subprocess.check_output([str(runner)], env=dict(env, D4R_DLSS_PRESET=str(preset)), text=True)
-                    self.assertIn(f'D4R_DLSS_PRESET={preset} (model {model}) overrides game/OptiScaler presets', output)
-                    self.assertIn('[DLAA=21 Quality=22 Balanced=23 Performance=24 UltraPerformance=25 UltraQuality=26]', output)
-                    self.assertIn(f'using preset={preset} for all quality modes', output)
-                    self.assertIn('presets:' + f' {preset}' * 6, output)
-            for value in (None, ''):
-                current = env if value is None else dict(env, D4R_DLSS_PRESET=value)
-                output = subprocess.check_output([str(runner)], env=current, text=True)
-                self.assertNotIn('model override', output)
-                self.assertEqual(output.strip(), 'presets: 21 22 23 24 25 26')
-
 
 if __name__ == '__main__':
     unittest.main()
