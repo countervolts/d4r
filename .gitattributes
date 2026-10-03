@@ -1,0 +1,3 @@
+# Patches are applied with `git apply`, which fails on CRLF. Keep them LF even
+# where core.autocrlf=true (Windows checkouts).
+*.patch text eol=lf
