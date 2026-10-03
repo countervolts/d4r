@@ -202,8 +202,8 @@ struct Args {
             else if (key == "--preset") {
                 size_t end = 0;
                 preset = static_cast<unsigned>(std::stoul(value, &end));
-                if (end != value.size() || (preset != 5 && preset != 11 && preset != 13))
-                    throw std::runtime_error("preset must be 5 (E), 11 (K) or 13 (M)");
+                if (end != value.size() || (preset != 5 && preset != 11 && preset != 12 && preset != 13))
+                    throw std::runtime_error("preset must be 5 (E), 11 (K), 12 (L) or 13 (M)");
             }
             else if (key == "--fixture-dir") fixture_dir = value;
             else if (key == "--benchmark-module") benchmark_module = value;

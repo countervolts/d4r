@@ -20,7 +20,7 @@ function New-Inputs([string]$Prefix,[scriptblock]$Mutate) {
     foreach ($target in $targets) {
         $arch=$target.architecture; $root="$Prefix-$arch"
         $text=@{'OptiScaler.dll'='optiscaler'; 'd4r/_nvngx.dll'="shim $arch"; 'd4r/nvapi/nvapi64.dll'="nvapi $arch";
-            'd4r/hip/bin/amdhip64_7.dll'='hip'; 'd4r/zluda/nvcuda.dll'='zluda'; 'licenses/d4r.txt'='license';
+            'd4r/hip/bin/amdhip64_7.dll'='hip'; 'd4r/zluda/nvcuda.dll'='zluda'; 'd4r/zluda/nvapi64.dll'='zluda nvapi'; 'licenses/d4r.txt'='license';
             'd4r/d4r_gpu_inventory.exe'='inventory'; 'd4r/d4r_debug_launcher.exe'='launcher'; 'windows-game.ps1'='installer';
             'd4r/native/d4r-kernels.txt'='manifest'}
         foreach ($entry in $text.GetEnumerator()) {
@@ -53,7 +53,8 @@ New-Inputs $prefix
 $release=Join-Path $OutputDirectory 'release'
 Invoke-Package $prefix $release
 foreach ($path in @('dxgi.dll','OptiScaler.ini','d4r/_nvngx.dll','d4r/d4r.ini','d4r/dll-pins.txt','d4r/package.json',
-                    'd4r/hip/bin/amdhip64_7.dll','d4r/zluda/nvcuda.dll','d4r/licenses/d4r.txt','d4r/ngx/PUT _nvngx.dll HERE.txt')) {
+                    'd4r/hip/bin/amdhip64_7.dll','d4r/zluda/nvcuda.dll','d4r/licenses/d4r.txt','d4r/ngx/PUT _nvngx.dll HERE.txt',
+                    'd4r/gpu-targets.json','d4r/d4r_gpu_inventory.exe','d4r/d4r-check.ps1','WINDOWS_README.txt')) {
     if (!(Test-Path -LiteralPath (Join-Path $release $path))) { throw "Release lacks $path" }
 }
 if ((Get-Content -LiteralPath (Join-Path $release 'd4r/_nvngx.dll') -Raw).Trim() -ne 'loader fixture') { throw 'd4r/_nvngx.dll is not the loader.' }
@@ -66,7 +67,8 @@ foreach ($target in $targets) {
     if ($native.Count -ne 16 -or !(Test-Path -LiteralPath (Join-Path $release "d4r/native/$arch/d4r-kernels.txt"))) { throw "Native folder for $arch is incomplete" }
     foreach ($object in $native) { Assert-D4RCodeObjectTarget $object.FullName $arch }
 }
-foreach ($excluded in @('d4r/d4r_gpu_inventory.exe','d4r/d4r_debug_launcher.exe','windows-game.ps1','d4r/native/kernel1.hsaco','d4r/nvapi/nvapi64.dll')) {
+if (@(Get-ChildItem -LiteralPath $release -Recurse -Filter 'd4r_gpu_inventory.exe').Count -ne 1) { throw 'The GPU query tool must ship exactly once.' }
+foreach ($excluded in @('d4r/d4r_debug_launcher.exe','windows-game.ps1','d4r/native/kernel1.hsaco','d4r/nvapi/nvapi64.dll')) {
     if (Test-Path -LiteralPath (Join-Path $release $excluded)) { throw "Installer-only or untargeted file shipped: $excluded" }
 }
 $manifest=Get-Content -LiteralPath (Join-Path $release 'd4r/package.json') -Raw | ConvertFrom-Json
@@ -76,6 +78,16 @@ foreach ($file in $manifest.files) {
 $shipped=@(Get-ChildItem -LiteralPath $release -Recurse -File | ForEach-Object { $_.FullName.Substring($release.Length+1).Replace('\','/') } | Where-Object { $_ -ne 'd4r/package.json' })
 if (Compare-Object $shipped @($manifest.files.path)) { throw 'Manifest and shipped files differ.' }
 $results+=@{case='drag-in-layout'; passed=$true; targets=$targets.Count; files=$shipped.Count}
+
+# 1b. A subset release carries only the requested targets.
+$subset=Join-Path $OutputDirectory 'release-subset'
+& (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $prefix -LoaderDll $loader -PackageRoot $subset -Architectures gfx1101,gfx1201 | Out-Null
+$kept=@(Get-ChildItem -LiteralPath (Join-Path $subset 'd4r') -Filter '_nvngx_gfx*.dll' | ForEach-Object { $_.Name })
+if (($kept | Sort-Object) -join ',' -ne '_nvngx_gfx1101.dll,_nvngx_gfx1201.dll') { throw "Subset shipped the wrong shims: $($kept -join ',')" }
+$rejected=$false
+try { & (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $prefix -LoaderDll $loader -PackageRoot (Join-Path $OutputDirectory 'release-unknown') -Architectures gfx9999 | Out-Null } catch { $rejected=$_.Exception.Message -match 'Unknown GPU target' }
+if (!$rejected) { throw 'An unknown architecture was not rejected.' }
+$results+=@{case='architecture-subset'; passed=$true; shipped=$kept}
 
 # 2. A code object for another GPU in a target's input is rejected.
 $prefix=Join-Path $OutputDirectory 'inputs/mixed/game'

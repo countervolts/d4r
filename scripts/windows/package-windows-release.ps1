@@ -7,6 +7,7 @@ param(
     [string]$GamePackagePrefix,
     [Parameter(Mandatory=$true)][string]$LoaderDll,
     [Parameter(Mandatory=$true)][string]$PackageRoot,
+    [string[]]$Architectures,   # default: every target in gpu-targets.json; a subset makes a smaller release
     [string]$ArchivePath
 )
 $ErrorActionPreference='Stop'
@@ -28,8 +29,10 @@ function Stage([string]$Source,[string]$Relative) {
     $item=Get-Item -LiteralPath $destination
     $files.Add(@{path=$Relative.Replace('\','/'); sha256=(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash; version=$item.VersionInfo.FileVersion})
 }
-$targets=[ordered]@{}; $baseline=$null; $commonStaged=$false
-foreach ($gpu in Get-D4RGpuTargets) {
+$targets=[ordered]@{}; $baseline=$null; $commonStaged=$false; $inventoryStaged=$false
+$selected=@(Get-D4RGpuTargets | Where-Object { !$Architectures -or $Architectures -contains $_.architecture })
+if (!$selected.Count -or ($Architectures -and $selected.Count -ne @($Architectures | Select-Object -Unique).Count)) { throw "Unknown GPU target in -Architectures: $($Architectures -join ', ')" }
+foreach ($gpu in $selected) {
     $arch=$gpu.architecture; $source="$GamePackagePrefix-$arch"
     $metadata=Get-Content -LiteralPath (Join-Path $source 'package.json') -Raw | ConvertFrom-Json
     if ($metadata.architecture -ne $arch -or $metadata.d4rWorkingTreeDirty) { throw "Uncommitted or wrong-target input: $source" }
@@ -41,7 +44,9 @@ foreach ($gpu in Get-D4RGpuTargets) {
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $file.sha256) { throw "Input file changed: $source/$relative" }
         if ($relative.EndsWith('.hsaco')) { Assert-D4RCodeObjectTarget $path $arch; $objects++ }
         # Per-target files get target-specific names so one folder serves every GPU.
-        if ($relative -eq 'd4r/_nvngx.dll') { Stage $path "d4r/_nvngx_$arch.dll" }
+        # One GPU-query tool serves every target: it reports each device's real architecture.
+        if ($relative -eq 'd4r/d4r_gpu_inventory.exe') { if (!$inventoryStaged) { Stage $path 'd4r/d4r_gpu_inventory.exe'; $inventoryStaged=$true } }
+        elseif ($relative -eq 'd4r/_nvngx.dll') { Stage $path "d4r/_nvngx_$arch.dll" }
         elseif ($relative -eq 'd4r/nvapi/nvapi64.dll') { Stage $path "d4r/nvapi/$arch/nvapi64.dll" }
         elseif ($relative -like 'd4r/pixel_convert_*.hsaco') { Stage $path $relative }
         elseif ($relative.StartsWith('d4r/native/')) { Stage $path ("d4r/native/$arch/" + $relative.Substring('d4r/native/'.Length)) }
@@ -51,7 +56,7 @@ foreach ($gpu in Get-D4RGpuTargets) {
             if (!$commonStaged) { Stage $path $public }
             elseif ((Get-FileHash -LiteralPath (Join-Path $PackageRoot $public) -Algorithm SHA256).Hash -ne $file.sha256) { throw "Shared runtime differs in $arch : $relative" }
         }
-        # Installer-only files (launcher, inventory, PowerShell, docs) are not part of a drag-in install.
+        # Installer-only files (launcher, PowerShell installer, docs) are not part of a drag-in install.
     }
     if ($objects -ne 17) { throw "Expected 17 code objects for $arch" }
     $commonStaged=$true
@@ -63,6 +68,8 @@ Stage $loader 'd4r/_nvngx.dll'
 Stage (Join-Path $repo 'packaging/windows/OptiScaler.ini') 'OptiScaler.ini'
 Stage (Join-Path $repo 'packaging/windows/d4r.ini') 'd4r/d4r.ini'
 Stage (Join-Path $repo 'tools/windows/dll-pins.txt') 'd4r/dll-pins.txt'
+Stage (Join-Path $repo 'tools/windows/gpu-targets.json') 'd4r/gpu-targets.json'
+if (!$inventoryStaged) { throw 'No d4r/d4r_gpu_inventory.exe in the inputs; d4r-check.ps1 needs it to query the GPU.' }
 foreach ($optional in @(@{source='packaging/windows/WINDOWS_README.txt'; path='WINDOWS_README.txt'},
                          @{source='scripts/windows/d4r-check.ps1'; path='d4r/d4r-check.ps1'})) {
     $path=Join-Path $repo $optional.source
@@ -95,4 +102,4 @@ if ($ArchivePath) {
         }
     } finally { if ($archive) { $archive.Dispose() }; $stream.Dispose() }
 }
-Write-Host "Windows drag-in release: $PackageRoot ($($targets.Count) GPU targets, no NVIDIA DLLs)"
+Write-Host "Windows drag-in release: $PackageRoot ($($targets.Count) GPU target(s): $($targets.Keys -join ', '); no NVIDIA DLLs)"

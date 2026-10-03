@@ -148,6 +148,11 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
         if (!snapshot->parameters) return failure;
         d4r::win::player::apply_preset(p);
         d4r::ngx::copy_create(p, snapshot->parameters); d4r::ngx::copy_frame(p, snapshot->parameters);
+        // NVIDIA's library stamps "DLSS SDK - DO NOT DISTRIBUTE" over its output unless the SDK's
+        // Disable.Watermark parameter is set (the Linux shim sets it too). The game's own value is
+        // not used. [DLSS] ShowWatermark = true (D4R_SHIM_WATERMARK=1) keeps the stamp.
+        static const bool watermark = [] { const char* v = std::getenv("D4R_SHIM_WATERMARK"); return v && v[0] == '1'; }();
+        d4r_ngx_set_int(snapshot->parameters, "Disable.Watermark", watermark ? 0 : 1);
         const char* names[] = {"Color", "Depth", "MotionVectors", "Output", "ExposureTexture"};
         const char* states[] = {"D4R.Color.State", "D4R.Depth.State", "D4R.Motion.State", "D4R.Output.State", "D4R.Exposure.State"};
         for (unsigned i = 0; i < 5; ++i) {

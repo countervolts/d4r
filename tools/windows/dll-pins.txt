@@ -2,8 +2,13 @@
 # never shipped or committed; players copy their own.
 #   dlss = nvngx_dlss.dll (d4r\nvngx_dlss.dll)
 #   ngx  = _nvngx.dll, NVIDIA's NGX core from a display driver (d4r\ngx\_nvngx.dll)
-# status: validated = tested on Windows hardware; anything else is accepted
-# but reported as unvalidated in d4r\d4r_nvngx.log.
+# status: validated = tested on Windows hardware by the project; anything else is
+# accepted but reported as having had less testing in d4r\d4r_nvngx.log and d4r-check.ps1.
+# Native kernels only replace DLSS code whose PTX identity matches; anything else
+# falls back to ZLUDA's translated kernels, so an accepted DLL is never run with a
+# wrong native kernel.
 # kind sha256                                                           version       status
 dlss 3975567B8943C53ACCE397F2B72380092F84F162D00B0D2C7D08A1025C563983 310.9.1      validated
+dlss 1CDFDC957CB7FC9805500CA6793F607EF2D4DBD7C967FEAC70ACA9CAF382D0C0 310.7.0      unvalidated
 ngx  66767018C36B3BAB46398DADE3ADF173DAA3730FDA75965689EA848C9BC4E79B 32.0.16.1714 validated
+ngx  0765FB7FB2B8BE28EE1F0226679D7B2636A69CACCE5A23891984978F690D81A4 32.0.15.9636 unvalidated

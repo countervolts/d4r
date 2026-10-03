@@ -22,7 +22,7 @@ struct IniEntry { std::string section, key, value; };
 struct Pin { std::string kind, sha256, version, status; };
 struct Settings {
     unsigned preset = 11; // K
-    bool asyncInterop = false, validateOutput = false, verbose = false;
+    bool asyncInterop = false, validateOutput = false, verbose = false, showWatermark = false;
     std::wstring cacheDir;
 };
 struct State {
@@ -102,7 +102,8 @@ inline Settings read_settings(const std::vector<IniEntry>& ini, std::vector<std:
             if (value.empty() || value == "AUTO" || value == "K" || value == "DLSS4" || value == "11") settings.preset = 11;
             else if (value == "M" || value == "DLSS4.5" || value == "13") settings.preset = 13;
             else notes.push_back("d4r.ini: [DLSS] Model '" + entry.value + "' is not available on Windows (use K or M); using K");
-        } else if (name == "interop.asyncinterop") settings.asyncInterop = flag(entry, false);
+        } else if (name == "dlss.showwatermark") settings.showWatermark = flag(entry, false);
+        else if (name == "interop.asyncinterop") settings.asyncInterop = flag(entry, false);
         else if (name == "debug.validateoutput") settings.validateOutput = flag(entry, false);
         else if (name == "debug.log") {
             const auto value = lower(entry.value);
@@ -213,11 +214,9 @@ inline void set_variable(const wchar_t* name, const std::optional<std::wstring>&
     SetEnvironmentVariableW(name, value ? value->c_str() : nullptr);
     _wputenv_s(name, value ? value->c_str() : L"");
 }
-// Only when the game has no console/pipe: never steal a launcher's streams.
-inline bool unattached(DWORD stream) {
-    const HANDLE current = GetStdHandle(stream);
-    return !current || current == INVALID_HANDLE_VALUE;
-}
+// Player mode only runs when no launcher set up the environment, so no launcher is
+// reading these streams. A game started from Steam can have a valid but unread pipe
+// as stderr; always writing to the log keeps errors visible.
 inline void redirect(FILE* crt, DWORD stream, const std::filesystem::path& path) {
     FILE* reopened = nullptr;
     if (_wfreopen_s(&reopened, path.c_str(), L"a", crt) || !reopened) return;
@@ -253,6 +252,7 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
         {L"D4R_QUIET_API", settings.verbose ? unset : on},
         {L"D4R_VALIDATE_OUTPUT", settings.validateOutput ? on : unset},
         {L"D4R_ASYNC_INTEROP", settings.asyncInterop ? on : unset},
+        {L"D4R_SHIM_WATERMARK", settings.showWatermark ? on : unset},
         {L"D4R_PROFILE_STAGES", unset}, {L"D4R_ZLUDA_PROFILE", unset}, {L"D4R_ZLUDA_PROFILE_DEFERRED", unset},
         {L"D4R_ZLUDA_PROFILE_ALLOW_LEGACY", unset}, {L"D4R_ZLUDA_PROFILE_EVERY", unset},
         {L"D4R_PROFILE_COMMAND_HOOKS", unset}, {L"D4R_ZLUDA_PROFILE_API", unset}, {L"D4R_PROFILE_GPU_BOUNDARY", unset},
@@ -278,12 +278,10 @@ inline void ensure_environment() {
             if (!std::filesystem::exists(dir / L"d4r.ini")) return; // Developer layout: keep the original requirement.
             auto& current = state(); current.dir = dir;
             const auto log = dir / L"d4r_nvngx.log";
-            if (unattached(STD_ERROR_HANDLE)) {
-                { std::ofstream truncate(log, std::ios::trunc); } // Rewritten at every launch, as on Linux.
-                redirect(stderr, STD_ERROR_HANDLE, log);
-            }
+            { std::ofstream truncate(log, std::ios::trunc); } // Rewritten at every launch, as on Linux.
+            redirect(stderr, STD_ERROR_HANDLE, log);
             const auto settings = read_settings(parse_ini(read_text(dir / L"d4r.ini")), current.notes);
-            if (settings.verbose && unattached(STD_OUTPUT_HANDLE)) redirect(stdout, STD_OUTPUT_HANDLE, log);
+            if (settings.verbose) redirect(stdout, STD_OUTPUT_HANDLE, log);
             const auto pins = parse_pins(read_text(dir / L"dll-pins.txt"));
             verify_dll(dir, pins, "dlss", L"nvngx_dlss.dll", "nvngx_dlss.dll", current.notes);
             verify_dll(dir, pins, "ngx", L"ngx\\_nvngx.dll", "_nvngx.dll", current.notes);

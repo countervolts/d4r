@@ -8,54 +8,11 @@ Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set
 
 **Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It has been tested on one GPU in a handful of games and depends on unreleased patches to ZLUDA and vkd3d-proton.
 
-**Native Windows development:** an experimental D3D12 backend runs K and M
-transformer networks on Windows 11 / RX 9070 XT (gfx1201), using patched
-ZLUDA/HIP and VRAM buffers/shared fences directly. Inputs and output belong to
-the current frame; this path does not use Wine, Proton or CPU image staging.
-The Windows backend, command-list hooks and diagnostics live in `tools/windows`.
-All twenty Windows diagnostic gates pass, and queued-frame/feature-recreation K
-outputs match synchronous controls exactly. A five-minute K/4K Silent Hill 2
-run completes 16941 finite frames without backend errors. Performance remains
-under development; asynchronous interop is opt-in and requires one queue.
-M retains the FP16-equivalent baseline; native FP8 has not established a
-full-network speedup. Windows preset L is not validated. See
-[Windows build and validation](docs/windows-rdna4-port.md),
-[OptiScaler installation](docs/windows-game.md) and
-[Windows measurements](docs/windows-performance.md). NVIDIA DLLs are supplied
-locally and excluded from packages.
+**Windows (experimental):** d4r also runs natively on Windows 11, in D3D12 games, with no Wine or Proton. It supports the DLSS 4 (K) and DLSS 4.5 (M) models. Installing works like the Linux release: extract the ZIP into the game folder, copy in two NVIDIA files, and edit `d4r\d4r.ini`. See [the Windows guide](packaging/windows/WINDOWS_README.txt); `d4r\d4r-check.ps1` checks an install and writes a bug-report ZIP.
 
-Experimental Windows builds also cover RDNA3 `gfx1100..gfx1103`, RDNA3.5
-`gfx1150..gfx1154` and RDNA4 `gfx1200/gfx1201`, with separate guarded packages.
-Only RX 9070 XT has physical validation here; other targets are compile-tested.
-Community RX 9060 XT / gfx1200 logs now show native K/M execution and finite
-output in Cyberpunk and Dawnwalker. Visual issues are still reported, so this
-is backend coverage rather than completed image-quality validation.
-The installer checks the real HIP target before changing game files. See
-[Windows GPU coverage and issue #10 diagnostics](docs/windows-gpu-support.md).
+Only the Radeon RX 9070 XT (gfx1201) has been tested on real hardware here. Its backend checks pass for K and M in Silent Hill 2 and Cyberpunk 2077 at 4K; those runs are correctness checks, not FPS benchmarks, and Windows performance is still under development. Community logs from an RX 9060 XT (gfx1200) show native K/M execution and finite output in Cyberpunk and Dawnwalker, but texture/LOD and motion artifacts are still reported, so that is backend coverage and not completed image-quality validation. The other targets (RDNA3 `gfx1100..gfx1103`, RDNA3.5 `gfx1150..gfx1154`) are compile-tested only. Windows preset E and L are not available. NVIDIA DLLs are supplied by you and are never part of the repository; the quick launcher can use a distributor-supplied DLL pair, but that packaging support does not establish redistribution permission.
 
-For a short Windows hardware test, the fork's
-[quick-test prereleases](https://github.com/xdfnx-dev/d4r/releases) provide one
-ZIP that detects the GPU automatically. Extract it and double-click START-K.cmd
-or START-M.cmd, select your game and local NVIDIA DLLs, then send the single
-diagnostic ZIP after exiting. RESTORE-GAME.cmd restores replaced files. Read
-[the short English instructions](docs/windows-quick-test.txt). Corresponding
-sources are a separate release asset; the test requires no SDK installation.
-The updated quick test launches without an attached debugger, stages the
-locally supplied DLSS DLL beside the shim for numeric CUDA NGX initialization,
-and reports a launcher exit with zero frames as inconclusive. Source fixes
-also serialize OptiScaler device-hook installation and forward numeric init
-errors. These fixes pass standalone direct/OptiScaler K and OptiScaler M on
-RX 9070 XT. Cyberpunk 2077 2.31 also reaches saved 4K gameplay with K and M:
-13,145 K session frames and 5,268 M frames pass GPU output checks, every
-required native transformer layer executes, and no backend failures,
-previous-frame outputs or CPU image copies occur. Sessions include menus and
-loading; this synchronous diagnostic is not an FPS benchmark. Other GPUs,
-including the reporter's RX 9060 XT / gfx1200, required further testing at that point.
-The subsequent RX 9060 XT retest passes all required native-layer/output
-checks in Cyberpunk and Dawnwalker; texture/LOD and motion artifacts remain
-open. Distributor-supplied DLL pairs can now be selected automatically by the
-quick launcher. The public fork ZIP still uses locally supplied NVIDIA files;
-packaging support does not establish redistribution permission.
+More: [Windows GPU coverage](docs/windows-gpu-support.md), [measurements](docs/windows-performance.md), [build and validation notes](docs/windows-rdna4-port.md), and the [diagnostic launcher](docs/windows-game.md) and [quick test](docs/windows-quick-test.txt) used for bug reports.
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 

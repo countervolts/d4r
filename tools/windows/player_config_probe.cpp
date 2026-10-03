@@ -46,6 +46,12 @@ int wmain(int argc, wchar_t** argv) {
     s = settings("[Kernels]\nNativeFp8 = on\n[Latency]\nFrameAge = 1\n", notes);
     expect(has_note(notes, "[Kernels] NativeFp8 is not a Windows setting") && has_note(notes, "[Latency] FrameAge"),
         "Linux-only settings are reported as ignored");
+    s = settings("", notes);
+    expect(!s.showWatermark, "watermark is hidden by default");
+    s = settings("[DLSS]\nShowWatermark = true\n", notes);
+    expect(s.showWatermark && notes.empty(), "[DLSS] ShowWatermark = true keeps NVIDIA's stamp");
+    s = settings("[DLSS]\nShowWatermark = sometimes\n", notes);
+    expect(!s.showWatermark && has_note(notes, "ShowWatermark must be true or false"), "invalid ShowWatermark falls back to hidden with a note");
     s = settings("[Paths]\nCacheDir = D:\\d4r-cache\n", notes);
     expect(s.cacheDir == L"D:\\d4r-cache" && notes.empty(), "CacheDir path");
 
