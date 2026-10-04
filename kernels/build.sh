@@ -2,7 +2,7 @@
 # Builds the native replacements for DLSS kernels into one directory that ZLUDA serves them from
 # (D4R_ZLUDA_NATIVE_DIR, or NativeKernelDirFast in d4r.ini). See docs/native-kernels.md.
 #
-# usage: kernels/build.sh [all|k|l|m|tex] [OUT_DIR]      (default: all, kernels/out/native)
+# usage: kernels/build.sh [all|k|l|m|tex|rr] [OUT_DIR] (default: all, kernels/out/native)
 #
 #   D4R_ROCM_DIR    ROCm installation with clang and the HIP device libraries (default /opt/rocm)
 #   D4R_GPU_ARCH    target GPU (default gfx1101): an RDNA3 (gfx110x) or RDNA4 (gfx120x) target; the kernels
@@ -17,6 +17,8 @@
 #   D4R_ZLUDA_EMIT  ZLUDA's d4r_emit (patches/zluda applied; `cargo build --release -p ptx --example d4r_emit`),
 #                   which compiles PTX offline for D4R_GPU_ARCH (no GPU of that kind needed)
 #   D4R_DLSS_PTX_DIR optional pre-extracted PTX directory for parallel per-target builds
+# Ray Reconstruction (rr) additionally needs D4R_DLSSD_DLL (CUDA-capable
+# nvngx_dlssd.dll); D4R_DLSSD_PTX_DIR may provide its pre-extracted modules.
 set -euo pipefail
 shopt -s extglob
 
@@ -38,7 +40,7 @@ esac
 CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "clang++ not found in $ROCM/lib/llvm/bin (set D4R_ROCM_DIR)" >&2; exit 2; }
 mkdir -p "$OUT"
-case "$WHAT" in all|k|l|m|tex) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
+case "$WHAT" in all|k|l|m|tex|rr) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
 # Never certify a directory containing older fast binaries as an accuracy set.
 if [[ "$ACCURACY" == 1 ]] && compgen -G "$OUT/*.hsaco" >/dev/null &&
     { [[ ! -f "$OUT/d4r-accuracy.txt" ]] || [[ "$(cat "$OUT/d4r-accuracy.txt")" != 1 ]]; }; then
@@ -164,6 +166,23 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
         cp "$NAT/in_regs.hip" "$NT/in_regs.hip"
         D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/in_regs.hip" "$OUT/$native_in.hsaco"
     fi
+fi
+if [[ "$WHAT" == rr || ( "$WHAT" == all && -n "${D4R_DLSSD_DLL:-}" ) ]]; then
+    echo "== Ray Reconstruction texture kernels"
+    : "${D4R_DLSSD_DLL:?set D4R_DLSSD_DLL to the CUDA-capable nvngx_dlssd.dll}"
+    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a patched ZLUDA build}"
+    RR_PTX_DIR="${D4R_DLSSD_PTX_DIR:-$HERE/extracted/rr}"
+    if [[ -z "${D4R_DLSSD_PTX_DIR:-}" ]]; then
+        python3 "$HERE/tools/extract_dlss_ptx.py" "$D4R_DLSSD_DLL" "$RR_PTX_DIR"
+    elif [[ ! -d "$RR_PTX_DIR" ]]; then
+        echo "missing extracted RR PTX directory: $RR_PTX_DIR" >&2; exit 2
+    fi
+    for kernel in cuda_dldn_engine_hkpn_output_kernel_transformer \
+                  cuda_dldn_engine_hkpn_output_kernel_transformer_diamond_wallaby; do
+        D4R_PREFER_ACCURACY="$ACCURACY" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
+            D4R_ZLUDA_WAVE64="$((1 - ACCURACY))" D4R_TEX_FP8="$FP8" \
+            D4R_DLSS_PTX_DIR="$RR_PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" sust_only "$OUT"
+    done
 fi
 [[ "$ACCURACY" == 1 ]] && printf '1\n' > "$OUT/d4r-accuracy.txt"
 echo "native kernels in $OUT"

@@ -59,6 +59,26 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
 
 Initial validation: a gfx1101 fast L build completed two Ultra Performance harness frames (192×108 → 576×324, DLSS 310.7). Its finite, nonzero RGBA16F output matched the original translated L texture kernels byte for byte with the same native Swin layers. A gfx1201 FP8 accuracy L set compiled successfully; RDNA4 hardware and 4K game output have not been tested. Full packaging rebuilds missing L variants when given an older texture bundle.
 
+**Ray Reconstruction, the denoiser (`kernels/tex` + `cuda_dldn_engine_*`).**
+- **Network:** `nvngx_dlssd.dll` defines the DLSS-D denoiser: six Swin encoders (`cuda_dldn_engine_swin_enc0_kernel` … `enc5`), five decoders (`dec0` … `dec4`), a high-fidelity kernel-prediction network whose output kernel is `cuda_dldn_engine_hkpn_output_kernel_transformer`, and the luma/auto-exposure/`reduce_sum` helpers. It shares no kernel with the Super Resolution libraries.
+- **Native today:** the hkpn output kernel (and its `_diamond_wallaby` twin), built by `kernels/build.sh rr` as a wave64 surface-store replacement. `make_ptx.py` replaces `sust.b.2d.v4.b16.zero` — a whole RGBA16F texel — with `d4r_sust_v4b16`; the neural body and the texture reads are unchanged.
+- **Still translated:** all eleven Swin layers. ZLUDA compiles NVIDIA's PTX at load time, and that compile is what costs the time (see the table below). A native replacement has to recover each layer's attention, norm and merge stages, the way `kernels/m/rrlite_*` does for the upscaler.
+- **Manifest:** the denoiser DLL is passed to `kernel_manifest.py` as `--rr-dll`, because its hashes may only authorize `cuda_dldn_engine_*` replacements. Without that split, a name both libraries define — `dl4rt_input_kernel` — would let a super-resolution binary be served for the denoiser's different implementation of it.
+
+Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E, 1280×720 → 3840×2160, `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness, 16 frames after 6 warm-up, with the shipped `[Kernels]` settings (`NativeFp8`, `IgnoreDenormals`; `IgnoreDenormals` alone is worth 11% here and `FastMath` changes nothing):
+
+| kernel | ms/frame | kernel | ms/frame |
+|---|---|---|---|
+| dec0 | 7.71 | dec4 | 1.16 |
+| enc0 | 6.49 | dec3 | 1.17 |
+| dec1 | 3.66 | enc4 | 1.02 |
+| enc1 | 3.48 | enc3 | 0.92 |
+| dec2 | 2.18 | enc5 | 0.65 |
+| enc2 | 1.74 | luma, exposure, reduce_sum | 0.05 |
+| hkpn output (translated / native) | 1.44 / 0.85 | **total** | **31.6** |
+
+The eleven Swin layers are 30.2 of those 31.6 ms. They are instruction-bound, not MMA-bound: the compiled `enc0` kernel is 83 373 instructions per thread for 536 FP8 WMMAs (0.6% of the stream), and the frame reaches about 6% of the card's FP8 WMMA peak. The stream is 13 k operand-gather shuffles (`ds_bpermute`/`v_perm`/`permlane`), 15 k packed 16-bit ops from the software `cvt.rn.satfinite.e4m3x2.f16x2` requantization, 9 k selects and 13 k ALU-dependency waits. `D4R_ZLUDA_IMPLICIT_MAX_BLOCK` (256 in the shipped config), `D4R_ZLUDA_SCHED_STRATEGY` and a 128-thread bound move the total by under 3%; a 128-thread bound additionally fails the launches of kernels that use larger blocks, and the whole-module wave64 switch produces no launches at all. Removing the gather and the codec — what a native layer does — is the remaining work.
+
 ## RDNA4
 
 `kernels/common/wmma_layout.h` selects the WMMA operand and accumulator layout. gfx12 uses eight f16 values per lane in each K half; the accumulator rows are `i + 8·half`. The gfx11 path retains its original layout. `D4R_WMMA_LAYOUT=12` on gfx11 is a test shim: it exercises gfx12 indexing but executes gfx11 WMMA, so its replay output can be compared byte for byte with the existing gfx11 build.
