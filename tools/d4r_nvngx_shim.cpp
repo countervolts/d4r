@@ -1801,7 +1801,13 @@ enum class AuxLayout
     Converted // the bytes must be unpacked into floats first (see convert_aux_row)
 };
 
-// The CUDA array a denoiser input uses.
+// The texel size an array of `arrayFormat` and `channels` occupies per texel.
+static size_t aux_texel_bytes(uint32_t arrayFormat, uint32_t channels);
+
+// The CUDA array a denoiser input uses, plus the texel size the caller's own resource
+// occupies. The two differ for every converted format (B8G8R8A8_UNORM is four bytes to
+// D3D12 and sixteen to the float array), and a capture records the caller's bytes, so a
+// replay runs them through the same conversion again.
 //
 // Only formats that are byte-for-byte correct go down the verbatim path, and that is a
 // shorter list than it looks. A CUDA array stores element_size * channels bytes per texel
@@ -1817,7 +1823,9 @@ enum class AuxLayout
 //
 // Everything that is not in this table is converted to a float array instead, which is
 // correct for all of those cases at the cost of a per-row unpack.
-static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t& channels, AuxLayout& how)
+
+static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t& channels, AuxLayout& how,
+                             uint32_t& texelBytes)
 {
     struct Entry
     {
@@ -1826,7 +1834,8 @@ static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t
         uint32_t channels;
     };
     // UNORM and SNORM map onto signed/unsigned integer arrays of the same width: sampling
-    // normalizes them, which is exactly how a D3D12 shader reads the resource.
+    // normalizes them, which is exactly how a D3D12 shader reads the resource. Their texel
+    // size is the array's own, so it is derived rather than listed twice.
     static const Entry entries[] = {
         {DXGI_FORMAT_R8_UNORM, CUDA_FORMAT_UNSIGNED_INT8, 1},
         {DXGI_FORMAT_R8_SNORM, CUDA_FORMAT_SIGNED_INT8, 1},
@@ -1853,28 +1862,31 @@ static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t
             arrayFormat = entry.arrayFormat;
             channels = entry.channels;
             how = AuxLayout::Verbatim;
+            texelBytes = static_cast<uint32_t>(aux_texel_bytes(entry.arrayFormat, entry.channels));
             return true;
         }
     // Converted formats all end up as float arrays, so a shader read of the denoiser's
-    // texture returns the same numbers a D3D12 read of the caller's resource would.
+    // texture returns the same numbers a D3D12 read of the caller's resource would. Their
+    // texel size is the caller's own, which is what a capture records.
     struct Converted
     {
         DXGI_FORMAT format;
         uint32_t channels;
+        uint32_t texelBytes;
     };
     static const Converted converted[] = {
-        {DXGI_FORMAT_R8_UINT, 1},
-        {DXGI_FORMAT_R8G8_UINT, 2},
-        {DXGI_FORMAT_R8G8B8A8_UINT, 4},
-        {DXGI_FORMAT_R16_UINT, 1},
-        {DXGI_FORMAT_R32_UINT, 1},
-        {DXGI_FORMAT_R32_SINT, 1},
-        {DXGI_FORMAT_R32G32_UINT, 2},
-        {DXGI_FORMAT_R32G32_SINT, 2},
-        {DXGI_FORMAT_R32G32B32A32_UINT, 4},
-        {DXGI_FORMAT_B8G8R8A8_UNORM, 4},
-        {DXGI_FORMAT_R10G10B10A2_UNORM, 4},
-        {DXGI_FORMAT_R11G11B10_FLOAT, 4},
+        {DXGI_FORMAT_R8_UINT, 1, 1},
+        {DXGI_FORMAT_R8G8_UINT, 2, 2},
+        {DXGI_FORMAT_R8G8B8A8_UINT, 4, 4},
+        {DXGI_FORMAT_R16_UINT, 1, 2},
+        {DXGI_FORMAT_R32_UINT, 1, 4},
+        {DXGI_FORMAT_R32_SINT, 1, 4},
+        {DXGI_FORMAT_R32G32_UINT, 2, 8},
+        {DXGI_FORMAT_R32G32_SINT, 2, 8},
+        {DXGI_FORMAT_R32G32B32A32_UINT, 4, 16},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, 4, 4},
+        {DXGI_FORMAT_R10G10B10A2_UNORM, 4, 4},
+        {DXGI_FORMAT_R11G11B10_FLOAT, 4, 4},
     };
     for (const Converted& entry : converted)
         if (entry.format == format)
@@ -1882,6 +1894,7 @@ static bool aux_array_layout(DXGI_FORMAT format, uint32_t& arrayFormat, uint32_t
             arrayFormat = CUDA_FORMAT_FLOAT;
             channels = entry.channels;
             how = AuxLayout::Converted;
+            texelBytes = entry.texelBytes;
             return true;
         }
     return false;
@@ -2134,6 +2147,17 @@ struct FrameParams
     unsigned int colorBaseX = 0, colorBaseY = 0, depthBaseX = 0, depthBaseY = 0;
     unsigned int mvBaseX = 0, mvBaseY = 0, outputBaseX = 0, outputBaseY = 0;
     bool hasExposure = false;
+    // The exposure texture's own geometry. A game may pass a per-pixel exposure buffer rather
+    // than the 1x1 scalar, and a capture that recorded a plane without its size could not say
+    // which it was.
+    unsigned int exposureWidth = 0, exposureHeight = 0;
+    // How this feature was created, copied off it so a capture records what the game asked for
+    // rather than what a replay would otherwise have to guess: the model, the render and output
+    // dimensions, the quality mode, the HDR/depth/exposure create flags, whether Output.Subrect
+    // origins are read, and the render preset in force.
+    unsigned int createWidth = 0, createHeight = 0, createOutWidth = 0, createOutHeight = 0;
+    int createQuality = 0, createFlags = 0, createSubrects = 0;
+    unsigned int createPreset = 0;
     bool vram = false; // inputs and output stay in VRAM (VRAM interop)
     bool split = false; // this frame presents its own result (split frames)
     unsigned motionDilation = 0; // actually applied, worker only
@@ -2201,6 +2225,7 @@ struct AuxSurface
     UINT width = 0, height = 0;
     uint32_t arrayFormat = 0, channels = 0;
     AuxLayout how = AuxLayout::Verbatim; // whether the bytes reach the array as they are
+    uint32_t texelBytes = 0;            // the caller's own texel size, for a capture
     uint32_t lastSeen = 0;  // frame the caller last registered this resource
     unsigned int holds = 0; // queued frames still naming this surface
     bool dropping = false;  // no longer registered; freed once holds reaches zero
@@ -2219,7 +2244,8 @@ struct AuxSurface
 struct AuxBinding
 {
     AuxSurface* surface = nullptr;
-    std::vector<const char*> names;
+    std::vector<const char*> names;   // what the denoiser reads it as
+    std::vector<const char*> sources; // what the caller registered it under
     uint32_t frame = 0;
 };
 
@@ -2295,6 +2321,9 @@ struct Feature
     unsigned int width = 0, height = 0, outWidth = 0, outHeight = 0;
     int quality = 0, flags = 0;
     unsigned int preset = 0;
+    // DLSS.Enable.Output.Subrects as the caller set it at creation: it decides whether the
+    // Output.Subrect origins are read at all, so a replay must create the feature the same way.
+    int outputSubrects = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
     CudaEvent outputReadyEvent = nullptr;
     bool profileEventsReady = false;
@@ -3833,20 +3862,26 @@ static void dump_input_planes(const HostPlane (&planes)[4], uint32_t frame, cons
         if (written > 0 && written < MAX_PATH)
             write_capture_file(frame, names[index], path, bytes, host.size());
     }
-    // The evaluation parameters, so the harness can replay the sequence.
+    // The evaluation parameters, so the harness can replay the sequence. The exposure plane's
+    // own geometry and the feature's creation state are recorded here too: a capture that kept a
+    // plane without its size, or a sequence without the model it ran under, would leave the
+    // replay guessing at both.
     char path[MAX_PATH];
     const int written = std::snprintf(path, MAX_PATH, "%s\\frame-%06u-params.txt", directory, frame);
     if (written <= 0 || written >= MAX_PATH)
         return;
-    char text[1024];
+    char text[1536];
     const int length = std::snprintf(
         text, sizeof(text),
         "jitter %.9g %.9g\nmv_scale %.9g %.9g\nsharpness %.9g\npre_exposure %.9g\n"
         "exposure_scale %.9g\nframe_time %.9g\nreset %d\ninvert %d %d\nrender %u %u\n"
-        "color_base %u %u\ndepth_base %u %u\nmv_base %u %u\noutput_base %u %u\nhas_exposure %d\n",
+        "color_base %u %u\ndepth_base %u %u\nmv_base %u %u\noutput_base %u %u\nhas_exposure %d\n"
+        "exposure_size %u %u\ncreate %u %u %u %u %d %d %d %u\n",
         p.jitterX, p.jitterY, p.mvScaleX, p.mvScaleY, p.sharpness, p.preExposure, p.exposureScale, p.frameTime,
         p.reset, p.invertX, p.invertY, p.renderWidth, p.renderHeight, p.colorBaseX, p.colorBaseY, p.depthBaseX,
-        p.depthBaseY, p.mvBaseX, p.mvBaseY, p.outputBaseX, p.outputBaseY, p.hasExposure ? 1 : 0);
+        p.depthBaseY, p.mvBaseX, p.mvBaseY, p.outputBaseX, p.outputBaseY, p.hasExposure ? 1 : 0, p.exposureWidth,
+        p.exposureHeight, p.createWidth, p.createHeight, p.createOutWidth, p.createOutHeight, p.createQuality,
+        p.createFlags, p.createSubrects, p.createPreset);
     if (length > 0)
         write_capture_file(frame, "params", path, text, static_cast<size_t>(length));
 }
@@ -4791,6 +4826,11 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
 {
     InputSlot& slot = feature.inputs[slotIndex];
     std::lock_guard<std::mutex> lock(feature.auxMutex);
+    // A frame the input dump selected records this frame's guides too, so a replay of an RR
+    // sequence feeds the denoiser the game's own guides rather than the harness's synthetic
+    // ones - without which the replayed image cannot be compared with the game's.
+    char captureDirectory[MAX_PATH];
+    const bool capture = input_dump_directory(frame, captureDirectory);
     std::vector<AuxBinding> bindings;
     for (const AuxInput& input : kAuxInputs)
     {
@@ -4834,15 +4874,20 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
             bound = bound || strcmp(name, input.publish) == 0;
         if (!bound)
             binding->names.push_back(input.publish);
+        bool sourceBound = false;
+        for (const char* name : binding->sources)
+            sourceBound = sourceBound || strcmp(name, input.source) == 0;
+        if (!sourceBound)
+            binding->sources.push_back(input.source);
         if (!firstBinding)
             continue; // aliases share one captured plane and one upload
 
         D3D12_RESOURCE_DESC desc;
         resource->GetDesc(&desc);
-        uint32_t arrayFormat = 0, channels = 0;
+        uint32_t arrayFormat = 0, channels = 0, texelBytes = 0;
         AuxLayout how = AuxLayout::Verbatim;
         if (desc.DepthOrArraySize != 1 || desc.Width > 0xFFFFFFFFull ||
-            !aux_array_layout(desc.Format, arrayFormat, channels, how))
+            !aux_array_layout(desc.Format, arrayFormat, channels, how, texelBytes))
         {
             logf("Ray Reconstruction: denoiser input %s is %llux%u array=%u fmt=0x%x, which has no single-plane "
                  "CUDA layout; this frame's evaluation is refused rather than run without it",
@@ -4853,6 +4898,7 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
         surface->arrayFormat = arrayFormat;
         surface->channels = channels;
         surface->how = how;
+        surface->texelBytes = texelBytes;
         surface->width = static_cast<UINT>(desc.Width);
         surface->height = static_cast<UINT>(desc.Height);
         VramCopy gpuCopy;
@@ -4862,7 +4908,10 @@ static bool gather_aux_inputs(Feature& feature, ID3D12GraphicsCommandList* list,
             if (!record_aux_vram(list, *surface, slotIndex, gpuCopy, inputState))
                 return false;
         }
-        if (!surface->gpu[slotIndex] || env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0)
+        // A captured frame reads its guides back even with VRAM interop on: the capture
+        // records the caller's own bytes in the caller's own format, which is what a replay
+        // has to feed back for the same conversion to run over it.
+        if (!surface->gpu[slotIndex] || env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0 || capture)
         {
             if (!ensure_staging(surface->staging[slotIndex], resource, D3D12_HEAP_TYPE_READBACK))
                 return false;
@@ -5031,6 +5080,125 @@ static bool upload_aux_inputs(Feature& feature, int slotIndex, uint32_t frame)
         surface.handle = surface.image.object;
     }
     return true;
+}
+
+// Worker. Writes this frame's Ray Reconstruction guides next to the canonical input planes:
+// the caller's own bytes in the caller's own format, the descriptor each was read with, and
+// the per-frame settings, subrect origins and camera matrices the denoiser was given. A replay
+// rebuilds the textures from those descriptors and uploads the recorded bytes, so the same
+// conversion runs over the same data and the replayed image is comparable with the game's -
+// which synthetic guides can never be.
+//
+// A guide whose bytes are not readable fails the whole capture: a descriptor without its
+// plane, or a plane the replay silently skipped, is an image the denoiser would produce from
+// fewer guides than the game gave it, and nothing downstream could tell.
+static void dump_aux_guides(Feature& feature, int slotIndex, uint32_t frame, const FrameParams& p)
+{
+    char directory[MAX_PATH];
+    if (!input_dump_directory(frame, directory))
+        return;
+    const InputSlot& slot = feature.inputs[slotIndex];
+    for (const AuxBinding& binding : slot.auxBindings)
+        if (binding.surface->staging[slotIndex].mapped == nullptr)
+        {
+            logf("frame %u: Ray Reconstruction guide %s is not readable, so this frame's capture is "
+                 "incomplete and is not written",
+                 frame, join_aux_names(binding.names).c_str());
+            return;
+        }
+    std::string text = "guides " + std::to_string(slot.auxBindings.size()) + "\n";
+    char path[MAX_PATH];
+    for (size_t index = 0; index < slot.auxBindings.size(); ++index)
+    {
+        const AuxBinding& binding = slot.auxBindings[index];
+        const AuxSurface& surface = *binding.surface;
+        // Both spellings are recorded: the names the caller registered the texture under, and
+        // the names the denoiser reads it as, which for the two albedos differ.
+        std::string sources, names;
+        for (const char* name : binding.sources)
+            sources += sources.empty() ? name : std::string(",") + name;
+        for (const char* name : binding.names)
+            names += names.empty() ? name : std::string(",") + name;
+        const int written =
+            std::snprintf(path, MAX_PATH, "%s\\frame-%06u-guide-%02zu.bin", directory, frame, index);
+        if (written <= 0 || written >= MAX_PATH)
+        {
+            logf("frame %u: the path for Ray Reconstruction guide %s does not fit; this frame's capture is "
+                 "incomplete and is not written",
+                 frame, join_aux_names(binding.names).c_str());
+            return;
+        }
+        const Staging& staging = surface.staging[slotIndex];
+        const size_t rowBytes = static_cast<size_t>(surface.texelBytes) * surface.width;
+        const size_t bytes = rowBytes * surface.height;
+        uint8_t* const pinned = capture_pinned(path, bytes);
+        std::vector<uint8_t> fallback;
+        if (pinned == nullptr)
+            fallback.resize(bytes);
+        uint8_t* const destination = pinned != nullptr ? pinned : fallback.data();
+        for (UINT row = 0; row < surface.height; ++row)
+            std::memcpy(destination + static_cast<size_t>(row) * rowBytes,
+                        staging.mapped + staging.layout.Offset +
+                            static_cast<size_t>(row) * staging.layout.Footprint.RowPitch,
+                        rowBytes);
+        if (pinned == nullptr)
+            write_capture_file(frame, "Ray Reconstruction guide", path, destination, bytes);
+        char line[512];
+        const int length = std::snprintf(line, sizeof(line),
+                                         "guide %zu %s %s %u %u %u %u %d\n", index, sources.c_str(), names.c_str(),
+                                         static_cast<unsigned>(surface.format), surface.width, surface.height,
+                                         surface.texelBytes, surface.how == AuxLayout::Verbatim ? 0 : 1);
+        if (length <= 0)
+            return;
+        text += line;
+    }
+    // The scalar settings, the Subrect origins and the camera matrices, under the very
+    // parameter names the denoiser reads: a replay sets them by name, so a table that drifted
+    // here and there could not misroute them.
+    for (size_t index = 0; index < sizeof(kAuxScalars) / sizeof(kAuxScalars[0]); ++index)
+    {
+        char line[256];
+        const int length = std::snprintf(line, sizeof(line), "scalar %s %d\n", kAuxScalars[index].name,
+                                         p.auxScalar[index]);
+        if (length <= 0)
+            return;
+        text += line;
+    }
+    for (size_t index = 0; index < sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0]); ++index)
+    {
+        for (int axis = 0; axis < 2; ++axis)
+        {
+            char line[256];
+            const int length = std::snprintf(line, sizeof(line), "subrect %s.Subrect.Base.%c %u\n",
+                                             kAuxSubrectNames[index], axis == 0 ? 'X' : 'Y',
+                                             p.auxSubrect[index][axis]);
+            if (length <= 0)
+                return;
+            text += line;
+        }
+    }
+    for (size_t index = 0; index < sizeof(kAuxMatrices) / sizeof(kAuxMatrices[0]); ++index)
+    {
+        char line[1024];
+        int length = std::snprintf(line, sizeof(line), "matrix %s %d", kAuxMatrices[index],
+                                   p.auxMatrixSet[index] ? 1 : 0);
+        if (length <= 0)
+            return;
+        for (size_t element = 0; element < 16 && p.auxMatrixSet[index]; ++element)
+        {
+            const int written = std::snprintf(line + length, sizeof(line) - static_cast<size_t>(length), " %.9g",
+                                              static_cast<double>(p.auxMatrix[index][element]));
+            if (written <= 0 || static_cast<size_t>(written) >= sizeof(line) - static_cast<size_t>(length))
+                return;
+            length += written;
+        }
+        text += line;
+        text += "\n";
+    }
+    const int written = std::snprintf(path, MAX_PATH, "%s\\frame-%06u-guides.txt", directory, frame);
+    if (written <= 0 || written >= MAX_PATH)
+        return;
+    write_capture_file(frame, "Ray Reconstruction guide parameters", path, text.data(), text.size());
 }
 
 // Worker. Points the denoiser's parameters at this frame's texture objects and forwards the
@@ -5730,6 +5898,8 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         {
             std::lock_guard<std::mutex> lock(feature->auxMutex);
             auxUploaded = upload_aux_inputs(*feature, slotIndex, frame);
+            if (auxUploaded)
+                dump_aux_guides(*feature, slotIndex, frame, params);
         }
         if (!auxUploaded)
         {
@@ -6525,6 +6695,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     feature->quality = quality;
     feature->flags = flags;
     const int subrects = get_int_or(parameters, "DLSS.Enable.Output.Subrects", 0);
+    feature->outputSubrects = subrects;
     // The render preset is chosen by two independent knobs. D4R_DLSS_PRESET forces the
     // Super Sampling model (NVSDK_NGX_DLSS_Hint_Render_Preset, e.g. 5 = E) and touches only
     // Super Sampling features; D4R_RR_PRESET forces the Ray Reconstruction model
@@ -6745,12 +6916,21 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                  outputDesc.Width, outputDesc.Height, outputDesc.Format, outputSupported ? "" : " (unsupported)");
         return NGX_FAIL_UNSUPPORTED_FORMAT;
     }
+    unsigned int exposureWidth = 0, exposureHeight = 0;
     if (exposure != nullptr)
     {
         D3D12_RESOURCE_DESC exposureDesc;
         exposure->GetDesc(&exposureDesc);
+        // Recorded before the format test: a capture that kept the plane but not its geometry
+        // could not say whether the game passed a scalar or a per-pixel exposure buffer.
+        exposureWidth = static_cast<unsigned int>(exposureDesc.Width);
+        exposureHeight = static_cast<unsigned int>(exposureDesc.Height);
         if (!supported_input(Plane::Exposure, exposureDesc.Format))
+        {
             exposure = nullptr;
+            exposureWidth = 0;
+            exposureHeight = 0;
+        }
     }
 
     FrameParams p;
@@ -6781,6 +6961,18 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     p.outputBaseX = get_uint_or(parameters, "DLSS.Output.Subrect.Base.X", 0);
     p.outputBaseY = get_uint_or(parameters, "DLSS.Output.Subrect.Base.Y", 0);
     p.hasExposure = exposure != nullptr;
+    p.exposureWidth = exposureWidth;
+    p.exposureHeight = exposureHeight;
+    // Creation state, so a capture records the model and geometry the game asked for rather
+    // than what a replay would otherwise have to guess.
+    p.createWidth = feature->width;
+    p.createHeight = feature->height;
+    p.createOutWidth = feature->outWidth;
+    p.createOutHeight = feature->outHeight;
+    p.createQuality = feature->quality;
+    p.createFlags = feature->flags;
+    p.createSubrects = feature->outputSubrects;
+    p.createPreset = feature->preset;
 
     // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices are read
     // here, on the game thread, while the caller's parameter object is certainly alive, and
