@@ -1554,12 +1554,25 @@ static void summarize_launch(unsigned int sequence, CUfunction function_handle, 
     if (extra == NULL || (uintptr_t)extra[0] != 1 || extra[1] == NULL ||
         (uintptr_t)extra[2] != 2 || extra[3] == NULL)
         return;
+    /* D4R_CUDA_LAUNCH_STATS_FILTER restricts the summarise/dump to kernels whose
+       name contains it, before the synchronize, so iterating on one kernel does
+       not pay for, or write, the rest of the frame. */
+    static char stats_filter[128];
+    static int stats_filter_ready;
+    if (!stats_filter_ready)
+    {
+        const char* value = getenv("D4R_CUDA_LAUNCH_STATS_FILTER");
+        snprintf(stats_filter, sizeof(stats_filter), "%s", value != NULL ? value : "");
+        stats_filter_ready = 1;
+    }
+    const char* kernel = find_function_name(function_handle);
+    if (stats_filter[0] != '\0' && strstr(kernel, stats_filter) == NULL)
+        return;
     CUCTX_SYNCHRONIZE_FN synchronize = (CUCTX_SYNCHRONIZE_FN)find_zluda_symbol("cuCtxSynchronize");
     CUMEMCPYDTOH_FN copy_to_host = (CUMEMCPYDTOH_FN)find_zluda_symbol("cuMemcpyDtoH_v2");
     if (synchronize == NULL || copy_to_host == NULL)
         return;
     const CUresult sync_result = synchronize();
-    const char* kernel = find_function_name(function_handle);
     tracef("launch[%u] %s synchronize result=%d", sequence, kernel, sync_result);
     const unsigned char* arguments = (const unsigned char*)extra[1];
     const size_t argument_bytes = *(const size_t*)extra[3];
