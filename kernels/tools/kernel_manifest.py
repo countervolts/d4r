@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Write the d4r-kernels.txt manifest of a native kernel directory.
 
-usage: kernel_manifest.py KERNEL_DIR NVNGX_DLSS_DLL [NVNGX_DLSS_DLL...]
+usage: kernel_manifest.py KERNEL_DIR [NVNGX_DLSS_DLL...] [--rr-dll NVNGX_DLSSD_DLL]
 
 For every NAME.hsaco in KERNEL_DIR, finds the PTX module of each DLL that defines `.entry NAME` and
 lists the FNV-1a 64 hash of the module's text (trailing NUL bytes removed), one "NAME HASH" line per
 distinct hash. The Wine CUDA bridge serves a native kernel only while DLSS loads a module with a
 listed hash, so a DLSS version that changed the kernel runs ZLUDA's own compile of it instead.
 The manifest is written to KERNEL_DIR/d4r-kernels.txt; it holds hashes, not NVIDIA code.
+RR DLLs are explicit: only a DLL passed with --rr-dll may authorize a cuda_dldn_engine_* replacement,
+and the Super Resolution DLLs passed positionally authorize everything else. Both libraries define
+cuda_dldn_engine_* modules of their own (the shared capture and exposure helpers), so without the split
+a Super Resolution hash could stand in for the denoiser's different implementation of the same name.
 """
+import argparse
 import hashlib
 import os
 import re
@@ -41,19 +46,25 @@ def module_hashes(dll: str) -> dict:
 
 
 def main(argv):
-    if len(argv) < 3:
-        sys.exit(__doc__)
-    directory = argv[1]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory")
+    parser.add_argument("dlls", nargs="*")
+    parser.add_argument("--rr-dll", action="append", default=[])
+    args = parser.parse_args(argv[1:])
+    if not args.dlls and not args.rr_dll:
+        parser.error("at least one SR DLL or --rr-dll is required")
+    directory = args.directory
     names = sorted(name[:-len('.hsaco')] for name in os.listdir(directory) if name.endswith('.hsaco'))
     lines = ['# d4r native kernels: NAME and the FNV-1a 64 hash of the DLSS PTX module each was written for',
              '# (written by kernels/tools/kernel_manifest.py from:']
     listed = {name: set() for name in names}
-    for dll in argv[2:]:
+    for dll, reconstruction in [(dll, False) for dll in args.dlls] + [(dll, True) for dll in args.rr_dll]:
         digest = hashlib.sha256(open(dll, 'rb').read()).hexdigest()[:16]
         lines.append(f'#   {os.path.basename(dll)} sha256 {digest}...)')
         hashes = module_hashes(dll)
         for name in names:
-            listed[name] |= hashes.get(name, set())
+            if name.startswith("cuda_dldn_engine_") == reconstruction:
+                listed[name] |= hashes.get(name, set())
     missing = [name for name in names if not listed[name]]
     if missing:
         sys.exit(f'no DLL defines {", ".join(missing)}; not writing a manifest')

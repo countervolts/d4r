@@ -98,6 +98,13 @@ SUST_EXTERN = """.extern .func d4r_sust_v2b16
 )
 ;
 """
+SUST4_EXTERN = """.extern .func d4r_sust_v4b16
+(
+	.param .b64 d4r_h0, .param .b32 d4r_h1, .param .b32 d4r_h2, .param .b16 d4r_h3,
+	.param .b16 d4r_h4, .param .b16 d4r_h5, .param .b16 d4r_h6
+)
+;
+"""
 SUSTP_EXTERN = """.extern .func d4r_sust_p_v4b32
 (
 	.param .b64 d4r_t0, .param .b32 d4r_t1, .param .b32 d4r_t2, .param .b32 d4r_t3, .param .b32 d4r_t4,
@@ -114,14 +121,31 @@ SUSTB32_EXTERN = """.extern .func d4r_sust_b32
 """
 SUSTB32_RE = re.compile(r"^sust\.b\.2d\.b32\.zero \[(%rd\d+), \{(%r\d+),(%r\d+)\}\], \{(%r\d+)\};$")
 SUST_RE = re.compile(r"^sust\.b\.2d\.v2\.b16\.zero \[(%rd\d+), \{(%r\d+),(%r\d+)\}\], \{(%rs\d+),(%rs\d+)\};$")
+SUST4_RE = re.compile(r"^sust\.b\.2d\.v4\.b16\.zero \[(%rd\d+), \{(%r\d+),\s*(%r\d+)\}\], \{(%rs\d+),\s*(%rs\d+),\s*(%rs\d+),\s*(%rs\d+)\};$")
 
 
 SUST_KINDS = set(os.environ.get("D4R_SUST_KINDS", "b16,p,b32").split(","))
 
 
 def replace_sust(lines):
-    out, n = [], {"b16": 0, "p": 0, "b32": 0}
+    out, n = [], {"b16": 0, "v4b16": 0, "p": 0, "b32": 0}
     for line in lines:
+        mh = SUST4_RE.match(line.strip()) if "b16" in SUST_KINDS else None
+        if mh:
+            s, x, y, *v = mh.groups()
+            st = "\n".join(f"\t.param .b16 v{i};\n\tst.param.b16 [v{i}+0], {r};" for i, r in enumerate(v))
+            out.append(f"""{{
+	.param .b64 u0;
+	st.param.b64 [u0+0], {s};
+	.param .b32 u1;
+	st.param.b32 [u1+0], {x};
+	.param .b32 u2;
+	st.param.b32 [u2+0], {y};
+{st}
+	call d4r_sust_v4b16, (u0, u1, u2, v0, v1, v2, v3);
+}}""")
+            n["v4b16"] += 1
+            continue
         mb = SUSTB32_RE.match(line.strip()) if "b32" in SUST_KINDS else None
         if mb:
             s, x, y, v = mb.groups()
@@ -213,7 +237,8 @@ ENC0_REF = "rrlite_enc0_4x4_mvhi_hdr_folded"
 SUST_ONLY_RE = re.compile(r"^(hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)(_max)?_v[12]_rel|"
                           r"rrlite_post_3_[12]_mv(hi|lo)_(hdr|ldr)(_folded)?|"
                           r"rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)|rrlite_dec0_4x4|"
-                          r"rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr))$")
+                          r"rrlite_downsample_kernel_(static|dynamic)_(hdr|ldr)|"
+                          r"cuda_dldn_engine_hkpn_output_kernel_transformer(_diamond_wallaby)?)$")
 ENC0_RE = re.compile(r"^rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)_folded$")
 
 
@@ -318,7 +343,7 @@ def main():
         at = next(i for i, l in enumerate(body) if l.startswith(".reg"))
         body = body[:at] + [f".reg .f32 %rq<{4 * nrz + 1}>;", f".reg .pred %pq<{nrz + 1}>;"] + body[at:]
         n["rz"] = nrz
-    extern = k["extern"] + (SUST_EXTERN if n["b16"] else "") + (SUSTP_EXTERN if n["p"] else "") + (SUSTB32_EXTERN if n["b32"] else "")
+    extern = k["extern"] + (SUST_EXTERN if n["b16"] else "") + (SUST4_EXTERN if n.get("v4b16") else "") + (SUSTP_EXTERN if n["p"] else "") + (SUSTB32_EXTERN if n["b32"] else "")
     text = "\n".join(head[:entry]) + "\n" + extern + "\n".join(body + tail)
     out.write_text(text)
     print(f"{out}: {len(text.splitlines())} lines, surface stores replaced: {n}")

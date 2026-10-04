@@ -105,6 +105,8 @@ else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
 IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
+RR_DLLS=()
+[[ -z "${D4R_BUNDLE_DLSSD:-}" ]] || RR_DLLS=(--rr-dll "$D4R_BUNDLE_DLSSD")
 # one folder per target; RDNA4 targets also get <target>-fp8 (native FP8 WMMA, d4r.ini NativeFp8), which the
 # bridge serves instead when that setting is on
 folders=()
@@ -130,6 +132,19 @@ ensure_l_textures() {
       D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" l "$dir" >/dev/null
   fi
 }
+ensure_rr_textures() {
+  local dir="$1" accuracy="$2" missing=0 name
+  [[ -n "${D4R_BUNDLE_DLSSD:-}" ]] || return 0
+  for name in cuda_dldn_engine_hkpn_output_kernel_transformer \
+              cuda_dldn_engine_hkpn_output_kernel_transformer_diamond_wallaby; do
+    [[ -f "$dir/$name.hsaco" ]] || missing=1
+  done
+  if [[ "$missing" == 1 ]]; then
+    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply the RR texture variants in D4R_BUNDLE_TEX}"
+    D4R_PREFER_ACCURACY="$accuracy" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
+      D4R_DLSSD_DLL="$D4R_BUNDLE_DLSSD" "$ROOT/kernels/build.sh" rr "$dir" >/dev/null
+  fi
+}
 build_target() {
   local folder="$1" arch fp8 tex_dir accurate accurate_tex f
   arch="${folder%-fp8}"
@@ -153,7 +168,8 @@ build_target() {
     fi
   fi
   [[ "$VARIANT" != full ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
+  [[ "$VARIANT" != full ]] || ensure_rr_textures "$STAGE/d4r/kernels/$folder" 0
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"
 
   # Every release target also gets conservative network and texture variants. Do not copy fast
   # texture objects into this set: their compiler policy is fixed inside the binary.
@@ -175,6 +191,7 @@ build_target() {
   fi
   if [[ "$VARIANT" == full ]]; then
     ensure_l_textures "$accurate" 1
+    ensure_rr_textures "$accurate" 1
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
       [[ -f "$accurate/$(basename "$f")" ]] || {
         echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
@@ -182,7 +199,7 @@ build_target() {
     done
   fi
   rm -f "$accurate"/*.resolution.txt
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}"
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}" "${RR_DLLS[@]}"
 }
 kernel_jobs="${D4R_PACKAGE_KERNEL_JOBS:-1}"
 [[ "$kernel_jobs" =~ ^[1-9][0-9]*$ ]] || { echo "D4R_PACKAGE_KERNEL_JOBS must be positive" >&2; exit 2; }
