@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -695,6 +696,34 @@ static void fill_guide_planes(std::array<ID3D12Resource*, Planes>& planes,
 // D4R_HARNESS_REPLAY_DIR=<dir> replays frames captured in a game by the shim
 // (D4R_SHIM_INPUT_DUMP_DIR + D4R_SHIM_CAPTURE_COUNT): frame-NNNNNN-color.rgba16f,
 // -depth.r32f, -motion.rg16f and -params.txt, starting at D4R_HARNESS_REPLAY_START.
+// A Ray Reconstruction capture adds -guides.txt, -guide-NN.bin and the exposure plane:
+// the denoiser's own inputs, recorded in the format the game passed them, so the replay
+// runs the same conversions over the same bytes the game rendered.
+struct ReplayGuide
+{
+    std::vector<std::string> sources; // parameter names the caller registered it under
+    std::vector<std::string> publish;  // names the denoiser reads it as
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    unsigned width = 0, height = 0, texelBytes = 0;
+    bool converted = false;            // the shim unpacks this format into floats
+    std::vector<uint8_t> bytes;
+};
+
+// A captured guide's texture, kept across frames so a game that reuses one G-buffer surface
+// is replayed as the same resource rather than a fresh one per frame.
+struct ReplayTexture
+{
+    ID3D12Resource* resource = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    unsigned width = 0, height = 0;
+    bool uploaded = false;
+};
+
+// Room for the camera matrices a capture records. Fixed, because the parameter object holds
+// the pointer until a later frame replaces it: storage that moved would dangle the denoiser's
+// read. A capture with more matrices than this is refused rather than truncated.
+constexpr size_t kReplayMatrices = 8;
+
 struct ReplayFrame
 {
     std::vector<uint8_t> color, depth, motion;
@@ -703,6 +732,32 @@ struct ReplayFrame
     int reset = 0, hasExposure = 0;
     unsigned renderWidth = 0, renderHeight = 0;
     unsigned colorBaseX = 0, colorBaseY = 0, depthBaseX = 0, depthBaseY = 0, mvBaseX = 0, mvBaseY = 0;
+    // Ray Reconstruction: the guides the game bound this frame and the settings, origins and
+    // camera matrices it gave the denoiser with them. matrixPresent says which of those
+    // matrices the caller actually registered, so an absent one is cleared rather than
+    // silently kept from an earlier frame.
+    std::vector<ReplayGuide> guides;
+    std::vector<std::pair<std::string, int>> scalars;
+    std::vector<std::pair<std::string, unsigned>> subrects;
+    std::vector<std::pair<std::string, std::array<float, 16>>> matrices;
+    std::vector<std::pair<std::string, bool>> matrixPresent;
+    // The exposure texture the game actually bound: its own geometry and the captured plane.
+    // A capture that says a frame had an exposure texture but carries no plane for it cannot be
+    // replayed exactly, so this is a missing plane, not a value to invent.
+    unsigned exposureWidth = 0, exposureHeight = 0;
+    std::vector<uint8_t> exposure;
+    int invertX = 0, invertY = 0;
+    unsigned outputBaseX = 0, outputBaseY = 0;
+    // How the game created this feature. Recorded per frame because it is part of what the
+    // replay has to reproduce: a different model, resolution, quality mode, create flag set,
+    // Output.Subrect setting or render preset is a different NVIDIA reference.
+    struct Creation
+    {
+        unsigned width = 0, height = 0, outWidth = 0, outHeight = 0;
+        int quality = 0, flags = 0, outputSubrects = 0;
+        unsigned preset = 0;
+        bool recorded = false;
+    } creation;
 };
 
 static bool read_file(const std::string& path, std::vector<uint8_t>& bytes, size_t expected)
@@ -717,12 +772,79 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& bytes, size
     return got == expected && !extra;
 }
 
+// Reads one frame's params.txt. Returns false when a parameter the replay needs was truncated,
+// so a partial read never leaves a plausible-looking default in place.
+static bool read_replay_params(FILE* file, uint32_t frame, ReplayFrame& out)
+{
+    char key[64];
+    while (std::fscanf(file, "%63s", key) == 1)
+    {
+        const std::string name = key;
+        int read = 0, expected = 0;
+        if (name == "jitter")
+            read = std::fscanf(file, "%f %f", &out.jitterX, &out.jitterY), expected = 2;
+        else if (name == "mv_scale")
+            read = std::fscanf(file, "%f %f", &out.mvScaleX, &out.mvScaleY), expected = 2;
+        else if (name == "sharpness") read = std::fscanf(file, "%f", &out.sharpness), expected = 1;
+        else if (name == "pre_exposure") read = std::fscanf(file, "%f", &out.preExposure), expected = 1;
+        else if (name == "exposure_scale") read = std::fscanf(file, "%f", &out.exposureScale), expected = 1;
+        else if (name == "frame_time") read = std::fscanf(file, "%f", &out.frameTime), expected = 1;
+        else if (name == "reset") read = std::fscanf(file, "%d", &out.reset), expected = 1;
+        else if (name == "invert") read = std::fscanf(file, "%d %d", &out.invertX, &out.invertY), expected = 2;
+        else if (name == "has_exposure") read = std::fscanf(file, "%d", &out.hasExposure), expected = 1;
+        else if (name == "render")
+            read = std::fscanf(file, "%u %u", &out.renderWidth, &out.renderHeight), expected = 2;
+        else if (name == "color_base")
+            read = std::fscanf(file, "%u %u", &out.colorBaseX, &out.colorBaseY), expected = 2;
+        else if (name == "depth_base")
+            read = std::fscanf(file, "%u %u", &out.depthBaseX, &out.depthBaseY), expected = 2;
+        else if (name == "mv_base") read = std::fscanf(file, "%u %u", &out.mvBaseX, &out.mvBaseY), expected = 2;
+        else if (name == "output_base")
+            read = std::fscanf(file, "%u %u", &out.outputBaseX, &out.outputBaseY), expected = 2;
+        else if (name == "exposure_size")
+            read = std::fscanf(file, "%u %u", &out.exposureWidth, &out.exposureHeight), expected = 2;
+        else if (name == "create")
+        {
+            read = std::fscanf(file, "%u %u %u %u %d %d %d %u", &out.creation.width, &out.creation.height,
+                               &out.creation.outWidth, &out.creation.outHeight, &out.creation.quality,
+                               &out.creation.flags, &out.creation.outputSubrects, &out.creation.preset);
+            expected = 8;
+            if (read == expected)
+                out.creation.recorded = true;
+        }
+        else
+        {
+            std::fscanf(file, "%*[^\n]");
+            continue;
+        }
+        // Every value the line promised, not merely some of them: a half-read line would leave
+        // the rest at its default, which is exactly the invented value this refuses.
+        if (read != expected)
+        {
+            std::fprintf(stderr, "replay frame %u: the capture's '%s' line is truncated (%d of %d values)\n",
+                         frame, name.c_str(), read, expected);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool load_replay_frame(const char* directory, uint32_t frame, size_t colorBytes, size_t depthBytes,
                               size_t motionBytes, ReplayFrame& out)
 {
     char prefix[MAX_PATH];
     std::snprintf(prefix, sizeof(prefix), "%s\\frame-%06u-", directory, frame);
     const std::string base = prefix;
+    FILE* file = std::fopen((base + "params.txt").c_str(), "r");
+    if (file == nullptr)
+    {
+        std::fprintf(stderr, "replay frame %u: no params\n", frame);
+        return false;
+    }
+    const bool params = read_replay_params(file, frame, out);
+    std::fclose(file);
+    if (!params)
+        return false;
     if (!read_file(base + "color.rgba16f", out.color, colorBytes) ||
         !read_file(base + "depth.r32f", out.depth, depthBytes) ||
         !read_file(base + "motion.rg16f", out.motion, motionBytes))
@@ -730,31 +852,181 @@ static bool load_replay_frame(const char* directory, uint32_t frame, size_t colo
         std::fprintf(stderr, "replay frame %u: missing or mis-sized plane under %s\n", frame, prefix);
         return false;
     }
-    FILE* file = std::fopen((base + "params.txt").c_str(), "r");
+    // The exposure plane, in the geometry the capture recorded: the game may have passed a 1x1
+    // scalar or a per-pixel buffer, and only its own size says which. Geometry missing under a
+    // claimed exposure texture is refused, not filled in with the harness's 1.0.
+    if (out.hasExposure != 0)
+    {
+        if (out.exposureWidth == 0 || out.exposureHeight == 0)
+        {
+            std::fprintf(stderr, "replay frame %u: the capture claims an exposure texture but records no "
+                                 "geometry for it\n",
+                         frame);
+            return false;
+        }
+        const size_t bytes = static_cast<size_t>(out.exposureWidth) * out.exposureHeight * sizeof(float);
+        if (!read_file(base + "exposure.r32f", out.exposure, bytes))
+        {
+            std::fprintf(stderr, "replay frame %u: the exposure plane (%ux%u) is missing or mis-sized: %s\n",
+                         frame, out.exposureWidth, out.exposureHeight, (base + "exposure.r32f").c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Splits a comma-separated name list, as the capture writes it.
+static std::vector<std::string> split_names(const std::string& joined)
+{
+    std::vector<std::string> names;
+    size_t start = 0;
+    while (start <= joined.size())
+    {
+        const size_t comma = joined.find(',', start);
+        names.push_back(joined.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return names;
+}
+
+static std::string join_names(const std::vector<std::string>& names)
+{
+    std::string joined;
+    for (const std::string& name : names)
+        joined += joined.empty() ? name : ", " + name;
+    return joined;
+}
+
+// Reads one frame's guides.txt and its guide planes. A Ray Reconstruction replay with no
+// guide descriptor is refused: without the game's own guides the denoiser would be handed a
+// different scene than the game rendered, and the comparison against the game's own image
+// would be meaningless while still producing a plausible picture.
+static bool load_replay_guides(const char* directory, uint32_t frame, ReplayFrame& out)
+{
+    char prefix[MAX_PATH];
+    std::snprintf(prefix, sizeof(prefix), "%s\\frame-%06u-", directory, frame);
+    const std::string base = prefix;
+    FILE* file = std::fopen((base + "guides.txt").c_str(), "r");
     if (file == nullptr)
     {
-        std::fprintf(stderr, "replay frame %u: no params\n", frame);
+        std::fprintf(stderr, "replay frame %u: no guides descriptor (%sguides.txt); a Ray Reconstruction replay "
+                             "requires the guides the game bound\n",
+                     frame, prefix);
         return false;
     }
+    bool declared = false;
+    unsigned guides = 0, parsed = 0;
     char key[64];
     while (std::fscanf(file, "%63s", key) == 1)
     {
         const std::string name = key;
-        if (name == "jitter") std::fscanf(file, "%f %f", &out.jitterX, &out.jitterY);
-        else if (name == "mv_scale") std::fscanf(file, "%f %f", &out.mvScaleX, &out.mvScaleY);
-        else if (name == "sharpness") std::fscanf(file, "%f", &out.sharpness);
-        else if (name == "pre_exposure") std::fscanf(file, "%f", &out.preExposure);
-        else if (name == "exposure_scale") std::fscanf(file, "%f", &out.exposureScale);
-        else if (name == "frame_time") std::fscanf(file, "%f", &out.frameTime);
-        else if (name == "reset") std::fscanf(file, "%d", &out.reset);
-        else if (name == "has_exposure") std::fscanf(file, "%d", &out.hasExposure);
-        else if (name == "render") std::fscanf(file, "%u %u", &out.renderWidth, &out.renderHeight);
-        else if (name == "color_base") std::fscanf(file, "%u %u", &out.colorBaseX, &out.colorBaseY);
-        else if (name == "depth_base") std::fscanf(file, "%u %u", &out.depthBaseX, &out.depthBaseY);
-        else if (name == "mv_base") std::fscanf(file, "%u %u", &out.mvBaseX, &out.mvBaseY);
-        else std::fscanf(file, "%*[^\n]");
+        if (name == "guides")
+        {
+            if (std::fscanf(file, "%u", &guides) != 1)
+                break;
+            declared = true;
+            parsed = 0;
+            out.guides.clear();
+            out.guides.resize(guides);
+            continue;
+        }
+        if (name == "guide")
+        {
+            unsigned index = 0, format = 0, width = 0, height = 0, texelBytes = 0, converted = 0;
+            char sources[512], publish[512];
+            if (!declared || std::fscanf(file, "%u %511s %511s %u %u %u %u %u", &index, sources, publish, &format,
+                                        &width, &height, &texelBytes, &converted) != 8 ||
+                index >= out.guides.size() || texelBytes == 0)
+            {
+                std::fprintf(stderr, "replay frame %u: malformed guide descriptor in %sguides.txt\n", frame, prefix);
+                std::fclose(file);
+                return false;
+            }
+            ++parsed;
+            ReplayGuide& guide = out.guides[index];
+            guide.sources = split_names(sources);
+            guide.publish = split_names(publish);
+            guide.format = static_cast<DXGI_FORMAT>(format);
+            guide.width = width;
+            guide.height = height;
+            guide.texelBytes = texelBytes;
+            guide.converted = converted != 0;
+            char path[MAX_PATH];
+            std::snprintf(path, sizeof(path), "%s\\frame-%06u-guide-%02u.bin", directory, frame, index);
+            if (!read_file(path, guide.bytes, static_cast<size_t>(texelBytes) * width * height))
+            {
+                std::fprintf(stderr, "replay frame %u: guide %u (%s) is missing or mis-sized: %s\n", frame, index,
+                             publish, path);
+                std::fclose(file);
+                return false;
+            }
+            continue;
+        }
+        if (name == "scalar")
+        {
+            char parameter[96];
+            int value = 0;
+            if (std::fscanf(file, "%95s %d", parameter, &value) != 2)
+                break;
+            out.scalars.emplace_back(parameter, value);
+            continue;
+        }
+        if (name == "subrect")
+        {
+            char parameter[128];
+            unsigned value = 0;
+            if (std::fscanf(file, "%127s %u", parameter, &value) != 2)
+                break;
+            out.subrects.emplace_back(parameter, value);
+            continue;
+        }
+        if (name == "matrix")
+        {
+            char parameter[128];
+            int present = 0;
+            if (std::fscanf(file, "%127s %d", parameter, &present) != 2)
+                break;
+            std::array<float, 16> values{};
+            if (present != 0)
+            {
+                int read = 0;
+                for (; read < 16; ++read)
+                    if (std::fscanf(file, "%f", &values[static_cast<size_t>(read)]) != 1)
+                        break;
+                if (read != 16)
+                    break;
+            }
+            // A matrix the caller did not register this frame is recorded as absent, so the
+            // replay clears it rather than leaving the previous frame's camera in place.
+            out.matrices.emplace_back(parameter, present != 0 ? values : std::array<float, 16>{});
+            out.matrixPresent.emplace_back(parameter, present != 0);
+            continue;
+        }
+        std::fscanf(file, "%*[^\n]");
     }
     std::fclose(file);
+    if (!declared)
+    {
+        std::fprintf(stderr, "replay frame %u: %sguides.txt lists no guides\n", frame, prefix);
+        return false;
+    }
+    for (size_t index = 0; index < out.guides.size(); ++index)
+        if (out.guides[index].bytes.size() !=
+            static_cast<size_t>(out.guides[index].texelBytes) * out.guides[index].width * out.guides[index].height)
+        {
+            std::fprintf(stderr, "replay frame %u: guide %zu has no recorded plane\n", frame, index);
+            return false;
+        }
+    // A descriptor that lists fewer guides than it declares is refused rather than partly read:
+    // the missing ones would otherwise be fed to the denoiser as nothing at all.
+    if (parsed != guides)
+    {
+        std::fprintf(stderr, "replay frame %u: %sguides.txt declares %u guides but %u were read\n", frame, prefix,
+                     guides, parsed);
+        return false;
+    }
     return true;
 }
 
@@ -778,12 +1050,57 @@ int main(int argc, char** argv)
         return 2;
     }
     const int frames = argc > 3 ? std::atoi(argv[3]) : 6;
-    const UINT inWidth = argc > 7 ? static_cast<UINT>(std::atoi(argv[4])) : 640;
-    const UINT inHeight = argc > 7 ? static_cast<UINT>(std::atoi(argv[5])) : 360;
-    const UINT outWidth = argc > 7 ? static_cast<UINT>(std::atoi(argv[6])) : 1280;
-    const UINT outHeight = argc > 7 ? static_cast<UINT>(std::atoi(argv[7])) : 720;
+    const char* replayDir = std::getenv("D4R_HARNESS_REPLAY_DIR");
+    const uint32_t replayStart = std::getenv("D4R_HARNESS_REPLAY_START") != nullptr
+        ? static_cast<uint32_t>(std::atoi(std::getenv("D4R_HARNESS_REPLAY_START"))) : 1;
+    // A replay creates the feature the game created: same render and output dimensions, quality
+    // mode, create flag set, Output.Subrect setting and render preset. These are read before any
+    // texture is sized or any parameter allocated, so the reference the replay compares against
+    // is the one the game asked for rather than the harness's own defaults. A capture without
+    // that state is refused rather than replayed against guessed settings.
+    ReplayFrame::Creation replayCreation;
+    if (replayDir != nullptr)
+    {
+        ReplayFrame probe;
+        char paramsPath[MAX_PATH];
+        std::snprintf(paramsPath, sizeof(paramsPath), "%s\\frame-%06u-params.txt", replayDir, replayStart);
+        FILE* paramsFile = std::fopen(paramsPath, "r");
+        if (paramsFile == nullptr)
+        {
+            std::fprintf(stderr, "replay frame %u: no params at %s\n", replayStart, paramsPath);
+            return 1;
+        }
+        const bool parsed = read_replay_params(paramsFile, replayStart, probe);
+        std::fclose(paramsFile);
+        if (!parsed)
+            return 1;
+        if (!probe.creation.recorded)
+        {
+            std::fprintf(stderr, "replay frame %u: the capture records no creation state (%s), so the feature "
+                                 "would have to be recreated from guessed settings\n",
+                         replayStart, paramsPath);
+            return 1;
+        }
+        replayCreation = probe.creation;
+    }
+    // The capture's own dimensions win: its planes are exactly this size, so anything else would
+    // upload a truncated or padded image rather than the game's.
+    UINT inWidth = argc > 7 ? static_cast<UINT>(std::atoi(argv[4])) : 640;
+    UINT inHeight = argc > 7 ? static_cast<UINT>(std::atoi(argv[5])) : 360;
+    UINT outWidth = argc > 7 ? static_cast<UINT>(std::atoi(argv[6])) : 1280;
+    UINT outHeight = argc > 7 ? static_cast<UINT>(std::atoi(argv[7])) : 720;
+    if (replayDir != nullptr)
+    {
+        inWidth = replayCreation.width;
+        inHeight = replayCreation.height;
+        outWidth = replayCreation.outWidth;
+        outHeight = replayCreation.outHeight;
+        std::printf("replay feature: %ux%u -> %ux%u quality=%d flags=0x%x output_subrects=%d preset=%u\n",
+                    inWidth, inHeight, outWidth, outHeight, replayCreation.quality, replayCreation.flags,
+                    replayCreation.outputSubrects, replayCreation.preset);
+    }
     const char* resourceWidthSetting = std::getenv("D4R_HARNESS_RESOURCE_WIDTH");
-    const UINT resourceWidth = resourceWidthSetting != nullptr
+    UINT resourceWidth = resourceWidthSetting != nullptr
         ? static_cast<UINT>(std::atoi(resourceWidthSetting)) : inWidth;
     if (resourceWidth < inWidth || resourceWidth > inWidth + 256)
     {
@@ -800,15 +1117,12 @@ int main(int argc, char** argv)
     const bool qualityScene = std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr;
     const bool poleScene = std::getenv("D4R_HARNESS_POLE_SCENE") != nullptr;
     const bool exposureRGBA32 = std::getenv("D4R_HARNESS_EXPOSURE_RGBA32") != nullptr;
-    const char* replayDir = std::getenv("D4R_HARNESS_REPLAY_DIR");
     const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
     if (rgba8 && (qualityScene || motionScene || jitterScene || replayDir != nullptr))
     {
         std::fprintf(stderr, "RGBA8 format probe requires the static synthetic scene\n");
         return 2;
     }
-    const uint32_t replayStart = std::getenv("D4R_HARNESS_REPLAY_START") != nullptr
-        ? static_cast<uint32_t>(std::atoi(std::getenv("D4R_HARNESS_REPLAY_START"))) : 1;
     const bool temporal = std::getenv("D4R_HARNESS_TEMPORAL") != nullptr || motionScene || jitterScene || qualityScene ||
                           replayDir != nullptr;
     const bool forceReset = std::getenv("D4R_HARNESS_FORCE_RESET") != nullptr;
@@ -937,7 +1251,9 @@ int main(int argc, char** argv)
     const bool guidePhase = std::getenv("D4R_HARNESS_RR_GUIDE_PHASE") != nullptr;
     std::array<std::vector<uint8_t>, 4> guideData{};
     std::array<ID3D12Resource*, 4> guides{};
-    if (reconstruction)
+    // A replay feeds the denoiser the guides the game itself bound, so no synthetic plane is
+    // created here: a pattern-filled guide would stand in for a scene the game never rendered.
+    if (reconstruction && replayDir == nullptr)
     {
         for (size_t input = 0; input < guides.size(); ++input)
         {
@@ -1140,6 +1456,28 @@ int main(int argc, char** argv)
                 d4r_ngx_set_uint(parameters, (std::string("RayReconstruction.Hint.Render.Preset.") + mode).c_str(),
                                  static_cast<unsigned int>(std::strtoul(preset, nullptr, 0)));
     }
+    // A replay overrides the environment's guesses with what the game actually created: the
+    // quality mode, the create flags (HDR, depth inversion, auto exposure), whether Output.Subrect
+    // origins are read at all, and the render preset. Each of these selects a different model or
+    // a different reference, so substituting a default here would compare against the wrong one.
+    if (replayDir != nullptr)
+    {
+        d4r_ngx_set_int(parameters, "PerfQualityValue", replayCreation.quality);
+        d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", replayCreation.flags);
+        d4r_ngx_set_int(parameters, "DLSS.Enable.Output.Subrects", replayCreation.outputSubrects);
+        static const char* const kRayReconstructionPresets[6] = {
+            "RayReconstruction.Hint.Render.Preset.DLAA", "RayReconstruction.Hint.Render.Preset.Quality",
+            "RayReconstruction.Hint.Render.Preset.Balanced", "RayReconstruction.Hint.Render.Preset.Performance",
+            "RayReconstruction.Hint.Render.Preset.UltraPerformance",
+            "RayReconstruction.Hint.Render.Preset.UltraQuality"};
+        static const char* const kSuperSamplingPresets[6] = {
+            "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
+            "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance",
+            "DLSS.Hint.Render.Preset.UltraQuality"};
+        const char* const* const presetNames = reconstruction ? kRayReconstructionPresets : kSuperSamplingPresets;
+        for (int index = 0; index < 6; ++index)
+            d4r_ngx_set_uint(parameters, presetNames[index], replayCreation.preset);
+    }
     NgxHandle* feature = nullptr;
     if (std::getenv("D4R_HARNESS_LIFETIME_TEST") != nullptr && !test_external_lifetime())
         return 1;
@@ -1153,7 +1491,9 @@ int main(int argc, char** argv)
     d4r_ngx_set_d3d12_resource(parameters, "MotionVectors", motionTexture);
     d4r_ngx_set_d3d12_resource(parameters, "Output", outputTexture);
     d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", exposureTexture);
-    if (reconstruction)
+    // A replay binds each guide under the names the capture recorded, per frame; the
+    // synthetic planes and the alpha scenario's own guide belong to the static probe only.
+    if (reconstruction && replayDir == nullptr)
     {
         // The SDK's caller-facing names (nvsdk_ngx_defs.h: NVSDK_NGX_Parameter_GBuffer_Normals,
         // _Roughness, _DiffuseAlbedo, _SpecularAlbedo), which is what a game registers. The
@@ -1163,7 +1503,9 @@ int main(int argc, char** argv)
         for (size_t input = 0; input < guides.size(); ++input)
             d4r_ngx_set_d3d12_resource(parameters, names[input], guides[input]);
     }
-    if (alphaScenario)
+    // DLSSD.Alpha is a guide the capture records in its own right, so the synthetic alpha
+    // scenario would double-bind that name; it belongs to the static probe only.
+    if (alphaScenario && replayDir == nullptr)
     {
         d4r_ngx_set_d3d12_resource(parameters, "DLSSD.Alpha", alphaInput);
         d4r_ngx_set_d3d12_resource(parameters, "DLSSD.OutputAlpha", alphaOutput);
@@ -1231,9 +1573,25 @@ int main(int argc, char** argv)
         lifecycle_report("SKIP input: discarded recording before submitting the next frame");
     }
 
+    // Ray Reconstruction replay state. The textures follow the capture's guide identity so a
+    // game that reuses a surface replays it as the same resource; the names remember what was
+    // bound last frame, so a guide the game dropped is cleared rather than left in place; the
+    // matrices outlive the per-frame ReplayFrame, because the parameter object holds their
+    // pointer until a later frame replaces it.
+    std::map<std::string, ReplayTexture> replayTextures;
+    std::vector<std::string> replayGuideNames;
+    // The exposure texture the capture recorded, at the geometry it recorded: a 1x1 scalar and a
+    // per-pixel buffer are different textures, and the game chose which.
+    ID3D12Resource* replayExposureTexture = nullptr;
+    UINT replayExposureWidth = 0, replayExposureHeight = 0;
+    bool replayExposureUploaded = false;
+    std::array<std::array<float, 16>, kReplayMatrices> replayMatrices{};
+
     for (int frame = 1; frame <= frames; ++frame)
     {
-        if (reconstruction && guidePhase && frame > 1)
+        // A replay's guides come from the capture; rewriting them with a pattern would
+        // replace the game's own data with an invented one.
+        if (reconstruction && replayDir == nullptr && guidePhase && frame > 1)
         {
             // The guides this frame are a different pattern, so the output can only be right
             // if this frame's own guides were the ones the denoiser read.
@@ -1351,8 +1709,148 @@ int main(int argc, char** argv)
             d4r_ngx_set_uint(parameters, "DLSS.Input.MV.Subrect.Base.X", replay.mvBaseX);
             d4r_ngx_set_uint(parameters, "DLSS.Input.MV.Subrect.Base.Y", replay.mvBaseY);
             d4r_ngx_set_int(parameters, "Reset", frame == 1 || replay.reset != 0 ? 1 : 0);
-            // Games with AutoExposure pass no exposure texture; the synthetic scenes pass 1.0.
-            d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", replay.hasExposure ? exposureTexture : nullptr);
+            // The indicator axes and the Output.Subrect origin, as the game set them: the origin is
+            // only read at all when the feature was created with DLSS.Enable.Output.Subrects, and
+            // both are set every frame rather than left at whatever the previous frame wrote.
+            d4r_ngx_set_int(parameters, "DLSS.Indicator.Invert.X.Axis", replay.invertX);
+            d4r_ngx_set_int(parameters, "DLSS.Indicator.Invert.Y.Axis", replay.invertY);
+            d4r_ngx_set_uint(parameters, "DLSS.Output.Subrect.Base.X", replay.outputBaseX);
+            d4r_ngx_set_uint(parameters, "DLSS.Output.Subrect.Base.Y", replay.outputBaseY);
+            // The exposure texture the game actually bound this frame, with its own geometry and
+            // its own contents. A capture claiming one but carrying no plane for it was already
+            // refused above, so no substituted 1.0 can reach the denoiser here.
+            if (replay.hasExposure != 0)
+            {
+                if (replayExposureTexture == nullptr || replayExposureWidth != replay.exposureWidth ||
+                    replayExposureHeight != replay.exposureHeight)
+                {
+                    if (replayExposureTexture != nullptr)
+                    {
+                        replayExposureTexture->Release();
+                        replayExposureTexture = nullptr;
+                    }
+                    replayExposureTexture = create_texture(replay.exposureWidth, replay.exposureHeight,
+                                                            DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+                    if (replayExposureTexture == nullptr)
+                    {
+                        std::fprintf(stderr, "replay frame %u: the %ux%u exposure texture could not be created\n",
+                                     replayStart + static_cast<uint32_t>(frame - 1), replay.exposureWidth,
+                                     replay.exposureHeight);
+                        return 1;
+                    }
+                    replayExposureWidth = replay.exposureWidth;
+                    replayExposureHeight = replay.exposureHeight;
+                    replayExposureUploaded = false;
+                }
+                if (!replayExposureUploaded)
+                {
+                    upload(replayExposureTexture, replay.exposure.data(), replayExposureWidth * 4, srv);
+                    replayExposureUploaded = true;
+                }
+                else
+                {
+                    update_texture(replayExposureTexture, replay.exposure.data(), replayExposureWidth * 4, srv);
+                }
+                d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", replayExposureTexture);
+            }
+            else
+            {
+                // A game with AutoExposure binds no exposure texture; nothing is left bound.
+                d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", nullptr);
+            }
+
+            // Ray Reconstruction: the guides the game bound this frame, in its own formats, plus
+            // the settings, origins and camera matrices it gave them with. A capture without
+            // them is refused rather than filled with synthetic planes - a denoiser handed
+            // invented guides would produce a plausible image that matches nothing the game
+            // rendered, which is the one outcome this replay exists to rule out.
+            if (reconstruction)
+            {
+                const uint32_t replayFrame = replayStart + static_cast<uint32_t>(frame - 1);
+                if (!load_replay_guides(replayDir, replayFrame, replay))
+                    return 1;
+                std::vector<std::string> bound;
+                for (size_t guide = 0; guide < replay.guides.size(); ++guide)
+                {
+                    const ReplayGuide& captured = replay.guides[guide];
+                    if (captured.sources.empty() || captured.publish.empty() || captured.texelBytes == 0 ||
+                        captured.width == 0 || captured.height == 0)
+                    {
+                        std::fprintf(stderr, "replay frame %u: guide %zu has an incomplete descriptor\n",
+                                     replayFrame, guide);
+                        return 1;
+                    }
+                    // Keyed on the first name the caller registered it under, so the texture the
+                    // game kept across frames is created once and only its contents are replaced.
+                    ReplayTexture& texture = replayTextures[captured.sources.front()];
+                    if (texture.resource == nullptr || texture.format != captured.format ||
+                        texture.width != captured.width || texture.height != captured.height)
+                    {
+                        if (texture.resource != nullptr)
+                        {
+                            texture.resource->Release();
+                            texture = {};
+                        }
+                        texture.resource = create_texture(captured.width, captured.height, captured.format,
+                                                          D3D12_RESOURCE_FLAG_NONE);
+                        if (texture.resource == nullptr)
+                        {
+                            std::fprintf(stderr, "replay frame %u: the %ux%u fmt=0x%x guide could not be created\n",
+                                         replayFrame, captured.width, captured.height,
+                                         static_cast<unsigned>(captured.format));
+                            return 1;
+                        }
+                        texture.format = captured.format;
+                        texture.width = captured.width;
+                        texture.height = captured.height;
+                        texture.uploaded = false;
+                    }
+                    const UINT rowBytes = captured.width * captured.texelBytes;
+                    if (!texture.uploaded)
+                    {
+                        upload(texture.resource, captured.bytes.data(), rowBytes, srv);
+                        texture.uploaded = true;
+                    }
+                    else
+                    {
+                        update_texture(texture.resource, captured.bytes.data(), rowBytes, srv);
+                    }
+                    for (const std::string& source : captured.sources)
+                    {
+                        d4r_ngx_set_d3d12_resource(parameters, source.c_str(), texture.resource);
+                        bound.push_back(source);
+                    }
+                    if (frame == 1)
+                        std::printf("replay guide %zu: %ux%u fmt=0x%x, %s as %s\n", guide, captured.width,
+                                    captured.height, static_cast<unsigned>(captured.format),
+                                    join_names(captured.sources).c_str(), join_names(captured.publish).c_str());
+                }
+                // A guide the game stopped registering is cleared: the parameter object outlives
+                // the frame, so leaving its texture bound would hand the denoiser a guide the game
+                // had already dropped, exactly as the shim clears the names it published before.
+                for (const std::string& name : replayGuideNames)
+                    if (std::find(bound.begin(), bound.end(), name) == bound.end())
+                        d4r_ngx_set_d3d12_resource(parameters, name.c_str(), nullptr);
+                replayGuideNames = bound;
+                for (const auto& [name, value] : replay.scalars)
+                    d4r_ngx_set_int(parameters, name.c_str(), value);
+                for (const auto& [name, value] : replay.subrects)
+                    d4r_ngx_set_uint(parameters, name.c_str(), value);
+                if (replay.matrices.size() != replay.matrixPresent.size() || replay.matrices.size() > kReplayMatrices)
+                {
+                    std::fprintf(stderr, "replay frame %u: %zu camera matrices recorded, which this replay cannot hold\n",
+                                 replayFrame, replay.matrices.size());
+                    return 1;
+                }
+                // Copied into storage that lives for the whole run, because the parameter object
+                // keeps the pointer until the next frame replaces it.
+                for (size_t index = 0; index < replay.matrices.size(); ++index)
+                {
+                    replayMatrices[index] = replay.matrices[index].second;
+                    d4r_ngx_set_void(parameters, replay.matrices[index].first.c_str(),
+                                     replay.matrixPresent[index].second ? replayMatrices[index].data() : nullptr);
+                }
+            }
         }
         else if (temporal)
             d4r_ngx_set_int(parameters, "Reset", forceReset || frame == 1 ? 1 : 0);
