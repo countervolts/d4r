@@ -65,7 +65,7 @@ Initial validation: a gfx1101 fast L build completed two Ultra Performance harne
 - **Still translated:** all eleven Swin layers. ZLUDA compiles NVIDIA's PTX at load time, and that compile is what costs the time (see the table below). A native replacement has to recover each layer's attention, norm and merge stages, the way `kernels/m/rrlite_*` does for the upscaler.
 - **Manifest:** the denoiser DLL is passed to `kernel_manifest.py` as `--rr-dll`, because its hashes may only authorize `cuda_dldn_engine_*` replacements. Without that split, a name both libraries define — `dl4rt_input_kernel` — would let a super-resolution binary be served for the denoiser's different implementation of it.
 
-Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E, 1280×720 → 3840×2160, `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness, 16 frames after 6 warm-up, with the shipped `[Kernels]` settings (`NativeFp8`, `IgnoreDenormals`; `IgnoreDenormals` alone is worth 11% here and `FastMath` changes nothing):
+Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E, 1280×720 → 3840×2160, `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness, 16 frames after 6 warm-up, with the shipped `[Kernels]` settings (`NativeFp8`, `IgnoreDenormals`; `IgnoreDenormals` alone is worth 11% here, and `FastMath`, the f32 accumulator shadows, a 1024- or 128-thread bound, both scheduler strategies and the wave64 switch are all neutral or worse):
 
 | kernel | ms/frame | kernel | ms/frame |
 |---|---|---|---|
@@ -75,7 +75,7 @@ Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E, 1280×
 | enc1 | 3.48 | enc3 | 0.92 |
 | dec2 | 2.18 | enc5 | 0.65 |
 | enc2 | 1.74 | luma, exposure, reduce_sum | 0.05 |
-| hkpn output (translated / native) | 1.44 / 0.85 | **total** | **31.6** |
+| hkpn output (translated → native) | 1.44 → 1.00 | **total** | **31.6 → 31.1** |
 
 The eleven Swin layers are 30.2 of those 31.6 ms. They are instruction-bound, not MMA-bound: the compiled `enc0` kernel is 83 373 instructions per thread for 536 FP8 WMMAs (0.6% of the stream), and the frame reaches about 6% of the card's FP8 WMMA peak. The stream is 13 k operand-gather shuffles (`ds_bpermute`/`v_perm`/`permlane`), 15 k packed 16-bit ops from the software `cvt.rn.satfinite.e4m3x2.f16x2` requantization, 9 k selects and 13 k ALU-dependency waits. `D4R_ZLUDA_IMPLICIT_MAX_BLOCK` (256 in the shipped config), `D4R_ZLUDA_SCHED_STRATEGY` and a 128-thread bound move the total by under 3%; a 128-thread bound additionally fails the launches of kernels that use larger blocks, and the whole-module wave64 switch produces no launches at all. Removing the gather and the codec — what a native layer does — is the remaining work.
 
