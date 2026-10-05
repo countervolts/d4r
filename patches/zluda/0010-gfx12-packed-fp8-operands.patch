@@ -1,0 +1,392 @@
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -391,8 +391,13 @@
+ struct Helpers
+ {
+     FunctionCallee AFromB, BFromA, Mma, FromNv, ToNv, AFromBPair, MmaPair;
+-    // m16n8k32 e4m3 MMAs: fragment widening and the two-WMMA products.
+-    FunctionCallee E4m3AToF16, E4m3BToF16, MmaE4m3, MmaE4m3Pair;
++    // m16n8k32 e4m3 MMAs. On gfx12 with native FP8 the operands are gathered straight
++    // into the packed FP8 WMMA layout (E4m3AFromB / E4m3AFromBPair / E4m3BFromA, one
++    // <4 x i32> per operand holding both K halves); elsewhere the fragments are widened
++    // to f16 K halves (E4m3AToF16 / E4m3BToF16) and gathered by the f16 helpers above.
++    // Both feed the same two-WMMA products.
++    FunctionCallee E4m3AFromB, E4m3BFromA, E4m3AFromBPair, E4m3AToF16, E4m3BToF16;
++    FunctionCallee MmaE4m3, MmaE4m3Pair;
+     // f32 accumulator shadows (D4R_ZLUDA_WMMA_F32ACC=1): see d4r_wmma_s_* in zluda_ptx_impl.cpp.
+     FunctionCallee SFromT, TFromS, MmaS, MmaPairS, MmaE4m3S, MmaE4m3PairS;
+ };
+@@ -408,7 +413,7 @@
+ // MmaE4m3 may be null. Both MMA kinds take (<4 x i32> A, <2 x i32> B,
+ // <2 x i32> C) and share the 16x8 f16 accumulator layout, so they share the
+ // accumulator shadows; only same-kind MMAs are fused into one WMMA pair.
+-static unsigned rewriteFunction(Function &F, Function *Mma, Function *MmaE4m3, const Helpers &H)
++static unsigned rewriteFunction(Function &F, Function *Mma, Function *MmaE4m3, bool PackedFp8, const Helpers &H)
+ {
+     SmallVector<CallInst *, 64> Calls;
+     for (Instruction &I : instructions(F))
+@@ -660,28 +665,43 @@
+         IRBuilder<> Builder(Call);
+         if (S.Fp8)
+         {
+-            // Widen A and B to f16 K halves (low = K 0..15, high = K 16..31).
++            // Native gfx12 FP8 gathers packed NVIDIA words for both WMMA K blocks.
++            // Other targets retain widening and the existing f16 operand gathers.
+             auto half = [&](Value *Vector, unsigned Half, unsigned Elements) {
+                 SmallVector<int, 4> Indices;
+                 for (unsigned Element = 0; Element < Elements; ++Element)
+                     Indices.push_back(static_cast<int>(Half * Elements + Element));
+                 return Builder.CreateShuffleVector(Vector, Indices);
+             };
+-            Value *AF16 = Builder.CreateCall(H.E4m3AToF16, {Call->getArgOperand(0)});
+-            Value *BF16 = Builder.CreateCall(H.E4m3BToF16, {Call->getArgOperand(1)});
+-            Value *BTLow = Builder.CreateCall(H.BFromA, {half(AF16, 0, 4)});
+-            Value *BTHigh = Builder.CreateCall(H.BFromA, {half(AF16, 1, 4)});
++            Value *BF16 = nullptr, *ALow = nullptr, *AHigh = nullptr, *BLow = nullptr, *BHigh = nullptr;
++            if (PackedFp8)
++                BLow = Builder.CreateCall(H.E4m3BFromA, {Call->getArgOperand(0)});
++            else
++            {
++                Value *AF16 = Builder.CreateCall(H.E4m3AToF16, {Call->getArgOperand(0)});
++                BF16 = Builder.CreateCall(H.E4m3BToF16, {Call->getArgOperand(1)});
++                BLow = Builder.CreateCall(H.BFromA, {half(AF16, 0, 4)});
++                BHigh = Builder.CreateCall(H.BFromA, {half(AF16, 1, 4)});
++            }
+             if (Index + 1 < Sites.size() && pairable(S, Sites[Index + 1]))
+             {
+                 const Site &Next = Sites[Index + 1];
+                 SmallVector<AllocaInst *, 2> BNext;
+                 matchLoadedVector(Next.Call->getArgOperand(1), 2, BNext);
+-                Value *B1F16 = Builder.CreateCall(H.E4m3BToF16, {loadPair(Builder, RegisterPair{BNext[0], BNext[1]})});
+-                Value *ATLow = Builder.CreateCall(H.AFromBPair, {half(BF16, 0, 2), half(B1F16, 0, 2)});
+-                Value *ATHigh = Builder.CreateCall(H.AFromBPair, {half(BF16, 1, 2), half(B1F16, 1, 2)});
++                Value *B1 = loadPair(Builder, RegisterPair{BNext[0], BNext[1]});
++                if (PackedFp8)
++                    ALow = Builder.CreateCall(H.E4m3AFromBPair, {Call->getArgOperand(1), B1});
++                else
++                {
++                    Value *B1F16 = Builder.CreateCall(H.E4m3BToF16, {B1});
++                    ALow = Builder.CreateCall(H.AFromBPair, {half(BF16, 0, 2), half(B1F16, 0, 2)});
++                    AHigh = Builder.CreateCall(H.AFromBPair, {half(BF16, 1, 2), half(B1F16, 1, 2)});
++                }
+                 Value *C0 = accumulator(S, Builder);
+                 Value *C1 = earlyAccumulator(Next, Builder);
+-                Value *D = Builder.CreateCall(F32 ? H.MmaE4m3PairS : H.MmaE4m3Pair, {ATLow, BTLow, ATHigh, BTHigh, C0, C1});
++                FunctionCallee MmaHelper = F32 ? H.MmaE4m3PairS : H.MmaE4m3Pair;
++                Value *D = PackedFp8 ? Builder.CreateCall(MmaHelper, {ALow, BLow, C0, C1})
++                                    : Builder.CreateCall(MmaHelper, {ALow, BLow, AHigh, BHigh, C0, C1});
+                 Value *D0 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1, 2, 3})
+                                 : Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1});
+                 Value *D1 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{4, 5, 6, 7})
+@@ -693,9 +713,17 @@
+                 ++Index;
+                 continue;
+             }
+-            Value *ATLow = Builder.CreateCall(H.AFromB, {half(BF16, 0, 2)});
+-            Value *ATHigh = Builder.CreateCall(H.AFromB, {half(BF16, 1, 2)});
+-            Value *D = Builder.CreateCall(F32 ? H.MmaE4m3S : H.MmaE4m3, {ATLow, BTLow, ATHigh, BTHigh, accumulator(S, Builder)});
++            if (PackedFp8)
++                ALow = Builder.CreateCall(H.E4m3AFromB, {Call->getArgOperand(1)});
++            else
++            {
++                ALow = Builder.CreateCall(H.AFromB, {half(BF16, 0, 2)});
++                AHigh = Builder.CreateCall(H.AFromB, {half(BF16, 1, 2)});
++            }
++            FunctionCallee MmaHelper = F32 ? H.MmaE4m3S : H.MmaE4m3;
++            Value *C = accumulator(S, Builder);
++            Value *D = PackedFp8 ? Builder.CreateCall(MmaHelper, {ALow, BLow, C})
++                                : Builder.CreateCall(MmaHelper, {ALow, BLow, AHigh, BHigh, C});
+             Call->replaceAllUsesWith(finish(S, D, Builder));
+             Call->eraseFromParent();
+             continue;
+@@ -969,8 +997,10 @@
+ 
+ // Flags bit 0: also lower m16n8k32 e4m3 MMAs (D4R_ZLUDA_WMMA_FP8=1).
+ // Flags bit 1: gfx12 (RDNA4) WMMA layout: the d4r_wmma12_* helpers.
+-// Flags bit 2 (with bit 1): e4m3 MMAs on native FP8 WMMA: the d4r_wmma12f8_* e4m3 helpers.
+-// The helper sets share one contract (see zluda_ptx_impl.cpp), so only their names change here.
++// Flags bit 2 (with bit 1): e4m3 MMAs on native FP8 WMMA: the d4r_wmma12f8_* e4m3 helpers. Their operands
++// are the packed NVIDIA bytes gathered straight into the FP8 WMMA layout (one <4 x i32> per operand, both
++// K halves), so the f16 widening helpers and their 8-word operands are not used at all on this path.
++// The helper sets share one contract (see zluda_ptx_impl.cpp), so only their names and shapes change here.
+ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+     Module *M = unwrap(ModuleRef);
+@@ -1016,7 +1046,9 @@
+     const bool Gfx12 = (Flags & 2) != 0, NativeFp8 = Gfx12 && (Flags & 4) != 0;
+     const std::string Arch = Gfx12 ? "__zluda_ptx_impl_d4r_wmma12_" : "__zluda_ptx_impl_d4r_wmma_";
+     const std::string E4m3 = NativeFp8 ? "__zluda_ptx_impl_d4r_wmma12f8_" : Arch;
+-    const std::string Widen = NativeFp8 ? E4m3 : "__zluda_ptx_impl_d4r_wmma_";
++    // e4m3 fragments are widened to f16 K halves by the shared helpers on every
++    // architecture without native FP8
++    const std::string Widen = "__zluda_ptx_impl_d4r_wmma_";
+     Helpers H;
+     H.AFromB = M->getOrInsertFunction((Arch + "t_a_from_b").c_str(), Attributes, V8, V2);
+     H.BFromA = M->getOrInsertFunction((Arch + "t_b_from_a").c_str(), Attributes, V8, V4);
+@@ -1025,30 +1057,44 @@
+     H.ToNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_to_nv", Attributes, V2, V2);
+     H.AFromBPair = M->getOrInsertFunction((Arch + "t_a_from_b_pair").c_str(), Attributes, V8, V2, V2);
+     H.MmaPair = M->getOrInsertFunction((Arch + "t_mma_f16_pair").c_str(), Attributes, V4, V8, V8, V2, V2);
+-    {
+-        Type *F = Type::getFloatTy(Context);
+-        Type *V4F = FixedVectorType::get(F, 4);
+-        Type *V8F = FixedVectorType::get(F, 8);
+-        H.SFromT = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_from_t", Attributes, V4F, V2, F);
+-        H.TFromS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_s", Attributes, V2, V4F, F);
+-        H.MmaS = M->getOrInsertFunction((Arch + "s_mma_f16").c_str(), Attributes, V4F, V8, V8, V4F, F, F);
+-        H.MmaPairS = M->getOrInsertFunction((Arch + "s_mma_f16_pair").c_str(), Attributes, V8F, V8, V8, V4F, V4F, F, F);
+-        H.MmaE4m3S = M->getOrInsertFunction((E4m3 + "s_mma_e4m3").c_str(), Attributes, V4F, V8, V8, V8, V8, V4F);
+-        H.MmaE4m3PairS =
+-            M->getOrInsertFunction((E4m3 + "s_mma_e4m3_pair").c_str(), Attributes, V8F, V8, V8, V8, V8, V4F, V4F);
+-    }
++    Type *F = Type::getFloatTy(Context);
++    Type *V4F = FixedVectorType::get(F, 4);
++    Type *V8F = FixedVectorType::get(F, 8);
++    H.SFromT = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_from_t", Attributes, V4F, V2, F);
++    H.TFromS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_s", Attributes, V2, V4F, F);
++    H.MmaS = M->getOrInsertFunction((Arch + "s_mma_f16").c_str(), Attributes, V4F, V8, V8, V4F, F, F);
++    H.MmaPairS = M->getOrInsertFunction((Arch + "s_mma_f16_pair").c_str(), Attributes, V8F, V8, V8, V4F, V4F, F, F);
+     if (MmaE4m3 != nullptr)
+     {
+-        H.E4m3AToF16 = M->getOrInsertFunction((Widen + "e4m3_a_to_f16").c_str(), Attributes, V8, V4);
+-        H.E4m3BToF16 = M->getOrInsertFunction((Widen + "e4m3_b_to_f16").c_str(), Attributes, V4, V2);
+-        H.MmaE4m3 = M->getOrInsertFunction((E4m3 + "t_mma_e4m3").c_str(), Attributes, V2, V8, V8, V8, V8, V2);
+-        H.MmaE4m3Pair =
+-            M->getOrInsertFunction((E4m3 + "t_mma_e4m3_pair").c_str(), Attributes, V4, V8, V8, V8, V8, V2, V2);
++        if (NativeFp8)
++        {
++            // Packed FP8 WMMA operands: both K halves of one NVIDIA fragment in a
++            // single <4 x i32> (see the layout derivation in zluda_ptx_impl.cpp).
++            H.E4m3AFromB = M->getOrInsertFunction((E4m3 + "a_from_b").c_str(), Attributes, V4, V2);
++            H.E4m3AFromBPair = M->getOrInsertFunction((E4m3 + "a_from_b_pair").c_str(), Attributes, V4, V2, V2);
++            H.E4m3BFromA = M->getOrInsertFunction((E4m3 + "b_from_a").c_str(), Attributes, V4, V4);
++            H.MmaE4m3 = M->getOrInsertFunction((E4m3 + "t_mma_e4m3").c_str(), Attributes, V2, V4, V4, V2);
++            H.MmaE4m3Pair = M->getOrInsertFunction((E4m3 + "t_mma_e4m3_pair").c_str(), Attributes, V4, V4, V4, V2, V2);
++            H.MmaE4m3S = M->getOrInsertFunction((E4m3 + "s_mma_e4m3").c_str(), Attributes, V4F, V4, V4, V4F);
++            H.MmaE4m3PairS = M->getOrInsertFunction((E4m3 + "s_mma_e4m3_pair").c_str(), Attributes, V8F, V4, V4, V4F, V4F);
++        }
++        else
++        {
++            // f16 K halves, gathered by the same helpers as the f16 operands.
++            H.E4m3AToF16 = M->getOrInsertFunction((Widen + "e4m3_a_to_f16").c_str(), Attributes, V8, V4);
++            H.E4m3BToF16 = M->getOrInsertFunction((Widen + "e4m3_b_to_f16").c_str(), Attributes, V4, V2);
++            H.MmaE4m3 = M->getOrInsertFunction((E4m3 + "t_mma_e4m3").c_str(), Attributes, V2, V8, V8, V8, V8, V2);
++            H.MmaE4m3Pair =
++                M->getOrInsertFunction((E4m3 + "t_mma_e4m3_pair").c_str(), Attributes, V4, V8, V8, V8, V8, V2, V2);
++            H.MmaE4m3S = M->getOrInsertFunction((E4m3 + "s_mma_e4m3").c_str(), Attributes, V4F, V8, V8, V8, V8, V4F);
++            H.MmaE4m3PairS =
++                M->getOrInsertFunction((E4m3 + "s_mma_e4m3_pair").c_str(), Attributes, V8F, V8, V8, V8, V8, V4F, V4F);
++        }
+     }
+     unsigned Rewritten = 0;
+     for (Function &F : *M)
+         if (!F.isDeclaration())
+-            Rewritten += rewriteFunction(F, Mma, MmaE4m3, H);
++            Rewritten += rewriteFunction(F, Mma, MmaE4m3, NativeFp8, H);
+     return Rewritten;
+ }
+ 
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -1760,8 +1760,24 @@
+ // in the low half of a wmma_uint8). With A' = B^T and B' = A^T as above, dword j of half h holds the k-pair of
+ // NVIDIA thread t = 2h + (j >> 1): the low pair (k 2t, 2t + 1) for even j, the high pair (k 2t + 8, 2t + 9)
+ // for odd j. Then every lane of a gather reads the same source register (4 bpermutes per operand; B' also
+-// needs a DPP swap per dword for rows 8..15). For e4m3 fragments the same slots hold, after the widening
+-// above, e4m3 k 8h .. 8h + 7 in order.
++// needs a DPP swap per dword for rows 8..15).
++//
++// Native FP8 (d4r_wmma12f8_*): preserve the previous split/gather/repack byte order
++// without materializing fake-half fragments. For NVIDIA lane L = 4g + t, the captured map is:
++//   B b.x: k = 2t + {0,1,16,17}; b.y: k = 2t + {8,9,24,25}
++//   A a.x/a.y: those first four k values on rows g/g+8; a.z/a.w: those values plus 8.
++// The old widening returned BF16 = {bx.lo,bx.hi,by.lo,by.hi} and
++// AF16 = {ax.lo,ay.lo,ax.hi,ay.hi,az.lo,aw.lo,az.hi,aw.hi}.
++// LLVM's half() takes contiguous slices, so the generic f16 gathers' j=0/1
++// consume the low/high halves of ONE original dword at the SAME source lane.
++// Their final repack restores that dword verbatim. Gather the original words instead:
++//   A' = B^T: source = (row % 8)*4 + 2h, next source = source+1; bx then by
++//   B' = A^T: rows 0..7 use ax/az, rows 8..15 use ay/aw, with the same two t values.
++// Here row = lane%16 and h = lane/16. Unpaired A' pads rows 8..15 with zero;
++// paired A' substitutes B1 for those rows. The first WMMA still covers actual
++// K 0..7 and 16..23, and the second K 8..15 and 24..31: preserve this common
++// permutation and the accumulation order, rather than imposing a new canonical K layout.
++// FP32 shadows retain their exact power-of-two 2^-16 scaling convention.
+ // The result D' has VGPR i = row n = i + 8h (columns m = lane % 16): unpaired, rows 0..7 are the h = 0 lanes
+ // and the h = 1 lanes are padding; paired (A' rows 8..15 = B1^T), D1 is in the h = 1 lanes. Converting from
+ // and to the transposed layout takes 2 permlanex16 each way (4 for f32 shadows).
+@@ -1792,16 +1808,20 @@
+     return std::bit_cast<float>(wmma12_other_half(std::bit_cast<uint32_t>(value)));
+ }
+ 
+-// dword j of an operand gathered from two candidate registers: rows r < 8 take `low` from lane 4r + t, rows
+-// r >= 8 take `high` from lane 4(r - 8) + t (t = 2h + (j >> 1)). The source lane is in the first half-wave,
+-// while t differs between the two destination half-waves, so the two candidates must be gathered independently.
+-__device__ static uint32_t wmma12_gather2(uint32_t low, uint32_t high, uint32_t j)
+-{
+-    const uint32_t row = wmma_lane() % 16;
+-    const uint32_t t = (j >> 1) + 2 * wmma12_half();
++// One operand dword gathered from two candidate registers: rows r < 8 take `low` from lane 4r + t, rows
++// r >= 8 take `high` from lane 4(r - 8) + t. The source lane is in the first half-wave, while t differs
++// between the two destination half-waves, so the two candidates must be gathered independently.
++__device__ static uint32_t wmma12_rows(uint32_t row, uint32_t t, uint32_t low, uint32_t high)
++{
+     const uint32_t lo = wmma_from_lane(row * 4 + t, low);
+     const uint32_t hi = wmma_from_lane((row % 8) * 4 + t, high);
+     return row < 8 ? lo : hi;
++}
++
++// f16 operand dword j: the k-pair of NVIDIA thread t = 2h + (j >> 1).
++__device__ static uint32_t wmma12_gather2(uint32_t low, uint32_t high, uint32_t j)
++{
++    return wmma12_rows(wmma_lane() % 16, (j >> 1) + 2 * wmma12_half(), low, high);
+ }
+ 
+ __device__ static wmma_uint4 wmma12_low4(wmma_uint8 v)
+@@ -1841,21 +1861,18 @@
+ #endif
+ }
+ 
+-// f32 D' = A' B' + C' for operands whose dwords hold two e4m3 bytes in their low 16 bits (the d4r_wmma12f8
+-// e4m3 "widening" below keeps the bytes): true e4m3 values, no scaling
+-__device__ static wmma_float8 wmma12_e4m3(wmma_uint8 a, wmma_uint8 b, wmma_float8 c)
+-{
+-    const wmma_int2 a8 = {int(__builtin_amdgcn_perm(a[1], a[0], 0x05040100u)), int(__builtin_amdgcn_perm(a[3], a[2], 0x05040100u))};
+-    const wmma_int2 b8 = {int(__builtin_amdgcn_perm(b[1], b[0], 0x05040100u)), int(__builtin_amdgcn_perm(b[3], b[2], 0x05040100u))};
++// f32 D' = A' B' + C' with packed e4m3 operands (8 bytes per lane): true e4m3 values, no scaling
++__device__ static wmma_float8 wmma12_e4m3(wmma_int2 a, wmma_int2 b, wmma_float8 c)
++{
+ #ifndef D4R_WMMA12_SHIM
+-    return __zluda_wmma12_f32_16x16x16_fp8_fp8(a8, b8, c);
++    return __zluda_wmma12_f32_16x16x16_fp8_fp8(a, b, c);
+ #else
+     // the gfx11 helpers' scaled widening (value * 2^-8 per operand, C * 2^-16): exact powers of two
+     auto widen = [](wmma_int2 q) {
+         auto lo = e4m3x4_to_scaled_f16x2x2(uint32_t(q.x)), hi = e4m3x4_to_scaled_f16x2x2(uint32_t(q.y));
+         return wmma_uint8{lo.x, lo.y, hi.x, hi.y, 0u, 0u, 0u, 0u};
+     };
+-    return wmma12_f16(widen(a8), widen(b8), c * 0x1p-16f) * 0x1p16f;
++    return wmma12_f16(widen(a), widen(b), c * 0x1p-16f) * 0x1p16f;
+ #endif
+ }
+ 
+@@ -2042,54 +2059,72 @@
+             wmma12_f16(a_t_high, b_t_high, wmma12_f16(a_t_low, b_t_low, wmma12_c_from_s_pair(c0, c1))));
+     }
+ 
+-    // Native FP8 (d4r_wmma12f8_*, D4R_ZLUDA_WMMA_FP8_NATIVE): the "widening" keeps the e4m3 bytes, two per
+-    // dword in the low 16 bits and in the same slots the f16 widening fills, so the f16 gathers above move them;
+-    // the MMA packs this half's 8 bytes (e4m3 k 8h .. 8h + 7 in order) into the FP8 operand. OCP e4m3 (gfx12)
+-    // is NVIDIA's e4m3, so the bytes need no conversion. Shadows keep the 2^-16 scaled domain of the e4m3
+-    // functions (exact power-of-two rescaling around the WMMA).
+-    __device__ static uint2::Native_vec_ e4m3x4_split(uint32_t packed)
+-    {
+-        return {__builtin_amdgcn_perm(0u, packed, 0x0c0c0100u), __builtin_amdgcn_perm(0u, packed, 0x0c0c0302u)};
+-    }
+-
+-    wmma_uint8 FUNC(d4r_wmma12f8_e4m3_a_to_f16)(uint4::Native_vec_ a)
+-    {
+-        auto x = e4m3x4_split(a.x), y = e4m3x4_split(a.y), z = e4m3x4_split(a.z), w = e4m3x4_split(a.w);
+-        return {x.x, y.x, x.y, y.y, z.x, w.x, z.y, w.y};
+-    }
+-
+-    uint4::Native_vec_ FUNC(d4r_wmma12f8_e4m3_b_to_f16)(uint2::Native_vec_ b)
+-    {
+-        auto x = e4m3x4_split(b.x), y = e4m3x4_split(b.y);
+-        return {x.x, x.y, y.x, y.y};
+-    }
+-
+-    uint2::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
+-                                                     wmma_uint8 b_t_high, uint2::Native_vec_ c_t)
+-    {
+-        return wmma12_t_from_d(wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_t(c_t))));
+-    }
+-
+-    uint4::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
+-                                                          wmma_uint8 b_t_high, uint2::Native_vec_ c0_t,
+-                                                          uint2::Native_vec_ c1_t)
+-    {
+-        return wmma12_t_from_d_pair(
+-            wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_t_pair(c0_t, c1_t))));
+-    }
+-
+-    wmma_float4 FUNC(d4r_wmma12f8_s_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
+-                                              wmma_uint8 b_t_high, wmma_float4 c)
+-    {
+-        wmma_float8 d = wmma12_e4m3(a_t_high, b_t_high, wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_s(c * 0x1p16f)));
++    // Native FP8 (d4r_wmma12f8_*, D4R_ZLUDA_WMMA_FP8_NATIVE): an FP8 WMMA operand is 8 packed e4m3
++    // bytes per lane (a wmma_int2), so the operands are gathered straight from the packed NVIDIA
++    // fragment registers - no f16 widening, no repack (see the derivation above). Each gather returns
++    // both WMMA K blocks as <low dword 0, low dword 1, high dword 0, high dword 1>.
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_a_from_b)(uint2::Native_vec_ b)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        const uint32_t n = wmma_lane() % 16;
++        const uint32_t source = (n % 8) * 4 + 2 * wmma12_half();
++        // All source lanes must participate in the gathers. Putting a shuffle
++        // inside the padding ternary masks EXEC and reads inactive source lanes.
++        const uint32_t x0 = wmma_from_lane(source, b.x);
++        const uint32_t x1 = wmma_from_lane(source + 1, b.x);
++        const uint32_t y0 = wmma_from_lane(source, b.y);
++        const uint32_t y1 = wmma_from_lane(source + 1, b.y);
++        return {n < 8 ? x0 : 0u, n < 8 ? x1 : 0u, n < 8 ? y0 : 0u, n < 8 ? y1 : 0u};
++    }
++
++    // Paired form: the WMMA A operand rows 0..7 are B0^T and rows 8..15 are B1^T.
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_a_from_b_pair)(uint2::Native_vec_ b0, uint2::Native_vec_ b1)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        const uint32_t row = wmma_lane() % 16, t = 2 * wmma12_half();
++        return {wmma12_rows(row, t, b0.x, b1.x), wmma12_rows(row, t + 1, b0.x, b1.x),
++                wmma12_rows(row, t, b0.y, b1.y), wmma12_rows(row, t + 1, b0.y, b1.y)};
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_b_from_a)(uint4::Native_vec_ a)
++    {
++        __builtin_amdgcn_sched_barrier(0);
++        const uint32_t row = wmma_lane() % 16, t = 2 * wmma12_half();
++        return {wmma12_rows(row, t, a.x, a.y), wmma12_rows(row, t + 1, a.x, a.y),
++                wmma12_rows(row, t, a.z, a.w), wmma12_rows(row, t + 1, a.z, a.w)};
++    }
++
++    // f32 D' = A' B' + C', the two K halves as chained FP8 WMMAs
++    __device__ static wmma_float8 wmma12_fp8_k32(uint4::Native_vec_ a, uint4::Native_vec_ b, wmma_float8 c)
++    {
++        const wmma_int2 a_low{int(a[0]), int(a[1])}, a_high{int(a[2]), int(a[3])};
++        const wmma_int2 b_low{int(b[0]), int(b[1])}, b_high{int(b[2]), int(b[3])};
++        c = wmma12_e4m3(a_low, b_low, c);
++        return wmma12_e4m3(a_high, b_high, c);
++    }
++
++    uint2::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3)(uint4::Native_vec_ a_t, uint4::Native_vec_ b_t,
++                                                     uint2::Native_vec_ c_t)
++    {
++        return wmma12_t_from_d(wmma12_fp8_k32(a_t, b_t, wmma12_c_from_t(c_t)));
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12f8_t_mma_e4m3_pair)(uint4::Native_vec_ a_t, uint4::Native_vec_ b_t,
++                                                          uint2::Native_vec_ c0_t, uint2::Native_vec_ c1_t)
++    {
++        return wmma12_t_from_d_pair(wmma12_fp8_k32(a_t, b_t, wmma12_c_from_t_pair(c0_t, c1_t)));
++    }
++
++    wmma_float4 FUNC(d4r_wmma12f8_s_mma_e4m3)(uint4::Native_vec_ a_t, uint4::Native_vec_ b_t, wmma_float4 c)
++    {
++        wmma_float8 d = wmma12_fp8_k32(a_t, b_t, wmma12_c_from_s(c * 0x1p16f));
+         return wmma12_s_from_d(d) * 0x1p-16f;
+     }
+ 
+-    wmma_float8 FUNC(d4r_wmma12f8_s_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
+-                                                   wmma_uint8 b_t_high, wmma_float4 c0, wmma_float4 c1)
+-    {
+-        wmma_float8 d = wmma12_e4m3(a_t_high, b_t_high,
+-                                    wmma12_e4m3(a_t_low, b_t_low, wmma12_c_from_s_pair(c0 * 0x1p16f, c1 * 0x1p16f)));
++    wmma_float8 FUNC(d4r_wmma12f8_s_mma_e4m3_pair)(uint4::Native_vec_ a_t, uint4::Native_vec_ b_t, wmma_float4 c0,
++                                                   wmma_float4 c1)
++    {
++        wmma_float8 d = wmma12_fp8_k32(a_t, b_t, wmma12_c_from_s_pair(c0 * 0x1p16f, c1 * 0x1p16f));
+         return wmma12_s_from_d_pair(d) * 0x1p-16f;
+     }
+ }
