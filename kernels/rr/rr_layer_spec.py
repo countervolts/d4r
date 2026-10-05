@@ -784,7 +784,7 @@ def print_cut_abi(stmts, phases, defs, entry, path, lines, body):
     live = live_across(stmts, lo, hi)
     print(f"      returns        {len(live)} accumulators written in the region and "
           f"read after s{hi}")
-    print(f"                    {live[:12]}{' ...' if len(live) > 12 else ''}")
+    print(f"                    {live}")
     weight_b = sorted({m.B for p in phases for m in p.mma})
     print(f"      weight image   {len(weight_b)} distinct B fragments; byte ranges "
           f"per phase are in the table above")
