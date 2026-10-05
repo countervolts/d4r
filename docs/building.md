@@ -5,7 +5,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 
 | Component | Tested version |
 |---|---|
-| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0008` in order |
+| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0012` in order |
 | vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` and `0002` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
@@ -18,7 +18,7 @@ git clone https://github.com/vosen/ZLUDA zluda && cd zluda
 git checkout ee2f25a
 git submodule update --init --recursive
 git lfs pull
-for p in 0002 0003 0004 0005 0006 0007 0008; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
+for p in 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
 # rebuild the device helpers the patches changed (ptx/lib/zluda_ptx_impl*.bc)
 ZLUDA_SOURCE_ROOT=$PWD ROCM_ROOT=/opt/rocm /path/to/d4r/scripts/build_zluda_ptx_helpers.sh
 LIBRARY_PATH=/opt/rocm/lib cargo build --release -p zluda
@@ -47,6 +47,10 @@ What the patches add:
 - **0007**: gfx12 WMMA layout lowering, optional native e4m3 FP8 WMMA (`D4R_ZLUDA_WMMA_FP8_NATIVE=1`), and an architecture argument for `d4r_emit`. `D4R_ZLUDA_WMMA_LAYOUT=12` on gfx11 is a validation shim, not a release setting.
 - **0008**: post-phase kernels for native overrides (`NAME_post1` … `NAME_post8`, see [native-kernels.md](native-kernels.md)). Preset K's dec5 layer runs as four phase kernels, so the K set needs this patch: an older `libnvcuda.so` would skip the phases.
 - **0008**: CUDA denoiser PTX support: four-half surface stores, floating-coordinate half texture sampling, streaming-cache store spellings, byte-vector trapping stores (including low-byte truncation from wider registers), finite-saturating half conversion, correctly typed half exponentiation, half unordered comparisons, and atomic reductions. CUDA block barriers use a workgroup release fence before the hardware barrier and an acquire fence afterward. It also fixes strict floating-point division operand selection in the LLVM AMDGPU backend and Cargo build-profile detection. Two LLVM sinking fixes remove repeated instruction-order rebuilding and avoid alias scans when no sink target exists; write tracking and memory-dependency checks remain intact. Initialize the LLVM submodule before applying this patch; rebuild device helpers and ZLUDA afterward.
+- **0009**: gfx12 native-FP8 half-to-e4m3 requantization, including the ReLU variant. Hardware packed FP8 conversion replaces the software rounding path only when `D4R_ZLUDA_WMMA_FP8_NATIVE=1` selects gfx12 native FP8. Explicit saturation and sign restoration preserve finite overflow, infinities, signed zero and NaNs. Rebuild both the device helpers and ZLUDA.
+- **0010**: gfx12 native FP8 operands stay packed through the NVIDIA-to-WMMA lane gathers, removing fake-half splitting and repacking. Paired and unpaired operations preserve the previous K permutation, accumulation order and FP32-shadow scaling. Unpaired gathers execute in every source lane before zero-padding; masking EXEC around them loses valid source values. Rebuild both the device helpers and ZLUDA.
+- **0011**: coalesce complete accumulator-register overwrites into one shadow-layout conversion. Intervening reads, rewritten shadow accesses and basic-block boundaries prevent coalescing; partial writes retain read/modify/write behavior. Gfx12 native-FP8 functions request eight waves per SIMD to limit register pressure. Rebuild ZLUDA and `d4r_emit`.
+- **0012**: preserve signs through the native FP8 conversion instead of reconstructing them afterward. Explicitly clamp finite overflow and infinities, and map NaNs to signed infinity before conversion: native infinity produces the required `0x7f`/`0xff`, whereas native NaN always produces `0xff`. Plain and ReLU paths remain exhaustive-table identical to software. Rebuild device helpers and ZLUDA.
 
 When linking on a system with ROCm libraries outside the default search path, include their library directory in `LIBRARY_PATH`. The build also needs the appropriate ROCm link libraries. `CARGO_BUILD_JOBS=8` caps parallel Rust compilation if memory is limited.
 
@@ -159,7 +163,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 | Variable | Input |
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
-| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0008` applied |
+| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0012` applied |
 | `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001` and `0002` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
