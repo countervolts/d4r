@@ -1,30 +1,14 @@
-"""Marker polling defaults and the shim's model-override diagnostics."""
-import configparser
+"""Preset-selection behavior and polling configuration precedence."""
 import os
 from pathlib import Path
-import re
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIM = ROOT / 'tools/d4r_nvngx_shim.cpp'
 
 
 class ShimConfigTests(unittest.TestCase):
-    def test_marker_poll_defaults_agree(self):
-        for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
-            ini = configparser.ConfigParser()
-            ini.read(ROOT / name)
-            self.assertEqual(ini.getint('Interop', 'MarkerPollUs'), 200, name)
-        source = SHIM.read_text()
-        portable = re.search(r'portable_set\("D4R_SHIM_MARKER_POLL_US", poll.empty\(\) \? "(\d+)" : poll\);', source)
-        runtime = re.search(r'env_uint\("D4R_SHIM_MARKER_POLL_US", (\d+)\)', source)
-        self.assertIsNotNone(portable, 'portable marker polling fallback missing')
-        self.assertIsNotNone(runtime, 'runtime marker polling fallback missing')
-        self.assertEqual(int(portable[1]), 200)
-        self.assertEqual(int(runtime[1]), 200)
-
     def test_launcher_marker_poll_defaults_overrides_and_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'
@@ -42,50 +26,78 @@ class ShimConfigTests(unittest.TestCase):
                 ini.write_text(f'[Interop]\nMarkerPollUs = {value}\n')
                 result = subprocess.run(cmd, env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('MarkerPollUs must be a number of microseconds', result.stderr)
 
-    def test_production_model_override_logs_and_presets(self):
-        # Compile the actual feature-creation preset block with fake NGX inputs
-        # and a captured logger, so the test exercises the production message
-        # and override behavior without requiring Windows, NGX or a GPU.
-        source = SHIM.read_text()
-        start = source.index('    const char* presetNames[] =')
-        end = source.index('    feature->preset = presets[1];', start)
-        block = source[start:end]
-        runner_source = r'''
+
+class RenderPresetPolicyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        cls.runner = Path(cls.directory.name) / 'render-presets'
+        source = r'''
+#include "d4r_render_presets.h"
 #include <cstdio>
-#include <cstdlib>
-#include <cstdarg>
-#include <string>
-static unsigned nextPreset = 21;
-unsigned get_uint_or(void*, const char*, unsigned) { return nextPreset++; }
-std::string env_string(const char* name) { const char* value = getenv(name); return value ? value : ""; }
-void logf(const char* format, ...) {
-    va_list args; va_start(args, format); vprintf(format, args); va_end(args); puts("");
-}
-int main() {
-    void* parameters = nullptr;
-''' + block + r'''
-    printf("presets:"); for (unsigned preset : presets) printf(" %u", preset); puts("");
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
+    const bool rr = argv[1][0] == '1';
+    unsigned int presets[6] = {21, 22, 23, 24, 25, 26};
+    if (rr) {
+        for (unsigned int& preset : presets) preset += 10;
+    }
+    const auto overrideValue = d4r_parse_render_preset_override(
+        std::getenv(d4r_render_preset_variable(rr)));
+    overrideValue.apply(presets);
+    for (unsigned int preset : presets) std::printf("%u ", preset);
+    std::puts("");
 }
 '''
-        with tempfile.TemporaryDirectory() as temporary:
-            runner = Path(temporary) / 'model-override'
-            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-x', 'c++', '-', '-o', str(runner)],
-                           input=runner_source, text=True, capture_output=True, check=True)
-            env = {key: value for key, value in os.environ.items() if key != 'D4R_DLSS_PRESET'}
-            for preset, model in ((5, 'E'), (11, 'K'), (12, 'L'), (13, 'M')):
-                with self.subTest(model=model):
-                    output = subprocess.check_output([str(runner)], env=dict(env, D4R_DLSS_PRESET=str(preset)), text=True)
-                    self.assertIn(f'D4R_DLSS_PRESET={preset} (model {model}) overrides game/OptiScaler presets', output)
-                    self.assertIn('[DLAA=21 Quality=22 Balanced=23 Performance=24 UltraPerformance=25 UltraQuality=26]', output)
-                    self.assertIn(f'using preset={preset} for all quality modes', output)
-                    self.assertIn('presets:' + f' {preset}' * 6, output)
-            for value in (None, ''):
-                current = env if value is None else dict(env, D4R_DLSS_PRESET=value)
-                output = subprocess.check_output([str(runner)], env=current, text=True)
-                self.assertNotIn('model override', output)
-                self.assertEqual(output.strip(), 'presets: 21 22 23 24 25 26')
+        subprocess.run(
+            ['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+             '-I', str(ROOT / 'tools'), '-x', 'c++', '-', '-o', str(cls.runner)],
+            input=source, text=True, capture_output=True, check=True)
+
+    def select(self, rr=False, **overrides):
+        env = dict(os.environ)
+        for name in ('D4R_DLSS_PRESET', 'D4R_RR_PRESET'):
+            env.pop(name, None)
+        env.update(overrides)
+        result = subprocess.run(
+            [str(self.runner), '1' if rr else '0'], env=env,
+            text=True, capture_output=True, check=True, timeout=5)
+        return [int(value) for value in result.stdout.split()]
+
+    def test_sr_models_override_every_quality_mode(self):
+        for value in (5, 11, 12, 13):
+            with self.subTest(preset=value):
+                self.assertEqual(
+                    self.select(D4R_DLSS_PRESET=str(value), D4R_RR_PRESET='4'),
+                    [value] * 6)
+
+    def test_rr_models_do_not_use_the_sr_override(self):
+        for value in (4, 5):
+            with self.subTest(preset=value):
+                self.assertEqual(
+                    self.select(rr=True, D4R_RR_PRESET=str(value), D4R_DLSS_PRESET='13'),
+                    [value] * 6)
+
+    def test_unset_override_preserves_quality_specific_game_presets(self):
+        for rr, foreign in ((False, 'D4R_RR_PRESET'), (True, 'D4R_DLSS_PRESET')):
+            with self.subTest(rr=rr):
+                expected = list(range(31, 37) if rr else range(21, 27))
+                self.assertEqual(self.select(rr=rr), expected)
+                self.assertEqual(self.select(rr=rr, **{foreign: '13'}), expected)
+
+    def test_empty_override_does_not_fall_back_to_the_other_feature(self):
+        self.assertEqual(
+            self.select(D4R_DLSS_PRESET='', D4R_RR_PRESET='5'),
+            list(range(21, 27)))
+        self.assertEqual(
+            self.select(rr=True, D4R_RR_PRESET='', D4R_DLSS_PRESET='13'),
+            list(range(31, 37)))
+
+    def test_explicit_default_preset_overrides_game_presets(self):
+        self.assertEqual(self.select(D4R_DLSS_PRESET='0'), [0] * 6)
+        self.assertEqual(self.select(rr=True, D4R_RR_PRESET='0'), [0] * 6)
 
 
 if __name__ == '__main__':

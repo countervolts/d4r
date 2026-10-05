@@ -47,9 +47,118 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
 
 Initial validation: a gfx1101 fast L build completed two Ultra Performance harness frames (192×108 → 576×324, DLSS 310.7). Its finite, nonzero RGBA16F output matched the original translated L texture kernels byte for byte with the same native Swin layers. A gfx1201 FP8 accuracy L set compiled successfully; RDNA4 hardware and 4K game output have not been tested. Full packaging rebuilds missing L variants when given an older texture bundle.
 
+**Ray Reconstruction, the denoiser (`kernels/tex` + `cuda_dldn_engine_*`).**
+- **Network:** `nvngx_dlssd.dll` defines the DLSS-D denoiser: six Swin encoders (`cuda_dldn_engine_swin_enc0_kernel` … `enc5`), five decoders (`dec0` … `dec4`), a high-fidelity kernel-prediction network whose output kernel is `cuda_dldn_engine_hkpn_output_kernel_transformer`, and the luma/auto-exposure/`reduce_sum` helpers. It shares no kernel with the Super Resolution libraries.
+- **Native today:** the hkpn output kernel (and its `_diamond_wallaby` twin), built by `kernels/build.sh rr` as a wave64 surface-store replacement. `make_ptx.py` replaces `sust.b.2d.v4.b16.zero` — a whole RGBA16F texel — with `d4r_sust_v4b16`; the neural body and the texture reads are unchanged.
+- **Still translated:** all eleven Swin layers. ZLUDA compiles NVIDIA's PTX at load time; the table below measures the resulting kernels' GPU execution, not JIT latency. A native replacement must preserve each layer's attention, norm and merge stages, as `kernels/m/rrlite_*` does for the upscaler.
+- **Manifest:** the denoiser DLL is passed to `kernel_manifest.py` as `--rr-dll`, because its hashes may only authorize `cuda_dldn_engine_*` replacements. Without that split, a name both libraries define — `dl4rt_input_kernel` — would let a super-resolution binary be served for the denoiser's different implementation of it.
+
+Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E,
+1280×720 → 3840×2160, with `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness:
+The earlier 20-frame run excluded the first 6 frames, with native hkpn output
+and gfx12 native FP8 enabled.
+The first implementation of patch `0009` replaced software half-to-e4m3
+requantization with hardware packed FP8 conversion: **33.90 ms** for the
+same-runtime software control, **26.28 ms** with native conversion, and
+**26.65 ms** without the diagnostic A/B gate. The compact integer saturation
+in `0009` plus `0010`'s packed FP8 operand gathers measured **25.33 ms**.
+All four final RGBA16F frames are byte-identical.
+
+An 80-frame run, excluding the first 20, measures **24.764 ms** with `0009` +
+`0010`. Patch `0011`'s complete-pair shadow-store coalescing reduces that to
+**23.340 ms**. Eight-wave register budgeting alone measures **20.135 ms**;
+both changes together measure **19.146 ms**. All 80 saved
+frames from each variant are byte-identical to the matching 80-frame control.
+Do not compare final images from different frame counts: the 20- and 80-frame
+captures differ even with the unchanged control.
+With `0012`'s signed native conversion, the same 80-frame configuration measures
+**16.234 ms**, with a byte-identical final frame. Signs stay in the half inputs;
+clamped finite values convert directly, and NaNs become signed infinity before
+conversion to obtain PTX's signed NaN bytes without post-conversion sign masks.
+The breakdown below uses that configuration. With the harness's 200 ms
+inter-frame idle gap removed, the same path measures **15.144 ms** and retains
+the identical final image; this steady-state run is not the idle-gap control.
+
+| kernel | ms/frame | kernel | ms/frame |
+|---|---|---|---|
+| enc0 | 3.79 | dec4 | 0.52 |
+| dec0 | 3.63 | dec3 | 0.60 |
+| dec1 | 1.76 | enc4 | 0.45 |
+| enc1 | 1.75 | enc3 | 0.49 |
+| dec2 | 1.01 | enc5 | 0.41 |
+| enc2 | 0.82 | luma, exposure, reduce_sum | 0.05 |
+| hkpn output | 0.96 | **total** | **16.23** |
+
+The actual PTX conversion probe checks all 65,536 half encodings in both packed
+positions, including overflow, infinities, signed zero and NaNs. Native and
+software conversions agree for both the plain and ReLU variants; the plain
+variant also matches an independent nearest-even E4M3 oracle. The gfx11 fallback
+compiles offline without reaching the gfx12-only intrinsic; gfx11 execution
+has not been checked. The older installed-runtime FTZ baseline (~31.5 ms)
+produces a different image and is not the arithmetic control for this gain.
+The packed-MMA GPU probe agrees with the previous implementation for all
+81,920 half values across paired, chained and unpaired operations, including
+subnormals, overflow, infinities and NaNs. The standalone
+`rrswin_fp8_unpaired_test.cpp` checks zero-padding with every source lane active,
+nonuniform bias and partial accumulator writes separated by a dependent read,
+against 512 independently calculated, exactly representable half values.
+A gfx12 register-permutation replacement for the LDS gathers was correct but
+slower (27.44 ms), and was reverted.
+A twelve-wave register budget preserved the final image but increased time to
+25.560 ms; it is not selected by `0011`.
+An isolated-cache fast-math run measured 18.920 ms versus 19.146 ms without
+relaxed math, but changed the image; relaxed math is not selected.
+
+Cyberpunk 2077 with `0009` + `0010` rendered a loaded save at 1280×720→3840×2160 with CUDA feature 13,
+preset E, DLSSD 310.7.0 and split-frame VRAM interop. Moving views showed coherent
+geometry and reflections; the overlay's average upscaler time was about 26.0 ms.
+This is a functional visual check, not RTX image-quality parity. Native-Wayland
+window shutdown reported a swapchain-creation error; the test prefix was stopped
+and the original game settings restored byte-for-byte.
+
+The eleven layers' cut ranges, from `rr_layer_spec.py <layer>` (file lines of the layer's corpus module, the region a native body replaces; everything outside stays in NVIDIA's PTX):
+
+| layer | corpus | cut lines | mma | phases | weight image |
+|---|---|---|---|---|---|
+| enc0 | 0013 | 3964-44524 | 536 | 22 | 54560 |
+| enc1 | 0014 | 13343-66941 | 1072 | 32 | 96468 |
+| enc2 | 0015 | 7669-33946 | 630 | 38 | 212244 |
+| enc3 | 0016 | 9812-41980 | 936 | 48 | 315732 |
+| enc4 | 0017 | 11883-52668 | 1386 | 62 | 533844 |
+| enc5 | 0018 | 11883-50752 | 1306 | 61 | 431124 |
+| dec0 | 0023 | 1393-46263 | 544 | 19 | 47872 |
+| dec1 | 0022 | 1486-38469 | 632 | 26 | 96788 |
+| dec2 | 0021 | 1535-36889 | 726 | 38 | 212756 |
+| dec3 | 0020 | 1658-46562 | 1112 | 48 | 316436 |
+| dec4 | 0019 | 1707-58076 | 1606 | 62 | 534804 |
+
+The denoiser's Swin block is the same block as presets L/M's: `cuda_dldn_engine_swin_enc0_kernel` computes position-only attention `S = bias + Q*Q^T` with no K projection, a 16x16 f16 bias table at 512 bytes per head, and one fused Q/V projection - the score `mma` at line 8406 takes both of its operands from the same accumulator registers, `%r1900`/`%r1920`, through their `cvt.rn.satfinite.e4m3x2.f16x2` at 8126/8129 and 8294/8297. That is `kernels/m/swin_block.h`'s block (`T16 S = bias; k32(S, a0, a0, a1, a1);`), not `kernels/k`'s learned-attention one. So the native denoiser layers can be built by instantiating that template - a prep that permutes the denoiser's own weight image into its slot layout, a parameter struct for the 144-byte block, and the surface stores through `tex_common.h` - rather than by writing a Swin block from scratch.
+
+`rr_layer_spec.py`'s M and N come from the distinct A and B fragment counts of a phase. That is unambiguous only when the phase makes one k32 step: dec0's first phase has 96 mma over 6 distinct A and 32 distinct B fragments, which is 48x128 with K=64 (two k32 steps of 3 A x 16 B), while the tool prints it as 96x256 with K=64 because it attributes both steps' fragments to M and N. Check the arithmetic `M/16 * N/8 * K/32 == mma` before trusting a row; enc0's rows all satisfy it and its first phase is verified bit-exactly against the GPU.
+
+Measured launch shape, from the replay manifest of a real harness frame. Block z is the number of waves per block and varies by layer, which is why the decoders' weight addressing carries a per-`tid.z` stride; the grid shrinks as the U-Net deepens. The parameter block is 144 bytes for the interior layers, 152 for dec0 and 1032 for enc0, which takes the guide textures:
+
+| layer | grid | block | waves | kernarg |
+|---|---|---|---|---|
+| enc0 | 161x93 | 32x1x1 | 1 | 1032 |
+| enc1 | 81x47 | 32x1x1 | 1 | 144 |
+| enc3 | 21x13 | 32x1x4 | 4 | 144 |
+| dec0 | 161x93 | 32x1x1 | 1 | 152 |
+| dec1 | 81x47 | 32x1x2 | 2 | 144 |
+| dec2 | 41x24 | 32x1x4 | 4 | 144 |
+| dec4 | 11x6 | 32x1x8 | 8 | 144 |
+
+enc0 and dec0 read their input from CUDA textures rather than the plane arena, and write to CUDA surfaces; the other nine read the arena. The native override can set block z and flatten the grid per kernel (`d4r_block_z`, `d4r_grid_x`), so a native replacement is free to choose its own shape.
+
+`kernels/rr/rr_layer_spec.py` recovers a layer's structure from the corpus PTX alone: `rr_layer_spec.py enc0` prints the phase table (each maximal run of adjacent `mma`, with M/N/K derived from the fragment counts and the accumulator dataflow, the weight and bias byte offsets it reads, and the size of the epilogue between phases) and the stage classification; `--geometry` does the same for all eleven layers and prints each one's weight image extent. It is how enc0's layout above was established, and it is the reference the native layers are written against.
+
+Before native FP8 conversion, enc0's translated shader contained 83,373 instructions for 536 FP8 WMMAs. Operand gathering and software requantization dominated that static stream; those counts are not measurements of the patch `0009` shader. Hardware conversion removes the software codec but leaves operand-layout conversion and the surrounding neural computation. A global 128-thread bound is invalid for the 256-thread layers; the captured E launches use 32 threads for enc0, enc1 and dec0, 64 for dec1, 128 for enc2/enc3/dec2/dec3, and 256 for enc4/enc5/dec4. The remaining network must be optimized and measured rather than treating the codec gain as meeting the target.
+
 ## RDNA4
 
 `kernels/common/wmma_layout.h` selects the WMMA operand and accumulator layout. gfx12 uses eight f16 values per lane in each K half; the accumulator rows are `i + 8·half`. The gfx11 path retains its original layout. `D4R_WMMA_LAYOUT=12` on gfx11 is a test shim: it exercises gfx12 indexing but executes gfx11 WMMA, so its replay output can be compared byte for byte with the existing gfx11 build.
+
+ A native kernel can call that unit directly: declaring `__device__ float8 f(int2, int2, float8) __asm("llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8.v8f32.v2i32");` compiles for gfx1201 and emits the instruction, which is what lets a denoiser layer read its weights straight out of NVIDIA's fragment order instead of gathering them. Verified by compiling a kernel that uses it.
 
 The gfx12 M variant can use native e4m3 FP8 WMMA with `D4R_NATIVE_FP8=1`. Its activations are requantized to e4m3 at operand load, and its prepared weights remain bytes. The matching ZLUDA and texture-tail variant uses `D4R_ZLUDA_WMMA_FP8_NATIVE=1` / `D4R_TEX_FP8=1`; the release bridge chooses the `-fp8` kernel folder. `NativeFp8` in d4r.ini controls that choice and defaults to on. The f16 widening path remains available.
 
@@ -105,8 +214,10 @@ The release includes both fast and accuracy network sets. Full releases also inc
    ```
 
    It runs the prep and main kernels, saves every buffer after the first launch, and times 30 launches. The replay tool refuses captures with texture or surface objects; use the full harness for those kernels.
-3. **Compare against a reference.** `kernels/tools/pwin_model.py` (K) and `swin_model.py` (M) are numpy models of the layers, written stage by stage against `ptxsim.py`, a small vectorised PTX interpreter that runs NVIDIA's kernels on the CPU. A bit-exact variant should match the model within f16 rounding; after any change, compare the new build's buffers with the previous build's.
-4. **Check the whole pipeline.** Replay captured frames through the harness with both kernel sets and compare the outputs with `kernels/tools/psnr.py`. `D4R_CUDA_KERNEL_PROFILE=1` makes the bridge time every kernel; `kernels/tools/kprof.py` summarises the log per frame.
+3. **A per-layer oracle for kernels with texture and surface objects.** The replay capture above cannot describe those kernels (the replayers refuse them), but the bridge's other instrumentation can: with `D4R_CUDA_LAUNCH_STATS=1` and `D4R_CUDA_LAUNCH_DUMP_DIR=<dir>` (with `D4R_CUDA_LAUNCH_STATS_FILTER=<substring>` to keep only the kernels being worked on, checked before the synchronize) every `cuLaunchKernel` is followed by a synchronize and a raw dump of every allocation, surface object and texture object named in its packed argument buffer, one file per launch and argument (`launch-NNN-<kernel>-argNNN-{buffer,surface,texture}-<shape>-fmtN.bin`). Run the harness once with the translated kernel and once with the native one and compare that kernel's files byte for byte: the surface files are the layer's own output, and a mismatch localises to that layer rather than to the frame. `cuda_dldn_engine_swin_enc0_kernel` dumps its weight image at arg040, its activation buffer at arg048 and four surfaces (1280x736x4 and 640x368x4 RGBA16F) as its outputs. The dump is large - 3 frames cost 3.7 GB - so keep the frame count small. A native denoiser layer is checked at a finer grain still: `D4R_RRSWIN_DEBUG=<stage>` builds NVIDIA's own body with a store of that stage's registers spliced in, and the native body built with `D4R_TEX_CFLAGS=-DD4R_RRSWIN_DEBUG_STAGE=<n>` stores its own; both land in the plane arena at 46,000,000, so the two are compared byte for byte with the frame out of the way. Verified on phase 4: both sides agree on all 524288 bytes of the region (md5 788f4274c7ff), two runs of one build reproduce it exactly, and the only arguments that differ between runs are the downstream textures the pipeline writes, not the layer's inputs.
+
+4. **Compare against a reference.** `kernels/tools/pwin_model.py` (K) and `swin_model.py` (M) are numpy models of the layers, written stage by stage against `ptxsim.py`, a small vectorised PTX interpreter that runs NVIDIA's kernels on the CPU. A bit-exact variant should match the model within f16 rounding; after any change, compare the new build's buffers with the previous build's.
+5. **Check the whole pipeline.** Replay captured frames through the harness with both kernel sets and compare the outputs with `kernels/tools/psnr.py`. `D4R_CUDA_KERNEL_PROFILE=1` makes the bridge time every kernel; `kernels/tools/kprof.py` summarises the log per frame.
 
 ## Per-kernel cost
 

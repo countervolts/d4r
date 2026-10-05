@@ -1,3 +1,5 @@
+Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
+
 d4r @VERSION@: where every file in this release comes from
 ============================================================
 
@@ -10,7 +12,7 @@ Built from source by d4r (Apache License 2.0, d4r/licenses/d4r-LICENSE.txt):
 
 Third-party software, unmodified or patched by d4r:
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
-                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0007 applied.
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0012 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).
                          Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
   d3d12.dll, d3d12core.dll
@@ -34,12 +36,13 @@ Third-party software, unmodified or patched by d4r:
   OptiScaler.ini         OptiScaler 0.9.4's OptiScaler.ini with the values d4r needs set
                          (packaging/optiscaler.settings in the d4r repository)
 
-@clean Not included: NVIDIA's DLSS library (nvngx_dlss.dll) and NGX runtime (_nvngx.dll). You supply them
+@clean Not included: NVIDIA's DLSS libraries (nvngx_dlss.dll, nvngx_dlssd.dll) and NGX runtime (_nvngx.dll). You supply them
 @clean and are responsible for complying with NVIDIA's license terms.
 @full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever distributes
 @full this zip, not by NVIDIA:
 @full   d4r/nvngx_dlss.dll   NVIDIA DLSS Super Resolution library @DLSS_VERSION@
 @full   d4r/ngx/_nvngx.dll   NVIDIA NGX runtime from NVIDIA's Windows display driver, @NGX_VERSION@
+@full   Optional d4r/nvngx_dlssd.dll: NVIDIA DLSS Ray Reconstruction library, when supplied through D4R_BUNDLE_DLSSD
 @full   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
 @full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code
 @full                        (kernels/tex in the d4r repository), compiled by ZLUDA

@@ -222,6 +222,39 @@ DEV __attribute__((always_inline)) void d4r_sust_v2b16(uint64_t surface, int32_t
         sust_v2b16_generic(surface, x, y, a, b);
 }
 
+typedef int16_t v4s __attribute__((ext_vector_type(4)));
+extern "C" __attribute__((device)) void __zluda_ptx_impl_surfobj_b_2d_v4_b16_zero(uint64_t surface, v2i coord, v4s value);
+
+__attribute__((device, noinline)) static void sust_v4b16_generic(uint64_t surface, int32_t x, int32_t y,
+                                                               uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    __zluda_ptx_impl_surfobj_b_2d_v4_b16_zero(surface, (v2i){x, y},
+                                           (v4s){(int16_t)a, (int16_t)b, (int16_t)c, (int16_t)d});
+}
+
+FP_BODY void sust_rgba16f_body(tsharp_t* image, int32_t px, int32_t y,
+                             uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    __ockl_image_store_2D(image, (v2i){px, y},
+                         (v4f){half_bits_to_float(a), half_bits_to_float(b),
+                               half_bits_to_float(c), half_bits_to_float(d)});
+}
+
+// RR stores complete RGBA16F texels. No channel reads or partial-pixel merges
+// are needed; other layouts retain the generic byte-addressed store.
+DEV __attribute__((always_inline)) void d4r_sust_v4b16(uint64_t surface, int32_t x, int32_t y,
+                                                     uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    tsharp_t* image = (tsharp_t*)surface;
+    if (__ockl_image_channel_data_type_2D(image) == 14 && __ockl_image_channel_order_2D(image) == 8 && (x & 7) == 0)
+    {
+        if (x >= 0)
+            sust_rgba16f_body(image, x >> 3, y, a, b, c, d);
+    }
+    else
+        sust_v4b16_generic(surface, x, y, a, b, c, d);
+}
+
 
 // f32 comparisons on the bits (no fcmp: kernels ZLUDA compiles in strict-FP mode cannot lower
 // constrained fcmp); same results as the float compares, -0.0 included

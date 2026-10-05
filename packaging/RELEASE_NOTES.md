@@ -1,3 +1,49 @@
+<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
+# Unreleased
+
+## Ray Reconstruction
+
+- Run the signed CUDA-capable 3.10.7 DLSS-Denoiser through the NGX core's feature-13 lifecycle.
+  Presets D and E select distinct network weights independently of the Super Resolution preset.
+- Preserve per-frame guide resources, camera matrices, subrects, and stable CUDA texture handles.
+  Support normalized 8-bit albedo guides with the CUDA array-format ABI and preserve full guide rows.
+- Support pre-Init feature discovery through the denoiser's requirements export without initializing
+  NGX with a provisional application identity. Initialized capability checks remain authoritative.
+- Keep separate alpha and RGB outputs paired, including padded output subrects and current-frame
+  split presentation. Separate alpha no longer forces the whole feature through host staging.
+  R32F alpha stays in VRAM; half/UNORM alpha uses GPU conversion with hardware-dependent rounding.
+  Raw integer alpha retains its existing host conversion without disabling RGB VRAM interop.
+  Converted alpha can differ from CPU quantization by one destination step.
+  Normals, roughness, albedo, and other compatible RR guides use shared VRAM buffers; BGRA and
+  packed RGB guides convert on the GPU. Raw integer guides retain their host conversion.
+  Add actual-CUDA-array verification, per-frame rendered RGB/alpha comparisons, and source-alpha
+  capture for checking conversion against the exact frame being presented.
+- Bound R8_UINT alpha stores to one byte and balance guide/alpha references when evaluation
+  cannot place its frame marker. Publish cached denoiser capabilities as a coherent snapshot.
+- Extend the ZLUDA patch stack for real denoiser PTX, LLVM lowering, half texture/store operations,
+  and release/acquire ordering around workgroup barriers.
+- Verified D/E temporal evaluation and separate alpha on RX 9070 XT (gfx1201) with native FP8 WMMA.
+  Scalar FP8 temporal RR produced nonfinite output and is not validated. Cold compilation can stall
+  initial rendering; other GPU targets and image-quality parity with RTX hardware remain unverified.
+- Cyberpunk 2077 2.31 rendered loaded local saves with path tracing and RR preset D enabled at
+  1920×1080 and 3840×2160 Ultra Performance on gfx1201. The actual overlay reported DLSSD 310.7.0,
+  and CUDA feature-13 evaluations completed. The observed ~53 FPS at 1080p and ~20 FPS at 4K are
+  snapshots, not comparative benchmarks. Newer DLSS 4.5 RR preset F is not implemented or validated.
+- Rechecked the optimized VRAM guide path in a loaded Cyberpunk 2077 2.31 save with path tracing,
+  RR preset E and 1080p Ultra Performance on gfx1201; the user verified gameplay.
+  All six supplied guide arrays matched the host reference byte-for-byte in diagnostic checks.
+  The tested GE-Proton11-3 setup required native ICU overrides
+  (`icuuc=n,b;icuin=n,b;icudt=n,b`) to avoid Wine's unimplemented `u_setMemoryFunctions_65`.
+  Keep guide/alpha verification off for normal play; it intentionally adds GPU readbacks.
+- Rebased RR onto the latest `linux` branch, preserving per-slot input markers and ordered
+  frame retirement. Rebuilt shim/bridge and rechecked a loaded Cyberpunk scene with camera
+  motion, RR E and path tracing at 1080p Ultra Performance on gfx1201.
+  Removed brittle source-text/wording tests; configuration validation remains covered.
+- Restore behavioral preset-override coverage through a shared, allocation-free policy used by
+  feature creation: SR/RR isolation, every quality mode, unset/empty overrides, and explicit
+  default-preset selection. Tests compile the helper directly without extracting shim source
+  or matching diagnostic wording; polling configuration validation and precedence remain covered.
+
 # d4r 0.1.3
 
 This release adds an optional accuracy mode and fixes the GLIBC compatibility failure, DLSS artifacts, and stale output-buffer redirects reported after 0.1.2. Accuracy mode is **off by default**.

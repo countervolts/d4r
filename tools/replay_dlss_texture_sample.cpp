@@ -1,3 +1,4 @@
+// Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 #include <dlfcn.h>
 
 #include <algorithm>
@@ -123,7 +124,8 @@ int main()
 {
     .reg .b64 %rd<5>;
     .reg .b32 %r<5>;
-    .reg .f32 %f<18>;
+    .reg .f32 %f<22>;
+    .reg .b16 %h<4>;
     ld.param.b64 %rd1, [texture_object];
     ld.param.b64 %rd2, [output_pointer];
     mov.u32 %r1, %tid.x;
@@ -138,13 +140,19 @@ int main()
     mul.f32 %f9, %f9, 0f3E000000;
     tex.base.2d.v4.f32.f32 {%f10,%f11,%f12,%f13}, [%rd1, {%f8,%f9}];
     tex.level.2d.v4.f32.f32 {%f14,%f15,%f16,%f17}, [%rd1, {%f8,%f9}], 0f00000000;
+    tex.base.2d.v4.f16.f32 {%h0,%h1,%h2,%h3}, [%rd1, {%f8,%f9}];
+    cvt.f32.f16 %f18, %h0;
+    cvt.f32.f16 %f19, %h1;
+    cvt.f32.f16 %f20, %h2;
+    cvt.f32.f16 %f21, %h3;
     mad.lo.u32 %r3, %r2, 8, %r1;
-    mul.wide.u32 %rd3, %r3, 64;
+    mul.wide.u32 %rd3, %r3, 80;
     add.s64 %rd4, %rd2, %rd3;
     st.global.v4.f32 [%rd4], {%f0,%f1,%f2,%f3};
     st.global.v4.f32 [%rd4+16], {%f4,%f5,%f6,%f7};
     st.global.v4.f32 [%rd4+32], {%f10,%f11,%f12,%f13};
     st.global.v4.f32 [%rd4+48], {%f14,%f15,%f16,%f17};
+    st.global.v4.f32 [%rd4+64], {%f18,%f19,%f20,%f21};
     ret;
 }
 
@@ -250,7 +258,7 @@ int main()
         const uint16_t mantissa = static_cast<uint16_t>((fraction * 2.0f - 1.0f) * 1024.0f);
         return static_cast<uint16_t>(((exponent - 1 + 15) << 10) | mantissa);
     };
-    const size_t outputFloats = static_cast<size_t>(width) * height * 16;
+    const size_t outputFloats = static_cast<size_t>(width) * height * 20;
     if (result == 0)
         result = report("cuMemAlloc_v2(output)", memAlloc(&deviceOutput, outputFloats * sizeof(float)), getErrorString);
     if (result == 0)
@@ -364,10 +372,10 @@ int main()
             size_t mismatches = 0;
             for (unsigned int y = 0; status == 0 && y < height; ++y)
                 for (unsigned int x = 0; x < width; ++x)
-                    for (unsigned int form = 0; form < (samplerCase.flags == 2 ? 4u : 2u); ++form)
+                    for (unsigned int form = 0; form < (samplerCase.flags == 2 ? 5u : 2u); ++form)
                         for (unsigned int channel = 0; channel < formatCase.channels; ++channel)
                         {
-                            const float got = sampled[(y * width + x) * 16 + form * 4 + channel];
+                            const float got = sampled[(y * width + x) * 20 + form * 4 + channel];
                             float want = expected_texel(x, y)[channel];
                             if (form >= 2 && samplerCase.filterMode == 1)
                             {
@@ -378,10 +386,10 @@ int main()
                                 want = 0.75f * (0.25f * topLeft + 0.75f * topRight)
                                      + 0.25f * (0.25f * bottomLeft + 0.75f * bottomRight);
                             }
-                            if (std::fabs(got - want) > 1e-6f && mismatches++ < 4)
+                            if ((!std::isfinite(got) || std::fabs(got - want) > 1e-6f) && mismatches++ < 4)
                                 std::printf("  %s %s %s (%u,%u) channel %u: got %g expected %g\n", formatCase.name,
                                             samplerCase.name,
-                                            form == 0 ? "tex.base" : form == 1 ? "tex" : form == 2 ? "tex.base normalized" : "tex.level LOD0",
+                                            form == 0 ? "tex.base" : form == 1 ? "tex" : form == 2 ? "tex.base normalized" : form == 3 ? "tex.level LOD0" : "tex.base f16 normalized",
                                             x, y, channel, got, want);
                         }
             const bool casePass = status == 0 && mismatches == 0;
@@ -436,12 +444,12 @@ int main()
         size_t mismatches = 0;
         for (unsigned int y = 0; status == 0 && y < height; ++y)
             for (unsigned int x = 0; x < width; ++x)
-                for (unsigned int form = 0; form < 4; ++form)
+                for (unsigned int form = 0; form < 5; ++form)
                     for (unsigned int channel = 0; channel < 4; ++channel)
                     {
                         const float expected = x == 3 && y == 4 ? expectedStored[channel]
                                                                   : expected_texel(x, y)[channel];
-                        const float got = sampled[(y * width + x) * 16 + form * 4 + channel];
+                        const float got = sampled[(y * width + x) * 20 + form * 4 + channel];
                         if (got != expected && mismatches++ < 5)
                             std::printf("  surface->texture (%u,%u) form %u channel %u: got %g expected %g\n",
                                         x, y, form, channel, got, expected);

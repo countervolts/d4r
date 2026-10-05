@@ -1,6 +1,6 @@
 # Performance
 
-All frame rates and kernel timings on this page were measured on an RX 7700 XT (gfx1101). RDNA4 (gfx1200/gfx1201) has compile and emulator validation only; no RDNA4 frame rate, latency, or kernel timing has been measured. Native FP8 may change both arithmetic and cost, so the gfx11 results cannot be projected to it.
+The pre-existing Super Resolution game benchmarks below were measured on an RX 7700 XT (gfx1101); they are historical results, not measurements from this RR update. All new Ray Reconstruction measurements and Cyberpunk verification in this update use RX 9070 XT (gfx1201). The RR timings are synthetic harness measurements, not RDNA4 game-FPS benchmarks. Native FP8 may change both arithmetic and cost, so the gfx1101 results cannot be projected to gfx1201.
 
 ## Method
 
@@ -61,3 +61,27 @@ For DLSS 4 at Quality the GPU spends about 2.8 ms per frame in DLSS kernels:
 - The input kernel, exposure and miscellaneous kernels: about 0.35 ms.
 
 The game-side input and output copies add about 0.3 ms. [native-kernels.md](native-kernels.md) lists every kernel.
+
+## Ray Reconstruction VRAM transport
+
+Measured separately from the Super Resolution game benchmarks above: RX 9070 XT (gfx1201), GE-Proton11-3, CUDA-capable DLSS-Denoiser 310.7, RR preset E, native FP8 WMMA and native Swin encoders. The synthetic D3D12 harness rendered 640×360 into 1280×720 with separate R32F alpha. Split-frame presentation and pitch-linear inputs were enabled; verification/capture downloads were disabled.
+
+Four back-to-back 40-frame runs used host guides, GPU guides, GPU guides, then host guides. The first five frames of each run were excluded; values below are warm-frame medians in milliseconds:
+
+| Guide transport | Worker time, first/repeat | Frame interval, first/repeat |
+|---|---:|---:|
+| Host staging | 14.967 / 14.296 | 17.373 / 16.795 |
+| Shared VRAM | 13.960 / 13.953 | 16.482 / 16.680 |
+
+All four final RGBA captures were byte-identical. The GPU guide runs recorded no host staging readbacks. This is a small synthetic transport comparison, not a game-FPS claim; network execution and clocks contribute to run-to-run variation.
+
+With the usual two RGBA16F and two RGBA8 guides, VRAM transport eliminates approximately 11.1 MB of guide payload crossing GPU↔CPU per frame at this render size (5.5 MB in each direction, excluding padding). Separate alpha also no longer forces RGB through host staging. Unsupported raw-integer guide/alpha formats retain their existing host conversion without disabling the other GPU routes.
+
+Correctness checks additionally covered five guide-format sets at an odd 193-pixel input width: 35 final/per-frame RGBA files were byte-identical between host and GPU guide transport. Six-frame source/presentation captures preserved RGB bytes and alpha subrect sentinels. R32F alpha was exact; half/UNORM blits can differ from the CPU quantizer by one destination step.
+
+An aligned 192×108→288×162 synthetic capture against native CUDA on RTX 4090 measured RGB PSNR 42.15 dB, mean absolute component error 0.00357, and maximum error 0.13623; neither image contained nonfinite RGB values. This spot check does not establish RTX image-quality parity or game-wide temporal correctness. Transport A/B comparisons on the same AMD backend were exact; cross-backend neural arithmetic remains a separate accuracy limitation.
+
+The optimized route also rendered a loaded Cyberpunk 2077 2.31 save at 640×360→1920×1080 Ultra Performance with path tracing and RR preset E on gfx1201. The overlay identified DLSSD 310.7.0; the shim created CUDA feature 13 with split-frame VRAM interop. In-game verification found zero differing bytes for all six supplied guide arrays, and the user verified gameplay. This diagnostic run enabled GPU readbacks and does not establish an FPS improvement or a game-wide artifact/latency audit.
+
+The extended diagnostic log also recorded prolonged split-frame waits and a GPU-marker timeout later in the run; their cause was not isolated. The successful rendering and guide comparisons are not evidence of stall-free operation.
+

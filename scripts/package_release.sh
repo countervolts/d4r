@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Builds the drag-in release: a zip whose contents are extracted into the folder that holds a game's
 # main .exe, like an OptiScaler release. packaging/D4R_README.txt describes the result.
 #
@@ -25,6 +26,7 @@
 # The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
+#   D4R_BUNDLE_DLSSD optional nvngx_dlssd.dll to include for Ray Reconstruction
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
@@ -96,10 +98,15 @@ if [[ "$VARIANT" == full ]]; then
   : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
   cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
   cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+  if [[ -n "${D4R_BUNDLE_DLSSD:-}" ]]; then
+    cp "$D4R_BUNDLE_DLSSD" "$STAGE/d4r/nvngx_dlssd.dll"
+  fi
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
 IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
+RR_DLLS=()
+[[ -z "${D4R_BUNDLE_DLSSD:-}" ]] || RR_DLLS=(--rr-dll "$D4R_BUNDLE_DLSSD")
 # one folder per target; RDNA4 targets also get <target>-fp8 (native FP8 WMMA, d4r.ini NativeFp8), which the
 # bridge serves instead when that setting is on
 folders=()
@@ -125,6 +132,19 @@ ensure_l_textures() {
       D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" l "$dir" >/dev/null
   fi
 }
+ensure_rr_textures() {
+  local dir="$1" accuracy="$2" missing=0 name
+  [[ -n "${D4R_BUNDLE_DLSSD:-}" ]] || return 0
+  for name in cuda_dldn_engine_hkpn_output_kernel_transformer \
+              cuda_dldn_engine_hkpn_output_kernel_transformer_diamond_wallaby; do
+    [[ -f "$dir/$name.hsaco" ]] || missing=1
+  done
+  if [[ "$missing" == 1 ]]; then
+    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply the RR texture variants in D4R_BUNDLE_TEX}"
+    D4R_PREFER_ACCURACY="$accuracy" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
+      D4R_DLSSD_DLL="$D4R_BUNDLE_DLSSD" "$ROOT/kernels/build.sh" rr "$dir" >/dev/null
+  fi
+}
 build_target() {
   local folder="$1" arch fp8 tex_dir accurate accurate_tex f
   arch="${folder%-fp8}"
@@ -148,7 +168,8 @@ build_target() {
     fi
   fi
   [[ "$VARIANT" != full ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
+  [[ "$VARIANT" != full ]] || ensure_rr_textures "$STAGE/d4r/kernels/$folder" 0
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"
 
   # Every release target also gets conservative network and texture variants. Do not copy fast
   # texture objects into this set: their compiler policy is fixed inside the binary.
@@ -170,6 +191,7 @@ build_target() {
   fi
   if [[ "$VARIANT" == full ]]; then
     ensure_l_textures "$accurate" 1
+    ensure_rr_textures "$accurate" 1
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
       [[ -f "$accurate/$(basename "$f")" ]] || {
         echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
@@ -177,7 +199,7 @@ build_target() {
     done
   fi
   rm -f "$accurate"/*.resolution.txt
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}"
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}" "${RR_DLLS[@]}"
 }
 kernel_jobs="${D4R_PACKAGE_KERNEL_JOBS:-1}"
 [[ "$kernel_jobs" =~ ^[1-9][0-9]*$ ]] || { echo "D4R_PACKAGE_KERNEL_JOBS must be positive" >&2; exit 2; }

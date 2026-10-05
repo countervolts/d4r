@@ -1,3 +1,4 @@
+<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
 # Architecture
 
 d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX D3D12 entry point in the game process, a CUDA driver underneath, and CUDA kernels that run. Everything between those points is translation.
@@ -8,7 +9,7 @@ d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX 
 |---|---|---|
 | OptiScaler (in GE-Proton) | external | Hooks the game's upscaler call and forwards DLSS requests to an NGX DLL (`NvngxPath`) |
 | NGX shim `d4r_nvngx.dll` | `tools/d4r_nvngx_shim.cpp` | Implements the NGX D3D12 API. Moves inputs and output between the game's D3D12 resources and CUDA, and drives the official NGX core through its CUDA API |
-| NGX core + `nvngx_dlss.dll` | NVIDIA, supplied by you | The real DLSS: parameter handling, network selection, the CUDA kernels |
+| NGX core + `nvngx_dlss.dll` and optional `nvngx_dlssd.dll` | NVIDIA, supplied by you | The real DLSS: parameter handling, Super Resolution or Ray Reconstruction network selection, and CUDA kernels |
 | CUDA bridge `nvcuda.dll` | `tools/wine_nvcuda_bridge.c` | A Wine builtin whose Windows exports forward to ZLUDA's Linux `libcuda.so`, plus d4r helpers (Vulkan memory import, asynchronous 2D copies, GPU-side waits, output redirect, linear textures) |
 | ZLUDA | `patches/zluda` | CUDA driver API on HIP; compiles NVIDIA's PTX to AMDGPU code; serves native kernels in place of PTX kernels |
 | Native kernels | `kernels/` | RDNA3 implementations of the DLSS network layers and parts of texture kernels |
@@ -33,6 +34,22 @@ With VRAM interop and split frames (the defaults when the patched vkd3d-proton i
 The watchdog reports delayed output but never signals an unfinished producer as ready. Cancellation and completion can occur out of order across the prep and CUDA threads, so the output timeline advances only through a completed prefix of admitted frames. Cancelling a later frame cannot release a game copy while an earlier producer is still writing. Retiring features remain registered until their CPU/CUDA jobs drain. The lifetime-aware vkd3d extension retains their staging buffers, imported buffers, conversion images and split semaphore through command-allocator reset or destruction after GPU completion. Discarded recordings are covered too; cleanup no longer relies on a 50 ms delay.
 
 The shim requires the matching lifetime-aware d3d12.dll and d3d12core.dll, even for host staging. It rejects older runtimes rather than recording references whose lifetime it cannot protect. FrameAge > 0 shows the newest finished result; without VRAM interop, inputs and output are staged through host memory.
+
+### Ray Reconstruction path
+
+Feature 13 uses the NGX core's CUDA lifecycle, not the denoiser's native D3D12 backend. A CUDA-capable `nvngx_dlssd.dll` must sit beside the calling shim; the installer stages it there as well as in the feature directory. Availability follows the core's denoiser availability and initialization result. `[RayReconstruction] Enable = auto` does not manufacture support; `Model` selects its own default/D/E preset independently of the Super Resolution model.
+
+Feature requirements may be queried before NGX initialization. The shim loads the providers without initializing NGX with a provisional application identity; when the core declines feature-13 discovery, it asks the CUDA-capable denoiser's D3D12 requirements export for the adapter's eligibility. This discovery-only call does not select the native D3D12 rendering backend. Initialized capability checks and feature creation still require the core's successful denoiser initialization.
+
+The shim snapshots denoiser guide bindings, scalar settings, camera matrices, and subrect origins per submitted frame. Normals and roughness use the SDK's `GBuffer.Normals` and `GBuffer.Roughness` keys; albedo bindings are translated to the CUDA denoiser's `DLSS.Input.*Albedo` keys. CUDA parameters point at stable texture-handle storage, not D3D12 resource pointers. Normals preserve the caller's component values rather than being renormalized during conversion.
+
+With VRAM interop, guides copy from Vulkan images into per-slot shared device buffers, then into the CUDA arrays sampled by the denoiser. Half, float, UNORM, and SNORM layouts copy verbatim where possible. BGRA and packed RGB formats are converted to RGBA32F by a Vulkan blit. Raw integer guides retain the host conversion because integer-to-float blits do not reproduce its semantics. CUDA import happens on the worker after allocation, outside the guide-binding lock. The input marker orders both routes, and resources remain held until their frame retires.
+
+`D4R_SHIM_RR_VRAM_GUIDES=0` selects the host guide route for A/B checks without disabling RGB VRAM interop. `D4R_SHIM_VRAM_VERIFY=1` also stages the guides and compares the actual CUDA arrays against the CPU conversion, failing the frame on mismatches. Verification preserves pitch-linear input row alignment; diagnostics must not replace GPU geometry with a tightly packed host stride.
+
+Separate alpha no longer forces RGB through host staging. R32F alpha copies from the denoiser's CUDA array into a shared result buffer and into the caller's subrect; half and UNORM destinations use a GPU blit. Raw integer destinations keep their existing host conversion, independently of the RGB route. Blit rounding is hardware-dependent and can differ from CPU conversion by one destination quantization step.
+
+Split frames reserve the current frame's alpha slot before its producer runs. Previous-frame presentation matches alpha to RGB's produced frame and validates its format and subrect. Pixels outside the evaluated rectangle remain untouched. `D4R_SHIM_ALPHA_VERIFY=1` compares the array region with its shared buffer; combined with output capture, it also saves that region as `*.rgba16f.alpha.f32`.
 
 ## Why each piece exists
 
@@ -69,7 +86,7 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 | `d4r\zluda\libcuda.so` | ZLUDA |
 | `d4r\kernels\<gfx target>\` | native kernels and their manifest `d4r-kernels.txt` |
 | `d4r\d4r.ini` | this game's settings |
-| `d4r\nvngx_dlss.dll`, `d4r\ngx\_nvngx.dll` | NVIDIA's files (the packager's `D4R_BUNDLE_NVIDIA=0` leaves them for the user to add) |
+| `d4r\nvngx_dlss.dll`, `d4r\ngx\_nvngx.dll`, optional `d4r\nvngx_dlssd.dll` | NVIDIA's files (the packager's `D4R_BUNDLE_NVIDIA=0` leaves them for the user to add); the optional denoiser is supplied through `D4R_BUNDLE_DLSSD` |
 
 **NGX routing.** OptiScaler tries `_nvngx.dll` before `nvngx.dll`, with system fallback for each name. `OptiDllPath=d4r` alone can therefore select Proton's system `_nvngx.dll` before reaching the shim. A file-valued `NvngxPath` takes priority on the first probe, regardless of the probe's name. It must select `d4r\nvngx.dll`, never `d4r\ngx\_nvngx.dll`: the latter is NVIDIA's core, which the shim loads internally. See OptiScaler 0.9.4's [NGX loader](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/proxies/NVNGX_Proxy.h) and [override handling](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/Util.cpp).
 
