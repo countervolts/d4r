@@ -12,7 +12,7 @@ Built from source by d4r (Apache License 2.0, d4r/licenses/d4r-LICENSE.txt):
 
 Third-party software, unmodified or patched by d4r:
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
-                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0008 applied.
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0012 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).
                          Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
   d3d12.dll, d3d12core.dll
