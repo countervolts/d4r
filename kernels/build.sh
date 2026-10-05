@@ -2,7 +2,7 @@
 # Builds the native replacements for DLSS kernels into one directory that ZLUDA serves them from
 # (D4R_ZLUDA_NATIVE_DIR, or NativeKernelDirFast in d4r.ini). See docs/native-kernels.md.
 #
-# usage: kernels/build.sh [all|k|l|m|tex|rr] [OUT_DIR] (default: all, kernels/out/native)
+# usage: kernels/build.sh [all|k|l|m|tex|rr|rrswin] [OUT_DIR] (default: all, kernels/out/native)
 #
 #   D4R_ROCM_DIR    ROCm installation with clang and the HIP device libraries (default /opt/rocm)
 #   D4R_GPU_ARCH    target GPU (default gfx1101): an RDNA3 (gfx110x) or RDNA4 (gfx120x) target; the kernels
@@ -39,7 +39,7 @@ esac
 CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "clang++ not found in $ROCM/lib/llvm/bin (set D4R_ROCM_DIR)" >&2; exit 2; }
 mkdir -p "$OUT"
-case "$WHAT" in all|k|l|m|tex|rr) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
+case "$WHAT" in all|k|l|m|tex|rr|rrswin) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
 # Never certify a directory containing older fast binaries as an accuracy set.
 if [[ "$ACCURACY" == 1 ]] && compgen -G "$OUT/*.hsaco" >/dev/null &&
     { [[ ! -f "$OUT/d4r-accuracy.txt" ]] || [[ "$(cat "$OUT/d4r-accuracy.txt")" != 1 ]]; }; then
@@ -138,6 +138,26 @@ if [[ "$WHAT" == rr || ( "$WHAT" == all && -n "${D4R_DLSSD_DLL:-}" ) ]]; then
         D4R_PREFER_ACCURACY="$ACCURACY" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
             D4R_ZLUDA_WAVE64="$((1 - ACCURACY))" D4R_TEX_FP8="$FP8" \
             D4R_DLSS_PTX_DIR="$RR_PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" sust_only "$OUT"
+    done
+fi
+if [[ "$WHAT" == rrswin ]]; then
+    echo "== Ray Reconstruction Swin layers"
+    : "${D4R_DLSSD_DLL:?set D4R_DLSSD_DLL to the CUDA-capable nvngx_dlssd.dll}"
+    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a patched ZLUDA build}"
+    RR_PTX_DIR="${D4R_DLSSD_PTX_DIR:-$HERE/extracted/rr}"
+    if [[ -z "${D4R_DLSSD_PTX_DIR:-}" ]]; then
+        python3 "$HERE/tools/extract_dlss_ptx.py" "$D4R_DLSSD_DLL" "$RR_PTX_DIR"
+    elif [[ ! -d "$RR_PTX_DIR" ]]; then
+        echo "missing extracted RR PTX directory: $RR_PTX_DIR" >&2; exit 2
+    fi
+    # one entry per denoiser layer; a layer whose body is not written yet is skipped so the family
+    # can be built while the ten bodies land independently
+    for layer in ${D4R_RRSWIN_ONLY:-enc0 enc1 enc2 enc3 enc4 enc5 dec0 dec1 dec2 dec3 dec4}; do
+        [[ -f "$HERE/rr/rrswin_$layer.hip" ]] || { echo "skipping $layer (kernels/rr/rrswin_$layer.hip is absent)"; continue; }
+        D4R_PREFER_ACCURACY="$ACCURACY" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
+            D4R_ZLUDA_WAVE64=0 D4R_TEX_FP8="$FP8" \
+            D4R_DLSS_PTX_DIR="$RR_PTX_DIR" "$HERE/tex/build_tex.sh" \
+            "cuda_dldn_engine_swin_${layer}_kernel" "../rr/rrswin_$layer" "$OUT"
     done
 fi
 [[ "$ACCURACY" == 1 ]] && printf '1\n' > "$OUT/d4r-accuracy.txt"
