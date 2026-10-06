@@ -76,6 +76,8 @@ In that build the GEMM activations live in LDS as e4m3 bytes (`SWIN_A8` in `swin
 - `-DSWIN_NO_TOKEN_LANES` builds these layers from `swin_block.h` again. enc2 and dec2 (96 channels, four heads) use the same template: byte-identical on the same recorded launches and harness sequences, 0.22 → 0.14 and 0.20 → 0.14 ms at 1280×720 render, 0.75 → 0.47 and 0.69 → 0.47 ms at 2560×1440.
 - Tried, no measurable gain: interleaving the WMMAs of independent k32 steps. Skipping windows that lie entirely outside the image was also exact but below the measurement noise (at most 2.4% of the windows of every other tube launch). Not tried: true16 code generation (the half-register conversions would save about 3% of the instructions).
 
+**Texture tails on the native-FP8 path.** The enc0 tail and the dec0 head encode their results with `v_cvt_pk_fp8_f32` on the f32 copies of the f16 values (`e4m3x4_f32` in `tex_common.h`) instead of ZLUDA's integer `e4m3x2`. With the tails' clamps (±2π for enc0, ±448 for dec0, as a median of three) the codes are equal for every non-NaN f16, checked over all 65536 patterns on an RX 9070 XT; a NaN in dec0 now encodes as −448 instead of the NaN code. Harness frames are byte-identical in both sets (LDR and HDR, motion vectors at render and display resolution). dec0: 0.21 → 0.15 ms at 1280×720 render and 0.74 → 0.53 ms at 2560×1440; enc0 changes by 1–2% (its time is ZLUDA's compile of the feature code). `-DD4R_TEX_SOFT_E4M3` (`D4R_TEX_CFLAGS`) keeps `e4m3x2`.
+
 RX 9070 XT, accuracy set, D3D12 harness at 3840×2160 output, median GPU ms per frame (`D4R_CUDA_KERNEL_PROFILE`, frames 81–200), previous build → this one:
 
 | Render | enc1 | dec1 | enc3 tube (6 launches) | whole evaluation |

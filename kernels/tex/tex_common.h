@@ -138,6 +138,19 @@ __attribute__((device)) static inline f8v k32_e4m3(f8v c, const kop& a0, const k
 }
 #endif
 
+// RDNA4 native FP8: the tails encode with the hardware conversion. e4m3x4_f32 gives the codes of four f32 values
+// that hold f16 values already clamped to the finite e4m3 range (the instruction encodes overflow as NaN), in the
+// bytes of one word. With the clamp it equals e4m3x2 for every non-NaN f16 (all 65536 patterns checked on an
+// RX 9070 XT). -DD4R_TEX_SOFT_E4M3 keeps e4m3x2.
+#if defined(D4R_TEX_FP8) && defined(__GFX12__) && !defined(D4R_TEX_SOFT_E4M3)
+#define D4R_TEX_HW_E4M3 1
+__attribute__((device)) static inline uint32_t e4m3x4_f32(float a, float b, float c, float d)
+{
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, d, (int)w, true);
+}
+#endif
+
 // ZLUDA's f16x2_to_e4m3x2_satfinite_bits: RNE satfinite e4m3 of both halves, low half -> low byte.
 __attribute__((device)) static inline uint32_t e4m3x2(uint32_t bits)
 {
