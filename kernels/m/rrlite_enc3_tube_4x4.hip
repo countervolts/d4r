@@ -11,6 +11,10 @@
 // recreation. Address-only caching then serves stale packed weights. Prepare
 // each launch; the default single image is sufficient on the launch stream.
 #define SWIN_PREP_KEY_AT 0
+// RDNA4 native FP8 builds use the token-lane block (swin_tok.h); -DSWIN_NO_TOKEN_LANES keeps swin_block.h
+#ifndef SWIN_NO_TOKEN_LANES
+#define SWIN_TOKEN_LANES
+#endif
 #include "swin_block.h"
 #ifndef SWIN_NW
 #define SWIN_NW 8
