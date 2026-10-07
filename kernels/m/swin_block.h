@@ -1050,6 +1050,12 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #ifndef SWIN_PREP_KEY_AT
 #define SWIN_PREP_KEY_AT 1 // weights pointer at offset 0; 0 forces preparation on every launch
 #endif
+#ifndef SWIN_PREP_IDENTITY_AT
+// weights pointer at offset (value - 1) for runtimes that key preparation by allocation identity (pointer +
+// allocation generation + write epoch: MicroCUDA), never by address alone; 0 = no such key. Runtimes that only
+// know d4r_prep_key_at (ZLUDA) ignore it.
+#define SWIN_PREP_IDENTITY_AT 0
+#endif
 
 // Optional weight-image slots for several weight sets with stable address identity. The ZLUDA
 // hook can run prep only for a weights pointer it has not seen (d4r_prep_key_at / d4r_prep_key_slots);
@@ -1090,13 +1096,14 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
     using NAME##_L = SwinLayout<C, NH, NPM, CIN>;                                                                       \
     constexpr int NAME##_S = SWIN_PREP_SLOTS;                                                                           \
     __device__ wslot g_w16[(NAME##_S + 1) * NAME##_L::TOTAL];                                                           \
-    __device__ uint64_t g_prep_keys[NAME##_S + 1];                                                                      \
+    extern "C" __device__ __attribute__((used)) uint64_t g_prep_keys[NAME##_S + 1] = {};                                \
     __constant__ SwinDescs<C, NH, NPM, CIN> g_descs = make_descs<C, NH, NPM, CIN>();                                    \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_block_z = NWAVES;                                         \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_blocks = (NAME##_L::TOTAL + 127) / 128;              \
     /* enc3 disables address-only reuse: a recreated feature may recycle a weights address */                        \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_at = SWIN_PREP_KEY_AT;                             \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_slots = NAME##_S;                                \
+    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_identity_at = SWIN_PREP_IDENTITY_AT;                 \
     extern "C" __global__ void __launch_bounds__(128) NAME##_prep(PARAMS p)                                             \
     {                                                                                                                   \
         const int idx = blockIdx.x * 128 + threadIdx.x;                                                                 \

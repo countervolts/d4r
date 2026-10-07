@@ -1615,6 +1615,7 @@ struct FrameTiming
     double prep = 0, worker = 0, workerWait = 0, finishWait = 0, markerWait = 0;
     double ngxHost = 0, ctxSync = 0, gpuEval = -1;
     double motionDilationWall = 0;
+    bool markerDeferred = false; // the worker waits for the input marker (D4R_SHIM_DEFER_MARKER)
     bool gpuEventsRecorded = false;
     double outputSyncWall = 0, outputSyncCpu = -1;
     bool outputSyncBlocking = false;
@@ -1680,6 +1681,9 @@ struct Feature
     unsigned int preset = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
     CudaEvent outputReadyEvent = nullptr;
+    // output wait pacing (D4R_SHIM_OUTPUT_POLL_US): smoothed time from the event record to its completion, kept
+    // separately for each wait site (they wait for very different amounts of GPU work)
+    double publishWaitEmaUs = 0.0, evalWaitEmaUs = 0.0;
     bool profileEventsReady = false;
 
     CudaImage color, depth, motion, exposure, output;
@@ -3757,16 +3761,59 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
 
 // Only called on the CUDA worker. A completion event covers queued work on
 // the default stream; do not rely on HIP's blocking flag to release the CPU.
-static int synchronize_default_stream(Feature& feature, bool* querySleep = nullptr)
+static int synchronize_default_stream(Feature& feature, bool* querySleep = nullptr, double* waitEmaUs = nullptr)
 {
     if (feature.outputReadyEvent != nullptr)
     {
         const int recorded = g.cu.eventRecord(feature.outputReadyEvent, nullptr);
         if (recorded == 0)
         {
+            // D4R_SHIM_OUTPUT_POLL_US: N > 0 polls every N us (200 was the fixed interval before), 0 yields between
+            // queries (spins). Unset: adaptive - sleep until shortly before the predicted completion (smoothed
+            // wait of earlier frames), then poll every 20 us, backing off to 200 us when the GPU runs late.
+            static const int fixedPoll = [] {
+                const char* v = std::getenv("D4R_SHIM_OUTPUT_POLL_US");
+                return v != nullptr && *v != '\0' ? static_cast<int>(env_uint("D4R_SHIM_OUTPUT_POLL_US", 200)) : -1;
+            }();
+            const auto waitStart = std::chrono::steady_clock::now();
+            unsigned polls = 0;
+            double lastNotReadyUs = -1.0; // elapsed time of the last query that found the work unfinished
             const int result = d4r_wait_event(
                 [&] { return g.cu.eventQuery(feature.outputReadyEvent); },
-                [] { d4r_sleep_us(200); });
+                [&] {
+                    if (fixedPoll >= 0)
+                    {
+                        d4r_sleep_us(static_cast<unsigned>(fixedPoll));
+                        return;
+                    }
+                    constexpr double kMarginUs = 120.0, kStepUs = 20.0, kChunkUs = 200.0, kSpinAfterUs = 150.0;
+                    const double elapsed = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - waitStart).count();
+                    lastNotReadyUs = elapsed; // this sleep follows a query that returned NOT_READY
+                    ++polls;
+                    const double predicted = waitEmaUs != nullptr ? *waitEmaUs : 0.0;
+                    const double remaining = predicted - kMarginUs - elapsed;
+                    // far from the predicted completion: sleep in chunks of at most 200 us (a single long sleep
+                    // can overshoot by far more under Wine); near it: 20 us polls; late: back off to 200 us
+                    if (remaining > kStepUs)
+                        d4r_sleep_us(static_cast<unsigned>(std::min(remaining, kChunkUs)));
+                    else if (elapsed < predicted + kSpinAfterUs)
+                        d4r_sleep_us(0); // final stretch around the predicted completion: spin (SwitchToThread);
+                                         // a Wine sleep rounds up to ~50 us, which would be the detection latency
+                    else
+                        d4r_sleep_us(static_cast<unsigned>(std::min(
+                            kStepUs * (1.0 + (elapsed - predicted - kSpinAfterUs) / 160.0), kChunkUs)));
+                });
+            if (result == 0 && fixedPoll < 0 && waitEmaUs != nullptr)
+            {
+                const double waited = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - waitStart).count();
+                // Learn the completion time, not our own wait: the work finished between the last NOT_READY query
+                // and the successful one (at most one 200 us chunk apart), so the midpoint cannot ratchet upwards
+                double sample = lastNotReadyUs >= 0.0 ? 0.5 * (lastNotReadyUs + waited) : waited;
+                sample = std::min(sample, 20000.0);
+                *waitEmaUs = *waitEmaUs == 0.0 ? sample : 0.8 * *waitEmaUs + 0.2 * sample;
+            }
             if (result == 0)
             {
                 if (querySleep != nullptr) *querySleep = true;
@@ -3811,7 +3858,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
         const double cpuStart = timing.enabled ? profile_thread_cpu_ms() : -1.0;
-        result = synchronize_default_stream(*feature, &timing.outputSyncBlocking);
+        result = synchronize_default_stream(*feature, &timing.outputSyncBlocking, &feature->publishWaitEmaUs);
         if (timing.enabled)
         {
             timing.outputSyncWall = profile_ms(syncStart, ProfileClock::now());
@@ -3943,6 +3990,8 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
     return feature.cudaHandle != nullptr && width == params.renderWidth && height == params.renderHeight;
 }
 
+static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t frame);
+
 static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
 {
     InputSlot& slot = feature->inputs[slotIndex];
@@ -4039,6 +4088,14 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         }
         feature->outputRedirected = redirect;
     }
+    if (timing.markerDeferred)
+    {
+        const auto markerStart = ProfileClock::now();
+        if (!wait_for_input_marker(feature, slotIndex, frame))
+            return;
+        if (timing.enabled)
+            timing.markerWait = profile_ms(markerStart, ProfileClock::now());
+    }
     const int eventStartResult = timing.enabled && feature->profileEventsReady
                                      ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
     const auto evalStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -4057,7 +4114,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     // D4R_SHIM_EVAL_SYNC=0 (VRAM interop): no wait between NGX's kernels and the output copy queued
     // behind them on the same stream; publish_vram synchronises before the result is released.
     static const bool evalSync = env_uint("D4R_SHIM_EVAL_SYNC", 1) != 0;
-    const int syncResult = params.vram && !evalSync ? 0 : synchronize_default_stream(*feature);
+    const int syncResult = params.vram && !evalSync ? 0 : synchronize_default_stream(*feature, nullptr, &feature->evalWaitEmaUs);
     const auto evaluated = ProfileClock::now();
     const bool gpuEventsRecorded = eventStartResult == 0 && eventEndResult == 0;
     float gpuEvalMs = -1.0f;
@@ -4120,10 +4177,12 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     post_publish(feature, hostIndex, frame, params, timing);
 }
 
-static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
+// Waits for this frame's own input marker (the GPU reached the game's input copies). false: the frame was
+// dropped (retired feature, skipped submission, timeout) and has been retired here.
+static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t frame)
 {
     InputSlot& slot = feature->inputs[slotIndex];
-    const auto start = ProfileClock::now();
+    const auto start = std::chrono::steady_clock::now();
     // A later input marker does not prove this slot's copies were submitted:
     // the game may have discarded this frame's command list. Require its own
     // tag, otherwise stale input data can enter DLSS's temporal history.
@@ -4143,7 +4202,7 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
                  *inputMarker);
             slot.busy = false;
             frame_retired(feature, frame);
-            return;
+            return false;
         }
         // D4R_SHIM_MARKER_POLL_US: poll interval (0 = yield); detection latency is on the critical path
         static const unsigned markerPollUs = env_uint("D4R_SHIM_MARKER_POLL_US", 200);
@@ -4152,6 +4211,34 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
         else
             d4r_sleep_us(markerPollUs);
     }
+    return true;
+}
+
+static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
+{
+    InputSlot& slot = feature->inputs[slotIndex];
+    const auto start = ProfileClock::now();
+    // D4R_SHIM_DEFER_MARKER (default on): with VRAM interop nothing else happens here before the marker lands, so
+    // the worker thread waits for it itself, after the host-side setup of the evaluation (which no longer queues
+    // behind the marker: ~0.1 ms off the critical path) and without a thread wake-up between marker and NGX.
+    static const bool deferMarker = env_uint("D4R_SHIM_DEFER_MARKER", 1) != 0 &&
+                                    env_uint("D4R_MOTION_DILATION", 0) == 0;
+    if (params.vram && deferMarker && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
+    {
+        timing.markerDeferred = true;
+        if (timing.enabled)
+        {
+            timing.prepStart = start;
+            timing.prep = profile_ms(start, ProfileClock::now());
+            timing.workerQueued = ProfileClock::now();
+        }
+        g.worker.post([feature, slotIndex, frame, params, timing] {
+            run_evaluation(feature, slotIndex, frame, params, timing);
+        });
+        return;
+    }
+    if (!wait_for_input_marker(feature, slotIndex, frame))
+        return;
     const auto ready = ProfileClock::now();
     // With VRAM interop the inputs are already on the GPU; host staging runs
     // only to cross-check them (D4R_SHIM_VRAM_VERIFY).

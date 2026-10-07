@@ -125,13 +125,23 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     for mode in static dynamic; do
         for range in hdr ldr; do specs+=("rrlite_downsample_kernel_${mode}_${range}:sust_only${downsample_mode}"); done
     done
-    # The fast set serves two K kernels from native code translated from the PTX (kernels/native): these builds
-    # replace the sust_only build of the same name. The accuracy set keeps ZLUDA's compile (denormals preserved).
-    native_out=hiluma_engine_output_depthinv_mvhi_hdr_max_v2_rel
-    native_in=hiluma_engine_input_depthinv_mvhi_hdr_v2_rel
+    # The fast set serves K's hiluma input/output kernels from native code translated from the PTX
+    # (kernels/native): these builds replace the sust_only build of the same name. Every flag variant whose
+    # code the translators prove compatible is covered (they refuse anything else): input = all 8
+    # depth x motion x range variants; output = the 4 HDR "max" variants (the LDR max kernels are a different
+    # kernel structure and keep the sust_only build). D4R_K_NO_DEPTH_TILE (skip the depth tile fill) is proven
+    # for mvhi only: mvlo kernels read the depth tile, so they keep the fill (measured: byte-exact only then).
+    # The accuracy set keeps ZLUDA's compile (denormals preserved).
+    native_outs=() native_ins=()
+    for depth in depthinv depthreg; do
+        for mv in mvhi mvlo; do
+            native_outs+=("hiluma_engine_output_${depth}_${mv}_hdr_max_v2_rel")
+            for range in hdr ldr; do native_ins+=("hiluma_engine_input_${depth}_${mv}_${range}_v2_rel"); done
+        done
+    done
     for spec in "${specs[@]}"; do
         IFS=: read -r kernel src mode <<< "$spec"
-        [[ "$ACCURACY" == 0 && "$kernel" == "$native_out" ]] && continue
+        [[ "$ACCURACY" == 0 && " ${native_outs[*]} " == *" $kernel "* ]] && continue
         # accuracy sets are wave32, except M's post and downsample kernels on RDNA4: their wave64 builds keep the
         # denormal handling and gave the same image on an RX 9070 XT (post 0.79 -> 0.67 ms, downsample 0.43 -> 0.39 ms)
         w64=0
@@ -145,24 +155,28 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     done
     if [[ "$WHAT" != l && "$ACCURACY" == 0 ]]; then
         # NVIDIA's PTX translated to HIP (native/ptx2hip.py) and rebuilt natively; the generated sources stay in a
-        # temporary directory. Both kernels run through the same texture/surface helpers as the other texture
-        # kernels and are byte-identical to ZLUDA's compile of the PTX.
+        # temporary directory. They run through the same texture/surface helpers as the other texture kernels
+        # and are byte-identical to ZLUDA's compile of the PTX (validated per variant in the harness).
         ptx_of() { grep -l -E "\.entry[[:space:]]+$1[[:space:]]*\(" "$PTX_DIR"/*.ptx | head -1; }
         NAT="$HERE/native"
         NT="$(mktemp -d)"
         trap 'rm -rf "$NT"' EXIT
-        ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
-        # hiluma output (path B for Quality..UltraPerf), LDS tile as a function, global-memory redirect stores
-        python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/output_translated.hip"
-        python3 "$NAT/rewrite_output.py" "$NT/output_translated.hip" > "$NT/$native_out.hip"
-        D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" "$OUT/$native_out.hsaco" \
-            -DD4R_NATIVE_F2I -DD4R_K_NO_DEPTH_TILE -DD4R_AS1_STORES
-        # hiluma input: scratch arrays in registers, wave32
-        ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
-        python3 "$NAT/ptx2hip.py" --ifconv --sink "$ptx" "$native_in" > "$NT/in_ifs.hip"
-        python3 "$NAT/in_fuse.py" "$NT/in_ifs.hip" > "$NT/in_unit.h"
-        cp "$NAT/in_regs.hip" "$NT/in_regs.hip"
-        D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/in_regs.hip" "$OUT/$native_in.hsaco"
+        for native_out in "${native_outs[@]}"; do
+            ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
+            # hiluma output (path B for Quality..UltraPerf), LDS tile as a function, global-memory redirect stores
+            python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/output_translated.hip"
+            python3 "$NAT/rewrite_output.py" "$NT/output_translated.hip" > "$NT/$native_out.hip"
+            depth_tile=(); [[ "$native_out" == *_mvhi_* ]] && depth_tile=(-DD4R_K_NO_DEPTH_TILE)
+            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" "$OUT/$native_out.hsaco" \
+                -DD4R_NATIVE_F2I "${depth_tile[@]}" -DD4R_AS1_STORES
+        done
+        for native_in in "${native_ins[@]}"; do
+            ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
+            # hiluma input: per-thread LDS scratch and local array in registers (in_lds2reg.py), wave32
+            python3 "$NAT/ptx2hip.py" --ifconv --sink "$ptx" "$native_in" > "$NT/in_ifs.hip"
+            python3 "$NAT/in_lds2reg.py" "$NT/in_ifs.hip" > "$NT/$native_in.hip"
+            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/$native_in.hip" "$OUT/$native_in.hsaco"
+        done
     fi
 fi
 [[ "$ACCURACY" == 1 ]] && printf '1\n' > "$OUT/d4r-accuracy.txt"

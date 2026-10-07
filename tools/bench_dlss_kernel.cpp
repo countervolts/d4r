@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -120,10 +121,15 @@ int main(int argc, char** argv)
     std::vector<unsigned char> image = read_file(argv[1]);
     image.resize(image.size() + 16, 0);
 
-    void* library = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL);
+    const char* library_path = std::getenv("D4R_BENCH_LIBCUDA");
+    if (!library_path) library_path = "libcuda.so";
+    const auto startup = std::chrono::steady_clock::now();
+    auto us_since = [](auto start) { return std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - start).count(); };
+    void* library = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
     if (library == nullptr)
     {
-        std::fprintf(stderr, "dlopen(libcuda.so): %s\n", dlerror());
+        std::fprintf(stderr, "dlopen(%s): %s\n", library_path, dlerror());
         return 1;
     }
     auto init = load<CUresult (*)(unsigned int)>(library, "cuInit");
@@ -149,8 +155,20 @@ int main(int argc, char** argv)
     CHECK(init(0));
     CHECK(device_get(&device, 0));
     CHECK(context_create(&context, 0, device));
+    std::printf("startup_init_context_us=%.3f\n", us_since(startup));
+    auto stage = std::chrono::steady_clock::now();
     CHECK(module_load(&module, image.data()));
+    std::printf("module_load_us=%.3f\n", us_since(stage));
+    stage = std::chrono::steady_clock::now();
     CHECK(get_function(&function, module, kernel.c_str()));
+    std::printf("first_lookup_us=%.3f\n", us_since(stage));
+    stage = std::chrono::steady_clock::now();
+    for (int i = 0; i < 10000; ++i) {
+        void* again = nullptr;
+        CHECK(get_function(&again, module, kernel.c_str()));
+        if (again != function) return 3;
+    }
+    std::printf("cached_lookup_us=%.3f\n", us_since(stage) / 10000);
     for (Allocation& allocation : allocations)
         CHECK(mem_alloc(&allocation.device, allocation.bytes));
     for (const Pointer& pointer : pointers)
@@ -161,20 +179,39 @@ int main(int argc, char** argv)
     size_t argument_bytes = arguments.size();
     void* extra[] = {reinterpret_cast<void*>(1), arguments.data(), reinterpret_cast<void*>(2), &argument_bytes,
                      nullptr};
-    auto restore = [&]() -> CUresult {
-        for (Allocation& allocation : allocations)
+    const bool immutable_weights = std::getenv("D4R_BENCH_IMMUTABLE_WEIGHTS") != nullptr;
+    size_t weight_allocation = allocations.size();
+    if (immutable_weights) {
+        if (kernel != "dltss_pwin_enc0_layer") return 2;
+        for (const auto& pointer : pointers) if (pointer.offset == 64) weight_allocation = pointer.allocation;
+        if (weight_allocation == allocations.size()) return 2;
+    }
+    auto restore = [&](bool initial = true) -> CUresult {
+        for (size_t i = 0; i < allocations.size(); ++i) {
+            if (!initial && immutable_weights && i == weight_allocation) continue;
+            auto& allocation = allocations[i];
             if (CUresult result = copy_h2d(allocation.device, allocation.data.data(), allocation.bytes))
                 return result;
+        }
         return 0;
     };
+    void* parameter_array[] = {arguments.data()};
+    const bool use_parameter_array = std::getenv("D4R_BENCH_PARAM_ARRAY") != nullptr;
     auto run = [&]() {
         return launch_kernel(function, launch[0], launch[1], launch[2], launch[3], launch[4], launch[5],
-                             launch[6], nullptr, nullptr, extra);
+                             launch[6], nullptr, use_parameter_array ? parameter_array : nullptr,
+                             use_parameter_array ? nullptr : extra);
     };
 
+    stage = std::chrono::steady_clock::now();
     CHECK(restore());
+    std::printf("restore_h2d_us=%.3f\n", us_since(stage));
+    stage = std::chrono::steady_clock::now();
     CHECK(run());
+    std::printf("first_launch_cpu_us=%.3f\n", us_since(stage));
+    stage = std::chrono::steady_clock::now();
     CHECK(synchronize());
+    std::printf("first_sync_wall_us=%.3f\n", us_since(stage));
     for (size_t index = 0; index < allocations.size(); ++index)
     {
         std::vector<unsigned char> result(allocations[index].bytes);
@@ -201,18 +238,35 @@ int main(int argc, char** argv)
     CHECK(event_create(&start, 0));
     CHECK(event_create(&end, 0));
     std::vector<float> times;
+    std::vector<double> cpu_times, sync_times;
     for (int iteration = 0; iteration < iterations; ++iteration)
     {
-        CHECK(restore());
+        CHECK(restore(false));
         CHECK(synchronize());
         CHECK(event_record(start, nullptr));
+        stage = std::chrono::steady_clock::now();
         CHECK(run());
+        cpu_times.push_back(us_since(stage));
         CHECK(event_record(end, nullptr));
+        stage = std::chrono::steady_clock::now();
         CHECK(synchronize());
+        sync_times.push_back(us_since(stage));
         float milliseconds = 0;
         CHECK(event_elapsed(&milliseconds, start, end));
         times.push_back(milliseconds);
     }
+    using Stats = CUresult (*)(void*, uint64_t*, uint64_t*);
+    auto stats = reinterpret_cast<Stats>(dlsym(library, "d4rMicrocudaGetDispatchStats"));
+    if (stats) {
+        uint64_t prep = 0, skips = 0;
+        CHECK(stats(function, &prep, &skips));
+        std::printf("microcuda_prep_runs=%llu skips=%llu\n", (unsigned long long)prep, (unsigned long long)skips);
+    }
+    std::sort(cpu_times.begin(), cpu_times.end());
+    std::sort(sync_times.begin(), sync_times.end());
+    if (!cpu_times.empty())
+        std::printf("launch_cpu_median_us=%.3f sync_wall_median_us=%.3f\n",
+                    cpu_times[cpu_times.size()/2], sync_times[sync_times.size()/2]);
     std::sort(times.begin(), times.end());
     if (!times.empty())
         std::printf("kernel %s grid=%u,%u,%u block=%u,%u,%u iterations=%d min=%.4f median=%.4f max=%.4f ms\n",

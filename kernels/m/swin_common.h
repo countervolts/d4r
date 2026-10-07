@@ -337,6 +337,20 @@ __device__ __forceinline__ sop lds16(const half_t* p)
 // e4m3 bytes of an f16 operand whose values are e4m3 values (K order kept: byte j = element j)
 __device__ __forceinline__ gop to_fp8(sop v)
 {
+#if defined(SWIN_FP8_HWCVT) && defined(__GFX12__)
+    // Opt-in, UNVERIFIED ON HARDWARE: the values already are e4m3 values (finite, |x| <= 448), so the hardware
+    // conversion has nothing to round or saturate; byte j = element j as below. Open question before enabling
+    // it by default: whether e4m3 subnormals (k * 2^-9) survive the gfx12 denormal mode in effect.
+    uint32_t w[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        int packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * j], (float)v[4 * j + 1], 0, false);
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * j + 2], (float)v[4 * j + 3], packed, true);
+        w[j] = (uint32_t)packed;
+    }
+    return (u2v){w[0], w[1]};
+#endif
     uint32_t c[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j)

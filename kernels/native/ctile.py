@@ -224,8 +224,15 @@ def apply(tr, tokenize):
     body = tr.body
     items = parse(body, tokenize)
     # color texture handle: ld.param.u64 [%rd1+-56] (param+200, %rd10 / %rd69); taps use it or its mov aliases
+    # (some variants, e.g. mvlo, re-materialize the parameter base: %rdN = param_0 + 256, the same address as %rd1)
+    param0 = {it['dst'][0] for it in items if it['kind'] == 'stmt' and it['op'] == 'mov.b64'
+              and re.search(r',\s*\w+_param_0\s*$', it['rest'])}
+    bases = {it['dst'][0] for it in items if it['kind'] == 'stmt' and it['op'] == 'add.s64'
+             and len(it['src']) == 1 and it['src'][0] in param0 and re.search(r',\s*256\s*$', it['rest'])}
+    if '%rd1' not in bases:
+        raise CtileErr(f'parameter base %rd1 not found ({sorted(bases)})')
     color = {it['dst'][0] for it in items if it['kind'] == 'stmt' and it['op'] == 'ld.param.u64'
-             and re.search(r'\[%rd1\+-56\]', it['rest'])}
+             and any(re.search(r'\[' + re.escape(b) + r'\+-56\]', it['rest']) for b in bases)}
     aliases = set(color)
     for it in items:
         if it['kind'] == 'stmt' and it['op'] == 'mov.u64' and len(it['src']) == 1 and it['src'][0] in color:

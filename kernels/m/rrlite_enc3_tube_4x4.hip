@@ -8,9 +8,13 @@
 #define SWIN_MLP_R(NW) 2
 #endif
 // NGX can recycle a weights address for another tube block after feature
-// recreation. Address-only caching then serves stale packed weights. Prepare
-// each launch; the default single image is sufficient on the launch stream.
+// recreation. Address-only caching then serves stale packed weights, so
+// d4r_prep_key_at stays 0 (ZLUDA prepares every launch). MicroCUDA instead keys
+// preparation by allocation identity (d4r_prep_identity_at): one image per tube
+// weight set (6 per evaluation), re-prepared on any free/reallocation or write.
 #define SWIN_PREP_KEY_AT 0
+#define SWIN_PREP_IDENTITY_AT 1
+#define SWIN_PREP_SLOTS 8
 #include "swin_block.h"
 #ifndef SWIN_NW
 #define SWIN_NW 8

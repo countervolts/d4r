@@ -43,6 +43,12 @@ def rewrite(source):
     live_out = definitions & uses_outside
     if live_out != {'r215', 'r217'}:
         raise ValueError(f'tile register contract changed: {sorted(live_out)}')
+    # The replacement passes r3, r4, r7, r8 and f1 by name: the region's inputs must be exactly the ones it was
+    # written for (other flag variants of the kernel reuse this region; the checks above alone only cover outputs).
+    region_text = ''.join(lines[i] for i in sorted(removed))
+    live_in = set(REGISTER.findall(region_text)) - definitions
+    if live_in != {'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'rd1', 'f1', 'f4'}:
+        raise ValueError(f'tile input contract changed: {sorted(live_in)}')
     replacement = '''L__BB0_124:;
     output_tile_fill(KARGP, (int32_t)r3, (int32_t)r4, (int32_t)r7, (int32_t)(r8 + 1u),
                      f1, (AS3 uint8_t*)sharedColor, (AS3 uint8_t*)sharedDepth);

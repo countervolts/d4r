@@ -62,6 +62,7 @@ enum
 };
 
 static void* cuda_library;
+static int microcuda_k_requested;
 static pthread_once_t load_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t array_descriptor_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -777,6 +778,61 @@ int WINAPI d4rOutputKernelNative(void)
 
 static void load_zluda(void)
 {
+    /* Explicit experimental backend. Never silently mix module/context/array
+       handles from MicroCUDA and ZLUDA, and never fall back after selection. */
+    const char* backend = getenv("D4R_CUDA_BACKEND");
+    if (backend != NULL && strcmp(backend, "microcuda-k") == 0)
+    {
+        microcuda_k_requested = 1;
+        backend = "zluda";
+        tracef("microcuda-k selected: audited K enc0 via MicroCUDA; all remaining APIs/kernels via ZLUDA (partial integration)");
+    }
+    if (backend != NULL && backend[0] != '\0' && strcmp(backend, "zluda") != 0)
+    {
+        if (strcmp(backend, "microcuda") != 0)
+        {
+            set_load_error("unknown D4R_CUDA_BACKEND: %s", backend);
+            return;
+        }
+        const char* library = getenv("D4R_MICROCUDA_LIBCUDA");
+        if (library == NULL || library[0] == '\0')
+        {
+            set_load_error("microcuda requires D4R_MICROCUDA_LIBCUDA and D4R_MICROCUDA_PACK");
+            return;
+        }
+        const char* prefer = getenv("D4R_PREFER_ACCURACY");
+        if (prefer != NULL && strcmp(prefer, "1") == 0)
+        {
+            set_load_error("microcuda has no PreferAccuracy module pack");
+            return;
+        }
+        char native_path[1024];
+        expand_home(library, native_path, sizeof(native_path));
+        init_library_dirs();
+        preload_rocm();
+        cuda_library = load_library_resolving(native_path, 0);
+        if (cuda_library != NULL)
+        {
+            load_error[0] = '\0';
+            /* Native kernels are verified and served exactly as for ZLUDA (per-process directory,
+               linked when NGX loads a module whose PTX matches); MicroCUDA reads that directory. */
+            const char* cache = getenv("D4R_ZLUDA_CACHE_HOME");
+            char cache_home[1024] = {0};
+            if (cache != NULL && cache[0] != '\0')
+            {
+                expand_home(cache, cache_home, sizeof(cache_home));
+                make_directories(cache_home);
+            }
+            prepare_native_kernels(cache_home[0] != '\0' ? cache_home : NULL);
+            const char* served = getenv("D4R_ZLUDA_NATIVE_DIR");
+            if (served != NULL && served[0] != '\0')
+                setenv("D4R_MICROCUDA_NATIVE_DIR", served, 1);
+            else
+                unsetenv("D4R_MICROCUDA_NATIVE_DIR");
+            tracef("MicroCUDA backend selected: %s (modules from D4R_MICROCUDA_PACK; no ZLUDA fallback)", native_path);
+        }
+        return;
+    }
     /* A policy switch, applied before ZLUDA loads or reads its compilation/cache settings. This
        also covers native-off and missing/version-mismatched native kernels. */
     const int accuracy = d4r_apply_accuracy_policy();
@@ -1061,7 +1117,7 @@ static void create_default_zluda_context(void)
         return;
     }
 
-    tracef("created ZLUDA context for device %d", device);
+    tracef("created CUDA context for device %d", device);
 }
 
 static void ensure_context(void)
@@ -1169,6 +1225,148 @@ static int find_allocation(CUdeviceptr address, CUdeviceptr* base, size_t* bytes
     }
     pthread_mutex_unlock(&instrumentation_lock);
     return found;
+}
+
+/* Explicit partial integration for game validation. Keep CUDA/ZLUDA handles
+   visible to NGX; replace only the audited enc0 dispatch, using the same HIP
+   context/default stream and linear pointers. This is NOT a ZLUDA-free backend. */
+static pthread_once_t microcuda_k_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t microcuda_k_lock = PTHREAD_MUTEX_INITIALIZER;
+static CUMODULELOADDATA_FN microcuda_k_load;
+static CUMODULEGETFUNCTION_FN microcuda_k_get;
+static CUMODULEUNLOAD_FN microcuda_k_unload;
+static CULAUNCHKERNEL_FN microcuda_k_launch;
+typedef void(__attribute__((sysv_abi)) *MICROCUDA_RANGE_FN)(uint64_t, size_t);
+typedef void(__attribute__((sysv_abi)) *MICROCUDA_FREE_FN)(uint64_t);
+typedef CUresult(__attribute__((sysv_abi)) *MICROCUDA_STATS_FN)(CUfunction, uint64_t*, uint64_t*);
+static MICROCUDA_RANGE_FN microcuda_k_track, microcuda_k_write;
+static MICROCUDA_FREE_FN microcuda_k_forget;
+static MICROCUDA_STATS_FN microcuda_k_stats;
+static CUmodule microcuda_k_reference[32], microcuda_k_modules[32];
+static CUfunction microcuda_k_original[32], microcuda_k_functions[32];
+static unsigned int microcuda_k_highwater;
+static uint64_t microcuda_k_launches;
+
+static void load_microcuda_k(void)
+{
+    const char* configured = getenv("D4R_MICROCUDA_LIBCUDA");
+    if (configured == NULL || configured[0] == '\0')
+    {
+        tracef("microcuda-k unavailable: D4R_MICROCUDA_LIBCUDA required");
+        return;
+    }
+    char path[1024];
+    expand_home(configured, path, sizeof(path));
+    void* library = load_library_resolving(path, 0);
+    if (library == NULL) return;
+    CUINIT_FN init = (CUINIT_FN)dlsym(library, "cuInit");
+    microcuda_k_load = (CUMODULELOADDATA_FN)dlsym(library, "cuModuleLoadData");
+    microcuda_k_get = (CUMODULEGETFUNCTION_FN)dlsym(library, "cuModuleGetFunction");
+    microcuda_k_unload = (CUMODULEUNLOAD_FN)dlsym(library, "cuModuleUnload");
+    microcuda_k_launch = (CULAUNCHKERNEL_FN)dlsym(library, "cuLaunchKernel");
+    microcuda_k_track = (MICROCUDA_RANGE_FN)dlsym(library, "d4rMicrocudaTrackAllocation");
+    microcuda_k_write = (MICROCUDA_RANGE_FN)dlsym(library, "d4rMicrocudaNotifyWrite");
+    microcuda_k_forget = (MICROCUDA_FREE_FN)dlsym(library, "d4rMicrocudaForgetAllocation");
+    microcuda_k_stats = (MICROCUDA_STATS_FN)dlsym(library, "d4rMicrocudaGetDispatchStats");
+    if (microcuda_k_track)
+    {
+        pthread_mutex_lock(&instrumentation_lock);
+        for (AllocationRecord* a = allocations; a != NULL; a = a->next)
+            microcuda_k_track(a->base, a->bytes);
+        pthread_mutex_unlock(&instrumentation_lock);
+    }
+    if (!init || !microcuda_k_load || !microcuda_k_get || !microcuda_k_unload || !microcuda_k_launch || init(0))
+    {
+        microcuda_k_load = NULL;
+        tracef("microcuda-k initialization failed; no native MicroCUDA dispatch available");
+    }
+}
+
+static void microcuda_k_note_module(CUmodule reference, const void* image)
+{
+    if (!microcuda_k_requested || native_source[0] == '\0') return;
+    /* The experimental dispatch must use the same selected accuracy/fast/native
+       set as the reference. A registry for another variant fails its SHA check. */
+    setenv("D4R_MICROCUDA_NATIVE_DIR", native_source, 1);
+    pthread_once(&microcuda_k_once, load_microcuda_k);
+    if (!microcuda_k_load) return;
+    CUmodule module = NULL;
+    const CUresult result = microcuda_k_load(&module, image);
+    if (result != CUDA_SUCCESS) return; /* explicit hybrid: unregistered modules use reference */
+    pthread_mutex_lock(&microcuda_k_lock);
+    unsigned int slot;
+    for (slot = 0; slot < 32; ++slot) if (microcuda_k_modules[slot] == NULL) break;
+    if (slot < 32)
+    {
+        microcuda_k_reference[slot] = reference;
+        microcuda_k_modules[slot] = module;
+        if (slot >= microcuda_k_highwater)
+            __atomic_store_n(&microcuda_k_highwater, slot + 1, __ATOMIC_RELEASE);
+        tracef("microcuda-k registered reference=%p native=%p slot=%u", reference, module, slot);
+    }
+    else
+    {
+        microcuda_k_unload(module);
+        tracef("microcuda-k module table exhausted");
+    }
+    pthread_mutex_unlock(&microcuda_k_lock);
+}
+
+static void microcuda_k_note_function(CUmodule reference, CUfunction original, const char* name)
+{
+    if (!microcuda_k_requested || strcmp(name, "dltss_pwin_enc0_layer") != 0) return;
+    pthread_mutex_lock(&microcuda_k_lock);
+    int mapped = 0;
+    for (unsigned int slot = 0; slot < microcuda_k_highwater; ++slot)
+        if (microcuda_k_reference[slot] == reference && microcuda_k_modules[slot] != NULL)
+        {
+            CUfunction function = NULL;
+            CUresult result = microcuda_k_get(&function, microcuda_k_modules[slot], name);
+            if (result == CUDA_SUCCESS)
+            {
+                mapped = 1;
+                __atomic_store_n(&microcuda_k_functions[slot], function, __ATOMIC_RELEASE);
+                __atomic_store_n(&microcuda_k_original[slot], original, __ATOMIC_RELEASE);
+                tracef("microcuda-k dispatch mapped %s original=%p native=%p", name, original, function);
+            }
+            else tracef("microcuda-k function lookup failed %d", result);
+        }
+    if (!mapped) tracef("microcuda-k enc0 remains reference: no compatible module/selected native variant");
+    pthread_mutex_unlock(&microcuda_k_lock);
+}
+
+static CUfunction microcuda_k_lookup(CUfunction original)
+{
+    if (!microcuda_k_requested) return NULL;
+    const unsigned int count = __atomic_load_n(&microcuda_k_highwater, __ATOMIC_ACQUIRE);
+    for (unsigned int i = 0; i < count; ++i)
+        if (__atomic_load_n(&microcuda_k_original[i], __ATOMIC_ACQUIRE) == original)
+            return __atomic_load_n(&microcuda_k_functions[i], __ATOMIC_ACQUIRE);
+    return NULL;
+}
+
+static void microcuda_k_remove_module(CUmodule reference)
+{
+    if (!microcuda_k_requested) return;
+    pthread_mutex_lock(&microcuda_k_lock);
+    for (unsigned int slot = 0; slot < microcuda_k_highwater; ++slot)
+        if (microcuda_k_reference[slot] == reference && microcuda_k_modules[slot] != NULL)
+        {
+            if (microcuda_k_stats && microcuda_k_functions[slot])
+            {
+                uint64_t prep = 0, skips = 0;
+                microcuda_k_stats(microcuda_k_functions[slot], &prep, &skips);
+                tracef("microcuda-k prep stats runs=%llu skips=%llu", (unsigned long long)prep, (unsigned long long)skips);
+            }
+            __atomic_store_n(&microcuda_k_original[slot], NULL, __ATOMIC_RELEASE);
+            __atomic_store_n(&microcuda_k_functions[slot], NULL, __ATOMIC_RELEASE);
+            CUresult result = microcuda_k_unload(microcuda_k_modules[slot]);
+            if (result != CUDA_SUCCESS) tracef("microcuda-k unload failed %d", result);
+            microcuda_k_modules[slot] = NULL;
+            microcuda_k_reference[slot] = NULL;
+            tracef("microcuda-k completed dispatches=%llu", (unsigned long long)microcuda_k_launches);
+        }
+    pthread_mutex_unlock(&microcuda_k_lock);
 }
 
 static void remember_surface_object(CUsurfObject object, const void* resource)
@@ -2119,6 +2317,7 @@ CUresult WINAPI cuModuleLoadData(CUmodule* module, const void* image)
     capture_ptx_if_present(image, "cuModuleLoadData");
     image = replacement_image(image, "cuModuleLoadData");
     CUresult result = function != NULL ? function(module, image) : missing("cuModuleLoadData");
+    if (result == CUDA_SUCCESS) microcuda_k_note_module(*module, image);
     tracef("cuModuleLoadData image=%p result=%d module=%p", image, result, module != NULL ? *module : NULL);
     return result;
 }
@@ -2131,6 +2330,7 @@ CUresult WINAPI cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned
     capture_ptx_if_present(image, "cuModuleLoadDataEx");
     CUresult result = function != NULL ? function(module, image, option_count, options, option_values)
                                        : missing("cuModuleLoadDataEx");
+    if (result == CUDA_SUCCESS && option_count == 0) microcuda_k_note_module(*module, image);
     tracef("cuModuleLoadDataEx image=%p options=%u result=%d module=%p",
            image, option_count, result, module != NULL ? *module : NULL);
     return result;
@@ -2149,6 +2349,7 @@ CUresult WINAPI cuModuleUnload(CUmodule module)
 {
     CUMODULEUNLOAD_FN function = (CUMODULEUNLOAD_FN)find_zluda_symbol("cuModuleUnload");
     CUresult result = function != NULL ? function(module) : missing("cuModuleUnload");
+    if (result == CUDA_SUCCESS) microcuda_k_remove_module(module);
     tracef("cuModuleUnload module=%p result=%d", module, result);
     return result;
 }
@@ -2159,6 +2360,7 @@ CUresult WINAPI cuModuleGetFunction(CUfunction* function_out, CUmodule module, c
     CUresult result = function != NULL ? function(function_out, module, name) : missing("cuModuleGetFunction");
     if (result == CUDA_SUCCESS && function_out != NULL)
     {
+        microcuda_k_note_function(module, *function_out, name);
         remember_function_name(*function_out, name);
         note_function_lookup(*function_out, name);
     }
@@ -2184,10 +2386,25 @@ CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, 
     note_launch(function_handle);
     PendingKernelProfile* profile = function != NULL
         ? begin_kernel_profile(sequence, function_handle, stream) : NULL;
-    CUresult result = function != NULL
-        ? function(function_handle, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+    CUfunction native_function = microcuda_k_lookup(function_handle);
+    if (native_function != NULL)
+    {
+        const uint64_t count = __atomic_add_fetch(&microcuda_k_launches, 1, __ATOMIC_RELAXED);
+        if (count == 1 || count % 4096 == 0)
+            tracef("microcuda-k actual dispatch %llu original=%p native=%p", (unsigned long long)count, function_handle, native_function);
+    }
+    CULAUNCHKERNEL_FN selected = native_function != NULL ? microcuda_k_launch : function;
+    CUresult result = selected != NULL
+        ? selected(native_function != NULL ? native_function : function_handle, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                    shared_bytes, stream, kernel_params, extra)
         : missing("cuLaunchKernel");
+    if (native_function != NULL && result == CUDA_SUCCESS && microcuda_k_stats &&
+        (__atomic_load_n(&microcuda_k_launches, __ATOMIC_RELAXED) % 4096) == 0)
+    {
+        uint64_t prep = 0, skips = 0;
+        microcuda_k_stats(native_function, &prep, &skips);
+        tracef("microcuda-k prep stats runs=%llu skips=%llu", (unsigned long long)prep, (unsigned long long)skips);
+    }
     end_kernel_profile(profile, result, stream);
     if (result != CUDA_SUCCESS || trace_verbose())
     {
@@ -2233,7 +2450,10 @@ CUresult WINAPI cuMemAlloc(CUdeviceptr* pointer, size_t bytes)
     CUMEMALLOC_FN function = (CUMEMALLOC_FN)find_zluda_symbol("cuMemAlloc_v2");
     CUresult result = function != NULL ? function(pointer, bytes) : missing("cuMemAlloc_v2");
     if (result == CUDA_SUCCESS && pointer != NULL)
+    {
         remember_allocation(*pointer, bytes);
+        if (microcuda_k_track) microcuda_k_track(*pointer, bytes);
+    }
     TRACE_CALL(result, "cuMemAlloc->v2 bytes=%zu result=%d device_ptr=0x%llx", bytes, result,
            (unsigned long long)(pointer != NULL ? *pointer : 0));
     return result;
@@ -2254,6 +2474,7 @@ CUresult WINAPI cuMemAllocHost(void** pointer, size_t bytes)
 CUresult WINAPI cuMemFree(CUdeviceptr pointer)
 {
     CUMEMFREE_FN function = (CUMEMFREE_FN)find_zluda_symbol("cuMemFree_v2");
+    if (microcuda_k_forget) microcuda_k_forget(pointer);
     CUresult result = function != NULL ? function(pointer) : missing("cuMemFree_v2");
     if (result == CUDA_SUCCESS)
         forget_allocation(pointer);
@@ -2272,6 +2493,7 @@ CUresult WINAPI cuMemFreeHost(void* pointer)
 CUresult WINAPI cuMemcpy2D(const void* copy)
 {
     CUMEMCPY2D_FN function = (CUMEMCPY2D_FN)find_zluda_symbol("cuMemcpy2D_v2");
+    if (microcuda_k_write) microcuda_k_write(0, SIZE_MAX);
     CUresult result = function != NULL ? function(copy) : missing("cuMemcpy2D_v2");
     TRACE_CALL(result, "cuMemcpy2D->v2 descriptor=%p result=%d", copy, result);
     return result;
@@ -2280,6 +2502,7 @@ CUresult WINAPI cuMemcpy2D(const void* copy)
 CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, size_t bytes, CUstream stream)
 {
     CUMEMCPYHTODASYNC_FN function = (CUMEMCPYHTODASYNC_FN)find_zluda_symbol("cuMemcpyHtoDAsync_v2");
+    if (microcuda_k_write) microcuda_k_write(destination, bytes);
     CUresult result = function != NULL ? function(destination, source, bytes, stream) : missing("cuMemcpyHtoDAsync_v2");
     TRACE_CALL(result, "cuMemcpyHtoDAsync->v2 dst=0x%llx src=%p bytes=%zu stream=%p result=%d",
            (unsigned long long)destination, source, bytes, stream, result);
@@ -2610,12 +2833,18 @@ CUresult WINAPI cuTexObjectGetResourceDesc(void* descriptor, CUtexObject object)
 /* Direct pass-throughs for driver APIs whose arguments are all integers or
    pointers, so the Windows x64 call forwards unchanged to ZLUDA (SysV). Unversioned
    names resolve to the versions the CUDA 12 driver returns for them. */
+static void microcuda_k_notify_generic_write(const char* target)
+{
+    if (microcuda_k_write && (strncmp(target, "cuMemcpyHtoD", 12) == 0 || strncmp(target, "cuMemcpyDtoD", 12) == 0 || strncmp(target, "cuMemset", 8) == 0))
+        microcuda_k_write(0, SIZE_MAX); /* unsupported/general writer: invalidate all prepared weights */
+}
 typedef uintptr_t D4rArg;
 #define D4R_FORWARD(name, target, count, params, args) \
     CUresult WINAPI name params \
     { \
         typedef CUresult(__attribute__((sysv_abi)) * function_type) params; \
         function_type function = (function_type)find_zluda_symbol(#target); \
+        microcuda_k_notify_generic_write(#target); \
         CUresult result = function != NULL ? function args : missing(#target); \
         TRACE_CALL(result, #name "->" #target " result=%d", result); \
         return result; \
