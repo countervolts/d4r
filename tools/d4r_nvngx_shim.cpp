@@ -857,7 +857,8 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
                format == DXGI_FORMAT_R32G8X24_TYPELESS || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
                format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_R24G8_TYPELESS ||
                format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_D16_UNORM ||
-               format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_TYPELESS;
+               format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_TYPELESS ||
+               format == DXGI_FORMAT_R16_FLOAT;
     case Plane::Motion:
         return format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_TYPELESS ||
                format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32_TYPELESS ||
@@ -984,6 +985,13 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
                 uint16_t value;
                 std::memcpy(&value, source + x * 2, 2);
                 single[x] = unorm(value, 16);
+                break;
+            }
+            case DXGI_FORMAT_R16_FLOAT:
+            {
+                uint16_t value;
+                std::memcpy(&value, source + x * 2, 2);
+                single[x] = half_to_float(value);
                 break;
             }
             default: // 32-bit float depth (the depth plane of D32S8 copies as 4 bytes)
@@ -1708,6 +1716,7 @@ struct Feature
     // formats later stop qualifying.
     bool vram = false, vramDecided = false;
     VramImage colorConversion;
+    VramImage depthConversion;
     VramImage motionConversion;
     VramImage exposureConversion;
     VramImage outputConversion;
@@ -2452,6 +2461,10 @@ static size_t vk_texel_bytes(VkFormat format)
     case VK_FORMAT_D32_SFLOAT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT: // the depth aspect alone
         return 4;
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_UINT:
+        return 2;
     default:
         return 0;
     }
@@ -2509,6 +2522,19 @@ static bool vram_exposure_blit_supported(VkFormat format)
     }
 }
 
+// Depth in a 16-bit format is widened to R32F by a blit (UNORM normalizes, SFLOAT converts).
+static bool vram_depth_blit_supported(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16_UNORM:
+        return vram_blit_supported(format, VK_FORMAT_R32_SFLOAT);
+    default:
+        return false;
+    }
+}
+
 // Motion vectors in a wider float format keep their first two components (as the host path does).
 static bool vram_motion_blit_supported(VkFormat format)
 {
@@ -2551,6 +2577,8 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
         copy.convert = vram_exposure_blit_supported(format);
     else if (plane == Plane::Motion)
         copy.convert = vram_motion_blit_supported(format);
+    else if (plane == Plane::Depth)
+        copy.convert = vram_depth_blit_supported(format);
     return copy.convert || vk_texel_bytes(format) == canonical_texel_bytes(plane);
 }
 
@@ -2596,7 +2624,8 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
         // to R32F, then copy from the canonical image into the shared buffer.
         VkImage conversion = kPlanes[index] == Plane::Exposure ? feature.exposureConversion.image
                              : kPlanes[index] == Plane::Motion ? feature.motionConversion.image
-                                                               : feature.colorConversion.image;
+                             : kPlanes[index] == Plane::Depth ? feature.depthConversion.image
+                                                              : feature.colorConversion.image;
         VkImageMemoryBarrier toDestination = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toDestination.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         toDestination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2806,6 +2835,7 @@ static void release_vram(Feature& feature)
         recycle_vram_buffer(buffer);
     feature.retiredBuffers.clear();
     destroy_vram_image(feature.colorConversion);
+    destroy_vram_image(feature.depthConversion);
     destroy_vram_image(feature.motionConversion);
     destroy_vram_image(feature.exposureConversion);
     destroy_vram_image(feature.outputConversion);
@@ -4954,6 +4984,10 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
                                                                vramInputs[0].width, vramInputs[0].height,
                                                                VK_FORMAT_R16G16B16A16_SFLOAT))
+            return NGX_FAIL_PLATFORM_ERROR;
+        if (vramInputs[1].convert && !ensure_conversion_image(*feature, feature->depthConversion,
+                                                               vramInputs[1].width, vramInputs[1].height,
+                                                               VK_FORMAT_R32_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
                                                                vramInputs[2].width, vramInputs[2].height,
