@@ -17,9 +17,10 @@ Release zips (scripts/package_release.sh) also bundle binaries of ZLUDA (Apache-
 LLVM under Apache-2.0 with LLVM exceptions), the patched vkd3d-proton (LGPL-2.1) and OptiScaler
 (https://github.com/optiscaler/OptiScaler, GPL-3.0, unmodified). Each zip carries their license
 texts in d4r/licenses and says where every file comes from in d4r/source/SOURCES.txt.
-Release zips also contain NVIDIA's nvngx_dlss.dll and _nvngx.dll and DLSS kernels compiled from
-NVIDIA's PTX. Those are NVIDIA's property, are not covered by this repository's license, and are
-included by whoever publishes the zip.
+Release zips include install.sh to download NVIDIA's nvngx_dlss.dll and _nvngx.dll separately.
+Optional builds may bundle those DLLs. Release zips also include DLSS kernels compiled from NVIDIA's
+PTX. Those are NVIDIA's property, are not covered by this repository's license, and are included
+by whoever publishes the zip. Downloaded DLLs remain governed by NVIDIA's license terms.
 
 This repository contains no NVIDIA software. The NVIDIA DLSS feature library (nvngx_dlss.dll) and
 the NGX core (_nvngx.dll) are NVIDIA's; you supply your own copies, and their use is governed by

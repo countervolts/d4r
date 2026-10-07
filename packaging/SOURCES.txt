@@ -7,6 +7,7 @@ Built from source by d4r (Apache License 2.0, d4r/licenses/d4r-LICENSE.txt):
   d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
                          (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
   d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
+@installer   install.sh           downloads and verifies NVIDIA DLLs; no driver installation
 
 Third-party software, unmodified or patched by d4r:
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
@@ -40,6 +41,12 @@ Third-party software, unmodified or patched by d4r:
 @full this zip, not by NVIDIA:
 @full   d4r/nvngx_dlss.dll   NVIDIA DLSS Super Resolution library @DLSS_VERSION@
 @full   d4r/ngx/_nvngx.dll   NVIDIA NGX runtime from NVIDIA's Windows display driver, @NGX_VERSION@
+@installer NVIDIA DLLs are not bundled. install.sh downloads DLSS 310.7.0 from NVIDIA/DLSS
+@installer commit a291cc7d2cc642a51566f3dfd5376f635cd1b284 and _nvngx.dll from NVIDIA driver 596.36.
+@installer URLs and SHA-256 hashes are pinned in install.sh. NVIDIA license terms apply.
+@installer Included NVIDIA PTX-derived kernels (not covered by d4r licenses):
+@installer   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@installer                        compiled from DLSS PTX by ZLUDA (kernels/tex in this repository).
 @full   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
 @full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code
 @full                        (kernels/tex in the d4r repository), compiled by ZLUDA

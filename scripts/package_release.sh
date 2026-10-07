@@ -22,23 +22,29 @@
 #   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
 #   D4R_BUILD_INFO    optional build-toolchain/provenance text to include in d4r/source/
 #   D4R_PACKAGE_KERNEL_JOBS  independent target builds at once (default 1)
-# The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
+# The zip contains texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
-#   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
+#   D4R_BUNDLE_DLSS  local nvngx_dlss.dll for texture builds (pinned by install.sh in installer mode)
+#   D4R_BUNDLE_NGX   local _nvngx.dll (only required for D4R_BUNDLE_NVIDIA=1)
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
 #                    Accuracy texture sets go in accuracy/<target>/, built with D4R_PREFER_ACCURACY=1.
 #   D4R_ZLUDA_EMIT  d4r_emit from the patched ZLUDA build; required in full builds when an accuracy
 #                    texture set or L's unfolded texture variants are not supplied in D4R_BUNDLE_TEX.
-# D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
+# D4R_BUNDLE_NVIDIA=installer (default) ships install.sh instead of NVIDIA DLLs, retaining texture kernels.
+# D4R_BUNDLE_NVIDIA=1 bundles both DLLs; =0 omits DLLs and texture kernels (nonvidia ZIP).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(realpath -m "${1:-$ROOT/dist}")"
 VERSION="$(cat "$ROOT/packaging/VERSION")"
-VARIANT=full
-[[ "${D4R_BUNDLE_NVIDIA:-1}" == 0 ]] && VARIANT=clean
+case "${D4R_BUNDLE_NVIDIA:-installer}" in
+  installer) VARIANT=installer ;;
+  1) VARIANT=full ;;
+  0) VARIANT=clean ;;
+  *) echo "D4R_BUNDLE_NVIDIA must be installer, 1 or 0" >&2; exit 2 ;;
+esac
 NAME="d4r-$VERSION"
 [[ "$VARIANT" == clean ]] && NAME="$NAME-nonvidia"
 STAGE="$OUT/$NAME"
@@ -95,10 +101,21 @@ cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
   "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
-if [[ "$VARIANT" == full ]]; then
-  : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
-  cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
-  cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+if [[ "$VARIANT" != clean ]]; then
+  : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
+  if [[ "$VARIANT" == full ]]; then
+    cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
+    : "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}"
+    cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+  else
+    cp "$ROOT/install.sh" "$STAGE/install.sh"
+    chmod +x "$STAGE/install.sh"
+    # The downloader is pinned to DLSS 310.7.0: refuse mismatched release inputs.
+    expected=$(sed -n "s/^DLSS_SHA256=//p" "$ROOT/install.sh")
+    [[ "$(sha256sum "$D4R_BUNDLE_DLSS" | cut -d' ' -f1)" == "$expected" ]] || {
+      echo "installer package requires the DLSS DLL pinned in install.sh" >&2; exit 2;
+    }
+  fi
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
@@ -136,7 +153,7 @@ build_target() {
   D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
   D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
   rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt  # empty LTO notes from clang's -save-temps
-  if [[ "$VARIANT" == full ]]; then
+  if [[ "$VARIANT" != clean ]]; then
     tex_dir=""
     if [[ -d "$D4R_BUNDLE_TEX/$folder" ]]; then
       tex_dir="$D4R_BUNDLE_TEX/$folder"
@@ -150,7 +167,7 @@ build_target() {
       done
     fi
   fi
-  [[ "$VARIANT" != full ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
+  [[ "$VARIANT" == clean ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
   python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
 
   # Every release target also gets conservative network and texture variants. Do not copy fast
@@ -158,7 +175,7 @@ build_target() {
   accurate="$STAGE/d4r/kernels/accuracy/$folder"
   D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$accurate" >/dev/null
   D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$accurate" >/dev/null
-  if [[ "$VARIANT" == full ]]; then
+  if [[ "$VARIANT" != clean ]]; then
     accurate_tex="$D4R_BUNDLE_TEX/accuracy/$folder"
     if [[ -f "$accurate_tex/d4r-accuracy.txt" && "$(cat "$accurate_tex/d4r-accuracy.txt")" == 1 ]]; then
       for f in "$accurate_tex"/*.hsaco; do
@@ -171,7 +188,7 @@ build_target() {
         D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" tex "$accurate" >/dev/null
     fi
   fi
-  if [[ "$VARIANT" == full ]]; then
+  if [[ "$VARIANT" != clean ]]; then
     ensure_l_textures "$accurate" 1
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
       # the fast set's native hiluma input kernels have no accuracy build: that set keeps ZLUDA's compile
@@ -216,7 +233,7 @@ mkdir -p "$STAGE/d4r/source/patches"
 cp -r "$ROOT/patches/zluda" "$ROOT/patches/vkd3d-proton" "$STAGE/d4r/source/patches/"
 ZLUDA_COMMIT="$(git -C "$ZLUDA_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
 VKD3D_COMMIT="$(git -C "$VKD3D_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
-# "@clean " / "@full " lines belong to one variant only
+# "@clean " / "@full " / "@installer " lines belong to one variant only
 variant() { sed -n -e "s/^@$VARIANT //" -e '/^@[a-z]* /d' -e p; }
 file_version() { [[ -f "$1" ]] && strings -el "$1" | grep -A1 '^FileVersion$' | sed -n 2p | tr ',' '.' | tr -d ' '; }
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@ZLUDA_COMMIT@/$ZLUDA_COMMIT/g" -e "s/@VKD3D_COMMIT@/$VKD3D_COMMIT/g" \

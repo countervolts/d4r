@@ -21,6 +21,8 @@ What you need
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
+@installer - Internet access, Bash, curl, sha256sum and 7-Zip to run the included install.sh.
+@installer   NVIDIA DLLs are downloaded during installation, under NVIDIA's terms.
 @clean - Two NVIDIA files, which this zip does not include:
 @clean   - nvngx_dlss.dll, the DLSS library, version 310.7 or 310.9 (tested: 310.7.0 and 310.9.1).
 @clean     Many games ship one, but often an older version. The d4r kernels check the DLSS code they
@@ -41,15 +43,23 @@ Install
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those
    out of the way first. Also remove PROTON_USE_OPTISCALER from the game's launch options if you
    used GE-Proton's built-in OptiScaler: d4r brings its own.
+@installer 2. Run bash install.sh from a terminal (Bash, curl, sha256sum and 7zz/7z/7za required).
+@installer    It downloads DLSS 310.7.0 and the NGX core from official NVIDIA sources, checks SHA-256,
+@installer    and installs d4r/nvngx_dlss.dll and d4r/ngx/_nvngx.dll. No sudo is needed. The driver
+@installer    archive is about 915 MiB; it is extracted, never executed. Downloads are temporary.
+@installer    Run it again to check the files; differing existing DLLs are backed up before replacement.
 @clean 2. Copy nvngx_dlss.dll into the d4r folder, and _nvngx.dll into d4r/ngx.
+@installer 3. In Steam, open the game's Properties:
 @clean 3. In Steam, open the game's Properties:
 @full 2. In Steam, open the game's Properties:
    - Compatibility: force GE-Proton11-3.
    - Launch options:
        PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
+@installer 4. Optional: check the install from a terminal in that folder:
 @clean 4. Optional: check the install from a terminal in that folder:
 @full 3. Optional: check the install from a terminal in that folder:
        sh d4r/d4r-check.sh
+@installer 5. Start the game and choose DLSS in its graphics settings.
 @clean 5. Start the game and choose DLSS in its graphics settings.
 @full 4. Start the game and choose DLSS in its graphics settings.
 
@@ -130,7 +140,7 @@ If something goes wrong
 Uninstall
 ---------
 Delete dxgi.dll, OptiScaler.ini, OptiScaler.log (if present), d3d12.dll, d3d12core.dll,
-D4R_README.txt and the d4r folder from the game folder, and clear the launch options. The kernel
+D4R_README.txt, install.sh (if present) and the d4r folder from the game folder, and clear the launch options. The kernel
 cache in ~/.cache/d4r can be deleted too.
 
 
@@ -144,3 +154,7 @@ AMD or the OptiScaler project.
 @full NVIDIA's files in this zip (d4r/nvngx_dlss.dll, d4r/ngx/_nvngx.dll) and the kernels built from
 @full NVIDIA's code (listed in d4r/source/SOURCES.txt) are NVIDIA's property, are not covered by
 @full d4r's license, and are included by whoever distributes this zip, not by NVIDIA.
+
+@installer NVIDIA DLLs are downloaded by install.sh from NVIDIA/DLSS SDK 310.7.0 and driver 596.36.
+@installer The included kernels compiled from NVIDIA PTX remain NVIDIA's property and are not
+@installer covered by d4r's license. See d4r/source/SOURCES.txt for their provenance.

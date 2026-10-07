@@ -112,8 +112,10 @@ The script:
 - builds the shim, the bridge and both fast and accuracy network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`, applied by `scripts/configure_optiscaler.py`; both full and clean ZIPs set `NvngxPath=d4r\nvngx.dll` explicitly, retaining `OptiDllPath=d4r` for other libraries;
-- adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
+- includes `install.sh` instead of NVIDIA's two DLLs by default, retaining any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
+
+`D4R_BUNDLE_NVIDIA=installer` is the default: the ZIP includes `install.sh`, and users run `bash install.sh` after extraction to fetch the pinned official NVIDIA DLLs. This mode requires `D4R_BUNDLE_DLSS` to match the DLSS 310.7.0 SHA-256 pinned in the installer, so bundled texture kernels match the downloaded library; `D4R_BUNDLE_NGX` is only needed with `D4R_BUNDLE_NVIDIA=1`, which retains the old DLL-bundling mode.
 
 The NVIDIA files are not covered by d4r's license; redistributing them is up to whoever publishes the zip. `D4R_BUNDLE_NVIDIA=0` builds `d4r-<version>-nonvidia.zip` without them and without the texture kernels. [architecture.md](architecture.md#portable-installs-the-release-zip) describes how the installed files work together.
 

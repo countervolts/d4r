@@ -104,12 +104,13 @@ The release zip works like an OptiScaler release: its contents go into the folde
 1. Extract `d4r-<version>.zip` there. It contains:
    - OptiScaler 0.9.4 as `dxgi.dll`, with an `OptiScaler.ini` set up for d4r;
    - the d4r-patched vkd3d-proton (`d3d12.dll`, `d3d12core.dll`);
-   - an `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and NVIDIA's `nvngx_dlss.dll` (310.7) and `_nvngx.dll`.
-2. In Steam, select GE-Proton 11 for the game and set these launch options: `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
+   - an `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and an `install.sh` beside the `d4r` folder.
+2. Run `bash install.sh` in the extracted release folder. It downloads NVIDIA DLSS 310.7.0 and NGX from official NVIDIA sources, verifies SHA-256 hashes, and places them in `d4r/nvngx_dlss.dll` and `d4r/ngx/_nvngx.dll`. Requires Bash, curl, sha256sum and 7-Zip (`7zz`, `7z` or `7za`); no sudo. The NGX download is a roughly 915 MiB driver archive which is extracted without executing it. Matching files are skipped and differing files are backed up.
+3. In Steam, select GE-Proton 11 for the game and set these launch options: `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
 
 When updating, replace `d3d12.dll` and `d3d12core.dll` together with `d4r/nvngx.dll`. The shim requires their matching resource-lifetime extension.
 
-ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubuntu 22.04 packages, which run under Steam's container runtime on any distribution). The zip's NVIDIA files and the kernels built from NVIDIA's code are not covered by this repository's license (see [NOTICE](NOTICE)). The Proton prefix and the system are not changed. [packaging/D4R_README.txt](packaging/D4R_README.txt) is the full guide that ships in the zip; `scripts/package_release.sh` builds the zip (see [docs/building.md](docs/building.md#7-package-a-release)).
+ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubuntu 22.04 packages, which run under Steam's container runtime on any distribution). The downloaded NVIDIA files and the bundled kernels built from NVIDIA's code are not covered by this repository's license (see [NOTICE](NOTICE)). The Proton prefix and the system are not changed. [packaging/D4R_README.txt](packaging/D4R_README.txt) is the full guide that ships in the zip; `scripts/package_release.sh` builds the zip (see [docs/building.md](docs/building.md#7-package-a-release)).
 
 ## Requirements (building from source)
 
