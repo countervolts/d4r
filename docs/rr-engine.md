@@ -92,23 +92,23 @@ An isolated native phase-8 splice preserves the other NVIDIA phases and produces
 a byte-identical final 3840×2160 RGBA16F frame with matching denormal settings.
 The initial splice is slower: enc0 measures 14.90 ms versus a 6.59 ms translated
 baseline. It is a correctness experiment, not a shipping performance improvement.
-The first implementation of patch `0009`'s native FP8 requantization measured
+The first implementation of patch `0010`'s native FP8 requantization measured
 26.65 ms of GPU kernel time at 720p→4K after six warm-up frames. Its same-runtime
 software-codec control measured 33.90 ms. Compact integer saturation plus
-`0010`'s packed FP8 operand gathers measure 25.33 ms in that 20-frame run;
+`0011`'s packed FP8 operand gathers measure 25.33 ms in that 20-frame run;
 the complete RGBA16F output remains byte-identical. The matching 80-frame
-control measures 24.764 ms after excluding the first 20 frames. Patch `0011`'s
+control measures 24.764 ms after excluding the first 20 frames. Patch `0012`'s
 complete-pair shadow-store coalescing and eight-wave register budgeting together
 measure 19.146 ms, with all 80 saved frames byte-identical to that control.
-Patch `0012`'s signed native conversion reduces the same configuration to
+Patch `0013`'s signed native conversion reduces the same configuration to
 16.234 ms with a byte-identical final frame; its plain and ReLU conversions
 match software for every half encoding in both packed positions. Removing
 the harness's 200 ms inter-frame idle gap measures 15.144 ms in steady state,
 also with the identical final image.
 The older installed-runtime FTZ output differs and is not a valid arithmetic
-control. Cyberpunk with `0009` + `0010` rendered a loaded 4K save with
+control. Cyberpunk with `0010` + `0011` rendered a loaded 4K save with
 720p RR input, coherent moving views and approximately 26.0 ms overlay upscaler
-time. With `0011` + `0012` the harness measures 16.234 ms (200 ms idle gap
+time. With `0012` + `0013` the harness measures 16.234 ms (200 ms idle gap
 between frames) and 15.144 ms continuous, with byte-identical final frames.
 
 ## Next direct-converter win: B operands from transposed accumulators

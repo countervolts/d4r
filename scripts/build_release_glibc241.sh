@@ -5,7 +5,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${D4R_RELEASE_BUILD_ROOT:?set the build output directory}"
-: "${D4R_ZLUDA_SRC:?set a build-local ZLUDA checkout with patches 0002-0012 applied}"
+: "${D4R_ZLUDA_SRC:?set a build-local ZLUDA checkout with patches 0002-0013 applied}"
 : "${D4R_VKD3D_SRC:?set a build-local vkd3d-proton checkout with patches 0001 and 0002 applied}"
 : "${D4R_ROCM_DIR:?set ROCm with clang and device libraries}"
 BUILD="$(realpath -m "$D4R_RELEASE_BUILD_ROOT")"

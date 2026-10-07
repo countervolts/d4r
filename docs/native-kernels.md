@@ -69,21 +69,21 @@ Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E,
 1280×720 → 3840×2160, with `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness:
 The earlier 20-frame run excluded the first 6 frames, with native hkpn output
 and gfx12 native FP8 enabled.
-The first implementation of patch `0009` replaced software half-to-e4m3
+The first implementation of patch `0010` replaced software half-to-e4m3
 requantization with hardware packed FP8 conversion: **33.90 ms** for the
 same-runtime software control, **26.28 ms** with native conversion, and
 **26.65 ms** without the diagnostic A/B gate. The compact integer saturation
-in `0009` plus `0010`'s packed FP8 operand gathers measured **25.33 ms**.
+in `0010` plus `0011`'s packed FP8 operand gathers measured **25.33 ms**.
 All four final RGBA16F frames are byte-identical.
 
-An 80-frame run, excluding the first 20, measures **24.764 ms** with `0009` +
-`0010`. Patch `0011`'s complete-pair shadow-store coalescing reduces that to
+An 80-frame run, excluding the first 20, measures **24.764 ms** with `0010` +
+`0011`. Patch `0012`'s complete-pair shadow-store coalescing reduces that to
 **23.340 ms**. Eight-wave register budgeting alone measures **20.135 ms**;
 both changes together measure **19.146 ms**. All 80 saved
 frames from each variant are byte-identical to the matching 80-frame control.
 Do not compare final images from different frame counts: the 20- and 80-frame
 captures differ even with the unchanged control.
-With `0012`'s signed native conversion, the same 80-frame configuration measures
+With `0013`'s signed native conversion, the same 80-frame configuration measures
 **16.234 ms**, with a byte-identical final frame. Signs stay in the half inputs;
 clamped finite values convert directly, and NaNs become signed infinity before
 conversion to obtain PTX's signed NaN bytes without post-conversion sign masks.
@@ -117,11 +117,11 @@ against 512 independently calculated, exactly representable half values.
 A gfx12 register-permutation replacement for the LDS gathers was correct but
 slower (27.44 ms), and was reverted.
 A twelve-wave register budget preserved the final image but increased time to
-25.560 ms; it is not selected by `0011`.
+25.560 ms; it is not selected by `0012`.
 An isolated-cache fast-math run measured 18.920 ms versus 19.146 ms without
 relaxed math, but changed the image; relaxed math is not selected.
 
-Cyberpunk 2077 with `0009` + `0010` rendered a loaded save at 1280×720→3840×2160 with CUDA feature 13,
+Cyberpunk 2077 with `0010` + `0011` rendered a loaded save at 1280×720→3840×2160 with CUDA feature 13,
 preset E, DLSSD 310.7.0 and split-frame VRAM interop. Moving views showed coherent
 geometry and reflections; the overlay's average upscaler time was about 26.0 ms.
 This is a functional visual check, not RTX image-quality parity. Native-Wayland
@@ -164,7 +164,7 @@ enc0 and dec0 read their input from CUDA textures rather than the plane arena, a
 
 `kernels/rr/rr_layer_spec.py` recovers a layer's structure from the corpus PTX alone: `rr_layer_spec.py enc0` prints the phase table (each maximal run of adjacent `mma`, with M/N/K derived from the fragment counts and the accumulator dataflow, the weight and bias byte offsets it reads, and the size of the epilogue between phases) and the stage classification; `--geometry` does the same for all eleven layers and prints each one's weight image extent. It is how enc0's layout above was established, and it is the reference the native layers are written against.
 
-Before native FP8 conversion, enc0's translated shader contained 83,373 instructions for 536 FP8 WMMAs. Operand gathering and software requantization dominated that static stream; those counts are not measurements of the patch `0009` shader. Hardware conversion removes the software codec but leaves operand-layout conversion and the surrounding neural computation. A global 128-thread bound is invalid for the 256-thread layers; the captured E launches use 32 threads for enc0, enc1 and dec0, 64 for dec1, 128 for enc2/enc3/dec2/dec3, and 256 for enc4/enc5/dec4. The remaining network must be optimized and measured rather than treating the codec gain as meeting the target.
+Before native FP8 conversion, enc0's translated shader contained 83,373 instructions for 536 FP8 WMMAs. Operand gathering and software requantization dominated that static stream; those counts are not measurements of the patch `0010` shader. Hardware conversion removes the software codec but leaves operand-layout conversion and the surrounding neural computation. A global 128-thread bound is invalid for the 256-thread layers; the captured E launches use 32 threads for enc0, enc1 and dec0, 64 for dec1, 128 for enc2/enc3/dec2/dec3, and 256 for enc4/enc5/dec4. The remaining network must be optimized and measured rather than treating the codec gain as meeting the target.
 
 ## RDNA4
 
