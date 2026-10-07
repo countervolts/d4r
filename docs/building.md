@@ -5,7 +5,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 | Component | Tested version |
 |---|---|
 | ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0008` in order |
-| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` and `0002` |
+| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` through `0003` in order |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
 | DLSS | `nvngx_dlss.dll` 310.7.0 |
@@ -54,7 +54,7 @@ When linking on a system with ROCm libraries outside the default search path, in
 scripts/build_vkd3d_proton_d4r.sh ~/.cache/d4r-vkd3d-d4r
 ```
 
-The patch lets the shim split the game's command list at the DLSS call, so the rest of the frame waits (at queue level) for DLSS instead of showing the previous frame's result. Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output. Without it the shim falls back to showing a one-frame-old result.
+Patches `0001` and `0002` provide same-frame command-list splitting and resource-lifetime tracking; both are required by the shim. Patch `0003` adds experimental exportable linear textures, enabled only by `VKD3D_D4R_LINEAR_TEXTURES=1`. Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output and update `d3d12.dll` and `d3d12core.dll` together.
 
 ## 3. Shim, bridge and NVAPI identity
 
@@ -133,7 +133,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
 | `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0008` applied |
-| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001` and `0002` applied |
+| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001`–`0003` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
 | `D4R_ROCM_LINK_STUBS` | optional directory for additional ROCm link libraries |
@@ -147,4 +147,7 @@ Run `bash scripts/build_release_glibc241.sh` inside the container. The script ch
 - `python3 -m unittest discover -s tests -v` includes OptiScaler INI generation, full/clean package staging and NGX-routing checker regressions. Package tests use fixture binaries and GPU-build stand-ins; real DLL loading still needs the OptiScaler/Proton harness.
 - `scripts/check_environment.sh` lists the tools, GPU and Proton builds it finds.
 - The D3D12 harness (`scripts/run_d3d12_dlss_harness_proton.sh`) drives DLSS outside a game.
+  - `D4R_HARNESS_MOTION_SCENE=1 D4R_HARNESS_SAVE_FRAMES=1` saves a temporal sequence for byte comparisons. Compare the regular output path against `D4R_SHIM_OUTPUT_PACKED=1` and/or `D4R_SHIM_INPLACE=1 VKD3D_D4R_LINEAR_TEXTURES=1`, with VRAM interop, split frames and direct output enabled; `D4R_HARNESS_OUTPUT_RGB10A2=1` selects packed output.
+  - `D4R_HARNESS_RECREATE_OUTPUT=1` releases and recreates the game's output texture between completed frames; compare its copy and in-place sequences to catch imported-memory handle reuse.
+  - `D4R_HARNESS_RECREATE=4 D4R_HARNESS_VERIFY_RECREATION=1` checks repeated feature/quality recreation. `D4R_HARNESS_SKIP_RECORDED_INPUT=1` checks discarded command-list input readiness without injecting stale history.
 - Native kernels have their own validation path; see [native-kernels.md](native-kernels.md).

@@ -656,28 +656,33 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
 // Module boilerplate: the weight and constant images, their prep kernel, and the 4-wave main kernel
 #define SWIN_TOK_MODULE(NAME, C, NH, NPM, TUBE, PARAMS, CIN)                                                            \
     using NAME##_K = TokLayout<C, NH, NPM, CIN>;                                                                        \
-    static_assert(SWIN_PREP_SLOTS == 0, "one prepared image");                                                         \
-    __device__ wslot g_w16[NAME##_K::TOTAL];                                                                            \
-    __device__ h8 g_c16[NAME##_K::CTOTAL];                                                                              \
+    constexpr int NAME##_S = SWIN_PREP_SLOTS;                                                                           \
+    __device__ wslot g_w16[(NAME##_S + 1) * NAME##_K::TOTAL];                                                           \
+    __device__ h8 g_c16[(NAME##_S + 1) * NAME##_K::CTOTAL];                                                             \
+    extern "C" __device__ __attribute__((used)) uint64_t g_prep_keys[NAME##_S + 1] = {};                                \
     __constant__ TokTables<C, NH, NPM, CIN> g_tok = make_tok_tables<C, NH, NPM, CIN>();                                 \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_block_z = 4;                                              \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_blocks =                                             \
         ((NAME##_K::TOTAL > NAME##_K::CTOTAL ? NAME##_K::TOTAL : NAME##_K::CTOTAL) + 127) / 128;                        \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_at = SWIN_PREP_KEY_AT;                             \
-    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_slots = 0;                                       \
+    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_slots = NAME##_S;                                \
+    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_identity_at = SWIN_PREP_IDENTITY_AT;                 \
     extern "C" __global__ void __launch_bounds__(128) NAME##_prep(PARAMS p)                                             \
     {                                                                                                                   \
         const int idx = blockIdx.x * 128 + threadIdx.x;                                                                 \
         const uint8_t* w = ((const CommonParams*)&p)->w;                                                                \
+        const int slot = NAME##_S ? prep_slot_claim<NAME##_S>(g_prep_keys, (uint64_t)w, idx == 0) : 0;                 \
         if (idx < NAME##_K::TOTAL)                                                                                      \
-            expand_tok_weights(w, g_w16, g_tok.d, NAME##_K::NDESC, idx);                                               \
+            expand_tok_weights(w, g_w16 + slot * NAME##_K::TOTAL, g_tok.d, NAME##_K::NDESC, idx);                       \
         if (idx < NAME##_K::CTOTAL)                                                                                     \
-            expand_tok_consts(w, g_c16, g_tok.c, NAME##_K::NCONST, idx);                                               \
+            expand_tok_consts(w, g_c16 + slot * NAME##_K::CTOTAL, g_tok.c, NAME##_K::NCONST, idx);                      \
     }                                                                                                                   \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_grid_x = 0;                                               \
     extern "C" __global__ void __launch_bounds__(128) SWIN_TOK_VGPR_ATTR NAME(PARAMS p)                                 \
     {                                                                                                                   \
         const CommonParams& cp = *(const CommonParams*)&p;                                                              \
+        const int slot = NAME##_S ? prep_slot_find<NAME##_S>(g_prep_keys, (uint64_t)cp.w) : 0;                         \
         const int gx = (cp.tw + cp.sx + 7) / 8;                                                                         \
-        swin_tok_block<C, NH, NPM, TUBE, CIN>(cp, (const TubeParams*)&p, g_w16, g_c16, blockIdx.x, blockIdx.y, gx);     \
+        swin_tok_block<C, NH, NPM, TUBE, CIN>(cp, (const TubeParams*)&p, g_w16 + slot * NAME##_K::TOTAL,                \
+                                             g_c16 + slot * NAME##_K::CTOTAL, blockIdx.x, blockIdx.y, gx);             \
     }

@@ -1,3 +1,11 @@
+# Unreleased
+
+- Merge the RDNA4 token-lane Swin and hardware-FP8 texture-tail optimizations, preserving MicroCUDA's allocation-identity tube weight cache.
+- Add opt-in packed R10G10B10A2 and in-place DLSS output, with vkd3d-proton patches `0001`–`0003`. In-place mappings retain their source textures until process exit; output recreation can increase retained VRAM.
+- Fix deferred input-marker ordering: wait for the game's GPU copies before CUDA uploads or diagnostic readbacks, not just before NGX evaluation.
+- Prevent stale in-place output mappings when games destroy and recreate output textures. The harness now supports `D4R_HARNESS_RECREATE_OUTPUT=1` for this regression.
+- Integration validation on RX 9070 XT: moving 12-frame RGBA16F/R10G10B10A2 copy, packed and in-place sequences matched byte-for-byte; fast and accuracy paths, token-disabled reference layers, MicroCUDA tube-cache reuse, discarded input recordings and four feature-recreation cycles were exercised. gfx1101 and gfx1200 compatibility builds also passed; those targets were not runtime-tested.
+
 # d4r 0.1.3
 
 This release adds an optional accuracy mode and fixes the GLIBC compatibility failure, DLSS artifacts, and stale output-buffer redirects reported after 0.1.2. Accuracy mode is **off by default**.

@@ -784,6 +784,20 @@ int main(int argc, char** argv)
 
     for (int frame = 1; frame <= frames; ++frame)
     {
+        // Recreate the game's output between completed frames to exercise imported-memory handle reuse.
+        if (frame > 1 && std::getenv("D4R_HARNESS_RECREATE_OUTPUT") != nullptr)
+        {
+            outputTexture->Release();
+            outputTexture = create_texture(outWidth, outHeight,
+                rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
+                : rgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
+                                  : rgb10 ? static_cast<const void*>(outputInit10.data())
+                                          : static_cast<const void*>(outputInit.data()),
+                   outWidth * (rgba8 || rgb10 ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            d4r_ngx_set_d3d12_resource(parameters, "Output", outputTexture);
+        }
         if (qualityScene)
         {
             // Halton(2,3) jitter in render pixels, [-0.5, 0.5); a render pixel

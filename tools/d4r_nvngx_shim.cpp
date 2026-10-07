@@ -2487,15 +2487,21 @@ static size_t vk_texel_bytes(VkFormat format)
 }
 
 // D4R_SHIM_INPLACE (experimental): a game texture that vkd3d-proton created linear and exportable is imported
-// into CUDA once, so DLSS reads or writes its texels without a game-side copy. Imports are kept for the
-// process lifetime (ROCm does not free mapped external memory, see g_vramPool).
+// into CUDA once, so DLSS writes its texels without a game-side copy. Imports and their source resources
+// stay alive for the process lifetime (ROCm does not free mapped external memory, see g_vramPool).
 struct InPlaceTexture
 {
     CudaDevicePtr texels = 0;
     size_t rowPitch = 0;
 };
+struct InPlaceImport
+{
+    uint64_t memory;
+    CudaDevicePtr base;
+    ID3D12Resource* owner; // retained: prevents reuse of the cached VkDeviceMemory handle
+};
 static std::mutex g_inPlaceMutex;
-static std::vector<std::pair<uint64_t, CudaDevicePtr>> g_inPlaceImports; // VkDeviceMemory -> CUDA mapping
+static std::vector<InPlaceImport> g_inPlaceImports;
 
 // Game thread.
 static bool describe_in_place(ID3D12Resource* resource, InPlaceTexture& texture)
@@ -2507,8 +2513,8 @@ static bool describe_in_place(ID3D12Resource* resource, InPlaceTexture& texture)
     {
         std::lock_guard<std::mutex> lock(g_inPlaceMutex);
         for (const auto& entry : g_inPlaceImports)
-            if (entry.first == memory)
-                base = entry.second;
+            if (entry.memory == memory)
+                base = entry.base;
     }
     if (base == 0)
     {
@@ -2525,7 +2531,8 @@ static bool describe_in_place(ID3D12Resource* resource, InPlaceTexture& texture)
              static_cast<unsigned long long>(size), static_cast<unsigned long long>(offset),
              static_cast<unsigned long long>(pitch));
         std::lock_guard<std::mutex> lock(g_inPlaceMutex);
-        g_inPlaceImports.emplace_back(memory, base);
+        resource->AddRef();
+        g_inPlaceImports.push_back({memory, base, resource});
     }
     texture.texels = base + offset;
     texture.rowPitch = static_cast<size_t>(pitch);
@@ -4141,6 +4148,14 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         timing.workerWait = profile_ms(timing.workerQueued, start);
     FrameTiming* stages = timing.enabled ? &timing : nullptr;
     const bool overlapped = async_copies() && copy_streams() != nullptr;
+    if (timing.markerDeferred)
+    {
+        const auto markerStart = ProfileClock::now();
+        if (!wait_for_input_marker(feature, slotIndex, frame))
+            return;
+        if (timing.enabled)
+            timing.markerWait = profile_ms(markerStart, ProfileClock::now());
+    }
     if (params.vram && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
         dump_vram_inputs(slot, frame, params, params.hasExposure ? 4 : 3);
     const bool linearInputs = params.vram && feature->linearInputs;
@@ -4238,14 +4253,6 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
             logged = true;
         }
         feature->outputRedirected = redirect;
-    }
-    if (timing.markerDeferred)
-    {
-        const auto markerStart = ProfileClock::now();
-        if (!wait_for_input_marker(feature, slotIndex, frame))
-            return;
-        if (timing.enabled)
-            timing.markerWait = profile_ms(markerStart, ProfileClock::now());
     }
     const int eventStartResult = timing.enabled && feature->profileEventsReady
                                      ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
@@ -4370,9 +4377,9 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
 {
     InputSlot& slot = feature->inputs[slotIndex];
     const auto start = ProfileClock::now();
-    // D4R_SHIM_DEFER_MARKER (default on): with VRAM interop nothing else happens here before the marker lands, so
-    // the worker thread waits for it itself, after the host-side setup of the evaluation (which no longer queues
-    // behind the marker: ~0.1 ms off the critical path) and without a thread wake-up between marker and NGX.
+    // D4R_SHIM_DEFER_MARKER (default on): the worker waits for the game's copies itself, avoiding a thread
+    // wake-up between readiness and evaluation. The wait must precede every input read, including CUDA
+    // uploads and diagnostic readbacks; waiting only before NGX would copy stale data into its arrays.
     static const bool deferMarker = env_uint("D4R_SHIM_DEFER_MARKER", 1) != 0 &&
                                     env_uint("D4R_MOTION_DILATION", 0) == 0;
     if (params.vram && deferMarker && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)

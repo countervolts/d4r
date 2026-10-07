@@ -15,7 +15,7 @@ Third-party software, unmodified or patched by d4r:
                          Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
   d3d12.dll, d3d12core.dll
                          vkd3d-proton (GNU LGPL 2.1), https://github.com/HansKristian-Work/vkd3d-proton
-                         commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 and 0002 applied,
+                         commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 to 0003 applied,
                          built with its build-win64.txt cross file (meson --buildtype release).
                          Licenses: d4r/licenses/vkd3d-proton-*.txt
   d4r/rocm/lib/          ROCm 7.2.4 runtime, unmodified, from AMD's Ubuntu 22.04 packages

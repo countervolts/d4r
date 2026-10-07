@@ -65,6 +65,8 @@ After DLSS, the result normally goes from the shared buffer into the game's outp
 - `D4R_SHIM_OUTPUT_PACKED=1` (preset M): the native output kernel stores R10G10B10A2 texels itself, rounding as the RGBA16F store followed by the blit does, so the conversion image and blit are not needed.
 - `D4R_SHIM_INPLACE=1` with `VKD3D_D4R_LINEAR_TEXTURES=1` (vkd3d-proton patch 0003): committed single-level RGBA16F and R10G10B10A2 textures are created linear on exportable memory, the shim imports the output texture into HIP, and the output kernel writes it directly.
 
+Both require VRAM interop, split frames and `D4R_SHIM_OUTPUT_DIRECT=1`; packed/in-place output remains off by default. In-place imports retain their source textures for the process lifetime to prevent recycled Vulkan memory handles from selecting stale CUDA mappings. Recreating output textures therefore retains their VRAM until exit; this is an experimental path, not a recommendation for general game use.
+
 Measured on an RX 9070 XT (gfx1201) in the D3D12 harness, preset M at 1280×720 → 3840×2160, median frame interval of 4 alternating runs of 400 frames. The harness runs DLSS back to back with no game rendering.
 
 | Output texture | Passes after DLSS | Frame interval |
