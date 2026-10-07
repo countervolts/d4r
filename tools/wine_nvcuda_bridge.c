@@ -1399,8 +1399,9 @@ static CUresult write_redirect_tail(CUsurfObject object, CUdeviceptr pointer, ui
     static unsigned char ring[256][16];
     static unsigned int next;
     unsigned char* tail = ring[next++ % 256];
-    // dword 21: 0x5232 ('R2') << 16 | pitch / 8 (0 = off); dwords 22-23: pointer
-    const uint32_t word = pitch != 0 ? 0x52320000u | ((pitch >> 3) & 0xffffu) : 0u;
+    // dword 21: 0x5232 ('R2', RGBA16F texels) << 16 | pitch / 8 (0 = off); dwords 22-23: pointer.
+    // Row pitches are multiples of 8, so bit 0 of `pitch` selects 'R3': R10G10B10A2_UNORM texels.
+    const uint32_t word = pitch != 0 ? ((pitch & 1u) != 0 ? 0x52330000u : 0x52320000u) | ((pitch >> 3) & 0xffffu) : 0u;
     memset(tail, 0, 16);
     memcpy(tail, &word, 4);
     memcpy(tail + 4, &pointer, 8);

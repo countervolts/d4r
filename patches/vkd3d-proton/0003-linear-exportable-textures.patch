@@ -1,0 +1,204 @@
+diff --git a/include/vkd3d_device_vkd3d_ext.idl b/include/vkd3d_device_vkd3d_ext.idl
+index 860640d5..fc91e283 100644
+--- a/include/vkd3d_device_vkd3d_ext.idl
++++ b/include/vkd3d_device_vkd3d_ext.idl
+@@ -132,6 +132,21 @@ interface ID3D12DXVKInteropDeviceD4R2 : ID3D12DXVKInteropDeviceD4R
+     HRESULT RetainExternalResources(ID3D12CommandList *list, IUnknown *resources);
+ }
+ 
++[
++    uuid(7b1e5d0a-93c4-4e8f-b6a2-51c08f2e4d73),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDeviceD4R3 : ID3D12DXVKInteropDeviceD4R2
++{
++    /* Textures created linear and exportable (VKD3D_D4R_LINEAR_TEXTURES=1): the
++     * dedicated VkDeviceMemory behind the image and the layout of its only
++     * subresource, so an external API can read or write the texels in place. */
++    HRESULT GetVulkanLinearImageInfo(ID3D12Resource *resource, UINT64 *vk_memory, UINT64 *memory_size,
++            UINT64 *offset, UINT64 *row_pitch);
++}
++
+ [
+     uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
+     object,
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index fd753830..3ba6b1b0 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4659,7 +4659,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice2)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R)
+-            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R2))
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R2)
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R3))
+     {
+         d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
+         *object = &device->ID3D12DXVKInteropDevice_iface;
+@@ -11381,7 +11382,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
+ }
+ 
+ extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
+-extern CONST_VTBL struct ID3D12DXVKInteropDeviceD4R2Vtbl d3d12_dxvk_interop_device_vtbl;
++extern CONST_VTBL struct ID3D12DXVKInteropDeviceD4R3Vtbl d3d12_dxvk_interop_device_vtbl;
+ extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
+ extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
+ 
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index fc5290da..f18e3c1a 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -1145,6 +1145,35 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanHeapInfo(d3d
+     return S_OK;
+ }
+ 
++static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanLinearImageInfo(d3d12_dxvk_interop_device_iface *iface,
++        ID3D12Resource *resource, UINT64 *vk_memory, UINT64 *memory_size, UINT64 *offset, UINT64 *row_pitch)
++{
++    struct d3d12_device *device = d3d12_device_from_ID3D12DXVKInteropDevice(iface);
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct d3d12_resource *resource_impl;
++    VkImageSubresource subresource;
++    VkSubresourceLayout layout;
++
++    if (!resource || !vk_memory || !memory_size || !offset || !row_pitch)
++        return E_INVALIDARG;
++
++    resource_impl = impl_from_ID3D12Resource(resource);
++    if (!(resource_impl->flags & VKD3D_RESOURCE_D4R_LINEAR) ||
++            resource_impl->mem.device_allocation.vk_memory == VK_NULL_HANDLE)
++        return E_FAIL;
++
++    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    subresource.mipLevel = 0;
++    subresource.arrayLayer = 0;
++    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource_impl->res.vk_image, &subresource, &layout));
++
++    *vk_memory = (UINT64)resource_impl->mem.device_allocation.vk_memory;
++    *memory_size = (UINT64)resource_impl->mem.device_allocation.size;
++    *offset = (UINT64)resource_impl->mem.offset + layout.offset;
++    *row_pitch = (UINT64)layout.rowPitch;
++    return S_OK;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_SplitCommandListForExternalWait(
+         d3d12_dxvk_interop_device_iface *iface, ID3D12CommandList *list, UINT64 vk_semaphore, UINT64 value)
+ {
+@@ -1166,7 +1195,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_RetainExternalResourc
+     return d3d12_command_list_retain_external_resources(cmd_list, resources);
+ }
+ 
+-CONST_VTBL struct ID3D12DXVKInteropDeviceD4R2Vtbl d3d12_dxvk_interop_device_vtbl =
++CONST_VTBL struct ID3D12DXVKInteropDeviceD4R3Vtbl d3d12_dxvk_interop_device_vtbl =
+ {
+     /* IUnknown methods */
+     d3d12_dxvk_interop_device_QueryInterface,
+@@ -1204,6 +1233,9 @@ CONST_VTBL struct ID3D12DXVKInteropDeviceD4R2Vtbl d3d12_dxvk_interop_device_vtbl
+ 
+     /* ID3D12DXVKInteropDeviceD4R2 methods */
+     d3d12_dxvk_interop_device_RetainExternalResources,
++
++    /* ID3D12DXVKInteropDeviceD4R3 methods */
++    d3d12_dxvk_interop_device_GetVulkanLinearImageInfo,
+ };
+ 
+ static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index e521ec69..0683c75e 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -701,6 +701,28 @@ static bool d3d12_device_supports_universal_color_ds_copy(struct d3d12_device *d
+     return true;
+ }
+ 
++/* d4r experiment (VKD3D_D4R_LINEAR_TEXTURES=1): committed single-level 2D textures in the formats the
++ * d4r shim can write a DLSS result in are created with linear tiling on dedicated exportable memory. */
++static bool d4r_linear_texture_candidate(const D3D12_HEAP_PROPERTIES *heap_properties,
++        const D3D12_RESOURCE_DESC1 *desc, const struct d3d12_resource *resource, const struct vkd3d_format *format)
++{
++    /* Read from the live process environment until it is set: the d4r shim applies its d4r.ini after
++     * this library has loaded. */
++    static bool enabled;
++    char value[8];
++    if (!enabled && vkd3d_get_env_var("VKD3D_D4R_LINEAR_TEXTURES", value, sizeof(value)) && value[0] == '1')
++        enabled = true;
++    if (!enabled || !heap_properties || heap_properties->Type != D3D12_HEAP_TYPE_DEFAULT)
++        return false;
++    if (!(resource->flags & VKD3D_RESOURCE_COMMITTED) || (resource->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY))
++        return false;
++    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->MipLevels != 1 ||
++            desc->DepthOrArraySize != 1 || desc->SampleDesc.Count != 1 ||
++            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
++        return false;
++    return format->vk_format == VK_FORMAT_R16G16B16A16_SFLOAT || format->vk_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++}
++
+ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties,
+         const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
+@@ -749,6 +771,14 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+         vk_prepend_struct(image_info, external_info);
+     }
++    else if (resource && d4r_linear_texture_candidate(heap_properties, desc, resource, format))
++    {
++        /* d4r: linear, exportable texels an external API can address in place. */
++        resource->flags |= VKD3D_RESOURCE_D4R_LINEAR;
++        external_info->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++        external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++        vk_prepend_struct(image_info, external_info);
++    }
+ 
+     disable_compression = false;
+ 
+@@ -905,6 +935,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+     image_info->mipLevels = min(desc->MipLevels, max_miplevel_count(desc));
+     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
+     image_info->tiling = format->vk_image_tiling;
++    if (resource && (resource->flags & VKD3D_RESOURCE_D4R_LINEAR))
++        image_info->tiling = VK_IMAGE_TILING_LINEAR;
+     image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+ 
+     if (resource && (resource->flags & VKD3D_RESOURCE_COMMITTED) &&
+@@ -4430,6 +4462,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+ #endif
+         }
+ 
++        if (object->flags & VKD3D_RESOURCE_D4R_LINEAR)
++        {
++            dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
++            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++            export_info.pNext = allocate_info.pNext;
++            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++            allocate_info.pNext = &export_info;
++        }
++
+         /* Requires implies that prefers is also set by spec. */
+         if (dedicated_requirements.prefersDedicatedAllocation)
+         {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index b2f66434..c60ffe00 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1081,7 +1081,8 @@ enum vkd3d_resource_flag
+     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
+     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
+     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
+-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
++    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
++    VKD3D_RESOURCE_D4R_LINEAR             = (1u << 12)
+ };
+ 
+ #define VKD3D_INVALID_TILE_INDEX (~0u)
+@@ -5480,7 +5481,7 @@ HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *li
+ 
+ HRESULT d3d12_command_list_retain_external_resources(struct d3d12_command_list *list, IUnknown *resources);
+ 
+-typedef ID3D12DXVKInteropDeviceD4R2 d3d12_dxvk_interop_device_iface;
++typedef ID3D12DXVKInteropDeviceD4R3 d3d12_dxvk_interop_device_iface;
+ 
+ /* ID3DLowLatencyDevice */
+ typedef ID3DLowLatencyDevice d3d_low_latency_device_iface;

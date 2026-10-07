@@ -9,7 +9,10 @@ inline void d4r_sleep_us(unsigned int microseconds)
     using Delay = LONG(WINAPI*)(BOOLEAN, LARGE_INTEGER*);
     static const auto delay = reinterpret_cast<Delay>(reinterpret_cast<void*>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution")));
-    if (microseconds == 0)
+    // D4R_SHIM_SPIN_POLL=1 (measurement only): every poll yields instead of sleeping, so frame timings are
+    // not quantised to the ~250 us a 200 us sleep takes. Costs a CPU core per waiting thread.
+    static const bool spin = GetEnvironmentVariableA("D4R_SHIM_SPIN_POLL", nullptr, 0) > 1;
+    if (microseconds == 0 || spin)
     {
         SwitchToThread();
         return;

@@ -504,6 +504,13 @@ int main(int argc, char** argv)
     const bool exposureRGBA32 = std::getenv("D4R_HARNESS_EXPOSURE_RGBA32") != nullptr;
     const char* replayDir = std::getenv("D4R_HARNESS_REPLAY_DIR");
     const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
+    // D4R_HARNESS_OUTPUT_RGB10A2=1: an R10G10B10A2_UNORM output texture (inputs unchanged), as some games pass
+    const bool rgb10 = std::getenv("D4R_HARNESS_OUTPUT_RGB10A2") != nullptr;
+    if (rgb10 && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
+    {
+        std::fprintf(stderr, "RGB10A2 output cannot be combined with RGBA8 or the quality scene\n");
+        return 2;
+    }
     if (rgba8 && (qualityScene || motionScene || jitterScene || replayDir != nullptr))
     {
         std::fprintf(stderr, "RGBA8 format probe requires the static synthetic scene\n");
@@ -627,7 +634,9 @@ int main(int argc, char** argv)
     ID3D12Resource* exposureTexture = create_texture(1, 1,
         exposureRGBA32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
-                                                   rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                   rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                                   : rgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                                           : DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
            resourceWidth * (rgba8 ? 4 : 8), srv);
@@ -636,8 +645,10 @@ int main(int argc, char** argv)
     upload(exposureTexture, exposureRGBA32 ? static_cast<const void*>(exposureRGBA.data())
                                           : static_cast<const void*>(&exposureValue),
            exposureRGBA32 ? 16 : 4, srv);
-    upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data()) : static_cast<const void*>(outputInit.data()),
-           outWidth * (rgba8 ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint8_t> outputInit10(rgb10 ? static_cast<size_t>(outWidth) * outHeight * 4 : 0);
+    upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
+                          : rgb10 ? static_cast<const void*>(outputInit10.data()) : static_cast<const void*>(outputInit.data()),
+           outWidth * (rgba8 || rgb10 ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     std::printf("synthetic inputs uploaded\n");
     trace_stage("synthetic inputs uploaded");
 
@@ -970,7 +981,7 @@ int main(int argc, char** argv)
         if (saveFrames)
         {
             const std::vector<uint8_t> frameOutput =
-                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 || rgb10 ? 4 : 8));
             const std::string framePath = std::string(argv[2]) + ".frame" + std::to_string(frame);
             if (FILE* frameFile = std::fopen(framePath.c_str(), "wb"))
             {
@@ -981,7 +992,7 @@ int main(int argc, char** argv)
     }
 
     const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                  outWidth * (rgba8 ? 4 : 8));
+                                                  outWidth * (rgba8 || rgb10 ? 4 : 8));
     FILE* file = std::fopen(argv[2], "wb");
     if (file != nullptr)
     {
@@ -1041,7 +1052,7 @@ int main(int argc, char** argv)
             Sleep(frameWaitMs);
         }
         const std::vector<uint8_t> cycleOutput = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                           outWidth * (rgba8 ? 4 : 8));
+                                                           outWidth * (rgba8 || rgb10 ? 4 : 8));
         if (verifyRecreation)
         {
             auto& reference = recreationReference[cycle % 2];

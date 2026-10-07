@@ -57,3 +57,13 @@ ID3D12DXVKInteropDeviceD4R2 : public ID3D12DXVKInteropDeviceD4R
 };
 __CRT_UUID_DECL(ID3D12DXVKInteropDeviceD4R2, 0x4f8c9462, 0x8197, 0x4dc1, 0xa5, 0x84, 0xcf, 0x44, 0xd9, 0x70, 0x6d, 0xb2)
 
+
+// Experimental (VKD3D_D4R_LINEAR_TEXTURES=1 in the patched vkd3d-proton): the dedicated, exportable memory
+// behind a linear-tiled texture and the layout of its only subresource.
+MIDL_INTERFACE("7b1e5d0a-93c4-4e8f-b6a2-51c08f2e4d73")
+ID3D12DXVKInteropDeviceD4R3 : public ID3D12DXVKInteropDeviceD4R2
+{
+    virtual HRESULT STDMETHODCALLTYPE GetVulkanLinearImageInfo(ID3D12Resource* resource, UINT64* memory, UINT64* memorySize,
+                                                               UINT64* offset, UINT64* rowPitch) = 0;
+};
+__CRT_UUID_DECL(ID3D12DXVKInteropDeviceD4R3, 0x7b1e5d0a, 0x93c4, 0x4e8f, 0xb6, 0xa2, 0x51, 0xc0, 0x8f, 0x2e, 0x4d, 0x73)
