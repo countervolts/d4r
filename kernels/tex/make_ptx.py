@@ -239,6 +239,176 @@ def replace_rz_round(lines):
     return out, n
 
 
+# Preset L's unfolded enc0 on the gfx12 native-FP8 build (source enc0l_tail): everything after the barrier that
+# ends the feature staging is the native tail. It needs only the staged features, the parameter block and the
+# block index, so the call loads those itself and no register of the original code is read.
+ENC0L_RE = re.compile(r"^rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)$")
+ENC0L_EXTERN = """.extern .func d4r_enc0l_tail
+(
+	.param .b32 d4r_a0, .param .b64 d4r_a1, .param .b64 d4r_a2, .param .b64 d4r_a3, .param .b32 d4r_a4,
+	.param .b32 d4r_a5, .param .b32 d4r_a6, .param .b32 d4r_a7, .param .b32 d4r_a8, .param .b32 d4r_a9
+)
+;
+"""
+ENC0L_TAIL = """mov.u32 %rel0, {smem};
+ld.param.u64 %rdel0, [{name}_param_0];
+ld.param.v2.u32 {{%rel1, %rel2}}, [{name}_param_0+8];
+ld.param.v2.u32 {{%rel3, %rel4}}, [{name}_param_0+16];
+ld.param.u64 %rdel1, [{name}_param_0+40];
+ld.param.u64 %rdel2, [{name}_param_0+48];
+mov.u32 %rel5, %ctaid.x;
+mov.u32 %rel6, %ctaid.y;
+{{
+	.param .b32 q0;
+	st.param.b32 [q0+0], %rel0;
+	.param .b64 q1;
+	st.param.b64 [q1+0], %rdel0;
+	.param .b64 q2;
+	st.param.b64 [q2+0], %rdel1;
+	.param .b64 q3;
+	st.param.b64 [q3+0], %rdel2;
+	.param .b32 q4;
+	st.param.b32 [q4+0], %rel1;
+	.param .b32 q5;
+	st.param.b32 [q5+0], %rel2;
+	.param .b32 q6;
+	st.param.b32 [q6+0], %rel3;
+	.param .b32 q7;
+	st.param.b32 [q7+0], %rel4;
+	.param .b32 q8;
+	st.param.b32 [q8+0], %rel5;
+	.param .b32 q9;
+	st.param.b32 [q9+0], %rel6;
+	call.uni d4r_enc0l_tail, (q0, q1, q2, q3, q4, q5, q6, q7, q8, q9);
+}}
+ret;
+
+}}
+"""
+
+
+def enc0l_variant(name):
+    """Cut line and tail of an unfolded enc0 variant: three bar.warp.sync (after the feature staging, after
+    the embedding, before the patch merge), 336 MMAs after the first, one 2048-byte shared array."""
+    path = module_file(name, {"file": ""})
+    lines = read_lines(path)
+    syncs = [i for i, l in enumerate(lines) if l.strip() == "bar.warp.sync -1;"]
+    mmas = [i for i, l in enumerate(lines) if "mma.sync.aligned" in l]
+    shared = [m.group(1) for m in (re.match(r"^\s*\.shared \.align \d+ \.b8 (\S+)\[2048\];$", l) for l in lines) if m]
+    if len(syncs) != 3 or len(mmas) != 336 or mmas[0] < syncs[0] or len(shared) != 1:
+        sys.exit(f"enc0l: {name} is not the kernel the tail was written for ({len(syncs)} barriers, {len(mmas)} MMAs, {shared})")
+    return dict(file=path.name, cut_after=syncs[0] + 1, cut_check="bar.warp.sync -1;", sust=True, extern=ENC0L_EXTERN,
+                tail=ENC0L_TAIL.format(name=name, smem=shared[0]), regs=[".reg .b32 %rel<7>;", ".reg .b64 %rdel<3>;"])
+
+
+# Preset L's unfolded dec0 on the gfx12 native-FP8 build (source dec0l_block): the patch expand, the skip sum and
+# the Swin block become one native call; the output code after the last MMA stays. That code reads the block's
+# result from the D registers of the last 16 MMAs (token tile m, column tile j, in that order), which the
+# native function leaves in shared memory in that layout, and otherwise depends only on a few statements
+# (block coordinates, constants) that are found by following its inputs backwards and are kept.
+DEC0L_EXTERN = """.extern .func (.param .b32 d4r_dr) d4r_dec0l_block
+(
+	.param .b64 d4r_a0, .param .b64 d4r_a1, .param .b64 d4r_a2, .param .b32 d4r_a3, .param .b32 d4r_a4,
+	.param .b32 d4r_a5, .param .b32 d4r_a6, .param .b32 d4r_a7, .param .b32 d4r_a8
+)
+;
+"""
+DEC0L_CALL = """ld.param.u64 %rddl0, [{name}_param_0];
+ld.param.v2.u32 {{%rdl1, %rdl2}}, [{name}_param_0+8];
+ld.param.v2.u32 {{%rdl3, %rdl4}}, [{name}_param_0+16];
+ld.param.u64 %rddl1, [{name}_param_0+24];
+ld.param.u64 %rddl2, [{name}_param_0+32];
+mov.u32 %rdl5, %ctaid.x;
+mov.u32 %rdl6, %ctaid.y;
+{{
+	.param .b64 q0;
+	st.param.b64 [q0+0], %rddl0;
+	.param .b64 q1;
+	st.param.b64 [q1+0], %rddl1;
+	.param .b64 q2;
+	st.param.b64 [q2+0], %rddl2;
+	.param .b32 q3;
+	st.param.b32 [q3+0], %rdl1;
+	.param .b32 q4;
+	st.param.b32 [q4+0], %rdl2;
+	.param .b32 q5;
+	st.param.b32 [q5+0], %rdl3;
+	.param .b32 q6;
+	st.param.b32 [q6+0], %rdl4;
+	.param .b32 q7;
+	st.param.b32 [q7+0], %rdl5;
+	.param .b32 q8;
+	st.param.b32 [q8+0], %rdl6;
+	.param .b32 d0;
+	call (d0), d4r_dec0l_block, (q0, q1, q2, q3, q4, q5, q6, q7, q8);
+	ld.param.b32 %rdl0, [d0+0];
+}}
+mov.u32 %rdl7, %laneid;
+shl.b32 %rdl7, %rdl7, 2;
+add.u32 %rdl0, %rdl0, %rdl7;"""
+PTX_REG_RE = re.compile(r"%(?:rd|rs|r|fd|f|p)\d+")
+
+
+def ptx_statements(line):
+    """(destinations, sources, opcode) of each simple statement on a line (inline { ... } blocks included)."""
+    text = re.sub(r"^\s*\{\s*(?=[a-z.@])", "", line.strip())
+    text = re.sub(r";\s*\}\s*$", ";", text)
+    out = []
+    for stmt in text.split(";"):
+        m = re.match(r"\s*(@!?%p\d+\s+)?([a-z][a-z0-9_.]*)\s+(.*)$", stmt)
+        if not m or stmt.strip().startswith("."):
+            continue
+        pred, op, args = m.groups()
+        uses = set(PTX_REG_RE.findall(pred or ""))
+        if op.startswith(("st.", "sust", "bra", "bar", "ret", "call")):
+            out.append((set(), uses | set(PTX_REG_RE.findall(args)), op))
+            continue
+        if args.startswith("{"):
+            end = args.index("}") + 1
+        else:
+            end = len(args.split(",")[0])
+        # (shfl's "%r|%p" destination pair is one operand: both are definitions)
+        out.append((set(PTX_REG_RE.findall(args[:end])), uses | set(PTX_REG_RE.findall(args[end:])), op))
+    return out
+
+
+def dec0l_spec(name):
+    path = module_file(name, {"file": ""})
+    lines = read_lines(path)
+    mmas = [i for i, l in enumerate(lines) if "mma.sync.aligned" in l]
+    entry = next(i for i, l in enumerate(lines) if l.startswith(".visible .entry"))
+    if len(mmas) != 304 or sum("sust." in l for l in lines[mmas[-1]:]) != 8:
+        sys.exit(f"dec0l: {name} is not the kernel the block was written for ({len(mmas)} MMAs)")
+    x2 = []
+    for i in mmas[-16:]:
+        x2 += [r.strip() for r in re.search(r"\{([^}]*)\}", lines[i]).group(1).split(",")]
+    end = next(i for i in range(mmas[-1], len(lines)) if lines[i].rstrip().endswith(";"))  # the MMA's last line
+    body = next(i for i in range(entry, len(lines)) if lines[i].strip() == "{") + 1
+    # registers the output code reads before it defines them
+    need, defined = set(), set()
+    for line in lines[end + 1:]:
+        for d, u, _ in ptx_statements(line):
+            need |= u - defined
+            defined |= d
+    need -= set(x2)
+    keep = set()
+    for i in range(end, body - 1, -1):
+        for d, u, op in ptx_statements(lines[i]):
+            if d & need:
+                if not re.match(r"^(mov|add|sub|shl|shr|and|or|ld\.param)\b", op):
+                    sys.exit(f"dec0l: the output code depends on {lines[i].strip()!r}")
+                keep.add(i)
+                need = (need - d) | (u - set(x2))
+    if len(keep) > 24 or len(x2) != 32:
+        sys.exit(f"dec0l: unexpected dependencies of the output code ({len(keep)} statements)")
+    # (the kernel's own declarations come first; declarations further down belong to inline blocks that go)
+    first = next(i for i in range(body, end) if lines[i].strip() and not lines[i].lstrip().startswith((".", "//")))
+    drop = {i for i in range(first, end + 1) if i not in keep}
+    loads = "\n".join(f"ld.shared.u32 {reg}, [%rdl0+{128 * r}];" for r, reg in enumerate(x2))
+    return dict(file=path.name, drop=drop, insert_at=end + 1, insert=DEC0L_CALL.format(name=name) + "\n" + loads,
+                sust=True, extern=DEC0L_EXTERN, regs=[".reg .b32 %rdl<8>;", ".reg .b64 %rddl<3>;"])
+
+
 ENC0_REF = "rrlite_enc0_4x4_mvhi_hdr_folded"
 # the other flag combinations of the kernels whose only native part is the surface-store rewrite
 SUST_ONLY_RE = re.compile(r"^(hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_(hdr|ldr)(_max)?_v[12]_rel|"
@@ -307,6 +477,10 @@ def kernel_spec(name):
         return KERNELS[name]
     if ENC0_RE.match(name):
         return enc0_variant(name)
+    if ENC0L_RE.match(name) and os.environ.get("D4R_TEX_SRC") == "enc0l_tail":
+        return enc0l_variant(name)
+    if name == "rrlite_dec0_4x4" and os.environ.get("D4R_TEX_SRC") == "dec0l_block":
+        return dec0l_spec(name)
     if SUST_ONLY_RE.match(name):
         return dict(file="", sust=True, extern="", rz_round=name.startswith("hiluma_engine_output"))
     sys.exit(f"make_ptx: no recipe for {name}")
@@ -334,6 +508,10 @@ def main():
         if lines[cut - 1].strip() != k["cut_check"]:
             sys.exit(f"line {cut} is {lines[cut - 1]!r}, expected {k['cut_check']!r}")
         head, tail = lines[:cut], k["tail"].split("\n")
+    elif "drop" in k:
+        at = k["insert_at"]
+        head = [l for i, l in enumerate(lines[:at]) if i not in k["drop"]] + k["insert"].split("\n") + lines[at:]
+        tail = []
     elif "delete" in k:
         a, b = k["delete"]
         if (lines[a - 1].strip(), lines[b - 1].strip()) != k["delete_check"]:
@@ -343,6 +521,10 @@ def main():
         head, tail = lines, []
     entry = next(i for i, l in enumerate(head) if l.startswith(".visible .entry"))
     body, n = replace_sust(head[entry:]) if k.get("sust") else (head[entry:], {"b16": 0, "p": 0, "b32": 0})
+    if k.get("regs"):
+        # registers of the inserted code, declared after the kernel's own .reg lines
+        at = next(i for i, l in enumerate(body) if l.startswith(".reg"))
+        body = body[:at] + k["regs"] + body[at:]
     if k.get("rz_round"):
         body, nrz = replace_rz_round(body)
         # temporaries for the rewrite, declared after the kernel's own .reg lines

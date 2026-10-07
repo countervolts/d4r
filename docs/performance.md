@@ -131,3 +131,14 @@ The 16-bit path never re-encoded its operands, so it was already faster than the
 The shim's whole-evaluation GPU time (`D4R_PROFILE`, no per-kernel synchronisation) went from 5.9–6.0 ms to 2.80 ms with the harness's 200 ms pause between frames, and to 2.39–2.43 ms with frames 0–4 ms apart (2000 frames at 4 ms spacing: median 2.39, maximum 2.56). The difference is the driver's clock governor: with the 200 ms pause the GPU is about 9% busy and runs at about 2790 MHz, with frames 0–4 ms apart it is 80–98% busy and runs at 3180–3300 MHz, as it does under a game's rendering load. Other GPU users on the desktop add occasional slower frames to any of these figures; the previous kernels show the same disturbances.
 
 The change is in [native-kernels.md](native-kernels.md#rdna4): the FP8 layers keep their activations as e4m3 bytes, and the downsample kernel is built as wave64 on gfx12. The output image is byte-identical before and after.
+
+DLSS 4.5 (L) on the same card and harness, with enc0 and dec0 as ZLUDA's compile (`sust_only`) and with their native token-lane parts ([native-kernels.md](native-kernels.md#families)). Median GPU time per frame in milliseconds from `D4R_CUDA_KERNEL_PROFILE` (frames 11–30, moving scene, LDR input unless noted); the final frames are byte-identical in every column pair.
+
+| | 1280×720 → 4K | | 1280×720 → 4K, HDR flags | | 1920×1080 → 4K | | accuracy set, 1280×720 → 4K | |
+|---|---|---|---|---|---|---|---|---|
+| Kernel | before | now | before | now | before | now | before | now |
+| enc0 | 1.69 | 0.63 | 1.56 | 0.67 | 2.73 | 1.16 | 1.82 | 0.67 |
+| dec0 | 1.26 | 0.54 | 1.26 | 0.54 | 2.28 | 1.01 | 1.31 | 0.59 |
+| **all kernels** | **5.83** | **4.06** | **5.93** | **4.34** | **8.63** | **5.69** | **5.99** | **4.14** |
+
+L's post kernel (1.2–1.5 ms) is the largest kernel left; it has no matrix multiplies. The 1920×1080 runs were taken in one of the two clock states the driver's governor settles in at that load (about 13% apart), so compare within the pair, not across resolutions.
