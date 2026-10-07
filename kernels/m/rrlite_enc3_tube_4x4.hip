@@ -15,6 +15,10 @@
 #define SWIN_PREP_KEY_AT 0
 #define SWIN_PREP_IDENTITY_AT 1
 #define SWIN_PREP_SLOTS 8
+// RDNA4 native FP8 builds use the token-lane block (swin_tok.h); -DSWIN_NO_TOKEN_LANES keeps swin_block.h
+#ifndef SWIN_NO_TOKEN_LANES
+#define SWIN_TOKEN_LANES
+#endif
 #include "swin_block.h"
 #ifndef SWIN_NW
 #define SWIN_NW 8

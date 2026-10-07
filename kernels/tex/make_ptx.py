@@ -56,6 +56,7 @@ KERNELS = {
         delete=(139, 587),
         delete_check=("mov.u32 %r17, %laneid;", "st.shared.v2.u16 [%r570+1168], {%rs63, %rs64};"),
         sust=True,
+        dec8=32,
         extern=""".extern .func d4r_dec0_head
 (
 	.param .b32 d4r_a0, .param .b64 d4r_a1, .param .b64 d4r_a2, .param .b32 d4r_a3,
@@ -173,6 +174,36 @@ def replace_sust(lines):
 	call d4r_sust_v2b16, (u0, u1, u2, u3, u4);
 }}""")
         n["b16"] += 1
+    return out, n
+
+
+# dec0 on the native-FP8 build (D4R_TEX_FP8=1): the tail's e4m3 decodes call d4r_dec_e4m3x2 (tex_common.h, the
+# hardware conversion) instead of ZLUDA's integer lowering of cvt.rn.f16x2.e4m3x2
+DEC8_EXTERN = """.extern .func (.param .b32 d4r_dr) d4r_dec_e4m3x2
+(
+	.param .b16 d4r_dc
+)
+;
+"""
+DEC8_RE = re.compile(r"^cvt\.rn\.f16x2\.e4m3x2 (%r\d+), (%rs\d+);$")
+
+
+def replace_dec8(lines):
+    out, n = [], 0
+    for line in lines:
+        m = DEC8_RE.match(line.strip())
+        if not m:
+            out.append(line)
+            continue
+        dst, src = m.groups()
+        out.append(f"""{{
+	.param .b16 c0;
+	st.param.b16 [c0+0], {src};
+	.param .b32 d0;
+	call (d0), d4r_dec_e4m3x2, (c0);
+	ld.param.b32 {dst}, [d0+0];
+}}""")
+        n += 1
     return out, n
 
 
@@ -318,6 +349,11 @@ def main():
         at = next(i for i, l in enumerate(body) if l.startswith(".reg"))
         body = body[:at] + [f".reg .f32 %rq<{4 * nrz + 1}>;", f".reg .pred %pq<{nrz + 1}>;"] + body[at:]
         n["rz"] = nrz
+    if k.get("dec8") and os.environ.get("D4R_TEX_FP8", "0") == "1":
+        body, n["dec8"] = replace_dec8(body)
+        if n["dec8"] != k["dec8"]:
+            sys.exit(f"{name}: {n['dec8']} e4m3 decodes, expected {k['dec8']}")
+        k = dict(k, extern=k["extern"] + DEC8_EXTERN)
     extern = k["extern"] + (SUST_EXTERN if n["b16"] else "") + (SUSTP_EXTERN if n["p"] else "") + (SUSTB32_EXTERN if n["b32"] else "")
     text = "\n".join(head[:entry]) + "\n" + extern + "\n".join(body + tail)
     out.write_text(text)

@@ -138,6 +138,45 @@ __attribute__((device)) static inline f8v k32_e4m3(f8v c, const kop& a0, const k
 }
 #endif
 
+// RDNA4 native FP8: the tails encode with the hardware conversion. e4m3x4_f32 gives the codes of four f32 values
+// that hold f16 values already clamped to the finite e4m3 range (the instruction encodes overflow as NaN), in the
+// bytes of one word. With the clamp it equals e4m3x2 for every non-NaN f16 (all 65536 patterns checked on an
+// RX 9070 XT). -DD4R_TEX_SOFT_E4M3 keeps e4m3x2.
+#if defined(D4R_TEX_FP8) && defined(__GFX12__) && !defined(D4R_TEX_SOFT_E4M3)
+#define D4R_TEX_HW_E4M3 1
+__attribute__((device)) static inline uint32_t e4m3x4_f32(float a, float b, float c, float d)
+{
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, d, (int)w, true);
+}
+#endif
+
+// cvt.rn.f16x2.e4m3x2 for the kernels whose PTX make_ptx.py points here (dec0's tail on the native-FP8 build):
+// two e4m3 codes -> an f16 pair. The hardware conversion equals ZLUDA's e4m3_to_f16_bits for every code except
+// the NaN codes 0x7f / 0xff (a different NaN), which the head never stages: it clamps to +-448 before encoding.
+DEV __attribute__((always_inline)) uint32_t d4r_dec_e4m3x2(uint16_t codes)
+{
+#ifdef D4R_TEX_HW_E4M3
+    typedef float dec_f2v __attribute__((ext_vector_type(2)));
+    typedef _Float16 dec_h2v __attribute__((ext_vector_type(2)));
+    const dec_f2v f = __builtin_amdgcn_cvt_pk_f32_fp8((int)codes, false);
+    return __builtin_bit_cast(uint32_t, (dec_h2v){(_Float16)f[0], (_Float16)f[1]});
+#else
+    uint32_t out = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t code = (codes >> (8 * i)) & 0xffu, magnitude = code & 0x7fu;
+        const uint32_t normal = (magnitude << 7) + 0x2000u;
+        const uint32_t subnormal = __builtin_bit_cast(uint16_t, (_Float16)((float)(magnitude & 7u) * 0x1p-9f));
+        uint32_t half = magnitude >= 8u ? normal : subnormal;
+        half = magnitude == 0x7fu ? 0x7fffu : half;
+        out |= (((code & 0x80u) << 8) | half) << (16 * i);
+    }
+    return out;
+#endif
+}
+
 // ZLUDA's f16x2_to_e4m3x2_satfinite_bits: RNE satfinite e4m3 of both halves, low half -> low byte.
 __attribute__((device)) static inline uint32_t e4m3x2(uint32_t bits)
 {

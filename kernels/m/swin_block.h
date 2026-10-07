@@ -1131,3 +1131,11 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
             __syncthreads();                                                                                            \
         }                                                                                                               \
     }
+
+// RDNA4 native FP8: a module that defines SWIN_TOKEN_LANES is built from the token-lane block instead
+// (swin_tok.h: one wave per window, transposed GEMMs, results stay in registers)
+#if defined(SWIN_A8) && defined(SWIN_TOKEN_LANES)
+#include "swin_tok.h"
+#undef SWIN_MODULE_W
+#define SWIN_MODULE_W(NAME, C, NH, NWAVES, NPM, TUBE, PARAMS, CIN) SWIN_TOK_MODULE(NAME, C, NH, NPM, TUBE, PARAMS, CIN)
+#endif

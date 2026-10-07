@@ -8,6 +8,10 @@
 #define SWIN_MLP_R(NW) 1
 #endif
 #define SWIN_SCALAR_BLOAD // scalar-base weight loads: faster here (no spills), slower in the 8-wave layers
+// RDNA4 native FP8 builds use the token-lane block (swin_tok.h); -DSWIN_NO_TOKEN_LANES keeps swin_block.h
+#ifndef SWIN_NO_TOKEN_LANES
+#define SWIN_TOKEN_LANES
+#endif
 #include "swin_block.h"
 #ifndef SWIN_NW
 #define SWIN_NW 4

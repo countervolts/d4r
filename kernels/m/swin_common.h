@@ -455,10 +455,18 @@ __device__ __forceinline__ T16 t16_splat(half_t h)
 // acc = f16(P + acc), rounded once (v_fma_mix: verified == f16(exact sum) on 8.4M cases)
 __device__ __forceinline__ hv2 mix2(float p0, float p1, hv2 c)
 {
+#ifdef MIX_COPY
     hv2 r = c;
     asm(MIX_PAD "v_fma_mixlo_f16 %0, %1, 1.0, %2 op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p0), "v"(c));
     asm("v_fma_mixhi_f16 %0, %1, 1.0, %2 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p1), "v"(c));
     return r;
+#else
+    // in place: mixlo writes only the low half and mixhi reads only the high half of the addend, so the
+    // accumulator is both the addend and the destination (no copy of it per pair)
+    asm(MIX_PAD "v_fma_mixlo_f16 %0, %1, 1.0, %0 op_sel_hi:[0,0,1]" : "+v"(c) : "v"(p0));
+    asm("v_fma_mixhi_f16 %0, %1, 1.0, %0 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(c) : "v"(p1));
+    return c;
+#endif
 }
 __device__ __forceinline__ void mixacc(T16& acc, f8v P)
 {
