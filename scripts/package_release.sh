@@ -174,6 +174,8 @@ build_target() {
   if [[ "$VARIANT" == full ]]; then
     ensure_l_textures "$accurate" 1
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
+      # the fast set's native hiluma input kernels have no accuracy build: that set keeps ZLUDA's compile
+      [[ "$(basename "$f")" == hiluma_engine_input_* ]] && continue
       [[ -f "$accurate/$(basename "$f")" ]] || {
         echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
       }
