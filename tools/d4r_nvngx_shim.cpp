@@ -34,6 +34,9 @@
 //   D4R_SHIM_VRAM_INTEROP=1 keep inputs and output in VRAM (see "VRAM interop")
 //   D4R_SHIM_SPLIT_FRAME=1 with VRAM interop and the d4r vkd3d-proton patch,
 //                       present each frame's own DLSS result (see "Split frames")
+//   D4R_SHIM_INPLACE=1  experimental, with VKD3D_D4R_LINEAR_TEXTURES=1 in the patched vkd3d-proton: the output
+//                       kernel writes the game's output texture itself (no game-side output copy).
+//                       D4R_SHIM_OUTPUT_PACKED=1 lets M's output kernel store R10G10B10A2 texels itself.
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -1603,6 +1606,12 @@ struct FrameParams
     bool vram = false; // inputs and output stay in VRAM (VRAM interop)
     bool split = false; // this frame presents its own result (split frames)
     unsigned motionDilation = 0; // actually applied, worker only
+    // D4R_SHIM_INPLACE: the game's linear output texture, written without a game-side copy (0 = none)
+    CudaDevicePtr outputInPlace = 0;
+    uint32_t outputInPlacePitch = 0;
+    // D4R_SHIM_OUTPUT_PACKED: the output kernel stores the game's R10G10B10A2 texels itself, so the game-side
+    // copy (or the in-place texture) takes them without the RGBA16F conversion image and blit
+    bool packedOutput = false;
 };
 
 struct FrameTiming
@@ -1719,6 +1728,9 @@ struct Feature
     // D4R_SHIM_OUTPUT_DIRECT: this frame's result is stored by the native output kernel straight into its
     // destination buffer (worker only), so the array -> buffer copy is skipped.
     bool outputRedirected = false;
+    // The previous frame's output kernel was the native one and honoured the redirect (worker writes, game
+    // thread reads): only then is a frame recorded for packed output.
+    std::atomic<bool> packedReady{false};
     bool outputDirectAllowed = false; // the forced preset's output kernel honours the redirect
     // D4R_SHIM_LINEAR_INPUTS: NGX samples the interop buffers directly through pitch-linear
     // texture objects (rows padded to 256 bytes), so the buffer -> array copies disappear.
@@ -2127,6 +2139,7 @@ struct VulkanInterop
     ID3D12DXVKInteropDevice1* interop = nullptr;
     ID3D12DXVKInteropDeviceD4R2* lifetime = nullptr;
     ID3D12DXVKInteropDeviceD4R* split = nullptr; // only with the d4r vkd3d-proton patch
+    ID3D12DXVKInteropDeviceD4R3* linear = nullptr; // experimental: linear exportable game textures
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory = {};
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -2232,6 +2245,9 @@ static void init_vram_interop()
         g_vk.split = nullptr;
     if (FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R2), reinterpret_cast<void**>(&g_vk.lifetime))))
         g_vk.lifetime = nullptr;
+    if (env_uint("D4R_SHIM_INPLACE", 0) == 0 ||
+        FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R3), reinterpret_cast<void**>(&g_vk.linear))))
+        g_vk.linear = nullptr;
     g_vk.ready = ok;
     logf("VRAM interop: %s (VkDevice %p), split frames %s", ok ? "ready" : "missing Vulkan entry points",
          static_cast<void*>(g_vk.device), g_vk.split != nullptr ? "available" : "unavailable (stock vkd3d-proton)");
@@ -2451,6 +2467,52 @@ static size_t vk_texel_bytes(VkFormat format)
     default:
         return 0;
     }
+}
+
+// D4R_SHIM_INPLACE (experimental): a game texture that vkd3d-proton created linear and exportable is imported
+// into CUDA once, so DLSS reads or writes its texels without a game-side copy. Imports are kept for the
+// process lifetime (ROCm does not free mapped external memory, see g_vramPool).
+struct InPlaceTexture
+{
+    CudaDevicePtr texels = 0;
+    size_t rowPitch = 0;
+};
+static std::mutex g_inPlaceMutex;
+static std::vector<std::pair<uint64_t, CudaDevicePtr>> g_inPlaceImports; // VkDeviceMemory -> CUDA mapping
+
+// Game thread.
+static bool describe_in_place(ID3D12Resource* resource, InPlaceTexture& texture)
+{
+    UINT64 memory = 0, size = 0, offset = 0, pitch = 0;
+    if (g_vk.linear == nullptr || FAILED(g_vk.linear->GetVulkanLinearImageInfo(resource, &memory, &size, &offset, &pitch)))
+        return false;
+    CudaDevicePtr base = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_inPlaceMutex);
+        for (const auto& entry : g_inPlaceImports)
+            if (entry.first == memory)
+                base = entry.second;
+    }
+    if (base == 0)
+    {
+        void* external = nullptr;
+        const int imported = g.worker.call([&] {
+            return g_vk.import(g_vk.device, memory, size, &base, &external);
+        });
+        if (imported != 0 || base == 0)
+        {
+            logf("in-place: importing %llu bytes of texture memory failed (%d)", static_cast<unsigned long long>(size), imported);
+            return false;
+        }
+        logf("in-place: imported %llu bytes of game texture memory (offset %llu, row pitch %llu)",
+             static_cast<unsigned long long>(size), static_cast<unsigned long long>(offset),
+             static_cast<unsigned long long>(pitch));
+        std::lock_guard<std::mutex> lock(g_inPlaceMutex);
+        g_inPlaceImports.emplace_back(memory, base);
+    }
+    texture.texels = base + offset;
+    texture.rowPitch = static_cast<size_t>(pitch);
+    return true;
 }
 
 // How one input or the output moves between its D3D12 texture and a buffer.
@@ -3781,6 +3843,44 @@ static int synchronize_default_stream(Feature& feature, bool* querySleep = nullp
     return g.cu.ctxSynchronize();
 }
 
+// A frame recorded for packed output whose output kernel then did not pack it (it was not the native one
+// after all): the RGBA16F result is converted on the host, rounding as the kernel store and the game-side
+// blit do. Slow, and only expected around a kernel change.
+static int pack_output_on_host(Feature& feature, CudaMemcpy2D copy, size_t packedPitch, uint32_t frame)
+{
+    const size_t width = feature.output.width, height = feature.output.height;
+    std::vector<uint16_t> halves(width * height * 4);
+    std::vector<uint32_t> packed(width * height);
+    const CudaDevicePtr target = copy.dstDevice;
+    copy.dstMemoryType = CUDA_MEMORY_HOST;
+    copy.dstHost = halves.data();
+    copy.dstPitch = width * 8;
+    int result = g.cu.memcpy2D(&copy);
+    if (result != 0)
+        return result;
+    const auto unorm = [](uint16_t half, float scale) {
+        float value = half_to_float(half);
+        value = value > 0.0f ? value : 0.0f;
+        value = value < 1.0f ? value : 1.0f;
+        return static_cast<uint32_t>(value * scale + 0.5f);
+    };
+    for (size_t texel = 0; texel < packed.size(); ++texel)
+        packed[texel] = unorm(halves[texel * 4], 1023.0f) | unorm(halves[texel * 4 + 1], 1023.0f) << 10 |
+                        unorm(halves[texel * 4 + 2], 1023.0f) << 20 | unorm(halves[texel * 4 + 3], 3.0f) << 30;
+    CudaMemcpy2D upload = {};
+    upload.srcMemoryType = CUDA_MEMORY_HOST;
+    upload.srcHost = packed.data();
+    upload.srcPitch = width * 4;
+    upload.dstMemoryType = CUDA_MEMORY_DEVICE;
+    upload.dstDevice = target;
+    upload.dstPitch = packedPitch;
+    upload.WidthInBytes = width * 4;
+    upload.Height = height;
+    result = g.cu.memcpy2D(&upload);
+    logf("frame %u: output kernel did not pack its result; converted on the host (%d)", frame, result);
+    return result;
+}
+
 // VRAM interop, worker thread: copies the finished result into a free output
 // slot's imported buffer and publishes it; evaluate() copies it on to the game.
 static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& params, FrameTiming& timing,
@@ -3796,7 +3896,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         frame_retired(feature, frame);
         return;
     }
-    const VramBuffer& buffer = feature->outputs[target].vram;
+    VramBuffer buffer = feature->outputs[target].vram;
     const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
     CudaMemcpy2D copy = {};
     copy.srcMemoryType = CUDA_MEMORY_ARRAY;
@@ -3806,7 +3906,18 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     copy.dstPitch = rowBytes;
     copy.WidthInBytes = rowBytes;
     copy.Height = feature->output.height;
-    int result = rowBytes * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
+    if (params.outputInPlace != 0)
+    {
+        // no game-side copy was recorded: a result the output kernel did not redirect goes to the texture here
+        buffer.device = copy.dstDevice = params.outputInPlace;
+        copy.dstPitch = params.outputInPlacePitch;
+        buffer.bytes = static_cast<size_t>(params.outputInPlacePitch) * feature->output.height;
+    }
+    int result = rowBytes / (params.packedOutput ? 2 : 1) * feature->output.height > buffer.bytes ? -1
+                 : feature->outputRedirected ? 0
+                 : params.packedOutput ? pack_output_on_host(*feature, copy, params.outputInPlace != 0 ? copy.dstPitch
+                                                                               : rowBytes / 2, frame)
+                 : copy_2d(copy);
     if (result == 0)
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -4021,10 +4132,20 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         (nativeOutput || feature->outputRedirected))
     {
         // split frames write their own slot; the staged path downloads from outputLinear
-        const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8, bytes = rowBytes * feature->output.height;
+        size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
+        const size_t bytes = rowBytes * feature->output.height;
         CudaDevicePtr target = 0;
-        if (params.vram && params.split && feature->outputs[frame % kOutputSlots].vram.bytes >= bytes)
+        if (params.packedOutput)
+            rowBytes = static_cast<size_t>(feature->output.width) * 4;
+        if (params.vram && params.split && params.outputInPlace != 0)
+        {
+            target = params.outputInPlace;
+            rowBytes = params.outputInPlacePitch;
+        }
+        else if (params.vram && params.split && feature->outputs[frame % kOutputSlots].vram.bytes >= bytes)
             target = feature->outputs[frame % kOutputSlots].vram.device;
+        if (params.packedOutput)
+            rowBytes |= 1; // the bridge's flag for R10G10B10A2 texels (row pitches are multiples of 8)
         else if (!params.vram && overlapped && ensure_linear(feature->outputLinear, feature->outputLinearBytes, bytes))
             target = feature->outputLinear;
         const bool redirect = nativeOutput && target != 0 &&
@@ -4051,6 +4172,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         g.cu.setArrayRedirect(feature->output.array, 0, 0);
         feature->outputRedirected = false;
     }
+    feature->packedReady = feature->outputRedirected;
     const auto evalReturned = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     const int eventEndResult = eventStartResult == 0 ? g.cu.eventRecord(feature->profileEnd, nullptr) : -1;
     const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -4864,6 +4986,49 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
+        // M's downsample kernel has only formatted stores, which the native store can pack (kernels/tex/tex_common.h).
+        p.packedOutput = feature->split && feature->outputDirectAllowed && feature->preset == 13 && vramOutput.convert &&
+                         outputDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && vramOutput.width % 2 == 0 &&
+                         env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_PACKED", 0) != 0 &&
+                         feature->packedReady.load();
+        static bool packedLogged = false;
+        if (p.packedOutput && !packedLogged)
+        {
+            packedLogged = true;
+            logf("frame %u: packed output (the output kernel stores R10G10B10A2 texels; no conversion blit)", frame);
+        }
+        InPlaceTexture outputTexture;
+        const size_t outputTexelBytes = p.packedOutput ? 4 : 8;
+        if (feature->split && feature->outputDirectAllowed && (!vramOutput.convert || p.packedOutput) &&
+            env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 &&
+            describe_in_place(output, outputTexture) && outputTexture.rowPitch % 8 == 0 &&
+            outputTexture.rowPitch / 8 <= 0xffffu &&
+            outputTexture.rowPitch >= static_cast<size_t>(vramOutput.width) * outputTexelBytes)
+        {
+            p.outputInPlace = outputTexture.texels;
+            p.outputInPlacePitch = static_cast<uint32_t>(outputTexture.rowPitch);
+        }
+        static bool outputInPlaceLogged = false;
+        if (p.outputInPlace != 0 && !outputInPlaceLogged)
+        {
+            outputInPlaceLogged = true;
+            logf("frame %u: output in place (the output kernel writes the game's %s texture; no game-side copy)", frame,
+                 p.packedOutput ? "R10G10B10A2" : "RGBA16F");
+        }
+        static bool inPlaceLogged = false;
+        if (g_vk.linear != nullptr && !inPlaceLogged)
+        {
+            inPlaceLogged = true;
+            if (p.outputInPlace == 0)
+            {
+                UINT64 memory = 0, size = 0, offset = 0, pitch = 0;
+                const HRESULT linear = g_vk.linear->GetVulkanLinearImageInfo(output, &memory, &size, &offset, &pitch);
+                logf("in-place: output copied on the first frame (split %d, direct output allowed %d, format %d, needs conversion %d, "
+                     "linear exportable texture %d, row pitch %llu)", static_cast<int>(feature->split), feature->outputDirectAllowed,
+                     static_cast<int>(outputDesc.Format), vramOutput.convert, SUCCEEDED(linear),
+                     static_cast<unsigned long long>(pitch));
+            }
+        }
         if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
                                                                vramInputs[0].width, vramInputs[0].height,
                                                                VK_FORMAT_R16G16B16A16_SFLOAT))
@@ -4970,14 +5135,24 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     if (p.vram && feature->split)
         p.split = SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
             list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
+    if (!p.split)
+    {
+        p.outputInPlace = 0; // only a split frame waits for the result before the game reads its texture
+        p.packedOutput = false;
+    }
     if (p.split)
     {
         // Runs in the second half of the list, once frame's result is in place.
         const int target = static_cast<int>(frame % kOutputSlots);
-        transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
-            logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
-        transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
+        if (p.outputInPlace == 0)
+        {
+            if (p.packedOutput)
+                vramOutput.convert = false; // the buffer already holds the texture's own texels
+            transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
+                logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
+            transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
+        }
         if (timing.enabled)
             timing.presentedFrame = frame;
     }

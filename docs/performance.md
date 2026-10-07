@@ -58,6 +58,29 @@ In SILENT HILL Townfall (static scene, K Quality 1706×960 → 2560×1440, Mango
 
 These were measured in the work copy. They have not been re-measured from this repository since the port.
 
+## Experimental: removing the output copies
+
+After DLSS, the result normally goes from the shared buffer into the game's output texture with one copy, or with a copy and a blit when the output is not RGBA16F. Two opt-in settings remove those passes:
+
+- `D4R_SHIM_OUTPUT_PACKED=1` (preset M): the native output kernel stores R10G10B10A2 texels itself, rounding as the RGBA16F store followed by the blit does, so the conversion image and blit are not needed.
+- `D4R_SHIM_INPLACE=1` with `VKD3D_D4R_LINEAR_TEXTURES=1` (vkd3d-proton patch 0003): committed single-level RGBA16F and R10G10B10A2 textures are created linear on exportable memory, the shim imports the output texture into HIP, and the output kernel writes it directly.
+
+Measured on an RX 9070 XT (gfx1201) in the D3D12 harness, preset M at 1280×720 → 3840×2160, median frame interval of 4 alternating runs of 400 frames. The harness runs DLSS back to back with no game rendering.
+
+| Output texture | Passes after DLSS | Frame interval |
+|---|---|---|
+| RGBA16F, copy | 1 | 5.76 ms |
+| RGBA16F, in place | 0 | 5.52 ms |
+| R10G10B10A2, copy and blit | 2 | 5.97 ms |
+| R10G10B10A2, packed store | 1 | 5.76 ms |
+| R10G10B10A2, packed store in place | 0 | 5.65 ms |
+| R10G10B10A2, accuracy kernels, copy and blit | 2 | 6.35 ms |
+| R10G10B10A2, accuracy kernels, packed store in place | 0 | 5.91 ms |
+
+Every variant was byte-identical to the path it replaces on moving scenes (`D4R_HARNESS_OUTPUT_RGB10A2=1` gives the harness an R10G10B10A2 output). In Ghost of Tsushima, which passes an R10G10B10A2 output, both settings engaged from the fourth frame.
+
+Limits: the harness does not render into its textures, so the cost of linear render targets to a game is not measured, and every committed single-level texture of those two formats becomes linear, not only the DLSS output. The packed store is only built into M's downsample kernel. A frame recorded for packed output whose output kernel turns out not to be the native one is converted on the CPU; that path has not been exercised. The input copies remain; see [in-place-inputs.md](in-place-inputs.md).
+
 ## What did not help
 
 - **Accumulating in f16 on the WMMA units.** The error grows about 20× and the image degrades.
