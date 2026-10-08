@@ -77,7 +77,7 @@ OptiScaler 0.9.4 checks a relative `NvngxPath` against the process working direc
 
 `sh d4r/d4r-check.sh` checks file presence and the explicit NGX route separately; it does not prove runtime initialization. OptiScaler's startup `nvngx.dll not found!` warning checks the executable folder and already loaded modules, not the override. It can appear before the shim loads from `d4r/`; verify the later `NVNGXProxy::InitNVNGX Loaded from ...\d4r\nvngx.dll` line and `d4r/d4r_nvngx.log` instead. Keep the shim in `d4r/`.
 
-**Settings.** When an `d4r.ini` sits next to the shim, the shim turns it into the same environment variables the developer launcher sets, with the release's defaults. A variable that is already set, for example in the launch options, wins. Settings for the Linux side (ZLUDA's and the bridge's) are handed to the bridge through `d4rSetEnv` right after it is loaded, before its first CUDA call.
+**Settings.** When a `d4r.ini` sits next to the shim, the shim turns it into the same environment variables the developer launcher sets, with the release's defaults. A variable that is already set, for example in the launch options, wins. Settings for the Linux side (ZLUDA's and the bridge's) are handed to the bridge through `d4rSetEnv` right after it is loaded, before its first CUDA call.
 
 **Loading ROCm.** Steam runs GE-Proton 11 inside its container runtime (SteamLinuxRuntime_4), whose library search path has no ROCm. The bridge therefore:
 - loads HIP, HSA and comgr by path, from `RocmDir` (default: the release's bundled `d4r/rocm`, else `/opt/rocm`);
