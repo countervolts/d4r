@@ -1,7 +1,8 @@
 d4r
 Copyright 2026 countervolts
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE), except for the files
+This product is licensed under the GNU General Public License, version 3 only
+(GPL-3.0-only; see LICENSE), except for the files
 listed below.
 
 patches/zluda/*.patch

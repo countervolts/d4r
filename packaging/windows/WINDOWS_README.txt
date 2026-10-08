@@ -57,7 +57,7 @@ from the game folder. The cache in %LOCALAPPDATA%\d4r can be deleted too. Nothin
 
 Licenses
 --------
-d4r is Apache License 2.0. This ZIP also contains ZLUDA (Apache 2.0 or MIT), OptiScaler (GPL 3.0,
+d4r is GNU General Public License, version 3 only (GPL-3.0-only). This ZIP also contains ZLUDA (Apache 2.0 or MIT), OptiScaler (GPL 3.0,
 patched; the patches are in the source repository), and AMD's HIP runtime. d4r\licenses has the
 texts. d4r is not affiliated with NVIDIA, AMD or the OptiScaler project. NVIDIA's files are yours
 to supply, under NVIDIA's terms.
