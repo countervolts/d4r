@@ -1,7 +1,7 @@
 d4r @VERSION@: where every file in this release comes from
 ============================================================
 
-Built from source by d4r (Apache License 2.0, d4r/licenses/d4r-LICENSE.txt):
+Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
   d4r/nvngx.dll          NGX shim            tools/d4r_nvngx_shim.cpp in the d4r repository
   d4r/nvcuda.dll         Wine CUDA bridge    tools/wine_nvcuda_bridge.c
   d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m

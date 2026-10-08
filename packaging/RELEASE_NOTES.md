@@ -66,6 +66,6 @@ The rebuilt runtime may compile a new kernel cache on first start. `sh d4r/d4r-c
 
 ## Licenses
 
-d4r is Apache 2.0. ZLUDA, LLVM, vkd3d-proton, OptiScaler, and the bundled ROCm libraries retain their respective licenses in `d4r/licenses`; sources and patches are listed in `d4r/source`. NVIDIA's libraries and texture kernels compiled from its code are not covered by those licenses. d4r is not affiliated with NVIDIA or AMD.
+d4r is GNU General Public License, version 3 only (GPL-3.0-only). ZLUDA, LLVM, vkd3d-proton, OptiScaler, and the bundled ROCm libraries retain their respective licenses in `d4r/licenses`; sources and patches are listed in `d4r/source`. NVIDIA's libraries and texture kernels compiled from its code are not covered by those licenses. d4r is not affiliated with NVIDIA or AMD.
 
 The attached `.sha256` file contains the ZIP's checksum.
