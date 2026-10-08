@@ -9,32 +9,6 @@
 #define SWIN_PRAGMA_IMPL(x) _Pragma(#x)
 #define SWIN_PRAGMA(x) SWIN_PRAGMA_IMPL(x)
 
-template <int C, int NW, int NPM, int CIN = 0> struct SwinLayout
-{
-    static constexpr int PREB = CIN ? 4 * C * CIN + 8 * C : 0; // patch-expand weights + bias first
-    static constexpr int NTE = CIN ? 4 * C / NW / 16 : 0;
-    static constexpr int NPL = C / 32, NT = C / 16, NT8 = C / 8, INNER = 32 * NW, NC = C / 8;
-    static constexpr int HS = 96 * C + 512;
-    static constexpr int G1 = PREB, E = PREB + 2 * C + NW * HS, BO = E, G2 = E + 2 * C, M0 = E + 4 * C;
-    static constexpr int B2 = M0 + 64 * C + 64;
-    __host__ __device__ static constexpr int head(int h) { return PREB + 2 * C + HS * h; }
-    __host__ __device__ static constexpr int b1(int c) { return c == 0 ? M0 : M0 + 66 * C + 64 + (64 * C + 64) * (c - 1); }
-    static constexpr int PM0 = M0 + 66 * C + 64 + (64 * C + 64) * (NC - 1);
-    static constexpr int PMB = PM0 + 4 * C * NPM;
-    // weight image (slots of 16 K values, see expand_weights)
-    __host__ __device__ static constexpr int qv(int h, int q) { return (2 * h + q) * 2 * C; }
-    static constexpr int WO = 4 * C * NW;
-    static constexpr int W1 = WO + 2 * NW * C;
-    __host__ __device__ static constexpr int w1(int c) { return W1 + 4 * C * c; }
-    __host__ __device__ static constexpr int w2(int c) { return W1 + 4 * C * c + 2 * C; }
-    static constexpr int PM = W1 + 4 * C * NC;
-    __host__ __device__ static constexpr int pm(int g) { return PM + 8 * C * g; }
-    static constexpr int PE = PM + (NPM / 32) * 8 * C;
-    __host__ __device__ static constexpr int pe(int w) { return PE + w * (CIN / 32) * 2 * NTE * 16; }
-    static constexpr int TOTAL = PE + (CIN ? NW * (CIN / 32) * 2 * NTE * 16 : 0);
-    static constexpr int NDESC = 2 * NW + 1 + 2 * NC + NPM / 32 + (CIN ? NW : 0);
-};
-
 // Start (in halves) of token T's row in the output staging buffer: stride C + 4 plus a shift by bits 4 and 5
 // of T. The patch merge's lanes read 8 bytes each from 16 tokens that differ in bits 1, 3, 4 and 5 (plus a
 // constant); this placement puts those 16 reads on 16 distinct 8-byte bank pairs for C = 64, 96 and 128.

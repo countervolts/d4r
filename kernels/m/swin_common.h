@@ -6,7 +6,11 @@
 // D4R_FP8_WMMA (gfx12 layout only): the GEMMs whose operands are both e4m3 values run as native FP8 WMMAs on
 // e4m3 bytes (weights prepared as bytes, activations encoded when loaded); P V stays f16.
 #pragma once
+// (D4R_NO_HIP_RUNTIME: built without the HIP headers, as part of a ZLUDA-compiled texture kernel; see
+// ../tex/enc0l_tail.hip, which supplies the few runtime names used here)
+#ifndef D4R_NO_HIP_RUNTIME
 #include <hip/hip_runtime.h>
+#endif
 #include <stdint.h>
 #include "../common/wmma_layout.h"
 #ifdef D4R_ACCURACY
@@ -249,9 +253,25 @@ __device__ __forceinline__ half_t f16(float v)
     return (half_t)v;
 }
 
+// SWIN_APPROX_RECIP: the reciprocal square root and the reciprocal as the hardware approximations ZLUDA lowers
+// rsqrt.approx / rcp.approx to (v_rsq_f32, v_rcp_f32) instead of correctly rounded divisions. The two differ in
+// the last f32 bit for some arguments, which changes about one token in 20,000 after the f16 rounding: a kernel
+// that has to reproduce ZLUDA's compile of the PTX byte for byte (../tex/enc0l_tail.hip) needs this form.
 __device__ __forceinline__ half_t rsqrt16(half_t s)
 {
+#ifdef SWIN_APPROX_RECIP
+    return f16(__builtin_amdgcn_rsqf((float)(s + (half_t)(1.0f / 8192.0f))));
+#else
     return f16(1.0f / __builtin_sqrtf((float)(s + (half_t)(1.0f / 8192.0f))));
+#endif
+}
+__device__ __forceinline__ half_t recip16(half_t s)
+{
+#ifdef SWIN_APPROX_RECIP
+    return f16(__builtin_amdgcn_rcpf((float)s));
+#else
+    return f16(1.0f / (float)s);
+#endif
 }
 
 // natural channel c -> pair-order column, and inverse (per 32-channel group)
@@ -455,7 +475,12 @@ __device__ __forceinline__ T16 t16_splat(half_t h)
 // acc = f16(P + acc), rounded once (v_fma_mix: verified == f16(exact sum) on 8.4M cases)
 __device__ __forceinline__ hv2 mix2(float p0, float p1, hv2 c)
 {
-#ifdef MIX_COPY
+#if defined(MIX_ONE)
+    // Without inline asm (a texture tail is compiled by ZLUDA's LLVM, which has no assembler): the same two
+    // instructions, selected from fma(P, one, f32(c)) rounded to f16. MIX_ONE must be a float 1.0 the compiler
+    // cannot fold: with a constant the fma becomes an f32 add followed by a second rounding.
+    return (hv2){(half_t)__builtin_fmaf(p0, MIX_ONE, (float)c[0]), (half_t)__builtin_fmaf(p1, MIX_ONE, (float)c[1])};
+#elif defined(MIX_COPY)
     hv2 r = c;
     asm(MIX_PAD "v_fma_mixlo_f16 %0, %1, 1.0, %2 op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p0), "v"(c));
     asm("v_fma_mixhi_f16 %0, %1, 1.0, %2 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p1), "v"(c));
@@ -636,3 +661,31 @@ __device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, con
 #endif
     w16[idx] = v;
 }
+
+// ---------------------------------------------------------------- weight layout of a block
+// (NVIDIA's weight offsets and the slot layout of the prepared images; used by swin_block.h and swin_tok.h)
+template <int C, int NW, int NPM, int CIN = 0> struct SwinLayout
+{
+    static constexpr int PREB = CIN ? 4 * C * CIN + 8 * C : 0; // patch-expand weights + bias first
+    static constexpr int NTE = CIN ? 4 * C / NW / 16 : 0;
+    static constexpr int NPL = C / 32, NT = C / 16, NT8 = C / 8, INNER = 32 * NW, NC = C / 8;
+    static constexpr int HS = 96 * C + 512;
+    static constexpr int G1 = PREB, E = PREB + 2 * C + NW * HS, BO = E, G2 = E + 2 * C, M0 = E + 4 * C;
+    static constexpr int B2 = M0 + 64 * C + 64;
+    __host__ __device__ static constexpr int head(int h) { return PREB + 2 * C + HS * h; }
+    __host__ __device__ static constexpr int b1(int c) { return c == 0 ? M0 : M0 + 66 * C + 64 + (64 * C + 64) * (c - 1); }
+    static constexpr int PM0 = M0 + 66 * C + 64 + (64 * C + 64) * (NC - 1);
+    static constexpr int PMB = PM0 + 4 * C * NPM;
+    // weight image (slots of 16 K values, see expand_weights)
+    __host__ __device__ static constexpr int qv(int h, int q) { return (2 * h + q) * 2 * C; }
+    static constexpr int WO = 4 * C * NW;
+    static constexpr int W1 = WO + 2 * NW * C;
+    __host__ __device__ static constexpr int w1(int c) { return W1 + 4 * C * c; }
+    __host__ __device__ static constexpr int w2(int c) { return W1 + 4 * C * c + 2 * C; }
+    static constexpr int PM = W1 + 4 * C * NC;
+    __host__ __device__ static constexpr int pm(int g) { return PM + 8 * C * g; }
+    static constexpr int PE = PM + (NPM / 32) * 8 * C;
+    __host__ __device__ static constexpr int pe(int w) { return PE + w * (CIN / 32) * 2 * NTE * 16; }
+    static constexpr int TOTAL = PE + (CIN ? NW * (CIN / 32) * 2 * NTE * 16 : 0);
+    static constexpr int NDESC = 2 * NW + 1 + 2 * NC + NPM / 32 + (CIN ? NW : 0);
+};

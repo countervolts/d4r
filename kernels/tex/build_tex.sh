@@ -27,7 +27,7 @@ read -r -a FLAGS <<< "${D4R_TEX_CFLAGS:-}"
 "$LLVM/llvm-dis" "$B/raw.bc" -o "$B/raw.ll"
 sed -E -e '/@llvm.used/d' -e '/wchar_size/d' -e '/llvm.module.flags/d' -e '/__hip_cuid/d' -e 's/optnone//g' \
     -e "s/\"target-cpu\"=\"$ARCH\"//g" -e 's/"target-features"="[^"]+"//g' "$B/raw.ll" | "$LLVM/llvm-as" -o "$B/extra.bc" -
-D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_FP8="$FP8" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
+D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_FP8="$FP8" D4R_TEX_SRC="$SRC" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
 # the code-generation switches of the runtime (d4r.ini [Kernels]), which ZLUDA's module cache keys on
 env LD_LIBRARY_PATH="$R/lib" D4R_ZLUDA_EXTRA_BC="$B/extra.bc" D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 \
     D4R_ZLUDA_WMMA_FP8_NATIVE="$FP8" D4R_ZLUDA_IGNORE_DENORMAL="$((1 - ACCURACY))" \

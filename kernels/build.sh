@@ -112,10 +112,16 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     fi
     # L's unfolded variants keep their complete neural arithmetic. The folded M
     # GEMM heads/tails are incompatible; substitute only the surface stores.
-    specs+=(rrlite_dec0_4x4:sust_only)
+    # RDNA4 native FP8: enc0 after its feature staging (embedding, Swin block, patch merge: enc0l_tail.hip) and
+    # dec0 before its output code (patch expand, Swin block: dec0l_block.hip) are native token-lane code in the
+    # order of ZLUDA's lowering. Harness frames are byte-identical to the sust_only builds (RX 9070 XT,
+    # 1280x720 render: enc0 1.71 -> 0.63 ms, dec0 1.26 -> 0.54 ms).
+    enc0l=sust_only dec0l=sust_only
+    [[ "$ARCH" == gfx12* && "$FP8" == 1 ]] && enc0l=enc0l_tail dec0l=dec0l_block
+    specs+=("rrlite_dec0_4x4:$dec0l")
     for mv in mvhi mvlo; do
         for range in hdr ldr; do
-            specs+=("rrlite_enc0_4x4_${mv}_${range}:sust_only")
+            specs+=("rrlite_enc0_4x4_${mv}_${range}:$enc0l")
             for v in 3_1 3_2; do specs+=("rrlite_post_${v}_${mv}_${range}:sust_only:w64"); done
         done
     done
