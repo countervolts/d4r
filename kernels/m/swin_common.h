@@ -274,6 +274,18 @@ __device__ __forceinline__ half_t recip16(half_t s)
 #endif
 }
 
+// NVIDIA's encoders clamp the patch merge's result to +-2 pi (as f16) before its e4m3 encoding
+// (max.f16x2 / min.f16x2 with 0fC0C90FDB / 0f40C90FDB after the merge's last MMA).
+__device__ __forceinline__ hv2 merge_clamp(hv2 v)
+{
+    const hv2 lim = {(half_t)6.2831855f, (half_t)6.2831855f};
+    return __builtin_elementwise_minimumnum(__builtin_elementwise_maximumnum(v, -lim), lim);
+}
+__device__ __forceinline__ half_t merge_clamp(half_t v)
+{
+    return merge_clamp((hv2){v, v})[0];
+}
+
 // natural channel c -> pair-order column, and inverse (per 32-channel group)
 __device__ __forceinline__ int gperm(int c)
 {

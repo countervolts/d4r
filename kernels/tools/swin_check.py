@@ -47,7 +47,9 @@ def model_block(P, layer, bx, by):
             Wg = me.E4M3[P.wbuf[sm.woff_table(PM0 + g * 128 * C, 512, 64 * C, 4 * C, 32)]]
             bias = P.f16vec(PM0 + 4 * C * NPM + 64 * g, 32)
             cols.append(me.mma_chain(A, Wg, C0=np.broadcast_to(bias, (16, 32)).copy()))
-        merged = me.q8(sm.pair_to_nat(np.concatenate(cols, axis=1)))
+        # the merged tokens are clamped to +-2 pi (f16) before the e4m3 encoding
+        lim = float(np.float16(6.2831855))
+        merged = me.q8(np.clip(sm.pair_to_nat(np.concatenate(cols, axis=1)), -lim, lim))
     return out, merged
 
 

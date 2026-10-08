@@ -738,7 +738,8 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
 #pragma unroll
                     for (int kc = 0; kc < C / 8; ++kc)
                         k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
-                    const u2v code = tok_codes(y);
+                    const u2v code = {codes4(merge_clamp(y.pair(0)), merge_clamp(y.pair(1))),
+                                      codes4(merge_clamp(y.pair(2)), merge_clamp(y.pair(3)))};
                     if (inside)
                         *(u2v*)(p.p48 + ((size_t)((u >> 1) * H2 + MY) * W2 + MX) * 32 + 16 * (u & 1) + 8 * hf) = code;
                 }

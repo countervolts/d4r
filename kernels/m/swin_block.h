@@ -975,7 +975,8 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 continue;
             const int ch = ginv(16 * (wv * NTP + j) + l16);
 #ifdef SWIN_A8
-            const uint32_t code[2] = {codes4(y[j].pair(0), y[j].pair(1)), codes4(y[j].pair(2), y[j].pair(3))};
+            const uint32_t code[2] = {codes4(merge_clamp(y[j].pair(0)), merge_clamp(y[j].pair(1))),
+                                      codes4(merge_clamp(y[j].pair(2)), merge_clamp(y[j].pair(3)))};
 #endif
 #pragma unroll
             for (int i = 0; i < 8; ++i)
@@ -988,7 +989,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #ifdef SWIN_A8
                     (uint8_t)(code[i >> 2] >> (8 * (i & 3)));
 #else
-                    (uint8_t)enc8(y[j].get(i));
+                    (uint8_t)enc8(merge_clamp(y[j].get(i)));
 #endif
             }
         }
