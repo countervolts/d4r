@@ -38,7 +38,7 @@ Install
 -------
 1. Extract everything in this zip into the folder that holds the game's main .exe. For Unreal
    Engine games that is <game>/<Project>/Binaries/Win64/, next to <Project>-Win64-Shipping.exe.
-   You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, this file and an d4r folder.
+   You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, this file and a d4r folder.
    When updating, replace both d3d12 DLLs with the shim: it requires their resource-lifetime extension.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those
    out of the way first. Also remove PROTON_USE_OPTISCALER from the game's launch options if you
