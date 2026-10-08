@@ -104,7 +104,7 @@ The release zip works like an OptiScaler release: its contents go into the folde
 1. Extract `d4r-<version>.zip` there. It contains:
    - OptiScaler 0.9.4 as `dxgi.dll`, with an `OptiScaler.ini` set up for d4r;
    - the d4r-patched vkd3d-proton (`d3d12.dll`, `d3d12core.dll`);
-   - an `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and an `install.sh` beside the `d4r` folder.
+   - a `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and an `install.sh` beside the `d4r` folder.
 2. Run `bash install.sh` in the extracted release folder. It downloads NVIDIA DLSS 310.7.0 and NGX from official NVIDIA sources, verifies SHA-256 hashes, and places them in `d4r/nvngx_dlss.dll` and `d4r/ngx/_nvngx.dll`. Requires Bash, curl, sha256sum and 7-Zip (`7zz`, `7z` or `7za`); no sudo. The NGX download is a roughly 915 MiB driver archive which is extracted without executing it. Matching files are skipped and differing files are backed up.
 3. In Steam, select GE-Proton 11 for the game and set these launch options: `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
 
