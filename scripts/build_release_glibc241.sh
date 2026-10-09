@@ -95,7 +95,7 @@ failed=0
 for arch in ${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
     build_textures "$arch" &
     pending+=("$!")
-    if (( ${#pending[@]} >= 4 )); then
+    if (( ${#pending[@]} >= ${D4R_TEX_JOBS:-4} )); then
         wait "${pending[0]}" || failed=1
         pending=("${pending[@]:1}")
     fi
@@ -106,6 +106,6 @@ python3 -m unittest discover -s "$ROOT/tests" -v > "$BUILD/logs/tests.log" 2>&1
 export D4R_SKIP_BUILD=1
 export D4R_MAX_GLIBC=2.41
 export D4R_BUILD_INFO="$BUILD/toolchain.txt"
-export D4R_PACKAGE_KERNEL_JOBS=4
+export D4R_PACKAGE_KERNEL_JOBS="${D4R_PACKAGE_KERNEL_JOBS:-4}"
 "$ROOT/scripts/package_release.sh" "$BUILD/dist" > "$BUILD/logs/package.log" 2>&1
 echo "Release packaged in $BUILD/dist"
