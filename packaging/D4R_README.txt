@@ -134,7 +134,10 @@ If something goes wrong
   can be expected with the shim under d4r/; do not move it into the game root to silence that check.
 - A wrong image: try Model = E in d4r/d4r.ini, and report the problem with both logs.
 - Do not use d4r in games with anti-cheat. OptiScaler's DLL injection can get an account banned.
-- Not supported: DLSS Frame Generation, DLSS Ray Reconstruction, DirectX 11 and Vulkan games.
+- Not supported: DLSS Frame Generation, DLSS Ray Reconstruction and DirectX 11.
+- Development builds expose an experimental native Vulkan NGX path using CPU staging.
+  Youngblood is the first intended game test; gameplay remains unverified. See the
+  project documentation (docs/vulkan.md) for its separate Vulkan setup and limits.
 
 
 Uninstall

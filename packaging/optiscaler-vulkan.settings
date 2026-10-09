@@ -1,0 +1,12 @@
+# Shared d4r native Vulkan route; preserve game-specific spoofing and plugin settings.
+Upscalers.VulkanUpscaler=dlss
+DLSS.Enabled=true
+Libraries.OptiDllPath=d4r
+Libraries.NvngxPath=d4r\nvngx.dll
+Inputs.EnableDlssInputs=true
+# Required: false redirects d4r's own CUDA NGX core load back to OptiScaler.
+Hooks.HookOriginalNvngxOnly=true
+NvApi.OverrideNvapiDll=false
+FrameGen.Enabled=false
+FrameGen.FGInput=nofg
+FrameGen.FGOutput=nofg

@@ -2100,6 +2100,38 @@ static void* bridge_export(const char* name)
     return module != NULL ? (void*)GetProcAddress(module, name) : NULL;
 }
 
+/* Process exit. NVIDIA's NGX DLL unloads its CUDA modules from its own detach, which runs before the
+   NGX shim's (it was loaded later). A Vulkan game can exit with a command buffer still waiting inside
+   the GPU ring for the shim's output event; that teardown then blocks on the stuck job until the ring
+   times out and resets. The shim registers a hook releasing those waits; it runs once, before the
+   first teardown call made while Wine is shutting the process down. */
+static void (WINAPI* shutdown_hook)(void);
+
+void WINAPI d4rSetShutdownHook(void (WINAPI* hook)(void))
+{
+    shutdown_hook = hook;
+}
+
+/* Returns 1 while Wine shuts the process down. ExitProcess has killed the other threads by then,
+   possibly inside HIP/HSA with a runtime lock held, so a teardown call into HIP can block forever
+   (seen: NVIDIA's NGX Shutdown1 -> cuTexObjectDestroy -> HSA mutex). Teardown and sync calls then
+   report success without touching HIP; the kernel reclaims the process's GPU state. */
+static int before_teardown(void)
+{
+    static BOOLEAN (WINAPI* in_progress)(void);
+    static LONG ran;
+    if (in_progress == NULL)
+        in_progress = (BOOLEAN (WINAPI*)(void))GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlDllShutdownInProgress");
+    if (in_progress == NULL || !in_progress())
+        return 0;
+    if (shutdown_hook != NULL && InterlockedExchange(&ran, 1) == 0)
+    {
+        tracef("process shutdown: running the shim's hook; CUDA teardown is skipped");
+        shutdown_hook();
+    }
+    return 1;
+}
+
 CUresult WINAPI cuInit(unsigned int flags)
 {
     CUINIT_FN function = (CUINIT_FN)find_zluda_symbol("cuInit");
@@ -2162,6 +2194,8 @@ CUresult WINAPI cuCtxCreate_v2(CUcontext* context, unsigned int flags, CUdevice 
 
 CUresult WINAPI cuCtxDestroy_v2(CUcontext context)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUCTXDESTROY_FN function = (CUCTXDESTROY_FN)find_zluda_symbol("cuCtxDestroy_v2");
     CUresult result = function != NULL ? function(context) : CUDA_ERROR_NOT_INITIALIZED;
     tracef("cuCtxDestroy_v2 context=%p result=%d", context, result);
@@ -2192,6 +2226,8 @@ static int elide_ngx_sync(void)
 
 CUresult WINAPI d4rCtxSynchronize(void)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUCTX_SYNCHRONIZE_FN function = (CUCTX_SYNCHRONIZE_FN)find_zluda_symbol("cuCtxSynchronize");
     CUresult result = function != NULL ? function() : missing("cuCtxSynchronize");
     if (result == CUDA_SUCCESS)
@@ -2202,6 +2238,8 @@ CUresult WINAPI d4rCtxSynchronize(void)
 
 CUresult WINAPI cuCtxSynchronize(void)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     if (elide_ngx_sync())
     {
         TRACE_CALL(CUDA_SUCCESS, "cuCtxSynchronize elided");
@@ -2348,6 +2386,8 @@ CUresult WINAPI cuModuleLoad(CUmodule* module, const char* filename)
 
 CUresult WINAPI cuModuleUnload(CUmodule module)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUMODULEUNLOAD_FN function = (CUMODULEUNLOAD_FN)find_zluda_symbol("cuModuleUnload");
     CUresult result = function != NULL ? function(module) : missing("cuModuleUnload");
     if (result == CUDA_SUCCESS) microcuda_k_remove_module(module);
@@ -2474,6 +2514,8 @@ CUresult WINAPI cuMemAllocHost(void** pointer, size_t bytes)
 
 CUresult WINAPI cuMemFree(CUdeviceptr pointer)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUMEMFREE_FN function = (CUMEMFREE_FN)find_zluda_symbol("cuMemFree_v2");
     if (microcuda_k_forget) microcuda_k_forget(pointer);
     CUresult result = function != NULL ? function(pointer) : missing("cuMemFree_v2");
@@ -2485,6 +2527,8 @@ CUresult WINAPI cuMemFree(CUdeviceptr pointer)
 
 CUresult WINAPI cuMemFreeHost(void* pointer)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUMEMFREEHOST_FN function = (CUMEMFREEHOST_FN)find_zluda_symbol("cuMemFreeHost");
     CUresult result = function != NULL ? function(pointer) : missing("cuMemFreeHost");
     TRACE_CALL(result, "cuMemFreeHost ptr=%p result=%d", pointer, result);
@@ -2572,6 +2616,8 @@ CUresult WINAPI cuArray3DCreate(CUarray* array, const void* descriptor)
 
 CUresult WINAPI cuArrayDestroy(CUarray array)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUARRAYDESTROY_FN function = (CUARRAYDESTROY_FN)find_zluda_symbol("cuArrayDestroy");
     CUresult result = function != NULL ? function(array) : missing("cuArrayDestroy");
     if (result == CUDA_SUCCESS)
@@ -2690,6 +2736,8 @@ CUresult WINAPI cuArrayGetDescriptor(void* descriptor, CUarray array)
 
 CUresult WINAPI cuMipmappedArrayDestroy(CUmipmappedArray array)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUMIPMAPPEDARRAYDESTROY_FN function =
         (CUMIPMAPPEDARRAYDESTROY_FN)find_zluda_symbol("cuMipmappedArrayDestroy");
     CUresult result = function != NULL ? function(array) : missing("cuMipmappedArrayDestroy");
@@ -2699,6 +2747,8 @@ CUresult WINAPI cuMipmappedArrayDestroy(CUmipmappedArray array)
 
 CUresult WINAPI cuDestroyExternalMemory(CUexternalMemory memory)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUEXTERNALMEMORYDESTROY_FN function =
         (CUEXTERNALMEMORYDESTROY_FN)find_zluda_symbol("cuDestroyExternalMemory");
     CUresult result = function != NULL ? function(memory) : missing("cuDestroyExternalMemory");
@@ -2731,6 +2781,8 @@ CUresult WINAPI cuSurfObjectCreate(CUsurfObject* object, const void* descriptor)
 
 CUresult WINAPI cuSurfObjectDestroy(CUsurfObject object)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUSURFOBJECTDESTROY_FN function = (CUSURFOBJECTDESTROY_FN)find_zluda_symbol("cuSurfObjectDestroy");
     pthread_mutex_lock(&instrumentation_lock);
     for (SurfaceObjectRecord** link = &surface_objects; *link != NULL; link = &(*link)->next)
@@ -2798,6 +2850,8 @@ CUresult WINAPI cuTexObjectCreate(CUtexObject* object, const void* resource,
 
 CUresult WINAPI cuTexObjectDestroy(CUtexObject object)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     CUTEXOBJECTDESTROY_FN function = (CUTEXOBJECTDESTROY_FN)find_zluda_symbol("cuTexObjectDestroy");
     CUresult result = function != NULL ? function(object) : missing("cuTexObjectDestroy");
     if (result == CUDA_SUCCESS)
@@ -2840,9 +2894,15 @@ static void microcuda_k_notify_generic_write(const char* target)
         microcuda_k_write(0, SIZE_MAX); /* unsupported/general writer: invalidate all prepared weights */
 }
 typedef uintptr_t D4rArg;
+static int d4r_forward_is_teardown(const char* target)
+{
+    return strstr(target, "Destroy") != NULL || strstr(target, "Synchronize") != NULL || strstr(target, "Release") != NULL;
+}
 #define D4R_FORWARD(name, target, count, params, args) \
     CUresult WINAPI name params \
     { \
+        if (d4r_forward_is_teardown(#target) && before_teardown()) \
+            return CUDA_SUCCESS; \
         typedef CUresult(__attribute__((sysv_abi)) * function_type) params; \
         function_type function = (function_type)find_zluda_symbol(#target); \
         microcuda_k_notify_generic_write(#target); \
@@ -2857,6 +2917,8 @@ D4R_FORWARD(cuEventRecord, cuEventRecord, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuEventRecordWithFlags, cuEventRecordWithFlags, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 CUresult WINAPI cuEventSynchronize(D4rArg a0)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
     if (elide_ngx_sync())
     {
@@ -2872,6 +2934,8 @@ CUresult WINAPI cuEventSynchronize(D4rArg a0)
    game's split command list only after this event has actually completed. */
 CUresult WINAPI d4rEventSynchronize(D4rArg a0)
 {
+    if (before_teardown())
+        return CUDA_SUCCESS;
     typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
     function_type function = (function_type)find_zluda_symbol("cuEventSynchronize");
     CUresult result = function != NULL ? function(a0) : missing("cuEventSynchronize");

@@ -10,6 +10,8 @@ Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set
 
 See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
+The development shim also has [experimental native Vulkan support](docs/vulkan.md).
+
 > **Not affiliated with NVIDIA or AMD.**
 
 

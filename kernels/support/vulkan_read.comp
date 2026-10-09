@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0, binding=0) uniform sampler2D sourceImage;
+layout(std430, set=0, binding=1) writeonly buffer Pixels { uint pixels[]; };
+layout(push_constant) uniform Size { uint width; uint height; uint mode; } size;
+// Match the CPU canonical conversion, including round-to-even and subnormals.
+uint halfBits(float value) {
+    uint bits = floatBitsToUint(value);
+    uint sign = (bits >> 16) & 0x8000u;
+    uint exponent = (bits >> 23) & 0xffu;
+    uint mantissa = bits & 0x7fffffu;
+    if (exponent == 255u) return sign | 0x7c00u | (mantissa != 0u ? 0x200u : 0u);
+    int e = int(exponent) - 112;
+    if (e >= 31) return sign | 0x7c00u;
+    uint shift = 13u;
+    if (e <= 0) {
+        if (e < -10) return sign;
+        mantissa |= 0x800000u;
+        shift = uint(14 - e); e = 0;
+    }
+    uint m = mantissa >> shift;
+    uint remainder = mantissa & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1u);
+    uint result = sign | (uint(e) << 10);
+    result += m & (e == 0 ? 0x7ffu : 0x3ffu);
+    if (remainder > halfway || (remainder == halfway && (m & 1u) != 0u)) ++result;
+    return result;
+}
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= size.width || p.y >= size.height) return;
+    ivec2 extent = textureSize(sourceImage, 0);
+    uint index = p.y * size.width + p.x;
+    vec4 value = all(lessThan(ivec2(p), extent))
+        ? texelFetch(sourceImage, ivec2(p), 0) : vec4(0.0);
+    if (size.mode == 1u) { // canonical RGBA16F color
+        pixels[index * 2u] = halfBits(value.x) | (halfBits(value.y) << 16);
+        pixels[index * 2u + 1u] = halfBits(value.z) | (halfBits(value.w) << 16);
+    } else if (size.mode == 3u) { // canonical RG16F motion
+        pixels[index] = halfBits(value.x) | (halfBits(value.y) << 16);
+    } else if (size.mode == 2u || size.mode == 4u) { // R32F depth/exposure
+        pixels[index] = floatBitsToUint(value.x);
+    } else {
+        uvec4 bits = floatBitsToUint(value);
+        for (uint c = 0u; c < 4u; ++c) pixels[index * 4u + c] = bits[c];
+    }
+}

@@ -1,3 +1,4 @@
+// Experimental native Vulkan NGX frontend: d4r_vulkan_frontend.inl.
 // d4r_nvngx.dll: an NGX core replacement that implements the D3D12 DLSS
 // entry points on top of the official NGX core's CUDA path (which runs on AMD
 // through the Wine nvcuda bridge and ZLUDA). OptiScaler loads it through its
@@ -1342,6 +1343,18 @@ static bool load_libraries()
         logf("loading D4R_NGX_CORE=%ls failed: %lu", corePath, GetLastError());
         return false;
     }
+    // A successful LoadLibrary can still be OptiScaler's interception proxy.
+    // Diagnose that before trying to bind the rest of the CUDA NGX API.
+    if (GetProcAddress(g.core, "NVSDK_NGX_CUDA_Init") == nullptr)
+    {
+        wchar_t loadedPath[MAX_PATH] = {};
+        GetModuleFileNameW(g.core, loadedPath, MAX_PATH);
+        logf("NGX core load returned an incompatible/intercepted module: %ls; "
+             "expected %ls. Set [Hooks] HookOriginalNvngxOnly=true in OptiScaler.ini",
+             loadedPath, corePath);
+        g.core = nullptr;
+        return false;
+    }
     bool ok = true;
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_Init", g.ngx.init);
     if (!load_export(g.core, "NVSDK_NGX_CUDA_Init_ProjectID", g.ngx.initProjectId))
@@ -1686,6 +1699,7 @@ struct OutputSlot
 struct Feature
 {
     NgxHandle handle = {}; // returned to the caller
+    bool nativeVulkan = false; // distinct resource/lifetime contract
     std::atomic<bool> retiring{false};
     IUnknown* resources = nullptr; // main reference plus command-allocator references
     NgxHandle* cudaHandle = nullptr;
@@ -1701,6 +1715,8 @@ struct Feature
     // output wait pacing (D4R_SHIM_OUTPUT_POLL_US): smoothed time from the event record to its completion, kept
     // separately for each wait site (they wait for very different amounts of GPU work)
     double publishWaitEmaUs = 0.0, evalWaitEmaUs = 0.0;
+    // native Vulkan input wait: smoothed time from recording to the input event (waiters may overlap)
+    std::atomic<double> vkInputWaitEmaUs{0.0};
     bool profileEventsReady = false;
 
     CudaImage color, depth, motion, exposure, output;
@@ -4766,15 +4782,17 @@ static float get_float_or(void* parameters, const char* name, float fallback)
     return d4r_ngx_get_float(parameters, name, &value) == NGX_SUCCESS ? value : fallback;
 }
 
-D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, unsigned int featureId, void* parameters,
-                                                   NgxHandle** handle)
+static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHandle** handle, bool nativeVulkan)
 {
     std::lock_guard<std::mutex> apiLock(g_featureApiMutex);
     std::lock_guard<std::mutex> stateLock(g.mutex);
     if (!g.ngxInitialized)
         return NGX_FAIL_NOT_INITIALIZED;
-    std::call_once(g_vk.once, init_vram_interop);
-    if (g_vk.lifetime == nullptr)
+    if (!nativeVulkan && g.device == nullptr)
+        return NGX_FAIL_NOT_INITIALIZED;
+    if (!nativeVulkan)
+        std::call_once(g_vk.once, init_vram_interop);
+    if (!nativeVulkan && g_vk.lifetime == nullptr)
     {
         logf("DLSS requires lifetime-aware d4r d3d12.dll/d3d12core.dll; update both files with the shim");
         return NGX_FAIL_PLATFORM_ERROR;
@@ -4785,6 +4803,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
     }
     auto* feature = new Feature();
+    feature->nativeVulkan = nativeVulkan;
     feature->width = get_uint_or(parameters, "Width", 0);
     feature->height = get_uint_or(parameters, "Height", 0);
     feature->outWidth = get_uint_or(parameters, "OutWidth", 0);
@@ -4895,15 +4914,18 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         release_feature(feature);
         return result;
     }
-    if (!create_buffer(D3D12_HEAP_TYPE_READBACK, 256, &feature->marker,
+    if (!nativeVulkan && !create_buffer(D3D12_HEAP_TYPE_READBACK, 256, &feature->marker,
                        reinterpret_cast<uint8_t**>(const_cast<uint32_t**>(&feature->markerValue))))
     {
         release_feature(feature);
         return NGX_FAIL_PLATFORM_ERROR;
     }
-    for (int index = 0; index <= kSlots; ++index)
-        feature->markerValue[index] = 0;
-    feature->resources = new DeferredResources(feature);
+    if (!nativeVulkan)
+    {
+        for (int index = 0; index <= kSlots; ++index)
+            feature->markerValue[index] = 0;
+        feature->resources = new DeferredResources(feature);
+    }
     feature->handle.Id = g.nextHandleId++;
     {
         std::lock_guard<std::mutex> lock(g_featuresMutex);
@@ -4911,6 +4933,12 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     }
     *handle = &feature->handle;
     return NGX_SUCCESS;
+}
+
+D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, unsigned int featureId,
+                                                   void* parameters, NgxHandle** handle)
+{
+    return create_feature(featureId, parameters, handle, false);
 }
 
 static Feature* find_feature(const NgxHandle* handle)
@@ -4947,7 +4975,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         lastGameStart = timing.gameStart;
     }
     Feature* feature = find_feature(handle);
-    if (feature == nullptr || list == nullptr || parameters == nullptr)
+    if (feature == nullptr || feature->nativeVulkan || list == nullptr || parameters == nullptr)
         return NGX_FAIL_INVALID_PARAMETER;
     ID3D12Resource* color = get_resource(parameters, "Color");
     ID3D12Resource* depth = get_resource(parameters, "Depth");
@@ -5426,13 +5454,13 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle)
     {
         std::lock_guard<std::mutex> lock(g_featuresMutex);
         for (Feature* candidate : g_features)
-            if (&candidate->handle == handle && !candidate->retiring.exchange(true))
+            if (&candidate->handle == handle && !candidate->nativeVulkan && !candidate->retiring.exchange(true))
             {
                 feature = candidate;
                 break;
             }
     }
-    if (feature == nullptr)
+    if (feature == nullptr || feature->nativeVulkan)
         return NGX_FAIL_INVALID_PARAMETER;
     logf("NVSDK_NGX_D3D12_ReleaseFeature(id=%u) after %u completed frames", feature->handle.Id,
          feature->completedFrames.load());
@@ -5471,6 +5499,9 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_Shutdown()
         std::lock_guard<std::mutex> lock(g_featuresMutex);
         features = g_features;
         for (Feature* feature : features)
+            if (feature->nativeVulkan)
+                return NGX_FAIL_INVALID_PARAMETER;
+        for (Feature* feature : features)
             feature->retiring = true;
     }
     for (Feature* feature : features)
@@ -5498,6 +5529,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_UpdateFeature(const void*, unsigned int)
     return NGX_SUCCESS;
 }
 
+#include "d4r_vulkan_frontend.inl"
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -5505,5 +5538,23 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         g_selfModule = instance;
         DisableThreadLibraryCalls(instance);
     }
+    else if (reason == DLL_PROCESS_DETACH)
+        native_vk_process_exit();
     return TRUE;
+}
+
+// The DLL entry point (linked with --entry). At process termination (reserved != NULL) ExitProcess
+// has already killed the worker and waiter threads, possibly inside winpthreads' global condition
+// variable spinlock, so the CRT's static destructors (mutexes, condition variables) can spin forever
+// and the game never exits. Release the GPU waits and skip all CRT teardown then, as Windows advises;
+// the system reclaims everything. Every other notification goes through the CRT as usual.
+extern "C" BOOL WINAPI DllMainCRTStartup(HANDLE, DWORD, LPVOID);
+extern "C" BOOL WINAPI d4r_dll_entry(HANDLE instance, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr)
+    {
+        native_vk_process_exit();
+        return TRUE;
+    }
+    return DllMainCRTStartup(instance, reason, reserved);
 }

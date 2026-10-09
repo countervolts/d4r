@@ -1,6 +1,9 @@
 # Architecture
 
-d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX D3D12 entry point in the game process, a CUDA driver underneath, and CUDA kernels that run. Everything between those points is translation.
+d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX D3D12 or Vulkan entry point in the game process, a CUDA driver underneath, and CUDA kernels that run. Everything between those points is translation.
+
+The [experimental native Vulkan frontend](vulkan.md) reuses the CUDA backend with
+host staging and command-buffer event synchronization; it does not use vkd3d-proton.
 
 ## Components
 

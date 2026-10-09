@@ -19,10 +19,6 @@ The following DirectX 12 games run DLSS Super Resolution through d4r on the test
 | Ratchet & Clank: Rift Apart | Works; occasional artifacts in the pause menu | Works; minor artifacts with HDR enabled and occasionally in the pause menu | Works; occasional artifacts in the pause menu |
 | Dying Light: The Beast | Works | Works | Works; small visual artifacts throughout |
 
-Unsupported games:
-
-- **DOOM: The Dark Ages:** the game uses Vulkan and has no D3D12 mode. d4r currently supports D3D12 DLSS only, so its DLSS calls cannot reach d4r. The game's hardware ray-tracing requirement is separate from this limitation.
-
 General notes:
 
 - Select DLSS in the game's graphics settings where it is offered. OptiScaler can also feed DLSS from a game's FSR or XeSS inputs, but those are a fallback for games that hide DLSS and can ghost or show a black screen.
