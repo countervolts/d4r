@@ -12,6 +12,9 @@ class FrameCompletionTests(unittest.TestCase):
         shim = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
         start = shim.index('static void release_split_frame(Feature* feature, uint32_t frame)\n{')
         end = shim.index('\nstatic void split_watchdog()', start)
+        # release_split_frame signals through this helper, defined after the engine network's exports
+        helper = shim.index('\nstatic VkResult signal_split_semaphore(Feature& feature, uint64_t value)\n{')
+        helper = shim[helper:shim.index('\n}\n', helper) + 3]
         source = r'''
 #include "d4r_frame_completion.h"
 #include <cassert>
@@ -25,7 +28,10 @@ struct Feature {
     D4rFrameCompletion splitCompletion;
     uint64_t splitSignalled = 0;
     int splitSemaphore = 1;
+    bool engineNetTimeline = false; // the Vulkan timeline of this test, not the native network's
+    int engineNet = 0;
 };
+static struct { int (*signalTimeline)(int, uint64_t) = nullptr; } g_engineNet;
 static uint64_t gpuTimeline = 0;
 static bool failSignal = false;
 static int signal(int, const VkSemaphoreSignalInfo* info) {
@@ -36,7 +42,7 @@ static int signal(int, const VkSemaphoreSignalInfo* info) {
 }
 static struct { int device = 1; decltype(&signal) signalSemaphore = signal; } g_vk;
 static void logf(const char*, ...) {}
-''' + shim[start:end] + r'''
+''' + helper + shim[start:end] + r'''
 int main() {
     Feature feature;
     feature.splitCompletion.admit(1); // still running on the CUDA worker

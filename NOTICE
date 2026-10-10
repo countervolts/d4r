@@ -1,5 +1,5 @@
 d4r
-Copyright 2026 countervolts
+Copyright 2026 countervolts and the d4r contributors
 
 This product is licensed under the GNU General Public License, version 3 only
 (GPL-3.0-only; see LICENSE), except for the files
@@ -27,7 +27,8 @@ This repository contains no NVIDIA software. The NVIDIA DLSS feature library (nv
 the NGX core (_nvngx.dll) are NVIDIA's; you supply your own copies, and their use is governed by
 NVIDIA's license terms. At build time, kernels/tools/extract_dlss_ptx.py reads PTX from your copy
 of nvngx_dlss.dll into kernels/extracted/, which is not part of the repository and must not be
-redistributed.
+redistributed. The same holds for the model files the native engine's tools write (engine/README.md):
+weights.bin, offsets.bin, lut.bin, hipnet.bin and model.json hold values read from NVIDIA's DLSS.
 
 NVIDIA and DLSS are trademarks of NVIDIA Corporation. AMD, Radeon and FSR are trademarks of
 Advanced Micro Devices, Inc. This project is not affiliated with or endorsed by either company.

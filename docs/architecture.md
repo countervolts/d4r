@@ -72,7 +72,7 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 | `d4r\zluda\libcuda.so` | ZLUDA |
 | `d4r\kernels\<gfx target>\` | native kernels and their manifest `d4r-kernels.txt` |
 | `d4r\d4r.ini` | this game's settings |
-| `d4r\nvngx_dlss.dll`, `d4r\ngx\_nvngx.dll` | NVIDIA's files (the packager's `D4R_BUNDLE_NVIDIA=0` leaves them for the user to add) |
+| `d4r\nvngx_dlss.dll`, `d4r\ngx\_nvngx.dll` | NVIDIA's files, downloaded by `install.sh` (`D4R_BUNDLE_NVIDIA=installer`, the default), bundled (`=1`) or added by the user (`=0`) |
 
 **NGX routing.** OptiScaler tries `_nvngx.dll` before `nvngx.dll`, with system fallback for each name. `OptiDllPath=d4r` alone can therefore select Proton's system `_nvngx.dll` before reaching the shim. A file-valued `NvngxPath` takes priority on the first probe, regardless of the probe's name. It must select `d4r\nvngx.dll`, never `d4r\ngx\_nvngx.dll`: the latter is NVIDIA's core, which the shim loads internally. See OptiScaler 0.9.4's [NGX loader](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/proxies/NVNGX_Proxy.h) and [override handling](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/Util.cpp).
 

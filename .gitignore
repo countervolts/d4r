@@ -8,6 +8,8 @@
 *.cubin
 *.fatbin
 *.nvngx
+# NVIDIA's NGX/DLSS SDK headers (the probes in tools/ build against the user's own copy)
+nvsdk_ngx*.h
 
 # Local captures, dumps, traces, and build products
 /captures/
@@ -36,3 +38,10 @@ videos/
 *.hsaco
 *.ptx
 /kernels/extracted/
+# Native engine models: weights and tables read from NVIDIA's DLSS, and shaders compiled next to them
+weights.bin
+offsets.bin
+lut.bin
+hipnet.bin
+model.json
+*.spv

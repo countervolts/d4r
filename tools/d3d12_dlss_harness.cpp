@@ -594,6 +594,17 @@ int main(int argc, char** argv)
     std::vector<uint16_t> motion(static_cast<size_t>(motionWidth) * motionHeight * 2, 0);
     const float exposureValue = 1.0f;
     const std::array<float, 4> exposureRGBA = {exposureValue, 0.25f, 0.5f, 0.75f};
+    // D4R_HARNESS_EXPOSURE_VALUES=v1,v2,...: exposure texture values, one per frame.
+    std::vector<float> exposureSchedule;
+    if (const char* values = std::getenv("D4R_HARNESS_EXPOSURE_VALUES"))
+        for (const char* cursor = values;;)
+        {
+            char* end = nullptr;
+            exposureSchedule.push_back(std::strtof(cursor, &end));
+            if (*end != ',')
+                break;
+            cursor = end + 1;
+        }
     std::vector<uint16_t> outputInit(static_cast<size_t>(outWidth) * outHeight * 4, 0);
     std::vector<uint8_t> color8;
     std::vector<uint8_t> outputInit8;
@@ -734,6 +745,13 @@ int main(int argc, char** argv)
     // Default to the proven single-frame reference. Temporal probes reset only
     // the first frame and let the same official NGX feature accumulate history.
     d4r_ngx_set_int(parameters, "Reset", 1);
+    // D4R_HARNESS_INDICATOR_INVERT=1 sets NGX's DLSS.Indicator.Invert.X/Y.Axis, which games set to place the
+    // DLSS debug indicator; compare against an unset run to see whether they reach the image.
+    if (const char* invert = std::getenv("D4R_HARNESS_INDICATOR_INVERT"); invert != nullptr && std::atoi(invert) != 0)
+    {
+        d4r_ngx_set_int(parameters, "DLSS.Indicator.Invert.X.Axis", 1);
+        d4r_ngx_set_int(parameters, "DLSS.Indicator.Invert.Y.Axis", 1);
+    }
 
     // Quality scene ground truth (8x8 supersampled output pixels) and metrics.
     // D4R_HARNESS_QUALITY_PAN="vx,vy" scrolls the scene content by whole
@@ -835,8 +853,13 @@ int main(int argc, char** argv)
                 const char* multiplier = std::getenv("D4R_HARNESS_MV_MULT");
                 const float mvScale = multiplier != nullptr ? std::strtof(multiplier, nullptr) : 1.0f;
                 const float unitX = motionHighRes ? 1.0f : 1.0f / scaleX, unitY = motionHighRes ? 1.0f : 1.0f / scaleY;
-                const uint16_t mvX = std::bit_cast<uint16_t>(static_cast<_Float16>(-mvScale * panX * unitX));
-                const uint16_t mvY = std::bit_cast<uint16_t>(static_cast<_Float16>(-mvScale * panY * unitY));
+                // D4R_HARNESS_MV_SCALE="sx,sy": the same motion expressed in other units, as games do
+                // (e.g. "-640,-360": negated, normalised vectors); MV.Scale carries the factor back.
+                float gameScaleX = 1.0f, gameScaleY = 1.0f;
+                if (const char* gameScale = std::getenv("D4R_HARNESS_MV_SCALE"))
+                    std::sscanf(gameScale, "%f,%f", &gameScaleX, &gameScaleY);
+                const uint16_t mvX = std::bit_cast<uint16_t>(static_cast<_Float16>(-mvScale * panX * unitX / gameScaleX));
+                const uint16_t mvY = std::bit_cast<uint16_t>(static_cast<_Float16>(-mvScale * panY * unitY / gameScaleY));
                 for (size_t pixel = 0; pixel < motion.size() / 2; ++pixel)
                 {
                     motion[pixel * 2 + 0] = mvX;
@@ -846,6 +869,13 @@ int main(int argc, char** argv)
             }
             d4r_ngx_set_float(parameters, "Jitter.Offset.X", signX * jx);
             d4r_ngx_set_float(parameters, "Jitter.Offset.Y", signY * jy);
+            if (const char* gameScale = std::getenv("D4R_HARNESS_MV_SCALE"))
+            {
+                float gameScaleX = 1.0f, gameScaleY = 1.0f;
+                std::sscanf(gameScale, "%f,%f", &gameScaleX, &gameScaleY);
+                d4r_ngx_set_float(parameters, "MV.Scale.X", gameScaleX);
+                d4r_ngx_set_float(parameters, "MV.Scale.Y", gameScaleY);
+            }
         }
         if (jitterScene)
         {
@@ -914,12 +944,51 @@ int main(int argc, char** argv)
         }
         else if (temporal)
             d4r_ngx_set_int(parameters, "Reset", forceReset || frame == 1 ? 1 : 0);
+        // D4R_HARNESS_PRE_EXPOSURE / D4R_HARNESS_EXPOSURE_SCALE: non-neutral values on every frame, as games
+        // with their own exposure pipeline pass them.
+        if (const char* value = std::getenv("D4R_HARNESS_PRE_EXPOSURE"))
+            d4r_ngx_set_float(parameters, "DLSS.Pre.Exposure", static_cast<float>(std::atof(value)));
+        if (const char* value = std::getenv("D4R_HARNESS_EXPOSURE_SCALE"))
+            d4r_ngx_set_float(parameters, "DLSS.Exposure.Scale", static_cast<float>(std::atof(value)));
+        // Change exposure after initial frames to exercise temporal/backend transitions.
+        // CUDA supports this scale; the native K adapter currently accepts only a neutral scale.
+        if (const char* changeFrame = std::getenv("D4R_HARNESS_EXPOSURE_CHANGE_FRAME"))
+            if (frame == std::atoi(changeFrame))
+                d4r_ngx_set_float(parameters, "DLSS.Exposure.Scale", 0.5f);
+        // D4R_HARNESS_EXPOSURE_VALUES: the exposure texture's value on each frame (the last value repeats).
+        if (!exposureSchedule.empty())
+        {
+            const float value = exposureSchedule[std::min(static_cast<size_t>(frame - 1), exposureSchedule.size() - 1)];
+            const std::array<float, 4> rgba = {value, 0.25f, 0.5f, 0.75f};
+            update_texture(exposureTexture, exposureRGBA32 ? static_cast<const void*>(rgba.data()) : static_cast<const void*>(&value),
+                           exposureRGBA32 ? 16 : 4, srv);
+        }
         const DWORD start = GetTickCount();
+        LARGE_INTEGER counterStart, counterRecorded, counterEnd, counterFrequency;
+        QueryPerformanceFrequency(&counterFrequency);
+        QueryPerformanceCounter(&counterStart);
         result = evaluate(g_list, feature, parameters, nullptr);
+        QueryPerformanceCounter(&counterRecorded);
         if (const char* delay = std::getenv("D4R_HARNESS_DELAY_SUBMIT_MS"))
             Sleep(static_cast<DWORD>(std::clamp(std::atoi(delay), 0, 4000)));
         submit_and_wait();
-        std::printf("frame %d: EvaluateFeature -> 0x%08x (%lu ms incl. submit)\n", frame, result, GetTickCount() - start);
+        QueryPerformanceCounter(&counterEnd);
+        // The list holds only the evaluation, so the second figure is its whole cost when it is recorded into
+        // the list (the engine backend): recording, submission, GPU execution and the fence.
+        std::printf("frame %d: EvaluateFeature -> 0x%08x (%lu ms incl. submit; call %.0f us, call + submit + wait %.0f us)\n",
+                    frame, result, GetTickCount() - start,
+                    1e6 * static_cast<double>(counterRecorded.QuadPart - counterStart.QuadPart) / counterFrequency.QuadPart,
+                    1e6 * static_cast<double>(counterEnd.QuadPart - counterStart.QuadPart) / counterFrequency.QuadPart);
+        // D4R_HARNESS_TIMING=<file>: one "frame call_us total_us start_us" line per frame.
+        if (const char* timingPath = std::getenv("D4R_HARNESS_TIMING"))
+            if (FILE* timingFile = std::fopen(timingPath, "a"))
+            {
+                std::fprintf(timingFile, "%d %.1f %.1f %.1f\n", frame,
+                             1e6 * static_cast<double>(counterRecorded.QuadPart - counterStart.QuadPart) / counterFrequency.QuadPart,
+                             1e6 * static_cast<double>(counterEnd.QuadPart - counterStart.QuadPart) / counterFrequency.QuadPart,
+                             1e6 * static_cast<double>(counterStart.QuadPart) / counterFrequency.QuadPart);
+                std::fclose(timingFile);
+            }
         Sleep(frameWaitMs); // let the CUDA worker finish before the next presentation
         if (qualityScene && !poleScene && frame > frames - 17)
         {

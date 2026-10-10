@@ -156,6 +156,16 @@ def main(argv):
             fail(f"[Interop] MarkerPollUs must be a number of microseconds, not {value!r}")
         env["D4R_SHIM_MARKER_POLL_US"] = value
 
+    value = flag("Engine", "Enabled")
+    env["D4R_ENGINE"] = "1" if value else "0"
+    if path_value("Engine", "ModelDir"):
+        env["D4R_ENGINE_MODEL_DIR"] = path_value("Engine", "ModelDir")
+    network = get("Engine", "Network")
+    if network is not None and network not in ("auto", "hip", "vulkan"):
+        fail("[Engine] Network must be auto, hip or vulkan")
+    if network in ("hip", "vulkan"):
+        env["D4R_ENGINE_NETWORK"] = network
+
     engine = path_value("Game", "EngineIni")
     cvars = get("Game", "Cvars")
     if engine and cvars:

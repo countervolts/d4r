@@ -90,6 +90,15 @@
 @ stdcall cuPointerGetAttribute(ptr ptr ptr) cuPointerGetAttribute
 @ stdcall d4rImportVulkanMemory(ptr int64 int64 ptr ptr) d4rImportVulkanMemory
 @ stdcall d4rReleaseVulkanMemory(ptr) d4rReleaseVulkanMemory
+@ stdcall d4rEngineNetCreate(ptr int64 ptr long long long int64 int64 ptr) d4rEngineNetCreate
+@ stdcall d4rEngineNetLaunch(ptr long) d4rEngineNetLaunch
+@ stdcall d4rEngineNetDone(ptr ptr) d4rEngineNetDone
+@ stdcall d4rEngineNetDestroy(ptr) d4rEngineNetDestroy
+@ stdcall d4rEngineNetInputWaitReady(ptr int64 ptr) d4rEngineNetInputWaitReady
+@ stdcall d4rEngineNetLaunchAt(ptr long) d4rEngineNetLaunchAt
+@ stdcall d4rEngineNetReleaseInput(ptr long) d4rEngineNetReleaseInput
+@ stdcall d4rEngineNetSetTimeline(ptr ptr int64) d4rEngineNetSetTimeline
+@ stdcall d4rEngineNetSignalTimeline(ptr int64) d4rEngineNetSignalTimeline
 @ stdcall d4rMemcpy2DAsync(ptr ptr) d4rMemcpy2DAsync
 @ stdcall d4rCtxSynchronize() d4rCtxSynchronize
 @ stdcall d4rSetShutdownHook(ptr) d4rSetShutdownHook

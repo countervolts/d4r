@@ -86,6 +86,15 @@ Settings
   PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
   native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
   some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
+- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K) and 4.5 (M) on d4r's own Vulkan
+  inference engine: the upscale is recorded into the game's own frame instead of going through CUDA
+  emulation. It needs Mesa RADV with VK_KHR_cooperative_matrix and the models in d4r/engine/k (K),
+  d4r/engine/k-ldr (K in games without HDR), d4r/engine/m and d4r/engine/m-ldr (M). Games and settings
+  it does not cover (other models, display-resolution motion vectors with M) keep using the normal path,
+  and d4r/d4r_nvngx.log says which one ran and why. Tested in one game so far.
+  This zip has only the engine's shaders in d4r/engine/k. The weights (weights.bin, offsets.bin,
+  lut.bin) are read from your own nvngx_dlss.dll with the tools in d4r's source repository
+  (engine/README.md); until they are there, d4r uses the normal path.
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
   [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=d4r is also
@@ -152,7 +161,8 @@ Licenses
 d4r is GNU General Public License, version 3 only (GPL-3.0-only). The release also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton
 (LGPL 2.1, patched) and OptiScaler 0.9.4 (GPL 3.0, unmodified). d4r/source/SOURCES.txt says where
 each file comes from, and d4r/licenses has the license texts. d4r is not affiliated with NVIDIA,
-AMD or the OptiScaler project.
+AMD or the OptiScaler project, and is provided "as is", without warranty of any kind (GPL-3.0,
+sections 15 and 16).
 @clean NVIDIA's files are yours to supply, under NVIDIA's terms.
 @full NVIDIA's files in this zip (d4r/nvngx_dlss.dll, d4r/ngx/_nvngx.dll) and the kernels built from
 @full NVIDIA's code (listed in d4r/source/SOURCES.txt) are NVIDIA's property, are not covered by

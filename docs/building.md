@@ -102,9 +102,7 @@ In the game, pick DLSS as the upscaler (OptiScaler intercepts it). Every setting
 scripts/fetch_rocm_runtime.sh         # -> ~/.cache/d4r-rocm-runtime (AMD's ROCm 7.2.4 runtime, checksummed)
 D4R_OPTISCALER=/path/to/OptiScaler_0.9.4.7z \
 D4R_DLSS_DLLS=/path/to/310.7/nvngx_dlss.dll:/path/to/310.9/nvngx_dlss.dll \
-D4R_BUNDLE_DLSS=/path/to/nvngx_dlss.dll D4R_BUNDLE_NGX=/path/to/_nvngx.dll D4R_BUNDLE_TEX=kernels/out/native \
 D4R_ZLUDA_DIR=~/.cache/d4r-zluda-current D4R_VKD3D_DIR=~/.cache/d4r-vkd3d-d4r D4R_ROCM_DIR=/opt/rocm \
-D4R_ZLUDA_EMIT=/path/to/zluda/target/release/examples/d4r_emit \
 scripts/package_release.sh            # -> dist/d4r-<version>.zip
 ```
 
@@ -113,6 +111,7 @@ The script:
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`, applied by `scripts/configure_optiscaler.py`; both full and clean ZIPs set `NvngxPath=d4r\nvngx.dll` explicitly, retaining `OptiDllPath=d4r` for other libraries;
 - includes `install.sh` instead of NVIDIA's two DLLs by default, retaining any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
+- with `D4R_BUNDLE_ENGINE`, adds the native engine's shaders as `d4r/engine/k`; the model's weights and tables are never packaged;
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
 `D4R_BUNDLE_NVIDIA=installer` is the default: the ZIP includes `install.sh`, and users run `bash install.sh` after extraction to fetch the pinned official NVIDIA DLLs. This mode requires `D4R_BUNDLE_DLSS` to match the DLSS 310.7.0 SHA-256 pinned in the installer, so bundled texture kernels match the downloaded library; `D4R_BUNDLE_NGX` is only needed with `D4R_BUNDLE_NVIDIA=1`, which retains the old DLL-bundling mode.

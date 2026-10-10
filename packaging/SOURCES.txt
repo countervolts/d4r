@@ -37,17 +37,19 @@ Third-party software, unmodified or patched by d4r:
 
 @clean Not included: NVIDIA's DLSS library (nvngx_dlss.dll) and NGX runtime (_nvngx.dll). You supply them
 @clean and are responsible for complying with NVIDIA's license terms.
-@full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever distributes
-@full this zip, not by NVIDIA:
+@full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever built this
+@full zip, not by NVIDIA. NVIDIA's license does not permit redistributing it; do not share this zip:
 @full   d4r/nvngx_dlss.dll   NVIDIA DLSS Super Resolution library @DLSS_VERSION@
 @full   d4r/ngx/_nvngx.dll   NVIDIA NGX runtime from NVIDIA's Windows display driver, @NGX_VERSION@
 @installer NVIDIA DLLs are not bundled. install.sh downloads DLSS 310.7.0 from NVIDIA/DLSS
 @installer commit a291cc7d2cc642a51566f3dfd5376f635cd1b284 and _nvngx.dll from NVIDIA driver 596.36.
 @installer URLs and SHA-256 hashes are pinned in install.sh. NVIDIA license terms apply.
 @installer Included NVIDIA PTX-derived kernels (not covered by d4r licenses):
-@installer   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
-@installer                        compiled from DLSS PTX by ZLUDA (kernels/tex in this repository).
-@full   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
-@full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code
-@full                        (kernels/tex in the d4r repository), compiled by ZLUDA
+@installer   d4r/kernels/*/hiluma_engine_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@installer                        NVIDIA's PTX with parts replaced by d4r code (kernels/tex) or translated to
+@installer                        HIP (kernels/native), compiled by ZLUDA or ROCm's clang.
+@full   d4r/kernels/*/hiluma_engine_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll, with parts replaced by d4r code
+@full                        (kernels/tex in the d4r repository) or translated to HIP (kernels/native),
+@full                        compiled by ZLUDA or ROCm's clang
 d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.
