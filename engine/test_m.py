@@ -76,12 +76,20 @@ def pack_layer(t, name):
     if CIN:
         assert t['expand_w'].shape == (CIN, 4 * C), t['expand_w'].shape
         o[68], o[69] = b8.add(pack8(t['expand_w'])), b16.add(tile(t['expand_b']))
+    if 'emb_w1' in t:
+        # preset L's input embedding (layer_m.comp KIND 3): 32 features -> 32 hidden -> C
+        assert t['emb_w1'].shape == (32, 32) and t['emb_w2'].shape == (32, C), (t['emb_w1'].shape, t['emb_w2'].shape)
+        o[60], o[61] = b8.add(pack8(t['emb_w1'])), b16.add(tile(t['emb_b1']))
+        o[62], o[63] = b8.add(pack8(t['emb_w2'])), b16.add(tile(t['emb_b2']))
     return o, b8.data(), b16.data()
 
 
 def defines(name):
     C, heads, NPM, CIN = mm.LAYERS[name]
-    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={1 if NPM else 2 if CIN else 0}', f'-DXC={NPM or CIN or 16}'] + os.environ.get('M_DEFS', '').split()
+    kind = {'enc0l': 3, 'dec0l': 4}.get(name, 1 if NPM else 2 if CIN else 0)
+    # compile_m.py's arithmetic (ZLUDA's lowering); M_TEXL=0 gives the native accuracy kernels' for the network layers
+    texl = ['-DTEXL=1'] if kind >= 3 or os.environ.get('M_TEXL', '1') != '0' else []
+    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}'] + texl + os.environ.get('M_DEFS', '').split()
 
 
 def token_codes(buf, off, W, H, C):

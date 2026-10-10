@@ -98,20 +98,20 @@ EvalSync = false
 MarkerPollUs = 200
 
 [Engine]
-; Experimental. Runs DLSS 4 and 4.5 (models K and M) on d4r's own Vulkan inference engine instead of NVIDIA's
+; Experimental. Runs DLSS 4 and 4.5 (models K, L and M) on d4r's own Vulkan inference engine instead of NVIDIA's
 ; kernels through ZLUDA: the whole evaluation is recorded into the game's own command list, the game shows the
 ; result of the frame it just rendered, and FrameAge and the [Interop] hand-off settings do not apply.
 ; Needs VkD3DDir, a driver with VK_KHR_cooperative_matrix (Mesa RADV on RDNA3/RDNA4) and the model folders
-; (RuntimeDir/engine/k, k-ldr, m, m-ldr; scripts/install_d4r_runtime.sh). A game or setting the engine does not
-; cover uses the normal path, with the reason in d4r_nvngx.log: other models than K and M, display-resolution
-; motion vectors with M, or a K model built before the current engine/compile_k.py for display-resolution
+; (RuntimeDir/engine/k, k-ldr, m, m-ldr, l, l-ldr; scripts/install_d4r_runtime.sh). A game or setting the engine
+; does not cover uses the normal path, with the reason in d4r_nvngx.log: other models than K, L and M,
+; display-resolution motion vectors with L or M, or a K model built before the current engine/compile_k.py for display-resolution
 ; motion, non-inverted depth or exposure supplied by the game. Details and measurements: engine/README.md.
 ; (D4R_ENGINE)
 Enabled = false
 ; The model K folder for games with the HDR flag: the folder engine/compile_k.py writes (weights extracted
 ; from your nvngx_dlss.dll plus d4r's shaders). auto = RuntimeDir/engine/k, where scripts/install_d4r_runtime.sh
-; puts D4R_ENGINE_MODEL. The other folders: D4R_ENGINE_MODEL_LDR_DIR, D4R_ENGINE_MODEL_M_DIR and
-; D4R_ENGINE_MODEL_M_LDR_DIR. (D4R_ENGINE_MODEL_DIR)
+; puts D4R_ENGINE_MODEL. The other folders: D4R_ENGINE_MODEL_LDR_DIR, D4R_ENGINE_MODEL_M_DIR,
+; D4R_ENGINE_MODEL_M_LDR_DIR, D4R_ENGINE_MODEL_L_DIR and D4R_ENGINE_MODEL_L_LDR_DIR. (D4R_ENGINE_MODEL_DIR)
 ModelDir = auto
 ; Where the network between the engine's Vulkan stages runs (K and M). hip = d4r's native HIP layer kernels
 ; (M: about 1.7x faster than the shader, 3.8 instead of 5.5 ms per frame at 1080p -> 4K on an RX 9070 XT);

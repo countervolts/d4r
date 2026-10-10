@@ -31,16 +31,32 @@
 // accumulator registers with a pair-aligned half-wave exchange. Without this the ten layers reach only 41-46 dB
 // against the capture even though every product, weight map and bias is already the native one.
 //
-// Build-time shape: C, NH, KIND (0 plain, 1 encoder with 2x2 patch merge, 2 decoder with patch expand + skip),
-// XC (merged channels or low-resolution channels). One workgroup is an 8x8-token block: four waves, one per
-// 4x4-token window. Bindings and the parameter block are unchanged; the FP8 weight matrices are the packed
-// fixed-16 tiles of test_m.pack8 (the f16 vectors stay row-major).
+// Build-time shape: C, NH, KIND (0 plain, 1 encoder with 2x2 patch merge, 2 decoder with patch expand + skip,
+// 3 preset L's input stage, 4 preset L's expansion stage), XC (merged channels or low-resolution channels). One
+// workgroup is an 8x8-token block: four waves, one per 4x4-token window. Bindings 0-6 and the parameter block are
+// the same for every kind; the FP8 weight matrices are the packed fixed-16 tiles of test_m.pack8 (the f16 vectors
+// stay row-major).
+//
+// Preset L (L_NOTES.md) runs a C 32, 2-head block of this shape at render-pixel resolution in its input and
+// expansion stages, where M has single folded matrix products:
+//   KIND 3 (rrlite_enc0_4x4_*): enc0_features.glsl's 32 FP8 feature slots per pixel, an embedding
+//          x0 = W2 q8(relu(W1 f + b1)) + b2 (32 -> 32 -> 32), the block, its FP8 output (dec0's skip input) and a
+//          patch merge to 64 channels at half resolution (the network's input). Weights o[60..63]: W1, b1, W2, b2.
+//   KIND 4 (rrlite_dec0_4x4): the patch expand of the network's 64-channel output plus that skip input, the
+//          block, and the reconstruction's per-pixel inputs from its f16 output (no FP8 rounding, no history).
+// TEXL selects the arithmetic of ZLUDA's lowering of NVIDIA's PTX (kernels/tex/swin_tex.h): the bias or previous
+// accumulator enters the first of a k32 step's two products as C, the norms sum in natural channel order, the P V
+// product's keys take ZLUDA's K slots, and the reciprocal square root is the hardware approximation. compile_m.py
+// builds every layer of M and L with it: the chained network and the whole frame are then byte-identical to the CUDA
+// backend running NVIDIA's translated kernels (L_NOTES.md). Without it the layers reproduce d4r's native accuracy
+// kernels (K32_MIX) instead, which drift from that reference through the FP8 tube.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_float_e4m3 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 128) in;
 // o: 0 g1, 1 bo, 2 g2, 3 b2 (f16); per head h at 4 + 4h: q, v (FP8), bias (f16), wo (FP8);
 //    per MLP chunk c at 20 + 3c: w1 (FP8), b1 (f16), w2 (FP8); 68, 69: merge or expand weights (FP8) and bias (f16)
@@ -49,8 +65,65 @@ layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
 layout(set = 0, binding = 2, std430) readonly buffer W16 { f16vec4 w[]; } w16;
 layout(set = 0, binding = 3, std430) readonly buffer Ib { floate4m3_t a[]; } inb;      // [H][W][C]; decoders: [H/2][W/2][XC]
 layout(set = 0, binding = 4, std430) readonly buffer Sb { floate4m3_t a[]; } skb;      // decoders: skip [H][W][C]
+#if KIND == 4 && defined(L_DUMP)
+layout(set = 0, binding = 5, std430) buffer O0 { float16_t a[]; } ldump;              // debug: the head's inputs [H][W][C]
+#else
 layout(set = 0, binding = 5, std430) buffer O0 { floate4m3_t a[]; } out0;              // [H][W][C]
+#endif
 layout(set = 0, binding = 6, std430) buffer O1 { floate4m3_t a[]; } out1;              // encoders: merged [H/2][W/2][XC]
+#ifndef TEXL
+#define TEXL 0
+#endif
+// PLANES (KIND 3 and 4): the half-resolution tokens in NGX's layout, planes of 32 channels ([XC/32][H/2][W/2][32]),
+// for a network that runs outside the engine (the native HIP layers)
+#ifndef PLANES
+#define PLANES 0
+#endif
+#if KIND == 3
+// the input stage's parameter block (MEnc0Params; W, Hh above are the token pixel grid)
+layout(set = 0, binding = 7, std430) readonly buffer Ep
+{
+    ivec2 size, shift, tok;
+    vec2 jitter, prevJitter;
+    vec2 mvScale, mvOffs;
+    vec2 rnd2hi, hi2rnd;
+    vec2 hiSize;
+    float changeScale, changeGain;
+    uint depthFlag, reset, frame;
+    float expo, expoPrev;
+    float halfInvX, halfInvY, renderInvX, renderInvY;
+} ep;
+layout(set = 0, binding = 8) uniform sampler2D colorTex;
+layout(set = 0, binding = 9) uniform sampler2D motionTex;
+layout(set = 0, binding = 10) uniform sampler2D depthTex;
+layout(set = 0, binding = 11) uniform sampler2D prevMvTex;     // candidate A of the previous frame, bilinear
+layout(set = 0, binding = 12) uniform sampler2D halfTex;       // half-resolution previous result, bilinear
+layout(set = 0, binding = 13) uniform sampler2D featTex;       // recurrent feature, bilinear
+layout(set = 0, binding = 14, rg16f) uniform writeonly image2D mvAOut;
+layout(set = 0, binding = 15, rg16f) uniform writeonly image2D mvBOut;
+layout(set = 0, binding = 16, rg16f) uniform writeonly image2D mvCOut;
+layout(set = 0, binding = 17, std430) readonly buffer Noise { uint16_t n[]; } noise;  // 8 x 16 x 16
+#define EP ep
+#include "enc0_features.glsl"
+#undef EP
+#endif
+#if KIND == 4
+#include "normalized_store.glsl"
+#include "round_half.glsl"
+// the expansion stage's parameter block (MDec0Params): render size, the covariance's sigma and rho
+layout(set = 0, binding = 7, std430) readonly buffer Dp
+{
+    ivec2 size;
+    int tokW; uint reset;
+    vec2 rndOffs, rnd2hi, hiSize, histOffs;
+    float sigma, rho;
+    vec2 renderInv;
+} dp;
+layout(set = 0, binding = 8, rgba8_snorm) uniform writeonly image2D featOut;
+layout(set = 0, binding = 9, rgba8) uniform writeonly image2D gateOut;
+layout(set = 0, binding = 10, rgba8) uniform writeonly image2D mixOut;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D covOut;
+#endif
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define HAC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -66,6 +139,7 @@ const uint VWD = 16u;                       // row width of the per-wave V trans
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 #define Q16(v) float16_t(v)
 #define CL8(v) clamp(v, float16_t(-448.0), float16_t(448.0))
+const float16_t MCL = float16_t(6.2831855);
 // NVIDIA's accumulator rounding: one binary16 rounding of the whole tile after every logical 32 products.
 // RADV folds a register-only f32->f16->f32 conversion away (measured: half of all values and every tie
 // midpoint unchanged), so the rounding has to pass through binary16 memory. Each invocation owns 8 halves of
@@ -85,6 +159,18 @@ shared f16vec4 RS[128 * 2];
 // operand values as the old plain W[K][N] ColumnMajor stride-N load, but a plain (non-transposed) load.
 #define LDA8(dst, base, ks, stride, moff) coopMatLoad((dst), w8.w, (base) + 256u * (uint(ks) * (uint(stride) / 16u) + (uint(moff) / 16u)), 16u, RM)
 
+#if TEXL
+// ZLUDA's lowering of m16n8k32 (K32_NO_MIX): the accumulator enters the first product as C, f32 throughout the step,
+// one binary16 rounding at its end
+#define K32H(dst, a0, b0, a1, b1) { \
+    ACC P_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(dst))); \
+    RS[gl_LocalInvocationID.x * 2u + 0u] = f16vec4(float16_t(P_[0]), float16_t(P_[1]), float16_t(P_[2]), float16_t(P_[3])); \
+    RS[gl_LocalInvocationID.x * 2u + 1u] = f16vec4(float16_t(P_[4]), float16_t(P_[5]), float16_t(P_[6]), float16_t(P_[7])); \
+    subgroupMemoryBarrierShared(); \
+    const f16vec4 u0_ = RS[gl_LocalInvocationID.x * 2u + 0u], u1_ = RS[gl_LocalInvocationID.x * 2u + 1u]; \
+    (dst)[0] = u0_.x; (dst)[1] = u0_.y; (dst)[2] = u0_.z; (dst)[3] = u0_.w; \
+    (dst)[4] = u1_.x; (dst)[5] = u1_.y; (dst)[6] = u1_.z; (dst)[7] = u1_.w; }
+#else
 #define K32H(dst, a0, b0, a1, b1) { \
     ACC P_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(0.0))); \
     RS[gl_LocalInvocationID.x * 2u + 0u] = f16vec4( \
@@ -97,6 +183,7 @@ shared f16vec4 RS[128 * 2];
     const f16vec4 u0_ = RS[gl_LocalInvocationID.x * 2u + 0u], u1_ = RS[gl_LocalInvocationID.x * 2u + 1u]; \
     (dst)[0] = u0_.x; (dst)[1] = u0_.y; (dst)[2] = u0_.z; (dst)[3] = u0_.w; \
     (dst)[4] = u1_.x; (dst)[5] = u1_.y; (dst)[6] = u1_.z; (dst)[7] = u1_.w; }
+#endif
 // a tiled f16 vector (16 equal rows) as the initial value of an accumulator whose rows are its channels
 HAC bias16(uint off, uint stride) { HAC b; coopMatLoad(b, w16.w, off / 4u, stride / 4u, CM); return b; }
 #define MK8_F8(dst, a) { \
@@ -123,7 +210,10 @@ float16_t gelu1(float16_t x)
     precise float16_t outer = float16_t(0.5) + c * inner;
     return x * outer;
 }
-#if C == 64
+#if C == 32
+#define EACH_T(X) X(0) X(1)
+#define EACH_T16(X) X(0, 1)
+#elif C == 64
 #define EACH_T(X) X(0) X(1) X(2) X(3)
 #define EACH_T16(X) X(0, 1) X(2, 3)
 #elif C == 96
@@ -145,7 +235,41 @@ float16_t gelu1(float16_t x)
 // #pragma clang fp contract(off)).
 #define SH16(v) subgroupShuffleXor(packHalf2x16(vec2(float((v).x), float((v).y))), 16u)
 #define UN16(p) f16vec2(float16_t(unpackHalf2x16(p).x), float16_t(unpackHalf2x16(p).y))
-#if C == 64
+#if TEXL
+// rsqrt.approx as ZLUDA lowers it (v_rsq_f32)
+#define RSQ16(S) float16_t(inversesqrt(float(float16_t((S) + float16_t(0.0001220703125)))))
+#else
+#define RSQ16(S) float16_t(1.0 / sqrt(float(float16_t((S) + float16_t(0.0001220703125)))))
+#endif
+#if TEXL
+// SWIN_TOK_NATURAL's tok_rsq: the lane's own channels 16T + 8hf + I; per g the tiles of each parity (WS), the two
+// parities, then g, then the halves
+#if C == 32
+#define WS(P, ww) P[ww]
+#elif C == 64
+#define WS(P, ww) (P[ww] + P[2 + ww])
+#elif C == 96
+#define WS(P, ww) ((P[ww] + P[2 + ww]) + P[4 + ww])
+#else
+#define WS(P, ww) ((P[ww] + P[2 + ww]) + (P[4 + ww] + P[6 + ww]))
+#endif
+#define RSQ_TREE(OUT) { \
+    f16vec2 P0_[NT], P1_[NT]; \
+    EACH_T(RSQ_TILE) \
+    precise f16vec2 W00_ = WS(P0_, 0), W10_ = WS(P0_, 1), W01_ = WS(P1_, 0), W11_ = WS(P1_, 1); \
+    precise f16vec2 U0_ = W00_ + W10_, U1_ = W01_ + W11_; \
+    precise f16vec2 A_ = U0_ + U1_; \
+    precise f16vec2 S_ = A_ + UN16(SH16(A_)); \
+    OUT = RSQ16(S_.x + S_.y); }
+#elif C == 32
+#define RSQ_TREE(OUT) { \
+    f16vec2 P0_[NT], P1_[NT]; \
+    EACH_T(RSQ_TILE) \
+    precise f16vec2 A0_ = P0_[0] + P0_[1], A1_ = P1_[0] + P1_[1]; \
+    precise f16vec2 U0_ = A0_ + UN16(SH16(A0_)), U1_ = A1_ + UN16(SH16(A1_)); \
+    precise f16vec2 S_ = U0_ + U1_; \
+    OUT = RSQ16(S_.x + S_.y); }
+#elif C == 64
 #define RSQ_TREE(OUT) { \
     f16vec2 P0_[NT], P1_[NT]; \
     EACH_T(RSQ_TILE) \
@@ -154,7 +278,7 @@ float16_t gelu1(float16_t x)
     precise f16vec2 A0_ = W00_ + W10_, A1_ = W01_ + W11_; \
     precise f16vec2 U0_ = A0_ + UN16(SH16(A0_)), U1_ = A1_ + UN16(SH16(A1_)); \
     precise f16vec2 S_ = U0_ + U1_; \
-    OUT = float16_t(1.0 / sqrt(float(float16_t((S_.x + S_.y) + float16_t(0.0001220703125))))); }
+    OUT = RSQ16(S_.x + S_.y); }
 #elif C == 96
 #define RSQ_TREE(OUT) { \
     f16vec2 P0_[NT], P1_[NT]; \
@@ -164,7 +288,7 @@ float16_t gelu1(float16_t x)
     precise f16vec2 A0_ = W00_ + W10_, A1_ = W01_ + W11_; \
     precise f16vec2 U0_ = A0_ + UN16(SH16(A0_)), U1_ = A1_ + UN16(SH16(A1_)); \
     precise f16vec2 S_ = U0_ + U1_; \
-    OUT = float16_t(1.0 / sqrt(float(float16_t((S_.x + S_.y) + float16_t(0.0001220703125))))); }
+    OUT = RSQ16(S_.x + S_.y); }
 #else
 #define RSQ_TREE(OUT) { \
     f16vec2 P0_[NT], P1_[NT]; \
@@ -174,22 +298,70 @@ float16_t gelu1(float16_t x)
     precise f16vec2 A0_ = W00_ + W10_, A1_ = W01_ + W11_; \
     precise f16vec2 U0_ = A0_ + UN16(SH16(A0_)), U1_ = A1_ + UN16(SH16(A1_)); \
     precise f16vec2 S_ = U0_ + U1_; \
-    OUT = float16_t(1.0 / sqrt(float(float16_t((S_.x + S_.y) + float16_t(0.0001220703125))))); }
+    OUT = RSQ16(S_.x + S_.y); }
 #endif
+#define ZK(m) { \
+    const bool up_ = hf != 0u; \
+    const f16vec2 w0_ = f16vec2((m)[0], (m)[1]), w1_ = f16vec2((m)[2], (m)[3]); \
+    const f16vec2 w2_ = f16vec2((m)[4], (m)[5]), w3_ = f16vec2((m)[6], (m)[7]); \
+    const f16vec2 r0_ = UN16(SH16(up_ ? w0_ : w2_)), r1_ = UN16(SH16(up_ ? w1_ : w3_)); \
+    const f16vec2 a_ = up_ ? r0_ : w0_, b_ = up_ ? w2_ : r0_, c_ = up_ ? r1_ : w1_, d_ = up_ ? w3_ : r1_; \
+    (m)[0] = a_.x; (m)[1] = a_.y; (m)[2] = b_.x; (m)[3] = b_.y; (m)[4] = c_.x; (m)[5] = c_.y; (m)[6] = d_.x; (m)[7] = d_.y; }
 #define RSQ_TILE(T) { \
     precise f16vec2 A_ = f16vec2(EV(T, 0), EV(T, 1)), B_ = f16vec2(EV(T, 2), EV(T, 3)); \
     precise f16vec2 C_ = f16vec2(EV(T, 4), EV(T, 5)), D_ = f16vec2(EV(T, 6), EV(T, 7)); \
     P0_[T] = (A_ * A_) + (B_ * B_); P1_[T] = (C_ * C_) + (D_ * D_); }
 
 shared f16vec4 VSH[4 * 2 * 16 * VWD / 4];   // per wave and head: the V tiles, transposed through shared memory
-#if KIND == 1
+#define MERGE (KIND == 1 || KIND == 3)
+#define EXPAND (KIND == 2 || KIND == 4)
+#if MERGE
 shared floate4m3_t NB[32 * S4];             // 16 merged rows, preceded by 16 rows of slack for the gather
 #endif
-#if KIND == 2
+#if EXPAND
 shared floate4m3_t NLI[16 * SLO];           // the block's 16 low-resolution tokens
 shared floate4m3_t NEX[16 * S4];            // their expanded 4C columns
 #endif
+#if KIND == 3
+const uint FS = 40u, XS = 40u;              // row strides of the feature and x0 images (32 + slack)
+shared floate4m3_t FEW[64 * FS];            // the block's 64 pixels' feature slots, window-major (wave, token)
+shared float16_t X0S[64 * XS];              // the embedding's output x0, the block's input
+#endif
+#if KIND == 4
+const uint HS = 40u;
+shared float16_t HO[64 * HS];               // the block's f16 output, window-major, for the per-pixel head
+#endif
 #define SYNC memoryBarrierShared(); barrier();
+#if KIND == 4
+// NVIDIA's f32 activations of the head (rrlite_dec0_4x4's output code): a sigmoid rounded to binary16, and a
+// tanh that is a polynomial below 0.6 and 1 - 2 / (e^2x + 1) above
+// (RADV folds a register f32 -> f16 -> f32 conversion away: round_half.glsl's integer rounding keeps it)
+float sigmoidL(float v) { return roundHalfValue(1.0 / (exp2(v * -1.442695) + 1.0)); }
+float tanhL(float t)
+{
+    const float m = abs(t), s = t * t;
+    const float big = m >= 9.0109138 ? 1.0 : fma(1.0 / (exp2(m * 2.88539) + 1.0), -2.0, 1.0);
+    return m >= 0.6 ? (t < 0.0 ? -big : big) :
+        fma(fma(fma(fma(fma(0.01573968306183815, s, -0.05230396240949631), s, 0.13315297663211823), s, -0.33332768082618713), s, 0.0), t, t);
+}
+// the block output channel of each head input: NGX's pair-order columns 0, 1, 6 (gates), 2-5 (feature), 7-9 (mix),
+// 10-12 (covariance a, b, rho) - preset M's columns without its four feature gates - in natural channel order
+#ifndef LH_GATE0
+#define LH_GATE0 0
+#define LH_GATE1 1
+#define LH_GATE2 12
+#define LH_MIX0 13
+#define LH_MIX1 16
+#define LH_MIX2 17
+#define LH_COVA 20
+#define LH_COVB 21
+#define LH_RHO 24
+#define LH_FEAT0 4
+#define LH_FEAT1 5
+#define LH_FEAT2 8
+#define LH_FEAT3 9
+#endif
+#endif
 void main()
 {
     const uint mt = gl_LocalInvocationID.x >> 5, lane = gl_LocalInvocationID.x & 31u;
@@ -202,11 +374,15 @@ void main()
     HAC res[NT];                                // the residual stream: rows are channels, columns are tokens
     B8 h1[NT];                                  // the normalised activation, the K operand of every product
     // ------------------------------------------------------------ patch expand: x0 = q8(E) + skip
-#if KIND == 2
+#if EXPAND
     {
         const uint W2 = uint(p.W) / 2u, H2 = uint(p.Hh) / 2u, part = UXC / 8u, c0 = (mt * 2u + hf) * part;
-        const uint lo = uint(mirror((Y0 >> 1) + int(row >> 2), int(H2)) * int(W2) + mirror((X0 >> 1) + int(row & 3u), p.W / 2)) * UXC;
-        for (uint c = c0; c < c0 + part; ++c) NLI[row * SLO + c] = inb.a[lo + c];
+        const uint lt = uint(mirror((Y0 >> 1) + int(row >> 2), int(H2)) * int(W2) + mirror((X0 >> 1) + int(row & 3u), p.W / 2));
+#if PLANES
+        for (uint c = c0; c < c0 + part; ++c) NLI[row * SLO + c] = inb.a[((c >> 5) * H2 * W2 + lt) * 32u + (c & 31u)];
+#else
+        for (uint c = c0; c < c0 + part; ++c) NLI[row * SLO + c] = inb.a[lt * UXC + c];
+#endif
         SYNC
         // this wave computes sub-position mt of every low-resolution token's 4C columns
         HAC ef[NT];
@@ -228,11 +404,54 @@ void main()
         SYNC
     }
 #endif
+#if KIND == 3
+    // ------------------------------------------------------------ L's input: features, embedding -> x0
+    {
+        const float e1 = ep.expo == 0.0 ? 1.0 : ep.expo, e2 = ep.expoPrev == 0.0 ? 1.0 : ep.expoPrev;
+        const uint li = gl_LocalInvocationID.x;
+        if (li < 64u)
+        {
+            // NGX stages two pixels per lane of one wave (rows y and y + 4); the first of them fuses its fourth
+            // history coordinate (enc0_features.glsl)
+            floate4m3_t fe[32];
+            gatherFeatures(li, ivec2(X0, Y0), e1, e2, li < 32u, fe);
+            const uint px = li & 7u, py = li >> 3;
+            const uint at = (((py >> 2) * 2u + (px >> 2)) * 16u + (py & 3u) * 4u + (px & 3u)) * FS;
+            for (uint k = 0u; k < 32u; ++k) FEW[at + k] = fe[k];
+        }
+        SYNC
+        // the embedding has the shape of an MLP chunk: 32 features -> 32 hidden (ReLU, FP8) -> C
+        B8 f0, f1;
+        coopMatLoad(f0, FEW, mt * 16u * FS, FS, CM);
+        coopMatLoad(f1, FEW, mt * 16u * FS + 16u, FS, CM);
+        HAC z0 = bias16(p.o[61], 32u), z1 = bias16(p.o[61] + 16u, 32u);
+        { A8 a0, a1; LDA8(a0, p.o[60], 0u, 32u, 0u); LDA8(a1, p.o[60], 1u, 32u, 0u); K32H(z0, a0, f0, a1, f1) }
+        { A8 a0, a1; LDA8(a0, p.o[60], 0u, 32u, 16u); LDA8(a1, p.o[60], 1u, 32u, 16u); K32H(z1, a0, f0, a1, f1) }
+        B8 g0, g1;
+        for (int i = 0; i < 8; ++i)
+        {
+            g0[i] = floate4m3_t(CL8(max(float16_t(z0[i]), float16_t(0.0))));
+            g1[i] = floate4m3_t(CL8(max(float16_t(z1[i]), float16_t(0.0))));
+        }
+        const uint xb = (mt * 16u + row) * XS + ch8;
+#define EMB_N(N) { \
+        HAC x_ = bias16(p.o[63] + 16u * (N), UC); \
+        A8 a0, a1; LDA8(a0, p.o[62], 0u, UC, 16u * (N)); LDA8(a1, p.o[62], 1u, UC, 16u * (N)); \
+        K32H(x_, a0, g0, a1, g1) \
+        for (int i = 0; i < 8; ++i) X0S[xb + 16u * (N) + uint(i)] = float16_t(x_[i]); }
+        EACH_T(EMB_N)
+#undef EMB_N
+        SYNC
+    }
+#endif
     // ------------------------------------------------------------ norm 1: sum of squares, residual and h1
-#if KIND == 2
+#if EXPAND
     const uint lb0 = ((byr >> 1) * 4u + (bxr >> 1)) * S4 + ((byr & 1u) * 2u + (bxr & 1u)) * UC + ch8;
     const uint sb0 = (iy * uint(p.W) + ix) * UC + ch8;
 #define XVAL(C) (float16_t(NEX[lb0 + (C)]) + float16_t(skb.a[sb0 + (C)]))
+#elif KIND == 3
+    const uint xb0 = (mt * 16u + row) * XS + ch8;
+#define XVAL(C) X0S[xb0 + (C)]
 #else
     const uint ib0 = (iy * uint(p.W) + ix) * UC + ch8;
 #define XVAL(C) float16_t(inb.a[ib0 + (C)])
@@ -241,12 +460,18 @@ void main()
 // 16T + 8*((I>>2)&1) + 4hf + (I&3) (kernels/m/swin_tok.h tok_rsq on the register layout the input plane implies).
 // This shader's own accumulators and A rows keep natural channels, so h1 and the residual use XVAL (the lane's
 // own half); the norm tree, however, groups per the native element order, so it reads the absolute channel.
-#if KIND == 2
+#if EXPAND
 #define XVALN(C) (float16_t(NEX[(lb0 - ch8) + (C)]) + float16_t(skb.a[(sb0 - ch8) + (C)]))
+#elif KIND == 3
+#define XVALN(C) X0S[(xb0 - ch8) + (C)]
 #else
 #define XVALN(C) float16_t(inb.a[(iy * uint(p.W) + ix) * UC + (C)])
 #endif
+#if TEXL
+#define EV(T, I) XVAL(16u * (T) + uint(I))         // natural order: the lane's own channels
+#else
 #define EV(T, I) XVALN(16u * (T) + 8u * ((uint(I) >> 2) & 1u) + 4u * hf + (uint(I) & 3u))
+#endif
     float16_t rn; RSQ_TREE(rn)
 #undef EV
 #define NM1(N) { \
@@ -320,6 +545,12 @@ void main()
         A16 vt0, vt1;
         coopMatLoad(vt0, VSH, (mt * 2u + 0u) * 64u, VWD / 4u, RM);
         coopMatLoad(vt1, VSH, (mt * 2u + 1u) * 64u, VWD / 4u, RM);
+#if TEXL
+        // P V is the block's one product of two f16 operands, and its f32 sum over the 16 keys is not exact: ZLUDA's
+        // lowering of m16n8k16 puts key pair (j & 1) * 4 + 2 h + (j >> 1) in K dword j of half h (swin_tok.h
+        // SWIN_PV_ZLUDA_ORDER), not 4 h + j. Both operands are permuted alike; it changes about one token in 30,000.
+        ZK(pb); ZK(vt0); ZK(vt1);
+#endif
         o[0] = coopMatMulAdd(vt0, pb, ACC(0.0));
         o[1] = coopMatMulAdd(vt1, pb, ACC(0.0));
         R16(o[0]); R16(o[1]);
@@ -337,6 +568,9 @@ void main()
     // the native element (T, 8h+i) holds the natural channel tok_xnat(T, 8h+i) = 16T + 4h + (i&3) + 8*((i>>2)&1),
     // which lives in my natural-order accumulator at the half ((i>>2)&1) and the element 4h+(i&3). The tree needs
     // the pairs in that order, so fetch the (pair 2h, pair 2h+1) of the half ((i>>2)&1) and select by this lane's half.
+#if TEXL
+#define EV(T, I) float16_t(res[T][I])               // natural order: the lane's own elements
+#else
     f16vec2 XA_[NT], XB_[NT], XC_[NT], XD_[NT];
     for (uint t_ = 0u; t_ < NT; ++t_)
     {
@@ -350,6 +584,7 @@ void main()
     }
 #define EV(T, I) ((uint(I) < 2u) ? XA_[T][uint(I) & 1u] : (uint(I) < 4u) ? XB_[T][uint(I) & 1u] : \
                   (uint(I) < 6u) ? XC_[T][uint(I) & 1u] : XD_[T][uint(I) & 1u])
+#endif
     float16_t rn2; RSQ_TREE(rn2)
 #undef EV
 #define N2(N) { \
@@ -398,6 +633,33 @@ void main()
         K32H(res[N], a0, g0, a1, g1) }
         EACH_T(MLP2_N)
     }
+#if KIND == 4
+    // ------------------------------------------------------------ L's expansion head: per-pixel reconstruction inputs
+    {
+        const uint hb = (mt * 16u + row) * HS + ch8;
+        for (uint nt = 0u; nt < NT; ++nt)
+            for (int i = 0; i < 8; ++i) HO[hb + 16u * nt + uint(i)] = float16_t(res[nt][i]);
+        SYNC
+        const uint li = gl_LocalInvocationID.x;
+        const uint px = li & 7u, py = li >> 3;
+        const ivec2 at = ivec2(X0 + int(px), Y0 + int(py));
+        if (li < 64u && at.x >= 0 && at.y >= 0 && at.x < dp.size.x && at.y < dp.size.y)
+        {
+            const uint hp = (((py >> 2) * 2u + (px >> 2)) * 16u + (py & 3u) * 4u + (px & 3u)) * HS;
+#ifdef L_DUMP
+            for (uint c = 0u; c < UC; ++c) ldump.a[(uint(at.y) * uint(p.W) + uint(at.x)) * UC + c] = HO[hp + c];
+#endif
+#define V(c) float(HO[hp + uint(c)])
+            imageStore(gateOut, at, unorm8Value(vec4(sigmoidL(V(LH_GATE0)), sigmoidL(V(LH_GATE1)), sigmoidL(V(LH_GATE2)), 0.0)));
+            const vec3 m = vec3(V(LH_MIX0), V(LH_MIX1), V(LH_MIX2)), ex = exp2((m - max(max(m.x, m.y), m.z)) * 1.442695);
+            imageStore(mixOut, at, unorm8Value(vec4(ex * (1.0 / (ex.z + (ex.x + ex.y))), 0.0)));
+            const float a = dp.sigma * sigmoidL(clamp(V(LH_COVA), -20.0, 20.0)), b = dp.sigma * sigmoidL(clamp(V(LH_COVB), -20.0, 20.0));
+            imageStore(covOut, at, vec4(a * a, b * b, a * b * tanhL(V(LH_RHO) * dp.rho), 0.0));
+            imageStore(featOut, at, snorm8Value(vec4(tanhL(V(LH_FEAT0)), tanhL(V(LH_FEAT1)), tanhL(V(LH_FEAT2)), tanhL(V(LH_FEAT3)))));
+#undef V
+        }
+    }
+#else
     // ------------------------------------------------------------ the block output, FP8
     const uint dst = uint(ty * p.W + tx) * UC + ch8;
     if (inside)
@@ -407,8 +669,9 @@ void main()
             OUT8(0) OUT8(1) OUT8(2) OUT8(3) OUT8(4) OUT8(5) OUT8(6) OUT8(7)
 #undef OUT8
         }
+#endif
     // ------------------------------------------------------------ patch merge: 2x2 tokens (4C) -> XC, half resolution
-#if KIND == 1
+#if MERGE
     {
         // the 16 merged rows are gathered from the four waves: the row is the merged token of the lane's pixel
         const uint mrow = (byr >> 1) * 4u + (bxr >> 1), qq = (byr & 1u) * 2u + (bxr & 1u);
@@ -418,7 +681,13 @@ void main()
         const uint MT = UXC / 16u, NI = (MT + 3u) / 4u;
         const int ym = (Y0 >> 1) + int(row >> 2), xm = (X0 >> 1) + int(row & 3u);
         const bool mok = ym >= 0 && ym < p.Hh / 2 && xm >= 0 && xm < p.W / 2;
-        const uint md = uint(ym * (p.W / 2) + xm) * UXC + ch8;
+#if PLANES
+        const uint mt2 = uint(ym * (p.W / 2) + xm), mplane = uint(p.Hh / 2) * uint(p.W / 2) * 32u;
+#define MADDR(C) ((C) >> 5) * mplane + mt2 * 32u + ((C) & 31u)
+#else
+        const uint md = uint(ym * (p.W / 2) + xm) * UXC;
+#define MADDR(C) md + (C)
+#endif
         for (uint i = 0u; i < NI; ++i)
         {
             const uint u = mt + 4u * i;
@@ -435,9 +704,11 @@ void main()
                 }
                 if (mok)
                 {
-#define MGO(I) out1.a[md + 16u * u + uint(I)] = floate4m3_t(CL8(y[I]));
+// NVIDIA's encoders clamp the merged result to +-2 pi (as f16) before its e4m3 encoding (kernels/m merge_clamp)
+#define MGO(I) out1.a[MADDR(16u * u + ch8 + uint(I))] = floate4m3_t(clamp(float16_t(y[I]), -MCL, MCL));
                     MGO(0) MGO(1) MGO(2) MGO(3) MGO(4) MGO(5) MGO(6) MGO(7)
 #undef MGO
+#undef MADDR
                 }
             }
         }

@@ -1,14 +1,15 @@
 # Native weight-based inference engine
 
-This directory implements standalone preset K and M inference engines. NGX is used **once to obtain weights
-and reference data**. K loads extracted f16 matrices and a reconstruction table; M loads FP8 matrices and
-f16 vectors. Both run d4r's own Vulkan shaders. M can run its network on d4r's native HIP kernels instead;
-neither engine translates PTX or launches NVIDIA kernels.
+This directory implements standalone preset K, M and L inference engines. NGX is used **once to obtain weights
+and reference data**. K loads extracted f16 matrices and a reconstruction table; M and L load FP8 matrices and
+f16 vectors. All run d4r's own Vulkan shaders. M and L can run their network on d4r's native HIP kernels instead;
+no engine translates PTX or launches NVIDIA kernels.
 
 The reusable library is `libd4r_engine.so`; `d4r-k` and `d4r-m` provide full-frame replay and benchmarking.
 The D3D12 game shim supports both as opt-in engine backends (see [In a game](#in-a-game-d3d12-shim)).
-The CUDA/ZLUDA backend remains the default and fallback. Presets L/E and RTX/game-quality parity are not
-implemented or established here. Exposure is supplied by the application or measured on the GPU.
+The CUDA/ZLUDA backend remains the default and fallback. Preset E and RTX/game-quality parity are not
+implemented or established here (L and M are byte-identical to the CUDA backend running NVIDIA's translated kernels
+in the harness; see [Preset L](#preset-l-runtime-and-shim-path-exist-experimental)). Exposure is supplied by the application or measured on the GPU.
 
 ## Architecture
 
@@ -284,9 +285,11 @@ The shim loads each model on first use from a folder next to it, or from a varia
 | K, no HDR flag | `engine\k-ldr` | `D4R_ENGINE_MODEL_LDR_DIR` | `compile_k.py --ldr` |
 | M, HDR flag set | `engine\m` | `D4R_ENGINE_MODEL_M_DIR` | `compile_m.py` |
 | M, no HDR flag | `engine\m-ldr` | `D4R_ENGINE_MODEL_M_LDR_DIR` | `compile_m.py --ldr` |
+| L, HDR flag set | `engine\l` | `D4R_ENGINE_MODEL_L_DIR` | `compile_m.py` on a capture of preset L |
+| L, no HDR flag | `engine\l-ldr` | `D4R_ENGINE_MODEL_L_LDR_DIR` | `compile_m.py --ldr` on a capture of preset L |
 
-`scripts/install_d4r_runtime.sh` stages them from `D4R_ENGINE_MODEL`, `D4R_ENGINE_MODEL_LDR`, `D4R_ENGINE_MODEL_M`
-and `D4R_ENGINE_MODEL_M_LDR`, copying each folder whole (with `hipnet.bin` and `hip/` from `--hip`). A model whose
+`scripts/install_d4r_runtime.sh` stages them from `D4R_ENGINE_MODEL`, `D4R_ENGINE_MODEL_LDR`, `D4R_ENGINE_MODEL_M`,
+`D4R_ENGINE_MODEL_M_LDR`, `D4R_ENGINE_MODEL_L` and `D4R_ENGINE_MODEL_L_LDR`, copying each folder whole (with `hipnet.bin` and `hip/` from `--hip`). A model whose
 `hipnet.bin` belongs to the other preset keeps the Vulkan network. `D4R_ENGINE_NETWORK=vulkan` (`[Engine] Network`)
 forces the Vulkan network for both presets; `D4R_SHIM_ENGINE_GPU_WAIT=0` makes the HIP network wait for its inputs on
 the CPU-visible marker instead of a GPU-side wait, for comparisons.
@@ -299,8 +302,8 @@ evaluation, CUDA launch, worker thread, frame marker, shared-memory import or sp
 the result of the frame it just rendered. The shim log says `engine backend: feature N runs preset K in the game's
 command list`.
 
-The shim hands a feature to the CUDA backend, with a log line giving the reason, when: the preset is not K or M;
-the feature is preset M with display-resolution motion vectors (MVLowRes clear), which M does not implement yet; the
+The shim hands a feature to the CUDA backend, with a log line giving the reason, when: the preset is not K, L or M;
+the feature is preset L or M with display-resolution motion vectors (MVLowRes clear), which they do not implement yet; the
 motion vectors are display-resolution and the K package predates `D4RO0003` (K with a current package takes them, and
 jittered vectors are handled by adding the jitter change, as NGX does); the depth is regular (not inverted) and the K
 package predates `D4RO0002`; HDR K runs without AutoExposure and either has no float exposure texture the engine can
@@ -631,7 +634,7 @@ against captured launches:
 | network | `layer_m.comp` | per layer on the captured inputs, all ten layers and all three captured frames: byte-identical to the capture (2026-10-09) |
 | expansion | `dec0_m.comp` | 96-99.6% of the 8-bit values identical; covariance 70-73 dB |
 | reconstruction | `post_m.comp` | 61.5 dB on the reset frame, 76.9 dB with history; packed output 94-98% identical |
-| downsample | `down_m.comp` | 70-71 dB, 92% identical |
+| downsample | `down_m.comp` | byte-identical (2026-10-11; was 70-71 dB, 92%: its weights, see L_NOTES.md) |
 
 `test_frame_m.py` chains all of them over captured frames with the engine's own intermediate data and history.
 Final image, three frames of the panning stress scene:
@@ -848,6 +851,34 @@ flag; they are not current accuracy results. Feature release and re-creation at 
 clean. The current game timing and longer accuracy comparison are reported above. The kernels are built per
 GPU architecture (gfx1201 with FP8 here); another GPU falls back to Vulkan when they do not load.
 
+## Preset L (runtime and shim path exist; experimental)
+
+Preset L (render preset 12, NVIDIA's model for Ultra Performance) is M's pipeline with its own input, expansion and
+reconstruction stages: a C 32 Swin block at render-pixel resolution behind an embedding (input) and in front of the
+per-pixel head (expansion), where M has single folded products, and a reconstruction with 4x4-texel Gaussians and a
+history blended in linear light. `L_NOTES.md` has the algorithms. The network is M's ten layers with L's weights.
+
+The runtime is M's (`MModel`, `MEngine`, `GameUpscalerM`, `d4r-m`): `compile_m.py` recognises a capture of preset L by
+its unfolded kernels and writes an L model directory (`offsets.bin` `D4RL0001`: the input and expansion stages as
+layer blocks of `layer_m.comp` KIND 3 and 4, and L's five constants), which `MModel` loads as preset L
+(`isPresetL()`). The shim runs preset 12 with the model in `engine\l` / `engine\l-ldr`; the log says `engine backend
+(L): feature N runs preset L in the game's command list`.
+
+```sh
+# capture one frame of preset L with the CUDA backend (D4R_DLSS_PRESET=12; replay filter rrlite_), then
+python3 engine/compile_m.py "$CAP" build/l-model                 # --ldr for a capture without the HDR flag
+python3 engine/test_l.py enc0 "$CAP" 0 build/l-work vulkan/kvk   # also: dec0; test_post_m.py with POST_KERNEL
+```
+
+Every stage is byte-identical to NVIDIA's kernels as ZLUDA translates them on every captured frame (640x360 ->
+1920x1080 HDR and LDR, 1280x720 -> 1920x1080); `d4r-m` on the captured frames and the D3D12 harness through the shim
+are byte-identical to the CUDA backend except for isolated single-frame knife edges in three of 20 compared frames
+(96-122 dB, gone the next frame). 1280x720 -> 3840x2160 takes 3.8 ms on an RX 9070 XT (3.6 ms with `--hip`).
+Building L showed four engine issues that M shared, all fixed: the encoders' merge clamp, the exposure grid at
+Ultra Performance, the downsample weights and the network's summation order (M is now byte-identical to the CUDA
+backend in the harness as well: 1706x960 -> 2560x1440 and 640x360 -> 1920x1080, where it measured 36-41 dB with the
+native accuracy kernels' order; `compile_m.py` builds both presets' networks with `TEXL`). Details: `L_NOTES.md`.
+
 ## Files
 
 | File | Role |
@@ -866,6 +897,8 @@ GPU architecture (gfx1201 with FP8 here); another GPU falls back to Vulkan when 
 | `activation_m.glsl`, `gen_activation_m.py` | Preset M: sigmoid/tanh/gate table of the 256 E4M3 codes and the script that computes it (`--check` verifies the table) |
 | `test_enc0_m.py`, `test_dec0_m.py`, `test_post_m.py`, `test_down_m.py`, `test_frame_m.py` | Preset M: per-stage and whole-frame tests |
 | `M_NOTES.md` | Preset M: the algorithms as reverse-engineered |
+| `l_model.py`, `test_l.py`, `L_NOTES.md` | Preset L: weights of the input and expansion stages, their tests against a capture, the algorithms |
+| `enc0_features.glsl` | Presets M and L: the input stage's 32 per-pixel feature slots |
 | `exposure_k.comp` | Automatic exposure: log-luma block sums, then the exposure state and the stages' exposure fields |
 | `test_frame.py`, `test_model.py` | Temporal result checks and model corruption tests |
 | `test_game.cpp` | Queued direct-texture, rectangle, layout, conversion and precision regression checks |

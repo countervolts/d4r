@@ -185,6 +185,20 @@ int main(int argc, char** argv) try {
                 if (hip) d[2] = networkUs; // measured HIP network time; the complete span includes host handoffs
                 const double us = double(t[6] - t[0]) * tick;
                 if (pass) for (int k = 0; k < 6; ++k) stage[k].push_back(d[k]);
+                if (pass == 0 && std::getenv("D4R_M_DUMP")) {
+                    // development: every intermediate of this frame, to PREFIX-NAME-FRAME.bin
+                    for (const auto& d : engine.debugResources()) {
+                        Staging st = staging(c, d.bytes);
+                        begin();
+                        if (d.buffer) { VkBufferCopy bc{0, 0, d.bytes}; vkCmdCopyBuffer(cb, d.buffer, st.buffer, 1, &bc); }
+                        else { VkBufferImageCopy ic{}; ic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; ic.imageExtent = {d.width, d.height, 1};
+                               vkCmdCopyImageToBuffer(cb, d.image, VK_IMAGE_LAYOUT_GENERAL, st.buffer, 1, &ic); }
+                        submit();
+                        std::ofstream(std::string(std::getenv("D4R_M_DUMP")) + "-" + d.name + "-" + std::to_string(f) + ".bin", std::ios::binary)
+                            .write(static_cast<const char*>(st.map), std::streamsize(d.bytes));
+                        vkDestroyBuffer(c.device, st.buffer, nullptr); vkFreeMemory(c.device, st.memory, nullptr);
+                    }
+                }
                 if (pass == 0) {
                     std::ofstream(prefix + "-" + std::to_string(f) + ".rgba16f", std::ios::binary).write(static_cast<const char*>(out.map), std::streamsize(ow) * oh * 8);
                     std::printf("frame %d: %.1f us GPU\n", f, us);

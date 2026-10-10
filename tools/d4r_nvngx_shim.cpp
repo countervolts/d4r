@@ -4997,8 +4997,11 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
 
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
-    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation.
-    feature->cudaCreationDeferred = !nativeVulkan && engine_requested() && feature->preset == 11;
+    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation. Presets K, L
+    // and M (the engine's) create the CUDA feature only when a frame falls back: NGX's L kernels take ZLUDA about 20 s
+    // to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch, 2026-10-11).
+    feature->cudaCreationDeferred = !nativeVulkan && engine_requested() &&
+                                    (feature->preset == 11 || feature->preset == 12 || feature->preset == 13);
     const NgxResult result = feature->cudaCreationDeferred ? NGX_SUCCESS : create_cuda_feature(*feature);
     if (feature->cudaCreationDeferred)
         logf("engine backend: CUDA feature creation deferred until fallback is needed");
@@ -5209,43 +5212,50 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
     }
 }
 
-// Preset M on the engine: its own model (engine\\m next to this DLL, or D4R_ENGINE_MODEL_M_DIR) and adapter.
+// Presets M and L on the engine (both run d4r::MEngine; the model directory decides which): a model per preset and
+// range, engine\\m, engine\\m-ldr, engine\\l and engine\\l-ldr next to this DLL, or D4R_ENGINE_MODEL_{M,L}[_LDR]_DIR.
 struct EngineBackendM
 {
-    std::once_flag once, ldrOnce;
-    std::unique_ptr<d4r::MModel> model, modelLdr; // LDR: engine\\m-ldr or D4R_ENGINE_MODEL_M_LDR_DIR
-    std::string directory, directoryLdr;
+    std::once_flag once[2][2];                       // [preset L][LDR]
+    std::unique_ptr<d4r::MModel> models[2][2];
+    std::string directories[2][2];
 };
 static EngineBackendM g_engineM;
 
-static void init_engine_backend_m_variant(bool ldr)
+static void init_engine_backend_m_variant(bool presetL, bool ldr)
 {
-    std::unique_ptr<d4r::MModel>& slot = ldr ? g_engineM.modelLdr : g_engineM.model;
-    std::string directory = env_string(ldr ? "D4R_ENGINE_MODEL_M_LDR_DIR" : "D4R_ENGINE_MODEL_M_DIR");
+    const char* const name = presetL ? "L" : "M";
+    std::unique_ptr<d4r::MModel>& slot = g_engineM.models[presetL][ldr];
+    std::string directory = env_string(presetL ? (ldr ? "D4R_ENGINE_MODEL_L_LDR_DIR" : "D4R_ENGINE_MODEL_L_DIR")
+                                               : (ldr ? "D4R_ENGINE_MODEL_M_LDR_DIR" : "D4R_ENGINE_MODEL_M_DIR"));
     if (directory.empty())
     {
         char folder[MAX_PATH * 3] = {};
-        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + (ldr ? L"\\engine\\m-ldr" : L"\\engine\\m")).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
+        const wchar_t* const sub = presetL ? (ldr ? L"\\engine\\l-ldr" : L"\\engine\\l") : (ldr ? L"\\engine\\m-ldr" : L"\\engine\\m");
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + sub).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
     }
     if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
     {
-        logf("engine backend (M): Vulkan interop is unavailable");
+        logf("engine backend (%s): Vulkan interop is unavailable", name);
         return;
     }
     const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
     const auto start = std::chrono::steady_clock::now();
     try
     {
-        slot = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path);
-        (ldr ? g_engineM.directoryLdr : g_engineM.directory) = path;
+        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path);
+        if (model->isPresetL() != presetL)
+            throw std::runtime_error(presetL ? "the directory holds a preset M model" : "the directory holds a preset L model");
+        slot = std::move(model);
+        g_engineM.directories[presetL][ldr] = path;
     }
     catch (const std::exception& error)
     {
-        logf("engine backend (M): cannot load the model from %s: %s", path.c_str(), error.what());
+        logf("engine backend (%s): cannot load the model from %s: %s", name, path.c_str(), error.what());
         return;
     }
-    logf("engine backend (M): model %s loaded and pipelines compiled in %.0f ms", path.c_str(),
+    logf("engine backend (%s): model %s loaded and pipelines compiled in %.0f ms", name, path.c_str(),
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 }
 
@@ -5401,7 +5411,7 @@ static void release_engine_network(Feature& feature)
 }
 
 // The HIP network of a feature: the buffers shared with HIP and the bridge's network over them. False: the
-// engine's own Vulkan network is used instead (reason logged). `preset` is "M" or "K"; `width`
+// engine's own Vulkan network is used instead (reason logged). `preset` is "K", "M" or "L"; `width`
 // and `height` are the dimensions the bridge derives the token grid from (M: render, K: output); `tokenBytes`
 // and `headBytes` size the two shared buffers (M: both MEngine::networkBufferBytes, K: Engine::networkTokenBytes
 // and Engine::networkHeadBytes). The layer kernel names come from hipnet.bin, so no preset list is repeated here.
@@ -5735,25 +5745,30 @@ static bool record_engine_network_frame(Feature& feature, ID3D12GraphicsCommandL
     return true;
 }
 
-// Preset M: record the evaluation into `list`, borrowing compatible inputs and copying only fallbacks.
+// Presets M (13) and L (12): record the evaluation into `list`, borrowing compatible inputs and copying only
+// fallbacks. L is M's pipeline with its own input, expansion and reconstruction stages (engine/L_NOTES.md).
 static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                               ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
                               const FrameParams& p, uint32_t frame)
 {
+    const bool presetL = feature.preset == 12;
+    const char* const name = presetL ? "L" : "M";
     auto refuse = [&](const char* reason) {
         feature.engineRefused = true;
-        logf("engine backend (M): %s; feature %u uses the CUDA backend from frame %u", reason, feature.handle.Id, frame);
+        logf("engine backend (%s): %s; feature %u uses the CUDA backend from frame %u", name, reason, feature.handle.Id, frame);
         return false;
     };
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
     const bool ldr = (feature.flags & 0x1) == 0; // NGX's LDR stages: a model directory of its own, no exposure
-    if (ldr)
-        std::call_once(g_engineM.ldrOnce, [] { init_engine_backend_m_variant(true); });
-    else
-        std::call_once(g_engineM.once, [] { init_engine_backend_m_variant(false); });
-    d4r::MModel* const model = ldr ? g_engineM.modelLdr.get() : g_engineM.model.get();
+    std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
+    d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
     if (model == nullptr)
-        return refuse(ldr ? "no LDR model (engine\\m-ldr) for a game without the HDR flag" : "not available");
+    {
+        if (!ldr)
+            return refuse("not available");
+        return refuse(presetL ? "no LDR model (engine\\l-ldr) for a game without the HDR flag"
+                              : "no LDR model (engine\\m-ldr) for a game without the HDR flag");
+    }
     if ((feature.flags & 0x2) == 0)
         return refuse("needs render-resolution motion vectors");
     // NGX measures the exposure for this preset, so the AutoExposure flag, the game's exposure texture, the
@@ -5796,7 +5811,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
         !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !d4r::gameOutputFormat(game.output.format))
     {
-        logf("engine backend (M): Vulkan formats colour %d, depth %d, motion %d, output %d", game.color.format,
+        logf("engine backend (%s): Vulkan formats colour %d, depth %d, motion %d, output %d", name, game.color.format,
              game.depth.format, game.motion.format, game.output.format);
         return refuse("a texture format is not implemented");
     }
@@ -5816,7 +5831,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         if (feature.engineM == nullptr)
         {
             const size_t bytes = static_cast<size_t>(d4r::MEngine::networkBufferBytes(p.renderWidth, p.renderHeight));
-            const bool hip = create_engine_network(feature, ldr ? g_engineM.directoryLdr : g_engineM.directory, "M",
+            const bool hip = create_engine_network(feature, g_engineM.directories[presetL][ldr], name,
                                                    model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
                                                    bytes, bytes);
             const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
@@ -5825,8 +5840,8 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
                                                                    hip ? &external : nullptr);
             feature.engineMRenderWidth = p.renderWidth;
             feature.engineMRenderHeight = p.renderHeight;
-            logf("engine backend (M): feature %u runs preset M in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
-                 feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
+            logf("engine backend (%s): feature %u runs preset %s in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
+                 name, feature.handle.Id, name, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
                  hip ? "the native HIP layers (list split around it)" : "Vulkan",
                  model->hasRgb10Output() && game.output.view != VK_NULL_HANDLE &&
                      game.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
@@ -5836,7 +5851,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     }
     catch (const std::exception& error)
     {
-        logf("engine backend (M): %s", error.what());
+        logf("engine backend (%s): %s", name, error.what());
         release_engine_network(feature);
         return refuse("the engine could not be created");
     }
@@ -5865,7 +5880,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
             }
             catch (const std::exception& error)
             {
-                logf("engine backend (M): %s", error.what());
+                logf("engine backend (%s): %s", name, error.what());
                 failure = "the frame could not be recorded";
             }
             if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && failure == nullptr)
@@ -5874,10 +5889,10 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         };
         auto abandon = [&](const char* reason) {
             feature.engineRefused = true;
-            logf("engine backend (M): %s; feature %u uses the CUDA backend after frame %u", reason, feature.handle.Id, frame);
+            logf("engine backend (%s): %s; feature %u uses the CUDA backend after frame %u", name, reason, feature.handle.Id, frame);
             return true;
         };
-        return record_engine_network_frame(feature, list, sources, frame, "M", game.reset, p.mvScaleX, p.mvScaleY,
+        return record_engine_network_frame(feature, list, sources, frame, name, game.reset, p.mvScaleX, p.mvScaleY,
                                            p.jitterX, p.jitterY, recordPart, refuse, abandon);
     }
     if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
@@ -5895,7 +5910,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         }
         catch (const std::exception& error)
         {
-            logf("engine backend (M): %s", error.what());
+            logf("engine backend (%s): %s", name, error.what());
             failure = "the frame could not be recorded";
             recorded = false;
         }
@@ -5912,7 +5927,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
     if (frame <= 3 || frame % 600 == 0)
-        logf("engine frame %u recorded, preset M (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame, p.jitterX, p.jitterY,
+        logf("engine frame %u recorded, preset %s (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame, name, p.jitterX, p.jitterY,
              game.reset, p.mvScaleX, p.mvScaleY);
     return true;
 }
@@ -5933,7 +5948,7 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return false;
     };
     std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
-    if (feature.preset == 13)
+    if (feature.preset == 13 || feature.preset == 12)
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
     const bool ldr = (feature.flags & 0x1) == 0;
@@ -5946,7 +5961,7 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return refuse(ldr ? "no LDR model (engine\\k-ldr) for a game without the HDR flag" : "not available");
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
     if (feature.preset != 11)
-        return refuse("only preset K is implemented");
+        return refuse("only presets K, L and M are implemented");
     // MVLowRes (0x2) clear: vectors are at output resolution (engine revision D4RO0003).
     const bool displayMotion = (feature.flags & 0x2) == 0;
     if (displayMotion && !model->hasDisplayMotion())

@@ -30,8 +30,14 @@ layout(set = 0, binding = 3, std430) readonly buffer Src { uint w[]; } src;
 shared f16vec4 tile[TILE_W * TILE_H];       // source texels around the block
 shared f16vec4 rows[TILE_H * BLOCK_X];      // after the horizontal pass
 // weights of taps -2 .. +2 for an even output coordinate; an odd one uses them mirrored
-const float16_t W0 = float16_t(-0.041347626596689224), W1 = float16_t(0.08728941529989243), W2 = float16_t(0.6202144026756287),
-                W3 = float16_t(0.3721286356449127), W4 = float16_t(-0.03828485310077667);
+// as binary16 bit patterns: NGX rounds its f32 constants to the nearest binary16 (cvt.rn), while glslang folds
+// float16_t(<literal>) toward zero (W0 became -0.041321 instead of -0.041351: 6% of the captured frame's outputs
+// one code or more off). The values are -0.041347627, 0.087289415, 0.6202144, 0.37212864, -0.038284853.
+#define W0 uint16BitsToFloat16(uint16_t(0xA94Bu))
+#define W1 uint16BitsToFloat16(uint16_t(0x2D96u))
+#define W2 uint16BitsToFloat16(uint16_t(0x38F6u))
+#define W3 uint16BitsToFloat16(uint16_t(0x35F4u))
+#define W4 uint16BitsToFloat16(uint16_t(0xA8E7u))
 f16vec3 filter5(f16vec3 a, f16vec3 b, f16vec3 c, f16vec3 d, f16vec3 e, bool odd)
 {
     const f16vec3 w0 = f16vec3(odd ? W4 : W0), w1 = f16vec3(odd ? W3 : W1), w3 = f16vec3(odd ? W1 : W3), w4 = f16vec3(odd ? W0 : W4);

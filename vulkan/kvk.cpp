@@ -10,6 +10,8 @@
 //   lut FILE                    (storage buffer bound after the surfaces)
 //   bufout OFF FILE             (after the dispatch, write the pointer buffer of parameter offset OFF to FILE)
 //   outbuf FILE BYTES           (storage buffer bound after those, written to FILE after the dispatch)
+//   bindings N0 N1 ...          (optional: the binding number of each of the above, in that order, for shaders
+//                                whose bindings are not ptx2glsl.py's; e.g. engine/layer_m.comp's L stages)
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <chrono>
@@ -97,12 +99,14 @@ int main(int argc, char** argv)
     // ---------------------------------------------------------------- manifest
     std::vector<char> param; uint32_t gx = 1, gy = 1;
     std::vector<Img> imgs; std::map<int, std::pair<Buf, int64_t>> bufs; std::vector<Buf> luts; std::vector<std::string> lutOut; std::map<int, std::string> bufOut;
+    std::vector<uint32_t> remap;
     std::ifstream mf(argv[2]); std::string line;
     while (std::getline(mf, line))
     {
         std::istringstream ls(line); std::string k; ls >> k;
         if (k == "param") { std::string f; ls >> f; param = slurp(f); }
         else if (k == "grid") ls >> gx >> gy;
+        else if (k == "bindings") { uint32_t b; while (ls >> b) remap.push_back(b); }
         else if (k == "tex" || k == "surf")
         {
             Img im{}; int ch, bits; std::string mode; im.surf = k == "surf";
@@ -176,12 +180,17 @@ int main(int argc, char** argv)
     auto code = slurp(argv[1]);
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = code.size(); smi.pCode = (const uint32_t*)code.data();
     VkShaderModule sm; CK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
+    auto B = [&](size_t positional) {
+        if (remap.empty()) return (uint32_t)positional;
+        if (positional >= remap.size()) { fprintf(stderr, "bindings: no number for resource %zu\n", positional); exit(1); }
+        return remap[positional];
+    };
     std::vector<VkDescriptorSetLayoutBinding> lb;
-    lb.push_back({0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+    lb.push_back({B(0), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
     for (size_t i = 0; i < imgs.size(); ++i)
-        lb.push_back({(uint32_t)i + 1, imgs[i].surf ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+        lb.push_back({B(i + 1), imgs[i].surf ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
     for (size_t i = 0; i < luts.size(); ++i)
-        lb.push_back({(uint32_t)(imgs.size() + 1 + i), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+        lb.push_back({B(imgs.size() + 1 + i), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dli.bindingCount = lb.size(); dli.pBindings = lb.data();
     VkDescriptorSetLayout dl; CK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dl));
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pli.setLayoutCount = 1; pli.pSetLayouts = &dl;
@@ -194,24 +203,24 @@ int main(int argc, char** argv)
     auto c0 = std::chrono::steady_clock::now();
     CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
     fprintf(stderr, "pipeline compile: %.0f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
-    VkDescriptorPoolSize dps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
+    VkDescriptorPoolSize dps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1; dpi.poolSizeCount = 3; dpi.pPoolSizes = dps;
     VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dl;
     VkDescriptorSet ds; CK(vkAllocateDescriptorSets(dev, &dai, &ds));
     VkDescriptorBufferInfo pbi{pbuf.b, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> ii(imgs.size()); std::vector<VkWriteDescriptorSet> wr;
-    wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pbi, nullptr});
+    wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, B(0), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pbi, nullptr});
     for (size_t i = 0; i < imgs.size(); ++i)
     {
         ii[i] = {imgs[i].linear ? linear : nearest, imgs[i].v, VK_IMAGE_LAYOUT_GENERAL};
-        wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, (uint32_t)i + 1, 0, 1, imgs[i].surf ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii[i], nullptr, nullptr});
+        wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, B(i + 1), 0, 1, imgs[i].surf ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii[i], nullptr, nullptr});
     }
     std::vector<VkDescriptorBufferInfo> li(luts.size());
     for (size_t i = 0; i < luts.size(); ++i)
     {
         li[i] = {luts[i].b, 0, VK_WHOLE_SIZE};
-        wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, (uint32_t)(imgs.size() + 1 + i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &li[i], nullptr});
+        wr.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, B(imgs.size() + 1 + i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &li[i], nullptr});
     }
     vkUpdateDescriptorSets(dev, wr.size(), wr.data(), 0, nullptr);
     auto dispatch = [&](int n) {

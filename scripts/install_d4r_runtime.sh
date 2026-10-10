@@ -11,6 +11,8 @@ set -euo pipefail
 #                       D4R_ENGINE_MODEL_LDR name the folders engine/compile_k.py wrote (--ldr for the second)
 #   engine/m/, m-ldr/   models of preset M, when D4R_ENGINE_MODEL_M / D4R_ENGINE_MODEL_M_LDR name the folders
 #                       engine/compile_m.py wrote
+#   engine/l/, l-ldr/   models of preset L, when D4R_ENGINE_MODEL_L / D4R_ENGINE_MODEL_L_LDR name the folders
+#                       engine/compile_m.py wrote from a capture of preset L
 # Each model folder is copied whole, with the native HIP network's hipnet.bin and hip/ when built with --hip.
 # usage: install_d4r_runtime.sh PATH_TO_NGX_CORE_DLL PATH_TO_NVNGX_DLSS_DLL
 if [[ $# -ne 2 ]]; then
@@ -30,13 +32,15 @@ copy_unless_same "$2" "$RUNTIME/dlss/nvngx_dlss.dll"
 # The NGX core's CUDA init ignores the feature search paths it is given and
 # scans the directory of the module that calls it, i.e. the shim's.
 cp -f "$RUNTIME/dlss/nvngx_dlss.dll" "$RUNTIME/bin/nvngx_dlss.dll"
-# K and M models; the -ldr variants serve games without the HDR flag
-for variant in k k-ldr m m-ldr; do
+# K, M and L models; the -ldr variants serve games without the HDR flag
+for variant in k k-ldr m m-ldr l l-ldr; do
   case "$variant" in
     k) source_dir="${D4R_ENGINE_MODEL:-}" required="weights.bin offsets.bin lut.bin input_k.spv output_k.spv exposure_k0.spv exposure_k1.spv" compiler=compile_k.py ;;
     k-ldr) source_dir="${D4R_ENGINE_MODEL_LDR:-}" required="weights.bin offsets.bin lut.bin input_k.spv output_k.spv" compiler="compile_k.py --ldr" ;;
     m) source_dir="${D4R_ENGINE_MODEL_M:-}" required="offsets.bin enc0_m.spv" compiler=compile_m.py ;;
     m-ldr) source_dir="${D4R_ENGINE_MODEL_M_LDR:-}" required="offsets.bin enc0_m.spv" compiler="compile_m.py --ldr" ;;
+    l) source_dir="${D4R_ENGINE_MODEL_L:-}" required="offsets.bin enc0_l.spv dec0_l.spv post_l.spv" compiler="compile_m.py (a preset L capture)" ;;
+    l-ldr) source_dir="${D4R_ENGINE_MODEL_L_LDR:-}" required="offsets.bin enc0_l.spv dec0_l.spv post_l.spv" compiler="compile_m.py --ldr (a preset L capture)" ;;
   esac
   [[ -n "$source_dir" ]] || continue
   for f in $required; do

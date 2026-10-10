@@ -86,11 +86,12 @@ Settings
   PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
   native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
   some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
-- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K) and 4.5 (M) on d4r's own Vulkan
-  inference engine: the upscale is recorded into the game's own frame instead of going through CUDA
+- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K) and 4.5 (M and L) on d4r's own
+  Vulkan inference engine: the upscale is recorded into the game's own frame instead of going through CUDA
   emulation. It needs Mesa RADV with VK_KHR_cooperative_matrix and the models in d4r/engine/k (K),
-  d4r/engine/k-ldr (K in games without HDR), d4r/engine/m and d4r/engine/m-ldr (M). Games and settings
-  it does not cover (other models, display-resolution motion vectors with M) keep using the normal path,
+  d4r/engine/k-ldr (K in games without HDR), d4r/engine/m and d4r/engine/m-ldr (M), d4r/engine/l and
+  d4r/engine/l-ldr (L). Games and settings it does not cover (other models, display-resolution motion
+  vectors with L or M) keep using the normal path,
   and d4r/d4r_nvngx.log says which one ran and why. Tested in one game so far.
   This zip has only the engine's shaders in d4r/engine/k. The weights (weights.bin, offsets.bin,
   lut.bin) are read from your own nvngx_dlss.dll with the tools in d4r's source repository

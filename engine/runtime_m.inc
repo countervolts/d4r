@@ -19,6 +19,11 @@ struct MDec0Params { int32_t size[2], tokW; uint32_t reset; float rndOffs[2], rn
 struct MPostParams { int32_t colOrigin[2], hiSize[2], rndSize[2]; float hi2rnd[2], rndOffs[2], invRnd[2], gain; uint32_t reset; float expo, expoPrev; };
 struct MDownParams { int32_t srcSize[2], outOrigin[2], colOrigin[2], colSize[2]; float out2rnd[2], rndOffs[2], expo; };
 struct MLayerParams { int32_t w, h, sx, sy; uint32_t o[72]; };
+// The grid NGX measures the exposure on (cuda_dldn_engine_luma_convert_kernel's launch, presets M and L alike,
+// harness captures 2026-10-11): half the output, unless the output is more than twice the render size on that axis
+// (Ultra Performance), then half the render size but at least 256 (640x360 -> 1920x1080: 320x256, 854x480 ->
+// 2560x1440: 427x256, 1280x720 -> 3840x2160: 640x360).
+uint32_t exposureGrid(uint32_t render, uint32_t output) { return output / 2 <= render ? output / 2 : std::max(render / 2, 256u); }
 static_assert(sizeof(MEnc0Params) == 124 && offsetof(MEnc0Params, expo) == 100 && offsetof(MEnc0Params, halfInv) == 108, "enc0_m.comp and exposure_k.comp (words 25, 26)");
 static_assert(sizeof(MDec0Params) == 64, "dec0_m.comp");
 static_assert(sizeof(MPostParams) == 64 && offsetof(MPostParams, expo) == 56, "post_m.comp and exposure_k.comp (words 14, 15)");
@@ -72,6 +77,12 @@ struct MModel::Impl {
     bool planes = false;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, ldr = false;
+    // preset L (offsets.bin D4RL0001, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
+    // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
+    bool presetL = false;
+    std::array<uint32_t, 74> lEnc0{}, lDec0{};
+    uint32_t dither16 = 0;
+    float lConst[5]{};
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
 MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
@@ -79,16 +90,27 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     auto& m = *impl;
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
-    const size_t expect = 16 + 5 * 4 + MLayers * 74 * 4;
-    if (head.size() != expect || std::memcmp(head.data(), "D4RM0003", 8)) throw std::runtime_error("incompatible M model metadata");
+    m.presetL = head.size() >= 8 && !std::memcmp(head.data(), "D4RL0001", 8);
+    const size_t expect = m.presetL ? 40 + (MLayers + 2) * 74 * 4 : 16 + 5 * 4 + MLayers * 74 * 4;
+    if (head.size() != expect || (!m.presetL && std::memcmp(head.data(), "D4RM0003", 8))) throw std::runtime_error("incompatible M/L model metadata");
     uint32_t n8 = 0, n16 = 0;
     std::memcpy(&n8, head.data() + 8, 4); std::memcpy(&n16, head.data() + 12, 4);
     auto b8 = read(directory + "/weights8.bin"), b16 = read(directory + "/weights16.bin");
     if (b8.size() != n8 || b16.size() != n16 || n16 % 64) throw std::runtime_error("invalid M model sizes");
-    std::memcpy(m.enc0, head.data() + 16, 12); std::memcpy(m.dec0, head.data() + 28, 8);
-    std::memcpy(m.layers.data(), head.data() + 36, sizeof(m.layers));
     auto inside = [&](uint32_t off8, uint32_t off16) { if (off8 >= n8 || off16 >= n16 || off8 % 64 || off16 % 64) throw std::runtime_error("invalid M model offsets"); };
-    inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
+    if (m.presetL) {
+        // the input stage's block, the ten layers, the expansion stage's block
+        std::memcpy(&m.dither16, head.data() + 16, 4); std::memcpy(m.lConst, head.data() + 20, sizeof(m.lConst));
+        std::memcpy(m.lEnc0.data(), head.data() + 40, sizeof(m.lEnc0));
+        std::memcpy(m.layers.data(), head.data() + 40 + sizeof(m.lEnc0), sizeof(m.layers));
+        std::memcpy(m.lDec0.data(), head.data() + 40 + sizeof(m.lEnc0) + sizeof(m.layers), sizeof(m.lDec0));
+        inside(m.lEnc0[0], m.lEnc0[1]); inside(m.lDec0[0], m.lDec0[1]); inside(0, m.dither16);
+        for (float c : m.lConst) if (!(c > 0.f && c < 100.f)) throw std::runtime_error("invalid L model constants");
+    } else {
+        std::memcpy(m.enc0, head.data() + 16, 12); std::memcpy(m.dec0, head.data() + 28, 8);
+        std::memcpy(m.layers.data(), head.data() + 36, sizeof(m.layers));
+        inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
+    }
     for (auto& l : m.layers) inside(l[0], l[1]);
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m.w8.create(m.device, b8.size(), usage); m.w16.create(m.device, b16.size(), usage);
@@ -96,16 +118,21 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     std::memcpy(m.up8.mapped, b8.data(), b8.size()); std::memcpy(m.up16.mapped, b16.data(), b16.size());
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     for (unsigned i = 0; i < MLayers; ++i) m.network[i].create(device, directory + "/" + MShader[i] + ".spv", {b,b,b,b,b,b,b}, 32, cache);
-    m.input.create(device, directory + "/enc0_m.spv", {b,t,t,t,t,t,t,s,s,s,b,b,b,b}, 32, cache);
-    m.expand.create(device, directory + "/dec0_m.spv", {b,t,t,s,s,s,s,b,b,b}, 32, cache);
-    if ((m.planes = exists(directory + "/enc0_m_planes.spv") && exists(directory + "/dec0_m_planes.spv"))) {
-        m.inputPlanes.create(device, directory + "/enc0_m_planes.spv", {b,t,t,t,t,t,t,s,s,s,b,b,b,b}, 32, cache);
-        m.expandPlanes.create(device, directory + "/dec0_m_planes.spv", {b,t,t,s,s,s,s,b,b,b}, 32, cache);
+    // layer_m.comp's L stages: bindings 0-6 of a layer, then the stage's own (layer_m.comp KIND 3 and 4)
+    const std::vector<VkDescriptorType> lIn{b,b,b,b,b,b,b,b,t,t,t,t,t,t,s,s,s,b}, lEx{b,b,b,b,b,b,b,b,s,s,s,s};
+    const std::string in = m.presetL ? "enc0_l" : "enc0_m", ex = m.presetL ? "dec0_l" : "dec0_m", po = m.presetL ? "post_l" : "post_m";
+    const auto inTypes = m.presetL ? lIn : std::vector<VkDescriptorType>{b,t,t,t,t,t,t,s,s,s,b,b,b,b};
+    const auto exTypes = m.presetL ? lEx : std::vector<VkDescriptorType>{b,t,t,s,s,s,s,b,b,b};
+    m.input.create(device, directory + "/" + in + ".spv", inTypes, 32, cache);
+    m.expand.create(device, directory + "/" + ex + ".spv", exTypes, 32, cache);
+    if ((m.planes = exists(directory + "/" + in + "_planes.spv") && exists(directory + "/" + ex + "_planes.spv"))) {
+        m.inputPlanes.create(device, directory + "/" + in + "_planes.spv", inTypes, 32, cache);
+        m.expandPlanes.create(device, directory + "/" + ex + "_planes.spv", exTypes, 32, cache);
     }
-    m.post.create(device, directory + "/post_m.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    m.postQuality.create(device, directory + "/post_m_q.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    if (exists(directory + "/post_m_c.spv"))
-        m.postCompact.create(device, directory + "/post_m_c.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
+    m.post.create(device, directory + "/" + po + ".spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
+    m.postQuality.create(device, directory + "/" + po + "_q.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
+    if (exists(directory + "/" + po + "_c.spv"))
+        m.postCompact.create(device, directory + "/" + po + "_c.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
     m.down.create(device, directory + "/down_m.spv", {b,t,s,b}, 64, cache);
     if (exists(directory + "/down_m_rgb10.spv"))
         m.downRgb10.create(device, directory + "/down_m_rgb10.spv", {b,t,s,b}, 64, cache);
@@ -116,6 +143,7 @@ MModel::~MModel() = default;
 bool MModel::uploadRecorded() const { return impl->uploaded; }
 bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
+bool MModel::isPresetL() const { return impl->presetL; }
 void MModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
     if (m.uploaded) throw std::runtime_error("model upload already recorded");
@@ -131,6 +159,7 @@ struct MEngine::Impl {
     Buffer enc0P, dec0P, postP, downP, expP, expSums, expState, dummy, packed;
     std::array<Buffer, MLayers> layerP;
     Buffer tokens, skip1, merged1, skip2, merged2, tubeA, tubeB, dec2Out, dec1Out;
+    Buffer skipL, enc0LP, dec0LP;               // preset L: the input stage's pixel output and the two stages' layer blocks
     std::array<Tex, 2> mvA, feat, hist, half;
     Tex mvB, mvC, gates, mix, cov, output;
     VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -183,7 +212,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     const VkBufferUsageFlags sb = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sbt = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     e.enc0P.create(d, sizeof(MEnc0Params), sbt); e.dec0P.create(d, sizeof(MDec0Params), sbt); e.postP.create(d, sizeof(MPostParams), sbt);
     e.downP.create(d, sizeof(MDownParams), sbt); e.expP.create(d, sizeof(ExposureParams), sbt);
-    e.expSums.create(d, VkDeviceSize((outputWidth / 2 + 31) / 32) * ((outputHeight / 2 + 31) / 32) * 4, sb);
+    e.expSums.create(d, VkDeviceSize((exposureGrid(renderWidth, outputWidth) + 31) / 32) * ((exposureGrid(renderHeight, outputHeight) + 31) / 32) * 4, sb);
     e.expState.create(d, 8, sbt); e.dummy.create(d, 256, sb);
     e.packed.create(d, VkDeviceSize(e.hw) * e.hh * 4, sb);
     auto tok = [&](Buffer& b, unsigned scale, unsigned channels) { b.create(d, VkDeviceSize(tw / scale) * (th / scale) * channels + 64, sb); };
@@ -227,8 +256,31 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         bindBuffer(dev, set, 0, e.layerP[i]); bindRange(dev, set, 1, m.w8, m.layers[i][0]); bindRange(dev, set, 2, m.w16, m.layers[i][1]);
         bindBuffer(dev, set, 3, *in[i]); bindBuffer(dev, set, 4, *skip[i]); bindBuffer(dev, set, 5, *out[i]); bindBuffer(dev, set, 6, *merged[i]);
     }
+    if (m.presetL) {
+        // the input stage's pixel-resolution block output (the expansion's skip input) and the two stages' layer
+        // parameter blocks (token pixel grid, window shift, offsets; the shift alternates per frame like the layers')
+        e.skipL.create(d, VkDeviceSize(e.gw) * e.gh * 32 + 64, sb);
+        e.enc0LP.create(d, sizeof(MLayerParams), sbt, true); e.dec0LP.create(d, sizeof(MLayerParams), sbt, true);
+        MLayerParams lp{int32_t(e.gw), int32_t(e.gh), 2, 2, {}};
+        std::memcpy(lp.o, m.lEnc0.data() + 2, sizeof(lp.o)); std::memcpy(e.enc0LP.mapped, &lp, sizeof(lp));
+        lp.sx = lp.sy = 0; std::memcpy(lp.o, m.lDec0.data() + 2, sizeof(lp.o)); std::memcpy(e.dec0LP.mapped, &lp, sizeof(lp));
+    }
     for (unsigned i = 0; i < 2; ++i) {      // i: the index of this frame's history outputs
         const unsigned prev = 1 - i;
+        if (m.presetL) {
+            auto s0 = e.enc0Sets[i] = descriptorSet(dev, e.pool, (external ? m.inputPlanes : m.input).descriptors);
+            bindBuffer(dev, s0, 0, e.enc0LP); bindRange(dev, s0, 1, m.w8, m.lEnc0[0]); bindRange(dev, s0, 2, m.w16, m.lEnc0[1]);
+            bindBuffer(dev, s0, 3, e.dummy); bindBuffer(dev, s0, 4, e.dummy); bindBuffer(dev, s0, 5, e.skipL); bindBuffer(dev, s0, 6, e.tokens);
+            bindBuffer(dev, s0, 7, e.enc0P);
+            bindImage(dev, s0, 11, e.mvA[prev].view, e.linear); bindImage(dev, s0, 12, e.half[prev].view, e.linear); bindImage(dev, s0, 13, e.feat[prev].view, e.linear);
+            bindImage(dev, s0, 14, e.mvA[i].view); bindImage(dev, s0, 15, e.mvB.view); bindImage(dev, s0, 16, e.mvC.view);
+            bindRange(dev, s0, 17, m.w16, m.dither16);
+            auto s1 = e.dec0Sets[i] = descriptorSet(dev, e.pool, (external ? m.expandPlanes : m.expand).descriptors);
+            bindBuffer(dev, s1, 0, e.dec0LP); bindRange(dev, s1, 1, m.w8, m.lDec0[0]); bindRange(dev, s1, 2, m.w16, m.lDec0[1]);
+            bindBuffer(dev, s1, 3, e.dec1Out); bindBuffer(dev, s1, 4, e.skipL); bindBuffer(dev, s1, 5, e.dummy); bindBuffer(dev, s1, 6, e.dummy);
+            bindBuffer(dev, s1, 7, e.dec0P);
+            bindImage(dev, s1, 8, e.feat[i].view); bindImage(dev, s1, 9, e.gates.view); bindImage(dev, s1, 10, e.mix.view); bindImage(dev, s1, 11, e.cov.view);
+        } else {
         auto s0 = e.enc0Sets[i] = descriptorSet(dev, e.pool, (external ? m.inputPlanes : m.input).descriptors);
         bindBuffer(dev, s0, 0, e.enc0P);
         bindImage(dev, s0, 4, e.mvA[prev].view, e.linear); bindImage(dev, s0, 5, e.half[prev].view, e.linear); bindImage(dev, s0, 6, e.feat[prev].view, e.linear);
@@ -238,6 +290,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         bindBuffer(dev, s1, 0, e.dec0P); bindImage(dev, s1, 1, e.mvA[i].view, e.nearest); bindImage(dev, s1, 2, e.feat[prev].view, e.linear);
         bindImage(dev, s1, 3, e.feat[i].view); bindImage(dev, s1, 4, e.gates.view); bindImage(dev, s1, 5, e.mix.view); bindImage(dev, s1, 6, e.cov.view);
         bindBuffer(dev, s1, 7, e.dec1Out); bindRange(dev, s1, 8, m.w8, m.dec0[0]); bindRange(dev, s1, 9, m.w16, m.dec0[1]);
+        }
         auto s2 = e.postSets[i] = descriptorSet(dev, e.pool, m.post.descriptors);
         bindBuffer(dev, s2, 0, e.postP);
         bindImage(dev, s2, 2, e.mix.view, e.nearest); bindImage(dev, s2, 3, e.gates.view, e.nearest); bindImage(dev, s2, 4, e.cov.view, e.nearest);
@@ -273,16 +326,18 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
         (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.downRgb10.handle))
         throw std::runtime_error("unsupported borrowed output format or missing RGB10A2 shader");
     const bool reset = s.reset || e.frame == 0;
+    const bool L = e.model.presetL;
     const float fx = float(e.hw) / float(e.rw), fy = float(e.hh) / float(e.rh);
     e.enc0 = {{int32_t(e.rw), int32_t(e.rh)}, {2, 2}, {int32_t(e.gw / 2), int32_t(e.gh / 2)}, {s.jitter[0], s.jitter[1]}, {e.prevJitter[0], e.prevJitter[1]},
-              {s.motionScale[0] * fx, s.motionScale[1] * fy}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)}, 9.045065879821777f, 0.22356846928596497f,
+              {s.motionScale[0] * fx, s.motionScale[1] * fy}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
+              L ? e.model.lConst[0] : 9.045065879821777f, L ? e.model.lConst[1] : 0.22356846928596497f,
               s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.rw), 1.f / float(e.rh)}};
     e.dec0 = {{int32_t(e.rw), int32_t(e.rh)}, int32_t(e.gw / 2), reset ? 1u : 0u, {s.jitter[0], s.jitter[1]}, {fx, fy}, {float(e.hw), float(e.hh)},
-              {e.prevJitter[0], e.prevJitter[1]}, 8.f, 0.07863261550664902f, {1.f / float(e.rw), 1.f / float(e.rh)}};
+              {e.prevJitter[0], e.prevJitter[1]}, L ? e.model.lConst[2] : 8.f, L ? e.model.lConst[3] : 0.07863261550664902f, {1.f / float(e.rw), 1.f / float(e.rh)}};
     e.post = {{0, 0}, {int32_t(e.hw), int32_t(e.hh)}, {int32_t(e.rw), int32_t(e.rh)}, {1.f / fx, 1.f / fy}, {s.jitter[0], s.jitter[1]},
-              {1.f / float(e.rw), 1.f / float(e.rh)}, 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
+              {1.f / float(e.rw), 1.f / float(e.rh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
     e.down = {{int32_t(e.hw), int32_t(e.hh)}, {0, 0}, {0, 0}, {int32_t(e.rw), int32_t(e.rh)}, {float(e.rw) / float(e.ow), float(e.rh) / float(e.oh)}, {s.jitter[0], s.jitter[1]}, 1.f};
-    const uint32_t sw = e.ow / 2, sh = e.oh / 2;
+    const uint32_t sw = exposureGrid(e.rw, e.ow), sh = exposureGrid(e.rh, e.oh);
     const uint32_t bx = (sw + 31) / 32, by = (sh + 31) / 32;
     e.exposure = {{0, 0}, {int32_t(e.rw), int32_t(e.rh)}, 1.f / (float(sw) * float(sh)), 1.f, 0.23547087609767914f, 1u | (reset ? 2u : 0u), bx * by, bx, {int32_t(sw), int32_t(sh)}};
     e.prevJitter[0] = s.jitter[0]; e.prevJitter[1] = s.jitter[1];
@@ -321,6 +376,18 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                     b.post[i] = descriptorSet(dev, b.pool, m.post.descriptors);
                 }
                 auto in = b.input[i], post = b.post[i];
+                if (L) {
+                    bindBuffer(dev, in, 0, e.enc0LP); bindRange(dev, in, 1, m.w8, m.lEnc0[0]); bindRange(dev, in, 2, m.w16, m.lEnc0[1]);
+                    bindBuffer(dev, in, 3, e.dummy); bindBuffer(dev, in, 4, e.dummy); bindBuffer(dev, in, 5, e.skipL); bindBuffer(dev, in, 6, e.tokens);
+                    bindBuffer(dev, in, 7, e.enc0P);
+                    bindImage(dev, in, 8, images.color, e.nearest, images.colorLayout);
+                    bindImage(dev, in, 9, images.motion, e.nearest, images.motionLayout);
+                    bindImage(dev, in, 10, images.depth, e.nearest, images.depthLayout);
+                    bindImage(dev, in, 11, e.mvA[1 - i].view, e.linear); bindImage(dev, in, 12, e.half[1 - i].view, e.linear);
+                    bindImage(dev, in, 13, e.feat[1 - i].view, e.linear);
+                    bindImage(dev, in, 14, e.mvA[i].view); bindImage(dev, in, 15, e.mvB.view); bindImage(dev, in, 16, e.mvC.view);
+                    bindRange(dev, in, 17, m.w16, m.dither16);
+                } else {
                 bindBuffer(dev, in, 0, e.enc0P);
                 bindImage(dev, in, 1, images.color, e.nearest, images.colorLayout);
                 bindImage(dev, in, 2, images.motion, e.nearest, images.motionLayout);
@@ -330,6 +397,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 bindImage(dev, in, 7, e.mvA[i].view); bindImage(dev, in, 8, e.mvB.view); bindImage(dev, in, 9, e.mvC.view);
                 bindRange(dev, in, 10, m.w8, m.enc0[0]); bindRange(dev, in, 11, m.w16, m.enc0[1]);
                 bindRange(dev, in, 12, m.w16, m.enc0[2]); bindBuffer(dev, in, 13, e.tokens);
+                }
                 bindBuffer(dev, post, 0, e.postP); bindImage(dev, post, 1, images.color, e.nearest, images.colorLayout);
                 bindImage(dev, post, 2, e.mix.view, e.nearest); bindImage(dev, post, 3, e.gates.view, e.nearest);
                 bindImage(dev, post, 4, e.cov.view, e.nearest); bindImage(dev, post, 5, e.hist[1 - i].view, e.linear);
@@ -370,6 +438,12 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
         const int32_t shifts[2] = {MShift[l] ^ int32_t((e.frame & 1u) * 2u), MShift[l]};
         vkCmdUpdateBuffer(cb, e.layerP[l].handle, offsetof(MLayerParams, sx), sizeof(shifts), shifts);
     }
+    if (m.presetL) {
+        // NGX alternates the horizontal window shift every frame: input stage (2, 2) / (0, 2), expansion (0, 0) / (2, 0)
+        const int32_t in[2] = {2 ^ int32_t((e.frame & 1u) * 2u), 2}, ex[2] = {int32_t((e.frame & 1u) * 2u), 0};
+        vkCmdUpdateBuffer(cb, e.enc0LP.handle, offsetof(MLayerParams, sx), sizeof(in), in);
+        vkCmdUpdateBuffer(cb, e.dec0LP.handle, offsetof(MLayerParams, sx), sizeof(ex), ex);
+    }
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, compute, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
@@ -379,6 +453,7 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
         dispatch(cb, m.exposure[1], e.expSets[1], 1, 1); nextStage(cb);
     }
     stamp();
+    // (preset L's input stage covers the same blocks: its shift is at most 2 in x and 2 in y)
     dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], (e.gw + 2 + 7) / 8, (e.gh + 2 + 7) / 8);
     stamp();
     if (e.external) closeStages(cb); else nextStage(cb);
@@ -393,7 +468,11 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
     stamp();
-    dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], e.gw / 8, e.gh / 8); nextStage(cb);
+    if (m.presetL)      // one block more in x on frames whose expansion shift is 2
+        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], (e.gw + (e.frame & 1u) * 2u + 7) / 8, e.gh / 8);
+    else
+        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], e.gw / 8, e.gh / 8);
+    nextStage(cb);
     stamp();
     const bool compact = e.compact && e.post.rndOffs[0] >= -0.5f && e.post.rndOffs[0] <= 0.5f &&
         e.post.rndOffs[1] >= -0.5f && e.post.rndOffs[1] <= 0.5f;
@@ -417,3 +496,17 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     recordBack(cb, stamps, stamps ? first + 3 : 0);
 }
 VkImage MEngine::outputImage() const { return impl->output.handle; }
+std::vector<MEngine::DebugResource> MEngine::debugResources() const {
+    auto& e = *impl;
+    const uint32_t w = e.rw, h = e.rh;
+    std::vector<DebugResource> r{{"enc0-params", e.enc0P.handle, VK_NULL_HANDLE, e.enc0P.size, 0, 0},
+                                 {"tokens", e.tokens.handle, VK_NULL_HANDLE, e.tokens.size, 0, 0},
+                                 {"head", e.dec1Out.handle, VK_NULL_HANDLE, e.dec1Out.size, 0, 0},
+                                 {"gates", VK_NULL_HANDLE, e.gates.handle, VkDeviceSize(w) * h * 4, w, h},
+                                 {"mix", VK_NULL_HANDLE, e.mix.handle, VkDeviceSize(w) * h * 4, w, h},
+                                 {"cov", VK_NULL_HANDLE, e.cov.handle, VkDeviceSize(w) * h * 8, w, h},
+                                 {"mvA", VK_NULL_HANDLE, e.mvA[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
+                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h}};
+    if (e.model.presetL) r.push_back({"skip", e.skipL.handle, VK_NULL_HANDLE, e.skipL.size, 0, 0});
+    return r;
+}

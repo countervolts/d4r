@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <vector>
 #include <string>
 
 namespace d4r {
@@ -202,6 +203,7 @@ public:
     bool uploadRecorded() const;
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
+    bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0001): MEngine then runs preset L
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
@@ -230,6 +232,10 @@ public:
     void recordFront(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
     void recordBack(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
     VkImage outputImage() const; // RGBA16F, GENERAL
+    // Development: the engine's intermediate buffers and render-resolution images (GENERAL), for replays that compare
+    // them with a capture. Valid while the engine lives; read them only after a recorded frame has completed.
+    struct DebugResource { const char* name; VkBuffer buffer; VkImage image; VkDeviceSize bytes; uint32_t width, height; };
+    std::vector<DebugResource> debugResources() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

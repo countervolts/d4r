@@ -10,6 +10,11 @@ cap, frame, work, kvk = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 K = os.environ.get('POST_KERNEL') or next((k for k in ('rrlite_post_3_1_mvlo_hdr_folded', 'rrlite_post_3_2_mvlo_hdr_folded')
     if glob.glob(f'{cap}/replay/replay-*-{k}')), 'rrlite_post_3_1_mvlo_hdr_folded')
 TILE = ['-DTILE_W=15', '-DTILE_H=15'] if '3_2' in K else []
+# preset L's unfolded kernels (no _folded suffix) run post_m.comp's PRESET_L variant, one tap wider per tier
+if '_ldr' in K:
+    TILE = TILE + ['-DLDR=1']
+if not K.endswith('_folded'):
+    TILE = [d for d in TILE if d == '-DLDR=1'] + ['-DPRESET_L=1'] + (['-DTILE_W=16', '-DTILE_H=16'] if '3_2' in K else ['-DTILE_W=11', '-DTILE_H=11'])
 reps = sys.argv[5] if len(sys.argv) > 5 else '1'
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(work, exist_ok=True)
