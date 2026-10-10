@@ -32,6 +32,10 @@
 #                    Accuracy texture sets go in accuracy/<target>/, built with D4R_PREFER_ACCURACY=1.
 #   D4R_ZLUDA_EMIT  d4r_emit from the patched ZLUDA build; required in full builds when an accuracy
 #                    texture set or L's unfolded texture variants are not supplied in D4R_BUNDLE_TEX.
+#   D4R_BUNDLE_ENGINE  optional: the native engine's preset K model (the folder engine/compile_k.py wrote),
+#                    packaged as d4r/engine/k for d4r.ini [Engine]. Only d4r's shaders are taken from it: the
+#                    weights and reconstruction table are values read from NVIDIA's DLSS and are never packaged,
+#                    in any variant. Users produce them from their own nvngx_dlss.dll (engine/README.md).
 # D4R_BUNDLE_NVIDIA=installer (default) ships install.sh instead of NVIDIA DLLs, retaining texture kernels.
 # D4R_BUNDLE_NVIDIA=1 bundles both DLLs; =0 omits DLLs and texture kernels (nonvidia ZIP).
 set -euo pipefail
@@ -118,6 +122,16 @@ if [[ "$VARIANT" != clean ]]; then
   fi
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
+fi
+if [[ -n "${D4R_BUNDLE_ENGINE:-}" ]]; then
+  for f in input_k.spv output_k.spv exposure_k0.spv exposure_k1.spv; do
+    [[ -f "$D4R_BUNDLE_ENGINE/$f" ]] || { echo "D4R_BUNDLE_ENGINE lacks $f (run engine/compile_k.py)" >&2; exit 2; }
+  done
+  mkdir -p "$STAGE/d4r/engine/k"
+  cp "$D4R_BUNDLE_ENGINE"/*.spv "$STAGE/d4r/engine/k/"
+  # d4r's own shader-revision marker; every other .bin in the model holds values read from NVIDIA's DLSS
+  [[ ! -f "$D4R_BUNDLE_ENGINE/direct_origins.bin" ]] || cp "$D4R_BUNDLE_ENGINE/direct_origins.bin" "$STAGE/d4r/engine/k/"
+  printf 'The native engine needs weights.bin, offsets.bin and lut.bin here (see D4R_README.txt).\r\n' > "$STAGE/d4r/engine/k/README.txt"
 fi
 IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
 # one folder per target; RDNA4 targets also get <target>-fp8 (native FP8 WMMA, d4r.ini NativeFp8), which the
@@ -244,6 +258,10 @@ if [[ -n "${D4R_BUILD_INFO:-}" ]]; then
 fi
 sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
 
+# Last line of defence for the published zip: only what this variant contains, never values read from DLSS.
+python3 "$ROOT/scripts/check_redistributable.py" release "$VARIANT" "$STAGE" ||
+  { echo "refusing to build $NAME.zip" >&2; exit 2; }
+
 # One timestamp for every file (SOURCE_DATE_EPOCH, default the last commit): ZLUDA's kernel cache is keyed on
 # its library's size and mtime, so every extraction of the zip shares one cache.
 EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}"
@@ -253,3 +271,6 @@ rm -f "$OUT/$NAME.zip"
 (cd "$STAGE" && find . -type f | LC_ALL=C sort | sed 's|^\./||' | zip -q -X -9 "$OUT/$NAME.zip" -@)
 (cd "$OUT" && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
 printf 'Built %s (%s)\n' "$OUT/$NAME.zip" "$(du -h "$OUT/$NAME.zip" | cut -f1)"
+if [[ "$VARIANT" == full ]]; then
+  echo "This zip contains NVIDIA's DLLs and kernels built from NVIDIA's code. Do not publish or share it." >&2
+fi

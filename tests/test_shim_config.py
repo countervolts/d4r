@@ -25,6 +25,29 @@ class ShimConfigTests(unittest.TestCase):
         self.assertEqual(int(portable[1]), 200)
         self.assertEqual(int(runtime[1]), 200)
 
+    def test_engine_is_opt_in_and_configured_by_ini(self):
+        for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
+            ini = configparser.ConfigParser(inline_comment_prefixes=(';',))
+            ini.read(ROOT / name)
+            self.assertFalse(ini.getboolean('Engine', 'Enabled'), name)
+            self.assertEqual(ini.get('Engine', 'ModelDir'), 'auto', name)
+        source = SHIM.read_text()
+        self.assertIn('portable_set("D4R_ENGINE", ini_flag(ini, "engine", "Enabled", 0) ? "1" : "0");', source)
+        self.assertIn('env_uint("D4R_ENGINE", 0)', source)
+        with tempfile.TemporaryDirectory() as temporary:
+            ini = Path(temporary) / 'd4r.ini'
+            env = {key: value for key, value in os.environ.items() if not key.startswith('D4R_')}
+            cmd = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
+            for text, enabled, model in (('', '0', None), ('[Engine]\nEnabled = true\n', '1', None),
+                                         ('[Engine]\nEnabled = true\nModelDir = /models/k\n', '1', '/models/k')):
+                ini.write_text(text)
+                result = subprocess.run(cmd, env=env, text=True, capture_output=True, check=True)
+                self.assertIn(f'export D4R_ENGINE={enabled}\n', result.stdout)
+                self.assertEqual('export D4R_ENGINE_MODEL_DIR=/models/k\n' in result.stdout, model is not None)
+            ini.write_text('[Engine]\nEnabled = maybe\n')
+            result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2)
+
     def test_launcher_marker_poll_defaults_overrides_and_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'
@@ -49,7 +72,8 @@ class ShimConfigTests(unittest.TestCase):
         # and a captured logger, so the test exercises the production message
         # and override behavior without requiring Windows, NGX or a GPU.
         source = SHIM.read_text()
-        start = source.index('    const char* presetNames[] =')
+        creation = source.index('static NgxResult create_feature(')
+        start = source.index('    const char* presetNames[] =', creation)
         end = source.index('    feature->preset = presets[1];', start)
         block = source[start:end]
         runner_source = r'''

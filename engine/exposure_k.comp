@@ -1,0 +1,152 @@
+#version 460
+// d4r engine: automatic exposure, as NGX computes it (luma convert, two reduce-sum passes, auto-exposure copy).
+//   MODE 0 (preset K): exposure = key * exp(-mean of the log luma).
+//   MODE 1 (preset M, the cuda_dldn_engine_* kernels): exposure = key / max(mean of the luma clamped to
+//          [0, 10000], 0.005).
+// Both modes measure the same grid: the colour rectangle sampled at half the output size with an
+// endpoint-aligned nearest-texel lookup (the reference's cuda_luma_convert_kernel; the grid equals the
+// rectangle itself only when the render size is half the output size).
+// The result is kept as a half float, through the reference's truncating formatted surface store.
+//   PASS 0: one workgroup sums the mapped luma over a 32x32-pixel block of the measured grid.
+//   PASS 1: one workgroup adds the block sums, advances the exposure state and writes the exposure fields of the
+//           input and output stages' parameter blocks. It also runs on frames that do not measure.
+//           With flag 4 (MODE 0) the game's 1x1 exposure texture replaces the measurement; nothing is measured then.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#ifndef MODE
+#define MODE 0
+#endif
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 origin, size;     // rectangle of the colour texture; the grid maps onto it
+    float invCount;         // 1 / (sampleSize.x * sampleSize.y)
+    float scale;            // applied to the luma before the logarithm
+    float key;              // exposure * geometric mean
+    uint flags;             // 1: measure this frame; 2: reset (previous exposure = current); 4: game exposure (MODE 0)
+    uint blocks, blocksX;
+    // The measured grid: the reference's cuda_luma_convert_kernel samples the colour rectangle at half the
+    // output size with an endpoint-aligned nearest-texel lookup, not at every render texel. size is the
+    // source rectangle; invCount is 1 / (sampleSize.x * sampleSize.y) and the workgroups cover the grid.
+    ivec2 sampleSize;
+    // The game's exposure scale and 1 / pre-exposure (MODE 0). NGX keeps the measured exposure unscaled and
+    // applies both when it fills the stages' parameters, in this order: (1 / pre) * (scale * exposure).
+    float gameScale, invPre;
+} p;
+shared float part[64];
+// The half surface the reference's auto_exposure_copy_kernel writes truncates toward zero. An explicit
+// float16_t cast rounds to nearest instead and lands on the next code whenever the exact value sits below
+// the midpoint of its binary16 interval - on ordinary frames the measured exposure, so emulate the store.
+float truncatedHalf(float v)
+{
+    uint bits = packHalf2x16(vec2(v, 0.0)) & 65535u;
+    if (unpackHalf2x16(bits).x > v) --bits;
+    return unpackHalf2x16(bits).x;
+}
+#if PASS == 0
+layout(set = 0, binding = 1) uniform sampler2D colorTex;
+layout(set = 0, binding = 2, std430) writeonly buffer Sums { float v[]; } sums;
+void main()
+{
+    const uint t = gl_LocalInvocationID.x;
+    const ivec2 base = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(t & 7u, t >> 3) * 4;
+    const ivec2 grid = p.sampleSize;
+    float sum = 0.0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+        {
+            const ivec2 at = base + ivec2(x, y);
+            if (at.x >= grid.x || at.y >= grid.y) continue;
+            // endpoint-aligned nearest-texel lookup from the grid to the colour rectangle
+            const ivec2 sampleAt = ivec2(floor(fma(vec2(at) / vec2(grid - 1), vec2(p.size - 1), vec2(0.5))));
+            const vec3 c = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+            // the reference accumulates the logarithm of the exposed luma (cuda_luma_convert_kernel). The
+            // constant is applied to Y = fma(b, 0.25, fma(r, 0.25, g * 0.5)); MODE 1 keeps its own expression.
+#if MODE == 0
+            precise const float luma = p.scale * fma(c.b, 0.25, fma(c.r, 0.25, 0.5 * c.g));
+            // log(luma + 1e-6) as lg2(x) * ln2, and a non-finite or non-positive luma contributes nothing
+            if (luma > 0.0 && !isinf(luma))
+                sum += (log2(luma + 1e-6) * uintBitsToFloat(0x3F317218u)) * p.invCount;
+#else
+            const float luma = p.scale * (0.25 * c.r + 0.5 * c.g + 0.25 * c.b);
+            sum += p.invCount * min(max(luma, 0.0), 10000.0);
+#endif
+        }
+    part[t] = sum;
+    barrier();
+    if (t == 0u)
+    {
+        float total = 0.0;
+        for (uint i = 0u; i < 64u; ++i) total += part[i];
+        sums.v[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = total;
+    }
+}
+#else
+layout(set = 0, binding = 1, std430) readonly buffer Sums { float v[]; } sums;
+layout(set = 0, binding = 2, std430) buffer State { float current, previous; } state;
+#if MODE == 0
+layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // expo, expoIn, expoRatio at words 28..30
+layout(set = 0, binding = 4, std430) buffer OutputParams { float w[]; } outp;   // expo, expoRatio at words 37, 38
+layout(set = 0, binding = 5) uniform sampler2D gameExposure;                                           // the game's 1x1 exposure (flag 4)
+#else
+layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // enc0_m: expo, expoPrev at words 25, 26
+layout(set = 0, binding = 4, std430) buffer PostParams { float w[]; } post;     // post_m: words 14, 15
+layout(set = 0, binding = 5, std430) buffer DownParams { float w[]; } down;     // down_m: word 12
+#endif
+void main()
+{
+    const uint t = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    if ((p.flags & 1u) != 0u)
+        for (uint i = t; i < p.blocks; i += 64u) sum += sums.v[i];
+    part[t] = sum;
+    barrier();
+    if (t != 0u) return;
+    float current = state.current, previous = current;
+#if MODE == 0
+    if ((p.flags & 4u) != 0u)
+    {
+        float value = texelFetch(gameExposure, ivec2(0), 0).r;
+        if (value == 0.0) value = 1.0;                        // NGX's texture read maps a zero exposure to 1
+        // NGX copies the exposure into a half surface with the same truncating store as the measured
+        // one, and the next frame's ratio uses that half value; a reset carries the live f32 value.
+        previous = (p.flags & 2u) != 0u ? value : truncatedHalf(current);
+        current = value;
+    }
+#endif
+    if ((p.flags & 1u) != 0u)
+    {
+        float mean = 0.0;
+        for (uint i = 0u; i < 64u; ++i) mean += part[i];
+#if MODE == 0
+        // auto_exposure_copy_kernel: key * exp2(-log2e * sum), written to a half surface. The formatted
+        // store truncates toward zero, as in MODE 1 (measured on the captured K exposure: the store lands
+        // one binary16 code below the correctly rounded value).
+        float measured = truncatedHalf(p.key * exp2(uintBitsToFloat(0xBFB8AA3Bu) * mean));
+#else
+        // The reference's formatted half surface store truncates positive exposure; an explicit f16 cast
+        // rounds to nearest instead and moves FP8 embedding codes across thresholds.
+        const float full = p.key / max(mean, 0.005);
+        float measured = truncatedHalf(full);
+#endif
+        if (!(measured > 0.0) || isinf(measured)) measured = 1.0;
+#if MODE == 0
+        previous = (p.flags & 2u) != 0u ? measured : current;
+#else
+        previous = (p.flags & 2u) != 0u ? 0.0 : current;       // 0: no earlier exposure (the stages read it as 1)
+#endif
+        current = measured;
+    }
+    state.current = current; state.previous = previous;
+#if MODE == 0
+    precise const float scaled = p.gameScale * current, scaledPrevious = p.gameScale * previous;
+    precise const float exposure = p.invPre * scaled;
+    precise const float ratio = scaled / scaledPrevious;
+    inp.w[28] = exposure; inp.w[29] = 1.0; inp.w[30] = ratio;
+    outp.w[37] = exposure; outp.w[38] = ratio;
+#else
+    inp.w[25] = current; inp.w[26] = previous;
+    post.w[14] = current; post.w[15] = previous;
+    down.w[12] = current;
+#endif
+}
+#endif

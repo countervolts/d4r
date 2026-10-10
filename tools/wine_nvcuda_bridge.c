@@ -58,7 +58,9 @@ enum
     CUDA_ERROR_OUT_OF_MEMORY = 2,
     CUDA_ERROR_NOT_FOUND = 500,
     CUDA_ERROR_NOT_READY = 600,
+    CUDA_ERROR_LAUNCH_FAILED = 719,
     CUDA_ERROR_NOT_SUPPORTED = 801,
+    CUDA_ERROR_UNKNOWN = 999,
 };
 
 static void* cuda_library;
@@ -1627,7 +1629,7 @@ static size_t array_element_bytes(int32_t format, uint32_t channels)
     case 0x01: case 0x08: return 1u * channels;
     case 0x02: case 0x09: case 0x10: return 2u * channels;
     case 0x03: case 0x0a: case 0x20: return 4u * channels;
-    case 80: return 16; /* packed 10:10:10:2 backed by RGBA32F */
+    case 80: return 4; /* CUDA copies packed 10:10:10:2 even though ZLUDA's backing is RGBA32F */
     case 192: case 198: return 1;
     case 193: case 199: return 2;
     case 194: case 200: return 4;
@@ -3174,6 +3176,956 @@ CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memor
     return CUDA_SUCCESS;
 }
 
+/* d4r engine: the Swin network on d4r's native HIP layer kernels, launched directly through HIP (no NGX, no
+   PTX; engine/hip_net.cpp is the same logic for native Linux programs). The engine's Vulkan front writes the
+   tokens into `tokens`, the network's layers run here, and its back reads `output`; both are device pointers of
+   memory imported with d4rImportVulkanMemory. `net` is the model's hipnet.bin:
+     D4RMHIP1 (compile_m.py --hip): preset M, ten layers, width/height are the render dimensions; two immutable
+       window-alignment graphs, one per evaluation.
+     D4RKHIP1 (compile_k.py --hip): preset K, eleven layers (the bottleneck dec5 as its main kernel plus
+       post1..3), width/height are the output dimensions (the token grid is makeKShape), and `tokens`/`output`
+       hold 16 / 40 f16 channels per token row-major. Eight immutable graphs, one per makeKWindows evaluation.
+   Either way: {kernel name[32], shift x, y, grid divisor, pad, weight offset, weight bytes} per layer, then the
+   weight allocations as NGX uploads them. */
+typedef struct
+{
+    const char* name; /* kernel name, as in hipnet.bin */
+    const void* data; /* its code object (.hsaco) */
+    uint64_t bytes;
+} D4rEngineNetCode;
+
+typedef struct
+{
+    void* w;
+    int32_t sx, sy, tw, th;
+    void* in;
+    void* skip;
+    void* out;
+    void* merged;
+    int32_t r69, r70, r71, r72;
+    void* in_flags;
+    void* out_flags;
+} D4rEngineNetParams; /* kernels/m/swin_common.h: CommonParams, TubeParams */
+
+typedef struct
+{
+    int32_t W, H; /* token grid of the layer, pixels */
+    uint8_t* in;
+    uint8_t* skip;  /* decoders: the full-resolution encoder output */
+    uint8_t* out24; /* encoders: patch-merged output; decoders: output; dec0: the caller's head buffer */
+    uint8_t* out32; /* encoders: full-resolution output (the skip of the matching decoder) */
+    uint64_t pad40, pad48;
+    int32_t sx, sy;
+    uint8_t* w;
+    uint8_t rest[104];
+} D4rEngineNetPwinParams; /* kernels/k/pwin_layer.h: PwinParams */
+_Static_assert(sizeof(D4rEngineNetPwinParams) == 176, "K param block");
+
+/* one immutable launch of one graph: entry point, grid, block and the frozen parameter block (the active
+   member follows the model's magic) */
+typedef union
+{
+    D4rEngineNetParams m;
+    D4rEngineNetPwinParams k;
+} D4rEngineNetParamsU;
+
+typedef struct
+{
+    void* function;
+    uint32_t gx, gy, bx, by, bz;
+    D4rEngineNetParamsU params;
+} D4rEngineNetNode;
+
+#define D4R_ENGINE_NET_M_LAYERS 10
+#define D4R_ENGINE_NET_K_LAYERS 11
+#define D4R_ENGINE_NET_LAYERS D4R_ENGINE_NET_K_LAYERS
+#define D4R_ENGINE_NET_MODULES D4R_ENGINE_NET_K_LAYERS
+#define D4R_ENGINE_NET_GRAPHS 8
+#define D4R_ENGINE_NET_NODES 16 /* 11 layers, the deepest of them with its three post phases */
+#define D4R_ENGINE_NET_OWNED 32
+#define D4R_ENGINE_NET_SIGNALS 16
+struct D4rEngineNet;
+typedef struct
+{
+    struct D4rEngineNet* net;
+    uint64_t value;
+    int busy;
+} D4rEngineNetSignal;
+
+typedef struct
+{
+    int sType; /* VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO = 1000207005 */
+    const void* pNext;
+    uint64_t semaphore, value;
+} D4rVkSemaphoreSignalInfo;
+typedef int (*VK_SIGNAL_SEMAPHORE_FN)(void*, const D4rVkSemaphoreSignalInfo*);
+typedef int (*VK_GET_SEMAPHORE_COUNTER_FN)(void*, uint64_t, uint64_t*);
+typedef int (*HIP_LAUNCH_HOST_FN)(void*, void (*)(void*), void*);
+
+typedef struct D4rEngineNet
+{
+    int k_preset;  /* D4RKHIP1: the token grid comes from the output dimensions and the cycle has eight graphs */
+    uint32_t graphs; /* 2 for M, 8 for K */
+    void* modules[D4R_ENGINE_NET_MODULES];
+    void* owned[D4R_ENGINE_NET_OWNED];
+    int module_count, owned_count;
+    uint32_t node_count[D4R_ENGINE_NET_GRAPHS];
+    D4rEngineNetNode nodes[D4R_ENGINE_NET_GRAPHS][D4R_ENGINE_NET_NODES];
+    /* weight-image preparations: one per layer, i.e. per distinct weights pointer, run once at create time */
+    uint32_t prep_count;
+    D4rEngineNetNode preps[D4R_ENGINE_NET_LAYERS];
+    void* stream;
+    void* graph[D4R_ENGINE_NET_GRAPHS];
+    void* executable[D4R_ENGINE_NET_GRAPHS];
+    uint32_t frame;
+    uint32_t* input_wait_host;
+    void* start;
+    void* stop;
+    /* Input readiness on the GPU (d4rEngineNetInputWaitReady / d4rEngineNetLaunchAt): the u32 the engine's
+       front fills with the frame number, and the value a queued stream wait is waiting for (0: none). */
+    CUdeviceptr input_wait;
+    uint32_t input_wait_value;
+    void* timeline_device;
+    uint64_t timeline_semaphore, timeline_value;
+    pthread_mutex_t timeline_lock;
+    VK_SIGNAL_SEMAPHORE_FN signal_timeline;
+    HIP_LAUNCH_HOST_FN launch_host;
+    D4rEngineNetSignal signals[D4R_ENGINE_NET_SIGNALS];
+    int timeline_error;
+} D4rEngineNet;
+
+typedef int (*HIP_PP_FN)(void**);
+typedef int (*HIP_P_FN)(void*);
+typedef int (*HIP_MALLOC_FN)(void**, size_t);
+typedef int (*HIP_MEMCPY_FN)(void*, const void*, size_t);
+typedef int (*HIP_MODULE_LOAD_DATA_FN)(void**, const void*);
+typedef int (*HIP_MODULE_GET_FUNCTION_FN)(void**, void*, const char*);
+typedef int (*HIP_MODULE_GET_GLOBAL_FN)(void**, size_t*, void*, const char*);
+typedef int (*HIP_MODULE_LAUNCH_FN)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*,
+                                    void**, void**);
+typedef int (*HIP_EVENT_RECORD_FN)(void*, void*);
+typedef int (*HIP_EVENT_ELAPSED_FN)(float*, void*, void*);
+typedef int (*HIP_STREAM_WAIT_VALUE32_FN)(void*, void*, uint32_t, unsigned int, uint32_t);
+typedef int (*HIP_STREAM_WRITE_VALUE32_FN)(void*, void*, uint32_t, unsigned int);
+typedef int (*HIP_STREAM_CREATE_WITH_FLAGS_FN)(void**, unsigned int);
+typedef int (*HIP_STREAM_SYNCHRONIZE_FN)(void*);
+typedef int (*HIP_CAPTURE_BEGIN_FN)(void*, int);
+typedef int (*HIP_CAPTURE_END_FN)(void*, void**);
+typedef int (*HIP_GRAPH_INSTANTIATE_FN)(void**, void*, void**, char*, size_t);
+
+
+CUresult WINAPI d4rEngineNetReleaseInput(void* handle, uint32_t value)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    if (net == NULL || net->input_wait_host == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    /* Never rewind a newer front's publication when releasing a discarded older frame. */
+    uint32_t current = __atomic_load_n(net->input_wait_host, __ATOMIC_ACQUIRE);
+    while (current < value &&
+           !__atomic_compare_exchange_n(net->input_wait_host, &current, value, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+    {}
+    return CUDA_SUCCESS;
+}
+
+/* preset K's eleven layers in network order (the same plan as engine/hip_net.cpp): token-grid divisor, input
+   channels, the core channels (the encoder's full-resolution output width), the channels written to out24 (the
+   patch-merged skip for encoders, the block output for the decoders, the 40-channel head for dec0) and the
+   window-schedule role. */
+typedef struct
+{
+    const char* name;
+    uint32_t divisor, cin, c, out24ch;
+    int role;
+} D4rEngineNetKLayer;
+
+static const D4rEngineNetKLayer d4r_engine_net_k_plan[D4R_ENGINE_NET_K_LAYERS] = {
+    {"enc0", 1, 16, 32, 64, -1}, {"enc1", 2, 64, 64, 64, -1},  {"enc2", 4, 64, 64, 96, -1},
+    {"enc3", 8, 96, 96, 128, 2}, {"enc4", 16, 128, 128, 160, 1}, {"dec5", 32, 160, 160, 160, 0},
+    {"dec4", 16, 160, 128, 128, 1}, {"dec3", 8, 128, 96, 96, 2}, {"dec2", 4, 96, 64, 64, -1},
+    {"dec1", 2, 64, 64, 64, -1}, {"dec0", 1, 64, 32, 40, -1},
+};
+
+/* makeKWindows (engine/runtime.cpp): dec5 moves once per frame around an eight-frame cycle and every shallower
+   layer follows the one below it as (2 * shift + 4) mod 8; role 0 = dec5, 1 = enc4/dec4, 2 = enc3/dec3,
+   everything else keeps shift 4. */
+static const int32_t d4r_engine_net_k_cycle[8][2] = {{0, 2}, {5, 6}, {4, 0}, {1, 4}, {7, 5}, {2, 1}, {3, 7}, {6, 3}};
+
+static void d4r_engine_net_k_shift(int role, uint32_t frame, int32_t* sx, int32_t* sy)
+{
+    if (role < 0)
+    {
+        *sx = 4;
+        *sy = 4;
+        return;
+    }
+    int32_t x = d4r_engine_net_k_cycle[frame % 8][0], y = d4r_engine_net_k_cycle[frame % 8][1];
+    for (int depth = 0; depth < role; ++depth)
+    {
+        x = (2 * x + 4) & 7;
+        y = (2 * y + 4) & 7;
+    }
+    *sx = x;
+    *sy = y;
+}
+
+/* one code object of a layer: the main entry, its weight-image preparation and the deep layers' post phases */
+typedef struct
+{
+    char name[33];
+    void* module;
+    void* main;
+    void* prep;
+    void* post[8];
+    uint32_t prep_blocks, block_z, grid_x, grid_y;
+    uint32_t post_gx[8], post_gy[8], post_bx[8], post_by[8], post_bz[8];
+    int post_count;
+} D4rEngineNetKernel;
+
+static uint32_t d4r_engine_net_global(void* module, const char* name, uint32_t fallback)
+{
+    HIP_MODULE_GET_GLOBAL_FN get = (HIP_MODULE_GET_GLOBAL_FN)hip_symbol("hipModuleGetGlobal");
+    HIP_MEMCPY_FN to_host = (HIP_MEMCPY_FN)hip_symbol("hipMemcpyDtoH");
+    void* at = NULL;
+    size_t bytes = 0;
+    uint32_t value = fallback;
+    if (get != NULL && to_host != NULL && get(&at, &bytes, module, name) == 0 && bytes == 4)
+        to_host(&value, at, 4);
+    return value;
+}
+
+void WINAPI d4rEngineNetDestroy(void* handle)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    if (net == NULL)
+        return;
+    HIP_P_FN synchronize = (HIP_P_FN)hip_symbol("hipStreamSynchronize");
+    HIP_P_FN free_device = (HIP_P_FN)hip_symbol("hipFree");
+    HIP_P_FN unload = (HIP_P_FN)hip_symbol("hipModuleUnload");
+    HIP_P_FN event_destroy = (HIP_P_FN)hip_symbol("hipEventDestroy");
+    HIP_P_FN stream_destroy = (HIP_P_FN)hip_symbol("hipStreamDestroy");
+    /* A queued input wait whose frame never reached the GPU would make the synchronize below wait forever:
+       satisfy it (the shim also releases waits it knows about, before it destroys the network). */
+    if (net->input_wait != 0 && net->input_wait_value != 0)
+        d4rEngineNetReleaseInput(net, net->input_wait_value);
+    if (net->stream != NULL && synchronize != NULL)
+        synchronize(net->stream);
+    HIP_P_FN exec_destroy = (HIP_P_FN)hip_symbol("hipGraphExecDestroy");
+    HIP_P_FN graph_destroy = (HIP_P_FN)hip_symbol("hipGraphDestroy");
+    for (unsigned phase = 0; phase < D4R_ENGINE_NET_GRAPHS; ++phase)
+    {
+        if (net->executable[phase] != NULL && exec_destroy != NULL)
+            exec_destroy(net->executable[phase]);
+        if (net->graph[phase] != NULL && graph_destroy != NULL)
+            graph_destroy(net->graph[phase]);
+    }
+    for (int i = 0; i < net->owned_count && free_device != NULL; ++i)
+        free_device(net->owned[i]);
+    for (int i = 0; i < net->module_count && unload != NULL; ++i)
+        unload(net->modules[i]);
+    if (net->start != NULL && event_destroy != NULL)
+        event_destroy(net->start);
+    if (net->stop != NULL && event_destroy != NULL)
+        event_destroy(net->stop);
+    if (net->stream != NULL && stream_destroy != NULL)
+        stream_destroy(net->stream);
+    if (net->timeline_device != NULL)
+        pthread_mutex_destroy(&net->timeline_lock);
+    free(net);
+}
+
+static CUresult d4r_engine_net_capture(D4rEngineNet* net, HIP_MODULE_LAUNCH_FN launch)
+{
+    HIP_CAPTURE_BEGIN_FN begin = (HIP_CAPTURE_BEGIN_FN)hip_symbol("hipStreamBeginCapture");
+    HIP_CAPTURE_END_FN end = (HIP_CAPTURE_END_FN)hip_symbol("hipStreamEndCapture");
+    HIP_GRAPH_INSTANTIATE_FN instantiate = (HIP_GRAPH_INSTANTIATE_FN)hip_symbol("hipGraphInstantiate");
+    if (begin == NULL || end == NULL || instantiate == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    /* Every frame of the alignment cycle has its own immutable graph (arguments and grids frozen, the K
+       bottleneck's post phases included); no per-frame node updates. */
+    for (uint32_t phase = 0; phase < net->graphs; ++phase)
+    {
+        if (begin(net->stream, 2 /* hipStreamCaptureModeRelaxed */) != 0)
+            return CUDA_ERROR_UNKNOWN;
+        int queued = 0;
+        for (uint32_t i = 0; i < net->node_count[phase] && queued == 0; ++i)
+        {
+            D4rEngineNetNode* node = &net->nodes[phase][i];
+            void* args[] = {&node->params};
+            queued = launch(node->function, node->gx, node->gy, 1, node->bx, node->by, node->bz, 0, net->stream, args,
+                            NULL);
+        }
+        const int captured = end(net->stream, &net->graph[phase]);
+        if (queued != 0 || captured != 0)
+            return CUDA_ERROR_LAUNCH_FAILED;
+        if (instantiate(&net->executable[phase], net->graph[phase], NULL, NULL, 0) != 0)
+            return CUDA_ERROR_UNKNOWN;
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult WINAPI d4rEngineNetCreate(const uint8_t* file, uint64_t file_bytes, const D4rEngineNetCode* codes,
+                                   uint32_t code_count, uint32_t width, uint32_t height, CUdeviceptr tokens,
+                                   CUdeviceptr output, void** handle)
+{
+    ensure_context();
+    if (file == NULL || codes == NULL || handle == NULL || tokens == 0 || output == 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    typedef int (*STREAM_PRIORITY_RANGE_FN)(int*, int*);
+    typedef int (*STREAM_CREATE_PRIORITY_FN)(void**, unsigned int, int);
+    STREAM_PRIORITY_RANGE_FN priority_range = (STREAM_PRIORITY_RANGE_FN)hip_symbol("hipDeviceGetStreamPriorityRange");
+    STREAM_CREATE_PRIORITY_FN stream_create = (STREAM_CREATE_PRIORITY_FN)hip_symbol("hipStreamCreateWithPriority");
+    HIP_PP_FN event_create = (HIP_PP_FN)hip_symbol("hipEventCreate");
+    HIP_P_FN synchronize = (HIP_P_FN)hip_symbol("hipStreamSynchronize");
+    HIP_MALLOC_FN allocate = (HIP_MALLOC_FN)hip_symbol("hipMalloc");
+    HIP_MEMCPY_FN to_device = (HIP_MEMCPY_FN)hip_symbol("hipMemcpyHtoD");
+    HIP_MODULE_LOAD_DATA_FN load = (HIP_MODULE_LOAD_DATA_FN)hip_symbol("hipModuleLoadData");
+    HIP_MODULE_GET_FUNCTION_FN function = (HIP_MODULE_GET_FUNCTION_FN)hip_symbol("hipModuleGetFunction");
+    HIP_MODULE_LAUNCH_FN launch = (HIP_MODULE_LAUNCH_FN)hip_symbol("hipModuleLaunchKernel");
+    if (priority_range == NULL || stream_create == NULL || event_create == NULL || synchronize == NULL || allocate == NULL || to_device == NULL ||
+        load == NULL || function == NULL || launch == NULL || hip_symbol("hipEventRecord") == NULL ||
+        hip_symbol("hipEventQuery") == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    if (file_bytes < 16)
+        return CUDA_ERROR_INVALID_VALUE;
+    const int k_preset = memcmp(file, "D4RKHIP1", 8) == 0;
+    if (!k_preset && memcmp(file, "D4RMHIP1", 8) != 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    uint32_t count = 0;
+    memcpy(&count, file + 8, 4);
+    const uint32_t layers = k_preset ? D4R_ENGINE_NET_K_LAYERS : D4R_ENGINE_NET_M_LAYERS;
+    if (count != layers || file_bytes < 16 + 64ull * count)
+        return CUDA_ERROR_INVALID_VALUE;
+    int least_priority = 0, greatest_priority = 0;
+    if (priority_range(&least_priority, &greatest_priority) != 0)
+        return CUDA_ERROR_UNKNOWN;
+    D4rEngineNet* net = (D4rEngineNet*)calloc(1, sizeof(*net));
+    if (net == NULL)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    net->k_preset = k_preset;
+    net->graphs = k_preset ? D4R_ENGINE_NET_GRAPHS : 2;
+    const char* failure = NULL;
+    /* The layer-0 token grid: M's render dimensions, K's output dimensions (makeKShape). */
+    uint32_t tw, th;
+    if (k_preset)
+    {
+        if (width < 256 || height < 256 || width > 8192 || height > 8192)
+            failure = "output dimensions";
+        tw = ((width + 3) / 4 + 31) / 32 * 32;
+        th = ((height + 3) / 4 + 31) / 32 * 32;
+        if (tw < 256) tw = 256;
+        if (th < 256) th = 256;
+    }
+    else
+    {
+        tw = (width + 31) / 32 * 16;
+        th = (height + 31) / 32 * 16;
+    }
+    /* This stream is on the frame's critical path, between two parts of the game's graphics list. */
+    if (failure == NULL && (stream_create(&net->stream, 1 /* hipStreamNonBlocking */, greatest_priority) != 0 ||
+                            event_create(&net->start) != 0 || event_create(&net->stop) != 0))
+        failure = "stream or events";
+    void* const tok = (void*)(uintptr_t)tokens;
+    void* const result = (void*)(uintptr_t)output;
+    D4rEngineNetKernel kern[D4R_ENGINE_NET_MODULES];
+    memset(kern, 0, sizeof(kern));
+    int module_count = 0;
+    void* layer_in[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+    void* layer_skip[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+    void* layer_out[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+    void* layer_merged[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+    void* k_full[5] = {NULL};
+    void* weights[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+    uint32_t divisor[D4R_ENGINE_NET_K_LAYERS] = {0};
+    int32_t shift_sx[D4R_ENGINE_NET_K_LAYERS] = {0}, shift_sy[D4R_ENGINE_NET_K_LAYERS] = {0};
+    uint32_t layer_kernel[D4R_ENGINE_NET_K_LAYERS] = {0};
+    D4rEngineNetParamsU layer_params[D4R_ENGINE_NET_K_LAYERS];
+    memset(layer_params, 0, sizeof(layer_params));
+    if (k_preset && failure == NULL)
+    {
+        /* NGX packs the encoder skips, the merged outputs and the decoder outputs into one scratch allocation;
+           separate buffers only have to respect the channel counts and the wiring, not the original aliasing. */
+        void* act[D4R_ENGINE_NET_K_LAYERS] = {NULL};
+        for (uint32_t i = 0; i < layers && failure == NULL; ++i)
+        {
+            const D4rEngineNetKLayer* p = &d4r_engine_net_k_plan[i];
+            const uint32_t w = tw / p->divisor, h = th / p->divisor;
+            /* an encoder's out24 is the patch-merged 2x2 output, half the resolution of its input */
+            const uint32_t ow = i < 5 ? tw / (2 * p->divisor) : w, oh = i < 5 ? th / (2 * p->divisor) : h;
+            const int need = (i + 1 != layers ? 1 : 0) + (i < 5 ? 1 : 0);
+            if (net->owned_count + need > D4R_ENGINE_NET_OWNED)
+            {
+                failure = "activation buffers";
+                break;
+            }
+            /* dec0 writes the head straight into the caller's output buffer */
+            if (i + 1 != layers)
+            {
+                if (allocate(&act[i], (size_t)ow * oh * p->out24ch * 2 + 4096) != 0)
+                {
+                    failure = "activation buffers";
+                    break;
+                }
+                net->owned[net->owned_count++] = act[i];
+            }
+            if (i < 5)
+            {
+                if (allocate(&k_full[i], (size_t)w * h * p->c * 2 + 4096) != 0)
+                {
+                    failure = "activation buffers";
+                    break;
+                }
+                net->owned[net->owned_count++] = k_full[i];
+            }
+            layer_in[i] = i == 0 ? tok : act[i - 1];
+            layer_skip[i] = i >= 6 ? k_full[10 - i] : NULL;
+            layer_out[i] = i + 1 == layers ? result : act[i];
+        }
+    }
+    else if (failure == NULL)
+    {
+        /* skip1, merged1, skip2, merged2, tubeA, tubeB, dec2 */
+        static const uint32_t scale[7] = {1, 2, 2, 4, 4, 4, 2}, channels[7] = {64, 96, 96, 128, 128, 128, 96};
+        void* b[7] = {NULL};
+        for (int i = 0; i < 7 && failure == NULL; ++i)
+        {
+            if (net->owned_count >= D4R_ENGINE_NET_OWNED ||
+                allocate(&b[i], (size_t)(tw / scale[i]) * (th / scale[i]) * channels[i] + 4096) != 0)
+                failure = "activation buffers";
+            else
+                net->owned[net->owned_count++] = b[i];
+        }
+        /* tokens -> enc1 -> enc2 -> six tube blocks (ping-pong) -> dec2 -> dec1 */
+        const int in_i[10] = {0, 1, 3, 4, 5, 4, 5, 4, 5, 6};
+        const int skip_i[10] = {-1, -1, -1, -1, -1, -1, -1, -1, 2, 0};
+        const int out_i[10] = {0, 2, 4, 5, 4, 5, 4, 5, 6, -1};
+        const int merged_i[10] = {1, 3, -1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < 10; ++i)
+        {
+            layer_in[i] = in_i[i] < 0 ? NULL : b[in_i[i]];
+            layer_skip[i] = skip_i[i] < 0 ? NULL : b[skip_i[i]];
+            layer_out[i] = out_i[i] < 0 ? result : b[out_i[i]];
+            layer_merged[i] = merged_i[i] < 0 ? NULL : b[merged_i[i]];
+        }
+        layer_in[0] = tok; /* the engine's token buffer feeds the first layer, not a scratch buffer */
+    }
+    for (uint32_t i = 0; i < count && failure == NULL; ++i)
+    {
+        const uint8_t* e = file + 16 + 64 * i;
+        char name[33] = {0};
+        int32_t sx, sy;
+        uint32_t div;
+        uint64_t at, bytes;
+        memcpy(name, e, 32);
+        memcpy(&sx, e + 32, 4);
+        memcpy(&sy, e + 36, 4);
+        memcpy(&div, e + 40, 4);
+        memcpy(&at, e + 48, 8);
+        memcpy(&bytes, e + 56, 8);
+        if (div == 0 || at > file_bytes || bytes > file_bytes - at)
+        {
+            failure = "layer table";
+            break;
+        }
+        if (k_preset)
+        {
+            char expect[48];
+            snprintf(expect, sizeof(expect), "dltss_pwin_%s_layer", d4r_engine_net_k_plan[i].name);
+            if (strcmp(name, expect) != 0)
+            {
+                failure = "layer table";
+                break;
+            }
+        }
+        int k = 0;
+        while (k < module_count && strcmp(kern[k].name, name) != 0)
+            ++k;
+        if (k == module_count)
+        {
+            const D4rEngineNetCode* code = NULL;
+            for (uint32_t c = 0; c < code_count; ++c)
+                if (codes[c].name != NULL && strcmp(codes[c].name, name) == 0)
+                    code = &codes[c];
+            if (code == NULL || k == D4R_ENGINE_NET_MODULES || load(&net->modules[k], code->data) != 0)
+            {
+                failure = "kernel code object";
+                break;
+            }
+            ++net->module_count;
+            ++module_count;
+            strcpy(kern[k].name, name);
+            kern[k].module = net->modules[k];
+            char prep_name[48];
+            snprintf(prep_name, sizeof(prep_name), "%s_prep", name);
+            if (function(&kern[k].main, kern[k].module, name) != 0)
+            {
+                failure = "kernel entry point";
+                break;
+            }
+            if (function(&kern[k].prep, kern[k].module, prep_name) != 0)
+                kern[k].prep = NULL;
+            kern[k].prep_blocks = d4r_engine_net_global(kern[k].module, "d4r_prep_blocks", 0);
+            kern[k].block_z = d4r_engine_net_global(kern[k].module, "d4r_block_z", 4);
+            kern[k].grid_x = d4r_engine_net_global(kern[k].module, "d4r_grid_x", 0);
+            kern[k].grid_y = d4r_engine_net_global(kern[k].module, "d4r_grid_y", 0);
+            if (kern[k].block_z == 0)
+                kern[k].block_z = 4;
+            /* one prepared weight image per weights pointer while a module's slots last: the tube needs six */
+            if ((kern[k].prep != NULL && kern[k].prep_blocks == 0) ||
+                (strstr(name, "tube") != NULL && d4r_engine_net_global(kern[k].module, "d4r_prep_key_slots", 0) < 6))
+            {
+                failure = "weight image slots";
+                break;
+            }
+            /* the deep layers' code objects also carry their post phases; their grids are compile-time */
+            for (int j = 1; j <= 8; ++j)
+            {
+                char tag[48], sym[48];
+                snprintf(tag, sizeof(tag), "%s_post%d", name, j);
+                if (function(&kern[k].post[kern[k].post_count], kern[k].module, tag) != 0)
+                    break;
+                snprintf(sym, sizeof(sym), "d4r_post%d_grid_x", j);
+                kern[k].post_gx[kern[k].post_count] = d4r_engine_net_global(kern[k].module, sym, 0);
+                snprintf(sym, sizeof(sym), "d4r_post%d_grid_y", j);
+                kern[k].post_gy[kern[k].post_count] = d4r_engine_net_global(kern[k].module, sym, 0);
+                snprintf(sym, sizeof(sym), "d4r_post%d_block_x", j);
+                kern[k].post_bx[kern[k].post_count] = d4r_engine_net_global(kern[k].module, sym, 0);
+                snprintf(sym, sizeof(sym), "d4r_post%d_block_y", j);
+                kern[k].post_by[kern[k].post_count] = d4r_engine_net_global(kern[k].module, sym, 0);
+                snprintf(sym, sizeof(sym), "d4r_post%d_block_z", j);
+                kern[k].post_bz[kern[k].post_count] = d4r_engine_net_global(kern[k].module, sym, 0);
+                if (kern[k].post_gx[kern[k].post_count] == 0)
+                    kern[k].post_gx[kern[k].post_count] = kern[k].grid_x;
+                if (kern[k].post_bx[kern[k].post_count] == 0)
+                    kern[k].post_bx[kern[k].post_count] = 32;
+                if (kern[k].post_by[kern[k].post_count] == 0)
+                    kern[k].post_by[kern[k].post_count] = 1;
+                if (kern[k].post_bz[kern[k].post_count] == 0)
+                    kern[k].post_bz[kern[k].post_count] = 1;
+                ++kern[k].post_count;
+            }
+        }
+        void* w = NULL;
+        if (net->owned_count >= D4R_ENGINE_NET_OWNED || allocate(&w, bytes + 4096) != 0)
+        {
+            failure = "weights";
+            break;
+        }
+        net->owned[net->owned_count++] = w;
+        if (to_device(w, file + at, bytes) != 0)
+        {
+            failure = "weights upload";
+            break;
+        }
+        weights[i] = w;
+        divisor[i] = div;
+        shift_sx[i] = sx;
+        shift_sy[i] = sy;
+        layer_kernel[i] = (uint32_t)k;
+    }
+    /* The frozen parameter block of every layer at phase/frame 0; the graph loop copies and shifts it. */
+    for (uint32_t i = 0; i < count && failure == NULL; ++i)
+    {
+        if (k_preset)
+        {
+            D4rEngineNetPwinParams* p = &layer_params[i].k;
+            p->W = (int32_t)(tw / divisor[i]);
+            p->H = (int32_t)(th / divisor[i]);
+            p->in = (uint8_t*)layer_in[i];
+            p->skip = (uint8_t*)layer_skip[i];
+            p->out24 = (uint8_t*)layer_out[i];
+            p->out32 = i < 5 ? (uint8_t*)k_full[i] : NULL;
+            p->w = (uint8_t*)weights[i];
+            d4r_engine_net_k_shift(d4r_engine_net_k_plan[i].role, 0, &p->sx, &p->sy);
+        }
+        else
+        {
+            D4rEngineNetParams* p = &layer_params[i].m;
+            p->w = weights[i];
+            p->sx = shift_sx[i];
+            p->sy = shift_sy[i];
+            p->tw = (int32_t)(tw / divisor[i]);
+            p->th = (int32_t)(th / divisor[i]);
+            p->in = layer_in[i];
+            p->skip = layer_skip[i];
+            p->out = layer_out[i];
+            p->merged = layer_merged[i];
+        }
+    }
+    /* Every frame of the alignment cycle has its own immutable graph: frozen grids, blocks and arguments,
+       the K bottleneck's post phases included. No per-frame allocation or parameter copy. */
+    for (uint32_t phase = 0; phase < net->graphs && failure == NULL; ++phase)
+    {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < count && failure == NULL; ++i)
+        {
+            const D4rEngineNetKernel* kk = &kern[layer_kernel[i]];
+            if (n >= D4R_ENGINE_NET_NODES)
+            {
+                failure = "too many nodes";
+                break;
+            }
+            D4rEngineNetNode* node = &net->nodes[phase][n++];
+            node->function = kk->main;
+            node->bx = 32;
+            node->by = 1;
+            node->bz = kk->block_z;
+            node->params = layer_params[i];
+            if (k_preset)
+            {
+                D4rEngineNetPwinParams* p = &node->params.k;
+                d4r_engine_net_k_shift(d4r_engine_net_k_plan[i].role, phase, &p->sx, &p->sy);
+                node->gx = kk->post_count != 0 ? (kk->grid_x != 0 ? kk->grid_x : 32)
+                                               : (uint32_t)(p->W + p->sx + 7) / 8;
+                node->gy = kk->post_count != 0 ? (kk->grid_y != 0 ? kk->grid_y : 1)
+                                               : (uint32_t)(p->H + p->sy + 7) / 8;
+                for (int j = 0; j < kk->post_count && failure == NULL; ++j)
+                {
+                    if (n >= D4R_ENGINE_NET_NODES)
+                    {
+                        failure = "too many nodes";
+                        break;
+                    }
+                    D4rEngineNetNode* post = &net->nodes[phase][n++];
+                    post->function = kk->post[j];
+                    post->params = node->params; /* the same PwinParams block */
+                    post->gx = kk->post_gx[j];
+                    post->gy = kk->post_gy[j] != 0 ? kk->post_gy[j] : 1;
+                    post->bx = kk->post_bx[j];
+                    post->by = kk->post_by[j];
+                    post->bz = kk->post_bz[j];
+                }
+            }
+            else
+            {
+                D4rEngineNetParams* p = &node->params.m;
+                /* NGX alternates horizontal window alignment every evaluation, including reset evaluations. */
+                p->sx = shift_sx[i] ^ (int32_t)(phase * 2);
+                node->gx = (uint32_t)(p->tw + p->sx + 7) / 8;
+                node->gy = (uint32_t)(p->th + shift_sy[i] + 7) / 8;
+            }
+        }
+        net->node_count[phase] = n;
+    }
+    /* The weights never change: every layer's weight image is prepared once, here, and found by its pointer.
+       A shared code object (the M tube) gets one preparation per layer, i.e. per distinct weights pointer. */
+    for (uint32_t i = 0; i < count && failure == NULL; ++i)
+    {
+        const D4rEngineNetKernel* kk = &kern[layer_kernel[i]];
+        if (kk->prep == NULL)
+            continue;
+        if (net->prep_count >= D4R_ENGINE_NET_LAYERS)
+        {
+            failure = "weight image slots";
+            break;
+        }
+        D4rEngineNetNode* prep = &net->preps[net->prep_count++];
+        prep->function = kk->prep;
+        prep->gx = kk->prep_blocks;
+        prep->bx = 128;
+        prep->by = 1;
+        prep->bz = 1;
+        prep->params = layer_params[i];
+    }
+    for (uint32_t i = 0; i < net->prep_count && failure == NULL; ++i)
+    {
+        D4rEngineNetNode* prep = &net->preps[i];
+        void* args[] = {&prep->params};
+        if (launch(prep->function, prep->gx, 1, 1, prep->bx, prep->by, prep->bz, 0, net->stream, args, NULL) != 0)
+            failure = "weight preparation";
+    }
+    if (failure == NULL && synchronize(net->stream) != 0)
+        failure = "weight preparation";
+    if (failure == NULL && d4r_engine_net_capture(net, launch) != CUDA_SUCCESS)
+        failure = "network graph capture";
+    if (failure == NULL)
+    {
+        HIP_EVENT_RECORD_FN upload = (HIP_EVENT_RECORD_FN)hip_symbol("hipGraphUpload");
+        if (upload == NULL)
+            failure = "network graph upload";
+        for (uint32_t phase = 0; phase < net->graphs && failure == NULL; ++phase)
+            if (upload(net->executable[phase], net->stream) != 0)
+                failure = "network graph upload";
+        if (failure == NULL && synchronize(net->stream) != 0)
+            failure = "network graph upload";
+    }
+    if (failure != NULL)
+    {
+        tracef("d4rEngineNetCreate: %s failed", failure);
+        d4rEngineNetDestroy(net);
+        return CUDA_ERROR_UNKNOWN;
+    }
+    *handle = net;
+    tracef("d4rEngineNetCreate: preset %s network on native HIP layers, %ux%u tokens, %u graphs", k_preset ? "K" : "M",
+           tw, th, net->graphs);
+    return CUDA_SUCCESS;
+}
+
+/* All writers (including cancellation retirement in the shim) use this lock. The callback runs on a native
+   HIP host thread: no Wine/PE entry points and no HIP APIs are called from it. */
+int WINAPI d4rEngineNetSignalTimeline(void* handle, uint64_t value)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    if (net == NULL || net->timeline_device == NULL)
+        return -13; /* VK_ERROR_UNKNOWN */
+    pthread_mutex_lock(&net->timeline_lock);
+    int result = 0;
+    if (value > net->timeline_value)
+    {
+        D4rVkSemaphoreSignalInfo info = {1000207005, NULL, net->timeline_semaphore, value};
+        result = net->signal_timeline(net->timeline_device, &info);
+        if (result == 0)
+            net->timeline_value = value;
+    }
+    pthread_mutex_unlock(&net->timeline_lock);
+    return result;
+}
+
+static void d4r_engine_net_completed(void* data)
+{
+    D4rEngineNetSignal* signal = (D4rEngineNetSignal*)data;
+    const int result = d4rEngineNetSignalTimeline(signal->net, signal->value);
+    if (result != 0)
+        __atomic_store_n(&signal->net->timeline_error, result, __ATOMIC_RELEASE);
+    __atomic_store_n(&signal->busy, 0, __ATOMIC_RELEASE);
+}
+
+CUresult WINAPI d4rEngineNetSetTimeline(void* handle, void* client_device, uint64_t client_semaphore)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    if (net == NULL || net->timeline_device != NULL || client_device == NULL || client_semaphore == 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    const uint64_t* device_object = (const uint64_t*)(uintptr_t)((const uint64_t*)client_device)[1];
+    const uint64_t* semaphore_object = (const uint64_t*)(uintptr_t)client_semaphore;
+    if (device_object == NULL || device_object[1] != (uint64_t)(uintptr_t)client_device ||
+        semaphore_object[1] != client_semaphore)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    void* host_device = (void*)(uintptr_t)device_object[0];
+    void* vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+    VK_GET_DEVICE_PROC_ADDR_FN get_proc =
+        vulkan != NULL ? (VK_GET_DEVICE_PROC_ADDR_FN)dlsym(vulkan, "vkGetDeviceProcAddr") : NULL;
+    HIP_LAUNCH_HOST_FN launch_host = (HIP_LAUNCH_HOST_FN)hip_symbol("hipLaunchHostFunc");
+    if (get_proc == NULL || launch_host == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    VK_SIGNAL_SEMAPHORE_FN signal = (VK_SIGNAL_SEMAPHORE_FN)get_proc(host_device, "vkSignalSemaphore");
+    VK_GET_SEMAPHORE_COUNTER_FN counter = (VK_GET_SEMAPHORE_COUNTER_FN)get_proc(host_device, "vkGetSemaphoreCounterValue");
+    uint64_t value = 0;
+    if (signal == NULL || counter == NULL || counter(host_device, semaphore_object[0], &value) != 0 ||
+        pthread_mutex_init(&net->timeline_lock, NULL) != 0)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    net->timeline_device = host_device;
+    net->timeline_semaphore = semaphore_object[0];
+    net->timeline_value = value;
+    net->signal_timeline = signal;
+    net->launch_host = launch_host;
+    for (unsigned i = 0; i < D4R_ENGINE_NET_SIGNALS; ++i)
+        net->signals[i].net = net;
+    return CUDA_SUCCESS;
+}
+
+/* Reserve before queuing this frame's input wait. A burst of discarded lists can leave callbacks in flight;
+   draining the previous work is safe here, but would deadlock on a newly queued wait for an unsubmitted list. */
+static D4rEngineNetSignal* d4r_engine_net_signal_slot(D4rEngineNet* net, uint32_t value)
+{
+    if (net->timeline_device == NULL || value == 0)
+        return NULL;
+    for (unsigned pass = 0; pass < 2; ++pass)
+    {
+        for (unsigned i = 0; i < D4R_ENGINE_NET_SIGNALS; ++i)
+        {
+            int free = 0;
+            if (__atomic_compare_exchange_n(&net->signals[i].busy, &free, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            {
+                net->signals[i].value = value;
+                return &net->signals[i];
+            }
+        }
+        HIP_P_FN synchronize = (HIP_P_FN)hip_symbol("hipStreamSynchronize");
+        if (pass != 0 || synchronize == NULL || synchronize(net->stream) != 0)
+            break;
+    }
+    return NULL;
+}
+
+static CUresult d4r_engine_net_queue(D4rEngineNet* net, HIP_EVENT_RECORD_FN graph_launch, HIP_EVENT_RECORD_FN record,
+                                    D4rEngineNetSignal* signal)
+{
+    CUresult result = CUDA_ERROR_UNKNOWN;
+    if (record(net->start, net->stream) == 0)
+    {
+        /* One evaluation advances the alignment cycle by one frame; a reset does not restart it. */
+        result = graph_launch(net->executable[net->frame % net->graphs], net->stream) == 0
+                     ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+        if (result == CUDA_SUCCESS)
+        {
+            ++net->frame;
+            if (record(net->stop, net->stream) != 0 ||
+                net->launch_host(net->stream, d4r_engine_net_completed, signal) != 0)
+                result = CUDA_ERROR_UNKNOWN;
+        }
+    }
+    if (result != CUDA_SUCCESS)
+        __atomic_store_n(&signal->busy, 0, __ATOMIC_RELEASE);
+    return result;
+}
+
+CUresult WINAPI d4rEngineNetLaunch(void* handle, uint32_t value)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    HIP_EVENT_RECORD_FN graph_launch = (HIP_EVENT_RECORD_FN)hip_symbol("hipGraphLaunch");
+    HIP_EVENT_RECORD_FN record = (HIP_EVENT_RECORD_FN)hip_symbol("hipEventRecord");
+    if (net == NULL || graph_launch == NULL || record == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    D4rEngineNetSignal* signal = d4r_engine_net_signal_slot(net, value);
+    if (signal == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    return d4r_engine_net_queue(net, graph_launch, record, signal);
+}
+
+/* Check HIP's wait-value capability and a round trip on this imported buffer before enabling LaunchAt.
+   Release the probe wait before querying its event: HIP may flush the blocked queue during a query.
+   The test leaves the word at 0; frame values then increase monotonically and use a Gte wait. */
+int WINAPI d4rEngineNetInputWaitReady(void* handle, CUdeviceptr sync, uint32_t* host)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    HIP_STREAM_WAIT_VALUE32_FN wait = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
+    HIP_STREAM_WRITE_VALUE32_FN write = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
+    HIP_EVENT_RECORD_FN record = (HIP_EVENT_RECORD_FN)hip_symbol("hipEventRecord");
+    HIP_P_FN query = (HIP_P_FN)hip_symbol("hipEventQuery");
+    HIP_PP_FN event_create = (HIP_PP_FN)hip_symbol("hipEventCreate");
+    HIP_P_FN event_destroy = (HIP_P_FN)hip_symbol("hipEventDestroy");
+    HIP_P_FN synchronize = (HIP_P_FN)hip_symbol("hipStreamSynchronize");
+    HIP_MEMCPY_FN to_host = (HIP_MEMCPY_FN)hip_symbol("hipMemcpyDtoH");
+    typedef int (*GET_ATTRIBUTE_FN)(int*, int, int);
+    typedef int (*GET_DEVICE_FN)(int*);
+    GET_ATTRIBUTE_FN attribute = (GET_ATTRIBUTE_FN)hip_symbol("hipDeviceGetAttribute");
+    GET_DEVICE_FN device = (GET_DEVICE_FN)hip_symbol("hipGetDevice");
+    int current = 0, supported = 0;
+    if (attribute == NULL || device == NULL || device(&current) != 0 ||
+        attribute(&supported, 10013 /* hipDeviceAttributeCanUseStreamWaitValue */, current) != 0 || !supported)
+        return 0;
+    if (net == NULL || sync == 0 || host == NULL || wait == NULL || write == NULL || record == NULL || query == NULL ||
+        event_create == NULL || event_destroy == NULL || synchronize == NULL || to_host == NULL)
+        return 0;
+    /* Set for the probe's own releases; cleared again below unless the probe proves GPU-side waits work. */
+    net->input_wait = sync;
+    net->input_wait_host = host;
+    void* probe = NULL;
+    if (event_create(&probe) != 0)
+    {
+        net->input_wait = 0;
+        net->input_wait_host = NULL;
+        return 0;
+    }
+    /* HIP lazily initializes queue/event storage. Do that before blocking a queue: allocating it after the
+       wait has been submitted can itself synchronize against the blocked queue. */
+    if (d4rEngineNetReleaseInput(net, 0) != CUDA_SUCCESS || record(probe, net->stream) != 0 ||
+        record(net->start, net->stream) != 0 || record(net->stop, net->stream) != 0 ||
+        synchronize(net->stream) != 0)
+    {
+        event_destroy(probe);
+        net->input_wait = 0;
+        net->input_wait_host = NULL;
+        return 0;
+    }
+    int ready = 0, wedged = 0;
+    if (write(net->stream, (void*)(uintptr_t)sync, 0, 0) == 0 && synchronize(net->stream) == 0 &&
+        wait(net->stream, (void*)(uintptr_t)sync, 1, 0 /* hipStreamWaitValueGte */, 0xffffffffu) == 0)
+    {
+        /* The wait is queued now: it must be satisfied before the stream is synchronized again. */
+        const int recorded = record(probe, net->stream);
+        int state = 600; /* hipErrorNotReady */
+        if (d4rEngineNetReleaseInput(net, 1) != CUDA_SUCCESS)
+            wedged = 1;
+        else if (recorded == 0)
+        {
+            for (int i = 0; i < 4000 && state == 600; ++i)
+            {
+                usleep(50);
+                state = query(probe);
+            }
+            if (state == 600)
+                wedged = 1;
+            else
+                ready = state == 0;
+        }
+        if (!wedged)
+        {
+            /* Back to 0 for the frames' own values, with no wait left queued. */
+            if (write(net->stream, (void*)(uintptr_t)sync, 0, 0) != 0 || synchronize(net->stream) != 0)
+                ready = 0;
+            if (ready != 0)
+            {
+                uint32_t value = 0;
+                if (to_host(&value, (void*)(uintptr_t)sync, 4) != 0 || value != 0)
+                    ready = 0;
+            }
+        }
+    }
+    event_destroy(probe);
+    if (wedged)
+    {
+        /* Destroy releases it (d4rEngineNetDestroy); the caller must not use this network. */
+        net->input_wait = sync;
+        net->input_wait_value = 1;
+    }
+    else if (!ready)
+    {
+        /* d4rEngineNetLaunchAt refuses without a proven wait. */
+        net->input_wait = 0;
+        net->input_wait_host = NULL;
+    }
+    tracef("d4rEngineNetInputWaitReady(%p): %s", (void*)(uintptr_t)sync,
+           wedged ? "the stream is stuck" : ready ? "GPU-side waits" : "not supported");
+    return wedged ? -1 : ready;
+}
+
+/* Queues a wait for `value` (the frame number the engine's front fills into the sync buffer) before this
+   evaluation's graph, so the network starts on the GPU the moment its inputs are complete. */
+CUresult WINAPI d4rEngineNetLaunchAt(void* handle, uint32_t value)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    HIP_EVENT_RECORD_FN graph_launch = (HIP_EVENT_RECORD_FN)hip_symbol("hipGraphLaunch");
+    HIP_EVENT_RECORD_FN record = (HIP_EVENT_RECORD_FN)hip_symbol("hipEventRecord");
+    HIP_STREAM_WAIT_VALUE32_FN wait = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
+    if (net == NULL || graph_launch == NULL || record == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (net->input_wait == 0 || wait == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    D4rEngineNetSignal* signal = d4r_engine_net_signal_slot(net, value);
+    if (signal == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (wait(net->stream, (void*)(uintptr_t)net->input_wait, value, 0 /* hipStreamWaitValueGte */, 0xffffffffu) != 0)
+    {
+        __atomic_store_n(&signal->busy, 0, __ATOMIC_RELEASE);
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    net->input_wait_value = value;
+    // Keep the queued wait tracked even if a later event/kernel enqueue fails; destroy must release it.
+    return d4r_engine_net_queue(net, graph_launch, record, signal);
+}
+
+/* 1: the launched layers have finished; 0: still running; negative: error */
+int WINAPI d4rEngineNetDone(void* handle, float* milliseconds)
+{
+    D4rEngineNet* net = (D4rEngineNet*)handle;
+    HIP_P_FN query = (HIP_P_FN)hip_symbol("hipEventQuery");
+    HIP_EVENT_ELAPSED_FN elapsed = (HIP_EVENT_ELAPSED_FN)hip_symbol("hipEventElapsedTime");
+    if (net == NULL || query == NULL || __atomic_load_n(&net->timeline_error, __ATOMIC_ACQUIRE) != 0)
+        return -1;
+    const int result = query(net->stop);
+    if (result == 600 /* hipErrorNotReady */)
+        return 0;
+    if (result != 0)
+        return -1;
+    /* The layers ran, so the input wait (if any) is behind us. */
+    net->input_wait_value = 0;
+    if (milliseconds != NULL && (elapsed == NULL || elapsed(milliseconds, net->start, net->stop) != 0))
+        *milliseconds = 0.0f;
+    return 1;
+}
+
 /* d4r: asynchronous 2D copy between device memory and arrays on the null stream (ZLUDA forwards
    CUarray handles as hipArray_t and the null CUstream as HIP's null stream; ZLUDA itself has no
    cuMemcpy2DAsync). The CUDA and HIP descriptors share their layout; only the memory type codes
@@ -3212,11 +4164,6 @@ CUresult WINAPI d4rMemcpy2DAsync(const D4rMemcpy2D* copy, CUstream stream)
 /* d4r: GPU-side handoff from the game's queue. The null stream (where NGX runs) waits until the u32 at
    `pointer` (device memory the game's queue writes with vkCmdFillBuffer) is >= value. d4rWriteValue32
    writes such a value from a separate non-blocking stream (initialisation, or releasing a stuck wait). */
-typedef int (*HIP_STREAM_WAIT_VALUE32_FN)(void*, void*, uint32_t, unsigned int, uint32_t);
-typedef int (*HIP_STREAM_WRITE_VALUE32_FN)(void*, void*, uint32_t, unsigned int);
-typedef int (*HIP_STREAM_CREATE_WITH_FLAGS_FN)(void**, unsigned int);
-typedef int (*HIP_STREAM_SYNCHRONIZE_FN)(void*);
-
 CUresult WINAPI d4rStreamWaitValue32(CUdeviceptr pointer, uint32_t value)
 {
     static HIP_STREAM_WAIT_VALUE32_FN function;

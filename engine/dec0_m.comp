@@ -1,0 +1,147 @@
+#version 460
+// d4r engine, preset M: the stage after the network. Expands the last decoder's tokens (64 channels, FP8) to 17
+// values per render pixel (one matrix product per 4x4-token block) and turns them into the reconstruction's
+// per-pixel inputs: a recurrent four-channel feature blended with its reprojected history, three gate values,
+// three softmax weights and a 2x2 covariance. See M_NOTES.md.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_GOOGLE_include_directive : require
+#include "round_half.glsl"
+#include "normalized_store.glsl"
+#include "activation_m.glsl"
+layout(local_size_x = 32) in;       // one wave: 16 tokens = 8x8 render pixels, two pixels per lane
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 size;             // render size
+    int tokW; uint reset;
+    vec2 rndOffs;           // jitter
+    vec2 rnd2hi;            // render pixels -> pixels of the 3x image (the motion vectors' unit)
+    vec2 hiSize;
+    vec2 histOffs;          // added to the history uv, in render pixels
+    float sigma, rho;
+    vec2 renderInv;         // host-rounded texture coordinates, distinct from GPU rcp.approx offsets
+} p;
+layout(set = 0, binding = 1) uniform sampler2D motionTex;      // texelFetch
+layout(set = 0, binding = 2) uniform sampler2D featTex;        // the previous feature, bilinear
+layout(set = 0, binding = 3, rgba8_snorm) uniform writeonly image2D featOut;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D gateOut;
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D mixOut;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D covOut;
+layout(set = 0, binding = 7, std430) readonly buffer Tokens { floate4m3_t a[]; } tok;      // [tokH][tokW][64]
+layout(set = 0, binding = 8, std430) readonly buffer W8 { floate4m3_t w[]; } w8;           // [64][80]: 20 columns per sub-position
+layout(set = 0, binding = 9, std430) readonly buffer W16 { f16vec4 w[]; } w16;             // bias, 16 equal rows of 80
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define HACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define RM gl_CooperativeMatrixLayoutRowMajor
+shared floate4m3_t TK[16 * 72];
+shared f16vec4 EO[16 * 88 / 4];
+float16_t q8(float16_t v) { return float16_t(floate4m3_t(clamp(v, float16_t(-448.0), float16_t(448.0)))); }
+f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
+// NVIDIA's expansion GEMM is chained m16n8k32 mma with an f16 accumulator: the bias is the initial C and every
+// 32 products are summed with one f16 rounding (swin_model.py mma_chain; the same k32 step the native kernels'
+// SWIN_EXACT build implements). K32_ROUND reproduces that: after each pair of k16 cooperative products the
+// accumulator is rounded to f16 through the shared EO region (ROUND_HALF_STORE).
+#ifndef K32_ROUND
+#define K32_ROUND 1
+#endif
+#if K32_ROUND
+#define R32(m, column) ROUND_HALF_STORE(m, EO, (column) * 4u, 22u)
+#else
+#define R32(m, column)
+#endif
+#ifndef PLANES
+#define PLANES 0
+#endif
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;
+    const ivec2 t0 = 4 * ivec2(gl_WorkGroupID.xy);
+#if PLANES
+    // NGX's layout, two planes of 32 channels (the HIP network's output); the dispatch covers the token grid
+    const uint src = (hf * 16u * gl_NumWorkGroups.x * gl_NumWorkGroups.y + uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u))) * 32u;
+#else
+    const uint src = uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u)) * 64u + hf * 32u;
+#endif
+    for (uint c = 0u; c < 32u; ++c) TK[row * 72u + hf * 32u + c] = tok.a[src + c];
+    memoryBarrierShared(); barrier();
+    // Share each activation tile across three output tiles, then the remaining two.
+    // Five live accumulators cost more registers than the saved loads on gfx1201.
+    {
+        HACC b0; coopMatLoad(b0, w16.w, 0u, 20u, RM);
+        ACC a0 = ACC(b0);
+        HACC b1; coopMatLoad(b1, w16.w, 4u, 20u, RM);
+        ACC a1 = ACC(b1);
+        HACC b2; coopMatLoad(b2, w16.w, 8u, 20u, RM);
+        ACC a2 = ACC(b2);
+        for (uint kt = 0u; kt < 4u; ++kt)
+        {
+            A8 a; coopMatLoad(a, TK, kt * 16u, 72u, RM);
+            B8 w0; coopMatLoad(w0, w8.w, kt * 16u * 80u, 80u, RM);
+            a0 = coopMatMulAdd(a, w0, a0);
+            B8 w1; coopMatLoad(w1, w8.w, kt * 16u * 80u + 16u, 80u, RM);
+            a1 = coopMatMulAdd(a, w1, a1);
+            B8 w2; coopMatLoad(w2, w8.w, kt * 16u * 80u + 32u, 80u, RM);
+            a2 = coopMatMulAdd(a, w2, a2);
+            if ((kt & 1u) != 0u) { R32(a0, 0u); R32(a1, 1u); R32(a2, 2u); }
+        }
+        coopMatStore(HACC(a0), EO, 0u, 22u, RM);
+        coopMatStore(HACC(a1), EO, 4u, 22u, RM);
+        coopMatStore(HACC(a2), EO, 8u, 22u, RM);
+    }
+    {
+        HACC b0; coopMatLoad(b0, w16.w, 12u, 20u, RM);
+        ACC a0 = ACC(b0);
+        HACC b1; coopMatLoad(b1, w16.w, 16u, 20u, RM);
+        ACC a1 = ACC(b1);
+        for (uint kt = 0u; kt < 4u; ++kt)
+        {
+            A8 a; coopMatLoad(a, TK, kt * 16u, 72u, RM);
+            B8 w0; coopMatLoad(w0, w8.w, kt * 16u * 80u + 48u, 80u, RM);
+            a0 = coopMatMulAdd(a, w0, a0);
+            B8 w1; coopMatLoad(w1, w8.w, kt * 16u * 80u + 64u, 80u, RM);
+            a1 = coopMatMulAdd(a, w1, a1);
+            if ((kt & 1u) != 0u) { R32(a0, 3u); R32(a1, 4u); }
+        }
+        coopMatStore(HACC(a0), EO, 12u, 22u, RM);
+        coopMatStore(HACC(a1), EO, 16u, 22u, RM);
+    }
+    memoryBarrierShared(); barrier();
+    for (uint pi = lane; pi < 64u; pi += 32u)
+    {
+        const uint px = pi & 7u, py = pi >> 3;
+        const ivec2 at = 2 * t0 + ivec2(px, py);
+        if (at.x >= p.size.x || at.y >= p.size.y) continue;
+        const uint e = (((py >> 1) * 4u + (px >> 1)) * 88u + ((py & 1u) * 2u + (px & 1u)) * 20u) / 4u;
+        const f16vec4 v0 = q8(EO[e]), v1 = q8(EO[e + 1u]), v2 = q8(EO[e + 2u]), v3 = q8(EO[e + 3u]), v4 = q8(EO[e + 4u]);
+        // values: 0, 1, 10 gates; 2..5 feature; 6..9 its blend; 11..13 mix; 14, 15, 16 covariance
+        imageStore(gateOut, at, unorm8Value(vec4(sig16(v0.x), sig16(v0.y), sig16(v2.z), 0.0)));
+        const vec3 m = vec3(v2.w, v3.x, v3.y), ex = exp2((m - max(max(m.x, m.y), m.z)) * 1.442695);
+        imageStore(mixOut, at, unorm8Value(vec4(ex * (1.0 / (ex.z + (ex.x + ex.y))), 0.0)));
+        const float a = p.sigma * float(sig16(v3.z));
+        const float b = p.sigma * float(sig16(v3.w));
+        const float t = float(v4.x) * p.rho, s = t * t, m_ = abs(t);
+        const float big = m_ >= 9.0109138 ? 1.0 : fma(1.0 / (exp2(m_ * 2.88539) + 1.0), -2.0, 1.0);
+        const float rho = m_ >= 0.6 ? (t < 0.0 ? -big : big) : fma(fma(fma(fma(fma(0.01573968306183815, s, -0.05230396240949631), s, 0.13315297663211823), s, -0.33332768082618713), s, 0.0), t, t);
+        imageStore(covOut, at, vec4(a * a, b * b, a * b * rho, 0.0));
+        precise vec2 f = fma(vec2(at) + 0.5 - p.rndOffs, p.rnd2hi, texelFetch(motionTex, at, 0).xy);
+        f16vec4 hist = f16vec4(0.0);
+        if (p.reset == 0u && all(greaterThanEqual(f, vec2(0.0))) && all(lessThanEqual(f, p.hiSize))) {
+            precise vec2 normalized = fma(f, 1.0 / p.hiSize, p.histOffs * (1.0 / vec2(p.size)));
+            precise vec2 texels = normalized * vec2(p.size);
+            precise vec2 uv = texels * p.renderInv;
+            hist = f16vec4(roundHalfValue(textureLod(featTex, uv, 0.0)));
+        }
+        // the recurrent feature: gated mix of its reprojected history and the new value. The reference's PTX
+        // computes it with four separate f16 operations (sub, mul, mul, add:
+        // build/gfx1201-perf/ptx/dlss-0162-00.ptx:1416-1447), so `precise` keeps the compiler from fusing a
+        // product into an fma and dropping a rounding.
+        const f16vec4 g = gate16(f16vec4(v1.z, v1.w, v2.x, v2.y));
+        precise f16vec4 blend = (f16vec4(1.0) - g) * hist + g * tan16(f16vec4(v0.z, v0.w, v1.x, v1.y));
+        imageStore(featOut, at, snorm8Value(vec4(blend)));
+    }
+}

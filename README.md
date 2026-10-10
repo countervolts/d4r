@@ -12,6 +12,13 @@ See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 The development shim also has [experimental native Vulkan support](docs/vulkan.md).
 
+A [standalone native inference engine](engine/README.md) runs presets K and M from weights extracted from your own
+`nvngx_dlss.dll`, with d4r's own Vulkan input, network and reconstruction shaders (optionally the native HIP network
+layers) and GPU-resident temporal history. The game shim uses the CUDA/ZLUDA path described below by default;
+`[Engine] Enabled = true` (`D4R_ENGINE=1`) records supported K and M evaluations with the native engine into the
+game's own command list instead and hands anything else to the CUDA path (see the engine's README). Presets E and L
+remain CUDA-only.
+
 > **Not affiliated with NVIDIA or AMD.**
 
 
@@ -160,6 +167,7 @@ Gameplay recordings of each DLSS model at the Quality, Performance and Ultra Per
 |---|---|
 | `tools/` | the NGX shim, the Wine CUDA bridge, a D3D12 DLSS harness, probes and kernel replay tools |
 | `kernels/` | native RDNA3/RDNA4 kernels (`k/` DLSS 4, `m/` DLSS 4.5, `tex/` texture-kernel parts, `common/` WMMA layouts), their build script, validation tools and numpy reference models |
+| `engine/` | standalone weight-based preset K and M inference runtime (Vulkan shaders, optional native HIP network), model packaging and full-frame validation |
 | `patches/` | ZLUDA and vkd3d-proton patches |
 | `scripts/` | build, install, launch and probe scripts |
 | `config/` | the default `d4r.ini` for the developer launcher |

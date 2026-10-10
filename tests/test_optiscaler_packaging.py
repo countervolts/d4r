@@ -88,7 +88,8 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs = Path(temporary) / 'inputs'
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
-            for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh'):
+            for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh',
+                         'check_redistributable.py'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
             for name in ('LICENSE', 'NOTICE'):
@@ -147,6 +148,11 @@ class OptiScalerConfigTests(unittest.TestCase):
                        D4R_BUNDLE_DLSS=str(dlss), D4R_BUNDLE_NGX=str(core), D4R_BUNDLE_TEX=str(inputs / 'tex'))
             version = (repo / 'packaging/VERSION').read_text().strip()
             configs = []
+            # A compiled engine model: only d4r's shaders and marker may reach a zip.
+            for name in ('input_k.spv', 'output_k.spv', 'exposure_k0.spv', 'exposure_k1.spv', 'enc0.spv',
+                         'direct_origins.bin', 'weights.bin', 'offsets.bin', 'lut.bin', 'hipnet.bin', 'model.json'):
+                fixture(inputs / 'engine' / name)
+            env['D4R_BUNDLE_ENGINE'] = str(inputs / 'engine')
             for bundled in ('1', '0'):
                 with self.subTest(bundled=bundled):
                     env['D4R_BUNDLE_NVIDIA'] = bundled
@@ -165,6 +171,10 @@ class OptiScalerConfigTests(unittest.TestCase):
                         self.assertNotIn('d4r/_nvngx.dll', archive.namelist())
                         self.assertEqual('d4r/ngx/_nvngx.dll' in archive.namelist(), bundled == '1')
                         self.assertEqual('d4r/nvngx_dlss.dll' in archive.namelist(), bundled == '1')
+                        engine = sorted(n for n in archive.namelist() if n.startswith('d4r/engine/'))
+                        self.assertEqual(engine, ['d4r/engine/k/' + n for n in (
+                            'README.txt', 'direct_origins.bin', 'enc0.spv', 'exposure_k0.spv', 'exposure_k1.spv',
+                            'input_k.spv', 'output_k.spv')])
                         self.assertEqual(archive.read('d4r/d4r-check.sh'), (ROOT / 'packaging/d4r-check.sh').read_bytes())
             self.assertEqual(configs[0], configs[1])
 

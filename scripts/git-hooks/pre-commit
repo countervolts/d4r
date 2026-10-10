@@ -1,0 +1,5 @@
+#!/bin/sh
+# Refuses commits that add NVIDIA's files, code built from NVIDIA's PTX or values read from DLSS
+# (scripts/check_redistributable.py; see NOTICE). Enable once per clone:
+#   git config core.hooksPath scripts/git-hooks
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_redistributable.py" tree --staged

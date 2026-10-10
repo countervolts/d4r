@@ -66,6 +66,9 @@
 #include "d4r_frame_completion.h"
 #include "d4r_win32_wait.h"
 #include "d4r_vkd3d_interop.h"
+#include "../engine/game.h"
+#include "../engine/game_m.h"
+#include "../engine/vk_dispatch.h"
 
 // --- NGX types (declared locally: the core's exports differ from the SDK) --
 
@@ -572,6 +575,17 @@ static void load_portable_config()
     // Direct output takes effect only while NGX runs the native output kernel (the bridge reports it); the
     // release cannot ship that kernel, which is built from NVIDIA's PTX.
     portable_set("D4R_SHIM_OUTPUT_DIRECT", ini_flag(ini, "interop", "DirectOutput", nativeOn) ? "1" : "0");
+
+    // [Engine]: d4r's own Vulkan inference for DLSS 4 (K); the model is looked up in d4r\engine\k
+    portable_set("D4R_ENGINE", ini_flag(ini, "engine", "Enabled", 0) ? "1" : "0");
+    if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
+        portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
+    // Network: preset M's network on the native HIP layers ("hip", the default when the model has them: faster) or
+    // on the engine's Vulkan shader ("vulkan")
+    if (const std::string network = ini_value(ini, "engine", "Network"); network == "hip" || network == "vulkan")
+        portable_set("D4R_ENGINE_NETWORK", network);
+    else if (!network.empty() && network != "auto")
+        g_portable.notes.push_back("[Engine] Network must be auto, hip or vulkan; using auto");
 
     portable_set("D4R_SHIM_WATERMARK", ini_flag(ini, "dlss", "ShowWatermark", 0) ? "1" : "0");
     const std::string dilation = ini_value(ini, "interop", "MotionVectorDilation");
@@ -1563,6 +1577,10 @@ struct VramBuffer
     CudaDevicePtr device = 0;
     void* external = nullptr;
     size_t bytes = 0;
+    void* mapped = nullptr;       // engine readiness word: CPU-coherent, kept until HIP and Vulkan retire
+    // What a pooled buffer can be reused as: 0 the interop transfer buffers (create_vram_buffer), 1 and 2 the
+    // engine's device-local and host-coherent storage buffers (create_engine_shared_buffer).
+    uint8_t kind = 0;
 };
 
 // A temporary image for colour or exposure format conversion.
@@ -1696,6 +1714,22 @@ struct OutputSlot
     std::atomic<uint32_t> producedFrame{0};
 };
 
+// Views and their D3D12 image owners survive every command list recorded by this feature.
+struct EngineBorrowedView
+{
+    ID3D12Resource* resource = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspect = 0;
+    VkImageUsageFlags usage = 0;
+    ~EngineBorrowedView()
+    {
+        if (view) d4r::vkTable.DestroyImageView(device, view, nullptr);
+        if (resource) resource->Release();
+    }
+};
+
 struct Feature
 {
     NgxHandle handle = {}; // returned to the caller
@@ -1708,7 +1742,9 @@ struct Feature
     unsigned int width = 0, height = 0, outWidth = 0, outHeight = 0;
     unsigned int cudaWidth = 0, cudaHeight = 0; // render size the NGX feature was created with (worker only)
     unsigned int refusedWidth = 0, refusedHeight = 0; // render size NGX would not create a feature for (worker only)
-    int quality = 0, flags = 0;
+    int quality = 0, flags = 0, subrects = 0;
+    std::array<unsigned int, 6> creationPresets{};
+    bool cudaCreationDeferred = false;
     unsigned int preset = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
     CudaEvent outputReadyEvent = nullptr;
@@ -1774,6 +1810,29 @@ struct Feature
     std::atomic<int> latestOutput{-1};
     std::atomic<uint32_t> completedFrames{0};
     uint32_t evaluatedFrames = 0; // worker only
+    // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
+    // lists retain `resources`, so this is destroyed only once the GPU has finished with them.
+    uint64_t engineViewBytes = 0;
+    bool engineViewBudgetReported = false;
+    std::vector<std::unique_ptr<EngineBorrowedView>> engineViews; // destroyed after engine descriptor pools
+    std::unique_ptr<d4r::GameUpscaler> engine;
+    std::unique_ptr<d4r::GameUpscalerM> engineM; // preset M
+    unsigned int engineMRenderWidth = 0, engineMRenderHeight = 0; // first evaluation's effective extent
+    // Preset M and preset K with the network on the native HIP layers ([Engine] Network): the buffers shared
+    // with HIP and the bridge's network. The game's list is split around the network, as for the CUDA backend's
+    // split frames. `engineHead` is the network's result (M's expansion / K's final store reads it).
+    VramBuffer engineTokens, engineHead;
+    // Input readiness for the HIP network: engineSync holds the frame number the engine's front writes (a Vulkan
+    // fill) and the network's stream waits for it on the GPU (engineGpuWait), so the layers start without a
+    // CPU round trip. engineWaitFrame: the frame a queued stream wait is waiting for (0: none).
+    VramBuffer engineSync;
+    std::atomic<bool> engineGpuWait{false};
+    bool engineNetTimeline = false; // native HIP callback and dropped-frame signals share one timeline lock
+    std::atomic<uint32_t> engineWaitFrame{0};
+    double engineNetWaitEmaUs = 0.0; // worker only: smoothed launch-to-completion wait, for adaptive polling
+    void* engineNet = nullptr;
+    bool engineRefused = false;
+    float engineJitter[2] = {0, 0}; // of the previous engine frame
     // Serializes picking the slot to present (game thread) against picking
     // the slot to overwrite (worker).
     std::mutex outputMutex;
@@ -2183,6 +2242,8 @@ struct VulkanInterop
     PFN_vkBindImageMemory bindImage = nullptr;
     PFN_vkAllocateMemory allocate = nullptr;
     PFN_vkFreeMemory free = nullptr;
+    PFN_vkMapMemory map = nullptr;
+    PFN_vkUnmapMemory unmap = nullptr;
     PFN_vkCmdPipelineBarrier barrier = nullptr;
     PFN_vkCmdCopyImageToBuffer copyImageToBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage copyBufferToImage = nullptr;
@@ -2262,6 +2323,8 @@ static void init_vram_interop()
     load(g_vk.bindImage, "vkBindImageMemory");
     load(g_vk.allocate, "vkAllocateMemory");
     load(g_vk.free, "vkFreeMemory");
+    load(g_vk.map, "vkMapMemory");
+    load(g_vk.unmap, "vkUnmapMemory");
     load(g_vk.barrier, "vkCmdPipelineBarrier");
     load(g_vk.copyImageToBuffer, "vkCmdCopyImageToBuffer");
     load(g_vk.copyBufferToImage, "vkCmdCopyBufferToImage");
@@ -2311,13 +2374,13 @@ static std::mutex g_vramPoolMutex;
 static std::vector<VramBuffer> g_vramPool;
 constexpr size_t kVramPoolLimit = 64;
 
-// The smallest pooled buffer that holds `bytes`.
-static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes)
+// The smallest pooled buffer of `kind` that holds `bytes`.
+static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes, uint8_t kind = 0)
 {
     std::lock_guard<std::mutex> lock(g_vramPoolMutex);
     auto best = g_vramPool.end();
     for (auto it = g_vramPool.begin(); it != g_vramPool.end(); ++it)
-        if (it->bytes >= bytes && (best == g_vramPool.end() || it->bytes < best->bytes))
+        if (it->kind == kind && it->bytes >= bytes && (best == g_vramPool.end() || it->bytes < best->bytes))
             best = it;
     if (best == g_vramPool.end())
         return false;
@@ -2387,6 +2450,8 @@ static void destroy_vram_buffer(VramBuffer& buffer)
                 logf("VRAM interop: freeing %zu-byte buffer: cuMemFree %d, release %d", buffer.bytes, freed, released);
             return released;
         });
+    if (buffer.mapped != nullptr)
+        g_vk.unmap(g_vk.device, buffer.memory);
     if (buffer.memory != VK_NULL_HANDLE)
         g_vk.free(g_vk.device, buffer.memory, nullptr);
     if (buffer.buffer != VK_NULL_HANDLE)
@@ -2804,16 +2869,15 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 // dropped frames advance the signal only past earlier retired frames. The
 // watchdog reports delays without releasing an unfinished producer.
 
+static VkResult signal_split_semaphore(Feature& feature, uint64_t value);
+
 static void release_split_frame(Feature* feature, uint32_t frame)
 {
     std::lock_guard<std::mutex> lock(feature->splitMutex);
     const uint64_t value = feature->splitCompletion.retire(frame);
     if (value <= feature->splitSignalled)
         return;
-    VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-    info.semaphore = feature->splitSemaphore;
-    info.value = value;
-    const VkResult result = g_vk.signalSemaphore(g_vk.device, &info);
+    const VkResult result = signal_split_semaphore(*feature, value);
     if (result == VK_SUCCESS)
         feature->splitSignalled = value;
     if (result != VK_SUCCESS)
@@ -4782,6 +4846,89 @@ static float get_float_or(void* parameters, const char* name, float fallback)
     return d4r_ngx_get_float(parameters, name, &value) == NGX_SUCCESS ? value : fallback;
 }
 
+static bool engine_requested();
+
+// Called on the game thread with the feature API lock held. All CUDA resources are made on its worker.
+// Vulkan-only K features retain just their creation settings until a frame actually needs CUDA.
+static NgxResult create_cuda_feature(Feature& feature)
+{
+    const char* presetNames[] = {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+                                "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+                                "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"};
+    const NgxResult result = g.worker.call([&]() -> NgxResult {
+        NgxResult allocation = g.ngx.allocateParameters(&feature.cudaParams);
+        if (allocation != NGX_SUCCESS)
+            return allocation;
+        void* p = feature.cudaParams;
+        d4r_ngx_set_uint(p, "Width", feature.width);
+        d4r_ngx_set_uint(p, "Height", feature.height);
+        d4r_ngx_set_uint(p, "OutWidth", feature.outWidth);
+        d4r_ngx_set_uint(p, "OutHeight", feature.outHeight);
+        d4r_ngx_set_int(p, "PerfQualityValue", feature.quality);
+        d4r_ngx_set_int(p, "DLSS.Feature.Create.Flags", feature.flags);
+        d4r_ngx_set_int(p, "DLSS.Enable.Output.Subrects", feature.subrects);
+        d4r_ngx_set_uint(p, "CreationNodeMask", 1);
+        d4r_ngx_set_uint(p, "VisibilityNodeMask", 1);
+        for (int index = 0; index < 6; ++index)
+            d4r_ngx_set_uint(p, presetNames[index], feature.creationPresets[index]);
+        if (g.cu.memAlloc(&feature.scratch, 64ull * 1024 * 1024) == 0)
+        {
+            d4r_ngx_set_void(p, "Scratch", reinterpret_cast<void*>(static_cast<uintptr_t>(feature.scratch)));
+            d4r_ngx_set_ull(p, "Scratch.SizeInBytes", 64ull * 1024 * 1024);
+        }
+        else
+            feature.scratch = 0;
+        const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+        if (created != NGX_SUCCESS)
+        {
+            if (feature.cudaHandle != nullptr) g.ngx.releaseFeature(feature.cudaHandle);
+            feature.cudaHandle = nullptr;
+            g.ngx.destroyParameters(feature.cudaParams); feature.cudaParams = nullptr;
+            if (feature.scratch != 0) g.cu.memFree(feature.scratch);
+            feature.scratch = 0;
+            return created;
+        }
+        feature.cudaWidth = feature.width;
+        feature.cudaHeight = feature.height;
+        if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
+            g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
+            g.cu.eventSynchronize != nullptr && g.cu.eventQuery != nullptr && g.cu.eventDestroy != nullptr)
+        {
+            // Explicit query/sleep waits avoid HIP's spinning event-sync path.
+            // Timing is unnecessary for this completion event.
+            constexpr unsigned int kBlockingSyncNoTiming = 0x1u | 0x2u;
+            const int eventResult = g.cu.eventCreate(&feature.outputReadyEvent, kBlockingSyncNoTiming);
+            if (eventResult != 0)
+            {
+                logf("blocking output wait unavailable (cuEventCreate %d); using context sync", eventResult);
+                feature.outputReadyEvent = nullptr;
+            }
+            else
+                logf("output event query/sleep wait enabled for this feature");
+        }
+        if (created == NGX_SUCCESS && profile_enabled() && g.cu.eventCreate != nullptr &&
+            g.cu.eventRecord != nullptr && g.cu.eventElapsedTime != nullptr && g.cu.eventDestroy != nullptr)
+        {
+            const int startResult = g.cu.eventCreate(&feature.profileStart, 0);
+            const int endResult = startResult == 0 ? g.cu.eventCreate(&feature.profileEnd, 0) : -1;
+            feature.profileEventsReady = startResult == 0 && endResult == 0;
+            if (!feature.profileEventsReady)
+            {
+                logf("D4R_PROFILE: CUDA event creation failed (%d, %d)", startResult, endResult);
+                if (feature.profileStart != nullptr)
+                    g.cu.eventDestroy(feature.profileStart);
+                if (feature.profileEnd != nullptr)
+                    g.cu.eventDestroy(feature.profileEnd);
+                feature.profileStart = feature.profileEnd = nullptr;
+            }
+        }
+        return created;
+    });
+    logf("NVSDK_NGX_CUDA_CreateFeature -> 0x%08x", result);
+    if (result == NGX_SUCCESS) feature.cudaCreationDeferred = false;
+    return result;
+}
+
 static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHandle** handle, bool nativeVulkan)
 {
     std::lock_guard<std::mutex> apiLock(g_featureApiMutex);
@@ -4848,67 +4995,13 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
     logf("NVSDK_NGX_D3D12_CreateFeature: %ux%u -> %ux%u quality=%d flags=0x%x subrects=%d preset=%u", feature->width,
          feature->height, feature->outWidth, feature->outHeight, quality, flags, subrects, presets[1]);
 
-    const NgxResult result = g.worker.call([&]() -> NgxResult {
-        NgxResult allocation = g.ngx.allocateParameters(&feature->cudaParams);
-        if (allocation != NGX_SUCCESS)
-            return allocation;
-        void* p = feature->cudaParams;
-        d4r_ngx_set_uint(p, "Width", feature->width);
-        d4r_ngx_set_uint(p, "Height", feature->height);
-        d4r_ngx_set_uint(p, "OutWidth", feature->outWidth);
-        d4r_ngx_set_uint(p, "OutHeight", feature->outHeight);
-        d4r_ngx_set_int(p, "PerfQualityValue", quality);
-        d4r_ngx_set_int(p, "DLSS.Feature.Create.Flags", flags);
-        d4r_ngx_set_int(p, "DLSS.Enable.Output.Subrects", subrects);
-        d4r_ngx_set_uint(p, "CreationNodeMask", 1);
-        d4r_ngx_set_uint(p, "VisibilityNodeMask", 1);
-        for (int index = 0; index < 6; ++index)
-            d4r_ngx_set_uint(p, presetNames[index], presets[index]);
-        if (g.cu.memAlloc(&feature->scratch, 64ull * 1024 * 1024) == 0)
-        {
-            d4r_ngx_set_void(p, "Scratch", reinterpret_cast<void*>(static_cast<uintptr_t>(feature->scratch)));
-            d4r_ngx_set_ull(p, "Scratch.SizeInBytes", 64ull * 1024 * 1024);
-        }
-        else
-            feature->scratch = 0;
-        const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature->cudaHandle);
-        feature->cudaWidth = feature->width;
-        feature->cudaHeight = feature->height;
-        if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
-            g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
-            g.cu.eventSynchronize != nullptr && g.cu.eventQuery != nullptr && g.cu.eventDestroy != nullptr)
-        {
-            // Explicit query/sleep waits avoid HIP's spinning event-sync path.
-            // Timing is unnecessary for this completion event.
-            constexpr unsigned int kBlockingSyncNoTiming = 0x1u | 0x2u;
-            const int eventResult = g.cu.eventCreate(&feature->outputReadyEvent, kBlockingSyncNoTiming);
-            if (eventResult != 0)
-            {
-                logf("blocking output wait unavailable (cuEventCreate %d); using context sync", eventResult);
-                feature->outputReadyEvent = nullptr;
-            }
-            else
-                logf("output event query/sleep wait enabled for this feature");
-        }
-        if (created == NGX_SUCCESS && profile_enabled() && g.cu.eventCreate != nullptr &&
-            g.cu.eventRecord != nullptr && g.cu.eventElapsedTime != nullptr && g.cu.eventDestroy != nullptr)
-        {
-            const int startResult = g.cu.eventCreate(&feature->profileStart, 0);
-            const int endResult = startResult == 0 ? g.cu.eventCreate(&feature->profileEnd, 0) : -1;
-            feature->profileEventsReady = startResult == 0 && endResult == 0;
-            if (!feature->profileEventsReady)
-            {
-                logf("D4R_PROFILE: CUDA event creation failed (%d, %d)", startResult, endResult);
-                if (feature->profileStart != nullptr)
-                    g.cu.eventDestroy(feature->profileStart);
-                if (feature->profileEnd != nullptr)
-                    g.cu.eventDestroy(feature->profileEnd);
-                feature->profileStart = feature->profileEnd = nullptr;
-            }
-        }
-        return created;
-    });
-    logf("NVSDK_NGX_CUDA_CreateFeature -> 0x%08x", result);
+    feature->subrects = subrects;
+    std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
+    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation.
+    feature->cudaCreationDeferred = !nativeVulkan && engine_requested() && feature->preset == 11;
+    const NgxResult result = feature->cudaCreationDeferred ? NGX_SUCCESS : create_cuda_feature(*feature);
+    if (feature->cudaCreationDeferred)
+        logf("engine backend: CUDA feature creation deferred until fallback is needed");
     if (result != NGX_SUCCESS)
     {
         release_feature(feature);
@@ -4959,6 +5052,1107 @@ static ID3D12Resource* get_resource(void* parameters, const char* name)
     if (d4r_ngx_get_void(parameters, name, &raw) == NGX_SUCCESS)
         return static_cast<ID3D12Resource*>(raw);
     return nullptr;
+}
+
+// --- Native engine backend (engine/): no NGX evaluation, CUDA, worker or frame split -------------
+// [Engine] Enabled in d4r.ini (D4R_ENGINE=1) runs presets K and M with d4r's own shaders inside the game's command
+// list. The models (the output of engine/compile_k.py / compile_m.py) are the folders engine\k, engine\k-ldr,
+// engine\m and engine\m-ldr next to this DLL, or [Engine] ModelDir (D4R_ENGINE_MODEL_DIR) and the
+// D4R_ENGINE_MODEL_{LDR,M,M_LDR}_DIR variables. Anything the engine does not cover falls back to the CUDA backend.
+struct EngineBackend
+{
+    std::once_flag vulkanOnce; // the game's device and the engine's Vulkan entry points, for every preset
+    std::once_flag once;
+    std::unique_ptr<d4r::Model> model; // shared by all features, kept for the life of the process
+    // The same network with NGX's LDR input and output stages, for games that do not set the HDR flag
+    // (engine\\k-ldr next to this DLL, or D4R_ENGINE_MODEL_LDR_DIR); loaded on first use.
+    std::once_flag ldrOnce;
+    std::unique_ptr<d4r::Model> modelLdr;
+    std::string directory, directoryLdr; // kept for the native HIP network's hipnet.bin and hip/*.hsaco
+};
+static EngineBackend g_engine;
+
+static bool engine_requested()
+{
+    static const bool requested = env_uint("D4R_ENGINE", 0) != 0;
+    return requested;
+}
+
+static void init_engine_vulkan()
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr ||
+        FAILED(g_vk.interop->GetVulkanHandles(&instance, &g_vk.physical, &g_vk.device)))
+    {
+        logf("engine backend: the vkd3d-proton interop interfaces are unavailable");
+        return;
+    }
+    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
+    PFN_vkGetInstanceProcAddr instanceProc = nullptr;
+    if (vulkan == nullptr || !load_export(vulkan, "vkGetInstanceProcAddr", instanceProc) ||
+        !d4r::loadVulkan(instanceProc, instance, g_vk.device))
+    {
+        logf("engine backend: Vulkan entry points are unavailable");
+        return;
+    }
+}
+
+static void init_engine_backend()
+{
+    // SetEnvironmentVariable (d4r.ini) does not reach the C runtime's getenv
+    std::string directory = env_string("D4R_ENGINE_MODEL_DIR");
+    if (directory.empty())
+    {
+        char folder[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + L"\\engine\\k").c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
+        directory = folder;
+    }
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+        return;
+    // A Unix path names the same file through Wine's Z: drive.
+    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
+    const auto start = std::chrono::steady_clock::now();
+    try
+    {
+        g_engine.model = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path);
+        g_engine.directory = path;
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend: cannot load the model from %s: %s (see D4R_README.txt / engine/README.md for how to "
+             "create it)", path.c_str(), error.what());
+        return;
+    }
+    logf("engine backend: model %s loaded and pipelines compiled in %.0f ms", path.c_str(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+static void init_engine_backend_ldr()
+{
+    std::string directory = env_string("D4R_ENGINE_MODEL_LDR_DIR");
+    if (directory.empty())
+    {
+        char folder[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + L"\\engine\\k-ldr").c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
+        directory = folder;
+    }
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+        return;
+    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
+    try
+    {
+        g_engine.modelLdr = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path);
+        g_engine.directoryLdr = path;
+        logf("engine backend: LDR model %s loaded", path.c_str());
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend: cannot load the LDR model from %s: %s", path.c_str(), error.what());
+    }
+}
+
+// K and M borrow compatible views through the same bounded, resource-owning cache.
+static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc,
+                                d4r::GameImage& image, bool isOutput, bool originSupported,
+                                D3D12_RESOURCE_STATES& state)
+{
+    if (image.format == VK_FORMAT_D32_SFLOAT || image.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        image.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    const VkImageUsageFlags usage = isOutput ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkFormatProperties properties{};
+    d4r::vkTable.GetPhysicalDeviceFormatProperties(g_vk.physical, image.format, &properties);
+    const bool enabled = env_uint(isOutput ? "D4R_ENGINE_DIRECT_OUTPUT" : "D4R_ENGINE_DIRECT_INPUTS", 1) != 0;
+    const bool compatible = desc.DepthOrArraySize == 1 && originSupported && (isOutput ?
+        (image.format == VK_FORMAT_R16G16B16A16_SFLOAT || image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) :
+        !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+            (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT));
+    if (!enabled || !compatible)
+        return;
+    auto found = std::find_if(feature.engineViews.begin(), feature.engineViews.end(), [&](const auto& view) {
+        return view->resource == resource && view->format == image.format && view->aspect == image.aspect &&
+            view->usage == usage;
+    });
+    if (found == feature.engineViews.end())
+    {
+        VkMemoryRequirements memory{};
+        d4r::vkTable.GetImageMemoryRequirements(g_vk.device, image.image, &memory);
+        constexpr uint64_t cacheBudget = 512ull * 1024 * 1024;
+        if (feature.engineViews.size() < 64 && memory.size <= cacheBudget - feature.engineViewBytes)
+        {
+            auto view = std::make_unique<EngineBorrowedView>();
+            view->device = g_vk.device; view->format = image.format;
+            view->aspect = image.aspect; view->usage = usage;
+            VkImageViewUsageCreateInfo restricted{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO}; restricted.usage = usage;
+            VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &restricted};
+            info.image = image.image; info.viewType = VK_IMAGE_VIEW_TYPE_2D; info.format = view->format;
+            info.subresourceRange = {view->aspect, 0, 1, 0, 1};
+            if (d4r::vkTable.CreateImageView(g_vk.device, &info, nullptr, &view->view) == VK_SUCCESS)
+            {
+                resource->AddRef(); view->resource = resource;
+                feature.engineViews.push_back(std::move(view));
+                feature.engineViewBytes += memory.size;
+                found = feature.engineViews.end() - 1;
+            }
+        }
+        else if (!feature.engineViewBudgetReported)
+        {
+            feature.engineViewBudgetReported = true;
+            logf("engine view cache budget reached; new textures use copies until feature retirement");
+        }
+    }
+    if (found != feature.engineViews.end())
+    {
+        image.view = (*found)->view;
+        state = isOutput ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+}
+
+// Preset M on the engine: its own model (engine\\m next to this DLL, or D4R_ENGINE_MODEL_M_DIR) and adapter.
+struct EngineBackendM
+{
+    std::once_flag once, ldrOnce;
+    std::unique_ptr<d4r::MModel> model, modelLdr; // LDR: engine\\m-ldr or D4R_ENGINE_MODEL_M_LDR_DIR
+    std::string directory, directoryLdr;
+};
+static EngineBackendM g_engineM;
+
+static void init_engine_backend_m_variant(bool ldr)
+{
+    std::unique_ptr<d4r::MModel>& slot = ldr ? g_engineM.modelLdr : g_engineM.model;
+    std::string directory = env_string(ldr ? "D4R_ENGINE_MODEL_M_LDR_DIR" : "D4R_ENGINE_MODEL_M_DIR");
+    if (directory.empty())
+    {
+        char folder[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + (ldr ? L"\\engine\\m-ldr" : L"\\engine\\m")).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
+        directory = folder;
+    }
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    {
+        logf("engine backend (M): Vulkan interop is unavailable");
+        return;
+    }
+    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
+    const auto start = std::chrono::steady_clock::now();
+    try
+    {
+        slot = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path);
+        (ldr ? g_engineM.directoryLdr : g_engineM.directory) = path;
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (M): cannot load the model from %s: %s", path.c_str(), error.what());
+        return;
+    }
+    logf("engine backend (M): model %s loaded and pipelines compiled in %.0f ms", path.c_str(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+// Preset M's network on d4r's native HIP layer kernels (bridge: d4rEngineNet*; engine/hip_net.h). HIP runs the
+// network about 1.7x faster than the engine's cooperative-matrix shader; the stages around it stay on Vulkan in
+// the game's command list, which is split at the network like a CUDA split frame. The ten layers wait on the GPU
+// for the front's fill of the frame number (d4rEngineNetInputWaitReady/d4rEngineNetLaunchAt, D4R_SHIM_ENGINE_GPU_WAIT)
+// when the bridge supports it; otherwise the worker waits for the CPU-visible marker before launching.
+struct EngineNetCode
+{
+    const char* name;
+    const void* data;
+    uint64_t bytes;
+};
+struct EngineNetExports
+{
+    std::once_flag once;
+    int(WINAPI* create)(const uint8_t*, uint64_t, const EngineNetCode*, uint32_t, uint32_t, uint32_t, CudaDevicePtr,
+                        CudaDevicePtr, void**) = nullptr;
+    int(WINAPI* launch)(void*, uint32_t) = nullptr;
+    int(WINAPI* done)(void*, float*) = nullptr;
+    void(WINAPI* destroy)(void*) = nullptr;
+    // GPU-side readiness: the front fills a u32; the HIP stream waits on it instead of a CPU-visible marker.
+    int(WINAPI* inputWaitReady)(void*, CudaDevicePtr, uint32_t*) = nullptr;
+    int(WINAPI* launchAt)(void*, uint32_t) = nullptr;
+    int(WINAPI* releaseInput)(void*, uint32_t) = nullptr;
+    int(WINAPI* setTimeline)(void*, VkDevice, uint64_t) = nullptr;
+    int(WINAPI* signalTimeline)(void*, uint64_t) = nullptr;
+    bool ready = false;
+};
+static EngineNetExports g_engineNet;
+
+static VkResult signal_split_semaphore(Feature& feature, uint64_t value)
+{
+    if (feature.engineNetTimeline)
+        return static_cast<VkResult>(g_engineNet.signalTimeline(feature.engineNet, value));
+    VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    info.semaphore = feature.splitSemaphore;
+    info.value = value;
+    return g_vk.signalSemaphore(g_vk.device, &info);
+}
+
+static bool read_file(const std::string& path, std::vector<char>& bytes)
+{
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr)
+        return false;
+    fseek(file, 0, SEEK_END);
+    const long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    bytes.resize(size > 0 ? static_cast<size_t>(size) : 0);
+    const bool ok = size > 0 && fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    fclose(file);
+    return ok;
+}
+
+// A storage buffer the engine's shaders and HIP both use. Pooled like the interop buffers, for the same ROCm leak.
+static bool create_engine_shared_buffer(VramBuffer& target, size_t bytes, bool host = false)
+{
+    const uint8_t kind = host ? 2 : 1;
+    if (take_pooled_vram_buffer(target, bytes, kind))
+    {
+        if (target.mapped != nullptr)
+        {
+            std::memset(target.mapped, 0, target.bytes);
+            MemoryBarrier();
+        }
+        return true;
+    }
+    VramBuffer buffer;
+    buffer.kind = kind;
+    VkExternalMemoryBufferCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = g_vk.createBuffer(g_vk.device, &info, nullptr, &buffer.buffer);
+    VkMemoryRequirements requirements = {};
+    if (result == VK_SUCCESS)
+        g_vk.bufferRequirements(g_vk.device, buffer.buffer, &requirements);
+    int type = device_local_type(requirements.memoryTypeBits);
+    if (host)
+    {
+        type = -1;
+        const auto coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (int pass = 0; pass < 2 && type < 0; ++pass)
+            for (uint32_t index = 0; index < g_vk.memory.memoryTypeCount; ++index)
+            {
+                const auto flags = g_vk.memory.memoryTypes[index].propertyFlags;
+                if ((requirements.memoryTypeBits & (1u << index)) && (flags & coherent) == coherent &&
+                    (pass != 0 || !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+                {
+                    type = static_cast<int>(index);
+                    break;
+                }
+            }
+    }
+    VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.buffer = buffer.buffer;
+    VkExportMemoryAllocateInfo exportInfo = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &dedicated};
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkMemoryAllocateInfo allocation = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exportInfo};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = static_cast<uint32_t>(type);
+    if (result == VK_SUCCESS && type < 0)
+        result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (result == VK_SUCCESS)
+        result = g_vk.allocate(g_vk.device, &allocation, nullptr, &buffer.memory);
+    if (result == VK_SUCCESS)
+        result = g_vk.bindBuffer(g_vk.device, buffer.buffer, buffer.memory, 0);
+    if (result == VK_SUCCESS && host)
+        result = g_vk.map(g_vk.device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped);
+    int imported = -1;
+    if (result == VK_SUCCESS)
+        imported = g.worker.call([&] {
+            return g_vk.import(g_vk.device, reinterpret_cast<uint64_t>(buffer.memory), requirements.size, &buffer.device,
+                               &buffer.external);
+        });
+    if (result != VK_SUCCESS || imported != 0)
+    {
+        logf("engine backend: shared buffer of %zu bytes failed (VkResult %d, import %d)", bytes, result, imported);
+        if (buffer.mapped != nullptr)
+            g_vk.unmap(g_vk.device, buffer.memory);
+        if (buffer.memory != VK_NULL_HANDLE)
+            g_vk.free(g_vk.device, buffer.memory, nullptr);
+        if (buffer.buffer != VK_NULL_HANDLE)
+            g_vk.destroyBuffer(g_vk.device, buffer.buffer, nullptr);
+        return false;
+    }
+    if (buffer.mapped != nullptr)
+    {
+        std::memset(buffer.mapped, 0, bytes);
+        MemoryBarrier();
+    }
+    buffer.bytes = bytes;
+    target = buffer;
+    return true;
+}
+
+// Only once no command list uses the engine and no network launch is pending.
+static void release_engine_network(Feature& feature)
+{
+    if (feature.engineNet != nullptr && g_engineNet.destroy != nullptr)
+        g.worker.call([&feature] {
+            g_engineNet.destroy(feature.engineNet);
+            return 0;
+        });
+    feature.engineNet = nullptr;
+    feature.engineNetTimeline = false;
+    for (VramBuffer* buffer : {&feature.engineTokens, &feature.engineHead, &feature.engineSync})
+        recycle_vram_buffer(*buffer);
+}
+
+// The HIP network of a feature: the buffers shared with HIP and the bridge's network over them. False: the
+// engine's own Vulkan network is used instead (reason logged). `preset` is "M" or "K"; `width`
+// and `height` are the dimensions the bridge derives the token grid from (M: render, K: output); `tokenBytes`
+// and `headBytes` size the two shared buffers (M: both MEngine::networkBufferBytes, K: Engine::networkTokenBytes
+// and Engine::networkHeadBytes). The layer kernel names come from hipnet.bin, so no preset list is repeated here.
+static bool create_engine_network(Feature& feature, const std::string& directory, const char* preset,
+                                  bool stagesAvailable, unsigned int width, unsigned int height, size_t tokenBytes,
+                                  size_t headBytes)
+{
+    const std::string choice = env_string("D4R_ENGINE_NETWORK");
+    if (choice == "vulkan")
+        return false;
+    auto unavailable = [&](const char* reason) {
+        logf("engine backend (%s): HIP network unavailable (%s); using the Vulkan network", preset, reason);
+        release_engine_network(feature);
+        return false;
+    };
+    std::call_once(g_engineNet.once, [] {
+        g_engineNet.ready = load_export(g.cuda, "d4rEngineNetCreate", g_engineNet.create) &&
+                            load_export(g.cuda, "d4rEngineNetLaunch", g_engineNet.launch) &&
+                            load_export(g.cuda, "d4rEngineNetDone", g_engineNet.done) &&
+                            load_export(g.cuda, "d4rEngineNetDestroy", g_engineNet.destroy) &&
+                            load_export(g.cuda, "d4rEngineNetInputWaitReady", g_engineNet.inputWaitReady) &&
+                            load_export(g.cuda, "d4rEngineNetLaunchAt", g_engineNet.launchAt) &&
+                            load_export(g.cuda, "d4rEngineNetReleaseInput", g_engineNet.releaseInput) &&
+                            load_export(g.cuda, "d4rEngineNetSetTimeline", g_engineNet.setTimeline) &&
+                            load_export(g.cuda, "d4rEngineNetSignalTimeline", g_engineNet.signalTimeline);
+    });
+    if (!g_engineNet.ready)
+        return unavailable("the CUDA bridge lacks d4rEngineNet*");
+    if (!stagesAvailable)
+        return unavailable("the model has no stages for the native network; rebuild it with --hip");
+    if (g_vk.split == nullptr || g_vk.import == nullptr || feature.marker == nullptr || feature.markerValue == nullptr)
+        return unavailable("split frames need the d4r vkd3d-proton and VRAM interop");
+    std::vector<char> net;
+    if (!read_file(directory + "\\hipnet.bin", net))
+        return unavailable("no hipnet.bin in the model directory");
+    // The bridge dispatches on the magic alone, and the shared buffers are sized for `preset`.
+    const char* const magic = std::strcmp(preset, "K") == 0 ? "D4RKHIP1" : "D4RMHIP1";
+    if (net.size() < 16 || std::memcmp(net.data(), magic, 8) != 0)
+        return unavailable("hipnet.bin is not a native network of this preset");
+    uint32_t count = 0;
+    std::memcpy(&count, net.data() + 8, sizeof(count));
+    if (count == 0 || net.size() < 16 + 64ull * count)
+        return unavailable("invalid hipnet.bin");
+    // The kernel names live in the layer table; load the code object of each distinct one (the M tube repeats).
+    std::vector<std::string> names;
+    names.reserve(count);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        char name[33] = {};
+        std::memcpy(name, net.data() + 16 + 64 * index, 32);
+        if (name[0] == '\0')
+            return unavailable("invalid kernel name in hipnet.bin");
+        if (std::find(names.begin(), names.end(), name) == names.end())
+            names.emplace_back(name);
+    }
+    std::vector<std::vector<char>> code(names.size());
+    std::vector<EngineNetCode> codes(names.size());
+    for (size_t index = 0; index < names.size(); ++index)
+    {
+        if (!read_file(directory + "\\hip\\" + names[index] + ".hsaco", code[index]))
+            return unavailable("a layer kernel is missing in the model's hip folder");
+        codes[index] = {names[index].c_str(), code[index].data(), code[index].size()};
+    }
+    if (!create_engine_shared_buffer(feature.engineTokens, tokenBytes) ||
+        !create_engine_shared_buffer(feature.engineHead, headBytes) ||
+        !create_engine_shared_buffer(feature.engineSync, 256, true))
+        return unavailable("shared buffers");
+    const int created = g.worker.call([&] {
+        return g_engineNet.create(reinterpret_cast<const uint8_t*>(net.data()), net.size(), codes.data(),
+                                  static_cast<uint32_t>(codes.size()), width, height, feature.engineTokens.device,
+                                  feature.engineHead.device, &feature.engineNet);
+    });
+    if (created != 0 || feature.engineNet == nullptr)
+    {
+        feature.engineNet = nullptr;
+        logf("engine backend (%s): d4rEngineNetCreate failed (%d)", preset, created);
+        return unavailable("the kernels could not be loaded for this GPU");
+    }
+    // Input readiness on the GPU: the engine's front fills engineSync with the frame number (the shim records the
+    // fill right after recordFront) and the network's stream waits for it, so the layers start the moment the
+    // front is complete, without the CPU round trip through the readback marker. The bridge checks HIP's
+    // capability and a round trip on this buffer. Without wait-value support (or D4R_SHIM_ENGINE_GPU_WAIT=0)
+    // the worker keeps waiting for the CPU-visible marker before launching.
+    const bool gpuWaitEnabled = env_uint("D4R_SHIM_ENGINE_GPU_WAIT", 1) != 0;
+    const int waitProbe = gpuWaitEnabled ? g.worker.call([&] {
+        return g_engineNet.inputWaitReady(feature.engineNet, feature.engineSync.device,
+                                         static_cast<uint32_t*>(feature.engineSync.mapped));
+    }) : 0;
+    if (waitProbe < 0)
+        return unavailable("the HIP stream cannot complete a wait-value test");
+    feature.engineGpuWait = waitProbe == 1;
+    logf("engine backend (%s): HIP network input readiness on %s", preset, feature.engineGpuWait.load()
+             ? "the GPU (the front publishes the frame number; the layers wait on it)"
+             : "the CPU (marker polling)");
+    if (feature.splitSemaphore == VK_NULL_HANDLE && !create_split_semaphore(feature))
+        return unavailable("timeline semaphore");
+    if (g.worker.call([&] {
+            return g_engineNet.setTimeline(feature.engineNet, g_vk.device,
+                                          reinterpret_cast<uint64_t>(feature.splitSemaphore));
+        }) != 0)
+        return unavailable("native HIP completion timeline");
+    feature.engineNetTimeline = true;
+    logf("engine backend (%s): network completion releases the split timeline from the native HIP callback", preset);
+    return true;
+}
+
+// Records the end of the front: a fill of this frame's number into the buffer the HIP stream waits on
+// (d4rEngineNetLaunchAt). The engine's recordFront ends the input stage with its own ALL_COMMANDS barrier (the
+// tokens are then available); the fill is ordered after it and, once it lands, the ten layers may read them.
+static void record_engine_input_ready(Feature& feature, VkCommandBuffer command, uint32_t frame)
+{
+    const VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                    VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+    g_vk.barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr,
+                 0, nullptr);
+    g_vk.fill(command, feature.engineSync.buffer, 0, sizeof(uint32_t), frame);
+    const VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    g_vk.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr,
+                 0, nullptr);
+}
+
+static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t frame);
+static void frame_retired(Feature* feature, uint32_t frame);
+
+// The network's inputs are written by the front of the game's list, so its stream waits for the frame's fill of
+// the shared u32 (d4rEngineNetLaunchAt). A wait for a frame whose front never reached the GPU (the game recorded
+// its list but did not execute it, or the game stalled) can only be satisfied by a later frame's fill: writing
+// the value it waits for releases it, so the stream keeps moving. The frame's output is undefined either way.
+// `disable`: the GPU-side wait itself looks broken for this feature, so later frames wait for the CPU marker.
+static void release_engine_input_wait(Feature& feature, uint32_t frame, const char* reason, bool disable)
+{
+    if (feature.engineNet == nullptr || g_engineNet.releaseInput == nullptr)
+        return;
+    const int result = g_engineNet.releaseInput(feature.engineNet, frame);
+    if (disable)
+        feature.engineGpuWait.store(false);
+    logf("engine frame %u: %s; releasing the GPU-side input wait (%d)", frame, reason, result);
+}
+
+// CUDA worker: runs the network of `frame` (behind the GPU-side input wait, or once the CPU marker shows the
+// front has run), then lets the second part of the game's command list (the engine's reconstruction) run.
+static void run_engine_network(Feature* feature, int slotIndex, uint32_t frame)
+{
+    const bool gpuWait = feature->engineGpuWait.load() && g_engineNet.launchAt != nullptr;
+    if (!gpuWait && !wait_for_input_marker(feature, slotIndex, frame))
+        return; // dropped and retired there
+    const auto start = std::chrono::steady_clock::now();
+    int launched;
+    if (gpuWait)
+    {
+        feature->engineWaitFrame.store(frame);
+        launched = g_engineNet.launchAt(feature->engineNet, frame);
+        if (launched == 801 /* CUDA_ERROR_NOT_SUPPORTED: no wait was queued */)
+        {
+            feature->engineWaitFrame.store(0);
+            // The bridge could not queue the wait (no hipStreamWaitValue32, or the stream rejected it): wait
+            // for the input marker on the CPU, as without the GPU-side wait.
+            feature->engineGpuWait.store(false);
+            logf("engine frame %u: GPU-side input wait unavailable (%d); waiting for the input marker on the CPU", frame, launched);
+            if (!wait_for_input_marker(feature, slotIndex, frame))
+                return;
+            launched = g_engineNet.launch(feature->engineNet, frame);
+        }
+    }
+    else
+        launched = g_engineNet.launch(feature->engineNet, frame);
+    float gpuMs = 0.0f;
+    int done = launched == 0 ? 0 : -1;
+    bool released = false, discarded = false;
+    // Completion polling (as the CUDA path's output event): sleep while far from the predicted completion,
+    // yield around it (a Wine sleep rounds up to ~50 us), back off when the GPU runs late. The prediction
+    // learns from the earlier frames; with the GPU-side wait it also covers the front's remaining GPU time.
+    double lastNotReadyUs = -1.0;
+    while (done == 0)
+    {
+        done = g_engineNet.done(feature->engineNet, &gpuMs);
+        if (done != 0)
+            break;
+        const double elapsedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        if (gpuWait && !released)
+        {
+            // This frame's own marker (written with the aggregate one, at the end of its front) tells whether
+            // its front ran at all. A later frame's front running while this one's never did means the game
+            // discarded this list: its wait can only be satisfied by that later front, which would make the
+            // network read another frame's tokens. Release it and drop the frame, as the CPU marker path does.
+            const uint32_t slotMarker = feature->markerValue[1 + slotIndex];
+            if (slotMarker != frame && static_cast<int32_t>(*feature->markerValue - frame) > 0)
+            {
+                release_engine_input_wait(*feature, frame, "its command list was discarded", false);
+                discarded = true;
+                break;
+            }
+            // The front ran but the stream's wait did not start the network (a broken wait would leave every
+            // later frame queued behind it): release it and wait for the CPU marker from now on.
+            if (slotMarker == frame && elapsedUs > 1000000.0)
+            {
+                release_engine_input_wait(*feature, frame, "the GPU-side wait did not start the network", true);
+                released = true;
+            }
+        }
+        if (elapsedUs > 2000000.0)
+        {
+            done = -2;
+            break;
+        }
+        lastNotReadyUs = elapsedUs;
+        constexpr double kMarginUs = 120.0, kStepUs = 20.0, kChunkUs = 200.0, kSpinAfterUs = 150.0;
+        const double predictedUs = feature->engineNetWaitEmaUs;
+        const double remaining = predictedUs - kMarginUs - elapsedUs;
+        if (remaining > kStepUs)
+            d4r_sleep_us(static_cast<unsigned>(std::min(remaining, kChunkUs)));
+        else if (elapsedUs < predictedUs + kSpinAfterUs)
+            d4r_sleep_us(0); // polling retires resources; the native callback releases the GPU's split wait
+        else
+            d4r_sleep_us(static_cast<unsigned>(std::min(
+                kStepUs * (1.0 + (elapsedUs - predictedUs - kSpinAfterUs) / 160.0), kChunkUs)));
+    }
+    feature->engineWaitFrame.store(0);
+    const double waitedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    if (done == 1)
+    {
+        // Learn the completion time, not our own wait: the work finished between the last NOT_READY poll and the
+        // successful one (at most one chunk apart), so the midpoint cannot ratchet upwards.
+        double sample = lastNotReadyUs >= 0.0 ? 0.5 * (lastNotReadyUs + waitedUs) : waitedUs;
+        sample = std::min(sample, 20000.0);
+        feature->engineNetWaitEmaUs = feature->engineNetWaitEmaUs == 0.0
+                                          ? sample : 0.8 * feature->engineNetWaitEmaUs + 0.2 * sample;
+    }
+    if (discarded)
+        logf("engine frame %u: the game discarded its command list; the frame is dropped", frame);
+    else if (done != 1)
+        logf("engine frame %u: HIP network failed (launch %d, state %d); the frame's output is undefined", frame, launched, done);
+    else if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u: HIP network %.2f ms GPU, %.2f ms %s", frame, gpuMs, waitedUs / 1000.0,
+             gpuWait ? "from launch to completion (GPU-side input wait)" : "from input readiness to completion");
+    if (gpuWait && !discarded && done != 1)
+        release_engine_input_wait(*feature, frame, "the network failed before completing its input wait", true);
+    feature->inputs[slotIndex].busy = false;
+    frame_retired(feature, frame);
+}
+
+// Preset K and preset M record a native-network frame the same way: the front half, this frame's marker, the
+// split of the game's list, the back half, and the worker that runs the network between the two halves.
+// `recordPart(front)` records one half into the game's list; `sources` is {colour, depth, motion, output}, the
+// first three sampled through the front. `refuse` (nothing usable recorded; the CUDA backend takes over) and
+// `abandon` (recorded but the frame is unusable) belong to the caller so its logging and flags stay preset-specific.
+struct EngineFrameSource
+{
+    ID3D12Resource* resource;
+    d4r::GameImage* image;
+    unsigned int x, y, width, height;
+    D3D12_RESOURCE_STATES state, copyState;
+};
+
+template <typename RecordPart, typename Refuse, typename Abandon>
+static bool record_engine_network_frame(Feature& feature, ID3D12GraphicsCommandList* list, EngineFrameSource* sources,
+                                        uint32_t frame, const char* preset, int reset, float mvScaleX, float mvScaleY,
+                                        float jitterX, float jitterY, RecordPart&& recordPart, Refuse&& refuse,
+                                        Abandon&& abandon)
+{
+    // HIP waits on the GPU-published input value between the two Vulkan list parts. Its native completion
+    // callback releases the second part. The Wine worker retires resources, not frame timing.
+    const int slotIndex = static_cast<int>(frame % kSlots);
+    InputSlot& slot = feature.inputs[slotIndex];
+    const auto waitStart = std::chrono::steady_clock::now();
+    while (slot.busy.load() || feature.inFlight.load() >= 2)
+    {
+        if (std::chrono::steady_clock::now() - waitStart > std::chrono::seconds(2))
+        {
+            logf("engine frame %u: %d frames in flight; skipping evaluation", frame, feature.inFlight.load());
+            return true;
+        }
+        d4r_sleep_us(200);
+    }
+    if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
+        return refuse("the command list cannot retain the engine's resources");
+    ID3D12GraphicsCommandList2* list2 = nullptr;
+    if (FAILED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&list2))))
+        return refuse("ID3D12GraphicsCommandList2 is unavailable");
+    for (int index = 0; index < 3; ++index)
+        transition(list, sources[index].resource, sources[index].state, sources[index].copyState);
+    const char* failure = recordPart(true);
+    if (failure != nullptr)
+    {
+        for (int index = 0; index < 3; ++index)
+            transition(list, sources[index].resource, sources[index].copyState, sources[index].state);
+        list2->Release();
+        return refuse(failure);
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS markerAddress = feature.marker->GetGPUVirtualAddress();
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER markers[] = {
+        {markerAddress + sizeof(uint32_t) * (1 + slotIndex), frame},
+        {markerAddress, frame},
+    };
+    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[] = {
+        D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+    };
+    list2->WriteBufferImmediate(2, markers, modes);
+    list2->Release();
+    // From here on this call owns the frame: a failure leaves this frame's output undefined and hands the next
+    // frame to the CUDA backend (which must not record its own marker and split for this frame).
+    if (FAILED(g_vk.split->SplitCommandListForExternalWait(list, reinterpret_cast<UINT64>(feature.splitSemaphore), frame)))
+    {
+        for (int index = 0; index < 3; ++index)
+            transition(list, sources[index].resource, sources[index].copyState, sources[index].state);
+        return abandon("the command list could not be split");
+    }
+    transition(list, sources[3].resource, sources[3].state, sources[3].copyState);
+    failure = recordPart(false);
+    transition(list, sources[3].resource, sources[3].copyState, sources[3].state);
+    // The reconstruction still samples borrowed colour; keep its sampled layout through the back.
+    for (int index = 0; index < 3; ++index)
+        transition(list, sources[index].resource, sources[index].copyState, sources[index].state);
+    feature.split = true;
+    slot.busy = true;
+    feature.inFlight.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(feature.splitMutex);
+        feature.splitCompletion.admit(frame);
+    }
+    Feature* const owner = &feature;
+    g.worker.post([owner, slotIndex, frame] { run_engine_network(owner, slotIndex, frame); });
+    if (failure != nullptr)
+        return abandon(failure);
+    feature.engineJitter[0] = jitterX;
+    feature.engineJitter[1] = jitterY;
+    if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u recorded, preset %s with the HIP network (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)",
+             frame, preset, jitterX, jitterY, reset, mvScaleX, mvScaleY);
+    return true;
+}
+
+// Preset M: record the evaluation into `list`, borrowing compatible inputs and copying only fallbacks.
+static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                              ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
+                              const FrameParams& p, uint32_t frame)
+{
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("engine backend (M): %s; feature %u uses the CUDA backend from frame %u", reason, feature.handle.Id, frame);
+        return false;
+    };
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
+    const bool ldr = (feature.flags & 0x1) == 0; // NGX's LDR stages: a model directory of its own, no exposure
+    if (ldr)
+        std::call_once(g_engineM.ldrOnce, [] { init_engine_backend_m_variant(true); });
+    else
+        std::call_once(g_engineM.once, [] { init_engine_backend_m_variant(false); });
+    d4r::MModel* const model = ldr ? g_engineM.modelLdr.get() : g_engineM.model.get();
+    if (model == nullptr)
+        return refuse(ldr ? "no LDR model (engine\\m-ldr) for a game without the HDR flag" : "not available");
+    if ((feature.flags & 0x2) == 0)
+        return refuse("needs render-resolution motion vectors");
+    // NGX measures the exposure for this preset, so the AutoExposure flag, the game's exposure texture, the
+    // pre-exposure and the exposure scale are all ignored here (CUDA output is identical for each of them).
+    if (feature.engineM != nullptr &&
+        (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
+        return refuse("changing the effective render resolution after initialization is not implemented");
+    if (color == output || depth == output || motion == output)
+        return refuse("input/output texture aliasing is not supported");
+    d4r::GameFrameM game;
+    using Source = EngineFrameSource;
+    const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
+    const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
+    const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
+    Source sources[4] = {
+        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {motion, &game.motion, p.mvBaseX, p.mvBaseY, p.renderWidth, p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState,
+         D3D12_RESOURCE_STATE_COPY_DEST},
+    };
+    for (Source& source : sources)
+    {
+        UINT64 handle = 0, offset = 0;
+        D3D12_RESOURCE_DESC desc;
+        source.resource->GetDesc(&desc);
+        if (FAILED(g_vk.interop->GetVulkanResourceInfo1(source.resource, &handle, &offset, &source.image->format)) ||
+            handle == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            source.x + source.width > desc.Width || source.y + source.height > desc.Height)
+            return refuse("a texture is not a single-sample 2D image covering its rectangle");
+        source.image->image = reinterpret_cast<VkImage>(handle);
+        source.image->x = source.x;
+        source.image->y = source.y;
+        prepare_engine_view(feature, source.resource, desc, *source.image, source.image == &game.output,
+                            source.x == 0 && source.y == 0, source.copyState);
+        g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
+    }
+    if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
+        !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !d4r::gameOutputFormat(game.output.format))
+    {
+        logf("engine backend (M): Vulkan formats colour %d, depth %d, motion %d, output %d", game.color.format,
+             game.depth.format, game.motion.format, game.output.format);
+        return refuse("a texture format is not implemented");
+    }
+    game.jitter[0] = p.jitterX;
+    game.jitter[1] = p.jitterY;
+    game.motionToRender[0] = p.mvScaleX;
+    game.motionToRender[1] = p.mvScaleY;
+    if ((feature.flags & 0x4) != 0 && p.mvScaleX != 0.0f && p.mvScaleY != 0.0f)
+    {
+        game.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;
+        game.motionOffset[1] = (p.jitterY - feature.engineJitter[1]) / p.mvScaleY;
+    }
+    game.reset = p.reset != 0 || feature.engineM == nullptr;
+    game.depthInverted = (feature.flags & 0x8) != 0;
+    try
+    {
+        if (feature.engineM == nullptr)
+        {
+            const size_t bytes = static_cast<size_t>(d4r::MEngine::networkBufferBytes(p.renderWidth, p.renderHeight));
+            const bool hip = create_engine_network(feature, ldr ? g_engineM.directoryLdr : g_engineM.directory, "M",
+                                                   model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
+                                                   bytes, bytes);
+            const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
+            feature.engineM = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device, feature.outWidth,
+                                                                   feature.outHeight, p.renderWidth, p.renderHeight,
+                                                                   hip ? &external : nullptr);
+            feature.engineMRenderWidth = p.renderWidth;
+            feature.engineMRenderHeight = p.renderHeight;
+            logf("engine backend (M): feature %u runs preset M in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
+                 feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
+                 hip ? "the native HIP layers (list split around it)" : "Vulkan",
+                 model->hasRgb10Output() && game.output.view != VK_NULL_HANDLE &&
+                     game.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                     game.output.layout == VK_IMAGE_LAYOUT_GENERAL && game.output.image != game.color.image &&
+                     game.output.image != game.motion.image && game.output.image != game.depth.image);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (M): %s", error.what());
+        release_engine_network(feature);
+        return refuse("the engine could not be created");
+    }
+    if (feature.engineNet != nullptr)
+    {
+        // The native HIP network: the game's list is split around it. Its native completion callback releases
+        // the second part, which records expansion, reconstruction and the final store (or the conversion blit
+        // for incompatible outputs). The Wine worker retires resources, not frame timing.
+        auto recordPart = [&](bool front) -> const char* {
+            VkCommandBuffer command = VK_NULL_HANDLE;
+            if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &command)))
+                return "BeginVkCommandBufferInterop failed";
+            const char* failure = nullptr;
+            try
+            {
+                if (front)
+                {
+                    feature.engineM->recordFront(command, game);
+                    // The HIP network's stream waits for this frame's number (record_engine_input_ready): the
+                    // fill is part of the first half, so the network starts the moment the front's GPU work ends.
+                    if (feature.engineGpuWait.load())
+                        record_engine_input_ready(feature, command, frame);
+                }
+                else
+                    feature.engineM->recordBack(command, game);
+            }
+            catch (const std::exception& error)
+            {
+                logf("engine backend (M): %s", error.what());
+                failure = "the frame could not be recorded";
+            }
+            if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && failure == nullptr)
+                failure = "EndVkCommandBufferInterop failed";
+            return failure;
+        };
+        auto abandon = [&](const char* reason) {
+            feature.engineRefused = true;
+            logf("engine backend (M): %s; feature %u uses the CUDA backend after frame %u", reason, feature.handle.Id, frame);
+            return true;
+        };
+        return record_engine_network_frame(feature, list, sources, frame, "M", game.reset, p.mvScaleX, p.mvScaleY,
+                                           p.jitterX, p.jitterY, recordPart, refuse, abandon);
+    }
+    if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
+        return refuse("the command list cannot retain the engine's resources");
+    for (const Source& source : sources)
+        transition(list, source.resource, source.state, source.copyState);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    bool recorded = SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list, &command));
+    const char* failure = recorded ? nullptr : "BeginVkCommandBufferInterop failed";
+    if (recorded)
+    {
+        try
+        {
+            feature.engineM->record(command, game);
+        }
+        catch (const std::exception& error)
+        {
+            logf("engine backend (M): %s", error.what());
+            failure = "the frame could not be recorded";
+            recorded = false;
+        }
+        if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && recorded)
+        {
+            failure = "EndVkCommandBufferInterop failed";
+            recorded = false;
+        }
+    }
+    for (const Source& source : sources)
+        transition(list, source.resource, source.copyState, source.state);
+    if (!recorded)
+        return refuse(failure);
+    feature.engineJitter[0] = p.jitterX;
+    feature.engineJitter[1] = p.jitterY;
+    if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u recorded, preset M (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame, p.jitterX, p.jitterY,
+             game.reset, p.mvScaleX, p.mvScaleY);
+    return true;
+}
+
+// Records the whole evaluation of `frame` into `list`. False: nothing usable was recorded and the
+// CUDA backend takes this feature over.
+static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                            ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
+                            ID3D12Resource* exposure, const FrameParams& p, uint32_t frame)
+{
+    if (feature.engineRefused)
+        return false;
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("engine backend: %s; feature %u uses the CUDA backend from frame %u", reason, feature.handle.Id, frame);
+        if (feature.engine != nullptr)
+            logf("engine backend: the temporal history restarts in the CUDA backend");
+        return false;
+    };
+    std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
+    if (feature.preset == 13)
+        return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
+    // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
+    const bool ldr = (feature.flags & 0x1) == 0;
+    if (ldr)
+        std::call_once(g_engine.ldrOnce, init_engine_backend_ldr);
+    else
+        std::call_once(g_engine.once, init_engine_backend);
+    d4r::Model* const model = ldr ? g_engine.modelLdr.get() : g_engine.model.get();
+    if (model == nullptr)
+        return refuse(ldr ? "no LDR model (engine\\k-ldr) for a game without the HDR flag" : "not available");
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
+    if (feature.preset != 11)
+        return refuse("only preset K is implemented");
+    // MVLowRes (0x2) clear: vectors are at output resolution (engine revision D4RO0003).
+    const bool displayMotion = (feature.flags & 0x2) == 0;
+    if (displayMotion && !model->hasDisplayMotion())
+        return refuse("display-resolution motion needs a model compiled by the current compile_k.py");
+    if ((feature.flags & 0x8) == 0 && !model->hasRegularDepth())
+        return refuse("regular (non-inverted) depth needs a model compiled by the current compile_k.py");
+    // DLSS.Indicator.Invert.X/Y.Axis (p.invertX/Y) only place NGX's debug indicator: NGX's K and M outputs are
+    // byte-identical with them set (harness D4R_HARNESS_INDICATOR_INVERT=1), so neither engine path reads them.
+    // Two exposure sources. AutoExposure (0x40) measures the frame's luma scaled by 1 / pre-exposure and multiplies
+    // the result by the exposure scale. Without it the game's ExposureTexture is the exposure: texel x scale /
+    // pre-exposure (read directly, not measured).
+    const bool autoExposure = (feature.flags & 0x40) != 0;
+    const bool gameExposure = !ldr && !autoExposure;
+    if (!ldr && autoExposure && !model->hasAutoExposure())
+        return refuse("automatic exposure needs a model with exposure shaders");
+    if (gameExposure && (!p.hasExposure || !model->hasGameExposure()))
+        return refuse("exposure without AutoExposure needs an exposure texture and a model compiled by the current compile_k.py");
+    if (!ldr && !(std::isfinite(p.exposureScale) && p.exposureScale > 0.0f))
+        return refuse("the exposure scale is not a positive number");
+    if (!ldr && !(std::isfinite(p.preExposure) && p.preExposure > 0.0f))
+        return refuse("the pre-exposure is not a positive number");
+
+    if (output == color || output == motion || output == depth)
+        return refuse("input/output texture aliasing is not supported");
+
+    d4r::GameFrame game;
+    using Source = EngineFrameSource;
+    const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
+    const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
+    const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
+    Source sources[5] = {
+        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState,
+         D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState,
+         D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {motion, &game.motion, p.mvBaseX, p.mvBaseY, displayMotion ? feature.outWidth : p.renderWidth,
+         displayMotion ? feature.outHeight : p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState,
+         D3D12_RESOURCE_STATE_COPY_DEST},
+        {exposure, &game.exposure, 0, 0, 1, 1, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+    };
+    const size_t sourceCount = gameExposure ? 5 : 4;
+    for (size_t index = 0; index < sourceCount; ++index)
+    {
+        Source& source = sources[index];
+        UINT64 handle = 0, offset = 0;
+        D3D12_RESOURCE_DESC desc;
+        source.resource->GetDesc(&desc);
+        if (FAILED(g_vk.interop->GetVulkanResourceInfo1(source.resource, &handle, &offset, &source.image->format)) ||
+            handle == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            source.x + source.width > desc.Width || source.y + source.height > desc.Height)
+            return refuse("a texture is not a single-sample 2D image covering its rectangle");
+        source.image->image = reinterpret_cast<VkImage>(handle);
+        source.image->x = source.x;
+        source.image->y = source.y;
+        const bool isOutput = source.image == &game.output;
+        prepare_engine_view(feature, source.resource, desc, *source.image, isOutput,
+                            (source.x == 0 && source.y == 0) || model->hasDirectOrigins(), source.copyState);
+        g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
+    }
+    if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R16_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT)))
+        return refuse("the exposure texture must be a float texture the engine samples directly");
+    if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
+        !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !d4r::gameOutputFormat(game.output.format))
+    {
+        logf("engine backend: Vulkan formats colour %d, depth %d, motion %d, output %d", game.color.format,
+             game.depth.format, game.motion.format, game.output.format);
+        return refuse("a texture format is not implemented");
+    }
+    if (frame <= 2)
+        logf("engine direct textures: color %d, motion %d, depth %d, output %d (format %d, RGB10A2 pipeline %d)",
+             game.color.view != VK_NULL_HANDLE, game.motion.view != VK_NULL_HANDLE,
+             game.depth.view != VK_NULL_HANDLE, game.output.view != VK_NULL_HANDLE,
+             game.output.format, model->hasRgb10Output());
+    game.settings.renderWidth = p.renderWidth;
+    game.settings.renderHeight = p.renderHeight;
+    game.settings.jitter[0] = p.jitterX;
+    game.settings.jitter[1] = p.jitterY;
+    game.settings.displayMotion = displayMotion;
+    // The engine takes motion in output pixels; MV.Scale gives render pixels (display-resolution vectors are output pixels already).
+    const float toOutput = displayMotion ? 1.0f : static_cast<float>(feature.outWidth) / static_cast<float>(p.renderWidth);
+    const float toOutputY = displayMotion ? 1.0f : static_cast<float>(feature.outHeight) / static_cast<float>(p.renderHeight);
+    game.settings.motionScale[0] = p.mvScaleX * toOutput;
+    game.settings.motionScale[1] = p.mvScaleY * toOutputY;
+    // MVJittered: NGX adds the change of the jitter (render pixels) to the vectors before scaling them
+    // (observed with MV.Scale 1: offset = jitter - previous jitter, the first frame's previous being 0).
+    // The offset is added to the raw vector, before motionScale's own output-pixel conversion, so it carries
+    // no extra output/render factor in either motion mode.
+    if ((feature.flags & 0x4) != 0 && p.mvScaleX != 0.0f && p.mvScaleY != 0.0f)
+    {
+        game.settings.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;
+        game.settings.motionOffset[1] = (p.jitterY - feature.engineJitter[1]) / p.mvScaleY;
+    }
+    game.settings.reset = p.reset != 0 || feature.engine == nullptr;
+    game.settings.depthInverted = (feature.flags & 0x8) != 0;
+    game.settings.autoExposure = !ldr && autoExposure; // LDR: no exposure at all
+    game.settings.exposureScale = ldr ? 1.0f : p.exposureScale;
+    // NGX's automatic K measurement scales the luma by 1 / pre-exposure before the logarithm
+    // (cuda_luma_convert_kernel), so the stored exposure is pre times the raw measurement and the stage's
+    // 1 / pre factor recovers it; the game texture path applies the same stage factor.
+    game.settings.preExposure = ldr ? 1.0f : p.preExposure;
+    try
+    {
+        if (feature.engine == nullptr)
+        {
+            const size_t tokenBytes = static_cast<size_t>(d4r::Engine::networkTokenBytes(feature.outWidth, feature.outHeight));
+            const size_t headBytes = static_cast<size_t>(d4r::Engine::networkHeadBytes(feature.outWidth, feature.outHeight));
+            const bool hip = create_engine_network(feature, ldr ? g_engine.directoryLdr : g_engine.directory, "K", true,
+                                                   feature.outWidth, feature.outHeight, tokenBytes, headBytes);
+            const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
+            feature.engine = std::make_unique<d4r::GameUpscaler>(*model, g_vk.physical, g_vk.device,
+                                                                 feature.outWidth, feature.outHeight,
+                                                                 std::max(feature.width, p.renderWidth),
+                                                                 std::max(feature.height, p.renderHeight),
+                                                                 hip ? &external : nullptr);
+            logf("engine backend: feature %u runs preset K in the game's command list (%ux%u -> %ux%u), network on %s",
+                 feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
+                 hip ? "the native HIP layers (list split around it)" : "Vulkan");
+        }
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend: %s", error.what());
+        release_engine_network(feature);
+        return refuse("the engine could not be created");
+    }
+    if (feature.engineNet != nullptr)
+    {
+        // The native HIP network: the game's list is split around it. Its native completion callback releases
+        // the second part, which records the final store (or the conversion blit for incompatible outputs).
+        auto recordPart = [&](bool front) -> const char* {
+            VkCommandBuffer command = VK_NULL_HANDLE;
+            if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &command)))
+                return "BeginVkCommandBufferInterop failed";
+            const char* failure = nullptr;
+            try
+            {
+                if (front)
+                {
+                    feature.engine->recordFront(command, game);
+                    // The HIP network's stream waits for this frame's number (record_engine_input_ready): the
+                    // fill is part of the first half, so the network starts the moment the front's GPU work ends.
+                    if (feature.engineGpuWait.load())
+                        record_engine_input_ready(feature, command, frame);
+                }
+                else
+                    feature.engine->recordBack(command, game);
+            }
+            catch (const std::exception& error)
+            {
+                logf("engine backend (K): %s", error.what());
+                failure = "the frame could not be recorded";
+            }
+            if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && failure == nullptr)
+                failure = "EndVkCommandBufferInterop failed";
+            return failure;
+        };
+        auto abandon = [&](const char* reason) {
+            feature.engineRefused = true;
+            logf("engine backend (K): %s; feature %u uses the CUDA backend after frame %u", reason, feature.handle.Id, frame);
+            return true;
+        };
+        return record_engine_network_frame(feature, list, sources, frame, "K", game.settings.reset,
+                                           game.settings.motionScale[0], game.settings.motionScale[1], p.jitterX,
+                                           p.jitterY, recordPart, refuse, abandon);
+    }
+    if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
+        return refuse("the command list cannot retain the engine's resources");
+    for (const Source& source : sources)
+        transition(list, source.resource, source.state, source.copyState);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    bool recorded = SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list, &command));
+    const char* failure = recorded ? nullptr : "BeginVkCommandBufferInterop failed";
+    if (recorded)
+    {
+        try
+        {
+            feature.engine->record(command, game);
+        }
+        catch (const std::exception& error)
+        {
+            logf("engine backend: %s", error.what());
+            failure = "the frame could not be recorded";
+            recorded = false;
+        }
+        if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && recorded)
+        {
+            failure = "EndVkCommandBufferInterop failed";
+            recorded = false;
+        }
+    }
+    for (const Source& source : sources)
+        transition(list, source.resource, source.copyState, source.state);
+    if (!recorded)
+        return refuse(failure);
+    feature.engineJitter[0] = p.jitterX;
+    feature.engineJitter[1] = p.jitterY;
+    if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u recorded (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)", frame,
+             p.jitterX, p.jitterY, game.settings.reset, p.mvScaleX, p.mvScaleY, p.renderWidth, p.renderHeight);
+    return true;
 }
 
 static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters)
@@ -5058,6 +6252,18 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     p.outputBaseY = get_uint_or(parameters, "DLSS.Output.Subrect.Base.Y", 0);
     p.hasExposure = exposure != nullptr;
 
+    if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, p, frame))
+        return NGX_SUCCESS;
+
+    if (feature->cudaCreationDeferred)
+    {
+        logf("engine backend: creating CUDA fallback for feature %u at frame %u", feature->handle.Id, frame);
+        const NgxResult created = create_cuda_feature(*feature);
+        if (created != NGX_SUCCESS) return created;
+        p.reset = 1; // the freshly created CUDA feature has none of the Vulkan engine's history
+        logf("engine backend: CUDA fallback initialized; temporal history reset");
+    }
+
     const int slotIndex = static_cast<int>(frame % kSlots);
     InputSlot& slot = feature->inputs[slotIndex];
     // Throttle the game to DLSS speed when the pipeline still owns this slot
@@ -5102,7 +6308,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         feature->vramDecided = true;
         feature->vram = p.vram;
         feature->split = p.vram && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 && g_vk.split != nullptr &&
-                         create_split_semaphore(*feature);
+                         (feature->splitSemaphore != VK_NULL_HANDLE || create_split_semaphore(*feature));
         feature->linearInputs = feature->split && env_uint("D4R_SHIM_LINEAR_INPUTS", 0) != 0 &&
                                 g.cu.registerLinearTexture != nullptr;
         if (feature->linearInputs)
@@ -5372,6 +6578,14 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList
 
 static void release_feature(Feature* feature)
 {
+    // A queued GPU-side input wait for a frame that never ran would stall the network's stream: release it
+    // before the drain below waits for the worker (the worker also releases waits it sees stuck).
+    if (feature->engineNet != nullptr)
+    {
+        const uint32_t waiting = feature->engineWaitFrame.load();
+        if (waiting != 0)
+            release_engine_input_wait(*feature, waiting, "the feature is being released", false);
+    }
     // Wait for outstanding evaluations, then free CUDA resources on the worker.
     drain_pipeline();
     g.worker.call([feature] {
@@ -5429,7 +6643,10 @@ static void release_feature(Feature* feature)
     if (feature->resources != nullptr)
         feature->resources->Release();
     else
+    {
+        release_engine_network(*feature);
         delete feature;
+    }
 }
 
 static void destroy_recorded_resources(Feature* feature)
@@ -5439,8 +6656,12 @@ static void destroy_recorded_resources(Feature* feature)
             staging->release();
     for (OutputSlot& slot : feature->outputs)
         slot.staging.release();
+    release_engine_network(*feature);
+    const bool engineSemaphore = !feature->vramDecided && feature->splitSemaphore != VK_NULL_HANDLE;
     if (g_vk.ready && feature->vramDecided)
         release_vram(*feature);
+    else if (engineSemaphore) // created for the engine's HIP network; release_vram destroys it otherwise
+        g_vk.destroySemaphore(g_vk.device, feature->splitSemaphore, nullptr);
     if (feature->marker != nullptr)
         feature->marker->Release();
     logf("feature %u recorded resources retired after allocator completion", feature->handle.Id);

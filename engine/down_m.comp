@@ -1,0 +1,76 @@
+#version 460
+// d4r engine, preset M: the last stage. The reconstruction works at three times the render resolution; this
+// resamples its packed result (11-11-10 bits, range-compressed) to the output resolution, 3 -> 2, with a separable
+// five-tap filter whose weights depend on the output pixel's parity, limits each pass to the range of its taps
+// (no ringing), and undoes the range compression and the exposure.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "output_store.glsl"
+// LDR (NGX's *_ldr_* kernel): the packed image is the display-referred colour itself.
+#ifndef LDR
+#define LDR 0
+#endif
+// D4RM0003: the runtime dispatches 8x64 output pixels per workgroup.
+#define BLOCK_X 8
+#define BLOCK_Y 64
+#define TILE_W (3 * BLOCK_X / 2 + 4)
+#define TILE_H (3 * BLOCK_Y / 2 + 4)
+layout(local_size_x = BLOCK_X, local_size_y = BLOCK_Y) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 srcSize;          // of the packed image
+    ivec2 outOrigin;
+    ivec2 colOrigin, colSize;
+    vec2 out2rnd, rndOffs;  // render texel of an output pixel centre: floor(centre * out2rnd + rndOffs)
+    float expo;
+} p;
+layout(set = 0, binding = 1) uniform sampler2D colorTex;        // render resolution; its alpha is passed through
+layout(set = 0, binding = 2, FINAL_OUTPUT_FORMAT) uniform writeonly image2D outImg;
+layout(set = 0, binding = 3, std430) readonly buffer Src { uint w[]; } src;
+shared f16vec4 tile[TILE_W * TILE_H];       // source texels around the block
+shared f16vec4 rows[TILE_H * BLOCK_X];      // after the horizontal pass
+// weights of taps -2 .. +2 for an even output coordinate; an odd one uses them mirrored
+const float16_t W0 = float16_t(-0.041347626596689224), W1 = float16_t(0.08728941529989243), W2 = float16_t(0.6202144026756287),
+                W3 = float16_t(0.3721286356449127), W4 = float16_t(-0.03828485310077667);
+f16vec3 filter5(f16vec3 a, f16vec3 b, f16vec3 c, f16vec3 d, f16vec3 e, bool odd)
+{
+    const f16vec3 w0 = f16vec3(odd ? W4 : W0), w1 = f16vec3(odd ? W3 : W1), w3 = f16vec3(odd ? W1 : W3), w4 = f16vec3(odd ? W0 : W4);
+    f16vec3 s = w0 * a;
+    s = fma(w1, b, s); s = fma(f16vec3(W2), c, s); s = fma(w3, d, s); s = fma(w4, e, s);
+    return min(max(s, min(min(min(a, b), min(c, d)), e)), max(max(max(a, b), max(c, d)), e));
+}
+void main()
+{
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy), pix = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 base = ivec2(3 * BLOCK_X / 2, 3 * BLOCK_Y / 2) * ivec2(gl_WorkGroupID.xy) - 2;
+    for (int i = lid.y * BLOCK_X + lid.x; i < TILE_W * TILE_H; i += BLOCK_X * BLOCK_Y)
+    {
+        const ivec2 at = clamp(base + ivec2(i % TILE_W, i / TILE_W), ivec2(0), p.srcSize - 1);
+        const uint w = src.w[at.y * p.srcSize.x + at.x];
+#if LDR
+        tile[i] = f16vec4(vec4(float(w & 2047u) * (1.0 / 2047.0), float((w >> 11) & 2047u) * (1.0 / 2047.0), float(w >> 22) * (1.0 / 1023.0), 0.0));
+#else
+        tile[i] = f16vec4(vec4(float(w & 2047u) * 0.0011968734906986356, float((w >> 11) & 2047u) * 0.0011968734906986356, float(w >> 22) * 0.002394916955381632, 0.0));
+#endif
+    }
+    memoryBarrierShared(); barrier();
+    const ivec2 c = ivec2(floor((vec2(pix) + 0.5) * 1.5)) - base;
+    for (int y = lid.y; y < TILE_H; y += BLOCK_Y)
+    {
+        const int o = y * TILE_W + c.x;
+        rows[y * BLOCK_X + lid.x].rgb = filter5(tile[o - 2].rgb, tile[o - 1].rgb, tile[o].rgb, tile[o + 1].rgb, tile[o + 2].rgb, (pix.x & 1) != 0);
+    }
+    memoryBarrierShared(); barrier();
+    // After both shared barriers: borrowed images may extend beyond the feature's true output rectangle.
+    // M accepts even output dimensions and srcSize = outputSize/2*3, so this bounds check is exact.
+    if (3 * pix.x >= 2 * p.srcSize.x || 3 * pix.y >= 2 * p.srcSize.y) return;
+    const int o = c.y * BLOCK_X + lid.x;
+#if LDR
+    const vec3 lin = vec3(filter5(rows[o - 2 * BLOCK_X].rgb, rows[o - BLOCK_X].rgb, rows[o].rgb, rows[o + BLOCK_X].rgb, rows[o + 2 * BLOCK_X].rgb, (pix.y & 1) != 0));
+#else
+    const vec3 v = clamp(vec3(filter5(rows[o - 2 * BLOCK_X].rgb, rows[o - BLOCK_X].rgb, rows[o].rgb, rows[o + BLOCK_X].rgb, rows[o + 2 * BLOCK_X].rgb, (pix.y & 1) != 0)), 1e-4, 3.0);
+    const vec3 lin = (exp2(v * (1.0 / 0.36) * log2(10.0)) - 1.0) * (1.0 / 100.0) * (1.0 / (p.expo == 0.0 ? 1.0 : p.expo));
+#endif
+    const ivec2 r = clamp(ivec2(floor((vec2(pix) + 0.5) * p.out2rnd + p.rndOffs)), ivec2(0), p.colSize - 1) + p.colOrigin;
+    imageStore(outImg, p.outOrigin + pix, finalOutputValue(vec4(lin, texelFetch(colorTex, r, 0).a)));
+}

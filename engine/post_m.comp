@@ -1,0 +1,236 @@
+#version 460
+// d4r engine, preset M: the reconstruction, written from the algorithm in M_NOTES.md. Every pixel resamples the
+// frame's colour and the network's per-pixel outputs with the anisotropic Gaussians the network predicted for the
+// 3x3 render texels around it, picks the two most likely of three motion candidates, fetches the previous result
+// along them (bicubic) and blends it with the resampled colour.
+//
+// NGX ships two kernels with this exact body, differing only in the shared render-texel tile: rrlite_post_3_1
+// (10x16, reconstruction/render >= 3) and rrlite_post_3_2 (15x27, 1.5 <= reconstruction/render < 3, sized for the
+// worst case of its range, 1.5x). TILE_W/TILE_H select the tile for the engine's own 16x16-pixel block: 10x10
+// covers reconstruction/render >= 3; 11x11 covers render/reconstruction <= 0.45 with jitter in [-0.5, 0.5];
+// 15x15 covers the whole post_3_2 range (render/reconstruction <= 2/3).
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "normalized_store.glsl"
+// One invocation owns a vertical pixel pair; the dispatch still covers 16x16 reconstruction pixels.
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 colOrigin;
+    ivec2 hiSize, rndSize;
+    vec2 hi2rnd, rndOffs;   // render position of a pixel centre: centre * hi2rnd + rndOffs
+    vec2 invRnd;
+    float gain;             // of the first gate
+    uint reset;
+    float expo, expoPrev;
+} p;
+layout(set = 0, binding = 1) uniform sampler2D colorTex;        // render resolution, linear HDR
+layout(set = 0, binding = 2) uniform sampler2D mixTex;          // three candidate weights
+layout(set = 0, binding = 3) uniform sampler2D gateTex;         // three gates
+layout(set = 0, binding = 4) uniform sampler2D covTex;          // covariance (xx, yy, xy)
+layout(set = 0, binding = 5) uniform sampler2D histTex;         // previous result, range-compressed; bilinear
+layout(set = 0, binding = 6) uniform sampler2D mvATex;
+layout(set = 0, binding = 7) uniform sampler2D mvBTex;
+layout(set = 0, binding = 8) uniform sampler2D mvCTex;          // bilinear
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D histOut;
+layout(set = 0, binding = 10, rgba32f) uniform writeonly image2D halfOut;
+layout(set = 0, binding = 11, std430) writeonly buffer Packed { uint w[]; } packed;
+// the render-texel tile around the block; the taps of every pixel stay inside it (see the file comment)
+#ifndef TILE_W
+#define TILE_W 10
+#endif
+#ifndef TILE_H
+#define TILE_H 10
+#endif
+shared f16vec4 tile0[TILE_W * TILE_H], tile1[TILE_W * TILE_H], tile2[TILE_W * TILE_H];
+shared vec3 colSum[128];           // vertical pair first, then the neighbouring column
+const float L10 = 3.3219281;        // log2(10)
+// LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no exposure and no
+// range compression anywhere.
+#ifndef LDR
+#define LDR 0
+#endif
+#if LDR
+vec3 compress(vec3 v) { return v; }
+vec3 expand(vec3 v) { return v; }
+const float PACK = 1.0;
+#else
+vec3 compress(vec3 v)
+{
+    precise vec3 mapped = fma(v, vec3(100.0), vec3(1.0));
+    precise vec3 log10 = log2(max(mapped, vec3(1e-4))) * 0.30103;
+    precise vec3 compressed = log10 * 0.36;
+    return compressed;
+}
+vec3 expand(vec3 v)
+{
+    precise vec3 scaled = clamp(v, 1e-4, 3.0) * (1.0 / 0.36);
+    precise vec3 exponent = scaled * L10;
+    return (exp2(exponent) - 1.0) * (1.0 / 100.0);
+}
+const float PACK = 0.4081632490158081;
+#endif
+ivec2 colourTexel(ivec2 t)
+{
+    return ivec2(t.x > 0 ? min(p.colOrigin.x + t.x, p.colOrigin.x + p.rndSize.x - 1) : p.colOrigin.x,
+                 t.y > 0 ? min(p.colOrigin.y + t.y, p.colOrigin.y + p.rndSize.y - 1) : p.colOrigin.y);
+}
+// the previous result at q (pixels), five bilinear taps of a Catmull-Rom filter
+vec3 history(vec2 q)
+{
+    const vec2 inv = 1.0 / vec2(p.hiSize);
+    const vec2 base = floor(q - 0.5) + 0.5, t = clamp(q - base, 0.0, 1.0), t2 = t * t, t3 = t * t2;
+    const vec2 w0 = t2 - (t + t3) * 0.5, w1 = (t3 * 1.5 - t2 * 2.5) + 1.0, w3 = (t3 - t2) * 0.5, w2 = ((1.0 - w0) - w1) - w3;
+    const vec2 w12 = w1 + w2, mid = inv * (base + w2 / w12), lo = inv * (base - 1.0), hi = inv * (base + 2.0);
+    const float a = w0.x * w12.y, b = w0.y * w12.x, c = w12.x * w12.y, d = w3.y * w12.x, e = w3.x * w12.y;
+    const vec3 s = fma(textureLod(histTex, vec2(hi.x, mid.y), 0.0).rgb, vec3(e), fma(textureLod(histTex, vec2(mid.x, hi.y), 0.0).rgb, vec3(d),
+                   fma(textureLod(histTex, mid, 0.0).rgb, vec3(c), fma(textureLod(histTex, vec2(mid.x, lo.y), 0.0).rgb, vec3(b),
+                   textureLod(histTex, vec2(lo.x, mid.y), 0.0).rgb * a))));
+    return s * (1.0 / (e + (d + (c + (b + a)))));
+}
+void main()
+{
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy), gid = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 origin = ivec2(p.hi2rnd * vec2(16 * ivec2(gl_WorkGroupID.xy))) - 2;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    const int li = lid.y * 16 + lid.x;
+#if TILE_W * TILE_H > 256
+#error "the tile fill assumes at most two tile entries per thread"
+#endif
+    // 128 invocations cover the tile in at most two entries each (TILE_W*TILE_H <= 225 here)
+    for (int e = 0; e < 2; ++e)
+    {
+        const int te = e * 128 + li;
+        if (te < TILE_W * TILE_H)
+        {
+            const ivec2 rel = origin + ivec2(te % TILE_W, te / TILE_W);
+            const ivec2 t = ivec2(rel.x > 0 ? min(rel.x, p.rndSize.x - 1) : 0, rel.y > 0 ? min(rel.y, p.rndSize.y - 1) : 0);
+            const vec3 c = e1 * texelFetch(colorTex, colourTexel(rel), 0).rgb;
+            vec3 l;
+#if LDR
+            for (int k = 0; k < 3; ++k) l[k] = isinf(c[k]) || isnan(c[k]) ? 0.0 : min(c[k], 32752.0);
+#else
+            for (int k = 0; k < 3; ++k) l[k] = max(isinf(c[k]) || isnan(c[k]) ? 1.0 : fma(min(c[k], 32752.0), 100.0, 1.0), 1e-4);
+#endif
+            const vec4 m = texelFetch(mixTex, t, 0), g = texelFetch(gateTex, t, 0), cov = texelFetch(covTex, t, 0);
+#if LDR
+            tile0[te] = f16vec4(vec4(l, m.x));
+#else
+            precise vec3 log10 = log2(l) * 0.30103;
+            precise vec3 compressed = log10 * 0.36;
+            tile0[te] = f16vec4(vec4(compressed, m.x));
+#endif
+            tile1[te] = f16vec4(m.y, m.z, g.x, g.y);
+            tile2[te] = f16vec4(vec4(g.z, cov.x * -0.721325, cov.y * -0.721325, cov.z * -1.44265));
+        }
+    }
+    memoryBarrierShared(); barrier();
+    // the two rows of the original 16x16 workgroup's row pair; y0 is even, so the odd row keeps the even row's
+    // three render texel rows and its own-cell residual rounding exactly as in the 16x16 shader
+    const int y0 = 2 * gid.y;
+    const bool inside0 = gid.x < p.hiSize.x && y0 < p.hiSize.y;
+    vec3 outA0 = vec3(0.0), outA1 = vec3(0.0);
+    for (int r = 0; r < 2; ++r)
+    {
+        const ivec2 pix = ivec2(gid.x, y0 + r);
+        vec3 outA = vec3(0.0);
+        const bool inside = pix.x < p.hiSize.x && pix.y < p.hiSize.y;
+        if (inside)
+        {
+            const vec2 centre = vec2(pix) + 0.5;
+            const vec2 pos = fma(centre, p.hi2rnd, p.rndOffs);
+            // NVIDIA's kernel handles rows in pairs and gives the odd row the even row's three texel rows
+            const float evenY = fma(float(pix.y & ~1) + 0.5, p.hi2rnd.y, p.rndOffs.y);
+            const ivec2 near = ivec2(floor(pos)), base = ivec2(floor(pos.x - 0.5), floor(evenY - 0.5));
+            f16vec2 d0 = f16vec2((vec2(base) + 0.5) - pos);
+            if ((pix.y & 1) != 0)
+            {
+                // Native paired rows round the odd row's own-cell residual first, then adjust it in f16.
+                // Casting the even-cell residual once changes Gaussian weights at half-rounding boundaries.
+                const int ownBaseY = int(floor(pos.y - 0.5));
+                if (ownBaseY != base.y)
+                    d0.y = float16_t((float(ownBaseY) + 0.5) - pos.y) - float16_t(1.0);
+            }
+            f16vec4 a0 = f16vec4(0.0), a1 = f16vec4(0.0);
+            float16_t a2 = float16_t(0.0);
+            float W = 0.0;
+            for (int i = -1; i <= 1; ++i)
+            {
+                const float16_t dx = d0.x + float16_t(i), sq = dx * dx;
+                for (int j = -1; j <= 1; ++j)
+                {
+                    const int k = (base.y - origin.y + j) * TILE_W + (base.x - origin.x + i);
+                    const f16vec4 t2 = tile2[k];
+                    const float16_t dy = d0.y + float16_t(j);
+                    precise float16_t e = (sq * t2.y + (dy * dy) * t2.z) + (dx * dy) * t2.w;
+                    const float w = exp2(float(e));
+                    const float16_t wh = float16_t(w);
+                    W += w;
+                    a0 = fma(f16vec4(wh), tile0[k], a0); a1 = fma(f16vec4(wh), tile1[k], a1); a2 = fma(wh, t2.x, a2);
+                }
+            }
+            const float inv = 1.0 / W;
+            const vec3 cur = inv * vec3(a0.rgb), m = inv * vec3(a0.w, a1.x, a1.y), g = inv * vec3(a1.z, a1.w, a2);
+            // the two most likely motion candidates
+            const vec2 mvA = texelFetch(mvATex, near, 0).xy, mvB = texelFetch(mvBTex, near, 0).xy, mvC = textureLod(mvCTex, pos * p.invRnd, 0.0).xy;
+            vec3 big = vec3(mvA, m.x), small = vec3(mvC, m.y);
+            if (big.z < small.z) { const vec3 t = big; big = small; small = t; }
+            vec3 second = !(small.z < m.z) ? small : vec3(mvB, m.z);
+            if (big.z < second.z) { const vec3 t = big; big = second; second = t; }
+            const float k1 = clamp(fma(big.z, 1.1, -0.05), 0.0, 1.0), k2 = clamp(fma(second.z, 1.1, -0.05), 0.0, 1.0);
+            const float kn = 1.0 / max(k1 + k2, 1e-10);
+            float b2 = k2 * kn, b1 = k1 * kn;
+            if (b2 < (1.0 / 255.0)) { b2 = 0.0; b1 = 1.0; }
+            const vec2 size = vec2(p.hiSize);
+            const vec2 q1 = centre + big.xy;
+            // the fallback colour is only fetched where the history sample leaves the image or the history was reset:
+            // the value is the same either way, so computing it in the branch saves the fetch on ordinary pixels
+            const bool out1 = q1.x < 0.0 || q1.y < 0.0 || q1.x > size.x || q1.y > size.y || p.reset != 0u;
+            const vec3 h1 = out1 ? compress(e2 * texelFetch(colorTex, colourTexel(near), 0).rgb) : history(q1);
+            vec3 h2 = vec3(0.0);
+            if (b2 > 0.0)
+            {
+                const vec2 q2 = centre + second.xy;
+                if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
+                    h2 = out1 ? h1 : compress(e2 * texelFetch(colorTex, colourTexel(near), 0).rgb);
+                else h2 = history(q2);
+            }
+            const vec3 hist = e1 * (expand(fma(vec3(b1), h1, b2 * h2)) * (1.0 / e2));
+            const vec3 lin = expand(cur);
+            const float g0 = clamp(p.gain * W * g.x, 0.0, 1.0);
+            const float ga = fma(g0, 1.0 - g.y, g.y), gb = fma(g0, 1.0 - g.z, g.z);
+            outA = fma(lin - hist, vec3(ga), hist);
+            if (isinf(outA.x + outA.y + outA.z) || isnan(outA.x + outA.y + outA.z)) outA = lin;
+            vec3 outB = fma(lin - hist, vec3(gb), hist);
+            if (isinf(outB.x + outB.y + outB.z) || isnan(outB.x + outB.y + outB.z)) outB = lin;
+            imageStore(histOut, pix, vec4(compress(outA), 0.0));
+            // precise: the reference rounds compress(outB) * PACK to f32 (mul.ftz.f32) and only then scales it with an
+            // fma. Without the qualifier RADV folds the constant PACK*2047 into one f32 constant and reassociates the
+            // chain, which biases the scaled value by up to one ulp and flips the 11-11-10 truncation at ~2e-5 of
+            // pixels (178 of 8.29M on the captured frame, all one step).
+            precise vec3 pk = compress(outB) * PACK;
+            const uint r = uint(min(max(fma(pk.r, 2047.0, 0.5), 0.0), 2047.0)), gg = uint(min(max(fma(pk.g, 2047.0, 0.5), 0.0), 2047.0)),
+                       b = uint(min(max(fma(pk.b, 1023.0, 0.5), 0.0), 1023.0));
+            packed.w[pix.y * p.hiSize.x + pix.x] = r | (gg << 11) | (b << 22);
+        }
+        if (r == 0) outA0 = outA; else outA1 = outA;
+    }
+    // the half-resolution mean of the new history. The reference adds a column's two rows first (the thread's own
+    // pair) and then the paired column (a shfl.sync.bfly of that sum); the row pair's vertical sum is materialised
+    // here and the even x lane adds the neighbouring column's sum, so the addition order is the same.
+    colSum[li] = outA0 + outA1;
+    memoryBarrierShared(); barrier();
+    if (inside0 && (lid.x & 1) == 0)
+    {
+        const bool x1 = gid.x + 1 < p.hiSize.x, y1 = y0 + 1 < p.hiSize.y;
+        vec3 sum = colSum[li];
+        float n = y1 ? 2.0 : 1.0;
+        if (x1) { sum += colSum[li + 1]; n += y1 ? 2.0 : 1.0; }
+        // precise: the reference keeps compress()'s first fma (mean * 100 + 1) fused. Passing the mean as the
+        // product chain sum * (1/n) lets RADV evaluate that multiply and add with separate roundings in this
+        // shader, which lands the mapped value one ulp high and flips the 10-bit code at knife-edge pixels
+        // (1 of 2.07M on the captured frame). Materialising the mean first keeps the fma fused.
+        precise vec3 halfMean = sum * (1.0 / n);
+        imageStore(halfOut, ivec2(gid.x, y0) >> 1, vec4(unorm10Value(compress(halfMean) * PACK), 0.0));
+    }
+}
