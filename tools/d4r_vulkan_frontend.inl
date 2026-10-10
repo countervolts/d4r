@@ -441,7 +441,7 @@ static void native_vk_run(Feature* feature, NativeVkFrame* frame)
                 staging.width = p.image.width; staging.height = p.image.height;
                 staging.format = p.format;
                 staging.layout.Footprint.RowPitch = static_cast<UINT>(p.rowBytes);
-                stage_plane(static_cast<Plane>(i), staging, slot.host[i], nullptr, i);
+                stage_plane(static_cast<Plane>(i), staging, slot.host[i], nullptr, i, 0);
             }
             auto& p = frame->params;
             const auto staged = ProfileClock::now();

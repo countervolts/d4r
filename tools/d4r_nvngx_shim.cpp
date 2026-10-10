@@ -7231,7 +7231,8 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
     // feature 13; the NGX core dispatches the second to the denoiser it loaded, and is
     // offered feature 13 only once it has reported that denoiser working.
     const bool rayReconstruction = featureId == NGX_FEATURE_RAY_RECONSTRUCTION;
-    if (featureId != NGX_FEATURE_SUPER_SAMPLING && !rayReconstruction)
+    // The native Vulkan frontend stages only Super Sampling's four inputs, not the denoiser's guides.
+    if ((featureId != NGX_FEATURE_SUPER_SAMPLING && !rayReconstruction) || (rayReconstruction && nativeVulkan))
     {
         logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unsupported", featureId);
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;

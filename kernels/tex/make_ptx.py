@@ -708,16 +708,16 @@ SWIN_DEBUG_STAGES = {
 # Per-layer extra debug stages, so a layer can add its own without editing this file:
 # kernels/rr/swin_<layer>_debug_stages.py exposing stages() -> {name: (line, [regs])}. They are keyed
 # by (layer, stage) because two layers can use the same stage name; the entries above stay unkeyed
-# and belong to enc0.
-for _extra in sorted((Path(__file__).resolve().parent.parent / "rr").glob("swin_*_debug_stages.py")):
-    _layer = _extra.stem[len("swin_"):-len("_debug_stages")]
-    _spec = importlib.util.spec_from_file_location(_extra.stem, _extra)
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    for _stage, _where in _mod.stages().items():
-        SWIN_DEBUG_STAGES[(_layer, _stage)] = _where
-
-
+# and belong to enc0. Loaded only when a debug stage is requested: some read the denoiser's PTX
+# corpus, which builds that do not touch the denoiser do not have.
+def load_layer_debug_stages():
+    for extra in sorted((Path(__file__).resolve().parent.parent / "rr").glob("swin_*_debug_stages.py")):
+        layer = extra.stem[len("swin_"):-len("_debug_stages")]
+        spec = importlib.util.spec_from_file_location(extra.stem, extra)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for stage, where in module.stages().items():
+            SWIN_DEBUG_STAGES[(layer, stage)] = where
 
 
 def swin_debug_block(regs, entry="cuda_dldn_engine_swin_enc0_kernel", base=None):
@@ -762,6 +762,7 @@ def swin_debug(name):
     match = re.fullmatch(r"cuda_dldn_engine_swin_(\w+)_kernel", name)
     if not stage or match is None:
         return None
+    load_layer_debug_stages()
     where = SWIN_DEBUG_STAGES.get((match.group(1), stage))
     if where is None:
         where = SWIN_DEBUG_STAGES.get(stage)
