@@ -88,7 +88,8 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs = Path(temporary) / 'inputs'
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
-            for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh'):
+            for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh',
+                         'check_redistributable.py'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
             for name in ('LICENSE', 'NOTICE'):

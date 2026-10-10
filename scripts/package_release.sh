@@ -258,6 +258,10 @@ if [[ -n "${D4R_BUILD_INFO:-}" ]]; then
 fi
 sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
 
+# Last line of defence for the published zip: only what this variant contains, never values read from DLSS.
+python3 "$ROOT/scripts/check_redistributable.py" release "$VARIANT" "$STAGE" ||
+  { echo "refusing to build $NAME.zip" >&2; exit 2; }
+
 # One timestamp for every file (SOURCE_DATE_EPOCH, default the last commit): ZLUDA's kernel cache is keyed on
 # its library's size and mtime, so every extraction of the zip shares one cache.
 EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}"
