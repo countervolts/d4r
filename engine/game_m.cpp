@@ -23,7 +23,10 @@ GameUpscalerM::~GameUpscalerM() = default;
 // the game's inputs into the engine's images, and the frame's settings
 void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
     auto& g = *this;
-    const uint32_t w = g.width, h = g.height;
+    const uint32_t w = frame.renderWidth ? frame.renderWidth : g.width;
+    const uint32_t h = frame.renderHeight ? frame.renderHeight : g.height;
+    if (w < 64 || h < 64 || w > g.width || h > g.height)
+        throw std::runtime_error("render size exceeds the adapter's inputs or is below 64");
     if (!gameColorFormat(frame.color.format) || !gameMotionFormat(frame.motion.format) ||
         !gameDepthFormat(frame.depth.format, frame.depth.aspect) || !gameOutputFormat(frame.output.format))
         throw std::runtime_error("unsupported game texture format");
@@ -40,6 +43,7 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
     }
     g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, w, h, directColor, directMotion, directDepth);
     MFrameSettings s;
+    s.renderWidth = w; s.renderHeight = h;
     s.jitter[0] = frame.jitter[0]; s.jitter[1] = frame.jitter[1];
     s.motionScale[0] = frame.motionToRender[0]; s.motionScale[1] = frame.motionToRender[1];
     s.motionOffset[0] = frame.motionOffset[0]; s.motionOffset[1] = frame.motionOffset[1];

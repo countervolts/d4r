@@ -32,7 +32,7 @@ frame color/depth/motion ──► Engine input stage ──► 11 fused Swin la
 - Input images are borrowed Vulkan views. The caller provides the device, synchronization, and command buffer,
   so a future game adapter can schedule inference with its own rendering work.
 - Per-frame parameters include exposure, jitter, motion conventions, reset, and each layer's window shifts.
-  Window shifts can change without rebuilding shaders or buffers. Resolution changes require a new `Engine`.
+  Window shifts and input resolution can change without rebuilding shaders or buffers. Output resolution changes require a new `Engine`.
 - Frame parameters and window shifts are written by commands inside the frame's own command buffer, so a frame can
   be recorded while earlier ones are still queued on the GPU. Each input/output view and layout combination gets
   immutable descriptors, cached and reused; first use allocates descriptors, steady recording does not. Borrowed
@@ -620,6 +620,38 @@ but reduced it by 0.83 dB on the independent capture. All-explicit gains improve
 consistently, so no accuracy variant became the default. `--unfold-gains` remains available;
 the retained enc0 change preserves numerical behavior on this device.
 
+## Dynamic input resolution (K, L and M)
+
+The engine accepts changing render subrect dimensions with a fixed output size. K keeps its output-sized
+network and temporal history, updates the frame's motion conversion and reconstruction table, and reserves
+conversion inputs up to the output size. Use a K package with all sixteen reconstruction tables for changing
+upscaling ratios; older single-table packages cannot match NGX at every ratio.
+
+L and M update the Vulkan network's active token grid, exposure grid and reconstruction tier per frame.
+Their input and history planes reserve the constructor's render capacity; the shim reserves output-sized
+capacity for the Vulkan path. Bilinear reads clamp to the active rectangle. A render-size change resets
+L/M temporal history. Input dimensions must be at least 64 on each axis and cannot exceed the output.
+Standalone callers set `GameFrameM::renderWidth/renderHeight` or `MFrameSettings::renderWidth/renderHeight`;
+zero keeps the constructor size.
+
+L/M's HIP network retains its fixed constructor grid. When a feature renders at another size, the shim uses
+one Vulkan engine for the changing sizes and retains the original HIP engine and shared buffers until queued
+command lists retire. Returning to the original size resumes HIP with reset history. This uses additional
+VRAM once the Vulkan engine is allocated. K's HIP network remains usable across all input-size changes.
+
+Rebuild L and M packages with the current `compile_m.py` (`D4RL0002` / `D4RM0004`). Earlier packages retain fixed-size support but lack
+active-rectangle sampling, so a size change uses the CUDA fallback. The dynamic regression can be run independently:
+
+```sh
+build/native-engine/test-game --dynamic-ml PATH_TO_M_OR_L_MODEL
+```
+
+On the RX 9070 XT, six-frame HDR sequences for both L and M pass shrinking/growing input sizes,
+Quality/Performance tier changes and queued direct/copy comparisons. Direct and copied inputs are byte-identical,
+and implicit resize resets match explicit resets. Increasing allocation capacity changes a few recurrent pixels
+through normalized sampling and FP8 rounding: RMSE is 7.29e-6 (M) and 8.12e-6 (L), within the test's
+5e-5 RMSE and 1% per-channel error limits. This is an adapter regression, not an in-game or NGX parity claim.
+
 ## Preset M (runtime and shim path exist; experimental)
 
 Preset M (DLSS 4.5, `rrlite_*`) is a different pipeline: an input stage that embeds 2x2-pixel tokens, a network of
@@ -687,7 +719,7 @@ each), and the engine output is byte-identical for each too. The shim records
 preset M through `engine_evaluate_m` when `[Engine] Enabled` is set and the model is in `engine\m` next to the DLL
 (or `D4R_ENGINE_MODEL_M_DIR`).
 
-M packages now use `D4RM0003`. Rebuild with the current `compile_m.py`: the blocked FP8 operands,
+M packages now use `D4RM0004` (L: `D4RL0002`). Rebuild with the current `compile_m.py`: the blocked FP8 operands,
 RGBA32F half-history bindings and 8×64 downsample dispatch must match the runtime. `D4RM0001` and
 `D4RM0002` packages are rejected rather than silently loading incompatible shaders. Native `hipnet.bin`
 remains `D4RMHIP1`; its tensor and weight layout is unchanged.
@@ -859,7 +891,7 @@ per-pixel head (expansion), where M has single folded products, and a reconstruc
 history blended in linear light. `L_NOTES.md` has the algorithms. The network is M's ten layers with L's weights.
 
 The runtime is M's (`MModel`, `MEngine`, `GameUpscalerM`, `d4r-m`): `compile_m.py` recognises a capture of preset L by
-its unfolded kernels and writes an L model directory (`offsets.bin` `D4RL0001`: the input and expansion stages as
+its unfolded kernels and writes an L model directory (`offsets.bin` `D4RL0002`: the input and expansion stages as
 layer blocks of `layer_m.comp` KIND 3 and 4, and L's five constants), which `MModel` loads as preset L
 (`isPresetL()`). The shim runs preset 12 with the model in `engine\l` / `engine\l-ldr`; the log says `engine backend
 (L): feature N runs preset L in the game's command list`.

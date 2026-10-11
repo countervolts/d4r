@@ -192,6 +192,7 @@ struct MFrameSettings {
     float motionOffset[2] = {0, 0}; // jittered motion vectors: jitter - previous jitter, in motion texel units
     bool reset = false;
     bool depthInverted = true;
+    uint32_t renderWidth = 0, renderHeight = 0; // zero uses the constructor size; otherwise within its capacity
 };
 class MModel {
 public:
@@ -203,7 +204,8 @@ public:
     bool uploadRecorded() const;
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
-    bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0001): MEngine then runs preset L
+    bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
+    bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
@@ -215,6 +217,8 @@ private:
 // rounded up to 32, halved).
 class MEngine {
 public:
+    // Constructor render dimensions allocate capacity. Vulkan frames may use smaller active dimensions;
+    // external networks retain their constructor grid. A size change resets temporal history.
     MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, const ExternalNetwork* external = nullptr);
     static VkDeviceSize networkBufferBytes(uint32_t renderWidth, uint32_t renderHeight);
     ~MEngine();

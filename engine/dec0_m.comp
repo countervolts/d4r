@@ -133,6 +133,8 @@ void main()
         if (p.reset == 0u && all(greaterThanEqual(f, vec2(0.0))) && all(lessThanEqual(f, p.hiSize))) {
             precise vec2 normalized = fma(f, 1.0 / p.hiSize, p.histOffs * (1.0 / vec2(p.size)));
             precise vec2 texels = normalized * vec2(p.size);
+            if (any(notEqual(textureSize(featTex, 0), p.size)))
+                texels = clamp(texels, vec2(0.5), vec2(p.size) - 0.5);
             precise vec2 uv = texels * p.renderInv;
             hist = f16vec4(roundHalfValue(textureLod(featTex, uv, 0.0)));
         }

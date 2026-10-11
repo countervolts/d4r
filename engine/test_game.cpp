@@ -72,6 +72,7 @@ struct Case {
     bool rgb10Output = false, rotateOutputFormats = false;
     bool regularDepth = false, swapDepth = false; // K: depth convention; near and far values exchanged
     float exposureScale = 1, preExposure = 1;     // K: the game's factors on the measured exposure
+    bool dynamicM = false, largerCapacityM = false, explicitSizeResetM = false;
     bool displayMotion = false;                   // K: motion vectors at output resolution, in output pixels
     bool gameExposure = false; float exposureValue = 1; // K: the game's 1x1 exposure texture instead of measurement
 };
@@ -201,7 +202,7 @@ std::vector<char> evaluateM(Context& c, d4r::MModel& model, const Case& test, un
         }
         std::memset(output[slot]->upload.map,0,output[slot]->upload.size);
     }
-    d4r::GameUpscalerM adapter(model,c.physical,c.device,ow,oh,rw,rh);
+    d4r::GameUpscalerM adapter(model,c.physical,c.device,ow,oh,test.largerCapacityM ? ow : rw,test.largerCapacityM ? oh : rh);
     const auto bytes = std::max({output[0]->upload.size, output[1]->upload.size, output[2]->upload.size});
     Buffer results(c,bytes*count);
     std::memset(results.map,0,results.size);
@@ -219,7 +220,12 @@ std::vector<char> evaluateM(Context& c, d4r::MModel& model, const Case& test, un
         const unsigned frameMask = rotateInputs ? rotatingMasks[frame] : mask;
         f.color=color[slot]->game(0,0,frameMask&1,layout); f.motion=motion[slot]->game(0,0,frameMask&2,layout);
         f.depth=depth[slot]->game(0,0,frameMask&4,layout); f.output=output[slot]->game(0,0,frameMask&8,VK_IMAGE_LAYOUT_GENERAL);
-        f.reset=frame==0||frame==4;
+        if (test.dynamicM) {
+            const uint32_t widths[count] = {640, 608, 448, 448, 640, 640};
+            const uint32_t heights[count] = {360, 344, 256, 256, 360, 360};
+            f.renderWidth = widths[frame]; f.renderHeight = heights[frame];
+        }
+        f.reset=frame==0||frame==4||(test.explicitSizeResetM && (frame==1||frame==2));
         f.jitter[0]=frame%2 ? .25f : -.125f; f.jitter[1]=frame%3 ? .375f : -.25f;
         adapter.record(c.command,f);
         auto r=region(ow,oh); r.bufferOffset=frame*bytes;
@@ -241,9 +247,46 @@ void expectEqual(const std::vector<char>& expected,const std::vector<char>& actu
     std::cout<<name<<": byte-identical (six temporal frames)\n";
 }
 } // namespace
+// Normalized bilinear sampling can round differently when the allocation extent changes.
+// FP8 quantization can amplify a rounding difference in a few recurrent pixels.
+// Require less than 1% per-channel error and at least 86 dB PSNR at peak 1.
+void expectCapacityEquivalent(const std::vector<char>& expected, const std::vector<char>& actual, const std::string& name) {
+    if (expected.size() != actual.size()) throw std::runtime_error(name + ": size mismatch");
+    double squared = 0; float relative = 0;
+    for (size_t i = 0; i < expected.size()/2; ++i) {
+        const float a = float(reinterpret_cast<const _Float16*>(expected.data())[i]);
+        const float b = float(reinterpret_cast<const _Float16*>(actual.data())[i]);
+        const float error = std::abs(a-b);
+        if (!std::isfinite(error)) throw std::runtime_error(name + ": nonfinite output");
+        squared += double(error)*error;
+        relative = std::max(relative,error/std::max(1.f,std::abs(a)));
+    }
+    const double rmse = std::sqrt(squared/(expected.size()/2));
+    if (relative > .01f || rmse > 5e-5)
+        throw std::runtime_error(name + ": capacity changed the result (relative " + std::to_string(relative) + ", RMSE " + std::to_string(rmse) + ")");
+    std::cout<<name<<": RMSE "<<rmse<<", max relative error "<<relative<<"\n";
+}
+void checkDynamicM(Context& c, d4r::MModel& m) {
+    Case dynamic; dynamic.dynamicM = true;
+    const auto reference = evaluateM(c,m,dynamic,0,false);
+    expectEqual(reference,evaluateM(c,m,dynamic,15,true),"M/L dynamic sizes with queued direct inputs");
+    dynamic.explicitSizeResetM = true;
+    expectEqual(reference,evaluateM(c,m,dynamic,0,true),"M/L size changes reset history automatically");
+    dynamic.explicitSizeResetM = false;
+    dynamic.largerCapacityM = true;
+    expectCapacityEquivalent(reference,evaluateM(c,m,dynamic,0,true),"M/L dynamic sizes within output-sized capacity");
+    expectCapacityEquivalent(reference,evaluateM(c,m,dynamic,15,true),"M/L dynamic sizes with larger capacity and direct inputs");
+}
 int main(int argc,char** argv) {
     try {
-        if(argc!=2 && argc!=3) throw std::runtime_error("usage: test-game K_MODEL_DIR [M_MODEL_DIR]");
+        if (argc == 3 && !std::strcmp(argv[1], "--dynamic-ml")) {
+            Context c; c.create(2,true);
+            d4r::MModel m(c.physical,c.device,argv[2],c.cache);
+            c.begin(); m.recordUpload(c.command); c.submit();
+            checkDynamicM(c,m);
+            return 0;
+        }
+        if(argc!=2 && argc!=3) throw std::runtime_error("usage: test-game K_MODEL_DIR [M_MODEL_DIR] | --dynamic-ml M_OR_L_MODEL_DIR");
         // The reconstruction table NGX itself selected at these sizes (measured through its launch arguments),
         // on both sides of every threshold and for unequal axis ratios: {render w, h, output w, h, table}.
         {
@@ -332,6 +375,7 @@ int main(int argc,char** argv) {
         if (argc==3) {
             d4r::MModel m(c.physical,c.device,argv[2],c.cache);
             c.begin();m.recordUpload(c.command);c.submit();
+            checkDynamicM(c, m);
             for (bool depthAspect:{false,true}) {
                 Case test;test.depthAspect=depthAspect;
                 auto reference=evaluateM(c,m,test,0,false);

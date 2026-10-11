@@ -5,16 +5,18 @@
 
 namespace d4r {
 struct GameFrameM {
-    GameImage color, depth, motion, output;     // as for GameUpscaler; views are not used (inputs are always copied)
+    GameImage color, depth, motion, output;     // as for GameUpscaler; compatible views at origin zero may be borrowed
     float jitter[2] = {0, 0};
     float motionToRender[2] = {1, 1};           // (motion texel + motionOffset) * this = render pixels
     float motionOffset[2] = {0, 0};             // jittered motion vectors: jitter - previous jitter, motion texel units
     bool reset = false;
     bool depthInverted = true;
+    uint32_t renderWidth = 0, renderHeight = 0; // zero selects the adapter capacity
 };
 class GameUpscalerM {
 public:
-    // The model must outlive this object. The render size is fixed and at most half the output size.
+    // The model must outlive this object. Constructor render dimensions allocate capacity, at most the output size.
+    // Vulkan frames may change active size within that capacity; external networks keep a fixed grid.
     GameUpscalerM(MModel& model, VkPhysicalDevice physical, VkDevice device, uint32_t outputWidth, uint32_t outputHeight,
                   uint32_t renderWidth, uint32_t renderHeight, const ExternalNetwork* external = nullptr);
     ~GameUpscalerM(); // only once every recorded frame has completed on the GPU

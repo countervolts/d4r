@@ -77,9 +77,9 @@ struct MModel::Impl {
     bool planes = false;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, ldr = false;
-    // preset L (offsets.bin D4RL0001, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
+    // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
     // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
-    bool presetL = false;
+    bool presetL = false, dynamicResolution = false;
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t dither16 = 0;
     float lConst[5]{};
@@ -90,9 +90,10 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     auto& m = *impl;
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
-    m.presetL = head.size() >= 8 && !std::memcmp(head.data(), "D4RL0001", 8);
+    m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
+    m.dynamicResolution = head.size() >= 8 && (!std::memcmp(head.data(), "D4RM0004", 8) || !std::memcmp(head.data(), "D4RL0002", 8));
     const size_t expect = m.presetL ? 40 + (MLayers + 2) * 74 * 4 : 16 + 5 * 4 + MLayers * 74 * 4;
-    if (head.size() != expect || (!m.presetL && std::memcmp(head.data(), "D4RM0003", 8))) throw std::runtime_error("incompatible M/L model metadata");
+    if (head.size() != expect || (!m.presetL && !m.dynamicResolution && std::memcmp(head.data(), "D4RM0003", 8))) throw std::runtime_error("incompatible M/L model metadata");
     uint32_t n8 = 0, n16 = 0;
     std::memcpy(&n8, head.data() + 8, 4); std::memcpy(&n16, head.data() + 12, 4);
     auto b8 = read(directory + "/weights8.bin"), b16 = read(directory + "/weights16.bin");
@@ -143,6 +144,7 @@ MModel::~MModel() = default;
 bool MModel::uploadRecorded() const { return impl->uploaded; }
 bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
+bool MModel::hasDynamicResolution() const { return impl->dynamicResolution; }
 bool MModel::isPresetL() const { return impl->presetL; }
 void MModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
@@ -155,7 +157,7 @@ void MModel::recordUpload(VkCommandBuffer cb) {
 
 struct MEngine::Impl {
     MModel::Impl& model;
-    uint32_t rw, rh, ow, oh, hw, hh, gw, gh;       // render, output, reconstruction, token pixel grid
+    uint32_t rw, rh, maxRw, maxRh, ow, oh, hw, hh, gw, gh;       // render, output, reconstruction, token pixel grid
     Buffer enc0P, dec0P, postP, downP, expP, expSums, expState, dummy, packed;
     std::array<Buffer, MLayers> layerP;
     Buffer tokens, skip1, merged1, skip2, merged2, tubeA, tubeB, dec2Out, dec1Out;
@@ -199,7 +201,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     e.external = external != nullptr;
     if (renderWidth < 64 || renderHeight < 64 || outputWidth % 2 || outputHeight % 2 || outputWidth > 16384 || outputHeight > 16384)
         throw std::runtime_error("unsupported preset M dimensions");
-    e.rw = renderWidth; e.rh = renderHeight; e.ow = outputWidth; e.oh = outputHeight;
+    e.rw = e.maxRw = renderWidth; e.rh = e.maxRh = renderHeight; e.ow = outputWidth; e.oh = outputHeight;
     e.hw = outputWidth / 2 * 3; e.hh = outputHeight / 2 * 3;
     if (renderWidth > outputWidth || renderHeight > outputHeight)
         throw std::runtime_error("preset M render dimensions must not exceed the output");
@@ -212,7 +214,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     const VkBufferUsageFlags sb = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sbt = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     e.enc0P.create(d, sizeof(MEnc0Params), sbt); e.dec0P.create(d, sizeof(MDec0Params), sbt); e.postP.create(d, sizeof(MPostParams), sbt);
     e.downP.create(d, sizeof(MDownParams), sbt); e.expP.create(d, sizeof(ExposureParams), sbt);
-    e.expSums.create(d, VkDeviceSize((exposureGrid(renderWidth, outputWidth) + 31) / 32) * ((exposureGrid(renderHeight, outputHeight) + 31) / 32) * 4, sb);
+    e.expSums.create(d, VkDeviceSize((std::max(outputWidth / 2, 256u) + 31) / 32) * ((std::max(outputHeight / 2, 256u) + 31) / 32) * 4, sb);
     e.expState.create(d, 8, sbt); e.dummy.create(d, 256, sb);
     e.packed.create(d, VkDeviceSize(e.hw) * e.hh * 4, sb);
     auto tok = [&](Buffer& b, unsigned scale, unsigned channels) { b.create(d, VkDeviceSize(tw / scale) * (th / scale) * channels + 64, sb); };
@@ -325,17 +327,30 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
     if (finalOutput.view && finalOutput.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
         (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.downRgb10.handle))
         throw std::runtime_error("unsupported borrowed output format or missing RGB10A2 shader");
-    const bool reset = s.reset || e.frame == 0;
+    const uint32_t rw = s.renderWidth ? s.renderWidth : e.maxRw;
+    const uint32_t rh = s.renderHeight ? s.renderHeight : e.maxRh;
+    if (rw < 64 || rh < 64 || rw > e.maxRw || rh > e.maxRh)
+        throw std::runtime_error("render size exceeds the engine's capacity or is below 64");
+    if (!e.model.dynamicResolution && (rw != e.maxRw || rh != e.maxRh))
+        throw std::runtime_error("recompile the M/L model for dynamic render sizes");
+    if (e.external && (rw != e.maxRw || rh != e.maxRh))
+        throw std::runtime_error("external M/L network requires its constructor render size");
+    const bool reset = s.reset || e.frame == 0 || rw != e.rw || rh != e.rh;
+    e.rw = rw; e.rh = rh;
+    e.gw = (rw + 31) / 32 * 32; e.gh = (rh + 31) / 32 * 32;
+    e.quality = uint64_t(e.hw) < 3ull * rw || uint64_t(e.hh) < 3ull * rh;
+    e.compact = e.quality && e.model.postCompact.handle &&
+        20ull * rw <= 9ull * e.hw && 20ull * rh <= 9ull * e.hh;
     const bool L = e.model.presetL;
     const float fx = float(e.hw) / float(e.rw), fy = float(e.hh) / float(e.rh);
     e.enc0 = {{int32_t(e.rw), int32_t(e.rh)}, {2, 2}, {int32_t(e.gw / 2), int32_t(e.gh / 2)}, {s.jitter[0], s.jitter[1]}, {e.prevJitter[0], e.prevJitter[1]},
               {s.motionScale[0] * fx, s.motionScale[1] * fy}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
               L ? e.model.lConst[0] : 9.045065879821777f, L ? e.model.lConst[1] : 0.22356846928596497f,
-              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.rw), 1.f / float(e.rh)}};
+              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
     e.dec0 = {{int32_t(e.rw), int32_t(e.rh)}, int32_t(e.gw / 2), reset ? 1u : 0u, {s.jitter[0], s.jitter[1]}, {fx, fy}, {float(e.hw), float(e.hh)},
-              {e.prevJitter[0], e.prevJitter[1]}, L ? e.model.lConst[2] : 8.f, L ? e.model.lConst[3] : 0.07863261550664902f, {1.f / float(e.rw), 1.f / float(e.rh)}};
+              {e.prevJitter[0], e.prevJitter[1]}, L ? e.model.lConst[2] : 8.f, L ? e.model.lConst[3] : 0.07863261550664902f, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
     e.post = {{0, 0}, {int32_t(e.hw), int32_t(e.hh)}, {int32_t(e.rw), int32_t(e.rh)}, {1.f / fx, 1.f / fy}, {s.jitter[0], s.jitter[1]},
-              {1.f / float(e.rw), 1.f / float(e.rh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
+              {1.f / float(e.maxRw), 1.f / float(e.maxRh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
     e.down = {{int32_t(e.hw), int32_t(e.hh)}, {0, 0}, {0, 0}, {int32_t(e.rw), int32_t(e.rh)}, {float(e.rw) / float(e.ow), float(e.rh) / float(e.oh)}, {s.jitter[0], s.jitter[1]}, 1.f};
     const uint32_t sw = exposureGrid(e.rw, e.ow), sh = exposureGrid(e.rh, e.oh);
     const uint32_t bx = (sw + 31) / 32, by = (sh + 31) / 32;
@@ -435,14 +450,16 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     vkCmdUpdateBuffer(cb, e.postP.handle, 0, sizeof(e.post), &e.post); vkCmdUpdateBuffer(cb, e.downP.handle, 0, sizeof(e.down), &e.down);
     vkCmdUpdateBuffer(cb, e.expP.handle, 0, sizeof(e.exposure), &e.exposure);
     if (!e.external) for (unsigned l = 0; l < MLayers; ++l) {
-        const int32_t shifts[2] = {MShift[l] ^ int32_t((e.frame & 1u) * 2u), MShift[l]};
-        vkCmdUpdateBuffer(cb, e.layerP[l].handle, offsetof(MLayerParams, sx), sizeof(shifts), shifts);
+        const int32_t grid[4] = {int32_t(e.gw / 2 / MScale[l]), int32_t(e.gh / 2 / MScale[l]),
+                                MShift[l] ^ int32_t((e.frame & 1u) * 2u), MShift[l]};
+        vkCmdUpdateBuffer(cb, e.layerP[l].handle, 0, sizeof(grid), grid);
     }
     if (m.presetL) {
         // NGX alternates the horizontal window shift every frame: input stage (2, 2) / (0, 2), expansion (0, 0) / (2, 0)
-        const int32_t in[2] = {2 ^ int32_t((e.frame & 1u) * 2u), 2}, ex[2] = {int32_t((e.frame & 1u) * 2u), 0};
-        vkCmdUpdateBuffer(cb, e.enc0LP.handle, offsetof(MLayerParams, sx), sizeof(in), in);
-        vkCmdUpdateBuffer(cb, e.dec0LP.handle, offsetof(MLayerParams, sx), sizeof(ex), ex);
+        const int32_t in[4] = {int32_t(e.gw), int32_t(e.gh), 2 ^ int32_t((e.frame & 1u) * 2u), 2};
+        const int32_t ex[4] = {int32_t(e.gw), int32_t(e.gh), int32_t((e.frame & 1u) * 2u), 0};
+        vkCmdUpdateBuffer(cb, e.enc0LP.handle, 0, sizeof(in), in);
+        vkCmdUpdateBuffer(cb, e.dec0LP.handle, 0, sizeof(ex), ex);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, compute, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     uint32_t query = first;
@@ -479,7 +496,7 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     dispatch(cb, compact ? m.postCompact : (e.quality ? m.postQuality : m.post),
              e.postSets[i], (e.hw + 15) / 16, (e.hh + 15) / 16); nextStage(cb);
     stamp();
-    // D4RM0003's downsample workgroup covers 8x64 output pixels.
+    // D4RM0004's downsample workgroup covers 8x64 output pixels.
     dispatch(cb, e.rgb10Output ? m.downRgb10 : m.down, e.downSet, (e.ow + 7) / 8, (e.oh + 63) / 64);
     stamp();
     closeStages(cb);

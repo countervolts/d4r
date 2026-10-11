@@ -5,14 +5,15 @@ usage: compile_m.py CAPTURE_DIR OUT_DIR [--frame N]
   CAPTURE_DIR/replay must hold the frame's rrlite_enc0 and rrlite_dec0 launches and its ten Swin layer launches,
   with their weight allocations (D4R_CUDA_REPLAY_DUMP_DIR, filter `rrlite_`). A capture of preset M has the `_folded`
   input and expansion kernels; one of preset L (DLSS preset 12) has the unfolded ones, and gets an L model directory
-  (offsets.bin `D4RL0001`, L_NOTES.md): the same network, layer_m.comp's L input and expansion stages, post_m.comp's
+  (offsets.bin `D4RL0002`, L_NOTES.md): the same network, layer_m.comp's L input and expansion stages, post_m.comp's
   L reconstruction.
 Writes weights8.bin (the layers' FP8 matrices in the blocked fixed-16 tile layout of test_m.pack8, with the front-end
 enc0/dec0 matrices plain and NGX-ordered as their own stages read them), weights16.bin (f16 vectors and the dither
 table), offsets.bin and the compiled shaders. The weights are values read from NVIDIA's DLSS and are not redistributable
 with d4r; the shaders are d4r's own.
 """
-# D4RM0003 couples the blocked FP8 operands, RGBA32F half-history backing and 8x64 downsample dispatch;
+# D4RM0004 / D4RL0002 add active-rectangle sampling for dynamic input sizes.
+# D4RM0003 coupled the blocked FP8 operands, RGBA32F half-history backing and 8x64 downsample dispatch;
 # the previous package's shader workgroup dimensions are not interchangeable with this runtime.
 import argparse, glob, hashlib, json, os, struct, subprocess, sys
 from pathlib import Path
@@ -86,7 +87,7 @@ def main():
         layers.append((add8(b8), add16(b16), o))
     blob8, blob16 = np.concatenate(w8), np.concatenate(w16)
     blob8.tofile(a.output / 'weights8.bin'); blob16.tofile(a.output / 'weights16.bin')
-    head = struct.pack('<8sII', b'D4RM0003', blob8.size, blob16.size) + struct.pack('<5I', *enc0, *dec0)
+    head = struct.pack('<8sII', b'D4RM0004', blob8.size, blob16.size) + struct.pack('<5I', *enc0, *dec0)
     for o8, o16, o in layers: head += struct.pack('<2I72I', o8, o16, *o)
     (a.output / 'offsets.bin').write_bytes(head)
     def glsl(src, out, flags=()):
@@ -108,7 +109,7 @@ def main():
     elif marker.exists(): marker.unlink()
     for p in '01': glsl('exposure_k.comp', f'exposure_m{p}.spv', ['-DMODE=1', '-DPASS=' + p])
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv')) + sorted(a.output.glob('hip/*.hsaco'))
-    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RM0003', 'preset': 'M', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
+    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RM0004', 'preset': 'M', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
     print(f'Compiled native preset M model in {a.output} ({blob8.size} FP8 bytes, {blob16.size} bytes of f16 data)')
 
 
@@ -138,7 +139,7 @@ def compile_l(a, one, R):
     consts = (arg(f'rrlite_enc0_4x4_mvlo_{R}', 268), arg(f'rrlite_enc0_4x4_mvlo_{R}', 272), arg('rrlite_dec0_4x4', 160),
               arg('rrlite_dec0_4x4', 164), arg(next(k for k in (f'rrlite_post_3_1_mvlo_{R}', f'rrlite_post_3_2_mvlo_{R}')
                                                        if glob.glob(f'{a.capture}/replay/replay-*-{k}')), 120))
-    head = struct.pack('<8sIII5f', b'D4RL0001', blob8.size, blob16.size, dither, *consts)
+    head = struct.pack('<8sIII5f', b'D4RL0002', blob8.size, blob16.size, dither, *consts)
     for o8, o16, o in blocks: head += struct.pack('<2I72I', o8, o16, *o)
     (a.output / 'offsets.bin').write_bytes(head)
     def glsl(src, out, flags=()):
@@ -164,7 +165,7 @@ def compile_l(a, one, R):
     for stale in ('enc0_m.spv', 'dec0_m.spv', 'post_m.spv', 'post_m_q.spv', 'post_m_c.spv', 'enc0_m_planes.spv', 'dec0_m_planes.spv'):
         (a.output / stale).unlink(missing_ok=True)
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv')) + sorted(a.output.glob('hip/*.hsaco'))
-    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RL0001', 'preset': 'L', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
+    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RL0002', 'preset': 'L', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
     print(f'Compiled native preset L model in {a.output} ({blob8.size} FP8 bytes, {blob16.size} bytes of f16 data)')
 
 

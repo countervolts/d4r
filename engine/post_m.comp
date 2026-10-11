@@ -197,7 +197,10 @@ void main()
             const float inv = 1.0 / W;
             const vec3 cur = inv * vec3(a0.rgb), m = inv * vec3(a0.w, a1.x, a1.y), g = inv * vec3(a1.z, a1.w, a2);
             // the two most likely motion candidates
-            const vec2 mvA = texelFetch(mvATex, near, 0).xy, mvB = texelFetch(mvBTex, near, 0).xy, mvC = textureLod(mvCTex, pos * p.invRnd, 0.0).xy;
+            const vec2 mvPos = any(notEqual(textureSize(mvCTex, 0), p.rndSize))
+                ? clamp(pos, vec2(0.5), vec2(p.rndSize) - 0.5) : pos;
+            const vec2 mvA = texelFetch(mvATex, near, 0).xy, mvB = texelFetch(mvBTex, near, 0).xy,
+                       mvC = textureLod(mvCTex, mvPos * p.invRnd, 0.0).xy;
             vec3 big = vec3(mvA, m.x), small = vec3(mvC, m.y);
             if (big.z < small.z) { const vec3 t = big; big = small; small = t; }
             vec3 second = !(small.z < m.z) ? small : vec3(mvB, m.z);

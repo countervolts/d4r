@@ -1816,7 +1816,9 @@ struct Feature
     bool engineViewBudgetReported = false;
     std::vector<std::unique_ptr<EngineBorrowedView>> engineViews; // destroyed after engine descriptor pools
     std::unique_ptr<d4r::GameUpscaler> engine;
-    std::unique_ptr<d4r::GameUpscalerM> engineM; // preset M
+    std::unique_ptr<d4r::GameUpscalerM> engineM; // preset M/L, original network
+    std::unique_ptr<d4r::GameUpscalerM> engineMDynamic; // Vulkan at changing sizes; original HIP resources stay alive
+    unsigned int engineMLastWidth = 0, engineMLastHeight = 0;
     unsigned int engineMRenderWidth = 0, engineMRenderHeight = 0; // first evaluation's effective extent
     // Preset M and preset K with the network on the native HIP layers ([Engine] Network): the buffers shared
     // with HIP and the bridge's network. The game's list is split around the network, as for the CUDA backend's
@@ -5771,11 +5773,11 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     }
     if ((feature.flags & 0x2) == 0)
         return refuse("needs render-resolution motion vectors");
+    if (!model->hasDynamicResolution() && feature.engineM != nullptr &&
+        (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
+        return refuse("dynamic render sizes need a model rebuilt by the current compile_m.py");
     // NGX measures the exposure for this preset, so the AutoExposure flag, the game's exposure texture, the
     // pre-exposure and the exposure scale are all ignored here (CUDA output is identical for each of them).
-    if (feature.engineM != nullptr &&
-        (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
-        return refuse("changing the effective render resolution after initialization is not implemented");
     if (color == output || depth == output || motion == output)
         return refuse("input/output texture aliasing is not supported");
     d4r::GameFrameM game;
@@ -5824,7 +5826,10 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         game.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;
         game.motionOffset[1] = (p.jitterY - feature.engineJitter[1]) / p.mvScaleY;
     }
-    game.reset = p.reset != 0 || feature.engineM == nullptr;
+    game.renderWidth = p.renderWidth;
+    game.renderHeight = p.renderHeight;
+    game.reset = p.reset != 0 || feature.engineM == nullptr ||
+        p.renderWidth != feature.engineMLastWidth || p.renderHeight != feature.engineMLastHeight;
     game.depthInverted = (feature.flags & 0x8) != 0;
     try
     {
@@ -5836,7 +5841,8 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
                                                    bytes, bytes);
             const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
             feature.engineM = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device, feature.outWidth,
-                                                                   feature.outHeight, p.renderWidth, p.renderHeight,
+                                                                   feature.outHeight, (hip || !model->hasDynamicResolution()) ? p.renderWidth : feature.outWidth,
+                                                                   (hip || !model->hasDynamicResolution()) ? p.renderHeight : feature.outHeight,
                                                                    hip ? &external : nullptr);
             feature.engineMRenderWidth = p.renderWidth;
             feature.engineMRenderHeight = p.renderHeight;
@@ -5855,7 +5861,30 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         release_engine_network(feature);
         return refuse("the engine could not be created");
     }
-    if (feature.engineNet != nullptr)
+    d4r::GameUpscalerM* adapter = feature.engineM.get();
+    const bool resizedHip = feature.engineNet != nullptr &&
+        (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight);
+    if (resizedHip)
+    {
+        try
+        {
+            if (!feature.engineMDynamic)
+            {
+                feature.engineMDynamic = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device,
+                    feature.outWidth, feature.outHeight, feature.outWidth, feature.outHeight);
+                logf("engine backend (%s): dynamic render sizes use the Vulkan network; original HIP resources retained", name);
+            }
+            adapter = feature.engineMDynamic.get();
+        }
+        catch (const std::exception& error)
+        {
+            logf("engine backend (%s): %s", name, error.what());
+            return refuse("the dynamic engine could not be created");
+        }
+    }
+    feature.engineMLastWidth = p.renderWidth;
+    feature.engineMLastHeight = p.renderHeight;
+    if (feature.engineNet != nullptr && !resizedHip)
     {
         // The native HIP network: the game's list is split around it. Its native completion callback releases
         // the second part, which records expansion, reconstruction and the final store (or the conversion blit
@@ -5869,14 +5898,14 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
             {
                 if (front)
                 {
-                    feature.engineM->recordFront(command, game);
+                    adapter->recordFront(command, game);
                     // The HIP network's stream waits for this frame's number (record_engine_input_ready): the
                     // fill is part of the first half, so the network starts the moment the front's GPU work ends.
                     if (feature.engineGpuWait.load())
                         record_engine_input_ready(feature, command, frame);
                 }
                 else
-                    feature.engineM->recordBack(command, game);
+                    adapter->recordBack(command, game);
             }
             catch (const std::exception& error)
             {
@@ -5906,7 +5935,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     {
         try
         {
-            feature.engineM->record(command, game);
+            adapter->record(command, game);
         }
         catch (const std::exception& error)
         {
@@ -6079,8 +6108,7 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
             const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
             feature.engine = std::make_unique<d4r::GameUpscaler>(*model, g_vk.physical, g_vk.device,
                                                                  feature.outWidth, feature.outHeight,
-                                                                 std::max(feature.width, p.renderWidth),
-                                                                 std::max(feature.height, p.renderHeight),
+                                                                 feature.outWidth, feature.outHeight,
                                                                  hip ? &external : nullptr);
             logf("engine backend: feature %u runs preset K in the game's command list (%ux%u -> %ux%u), network on %s",
                  feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,

@@ -65,7 +65,11 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     const vec3 own = texelFetch(colorTex, texel(m), 0).rgb;
     const vec2 centre = vec2(m) + 0.5, f = centre - EP.jitter, inv = 1.0 / vec2(EP.size);
     // how much the motion changed since the previous frame
-    const vec2 prev = textureLod(prevMvTex, clamp(((f + EP.prevJitter) + mvA * EP.hi2rnd) * vec2(EP.renderInvX, EP.renderInvY), vec2(0.0), vec2(EP.size) * vec2(EP.renderInvX, EP.renderInvY)), 0.0).xy;
+    vec2 prevPixel = clamp(((f + EP.prevJitter) + mvA * EP.hi2rnd) * vec2(EP.renderInvX, EP.renderInvY), vec2(0.0), vec2(EP.size) * vec2(EP.renderInvX, EP.renderInvY));
+    if (any(notEqual(textureSize(prevMvTex, 0), EP.size)))
+        prevPixel = clamp(prevPixel, 0.5 * vec2(EP.renderInvX, EP.renderInvY),
+                          (vec2(EP.size) - 0.5) * vec2(EP.renderInvX, EP.renderInvY));
+    const vec2 prev = textureLod(prevMvTex, prevPixel, 0.0).xy;
     const vec2 dm = (EP.changeScale * 540.0 / float(EP.size.y)) * (mvA * EP.hi2rnd - EP.hi2rnd * prev);
     const float d2 = fma(dm.x, dm.x, dm.y * dm.y);
     const float change = EP.changeGain * (log2(d2 > 0.0 ? sqrt(d2) + 1.0 : 1.0) * 0.6931472);
@@ -102,6 +106,8 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
         {
             precise vec2 normalized = fma(q[0], 1.0 / EP.hiSize, EP.prevJitter * inv);
             precise vec2 texels = normalized * vec2(EP.size);
+            if (any(notEqual(textureSize(featTex, 0), EP.size)))
+                texels = clamp(texels, vec2(0.5), vec2(EP.size) - 0.5);
             precise vec2 uv = texels * vec2(EP.renderInvX, EP.renderInvY);
             feat = textureLod(featTex, uv, 0.0);
         }
