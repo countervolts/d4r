@@ -85,6 +85,12 @@ Settings
 - On RDNA4, [Kernels] NativeFp8 is on by default. It selects native FP8 WMMA and the matching
   gfx12-fp8 kernel folder; set it to false to use f16 widening. The FP8 path has not been tested
   on a real RDNA4 GPU.
+@full - Ray Reconstruction: this zip includes NVIDIA's CUDA-capable denoiser (d4r/nvngx_dlssd.dll
+@full   310.7.0). [RayReconstruction] Enable defaults to auto: when the game turns Ray
+@full   Reconstruction on, d4r runs it through the denoiser. Model = D or E selects a denoiser
+@full   preset explicitly; auto follows the game. RR presets D/E are validated on RX 9070 XT
+@full   (gfx1201) with [Kernels] NativeFp8 = on, the packaged default on RDNA4. Keep NativeFp8 on:
+@full   the scalar FP8 RR path is not validated.
 - If L/M shows extra trails in motion, try [Kernels] NativeSwinEncoders = false with
   PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
   native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
@@ -135,6 +141,22 @@ Why the launch options
   weights that match the kernels d4r runs.
 
 
+Ray Reconstruction launch options
+---------------------------------
+On the tested GE-Proton11-3 setup, Wine's builtin ICU libraries abort inside the denoiser
+(u_setMemoryFunctions_65). With Ray Reconstruction (for example Cyberpunk 2077 2.31 with path
+tracing and RR preset D or E), use launch options that prefer the game's native ICU DLLs and the
+game-local d3d12.dll/d3d12core.dll over Wine's copies:
+
+  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='icuuc=n,b;icuin=n,b;icudt=n,b;d3d12=n,b;d3d12core=n,b' %command%
+
+Merge that WINEDLLOVERRIDES value with any overrides another mod needs instead of replacing it.
+Without Ray Reconstruction, the base launch options above are enough. In the game, select DLSS,
+then Ray Reconstruction; d4r/d4r.ini ships [RayReconstruction] Enable = auto and
+[Kernels] NativeFp8 = on for RDNA4. Keep the patched d3d12.dll/d3d12core.dll current, including
+game-local copies.
+
+
 If something goes wrong
 -----------------------
 - d4r's log is d4r/d4r_nvngx.log. It is rewritten at every launch. Lines starting with "d4r:" and
@@ -147,8 +169,9 @@ If something goes wrong
   can be expected with the shim under d4r/; do not move it into the game root to silence that check.
 - A wrong image: try Model = E in d4r/d4r.ini, and report the problem with both logs.
 - Do not use d4r in games with anti-cheat. OptiScaler's DLL injection can get an account banned.
-- Ray Reconstruction requires the CUDA-capable 3.10.7 nvngx_dlssd.dll beside the shim and the matching
-  patched d3d12.dll/d3d12core.dll. Enable [Kernels] NativeFp8; the scalar FP8 RR path is not validated.
+- Ray Reconstruction needs the CUDA-capable 3.10.7 nvngx_dlssd.dll beside the shim, the matching
+  patched d3d12.dll/d3d12core.dll, and the ICU launch overrides from the Ray Reconstruction section
+  above. Enable [Kernels] NativeFp8; the scalar FP8 RR path is not validated.
 - Not supported: DLSS Frame Generation and DirectX 11.
 - Development builds expose an experimental native Vulkan NGX path using CPU staging.
   Youngblood is the first intended game test; gameplay remains unverified. See the

@@ -79,6 +79,7 @@
 #include "d4r_vkd3d_interop.h"
 #include "../engine/game.h"
 #include "../engine/game_m.h"
+#include "../engine/game_rr.h"
 #include "../engine/vk_dispatch.h"
 
 // --- NGX types (declared locally: the core's exports differ from the SDK) --
@@ -290,7 +291,6 @@ struct CoreApi
     // The core's CUDA entry point takes a CUdevice ordinal, not an IDXGIAdapter* (its
     // disassembly rejects a negative value in the first argument, which is the ordinal
     // check). The D3D12 export this file implements takes an adapter and must translate.
-    NgxResult (*getFeatureRequirements)(int, const void*, NgxFeatureRequirement*) = nullptr;
 };
 
 // --- DLSS-Denoiser (Ray Reconstruction) ----------------------------------------
@@ -1473,9 +1473,6 @@ static bool load_libraries()
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_CreateFeature", g.ngx.createFeature);
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_ReleaseFeature", g.ngx.releaseFeature);
     ok &= load_export(g.core, "NVSDK_NGX_CUDA_EvaluateFeature", g.ngx.evaluateFeature);
-    // Optional: the core answers feature 13 by consulting the denoiser it loaded.
-    if (!load_export(g.core, "NVSDK_NGX_CUDA_GetFeatureRequirements", g.ngx.getFeatureRequirements))
-        g.ngx.getFeatureRequirements = nullptr;
 
     g.cuda = LoadLibraryA("nvcuda.dll");
     if (g.cuda == nullptr)
@@ -2538,6 +2535,7 @@ struct Feature
     std::unique_ptr<d4r::GameUpscalerM> engineMDynamic; // Vulkan at changing sizes; original HIP resources stay alive
     unsigned int engineMLastWidth = 0, engineMLastHeight = 0;
     unsigned int engineMRenderWidth = 0, engineMRenderHeight = 0; // first evaluation's effective extent
+    std::unique_ptr<d4r::GameDenoiser> engineR; // Ray Reconstruction (engine/runtime_rr.inc)
     // Preset M and preset K with the network on the native HIP layers ([Engine] Network): the buffers shared
     // with HIP and the bridge's network. The game's list is split around the network, as for the CUDA backend's
     // split frames. `engineHead` is the network's result (M's expansion / K's final store reads it).
@@ -6973,6 +6971,17 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int, const vo
 //   NVSDK_NGX_FeatureRequirement *OutSupported). The feature is NOT a separate argument: it is
 // FeatureDiscoveryInfo->FeatureID (defs.h, the field after SDKVersion), and the first argument
 // is the display adapter, which must never be read as a feature id.
+//
+// This answer is derived from d4r's own state alone. The earlier version forwarded the query
+// to the NGX core's CUDA entry point on the shim's worker thread and, for feature 13, called
+// the denoiser's discovery export before Init. Those calls turn a requirements query that
+// OptiScaler hooks into a cross-binary handoff: inside a Steam runtime that reorders module
+// loads, OptiScaler's follow-up scan of its own support lists then read memory the other
+// binary had already released (deterministic EXCEPTION_ACCESS_VIOLATION inside OptiScaler's
+// dxgi.dll; see the repo's Cyberpunk notes). The requirements answer carries no state that is
+// not already authoritative elsewhere: Ray Reconstruction's real gate is the CreateFeature
+// check plus the core's denoiser account reported through GetCapabilityParameters, both of
+// which run after their CUDA context exists.
 D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const void* discovery,
                                                           NgxFeatureRequirement* requirement)
 {
@@ -6984,89 +6993,47 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const
     if (discovery != nullptr)
         std::memcpy(&feature, static_cast<const char*>(discovery) + sizeof(unsigned int), sizeof(feature));
     std::memset(requirement, 0, sizeof(*requirement));
-    ensure_portable_config();
-    // The local switch is checked before the core is asked: with D4R_RR_ENABLE=0 this process
-    // is not offering Ray Reconstruction, and the core's authoritative "supported" must not
-    // be passed on to a game that would then create a feature this shim would refuse.
+    if (feature != NGX_FEATURE_SUPER_SAMPLING && feature != NGX_FEATURE_RAY_RECONSTRUCTION)
+    {
+        requirement->FeatureSupported = 1; // not supported
+        return NGX_SUCCESS;
+    }
+    // The local switch is checked before any core appears: with D4R_RR_ENABLE=0 this process
+    // is not offering Ray Reconstruction, and no core answer may override that.
     if (feature == NGX_FEATURE_RAY_RECONSTRUCTION && !rr_enabled())
     {
         requirement->FeatureSupported = 1; // not supported
         logf("Ray Reconstruction is not supported: %s", rr_denial_reason());
         return NGX_SUCCESS;
     }
+    // CPU-side adapter identity only; safe before Init and without any CUDA context.
+    if (adapter != nullptr && !g.ngxInitialized)
+    {
+        DXGI_ADAPTER_DESC desc = {};
+        if (SUCCEEDED(static_cast<IDXGIAdapter*>(adapter)->GetDesc(&desc)))
+            set_cuda_adapter_luid(desc.AdapterLuid);
+    }
     {
         std::lock_guard<std::mutex> lock(g.mutex);
-        // Discovery can precede Init; CUDA still needs the caller's adapter identity.
-        if (adapter != nullptr && !g.ngxInitialized)
-        {
-            DXGI_ADAPTER_DESC desc = {};
-            if (SUCCEEDED(static_cast<IDXGIAdapter*>(adapter)->GetDesc(&desc)))
-                set_cuda_adapter_luid(desc.AdapterLuid);
-        }
-        // Requirements must not depend on a prior Init. Load the provider without
-        // initializing NGX here: the later Init retains the game's identity and device.
+        // Load the provider without initializing NGX: creation keeps the game's identity, and
+        // feature 13's acceptance is decided later from ray_reconstruction_available().
         if (ensure_workers_started() != NGX_SUCCESS || (g.core == nullptr && !load_libraries()))
             return NGX_FAIL_PLATFORM_ERROR;
         if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
             load_denoiser_library();
     }
-    // Otherwise the core's answer is authoritative - it consulted the denoiser it loaded - and
-    // this file only steps in when the core declines.
-    if (g.ngx.getFeatureRequirements != nullptr)
-    {
-        // The adapter this export receives is not what the core's CUDA entry point wants: it
-        // takes a CUdevice ordinal. Passing the adapter pointer through would read its low 32
-        // bits as an ordinal, so the current context's device is asked for instead.
-        int device = 0;
-        const NgxResult result = g.worker.call([&] {
-            if (g.cu.ctxGetDevice != nullptr && g.cu.ctxGetDevice(&device) != 0)
-                device = 0; // no current context: device 0 is this process's only CUDA device
-            return g.ngx.getFeatureRequirements(device, discovery, requirement);
-        });
-        if (result == NGX_SUCCESS)
-        {
-            logf("GetFeatureRequirements(feature=%u, cuda device %d) from the NGX core: supported=%u minHW=0x%x "
-                 "'%s'",
-                 feature, device, requirement->FeatureSupported, requirement->MinHWArchitecture,
-                 requirement->MinOSVersion);
-            return result;
-        }
-        logf("GetFeatureRequirements(feature=%u) from the NGX core -> 0x%08x; answering here instead", feature,
-             result);
-    }
-    if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
-    {
-        // Requirements are legal before Init. Ask the denoiser's discovery export,
-        // not its Init stub, without binding NGX to an application prematurely.
-        if (!g.ngxInitialized && g.denoiser.cudaCapable)
-        {
-            using RequirementsFn = NgxResult (*)(void*, const void*, NgxFeatureRequirement*);
-            RequirementsFn denoiserRequirements = nullptr;
-            if (load_export(g.denoiserModule, "NVSDK_NGX_D3D12_GetFeatureRequirements", denoiserRequirements))
-            {
-                const NgxResult result = g.worker.call([&] {
-                    return denoiserRequirements(adapter, discovery, requirement);
-                });
-                logf("GetFeatureRequirements before Init from DLSS-Denoiser -> 0x%08x, supported=%u",
-                     result, requirement->FeatureSupported);
-                return result;
-            }
-        }
-        const bool supported = ray_reconstruction_available();
-        if (!supported)
-        {
-            requirement->FeatureSupported = 1;
-            logf("Ray Reconstruction is not supported: %s",
-                 g.ngxInitialized ? rr_denial_reason() : "no CUDA-capable DLSS-Denoiser for pre-Init discovery");
-            return NGX_SUCCESS;
-        }
-    }
-    if (feature != NGX_FEATURE_SUPER_SAMPLING && feature != NGX_FEATURE_RAY_RECONSTRUCTION)
+    const bool supported = feature == NGX_FEATURE_SUPER_SAMPLING
+                               ? true
+                               : (g.ngxInitialized ? ray_reconstruction_available() : g.denoiser.cudaCapable);
+    if (!supported)
     {
         requirement->FeatureSupported = 1; // not supported
+        if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
+            logf("Ray Reconstruction is not supported: %s",
+                 g.ngxInitialized ? rr_denial_reason() : "no CUDA-capable DLSS-Denoiser for pre-Init discovery");
         return NGX_SUCCESS;
     }
-    requirement->FeatureSupported = 0; // supported
+    requirement->FeatureSupported = 0; // supported (NVSDK_NGX_FeatureSupportResult bitfield)
     requirement->MinHWArchitecture = 0x160;
     return NGX_SUCCESS;
 }
@@ -7317,10 +7284,12 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
     // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation. Presets K, L
-    // and M (the engine's) create the CUDA feature only when a frame falls back: NGX's L kernels take ZLUDA about 20 s
-    // to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch, 2026-10-11).
+    // and M and Ray Reconstruction (the engine's) create the CUDA feature only when a frame falls back: NGX's L kernels
+    // take ZLUDA about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch,
+    // 2026-10-11), and the denoiser's are larger still.
     feature->cudaCreationDeferred = !nativeVulkan && engine_requested() &&
-                                    (feature->preset == 11 || feature->preset == 12 || feature->preset == 13);
+                                    (rayReconstruction || feature->preset == 11 || feature->preset == 12 ||
+                                     feature->preset == 13);
     const NgxResult result = feature->cudaCreationDeferred ? NGX_SUCCESS : create_cuda_feature(*feature);
     if (feature->cudaCreationDeferred)
         logf("engine backend: CUDA feature creation deferred until fallback is needed");
@@ -8268,11 +8237,272 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     return true;
 }
 
+// Ray Reconstruction models (engine/compile_rr.py): one per preset, engine\rr-d and engine\rr-e next to this DLL, or
+// D4R_ENGINE_MODEL_RR_D_DIR / D4R_ENGINE_MODEL_RR_E_DIR.
+struct EngineBackendR
+{
+    // The model's pipelines take minutes to compile on a cold shader cache, so each preset's model loads on a thread
+    // of its own; until it is ready the CUDA backend serves the frames. state: 0 not started, 1 loading, 2 ready,
+    // 3 failed.
+    std::once_flag once[2];                          // [preset E]
+    std::atomic<int> state[2] = {};
+    std::unique_ptr<d4r::RModel> models[2];
+};
+static EngineBackendR g_engineR;
+
+static void init_engine_backend_rr(bool presetE)
+{
+    std::string directory = env_string(presetE ? "D4R_ENGINE_MODEL_RR_E_DIR" : "D4R_ENGINE_MODEL_RR_D_DIR");
+    if (directory.empty())
+    {
+        char folder[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + (presetE ? L"\\engine\\rr-e" : L"\\engine\\rr-d")).c_str(), -1,
+                            folder, sizeof(folder), nullptr, nullptr);
+        directory = folder;
+    }
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    {
+        logf("engine backend (Ray Reconstruction): Vulkan interop is unavailable");
+        g_engineR.state[presetE] = 3;
+        return;
+    }
+    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
+    logf("engine backend (Ray Reconstruction %c): loading the model from %s and compiling its pipelines; the CUDA "
+         "backend serves frames until it is ready", presetE ? 'E' : 'D', path.c_str());
+    const auto start = std::chrono::steady_clock::now();
+    try
+    {
+        auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path);
+        if (model->preset() != (presetE ? 5u : 4u))
+            throw std::runtime_error(presetE ? "the directory holds a preset D model" : "the directory holds a preset E model");
+        g_engineR.models[presetE] = std::move(model);
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (Ray Reconstruction): cannot load the model from %s: %s", path.c_str(), error.what());
+        g_engineR.state[presetE] = 3;
+        return;
+    }
+    g_engineR.state[presetE] = 2;
+    logf("engine backend (Ray Reconstruction %c): model %s loaded and pipelines compiled in %.0f ms", presetE ? 'E' : 'D',
+         path.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+// Ray Reconstruction on the engine: d4r's stages in the game's command list, with the denoiser's guides sampled
+// straight from the game's textures. False: the CUDA backend serves the feature (reason logged).
+static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                               ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output, void* parameters,
+                               const FrameParams& p, uint32_t frame)
+{
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("engine backend (Ray Reconstruction): %s; feature %u uses the CUDA backend from frame %u", reason,
+             feature.handle.Id, frame);
+        return false;
+    };
+    // NGX 310.7 runs preset D's kernels when the game names no preset (harness, 2026-10-11).
+    const bool presetE = feature.preset == 5;
+    if (feature.preset != 0 && feature.preset != 4 && feature.preset != 5)
+        return refuse("only presets D and E are implemented");
+    std::call_once(g_engineR.once[presetE], [presetE] {
+        g_engineR.state[presetE] = 1;
+        // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
+        if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
+            init_engine_backend_rr(presetE);
+        else
+            std::thread([presetE] { init_engine_backend_rr(presetE); }).detach();
+    });
+    const int state = g_engineR.state[presetE].load();
+    if (state == 1)
+        return false; // still compiling: the CUDA backend serves this frame, the engine is tried again next frame
+    d4r::RModel* const model = g_engineR.models[presetE].get();
+    if (state != 2 || model == nullptr)
+        return refuse(presetE ? "no preset E model (engine\\rr-e)" : "no preset D model (engine\\rr-d)");
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
+    if ((feature.flags & 0x3) != 0x3)
+        return refuse("needs the HDR flag and render-resolution motion vectors");
+    if ((feature.flags & 0x4) != 0)
+        return refuse("jittered motion vectors are not implemented");
+    if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
+        return refuse("the camera matrices are missing");
+    if (feature.engineR != nullptr &&
+        (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
+        return refuse("changing the effective render resolution after initialization is not implemented");
+    const char* const guideNames[4][2] = {{"GBuffer.Normals", nullptr}, {"GBuffer.Roughness", nullptr},
+                                          {"DLSS.Input.DiffuseAlbedo", "GBuffer.DiffuseAlbedo"},
+                                          {"DLSS.Input.SpecularAlbedo", "GBuffer.SpecularAlbedo"}};
+    ID3D12Resource* guides[4] = {};
+    // DLSS.Roughness.Mode 1 (packed): no roughness texture, the roughness is the normals' w
+    const bool roughnessPacked = get_resource(parameters, "GBuffer.Roughness") == nullptr &&
+        get_uint_or(parameters, "DLSS.Roughness.Mode", 0) == 1;
+    for (int i = 0; i < 4; ++i)
+    {
+        guides[i] = get_resource(parameters, guideNames[i][0]);
+        if (guides[i] == nullptr && guideNames[i][1] != nullptr)
+            guides[i] = get_resource(parameters, guideNames[i][1]);
+        if (guides[i] == nullptr && i == 1 && roughnessPacked)
+            guides[i] = guides[0];
+        if (guides[i] == nullptr)
+            return refuse("a guide the engine needs (normals, roughness, diffuse or specular albedo) is missing");
+    }
+    // the optional inputs a game may add (RE Requiem passes both): bound when present, like NGX
+    ID3D12Resource* const hitDistance = get_resource(parameters, "DLSSD.SpecularHitDistance");
+    ID3D12Resource* const disocclusion = get_resource(parameters, "DLSS.DisocclusionMask");
+    for (ID3D12Resource* input : {color, depth, motion, guides[0], guides[1], guides[2], guides[3], hitDistance, disocclusion})
+        if (input == output)
+            return refuse("input/output texture aliasing is not supported");
+    d4r::GameFrameR game;
+    using Source = EngineFrameSource;
+    const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
+    const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
+    const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
+    const unsigned int rw = p.renderWidth, rh = p.renderHeight;
+    std::vector<Source> sources = {
+        {color, &game.color, p.colorBaseX, p.colorBaseY, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, rw, rh, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {motion, &game.motion, p.mvBaseX, p.mvBaseY, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {guides[0], &game.normals, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {guides[1], &game.roughness, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {guides[2], &game.diffuseAlbedo, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {guides[3], &game.specularAlbedo, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState,
+         D3D12_RESOURCE_STATE_COPY_DEST},
+    };
+    if (hitDistance != nullptr)
+        sources.push_back({hitDistance, &game.specularHitDistance, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
+    if (disocclusion != nullptr)
+        sources.push_back({disocclusion, &game.disocclusionMask, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
+    // a guide with its own subrect origin (DLSS.Input.Normals.Subrect.Base etc.) is not implemented
+    for (size_t i = 0; i < sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0]); ++i)
+        if (p.auxSubrect[i][0] != 0 || p.auxSubrect[i][1] != 0)
+            return refuse("guide subrect origins are not implemented");
+    for (Source& source : sources)
+    {
+        UINT64 handle = 0, offset = 0;
+        D3D12_RESOURCE_DESC desc;
+        source.resource->GetDesc(&desc);
+        if (FAILED(g_vk.interop->GetVulkanResourceInfo1(source.resource, &handle, &offset, &source.image->format)) ||
+            handle == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            source.x + source.width > desc.Width || source.y + source.height > desc.Height)
+            return refuse("a texture is not a single-sample 2D image covering its rectangle");
+        source.image->image = reinterpret_cast<VkImage>(handle);
+        source.image->x = source.x;
+        source.image->y = source.y;
+        // The stages sample inputs with normalized coordinates over the whole view: a texture larger than the render
+        // size (dynamic resolution, padded targets) goes through the copy into an exactly sized plane instead.
+        const bool exact = source.image == &game.output || (desc.Width == source.width && desc.Height == source.height);
+        prepare_engine_view(feature, source.resource, desc, *source.image, source.image == &game.output,
+                            source.x == 0 && source.y == 0 && exact, source.copyState);
+        g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
+    }
+    // the same resource can appear twice (a game may pass one texture as two guides): transition it once
+    std::vector<ID3D12Resource*> distinct;
+    for (const Source& source : sources)
+        if (std::find(distinct.begin(), distinct.end(), source.resource) == distinct.end())
+            distinct.push_back(source.resource);
+    if (distinct.size() != sources.size() - (roughnessPacked ? 1u : 0u))
+        return refuse("two inputs share one texture");
+    // each distinct resource is transitioned once (the packed roughness repeats the normals)
+    auto firstUse = [&](size_t i) {
+        for (size_t j = 0; j < i; ++j)
+            if (sources[j].resource == sources[i].resource) return false;
+        return true;
+    };
+    if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
+        !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !d4r::gameOutputFormat(game.output.format))
+    {
+        logf("engine backend (Ray Reconstruction): Vulkan formats colour %d, depth %d, motion %d, output %d",
+             game.color.format, game.depth.format, game.motion.format, game.output.format);
+        return refuse("a texture format is not implemented");
+    }
+    if (frame <= 2)
+    {
+        const char* names[8] = {"color", "depth", "motion", "normals", "roughness", "diffuse", "specular", "output"};
+        for (int i = 0; i < 8; ++i)
+        {
+            D3D12_RESOURCE_DESC desc;
+            sources[i].resource->GetDesc(&desc);
+            logf("engine backend (Ray Reconstruction): %s format %d layout %d origin %u,%u size %llux%u view %p aspect %u",
+                 names[i], sources[i].image->format, sources[i].image->layout, sources[i].image->x, sources[i].image->y,
+                 static_cast<unsigned long long>(desc.Width), desc.Height, reinterpret_cast<void*>(sources[i].image->view),
+                 sources[i].image->aspect);
+        }
+    }
+    auto& s = game.settings;
+    s.jitter[0] = p.jitterX; s.jitter[1] = p.jitterY;
+    s.motionScale[0] = p.mvScaleX; s.motionScale[1] = p.mvScaleY;
+    s.preExposure = p.preExposure;
+    s.frameTimeMs = p.frameTime;
+    s.reset = p.reset != 0 || feature.engineR == nullptr;
+    s.depthInverted = (feature.flags & 0x8) != 0;
+    s.roughnessPacked = roughnessPacked;
+    if (frame <= 2)
+        logf("engine backend (Ray Reconstruction): roughness %s, specular hit distance %s, disocclusion mask %s",
+             roughnessPacked ? "packed in the normals' w" : "texture", hitDistance != nullptr ? "bound" : "none",
+             disocclusion != nullptr ? "bound" : "none");
+    std::copy(std::begin(p.auxMatrix[0]), std::end(p.auxMatrix[0]), s.worldToView);
+    std::copy(std::begin(p.auxMatrix[1]), std::end(p.auxMatrix[1]), s.viewToClip);
+    try
+    {
+        if (feature.engineR == nullptr)
+        {
+            feature.engineR = std::make_unique<d4r::GameDenoiser>(*model, g_vk.physical, g_vk.device, feature.outWidth,
+                                                                  feature.outHeight, rw, rh);
+            feature.engineMRenderWidth = rw;
+            feature.engineMRenderHeight = rh;
+            logf("engine backend (Ray Reconstruction %c): feature %u runs in the game's command list (%ux%u -> %ux%u)",
+                 presetE ? 'E' : 'D', feature.handle.Id, rw, rh, feature.outWidth, feature.outHeight);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (Ray Reconstruction): %s", error.what());
+        return refuse("the engine could not be created");
+    }
+    if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
+        return refuse("the command list cannot retain the engine's resources");
+    for (size_t i = 0; i < sources.size(); ++i)
+        if (firstUse(i))
+            transition(list, sources[i].resource, sources[i].state, sources[i].copyState);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    bool recorded = SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list, &command));
+    const char* failure = recorded ? nullptr : "BeginVkCommandBufferInterop failed";
+    if (recorded)
+    {
+        try
+        {
+            feature.engineR->record(command, game);
+        }
+        catch (const std::exception& error)
+        {
+            logf("engine backend (Ray Reconstruction): %s", error.what());
+            failure = "the frame could not be recorded";
+            recorded = false;
+        }
+        if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && recorded)
+        {
+            failure = "EndVkCommandBufferInterop failed";
+            recorded = false;
+        }
+    }
+    for (size_t i = 0; i < sources.size(); ++i)
+        if (firstUse(i))
+            transition(list, sources[i].resource, sources[i].copyState, sources[i].state);
+    if (!recorded)
+        return refuse(failure);
+    if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u recorded, Ray Reconstruction %c (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame,
+             presetE ? 'E' : 'D', p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY);
+    return true;
+}
+
 // Records the whole evaluation of `frame` into `list`. False: nothing usable was recorded and the
 // CUDA backend takes this feature over.
 static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                             ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
-                            ID3D12Resource* exposure, const FrameParams& p, uint32_t frame)
+                            ID3D12Resource* exposure, void* parameters, const FrameParams& p, uint32_t frame)
 {
     if (feature.engineRefused)
         return false;
@@ -8284,6 +8514,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return false;
     };
     std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
+    if (feature.rayReconstruction)
+        return engine_evaluate_rr(feature, list, color, depth, motion, output, parameters, p, frame);
     if (feature.preset == 13 || feature.preset == 12)
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
@@ -8659,7 +8891,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         }
     }
 
-    if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, p, frame))
+    if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame))
         return NGX_SUCCESS;
 
     if (feature->cudaCreationDeferred)

@@ -2795,8 +2795,9 @@ CUresult WINAPI cuSurfObjectCreate(CUsurfObject* object, const void* descriptor)
         if (redirected && (result = write_redirect_tail(*object, pointer, pitch, 0)) != CUDA_SUCCESS)
             cuSurfObjectDestroy(*object);
     }
-    TRACE_CALL(result, "cuSurfObjectCreate descriptor=%p result=%d object=0x%llx", descriptor, result,
-           (unsigned long long)(object != NULL ? *object : 0));
+    TRACE_CALL(result, "cuSurfObjectCreate descriptor=%p array=%p result=%d object=0x%llx", descriptor,
+               result == CUDA_SUCCESS && object != NULL ? (void*)find_surface_array(*object) : NULL, result,
+               (unsigned long long)(object != NULL ? *object : 0));
     return result;
 }
 

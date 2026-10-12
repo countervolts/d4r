@@ -10,6 +10,7 @@
 //   lut FILE                    (storage buffer bound after the surfaces)
 //   bufout OFF FILE             (after the dispatch, write the pointer buffer of parameter offset OFF to FILE)
 //   outbuf FILE BYTES           (storage buffer bound after those, written to FILE after the dispatch)
+//   inout FILE OUTFILE          (storage buffer initialised from FILE, bound like outbuf, written to OUTFILE)
 //   bindings N0 N1 ...          (optional: the binding number of each of the above, in that order, for shaders
 //                                whose bindings are not ptx2glsl.py's; e.g. engine/layer_m.comp's L stages)
 #include <vulkan/vulkan.h>
@@ -75,7 +76,10 @@ int main(int argc, char** argv)
     uint32_t np = 8; VkPhysicalDevice pds[8]; vkEnumeratePhysicalDevices(inst, &np, pds);
     VkPhysicalDevice pd = pds[0];
     for (uint32_t i = 0; i < np; ++i) { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p); if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pd = pds[i]; }
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    // FP8 cooperative matrices (engine/rr's translated stages, engine/layer_m.comp)
+    VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &f8};
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &cm};
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
     VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
@@ -84,7 +88,12 @@ int main(int argc, char** argv)
     uint32_t nq = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
     uint32_t qi = 0; for (uint32_t i = 0; i < nq; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qi = i; break; }
     float prio = 1; VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    std::vector<const char*> exts;
+    if (cm.cooperativeMatrix) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (f8.shaderFloat8) exts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    if (!cm.cooperativeMatrix) v13.pNext = nullptr; else if (!f8.shaderFloat8) cm.pNext = nullptr;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = static_cast<uint32_t>(exts.size()); dci.ppEnabledExtensionNames = exts.data();
     CK(vkCreateDevice(pd, &dci, nullptr, &dev));
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex = qi; cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -125,6 +134,12 @@ int main(int argc, char** argv)
         {
             std::string f; VkDeviceSize n; ls >> f >> n;
             Buf b = make_buf(n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); memset(b.map, 0, n); luts.push_back(b); lutOut.push_back(f);
+        }
+        else if (k == "inout")
+        {
+            std::string f, o; ls >> f >> o; auto data = slurp(f);
+            Buf b = make_buf(data.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); memcpy(b.map, data.data(), data.size());
+            luts.push_back(b); lutOut.push_back(o);
         }
         else if (k == "buf")
         {
@@ -197,6 +212,8 @@ int main(int argc, char** argv)
     VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO}; rs.requiredSubgroupSize = subgroup;
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    // KVK_DISABLE_OPTIMIZATION=1: VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (RADV: ACO without its optimizer/scheduler)
+    if (getenv("KVK_DISABLE_OPTIMIZATION")) cpi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &rs, VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr};
     cpi.layout = pl;
     VkPipeline pipe;

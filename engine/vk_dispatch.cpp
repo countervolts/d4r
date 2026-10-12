@@ -22,6 +22,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.CmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(deviceProc(device, "vkCmdCopyBufferToImage"))) != nullptr;
     ok &= (vkTable.CmdCopyImageToBuffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(deviceProc(device, "vkCmdCopyImageToBuffer"))) != nullptr;
     ok &= (vkTable.CmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(deviceProc(device, "vkCmdDispatch"))) != nullptr;
+    ok &= (vkTable.CmdFillBuffer = reinterpret_cast<PFN_vkCmdFillBuffer>(deviceProc(device, "vkCmdFillBuffer"))) != nullptr;
     ok &= (vkTable.CmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(deviceProc(device, "vkCmdPipelineBarrier"))) != nullptr;
     ok &= (vkTable.CmdUpdateBuffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(deviceProc(device, "vkCmdUpdateBuffer"))) != nullptr;
     ok &= (vkTable.CmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(deviceProc(device, "vkCmdWriteTimestamp"))) != nullptr;

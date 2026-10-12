@@ -39,9 +39,10 @@
 // helpers and ZLUDA's own device functions are available. Compiled with -nogpuinc,
 // so only plain clang builtins and attributes are used.
 #include "../tex/tex_common.h"
-#ifdef D4R_RRSWIN_NATIVE_GEMM
+// The staged-image engine: the body's sixteen plain GEMM phases read staged images and prepared
+// slots through it, so the header is needed unconditionally (the phase-8 pilot below keeps its
+// own D4R_RRSWIN_NATIVE_GEMM guard).
 #include "rrswin_engine.h"
-#endif
 
 // ---------------------------------------------------------------------------
 // Parameter block. Fields are addressed by their byte offset in the PTX, so the
@@ -65,7 +66,7 @@ enum : int
 
 #define DEVF __attribute__((device)) static inline
 typedef float lds_f32 __attribute__((address_space(3)));
-typedef uint32_t lds_u32 __attribute__((address_space(3)));
+using rrswin::lds_u32;   // the engine header's AS3 word (the body defines none of its own)
 typedef uint8_t lds_u8 __attribute__((address_space(3)));
 
 #ifdef D4R_RRSWIN_NATIVE_GEMM
@@ -75,8 +76,8 @@ DEVF void gemm_native_unbiased(const uint32_t* as, const uint32_t* bs,
                                int nmi, uint32_t scratch, lds_u32* out)
 {
     lds_u8* const shared = (lds_u8*)(uintptr_t)scratch;
-    uint8_t* const image = (uint8_t*)shared;
-    uint8_t* const weights = (uint8_t*)(shared + 512);
+    lds_u8* const image = shared;
+    lds_u8* const weights = shared + 512;
     __attribute__((address_space(3))) half_t* const result =
         (__attribute__((address_space(3))) half_t*)(shared + 1536);
     const uint32_t lane = lane_id();
@@ -102,7 +103,7 @@ DEVF void gemm_native_unbiased(const uint32_t* as, const uint32_t* bs,
         for (int mt = 0; mt < 2; ++mt)
         {
             f8v c = {0, 0, 0, 0, 0, 0, 0, 0};
-            c = rrswin::swin_gemm_tile(c, (const kslot*)weights, 16 * mt, 32, image, 32, 0);
+            c = rrswin::swin_gemm_tile(c, weights, 16 * mt, 32, image, 32, 0);
 #pragma unroll
             for (int i = 0; i < 8; ++i)
                 result[32 * (lane & 15) + 16 * mt + i + 8 * (lane >> 4)] = (half_t)c[i];
@@ -220,17 +221,8 @@ DEVF uint32_t pair_of(half_t a, half_t b)
          | ((uint32_t)__builtin_bit_cast(uint16_t, b) << 16);
 }
 
-// ZLUDA's relu_keep_nan_halves: a negative (or -0) half becomes +0, NaN is kept.
-DEVF uint32_t relu_pair(uint32_t p)
-{
-    if ((p & 0x8000u) != 0 && (p & 0x7fffu) <= 0x7c00u) {
-        p &= 0xffff0000u;
-    }
-    if ((p & 0x80000000u) != 0 && ((p >> 16) & 0x7fffu) <= 0x7c00u) {
-        p &= 0x0000ffffu;
-    }
-    return p;
-}
+// ZLUDA's relu_keep_nan_halves (the phase-2 staging's mode 1) lives in the engine header
+// as rrswin::swin_relu_pair; this body has no local copy.
 
 // ---------------------------------------------------------------------------
 // One GEMM: 96 rows (six m-tiles of 16) x 32 columns, K=32, f16 output.
@@ -784,6 +776,225 @@ DEVF void cres_regs(const uint32_t d[4][2][4], uint32_t c[64])
 }
 
 // ---------------------------------------------------------------------------
+// The staged-image engine's plumbing: the four contract-§4 primitives live in
+// rrswin_engine.h (rrswin::lds_u32, swin_slots_from_wimg, swin_dcell_exchange_write/read,
+// swin_stage_operand_p with modes 0/1/2); what remains here is the body's own drivers.
+
+// The engine tile's f16 pair compaction -- the one f16 rounding of a phase -- and its C
+// seeds.  Per-column f16 tables widen to f32; a residual enters as the producer's own tile
+// pairs (contract §2's identity: same tile, same lane, pair i>>1 half i&1), with a
+// per-column table added in f16 first where one exists (phases 7 and 14).
+DEVF void enc0_pack(uint32_t pairs[4], const f8v& c)
+{
+#pragma unroll
+    for (int p = 0; p < 4; ++p)
+        pairs[p] = pair_of((half_t)c[2 * p], (half_t)c[2 * p + 1]);
+}
+
+// The lane's 16 f16 of a per-column blob = 8 u32: features 16*mt + 8h + 2j and +1 sit at
+// bytes 32*mt + 16h + 4j (column c at byte 2c, contract §2).
+DEVF void enc0_load_cols(uint32_t wb[2][4], const uint8_t* w, int base)
+{
+    const uint32_t h = lane_id() >> 4;
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            wb[mt][j] = *(const uint32_t*)(w + base + 32 * mt + 16 * h + 4 * j);
+}
+
+DEVF void enc0_seed_bias(f8v& c, int mt, const uint32_t wb[2][4])
+{
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        c[i] = h2f((i & 1) ? (wb[mt][i >> 1] >> 16) : wb[mt][i >> 1]);
+}
+
+DEVF void enc0_seed_res(f8v& c, int mt, int nt, const uint32_t* pp, int n_nt)
+{
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t r = pp[(mt * n_nt + nt) * 4 + (i >> 1)];
+        c[i] = (float)((i & 1) ? half_hi(r) : half_lo(r));
+    }
+}
+
+DEVF void enc0_seed_res_tab(f8v& c, int mt, int nt, const uint32_t* pp, int n_nt,
+                            const uint32_t* wt)
+{
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t r = pp[(mt * n_nt + nt) * 4 + (i >> 1)];
+        const uint32_t tb = wt[(mt << 2) + (i >> 1)];
+        c[i] = (float)((i & 1) ? half_hi(r) + half_hi(tb) : half_lo(r) + half_lo(tb));
+    }
+}
+
+// One phase's dcell exchange: its 2*n_nt engine tiles do not fit the 2048-byte dead image
+// (128 u32 per tile block), so the exchange runs in 2x2-tile chunks of 2048 bytes, chunk c
+// refilling d[2c] and d[2c+1].  pairs is the lane's [2][n_nt][4] pair array, d its
+// [n_nt][2][4] accumulator view.
+DEVF void enc0_dcell_exchange(const uint32_t* pairs, int n_nt, lds_u32* ex, uint32_t* d)
+{
+    for (int c = 0; c < n_nt / 2; ++c) {
+        uint32_t xp[16];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (int l = 0; l < 2; ++l)
+#pragma unroll
+                for (int p = 0; p < 4; ++p)
+                    xp[(mt * 2 + l) * 4 + p] = pairs[(mt * n_nt + 2 * c + l) * 4 + p];
+        rrswin::swin_dcell_exchange_write(ex, xp, 2, 2);
+        __builtin_amdgcn_wave_barrier();
+        rrswin::swin_dcell_exchange_read(ex, d + 16 * c, 2, 4, 2);
+        __builtin_amdgcn_wave_barrier();
+    }
+}
+
+// Phase 1: the staged block's fragments stage into the image per 48-token half (the six
+// m-tiles restaged at local rows 0..47), the C seed is the per-column bias at w+5120, and
+// the result stays in registers as pairs.
+DEVF void enc0_phase1(const uint32_t* as1, const uint8_t* w, lds_u8* slots, lds_u8* img,
+                      uint32_t pairs1[2][6][4])
+{
+    uint32_t wb[2][4];
+    rrswin::swin_slots_from_wimg(slots, w, 4096, 32);
+    rrswin::swin_stage_fragment(img, 32, as1, 3);
+    __builtin_amdgcn_wave_barrier();
+    enc0_load_cols(wb, w, 5120);
+    for (int half = 0; half < 2; ++half) {
+        if (half != 0) {
+            rrswin::swin_stage_fragment(img, 32, as1 + 12, 3);
+            __builtin_amdgcn_wave_barrier();
+        }
+#pragma unroll
+        for (int nt = 3 * half; nt < 3 * half + 3; ++nt)
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                f8v c;
+                enc0_seed_bias(c, mt, wb);
+                c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32,
+                                           16 * (nt - 3 * half));
+                enc0_pack(pairs1[mt][nt], c);
+            }
+        __builtin_amdgcn_wave_barrier();
+    }
+}
+
+// Phase 2: phase 1's pairs staged with the relu (mode 1) as the A image, the per-column
+// bias at w+6208 as C; the caller keeps pairs2 for phase 7's C and exchanges the dcell view.
+DEVF void enc0_phase2(const uint32_t pairs1[2][6][4], const uint8_t* w, lds_u8* slots,
+                      lds_u8* img, uint32_t pairs2[2][6][4])
+{
+    uint32_t wb[2][4];
+    rrswin::swin_slots_from_wimg(slots, w, 5184, 32);
+    __builtin_amdgcn_wave_barrier();
+    enc0_load_cols(wb, w, 6208);
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int nt = 3 * half; nt < 3 * half + 3; ++nt)
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                rrswin::swin_stage_operand_p(img, 32, 16 * (nt - 3 * half), mt, pairs1[mt][nt], 1);
+        __builtin_amdgcn_wave_barrier();
+#pragma unroll
+        for (int nt = 3 * half; nt < 3 * half + 3; ++nt)
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                f8v c;
+                enc0_seed_bias(c, mt, wb);
+                c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32,
+                                           16 * (nt - 3 * half));
+                enc0_pack(pairs2[mt][nt], c);
+            }
+        __builtin_amdgcn_wave_barrier();
+    }
+}
+
+// Phases 3, 4, 8 and 9: the fused projections of the normed tile -- a 96-token phase whose
+// A image is the as3 fragment pack staged per half and whose D is consumed only as the
+// NVIDIA d[mi][row][nt] view (the score and P·V GEMMs walk it scalar).
+DEVF void enc0_proj96(const uint32_t* as3, const uint8_t* w, int base, lds_u8* slots,
+                      lds_u8* img, lds_u32* ex, uint32_t* d)
+{
+    uint32_t pr[2][6][4];
+    rrswin::swin_slots_from_wimg(slots, w, base, 32);
+    rrswin::swin_stage_fragment(img, 32, as3, 3);
+    __builtin_amdgcn_wave_barrier();
+    for (int half = 0; half < 2; ++half) {
+        if (half != 0) {
+            rrswin::swin_stage_fragment(img, 32, as3 + 12, 3);
+            __builtin_amdgcn_wave_barrier();
+        }
+#pragma unroll
+        for (int nt = 3 * half; nt < 3 * half + 3; ++nt)
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                f8v c = {0, 0, 0, 0, 0, 0, 0, 0};
+                c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32,
+                                           16 * (nt - 3 * half));
+                enc0_pack(pr[mt][nt], c);
+            }
+        __builtin_amdgcn_wave_barrier();
+    }
+    enc0_dcell_exchange(&pr[0][0][0], 6, ex, d);
+}
+
+// The four MLP branches' first GEMMs (13, 15, 17, 19): the normed tile as the A image, the
+// per-column bias as C, the result kept as pairs for the mode-2 staging and the residual.
+DEVF void enc0_branch(const uint32_t* asN, const uint8_t* w, int base, int bias,
+                      lds_u8* slots, lds_u8* img, uint32_t pairs[2][4][4])
+{
+    uint32_t wb[2][4];
+    rrswin::swin_slots_from_wimg(slots, w, base, 32);
+    rrswin::swin_stage_fragment(img, 32, asN, 4);
+    __builtin_amdgcn_wave_barrier();
+    enc0_load_cols(wb, w, bias);
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            f8v c;
+            enc0_seed_bias(c, mt, wb);
+            c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32, 16 * nt);
+            enc0_pack(pairs[mt][nt], c);
+        }
+    __builtin_amdgcn_wave_barrier();
+}
+
+// The four branches' second GEMMs (14, 16, 18, 20): the previous branch's pairs staged with
+// the clamped cubic transform (mode 2) as the A image (pp), the running residual as C (pc)
+// -- phase 12's pairs plus the per-column table for phase 14 (wt), the producer pairs
+// without one for 16, 18 and 20 (wt null).
+DEVF void enc0_branch_act(const uint32_t pp[2][4][4], const uint32_t* pc, const uint32_t* wt,
+                          const uint8_t* w, int base, lds_u8* slots, lds_u8* img,
+                          uint32_t pairs[2][4][4])
+{
+    rrswin::swin_slots_from_wimg(slots, w, base, 32);
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+            rrswin::swin_stage_operand_p(img, 32, 16 * nt, mt, pp[mt][nt], 2);
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            f8v c;
+            if (wt != nullptr) {
+                enc0_seed_res_tab(c, mt, nt, pc, 4, wt);
+            } else {
+                enc0_seed_res(c, mt, nt, pc, 4);
+            }
+            c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32, 16 * nt);
+            enc0_pack(pairs[mt][nt], c);
+        }
+    __builtin_amdgcn_wave_barrier();
+}
+
+// ---------------------------------------------------------------------------
 // Ground truth for a stage comes from kernels/tex/make_ptx.py's debug recipe:
 // with D4R_RRSWIN_DEBUG=p1 (p2, p3, p4, or a) the same splice stores that stage's
 // registers into the plane arena at +46,000,000, which the kernel never otherwise
@@ -1003,6 +1214,10 @@ DEVF void band21(const uint32_t a[16], const uint8_t* w, const uint8_t* cbias, i
 // twelve as six u32.
 DEVF void surface_scatter21(const uint8_t* prm, const uint32_t d[8][2], int lane)
 {
+#if defined(D4R_RRSWIN_SC1) && D4R_RRSWIN_SC1 == 1
+    (void)prm; (void)d; (void)lane;
+    return;   // regression probe: empty call
+#endif
     const int r1 = 8 * (int)__builtin_amdgcn_workgroup_id_x()
                  - (int)*(const uint16_t*)(prm + 80);
     const int r6 = 8 * (int)(__builtin_amdgcn_workgroup_id_y()
@@ -1017,35 +1232,105 @@ DEVF void surface_scatter21(const uint8_t* prm, const uint32_t d[8][2], int lane
     const int y2 = y1 + 1;
     const int x1 = (r1 >> 1) + ((lane >> 3) & 3);
     const int x2 = (r1 >> 1) + ((g >> 1) & 3);
-    uint8_t* const dst = (uint8_t*)(uintptr_t)*(const uint64_t*)(prm + 56);
-    uint16_t q[16];
+    uint8_t* const dst_raw = (uint8_t*)(uintptr_t)*(const uint64_t*)(prm + 56);
+    // quadrant bisect: 1 = the four prm reads and the target load, 2 = the q fill,
+    // 3 = the index arithmetic and its two gates, 4 = the store groups
+#ifndef D4R_RRSWIN_Q
+#define D4R_RRSWIN_Q 4
+#endif
+#if D4R_RRSWIN_Q == 1
+    (void)d; (void)lane;
+    return;
+#endif
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 19
+    uint8_t* const dst = (uint8_t*)(uintptr_t)*(const uint64_t*)(prm + 48);   // the dumped arena
+#else
+    uint8_t* const dst = dst_raw;
+#endif
+#if D4R_RRSWIN_DEBUG_STAGE == 19
+    {
+        // pointer capture: prm's own words, the +56 target and the geometry, in the
+        // debug-store convention (stage_regs4 layout filler is irrelevant here)
+        uint32_t cap[36];
+        for (int i = 0; i < 32; ++i) {
+            cap[i] = *(const uint32_t*)(prm + 4 * i);
+        }
+        cap[32] = (uint32_t)(uintptr_t)(prm + 56);
+        *(uint64_t*)(cap + 32) = *(const uint64_t*)(prm + 56);
+        debug_store(prm, cap, 34);
+    }
+#endif
+    // The sixteen payloads as the eight u32 words the four store groups write.
+    //   pair16(q[2n], q[2n+1]) with q[k] = (uint16_t)e4m3x2(d[n][row]) is exactly
+    //   e4m3x2(d[n][0]) | (e4m3x2(d[n][1]) << 16):
+    //   e4m3x2 returns two e4m3 bytes, each in [0,255] with a zero upper half, so the
+    //   uint16_t truncation in q[] is a no-op and the packing is bit for bit the same.
+    //   Forming the words directly (rather than through a uint16_t q[16] that -O2/-O3
+    //   widens into a sixteen-lane <16 x i16> built by a shuffle whose mask indexes
+    //   past its operands -- the last two lanes come back `poison`) keeps each payload in
+    //   one u32 register and restores the -O0/-O1 lowering of the stores.
+    uint32_t w[8];
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
-        for (int row = 0; row < 2; ++row) {
-            q[2 * nt + row] = (uint16_t)e4m3x2(d[nt][row]);
-        }
+        w[nt] = e4m3x2(d[nt][0]) | (e4m3x2(d[nt][1]) << 16);
     }
+#if D4R_RRSWIN_Q == 2
+    return;
+#endif
     const int b1 = sx * y1 + 8 * x1;
     const int b2 = sx * y2 + 8 * x2;
     const int st = sx * ey;
     const bool ok1 = (unsigned)y1 < (unsigned)ey && (unsigned)x1 < (unsigned)ex;
     const bool ok2 = (unsigned)y2 < (unsigned)ey && (unsigned)x2 < (unsigned)ex;
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 18
+    return;   // bisect: the scatter's prm/geometry reads only, no stores
+#endif
+#if D4R_RRSWIN_Q == 3
+    return;
+#endif
+#if D4R_RRSWIN_Q == 9
+    // same as Q5, but the target pointer is re-read from prm inside the guarded block
     if (ok1) {
-        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + t)) = pair16(q[0], q[1]);
-        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + (t | 4))) = pair16(q[2], q[3]);
+        uint8_t* const d2 = (uint8_t*)(uintptr_t)*(const uint64_t*)(prm + 56);
+        *(uint32_t*)(d2 + 4 * (uint32_t)(b1 + t)) = w[0];
+        *(uint32_t*)(d2 + 4 * (uint32_t)(b1 + (t | 4))) = w[1];
     }
-    if (ok2) {
-        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + t)) = pair16(q[4], q[5]);
-        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + (t | 4))) = pair16(q[6], q[7]);
-    }
+    return;
+#endif
+    // Q5..Q8 keep exactly one store group; Q4 keeps all four
+#if D4R_RRSWIN_Q >= 4
     if (ok1) {
-        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + st + t)) = pair16(q[8], q[9]);
-        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + st + (t | 4))) = pair16(q[10], q[11]);
+        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + t)) = w[0];
+        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + (t | 4))) = w[1];
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 15
+        return;
+#endif
     }
+#endif
+#if D4R_RRSWIN_Q == 4 || D4R_RRSWIN_Q >= 6
     if (ok2) {
-        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + st + t)) = pair16(q[12], q[13]);
-        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + st + (t | 4))) = pair16(q[14], q[15]);
+        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + t)) = w[2];
+        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + (t | 4))) = w[3];
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 16
+        return;
+#endif
     }
+#endif
+#if D4R_RRSWIN_Q == 4 || D4R_RRSWIN_Q == 7
+    if (ok1) {
+        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + st + t)) = w[4];
+        *(uint32_t*)(dst + 4 * (uint32_t)(b1 + st + (t | 4))) = w[5];
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 17
+        return;
+#endif
+    }
+#endif
+#if D4R_RRSWIN_Q == 4 || D4R_RRSWIN_Q == 8
+    if (ok2) {
+        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + st + t)) = w[6];
+        *(uint32_t*)(dst + 4 * (uint32_t)(b2 + st + (t | 4))) = w[7];
+    }
+#endif
 }
 
 
@@ -1065,6 +1350,15 @@ DEVF void surface_scatter21(const uint8_t* prm, const uint32_t d[8][2], int lane
 // the callee reads 0x0 in all eighteen slots, and an 18 x i32 C++ struct return is an sret pointer,
 // a different LLVM signature that will not link. `scratch` is the base of the entry's `input_tensor`
 // (.shared 3200 bytes, dead after the cut), 72 bytes apart per lane.
+#ifndef D4R_RRSWIN_PAD
+#define D4R_RRSWIN_PAD 0
+#endif
+#ifndef D4R_RRSWIN_VGPRC
+#define D4R_RRSWIN_VGPRC 0
+#endif
+#if D4R_RRSWIN_VGPRC
+__attribute__((amdgpu_max_vgpr_count(D4R_RRSWIN_VGPRC)))
+#endif
 extern "C" __attribute__((device)) void d4r_swin_enc0(
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6,
     uint32_t a7, uint32_t a8, uint32_t a9, uint32_t a10, uint32_t a11, uint32_t a12, uint32_t a13,
@@ -1074,7 +1368,8 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
 {
     const uint32_t as1[24] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
                               a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23};
-    const uint32_t seeds[4] = {b0, b1, b2, b3};
+    // b0..b3 (phase 1's bias C seeds, this lane's t-slice of the per-column blob) are unused
+    // by the engine body: its column-major C seed reads the whole blob at w+5120 directly.
     // The epilogue's eighteen registers: %r17597, %r18203 (%tid.x) and phase 22's eight mma D pairs.
     // Address space 3 (the shared scratch) explicitly: a generic store lowers to flat, which faults.
     __attribute__((address_space(3))) uint32_t* out =
@@ -1083,33 +1378,49 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     const int g = (int)(lane_id() >> 2);  // ... and of its sixteen rows
     const uint32_t lane = lane_id();
     const half_t eps = (half_t)0.0009765625f;   // the tree's sum-of-squares epsilon
+#if D4R_RRSWIN_PAD
+    volatile uint32_t pad[D4R_RRSWIN_PAD];
+#pragma unroll
+    for (int i = 0; i < D4R_RRSWIN_PAD; ++i) {
+        pad[i] = (uint32_t)i;
+    }
+#endif
+
+    // The staged-image engine's shared regions: the prepared slots (1024 B) at +0, the
+    // phase's A image (2048 B) at +1024, and the dcell exchange overlaying the dead image
+    // (3072 of the 3200 bytes; the score_gemm/pv_gemm `slot` = scratch use comes later,
+    // by then both are dead).  AS3 pointers throughout: generic pointers built from the
+    // raw shared-offset value lower to flat accesses at VA ~0 and fault.
+    lds_u8* const slots = (lds_u8*)(uintptr_t)scratch;
+    lds_u8* const img = slots + 1024;
+    lds_u32* const ex = (lds_u32*)(uintptr_t)(scratch + 1024);
 
     // ---- phase 1 -----------------------------------------------------------
-    uint32_t d1[6][2][4];                 // [m-tile][row half][n-tile]: f16 pair
-    gemm(as1, w, 4096, nullptr, seeds, nullptr, 6, t, d1);
+    // The staged block's fragments stage into the image per 48-token half (the six m-tiles
+    // restaged at local rows 0..47); the C seed is the per-column bias at w+5120.  The
+    // result stays in registers as pairs; E1's relu requantisation happens inside phase 2's
+    // mode-1 staging.
+    uint32_t pairs1[2][6][4];
+    enc0_phase1(as1, w, slots, img, pairs1);
 #if D4R_RRSWIN_DEBUG_STAGE == 1
     {
+        uint32_t d1o[6][2][4];
+        enc0_dcell_exchange(&pairs1[0][0][0], 6, ex, &d1o[0][0][0]);
         uint32_t regs[48];
-        stage_regs(d1, regs);
+        stage_regs(d1o, regs);
         debug_store(prm, regs, 48);
     }
 #endif
 
     // ---- phase 2, on phase 1's relu requantisation --------------------------
-    // cvt.rn.satfinite.relu.e4m3x2.f16x2, packed by the epilogue as {n-tile 0,
-    // n-tile 2} into the k-group 0 register and {n-tile 1, n-tile 3} into k-group 1.
-    uint32_t as2[24];
-    for (int mi = 0; mi < 6; ++mi) {
-        for (int row = 0; row < 2; ++row) {
-            const uint32_t* d = d1[mi][row];
-            const uint32_t c0 = e4m3x2(relu_pair(d[0])) | (e4m3x2(relu_pair(d[2])) << 16);
-            const uint32_t c1 = e4m3x2(relu_pair(d[1])) | (e4m3x2(relu_pair(d[3])) << 16);
-            as2[4 * mi + row] = c0;
-            as2[4 * mi + 2 + row] = c1;
-        }
-    }
+    // E1's relu (cvt.rn.satfinite.relu.e4m3x2.f16x2) is a per-pair transform, so staging
+    // phase 1's pairs with swin_stage_operand_p's mode 1 replaces the old as2 pack
+    // bit-identically; the C seed is the per-column bias at w+6208.  The dcell exchange
+    // feeds norm_as (and stage 2); the pairs themselves stay for phase 7's C.
+    uint32_t pairs2[2][6][4];
+    enc0_phase2(pairs1, w, slots, img, pairs2);
     uint32_t d2[6][2][4];
-    gemm(as2, w, 5184, w + 6208, nullptr, nullptr, 6, t, d2);
+    enc0_dcell_exchange(&pairs2[0][0][0], 6, ex, &d2[0][0][0]);
 #if D4R_RRSWIN_DEBUG_STAGE == 2
     {
         uint32_t regs[48];
@@ -1128,11 +1439,30 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     uint32_t as3[24];
     norm_as(d2, w, 6272, eps, 6, as3);
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 1
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 1) {
+        return;
+    }
+#endif
+
     // ---- phases 3 and 4, the fused Q/V projection, on that A operand -------
+    // Both phases read the same normed-tile image halves (as3's fragment groups restaged
+    // per half); their D is consumed only as the dcell view (phases 5/6 walk it scalar).
     uint32_t d3[6][2][4];
     uint32_t d4[6][2][4];
-    gemm(as3, w, 6336, nullptr, nullptr, nullptr, 6, t, d3);
-    gemm(as3, w, 7360, nullptr, nullptr, nullptr, 6, t, d4);
+    enc0_proj96(as3, w, 6336, slots, img, ex, &d3[0][0][0]);
+    enc0_proj96(as3, w, 7360, slots, img, ex, &d4[0][0][0]);
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 2
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 2) {
+        return;
+    }
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 3
     {
         uint32_t regs[48];
@@ -1207,12 +1537,11 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
 #endif
 
     // ---- E6 and phase 7, the first window's output projection ----------------
-    // A is phase 6's D packed as before; C is phase 2's D plus the per-column table at
-    // weight bytes 37056..37120 (four words of eight f16, indexed by the 64-byte record
-    // each group of four lanes shares), taken from the d2 m-tile and n-tile the register
-    // order names: the mma's C pair for (m-tile mi, n-tile nt) is d2[mi][row][nt] -- the
-    // identity: phase 7's first four m-tiles are phase 2's rows 0..63 (VERIFIED, stage e6).
-    // Its output is also phase 12's C operand, so it has to exist before the second window.
+    // A is phase 6's D packed as before (the as7 fragment pack stages as the image); C is
+    // phase 2's pairs plus the per-column table at weight bytes 37056..37120, seeded per
+    // tile from the producer's own pairs (contract §2's residual identity, VERIFIED, stage
+    // e6).  The pairs stay for phase 12's C; the dcell view only the stage 7 and stage 112
+    // c12 rebuilds need, so its exchange is debug-only.
     uint32_t as7[16];
     for (int mi = 0; mi < 4; ++mi) {
         for (int row = 0; row < 2; ++row) {
@@ -1220,21 +1549,40 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
             as7[4 * mi + 2 + row] = e4m3x2(d6[mi][row][1]) | (e4m3x2(d6[mi][row][3]) << 16);
         }
     }
-    uint32_t c7[64];        // [(4*m-tile + row)][n-tile]
-    for (int mi = 0; mi < 4; ++mi) {
-        for (int nt = 0; nt < 4; ++nt) {
-            const uint32_t tab = *(const uint32_t*)(w + 37056 + 16 * nt + ((lane << 2) & 12));
-            for (int row = 0; row < 2; ++row) {
-                const uint32_t r = d2[mi][row][nt];
-                c7[(4 * mi + row) * 4 + nt] = pair_of(
-                    (half_t)(half_lo(tab) + half_lo(r)), (half_t)(half_hi(tab) + half_hi(r)));
-            }
+    uint32_t wt7[2][4];
+    enc0_load_cols(wt7, w, 37056);
+    uint32_t pairs7[2][4][4];
+    rrswin::swin_slots_from_wimg(slots, w, 20672, 32);
+    rrswin::swin_stage_fragment(img, 32, as7, 4);
+    __builtin_amdgcn_wave_barrier();
+    for (int nt = 0; nt < 4; ++nt) {
+        for (int mt = 0; mt < 2; ++mt) {
+            f8v c;
+            enc0_seed_res_tab(c, mt, nt, &pairs2[0][0][0], 6, &wt7[0][0]);
+            c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32, 16 * nt);
+            enc0_pack(pairs7[mt][nt], c);
         }
     }
-    uint32_t d7[4][2][4];
-    gemm(as7, w, 20672, nullptr, nullptr, c7, 4, t, d7);
+    __builtin_amdgcn_wave_barrier();
+#if D4R_RRSWIN_DEBUG_STAGE == 7 || D4R_RRSWIN_DEBUG_STAGE == 112
+    uint32_t d7o[4][2][4];
+    enc0_dcell_exchange(&pairs7[0][0][0], 4, ex, &d7o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 202
     {
+        // the oracle's C array, rebuilt from phase 2's dcell view (which norm_as read in
+        // production) plus the per-column table
+        uint32_t c7[64];
+        for (int mi = 0; mi < 4; ++mi) {
+            for (int nt = 0; nt < 4; ++nt) {
+                const uint32_t tab = *(const uint32_t*)(w + 37056 + 16 * nt + ((lane << 2) & 12));
+                for (int row = 0; row < 2; ++row) {
+                    const uint32_t r = d2[mi][row][nt];
+                    c7[(4 * mi + row) * 4 + nt] = pair_of(
+                        (half_t)(half_lo(tab) + half_lo(r)), (half_t)(half_hi(tab) + half_hi(r)));
+                }
+            }
+        }
         uint32_t regs[48];
         int i = 0;
         for (int mi = 0; mi < 4; ++mi) {
@@ -1254,14 +1602,16 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
 #if D4R_RRSWIN_DEBUG_STAGE == 7
     {
         uint32_t regs[32];
-        int i = 0;
-        for (int mi = 0; mi < 4; ++mi) {
-            for (int nt = 0; nt < 4; ++nt) {
-                regs[i++] = d7[mi][0][nt];
-                regs[i++] = d7[mi][1][nt];
-            }
-        }
+        stage_regs4(d7o, regs);
         debug_store(prm, regs, 32);
+    }
+#endif
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 3
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 3) {
+        return;
     }
 #endif
 
@@ -1272,8 +1622,8 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     // its V from D9.  E7 and E8 between them only load the two weight tiles this reads.
     uint32_t d8[6][2][4];
     uint32_t d9[6][2][4];
-    gemm(as3, w, 21696, nullptr, nullptr, nullptr, 6, t, d8);
-    gemm(as3, w, 22720, nullptr, nullptr, nullptr, 6, t, d9);
+    enc0_proj96(as3, w, 21696, slots, img, ex, &d8[0][0][0]);
+    enc0_proj96(as3, w, 22720, slots, img, ex, &d9[0][0][0]);
 #if D4R_RRSWIN_DEBUG_STAGE == 8
     {
         uint32_t regs[48];
@@ -1340,11 +1690,19 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     }
 #endif
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 4
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 4) {
+        return;
+    }
+#endif
     // ---- E11 and phase 12: the second window's output projection --------------
-    // Unlike E6 there is no table: phase 11's output is requantised only, because the
-    // residual of the first window is phase 12's C operand (the mma's C pair for m-tile
-    // mi and n-tile nt is phase 7's D register pair %r6334+10*(4*mi+nt) -- VERIFIED
-    // against the oracle's own C registers, debug stage p12o).
+    // Unlike E6 there is no table: the residual of the first window is phase 12's C
+    // operand, seeded per tile from phase 7's own pairs (contract §2's identity, VERIFIED
+    // against the oracle's own C registers, debug stage p12o).  The dcell view feeds E12's
+    // RMS norm (and stage 12); the pairs stay for phase 14's C.
     uint32_t as12[16];
     for (int mi = 0; mi < 4; ++mi) {
         for (int row = 0; row < 2; ++row) {
@@ -1352,16 +1710,21 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
             as12[4 * mi + 2 + row] = e4m3x2(d11[mi][row][1]) | (e4m3x2(d11[mi][row][3]) << 16);
         }
     }
-    uint32_t c12[64];       // [(4*m-tile + row)][n-tile]: phase 7's accumulators
-    for (int mi = 0; mi < 4; ++mi) {
-        for (int nt = 0; nt < 4; ++nt) {
-            for (int row = 0; row < 2; ++row) {
-                c12[(4 * mi + row) * 4 + nt] = d7[mi][row][nt];
-            }
+    uint32_t pairs12[2][4][4];
+    rrswin::swin_slots_from_wimg(slots, w, 36032, 32);
+    rrswin::swin_stage_fragment(img, 32, as12, 4);
+    __builtin_amdgcn_wave_barrier();
+    for (int nt = 0; nt < 4; ++nt) {
+        for (int mt = 0; mt < 2; ++mt) {
+            f8v c;
+            enc0_seed_res(c, mt, nt, &pairs7[0][0][0], 4);
+            c = rrswin::swin_gemm_tile(c, slots, 16 * mt, 32, img, 32, 16 * nt);
+            enc0_pack(pairs12[mt][nt], c);
         }
     }
+    __builtin_amdgcn_wave_barrier();
     uint32_t d12[4][2][4];
-    gemm(as12, w, 36032, nullptr, nullptr, c12, 4, t, d12);
+    enc0_dcell_exchange(&pairs12[0][0][0], 4, ex, &d12[0][0][0]);
 #if D4R_RRSWIN_DEBUG_STAGE == 12
     {
         uint32_t regs[32];
@@ -1378,7 +1741,10 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
 #if D4R_RRSWIN_DEBUG_STAGE == 112
     {
         // phase 12's mma operands: the four A fragments, the four B fragment pairs and
-        // the 32 C seeds in the oracle's (m-tile, n-tile) pair order
+        // the 32 C seeds in the oracle's (m-tile, n-tile) pair order -- the C array
+        // rebuilt from phase 7's debug-only dcell view
+        uint32_t c12[64];
+        cres_regs(d7o, c12);
         uint32_t regs[56];
         for (int o = 0; o < 16; ++o) {
             regs[o] = as12[o];
@@ -1389,6 +1755,14 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     }
 #endif
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 5
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 5) {
+        return;
+    }
+#endif
     // ---- E12 and phases 13 to 20: the MLP ------------------------------------
     // E12's RMS norm is the same sum-of-squares tree as the LayerNorm above, on phase 12's
     // accumulators and with the gain at weight bytes 37120..37184; its epsilon is E12's own
@@ -1399,15 +1773,19 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     norm_as(d12, w, 37120, (half_t)0.0001220703125f, 4, asN);
 
     // ---- phase 13 and E13, the first branch -----------------------------------
-    // A = the normed tile, B = the weights at 37184, C = the bias at 38208 (one word per
-    // n-tile, replicated over the 16 rows of its tile).  E13 activates the result and adds
-    // the per-column table at 39296 to the activation's *input*, which is phase 14's C.
-    uint32_t d13[4][2][4];
-    gemm(asN, w, 37184, w + 38208, nullptr, nullptr, 4, t, d13);
+    // A = the normed tile image, B = the weights at 37184, C = the per-column bias at
+    // 38208.  E13's activation stages into phase 14's image as mode 2; the d13 view only
+    // stages 13 and 114 need, so its exchange is debug-only.
+    uint32_t pairs13[2][4][4];
+    enc0_branch(asN, w, 37184, 38208, slots, img, pairs13);
+#if D4R_RRSWIN_DEBUG_STAGE == 13 || D4R_RRSWIN_DEBUG_STAGE == 114
+    uint32_t d13o[4][2][4];
+    enc0_dcell_exchange(&pairs13[0][0][0], 4, ex, &d13o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 13
     {
         uint32_t regs[32];
-        stage_regs4(d13, regs);
+        stage_regs4(d13o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
@@ -1422,21 +1800,31 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
         debug_store(prm, regs, 28);
     }
 #endif
-    uint32_t as14[16];
-    act_pack(d13, as14);
-    uint32_t c14[64];
-    tab_seed(d12, w + 39296, (int)lane, c14);
-    uint32_t d14[4][2][4];
-    gemm(as14, w, 38272, nullptr, nullptr, c14, 4, t, d14);
+    // E13's activation is phase 14's A image (mode 2 = the clamped cubic per pair,
+    // bit-identical to the old act_pair + e4m3x2 pack); C is phase 12's pairs plus the
+    // per-column table at 39296, added in f16 before the widen (VERIFIED, stage p14o).
+    uint32_t wt14[2][4];
+    enc0_load_cols(wt14, w, 39296);
+    uint32_t pairs14[2][4][4];
+    enc0_branch_act(pairs13, &pairs12[0][0][0], &wt14[0][0], w, 38272, slots, img, pairs14);
+#if D4R_RRSWIN_DEBUG_STAGE == 14 || D4R_RRSWIN_DEBUG_STAGE == 116
+    uint32_t d14o[4][2][4];
+    enc0_dcell_exchange(&pairs14[0][0][0], 4, ex, &d14o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 14
     {
         uint32_t regs[32];
-        stage_regs4(d14, regs);
+        stage_regs4(d14o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
 #if D4R_RRSWIN_DEBUG_STAGE == 114
     {
+        // the oracle's as14 pack and C array, rebuilt from the d13/d12 dcell views
+        uint32_t as14[16];
+        act_pack(d13o, as14);
+        uint32_t c14[64];
+        tab_seed(d12, w + 39296, (int)lane, c14);
         uint32_t regs[56];
         for (int o = 0; o < 16; ++o) {
             regs[o] = as14[o];
@@ -1450,12 +1838,16 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     // ---- phases 15 and 16, the second branch ---------------------------------
     // The same pair with the weights at 39360 and 40448 and the bias at 40384: no table
     // add, and phase 16's C is branch one's accumulators.
-    uint32_t d15[4][2][4];
-    gemm(asN, w, 39360, w + 40384, nullptr, nullptr, 4, t, d15);
+    uint32_t pairs15[2][4][4];
+    enc0_branch(asN, w, 39360, 40384, slots, img, pairs15);
+#if D4R_RRSWIN_DEBUG_STAGE == 15 || D4R_RRSWIN_DEBUG_STAGE == 116
+    uint32_t d15o[4][2][4];
+    enc0_dcell_exchange(&pairs15[0][0][0], 4, ex, &d15o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 15
     {
         uint32_t regs[32];
-        stage_regs4(d15, regs);
+        stage_regs4(d15o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
@@ -1470,21 +1862,26 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
         debug_store(prm, regs, 28);
     }
 #endif
-    uint32_t as16[16];
-    act_pack(d15, as16);
-    uint32_t c16[64];
-    cres_regs(d14, c16);
-    uint32_t d16[4][2][4];
-    gemm(as16, w, 40448, nullptr, nullptr, c16, 4, t, d16);
+    uint32_t pairs16[2][4][4];
+    enc0_branch_act(pairs15, &pairs14[0][0][0], nullptr, w, 40448, slots, img, pairs16);
+#if D4R_RRSWIN_DEBUG_STAGE == 16 || D4R_RRSWIN_DEBUG_STAGE == 118
+    uint32_t d16o[4][2][4];
+    enc0_dcell_exchange(&pairs16[0][0][0], 4, ex, &d16o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 16
     {
         uint32_t regs[32];
-        stage_regs4(d16, regs);
+        stage_regs4(d16o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
 #if D4R_RRSWIN_DEBUG_STAGE == 116
     {
+        // the oracle's as16 pack and C array, rebuilt from the d15/d14 dcell views
+        uint32_t as16[16];
+        act_pack(d15o, as16);
+        uint32_t c16[64];
+        cres_regs(d14o, c16);
         uint32_t regs[56];
         for (int o = 0; o < 16; ++o) {
             regs[o] = as16[o];
@@ -1495,13 +1892,25 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     }
 #endif
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 6
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 6) {
+        return;
+    }
+#endif
     // ---- phases 17 and 18, the third branch ----------------------------------
-    uint32_t d17[4][2][4];
-    gemm(asN, w, 41472, w + 42496, nullptr, nullptr, 4, t, d17);
+    uint32_t pairs17[2][4][4];
+    enc0_branch(asN, w, 41472, 42496, slots, img, pairs17);
+#if D4R_RRSWIN_DEBUG_STAGE == 17 || D4R_RRSWIN_DEBUG_STAGE == 118
+    uint32_t d17o[4][2][4];
+    enc0_dcell_exchange(&pairs17[0][0][0], 4, ex, &d17o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 17
     {
         uint32_t regs[32];
-        stage_regs4(d17, regs);
+        stage_regs4(d17o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
@@ -1516,21 +1925,26 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
         debug_store(prm, regs, 28);
     }
 #endif
-    uint32_t as18[16];
-    act_pack(d17, as18);
-    uint32_t c18[64];
-    cres_regs(d16, c18);
-    uint32_t d18[4][2][4];
-    gemm(as18, w, 42560, nullptr, nullptr, c18, 4, t, d18);
+    uint32_t pairs18[2][4][4];
+    enc0_branch_act(pairs17, &pairs16[0][0][0], nullptr, w, 42560, slots, img, pairs18);
+#if D4R_RRSWIN_DEBUG_STAGE == 18
+    uint32_t d18o[4][2][4];
+    enc0_dcell_exchange(&pairs18[0][0][0], 4, ex, &d18o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 18
     {
         uint32_t regs[32];
-        stage_regs4(d18, regs);
+        stage_regs4(d18o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
 #if D4R_RRSWIN_DEBUG_STAGE == 118
     {
+        // the oracle's as18 pack and C array, rebuilt from the d17/d16 dcell views
+        uint32_t as18[16];
+        act_pack(d17o, as18);
+        uint32_t c18[64];
+        cres_regs(d16o, c18);
         uint32_t regs[56];
         for (int o = 0; o < 16; ++o) {
             regs[o] = as18[o];
@@ -1542,12 +1956,16 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
 #endif
 
     // ---- phases 19 and 20, the fourth branch ---------------------------------
-    uint32_t d19[4][2][4];
-    gemm(asN, w, 43584, w + 44608, nullptr, nullptr, 4, t, d19);
+    uint32_t pairs19[2][4][4];
+    enc0_branch(asN, w, 43584, 44608, slots, img, pairs19);
+#if D4R_RRSWIN_DEBUG_STAGE == 19
+    uint32_t d19o[4][2][4];
+    enc0_dcell_exchange(&pairs19[0][0][0], 4, ex, &d19o[0][0][0]);
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 19
     {
         uint32_t regs[32];
-        stage_regs4(d19, regs);
+        stage_regs4(d19o, regs);
         debug_store(prm, regs, 32);
     }
 #endif
@@ -1562,13 +1980,28 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
         debug_store(prm, regs, 28);
     }
 #endif
-    uint32_t as20[16];
-    act_pack(d19, as20);
-    uint32_t c20[64];
-    cres_regs(d18, c20);
+    uint32_t pairs20[2][4][4];
+    enc0_branch_act(pairs19, &pairs18[0][0][0], nullptr, w, 44672, slots, img, pairs20);
+    // E20's r20 build walks the NVIDIA d[mi][row][nt] view
     uint32_t d20[4][2][4];
-    gemm(as20, w, 44672, nullptr, nullptr, c20, 4, t, d20);
+    enc0_dcell_exchange(&pairs20[0][0][0], 4, ex, &d20[0][0][0]);
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 8
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 8) {
+        return;
+    }
+#endif
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 7
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 7) {
+        return;
+    }
+#endif
     // ---- E20 and phases 21 and 22: the merge ---------------------------------
     // E20 requantises phase 20 into sixteen packed words (r20, the four A fragments of
     // phase 22), scatters them into the plane arena, and merges the lanes of each group of
@@ -1582,19 +2015,77 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
             r20[4 * mi + 2 + row] = a1;
         }
     }
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 9
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 9) {
+        return;
+    }
+#endif
     arena_scatter(prm, r20, (int)lane);
     uint32_t m21[16];
     merge_frag(r20, scratch, (int)lane, m21);
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 10
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 10) {
+        return;
+    }
+#endif
     uint32_t d21[8][2];
     band21(m21, w, w + 53888, (int)lane, d21);
+#if D4R_RRSWIN_KEEP21 == 1
+    // band21 live, but no E21 store: d21's only real consumer is the scatter, so without
+    // this the whole phase-21 band gemm is dead-code-eliminated
+    if (lane == 0x7ffffffu) {
+        out[0] = d21[0][0];
+        out[1] = d21[7][1];
+        out[2] = d21[3][0];
+        return;
+    }
+#endif
 
     // ---- E21 and phase 22 ---------------------------------------------------
     // E21 requantises phase 21 and scatters it into the buffer at parameter block +56;
     // phase 22 takes the sixteen words E20 packed as its A operand (four m-tiles, K=32)
     // with the weights at 54016 and the two bias words at 54528.
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT == 20
+    // capture: the param block's words (arena/extents/buffer pointers/geometry) handed back
+    // through the 18-word cut ABI, so the launch dump's arg112 surface bytes carry them
+    for (int i = 0; i < 18; ++i) {
+        out[i] = *(const uint32_t*)(prm + 4 * i);
+    }
+    return;
+#endif
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 12
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 12) {
+        return;
+    }
+#endif
     surface_scatter21(prm, d21, (int)lane);
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 14
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 14) {
+        return;
+    }
+#endif
     uint32_t d22[4][2][4];
     gemm(r20, w, 54016, w + 54528, nullptr, nullptr, 4, t, d22, 2);
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 11
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 11) {
+        return;
+    }
+#endif
 #if D4R_RRSWIN_DEBUG_STAGE == 20
     {
         uint32_t regs[32];
@@ -1626,6 +2117,14 @@ extern "C" __attribute__((device)) void d4r_swin_enc0(
     }
 #endif
 
+#if defined(D4R_RRSWIN_BISECT) && D4R_RRSWIN_BISECT >= 13
+    out[0] = *(const uint32_t*)prm;
+    out[1] = (uint32_t)__builtin_amdgcn_workitem_id_x();
+    for (int i = 2; i < 18; ++i) out[i] = 0;
+    if (D4R_RRSWIN_BISECT == 13) {
+        return;
+    }
+#endif
     // ---- handing the accumulators back ------------------------------------
     // %r17597 is param_0[0] (ld.param.v2.u32 at line 44316) and %r18203 is %tid.x
     // (line 44456); both sit inside the cut, so the epilogue cannot recompute them.

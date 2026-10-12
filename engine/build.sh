@@ -12,9 +12,11 @@ if [[ -f "$ROCM/include/hip/hip_runtime_api.h" ]]; then
     HIP=(-DD4R_ENGINE_HIP "$ROOT/engine/hip_net.cpp" -I"$ROCM/include" -L"$ROCM/lib" -lamdhip64 "-Wl,-rpath,$ROCM/lib")
 fi
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers -fPIC -shared \
-    "$ROOT/engine/runtime.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" -lvulkan -o "$OUT/libd4r_engine.so"
+    "$ROOT/engine/runtime.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" "$ROOT/engine/game_rr.cpp" -lvulkan -o "$OUT/libd4r_engine.so"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers \
     "$ROOT/engine/replay.cpp" "${HIP[@]}" -L"$OUT" -ld4r_engine -lvulkan '-Wl,-rpath,$ORIGIN' -o "$OUT/d4r-k"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers \
     "$ROOT/engine/replay_m.cpp" "${HIP[@]}" -L"$OUT" -ld4r_engine -lvulkan '-Wl,-rpath,$ORIGIN' -o "$OUT/d4r-m"
-printf 'Built %s and %s\n' "$OUT/d4r-k" "$OUT/d4r-m"
+"$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers \
+    "$ROOT/engine/replay_rr.cpp" -L"$OUT" -ld4r_engine -lvulkan '-Wl,-rpath,$ORIGIN' -o "$OUT/d4r-rr"
+printf 'Built %s, %s and %s\n' "$OUT/d4r-k" "$OUT/d4r-m" "$OUT/d4r-rr"

@@ -244,4 +244,64 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
+
+// ---------------------------------------------------------------- Ray Reconstruction (DLSS-D, presets D and E)
+// NVIDIA's denoiser frame as d4r's own shaders (engine/rr): exposure, six encoders, five decoders and the output
+// stage, each reading and writing NGX's layouts so it can be checked against a captured launch. The network runs at
+// the render size, the output stage at the output size. Same conventions as the classes above.
+struct RFrameImages {
+    // Render-resolution inputs, sampled: colour, motion (two channels, before MV.Scale), depth (one channel), and the
+    // guides the denoiser reads (GBuffer.Normals, GBuffer.Roughness, the diffuse and specular albedo).
+    VkImageView color, motion, depth, normals, roughness, diffuseAlbedo, specularAlbedo;
+    // Optional inputs (null: the game passes none): DLSSD.SpecularHitDistance and DLSS.DisocclusionMask, one channel each
+    VkImageView specularHitDistance = VK_NULL_HANDLE, disocclusionMask = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL; // of every view
+};
+struct RFrameSettings {
+    float jitter[2] = {0, 0};         // Jitter.Offset, render pixels
+    float motionScale[2] = {1, 1};    // MV.Scale
+    float preExposure = 1;            // DLSS.Pre.Exposure
+    float frameTimeMs = 16.666667f;   // FrameTimeDeltaInMsec
+    bool reset = false;
+    bool depthInverted = false;       // creation flag NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
+    bool roughnessPacked = false;     // DLSS.Roughness.Mode 1: the roughness is the normals' w (no roughness texture)
+    float worldToView[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // row-major, as the SDK passes them
+    float viewToClip[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+};
+class RModel {
+public:
+    RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    ~RModel();
+    RModel(const RModel&) = delete;
+    RModel& operator=(const RModel&) = delete;
+    void recordUpload(VkCommandBuffer command);
+    bool uploadRecorded() const;
+    uint32_t preset() const; // NVSDK_NGX_RayReconstruction_Hint_Render_Preset: 4 = D, 5 = E
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+    friend class REngine;
+};
+class REngine {
+public:
+    REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight);
+    ~REngine();
+    REngine(const REngine&) = delete;
+    REngine& operator=(const REngine&) = delete;
+    void recordInitialize(VkCommandBuffer command);
+    // A borrowed RGBA16F finalOutput (GENERAL, origin zero) receives the presented image as a copy after the frame;
+    // otherwise read outputImage(). Views must outlive this engine.
+    void setFrame(const RFrameImages& images, const RFrameSettings& settings, FrameOutput finalOutput = {});
+    // With a timestamp query pool, four stamps are written from query `first`: start, after the exposure, after the
+    // network (enc0 to dec0) and after the output stage.
+    void recordFrame(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
+    VkImage outputImage() const; // RGBA16F, GENERAL: the presented image of the last recorded frame
+    // Debugging (engine/replay_rr.cpp): every image the frame writes, named after the stage and argument offset that
+    // writes it ("enc1-112", "dec0-144", "q0", ...), GENERAL layout
+    struct DebugImage { std::string name; VkImage image; VkFormat format; uint32_t width, height; };
+    std::vector<DebugImage> debugImages() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
 } // namespace d4r

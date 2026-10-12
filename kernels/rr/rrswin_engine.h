@@ -47,17 +47,28 @@
 namespace rrswin
 {
 
+// The engine's LDS-typed register vectors: the images, the prepared slots and the exchange
+// live in the caller's shared arena, and a pointer here that is typed with no address space
+// is a generic pointer whose accesses lower to flat -- in the cut context, where this body
+// is linked, that faults on the raw shared-offset value (VA ~0).  Everything the engine
+// reads or writes in shared memory is therefore typed with address_space(3) end to end
+// (lds_u8 bytes, lds_v2 the 8-byte k16 operand read, lds_v4/u8 the widened variants of the
+// non-native-FP8 layout); global pointers (the weight image, the _prep writes) stay generic.
+typedef __attribute__((address_space(3))) uint2_t lds_v2;
+typedef __attribute__((address_space(3))) u4v lds_v4;
+typedef __attribute__((address_space(3))) u8v lds_v8;
+
 // This lane's operand for k16 chunk `chunk` of image row `row_base + (lane & 15)`; rows are
 // `stride` bytes apart.  The row comes from the lane, as in enc0_tail (`m = l & 15`), so a
 // caller cannot pass a row that does not match its lane.  A row holds consecutive k, 16
 // bytes per k16 chunk, so a k32 image needs stride >= 32; a smaller stride silently reads
 // the next row.
-__attribute__((device)) static inline kop swin_operand(const uint8_t* img, int stride, int row_base, int chunk)
+__attribute__((device)) static inline kop swin_operand(const lds_u8* img, int stride, int row_base, int chunk)
 {
     const uint32_t l = lane_id();
     const uint32_t half_bytes = (l >= 16) ? 8u : 0u;
     const uint32_t row = (uint32_t)row_base + (l & 15u);
-    const uint2_t* p = (const uint2_t*)(img + (size_t)row * (size_t)stride + 16u * (uint32_t)chunk + half_bytes);
+    const lds_v2* p = (const lds_v2*)(img + (size_t)row * (size_t)stride + 16u * (uint32_t)chunk + half_bytes);
     return kop_from8(*p);
 }
 
@@ -74,14 +85,28 @@ __attribute__((device)) static inline kop swin_operand(const uint8_t* img, int s
 // with slot_step fixed at 16 a 32-row phase would read tile 1's rows as tile 0's second k16.
 // `k32_index` selects which 32-wide slice of the activations this step reads: a phase with more
 // than one k32 step must advance the image's chunks too, or every step re-reads k 0..31.
-__attribute__((device)) static inline f8v swin_gemm_tile(f8v c, const kslot* w, int slot_base,
-                                                         int slot_step, const uint8_t* img, int stride,
+// The engine's own slot reader: the prepared slots live in the caller's shared arena, so the
+// read must be AS3-typed (tex_common.h's generic kop_image is for global slot banks and stays
+// for those callers).  Byte offsets are the same as the generic one's: 8 bytes per kslot under
+// the native-FP8 layout, 16 under the widened one.
+__attribute__((device)) static inline kop kop_image_lds(const lds_u8* img, int idx)
+{
+    const int i = 2 * idx + (int)(lane_id() >> 4);
+#if defined(D4R_TEX_FP8)
+    return *(const lds_v2*)(img + 8 * (unsigned)i);
+#else
+    return *(const lds_v4*)(img + 16 * (unsigned)i);
+#endif
+}
+
+__attribute__((device)) static inline f8v swin_gemm_tile(f8v c, const lds_u8* w, int slot_base,
+                                                         int slot_step, const lds_u8* img, int stride,
                                                          int row_base, int k32_index = 0)
 {
     const int slot = slot_base + (int)(lane_id() & 15u);
-    const kop a0 = kop_image(w, slot);
+    const kop a0 = kop_image_lds(w, slot);
     const kop b0 = swin_operand(img, stride, row_base, 2 * k32_index);
-    const kop a1 = kop_image(w, slot + slot_step);
+    const kop a1 = kop_image_lds(w, slot + slot_step);
     const kop b1 = swin_operand(img, stride, row_base, 2 * k32_index + 1);
     return k32_e4m3(c, a0, b0, a1, b1);
 }
@@ -94,12 +119,12 @@ __attribute__((device)) static inline f8v swin_gemm_tile(f8v c, const kslot* w, 
 // `row_base` is the first token column this tile covers and `chunk` the k16 chunk the tile's
 // rows land in (a 16-row m-tile is one k16 chunk), so a phase with several tiles stages each
 // into its own place.
-__attribute__((device)) static inline void swin_stage_operand(uint8_t* img, int stride, int row_base,
+__attribute__((device)) static inline void swin_stage_operand(lds_u8* img, int stride, int row_base,
                                                               int chunk, const f8v acc)
 {
     const uint32_t l = lane_id();
     const uint32_t h = l >> 4, col = (uint32_t)row_base + (l & 15u);
-    uint8_t* p = img + (size_t)col * (size_t)stride + 16u * (uint32_t)chunk + 8u * h;
+    lds_u8* p = img + (size_t)col * (size_t)stride + 16u * (uint32_t)chunk + 8u * h;
 #pragma unroll
     for (int i = 0; i < 8; i += 2)
     {
@@ -178,16 +203,16 @@ __attribute__((device)) static inline uint32_t swin_act_pair(uint32_t x)
 // phase's 4*m_tiles registers cover 16*m_tiles rows.  Each lane scatters its own 16 bytes, which
 // is a shared-memory store per byte -- the whole point of the engine is that this happens once
 // per phase instead of once per mma.
-__attribute__((device)) static inline void swin_stage_fragment(uint8_t* img, int stride,
-                                                              const uint32_t* frag, int m_tiles)
+__attribute__((device)) static inline void swin_stage_fragment(lds_u8* img, int stride,
+                                                               const uint32_t* frag, int m_tiles)
 {
     const uint32_t l = lane_id();
     const uint32_t g = l >> 2, t = l & 3u;
     for (int mi = 0; mi < m_tiles; ++mi)
     {
         const uint32_t* f = frag + 4 * mi;
-        uint8_t* r0 = img + (size_t)(16 * mi + g) * (size_t)stride;
-        uint8_t* r1 = img + (size_t)(16 * mi + g + 8) * (size_t)stride;
+        lds_u8* r0 = img + (size_t)(16 * mi + g) * (size_t)stride;
+        lds_u8* r1 = img + (size_t)(16 * mi + g + 8) * (size_t)stride;
 #pragma unroll
         for (int j = 0; j < 4; ++j)
         {
@@ -217,9 +242,9 @@ struct Phase
 // Run one phase from `src`, staging requantized accumulators into `dst` or retaining them.
 // `weight_rows` is the output row count used to prepare each pair of k16 weight slot banks.
 // When retaining results, `acc` must hold m_tiles * n_tiles entries in row-major tile order.
-__attribute__((device)) static inline void swin_phase(const Phase& ph, const kslot* w, int weight_rows,
-                                                      const uint8_t* src, int src_stride,
-                                                      uint8_t* dst, int dst_stride, f8v* acc)
+__attribute__((device)) static inline void swin_phase(const Phase& ph, const lds_u8* w, int weight_rows,
+                                                      const lds_u8* src, int src_stride,
+                                                      lds_u8* dst, int dst_stride, f8v* acc)
 {
     for (int mt = 0; mt < ph.m_tiles; ++mt)
         for (int nt = 0; nt < ph.n_tiles; ++nt)
@@ -240,6 +265,118 @@ __attribute__((device)) static inline int swin_waddr_enc0(int k, int n)
 {
     return 512 * (n >> 4) + 64 * (n & 7) + 16 * ((k >> 1) & 3) + 8 * ((n >> 3) & 1)
          + 4 * ((k >> 3) & 1) + 2 * ((k >> 4) & 1) + (k & 1);
+}
+
+// ------------------------------------------------------------------ the enc0 port
+// Address space 3 (the shared arena) explicitly: a generic access lowers to flat, which
+// faults (rrswin_enc0.hip's typedef comment).  The cut body consumes rrswin::lds_u32 and
+// must not define its own.
+typedef unsigned lds_u32 __attribute__((address_space(3)));
+
+// ZLUDA's relu_keep_nan_halves on a packed pair, byte for byte the body's relu_pair
+// (rrswin_enc0.hip): a negative or -0 half becomes +0, NaN kept, positive unchanged.
+__attribute__((device)) static inline uint32_t swin_relu_pair(uint32_t p)
+{
+    if ((p & 0x8000u) != 0 && (p & 0x7fffu) <= 0x7c00u)
+    {
+        p &= 0xffff0000u;
+    }
+    if ((p & 0x80000000u) != 0 && ((p >> 16) & 0x7fffu) <= 0x7c00u)
+    {
+        p &= 0x0000ffffu;
+    }
+    return p;
+}
+
+// The dcell exchange (contract §3), in u32 units: tile block (mt*n_nt + nt) is 128 words,
+// the writer's own lane slot l*4 + p inside it, the reader walking the same words at
+// (8rh + g + 16*(nt&1))*4 + t.  Writer and reader are separate calls; the wave barriers
+// between them belong to the caller.
+__attribute__((device)) static inline void swin_dcell_exchange_write(lds_u32* lds,
+                                                                     const uint32_t* pairs,
+                                                                     int n_mt, int n_nt)
+{
+    const uint32_t l = lane_id() & 31u;
+    for (int mt = 0; mt < n_mt; ++mt)
+        for (int nt = 0; nt < n_nt; ++nt)
+#pragma unroll
+            for (int p = 0; p < 4; ++p)
+                lds[(mt * n_nt + nt) * 128 + l * 4 + p] = pairs[(mt * n_nt + nt) * 4 + p];
+}
+
+// The matching reader: the epilogue's d[mi][rh][nt] from the same lds words.
+__attribute__((device)) static inline void swin_dcell_exchange_read(const lds_u32* lds, uint32_t* d,
+                                                                    int n_mi, int n_nt4, int n_nt)
+{
+    const uint32_t l = lane_id();
+    const uint32_t g = (l >> 2) & 7u, t = l & 3u;
+    for (int mi = 0; mi < n_mi; ++mi)
+        for (int rh = 0; rh < 2; ++rh)
+#pragma unroll
+            for (int nt = 0; nt < n_nt4; ++nt)
+                d[(mi * 2 + rh) * n_nt4 + nt] =
+                    lds[((nt >> 1) * n_nt + mi) * 128 + (8 * rh + g + 16 * (nt & 1)) * 4 + t];
+}
+
+// ------------------------------------------------------------------ slots from wimg
+// One phase's B fragments (the WMMA slot order, rrswin_enc0.hip's documented layout)
+// scattered into the slots swin_gemm_tile reads, without touching the image layout:
+// one tile's 8 u32 per lane wait at w + base + 512*t + 16*lane + 4*word for tile t and
+// fragment word, and their bytes are (n, k) at
+//   (t, lane, word, j) -> n = 16*t + (lane>>2) + 8*(word>>1), k = 2*(lane&3) + (j&1)
+//                          + 16*(j>>1) + 8*(word&1)
+//                                  -- gemm_native_unbiased, enc0 phases 1-20 being a
+//                                     k32-steps variant of the same D4R_ZLUDA_WMMA_FP8 + bfly
+//                                     shape (D layout, wmma_layout.h)
+// The destination layout is the slot one: slot (n_rows*(k>>4) + n)*16 + (k&15) of the
+// phase's own bank, with the bytes in k order, exactly swin_gemm_tile's read with
+// slot_base = 16*mt and slot_step = n_rows.  Like the body's loops that make the same
+// scatter, it is wave-wide (no barrier inside); the caller orders it against its GEMM.
+__attribute__((device)) static inline void swin_slots_from_wimg(lds_u8* slots, const uint8_t* w,
+                                                                int base, int n_rows)
+{
+    const uint32_t l = lane_id();
+    for (int t = 0; t < n_rows / 16; ++t)
+        for (int word = 0; word < 4; ++word)
+        {
+            const uint32_t n = 16u * (uint32_t)t + (l >> 2) + 8u * ((uint32_t)word >> 1);
+            const uint32_t src = *(const uint32_t*)(w + base + 512 * t + 16 * l + 4 * word);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                const uint32_t k = 2u * (l & 3u) + (j & 1) + 16u * (j >> 1) + 8u * (word & 1);
+                slots[(size_t)(n_rows * (k >> 4) + (int)n) * 16 + (k & 15)] =
+                    (uint8_t)(src >> (8 * j));
+            }
+        }
+}
+
+// ---------------------------------------------- stage a tile's pairs with a transform
+// swin_stage_operand from a tile's four f16 pairs (p = f16(D[2p]) | f16(D[2p+1]) << 16)
+// with the epilogue's per-pair transform before e4m3x2: mode 0 plain, 1 the relu
+// (swin_relu_pair), 2 the clamped cubic (swin_act_pair).  Both transforms are
+// per-element, so each is bit-identical to the body's packed-register path.  This
+// mirrors swin_stage_operand byte for byte, with the caller's pair array in place of
+// the accumulator.
+__attribute__((device)) static inline void swin_stage_operand_p(lds_u8* img, int stride,
+                                                                int row_base, int chunk,
+                                                                const uint32_t pairs[4], int mode)
+{
+    const uint32_t l = lane_id();
+    const uint32_t h = l >> 4, col = (uint32_t)row_base + (l & 15u);
+    lds_u8* p = img + (size_t)col * (size_t)stride + 16u * (uint32_t)chunk + 8u * h;
+#pragma unroll
+    for (int p_ = 0; p_ < 4; ++p_)
+    {
+        uint32_t pair = pairs[p_];
+        if (mode == 1)
+            pair = swin_relu_pair(pair);
+        else if (mode == 2)
+            pair = swin_act_pair(pair);
+        const uint32_t code = e4m3x2(pair);
+        p[2 * p_] = (uint8_t)(code & 0xffu);
+        p[2 * p_ + 1] = (uint8_t)(code >> 8);
+    }
 }
 
 } // namespace rrswin

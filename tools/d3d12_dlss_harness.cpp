@@ -1331,6 +1331,38 @@ int main(int argc, char** argv)
             }
         upload(alphaOutput, sentinel.data(), alphaWidth * texel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    // D4R_HARNESS_RR_EXTRA=hit,mask: the two optional denoiser inputs RE Requiem passes, in its formats: the specular
+    // hit distance (R32_FLOAT) and the disocclusion mask (R16_FLOAT), each a pattern that varies over the frame so a
+    // capture shows where the denoiser reads them.
+    ID3D12Resource* hitDistance = nullptr;
+    ID3D12Resource* disocclusionMask = nullptr;
+    if (const char* extra = reconstruction ? std::getenv("D4R_HARNESS_RR_EXTRA") : nullptr)
+    {
+        if (std::strstr(extra, "hit") != nullptr)
+        {
+            std::vector<float> distance(static_cast<size_t>(resourceWidth) * inHeight);
+            for (UINT y = 0; y < inHeight; ++y)
+                for (UINT x = 0; x < resourceWidth; ++x)
+                    distance[static_cast<size_t>(y) * resourceWidth + x] =
+                        0.5f + 20.0f * static_cast<float>((x / 16 + y / 16) % 7) / 6.0f + 0.01f * static_cast<float>(x % 16);
+            hitDistance = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+            if (!hitDistance) return 1;
+            upload(hitDistance, distance.data(), resourceWidth * sizeof(float), srv);
+        }
+        if (std::strstr(extra, "mask") != nullptr)
+        {
+            std::vector<uint16_t> mask(static_cast<size_t>(resourceWidth) * inHeight);
+            for (UINT y = 0; y < inHeight; ++y)
+                for (UINT x = 0; x < resourceWidth; ++x)
+                    mask[static_cast<size_t>(y) * resourceWidth + x] = std::bit_cast<uint16_t>(static_cast<_Float16>(
+                        ((x / 24 + y / 24) % 5 == 0) ? 1.0f : ((x / 24 + y / 24) % 5 == 1 ? 0.5f : 0.0f)));
+            disocclusionMask = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+            if (!disocclusionMask) return 1;
+            upload(disocclusionMask, mask.data(), resourceWidth * sizeof(uint16_t), srv);
+        }
+        std::printf("Ray Reconstruction extra inputs:%s%s\n", hitDistance ? " DLSSD.SpecularHitDistance" : "",
+                    disocclusionMask ? " DLSS.DisocclusionMask" : "");
+    }
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
@@ -1464,14 +1496,33 @@ int main(int argc, char** argv)
                     (alphaScenario ? 0x80 : 0));
     if (alphaScenario)
         d4r_ngx_set_int(parameters, "DLSS.Enable.Output.Subrects", 1);
-    std::array<float, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    // D4R_HARNESS_RR_MATRICES="w0,...,w15;c0,...,c15": the camera's WorldToView and ViewToClip matrices
+    // (row-major as the SDK passes them) instead of identities, for Ray Reconstruction.
+    static std::array<float, 16> worldToView{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    static std::array<float, 16> viewToClip = worldToView;
+    if (const char* matrices = std::getenv("D4R_HARNESS_RR_MATRICES"))
+    {
+        const char* cursor = matrices;
+        for (std::array<float, 16>* matrix : {&worldToView, &viewToClip})
+            for (float& value : *matrix)
+            {
+                char* end = nullptr;
+                value = std::strtof(cursor, &end);
+                if (end == cursor)
+                {
+                    std::fprintf(stderr, "D4R_HARNESS_RR_MATRICES needs 32 numbers\n");
+                    return 2;
+                }
+                cursor = *end != '\0' ? end + 1 : end;
+            }
+    }
     if (reconstruction)
     {
         d4r_ngx_set_int(parameters, "DLSS.Denoise.Mode", 1);
         d4r_ngx_set_int(parameters, "DLSS.Roughness.Mode", 0);
         d4r_ngx_set_int(parameters, "DLSS.Use.HW.Depth", 0);
-        d4r_ngx_set_void(parameters, "WorldToViewMatrix", identity.data());
-        d4r_ngx_set_void(parameters, "ViewToClipMatrix", identity.data());
+        d4r_ngx_set_void(parameters, "WorldToViewMatrix", worldToView.data());
+        d4r_ngx_set_void(parameters, "ViewToClipMatrix", viewToClip.data());
         const char* preset = std::getenv("D4R_HARNESS_RR_PRESET");
         if (preset)
             for (const char* mode : {"DLAA", "Quality", "Balanced", "Performance", "UltraPerformance", "UltraQuality"})
@@ -1525,6 +1576,10 @@ int main(int argc, char** argv)
         for (size_t input = 0; input < guides.size(); ++input)
             d4r_ngx_set_d3d12_resource(parameters, names[input], guides[input]);
     }
+    if (hitDistance != nullptr && replayDir == nullptr)
+        d4r_ngx_set_d3d12_resource(parameters, "DLSSD.SpecularHitDistance", hitDistance);
+    if (disocclusionMask != nullptr && replayDir == nullptr)
+        d4r_ngx_set_d3d12_resource(parameters, "DLSS.DisocclusionMask", disocclusionMask);
     // DLSSD.Alpha is a guide the capture records in its own right, so the synthetic alpha
     // scenario would double-bind that name; it belongs to the static probe only.
     if (alphaScenario && replayDir == nullptr)
@@ -1915,6 +1970,38 @@ int main(int argc, char** argv)
             d4r_ngx_set_float(parameters, "DLSS.Pre.Exposure", static_cast<float>(std::atof(value)));
         if (const char* value = std::getenv("D4R_HARNESS_EXPOSURE_SCALE"))
             d4r_ngx_set_float(parameters, "DLSS.Exposure.Scale", static_cast<float>(std::atof(value)));
+        // D4R_HARNESS_NGX_FLOATS="Name=value,Name=value": float evaluation parameters set on every frame after the
+        // defaults (e.g. MV.Scale.X=2,FrameTimeDeltaInMsec=8), to see how NGX passes them on.
+        if (const char* list = std::getenv("D4R_HARNESS_NGX_FLOATS"))
+        {
+            std::string entries(list);
+            for (size_t start = 0; start < entries.size();)
+            {
+                const size_t end = std::min(entries.find(',', start), entries.size());
+                const std::string entry = entries.substr(start, end - start);
+                const size_t equals = entry.find('=');
+                if (equals != std::string::npos)
+                    d4r_ngx_set_float(parameters, entry.substr(0, equals).c_str(),
+                                      std::strtof(entry.c_str() + equals + 1, nullptr));
+                start = end + 1;
+            }
+        }
+        // D4R_HARNESS_RR_MATRIX_STEP="32 numbers": added to D4R_HARNESS_RR_MATRICES' two matrices once per frame
+        // (frame N uses base + (N - 1) * step), so the camera moves and turns between evaluations.
+        if (const char* step = std::getenv("D4R_HARNESS_RR_MATRIX_STEP"); step != nullptr && reconstruction)
+        {
+            static const std::array<float, 16> baseView = worldToView, baseClip = viewToClip;
+            const char* cursor = step;
+            for (int m = 0; m < 2; ++m)
+                for (int i = 0; i < 16; ++i)
+                {
+                    char* end = nullptr;
+                    const float value = std::strtof(cursor, &end);
+                    cursor = end != nullptr && *end != '\0' ? end + 1 : end;
+                    (m == 0 ? worldToView : viewToClip)[i] =
+                        (m == 0 ? baseView : baseClip)[i] + static_cast<float>(frame - 1) * value;
+                }
+        }
         // Change exposure after initial frames to exercise temporal/backend transitions.
         // CUDA supports this scale; the native K adapter currently accepts only a neutral scale.
         if (const char* changeFrame = std::getenv("D4R_HARNESS_EXPOSURE_CHANGE_FRAME"))

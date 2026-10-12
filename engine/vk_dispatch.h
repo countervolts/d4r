@@ -20,6 +20,7 @@ struct VkTable {
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
     PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
     PFN_vkCmdDispatch CmdDispatch = nullptr;
+    PFN_vkCmdFillBuffer CmdFillBuffer = nullptr;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
     PFN_vkCmdUpdateBuffer CmdUpdateBuffer = nullptr;
     PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
@@ -67,6 +68,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkCmdCopyBufferToImage ::d4r::vkTable.CmdCopyBufferToImage
 #define vkCmdCopyImageToBuffer ::d4r::vkTable.CmdCopyImageToBuffer
 #define vkCmdDispatch ::d4r::vkTable.CmdDispatch
+#define vkCmdFillBuffer ::d4r::vkTable.CmdFillBuffer
 #define vkCmdPipelineBarrier ::d4r::vkTable.CmdPipelineBarrier
 #define vkCmdUpdateBuffer ::d4r::vkTable.CmdUpdateBuffer
 #define vkCmdWriteTimestamp ::d4r::vkTable.CmdWriteTimestamp

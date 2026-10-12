@@ -3,6 +3,8 @@
 //   MODE 0 (preset K): exposure = key * exp(-mean of the log luma).
 //   MODE 1 (preset M, the cuda_dldn_engine_* kernels): exposure = key / max(mean of the luma clamped to
 //          [0, 10000], 0.005).
+//   MODE 2 (Ray Reconstruction, the same cuda_dldn_engine_* kernels): MODE 1's measurement, written to two 1x1
+//          images instead of stage parameter blocks.
 // Both modes measure the same grid: the colour rectangle sampled at half the output size with an
 // endpoint-aligned nearest-texel lookup (the reference's cuda_luma_convert_kernel; the grid equals the
 // rectangle itself only when the render size is half the output size).
@@ -87,10 +89,15 @@ layout(set = 0, binding = 2, std430) buffer State { float current, previous; } s
 layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // expo, expoIn, expoRatio at words 28..30
 layout(set = 0, binding = 4, std430) buffer OutputParams { float w[]; } outp;   // expo, expoRatio at words 37, 38
 layout(set = 0, binding = 5) uniform sampler2D gameExposure;                                           // the game's 1x1 exposure (flag 4)
-#else
+#elif MODE == 1
 layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // enc0_m: expo, expoPrev at words 25, 26
 layout(set = 0, binding = 4, std430) buffer PostParams { float w[]; } post;     // post_m: words 14, 15
 layout(set = 0, binding = 5, std430) buffer DownParams { float w[]; } down;     // down_m: word 12
+#else
+// MODE 2 (Ray Reconstruction): the denoiser's stages sample the exposure as two 1x1 textures, this frame's and
+// the previous frame's (zero on the first frame and after a reset)
+layout(set = 0, binding = 3, r16f) uniform writeonly image2D exposureOut;
+layout(set = 0, binding = 4, r16f) uniform writeonly image2D previousOut;
 #endif
 void main()
 {
@@ -143,10 +150,13 @@ void main()
     precise const float ratio = scaled / scaledPrevious;
     inp.w[28] = exposure; inp.w[29] = 1.0; inp.w[30] = ratio;
     outp.w[37] = exposure; outp.w[38] = ratio;
-#else
+#elif MODE == 1
     inp.w[25] = current; inp.w[26] = previous;
     post.w[14] = current; post.w[15] = previous;
     down.w[12] = current;
+#else
+    imageStore(exposureOut, ivec2(0), vec4(current));
+    imageStore(previousOut, ivec2(0), vec4(previous));
 #endif
 }
 #endif
