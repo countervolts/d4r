@@ -1,5 +1,7 @@
 # d4r (dlss 4 radeon)
 
+want to run xess (xmx) on radeon? check out [x4r](https://github.com/countervolts/x4r)!
+
 d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 and RDNA4 code.
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus experimental L). DLSS 5 is PURPOSELY not supported.
