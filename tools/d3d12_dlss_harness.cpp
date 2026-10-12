@@ -1336,6 +1336,8 @@ int main(int argc, char** argv)
     // capture shows where the denoiser reads them.
     ID3D12Resource* hitDistance = nullptr;
     ID3D12Resource* disocclusionMask = nullptr;
+    ID3D12Resource* colorBeforeParticles = nullptr;
+    ID3D12Resource* subsurfaceGuide = nullptr;
     if (const char* extra = reconstruction ? std::getenv("D4R_HARNESS_RR_EXTRA") : nullptr)
     {
         if (std::strstr(extra, "hit") != nullptr)
@@ -1359,6 +1361,31 @@ int main(int argc, char** argv)
             disocclusionMask = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
             if (!disocclusionMask) return 1;
             upload(disocclusionMask, mask.data(), resourceWidth * sizeof(uint16_t), srv);
+        }
+        // "particles" / "sss": Cyberpunk 2077's DLSSD.ColorBeforeParticles (RGBA16F) and
+        // DLSSD.ScreenSpaceSubsurfaceScatteringGuide (R16F)
+        if (std::strstr(extra, "particles") != nullptr)
+        {
+            std::vector<uint16_t> before(static_cast<size_t>(resourceWidth) * inHeight * 4);
+            for (UINT y = 0; y < inHeight; ++y)
+                for (UINT x = 0; x < resourceWidth; ++x)
+                    for (UINT c = 0; c < 4; ++c)
+                        before[(static_cast<size_t>(y) * resourceWidth + x) * 4 + c] = std::bit_cast<uint16_t>(static_cast<_Float16>(
+                            c == 3 ? 1.0f : 0.05f + 0.6f * static_cast<float>((x / 20 + 2 * (y / 20) + c) % 5) / 4.0f));
+            colorBeforeParticles = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+            if (!colorBeforeParticles) return 1;
+            upload(colorBeforeParticles, before.data(), resourceWidth * 4 * sizeof(uint16_t), srv);
+        }
+        if (std::strstr(extra, "sss") != nullptr)
+        {
+            std::vector<uint16_t> guide(static_cast<size_t>(resourceWidth) * inHeight);
+            for (UINT y = 0; y < inHeight; ++y)
+                for (UINT x = 0; x < resourceWidth; ++x)
+                    guide[static_cast<size_t>(y) * resourceWidth + x] = std::bit_cast<uint16_t>(static_cast<_Float16>(
+                        ((x / 28 + y / 28) % 3 == 0) ? 0.75f : 0.0f));
+            subsurfaceGuide = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+            if (!subsurfaceGuide) return 1;
+            upload(subsurfaceGuide, guide.data(), resourceWidth * sizeof(uint16_t), srv);
         }
         std::printf("Ray Reconstruction extra inputs:%s%s\n", hitDistance ? " DLSSD.SpecularHitDistance" : "",
                     disocclusionMask ? " DLSS.DisocclusionMask" : "");
@@ -1520,7 +1547,9 @@ int main(int argc, char** argv)
     {
         d4r_ngx_set_int(parameters, "DLSS.Denoise.Mode", 1);
         d4r_ngx_set_int(parameters, "DLSS.Roughness.Mode", 0);
-        d4r_ngx_set_int(parameters, "DLSS.Use.HW.Depth", 0);
+        // D4R_HARNESS_RR_HW_DEPTH=1: the depth is the hardware (nonlinear) depth buffer, as Cyberpunk 2077 declares it
+        d4r_ngx_set_int(parameters, "DLSS.Use.HW.Depth",
+                        std::getenv("D4R_HARNESS_RR_HW_DEPTH") != nullptr ? std::atoi(std::getenv("D4R_HARNESS_RR_HW_DEPTH")) : 0);
         d4r_ngx_set_void(parameters, "WorldToViewMatrix", worldToView.data());
         d4r_ngx_set_void(parameters, "ViewToClipMatrix", viewToClip.data());
         const char* preset = std::getenv("D4R_HARNESS_RR_PRESET");
@@ -1580,6 +1609,10 @@ int main(int argc, char** argv)
         d4r_ngx_set_d3d12_resource(parameters, "DLSSD.SpecularHitDistance", hitDistance);
     if (disocclusionMask != nullptr && replayDir == nullptr)
         d4r_ngx_set_d3d12_resource(parameters, "DLSS.DisocclusionMask", disocclusionMask);
+    if (colorBeforeParticles != nullptr && replayDir == nullptr)
+        d4r_ngx_set_d3d12_resource(parameters, "DLSSD.ColorBeforeParticles", colorBeforeParticles);
+    if (subsurfaceGuide != nullptr && replayDir == nullptr)
+        d4r_ngx_set_d3d12_resource(parameters, "DLSSD.ScreenSpaceSubsurfaceScatteringGuide", subsurfaceGuide);
     // DLSSD.Alpha is a guide the capture records in its own right, so the synthetic alpha
     // scenario would double-bind that name; it belongs to the static probe only.
     if (alphaScenario && replayDir == nullptr)

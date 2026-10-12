@@ -171,3 +171,21 @@ exp2 / reciprocal (rrsim's exact arithmetic is further from the capture than the
 single-use multiply-subtract pairs into fma, merging the two constant multiplications after the log transform,
 `precise` on the inlined exp2, NoContraction on its conversions. The differing values come in spatial clusters, one
 colour channel at a time, always one ulp, mostly just above 0.5 in surface 224.
+
+## Cyberpunk 2077: more inputs and settings (2026-10-12)
+
+Found on harness captures (`D4R_HARNESS_RR_EXTRA=particles,sss`, `D4R_HARNESS_RR_HW_DEPTH=1`, `D4R_RR_PRESET=N`):
+
+| what the game passes | where NGX puts it |
+|---|---|
+| `DLSSD.ScreenSpaceSubsurfaceScatteringGuide` (R16F) | encoder 0 texture 264 (its handle is the only switch) |
+| `DLSSD.ColorBeforeParticles` (RGBA16F) | output stage texture 416, flag byte 432, and a second output-size history: surface 384, read back next frame as texture 392 (linear) |
+| `DLSS.Use.HW.Depth = 1` | encoder 0 byte 980, output stage byte 443 |
+| preset hint | 5 runs preset E; every other value (0-4, 6, 0x80000002, 0x80000005) runs preset D |
+
+Integer texture fetches outside the image return zero (`fetch0`), which is what the reference does; CUDA would clamp.
+With Cyberpunk's set (hit distance, particles, subsurface guide, hardware depth) the engine's presented image is
+byte-identical to the CUDA path through the shim on the frames the harness can compare (640x360 -> 1920x1080), and
+with RE Requiem's set the network is identical on every frame (output 107-109 dB). At 1280x720 and 1920x1080 -> 4K
+without these inputs the output still falls to 43-53 dB after the first frame (the output stage's one-ulp values);
+a correctly rounded log2 there matches the capture worse than the GPU instruction does.

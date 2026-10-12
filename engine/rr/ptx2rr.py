@@ -66,6 +66,7 @@ uint HU2_(u16vec2 u) { return uint(u.x) | (uint(u.y) << 16); }
 uint H2U(f16vec2 h) { return HU2_(float16BitsToUint16(h)); }
 int s16(uint u) { return (int(u) << 16) >> 16; }
 float rcp_a(float x) { return 1.0 / x; }
+vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return (c.x < 0 || c.y < 0 || c.x >= n.x || c.y >= n.y) ? vec4(0.0) : texelFetch(t, c, 0); }
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
 float round_half_away(float x) { float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
 uint PARAM32(uint o) { return param.w[o >> 2]; }
@@ -509,10 +510,11 @@ class RRT(base.T):
         off = self.handle_off(h)
         self.textures.add(off)
         if 'base' in o and o[-1] == 's32':
-            # integer coordinates still go through the texture's address mode in CUDA (clamp for every denoiser
-            # texture); texelFetch does not clamp, and what it returns out of range depends on the device's robustness
-            fetch = (f'texelFetch(T{off}, clamp(ivec2({self.val(c[0], "s32")}, {self.val(c[1], "s32")}), ivec2(0), '
-                     f'textureSize(T{off}, 0) - 1), 0)')
+            # an integer fetch outside the image: CUDA applies the texture's address mode (clamp for every denoiser
+            # texture), but the reference this engine is checked against is ZLUDA, whose image load returns zero there
+            # (zluda_ptx_impl.cpp fetch_2D). The output stage's specular reprojection reads such neighbours at the image
+            # border: with clamp its surfaces were 99.92% identical to the capture, with zero 99.997% (capDX, 2026-10-12)
+            fetch = f'fetch0(T{off}, ivec2({self.val(c[0], "s32")}, {self.val(c[1], "s32")}))'
         elif 'base' in o and o[-1] == 'f32':
             fetch = f'textureLod(T{off}, vec2({self.val(c[0], "f32")}, {self.val(c[1], "f32")}), 0.0)'
         elif 'level' in o and o[-1] == 'f32':

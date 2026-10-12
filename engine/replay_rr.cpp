@@ -159,8 +159,8 @@ int main(int argc, char** argv) try {
                                 VK_FORMAT_R8G8B8A8_UNORM};
     std::vector<Input> inputs;
     for (VkFormat f : formats) inputs.emplace_back(c, f, rw, rh);
-    const char* optionalNames[] = {"hitdistance", "disocclusion"};
-    const VkFormat optionalFormats[] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT};
+    const char* optionalNames[] = {"hitdistance", "disocclusion", "sss", "particles"};
+    const VkFormat optionalFormats[] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
     std::vector<Input> optional;
     for (VkFormat f : optionalFormats) optional.emplace_back(c, f, rw, rh);
     HostBuffer staging(c, VkDeviceSize(ow) * oh * 8);
@@ -178,7 +178,7 @@ int main(int argc, char** argv) try {
         frames >> f >> s.jitter[0] >> s.jitter[1] >> s.motionScale[0] >> s.motionScale[1] >> s.preExposure >> reset >> inverted;
         for (float& v : s.worldToView) frames >> v;
         for (float& v : s.viewToClip) frames >> v;
-        s.reset = reset != 0; s.depthInverted = inverted != 0;
+        s.reset = reset != 0; s.depthInverted = (inverted & 1) != 0; s.hardwareDepth = (inverted & 2) != 0;   // bit 1: DLSS.Use.HW.Depth
         for (size_t i = 0; i < inputs.size(); ++i) {
             auto data = read(inputDir + "/" + std::to_string(f) + "-" + names[i] + ".bin");
             if (data.size() != size_t(rw) * rh * texelBytes(formats[i])) throw std::runtime_error(std::string("input size: ") + names[i]);
@@ -195,7 +195,7 @@ int main(int argc, char** argv) try {
         images.normals = inputs[3].view; images.roughness = inputs[4].view;
         images.diffuseAlbedo = inputs[5].view; images.specularAlbedo = inputs[6].view;
         // optional inputs, present when the capture had them (rr_inputs.py)
-        for (int k = 0; k < 2; ++k) {
+        for (int k = 0; k < 4; ++k) {
             std::ifstream probe(inputDir + "/" + std::to_string(f) + "-" + optionalNames[k] + ".bin", std::ios::binary);
             if (!probe) continue;
             auto data = read(inputDir + "/" + std::to_string(f) + "-" + optionalNames[k] + ".bin");
@@ -207,7 +207,8 @@ int main(int argc, char** argv) try {
                 vkCmdCopyBufferToImage(cb, staging.buffer, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
                 barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
             });
-            (k == 0 ? images.specularHitDistance : images.disocclusionMask) = optional[k].view;
+            VkImageView* slots[] = {&images.specularHitDistance, &images.disocclusionMask, &images.subsurfaceGuide, &images.colorBeforeParticles};
+            *slots[k] = optional[k].view;
         }
         engine.setFrame(images, s);
         if (first) c.submit([&](VkCommandBuffer cb) { model.recordUpload(cb); engine.recordInitialize(cb); first = false; });

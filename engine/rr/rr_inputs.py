@@ -20,7 +20,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rr_capture import Capture  # noqa: E402
 
-OPTIONAL = {'hitdistance': 248, 'disocclusion': 296}
+OPTIONAL = {'hitdistance': 248, 'disocclusion': 296, 'sss': 264}   # encoder 0 textures
+OPTIONAL_OUTPUT = {'particles': 416}                             # output stage textures
 INPUTS = {'color': 160, 'motion': 168, 'normals': 184, 'roughness': 192, 'diffuse': 232, 'specular': 240, 'depth': 512}
 
 
@@ -49,6 +50,10 @@ def main():
         for name, off in OPTIONAL.items():   # DLSSD.SpecularHitDistance, DLSS.DisocclusionMask when the game passed them
             if off in images:
                 (o.out / f'{f}-{name}.bin').write_bytes(images[off].path.read_bytes())
+        out_images = {i.offset: i for i in cap.find('hkpn_output', f).images}
+        for name, off in OPTIONAL_OUTPUT.items():   # DLSSD.ColorBeforeParticles
+            if off in out_images:
+                (o.out / f'{f}-{name}.bin').write_bytes(out_images[off].path.read_bytes())
         clip = mat(660)
         view = mat(596) @ np.linalg.inv(clip)
         view[3, :3] = 0.0
@@ -56,7 +61,7 @@ def main():
         mvx, mvy = f32(344) * rw / ow, f32(348) * rh / oh
         reset = 1 if f == 1 or not o.no_reset else 0
         values = ' '.join(f'{v:.9g}' for v in list(view.flatten()) + list(clip.flatten()))
-        lines.append(f'frame {f} {jx:.9g} {jy:.9g} {mvx:.9g} {mvy:.9g} 1 {reset} {u32(528)} {values}')
+        lines.append(f'frame {f} {jx:.9g} {jy:.9g} {mvx:.9g} {mvy:.9g} 1 {reset} {u32(528) | (a[980] << 1)} {values}')
     (o.out / 'frames.txt').write_text('\n'.join(lines) + '\n')
     print(f'{o.frames} frames of {o.capture} in {o.out}')
 

@@ -13,7 +13,7 @@ struct GameDenoiser::Impl {
     REngine engine;
     uint32_t width, height, outputWidth, outputHeight;
     game_detail::CanonicalInputs fallback;                 // colour, motion, depth
-    std::array<game_detail::Plane, 6> guides;              // the guides and optional inputs, when one cannot be sampled directly
+    std::array<game_detail::Plane, 8> guides;              // the guides and optional inputs, when one cannot be sampled directly
     bool started = false;
     // debugging: D4R_ENGINE_RR_DUMP=DIR copies every engine image after each frame into a host-visible buffer and
     // writes it at the next frame's recording (by then the game has waited for the frame), as DIR/F-NAME.bin
@@ -100,10 +100,12 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
     };
     const bool directColor = direct(frame.color), directMotion = direct(frame.motion), directDepth = direct(frame.depth);
     // the four guides, then the two optional inputs (kept in their own one-channel formats when copied)
-    const GameImage* guides[6] = {&frame.normals, &frame.roughness, &frame.diffuseAlbedo, &frame.specularAlbedo,
-                                  &frame.specularHitDistance, &frame.disocclusionMask};
-    const VkFormat guideFormats[6] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT};
+    const GameImage* guides[8] = {&frame.normals, &frame.roughness, &frame.diffuseAlbedo, &frame.specularAlbedo,
+                                  &frame.specularHitDistance, &frame.disocclusionMask, &frame.subsurfaceGuide,
+                                  &frame.colorBeforeParticles};
+    const VkFormat guideFormats[8] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT,
+                                      VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
     auto present = [&](int i) { return i < 4 || guides[i]->image != VK_NULL_HANDLE; };
     if (!g.started) {
         if (!g.model.uploadRecorded()) g.model.recordUpload(cb);
@@ -111,7 +113,7 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
         g.started = true;
     }
     g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, w, h, directColor, directMotion, directDepth);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 8; ++i) {
         if (!present(i) || direct(*guides[i])) continue;
         if (!g.guides[i].image) {
             g.fallback.ensure(cb, g.guides[i], guideFormats[i], w, h);
@@ -126,9 +128,10 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
     images.color = directColor ? frame.color.view : g.fallback.color.view;
     images.motion = directMotion ? frame.motion.view : g.fallback.motion.view;
     images.depth = directDepth ? frame.depth.view : g.fallback.depth.view;
-    VkImageView* guideViews[6] = {&images.normals, &images.roughness, &images.diffuseAlbedo, &images.specularAlbedo,
-                                  &images.specularHitDistance, &images.disocclusionMask};
-    for (int i = 0; i < 6; ++i)
+    VkImageView* guideViews[8] = {&images.normals, &images.roughness, &images.diffuseAlbedo, &images.specularAlbedo,
+                                  &images.specularHitDistance, &images.disocclusionMask, &images.subsurfaceGuide,
+                                  &images.colorBeforeParticles};
+    for (int i = 0; i < 8; ++i)
         if (present(i)) *guideViews[i] = direct(*guides[i]) ? guides[i]->view : g.guides[i].view;
     const bool directOutput = frame.output.view != VK_NULL_HANDLE && frame.output.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
         frame.output.layout == VK_IMAGE_LAYOUT_GENERAL && !frame.output.x && !frame.output.y &&

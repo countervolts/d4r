@@ -8300,10 +8300,10 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
              feature.handle.Id, frame);
         return false;
     };
-    // NGX 310.7 runs preset D's kernels when the game names no preset (harness, 2026-10-11).
+    // NGX 310.7 runs preset E's kernels for the hint 5 only and preset D's (diamond_wallaby) for every other value:
+    // none, the retired A / B / C (1-3), 6, and values with the top bit set such as Cyberpunk 2077's 0x80000002 or
+    // 0x80000005 (harness captures with D4R_RR_PRESET, 2026-10-12).
     const bool presetE = feature.preset == 5;
-    if (feature.preset != 0 && feature.preset != 4 && feature.preset != 5)
-        return refuse("only presets D and E are implemented");
     std::call_once(g_engineR.once[presetE], [presetE] {
         g_engineR.state[presetE] = 1;
         // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
@@ -8348,7 +8348,10 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
     // the optional inputs a game may add (RE Requiem passes both): bound when present, like NGX
     ID3D12Resource* const hitDistance = get_resource(parameters, "DLSSD.SpecularHitDistance");
     ID3D12Resource* const disocclusion = get_resource(parameters, "DLSS.DisocclusionMask");
-    for (ID3D12Resource* input : {color, depth, motion, guides[0], guides[1], guides[2], guides[3], hitDistance, disocclusion})
+    // and Cyberpunk 2077's: the subsurface scattering guide and the colour before particles
+    ID3D12Resource* const subsurface = get_resource(parameters, "DLSSD.ScreenSpaceSubsurfaceScatteringGuide");
+    ID3D12Resource* const beforeParticles = get_resource(parameters, "DLSSD.ColorBeforeParticles");
+    for (ID3D12Resource* input : {color, depth, motion, guides[0], guides[1], guides[2], guides[3], hitDistance, disocclusion, subsurface, beforeParticles})
         if (input == output)
             return refuse("input/output texture aliasing is not supported");
     d4r::GameFrameR game;
@@ -8372,6 +8375,10 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         sources.push_back({hitDistance, &game.specularHitDistance, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
     if (disocclusion != nullptr)
         sources.push_back({disocclusion, &game.disocclusionMask, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
+    if (subsurface != nullptr)
+        sources.push_back({subsurface, &game.subsurfaceGuide, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
+    if (beforeParticles != nullptr)
+        sources.push_back({beforeParticles, &game.colorBeforeParticles, 0, 0, rw, rh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE});
     // a guide with its own subrect origin (DLSS.Input.Normals.Subrect.Base etc.) is not implemented
     for (size_t i = 0; i < sizeof(kAuxSubrectNames) / sizeof(kAuxSubrectNames[0]); ++i)
         if (p.auxSubrect[i][0] != 0 || p.auxSubrect[i][1] != 0)
@@ -8437,11 +8444,14 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
     s.frameTimeMs = p.frameTime;
     s.reset = p.reset != 0 || feature.engineR == nullptr;
     s.depthInverted = (feature.flags & 0x8) != 0;
+    s.hardwareDepth = get_uint_or(parameters, "DLSS.Use.HW.Depth", 0) != 0;
     s.roughnessPacked = roughnessPacked;
     if (frame <= 2)
-        logf("engine backend (Ray Reconstruction): roughness %s, specular hit distance %s, disocclusion mask %s",
+        logf("engine backend (Ray Reconstruction): roughness %s, specular hit distance %s, disocclusion mask %s, "
+             "subsurface guide %s, colour before particles %s, hardware depth %d",
              roughnessPacked ? "packed in the normals' w" : "texture", hitDistance != nullptr ? "bound" : "none",
-             disocclusion != nullptr ? "bound" : "none");
+             disocclusion != nullptr ? "bound" : "none", subsurface != nullptr ? "bound" : "none",
+             beforeParticles != nullptr ? "bound" : "none", s.hardwareDepth ? 1 : 0);
     std::copy(std::begin(p.auxMatrix[0]), std::end(p.auxMatrix[0]), s.worldToView);
     std::copy(std::begin(p.auxMatrix[1]), std::end(p.auxMatrix[1]), s.viewToClip);
     try

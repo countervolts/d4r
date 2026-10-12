@@ -173,6 +173,10 @@ struct REngine::Impl {
     std::array<Tex, 2> q, r, h, e;  // ping-pong: enc0's 304 / 224, dec0's 144 / enc0's 488, the output-size history,
                                     // and e: this frame's and the previous frame's exposure (1x1)
     Tex out;                        // the presented image (the output stage's surface 240)
+    // the output stage's second history (surface 384, read back as texture 392), kept only for games that pass
+    // DLSSD.ColorBeforeParticles; created on first use
+    Tex pb[2];
+    bool pbNew = false;
     Tex zero;                       // a zeroed 1x1 texture for the handles NGX leaves null (they read zero)
     std::map<std::string, Tex> spare;   // per format, a 1x1 surface for stores NGX leaves unbound
     VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -201,6 +205,7 @@ struct REngine::Impl {
                 // the optional inputs (capDX, 2026-10-12): unbound without them, like NGX
                 case 248: return in.specularHitDistance ? G(in.specularHitDistance) : Resource{};
                 case 296: return in.disocclusionMask ? G(in.disocclusionMask) : Resource{};
+                case 264: return in.subsurfaceGuide ? G(in.subsurfaceGuide) : Resource{};   // capDXsss
                 case 488: return T(r[par ^ 1], true); case 496: return T(h[par ^ 1], true); case 512: return G(in.depth);
             } else switch (offset) {
                 case 112: return T(s112[0]); case 120: return T(s120[0]); case 128: return T(s128[0]); case 304: return T(q[par]);
@@ -222,8 +227,12 @@ struct REngine::Impl {
                 case 176: return G(in.color, true); case 192: return G(in.depth); case 200: return T(e[0]); case 208: return T(e[1]);
                 case 216: return T(h[par ^ 1], true); case 280: return G(in.diffuseAlbedo); case 288: return G(in.specularAlbedo);
                 case 296: return T(q[par]); case 448: return T(d112[0]);
+                // DLSSD.ColorBeforeParticles and its history (capDXparticles, 2026-10-12)
+                case 416: return in.colorBeforeParticles ? G(in.colorBeforeParticles) : Resource{};
+                case 392: return in.colorBeforeParticles ? T(pb[par ^ 1], true) : Resource{};
             } else switch (offset) {
                 case 224: return T(h[par]); case 240: return Resource{output, false, false};
+                case 384: return in.colorBeforeParticles ? T(pb[par]) : Resource{};
             }
         }
         return {};
@@ -398,6 +407,8 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
     p[539] = images.disocclusionMask ? 1u : 0u;
     put32(p, 432, e.rw - 1); put32(p, 436, e.rh - 1); put32(p, 472, e.ow); put32(p, 476, e.oh);
     put32(p, 528, settings.depthInverted ? 1u : 0u);
+    // byte 980 (and the output stage's byte 443): DLSS.Use.HW.Depth (capDXhw, 2026-10-12)
+    p[980] = settings.hardwareDepth ? 1u : 0u;
     // the camera: the view's rotation (its translation row dropped) times the projection, its inverse, and both
     // composed with the render viewport (NDC <-> render pixels, y down)
     Mat4 view, clip;
@@ -420,9 +431,10 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
     put32(o, 56, e.w0); put32(o, 60, e.h0); put32(o, 140, e.rw - 1); put32(o, 144, e.rh - 1);
     putF(o, 152, settings.frameTimeMs);
     o[160] = images.specularHitDistance ? 1u : 0u;
+    o[432] = images.colorBeforeParticles ? 1u : 0u;   // the particle layer is composited (textures 392 / 416, surface 384)
     put64(o, 256, e.arenaOffset(RHkpnArena));
     putF(o, 336, settings.motionScale[0] * (ow / rw)); putF(o, 340, settings.motionScale[1] * (oh / rh));
-    put32(o, 440, (reset ? 1u : 0u) | (settings.depthInverted ? 0x10000u : 0u));
+    put32(o, 440, (reset ? 1u : 0u) | (settings.depthInverted ? 0x10000u : 0u) | (settings.hardwareDepth ? 0x1000000u : 0u));
     // the exposure: NGX's MODE 1 measurement (engine/exposure_k.comp) on 1 / pre-exposure scaled colour
     const uint32_t gx = exposureGrid(e.rw, e.ow), gy = exposureGrid(e.rh, e.oh);
     e.exposure.origin[0] = e.exposure.origin[1] = 0;
@@ -440,6 +452,10 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
     e.reset = reset;
     // descriptors for the caller's images, cached per combination: every stage, both frame parities, bound by the
     // argument offsets its shader declares (rr.txt)
+    if (images.colorBeforeParticles && !e.pb[0].handle) {
+        for (auto& t : e.pb) t.create(d, e.ow, e.oh, VK_FORMAT_R16G16B16A16_SFLOAT);
+        e.pbNew = true;
+    }
     // texture and surface handles of the two stages with optional inputs: 1 where something is bound, 0 where NGX
     // leaves the argument null. The kernels branch on that (enc0 takes its specular hit distance path only when
     // argument 248's handle is not null; capDX, 2026-10-12).
@@ -516,6 +532,18 @@ void REngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     };
+    if (e.pbNew) {   // the particle history starts from zero, like the rest of the temporal state
+        VkClearColorValue zero{};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        for (auto& t : e.pb) {
+            imageBarrier(cb, t.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+            vkCmdClearColorImage(cb, t.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+        }
+        memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        e.pbNew = false;
+    }
     stamp(0);
     // the frame's parameter blocks, then (on a reset) a clean temporal state
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);

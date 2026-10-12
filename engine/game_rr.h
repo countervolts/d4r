@@ -9,6 +9,8 @@ struct GameFrameR {
     GameImage color, depth, motion, normals, roughness, diffuseAlbedo, specularAlbedo, output;
     // optional (image null: the game passes none): DLSSD.SpecularHitDistance, DLSS.DisocclusionMask
     GameImage specularHitDistance, disocclusionMask;
+    // optional too: DLSSD.ScreenSpaceSubsurfaceScatteringGuide, DLSSD.ColorBeforeParticles
+    GameImage subsurfaceGuide, colorBeforeParticles;
     RFrameSettings settings;
 };
 class GameDenoiser {

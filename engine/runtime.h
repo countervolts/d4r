@@ -255,6 +255,8 @@ struct RFrameImages {
     VkImageView color, motion, depth, normals, roughness, diffuseAlbedo, specularAlbedo;
     // Optional inputs (null: the game passes none): DLSSD.SpecularHitDistance and DLSS.DisocclusionMask, one channel each
     VkImageView specularHitDistance = VK_NULL_HANDLE, disocclusionMask = VK_NULL_HANDLE;
+    // DLSSD.ScreenSpaceSubsurfaceScatteringGuide (one channel) and DLSSD.ColorBeforeParticles (colour), optional too
+    VkImageView subsurfaceGuide = VK_NULL_HANDLE, colorBeforeParticles = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL; // of every view
 };
 struct RFrameSettings {
@@ -264,6 +266,7 @@ struct RFrameSettings {
     float frameTimeMs = 16.666667f;   // FrameTimeDeltaInMsec
     bool reset = false;
     bool depthInverted = false;       // creation flag NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
+    bool hardwareDepth = false;       // DLSS.Use.HW.Depth: the depth input is the nonlinear depth buffer (Cyberpunk 2077)
     bool roughnessPacked = false;     // DLSS.Roughness.Mode 1: the roughness is the normals' w (no roughness texture)
     float worldToView[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // row-major, as the SDK passes them
     float viewToClip[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
