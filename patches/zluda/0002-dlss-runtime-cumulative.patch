@@ -1,0 +1,2768 @@
+diff --git a/cuda_macros/src/lib.rs b/cuda_macros/src/lib.rs
+index 9188284..205f932 100644
+--- a/cuda_macros/src/lib.rs
++++ b/cuda_macros/src/lib.rs
+@@ -250,7 +250,7 @@ impl VisitMut for FixFnSignatures {
+ 
+ const MODULES: &[&str] = &[
+     "array", "context", "device", "driver", "event", "function", "graph", "kernel",
+-    "library", "link", "memory", "module", "pointer", "stream", "tex"
++    "library", "link", "memory", "module", "pointer", "stream", "surf", "tex"
+ ];
+ 
+ fn normalize_fn_impl(
+diff --git a/llvm_zluda/src/compile.rs b/llvm_zluda/src/compile.rs
+index 59bbf0f..b80262b 100644
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -144,10 +144,17 @@ pub fn compile(
+     );
+ 
+     let pb_options = PassBuilderOptions::new();
++    // D4R_ZLUDA_PASSES overrides the optimization pipeline (e.g. "default<O1>")
++    // to tell translator bugs apart from optimizer-dependent miscompiles. It is
++    // not part of the module cache key: use a fresh cache when setting it.
++    let passes = std::env::var("D4R_ZLUDA_PASSES")
++        .ok()
++        .and_then(|value| std::ffi::CString::new(value).ok())
++        .unwrap_or_else(|| c"default<O3>".to_owned());
+     let error = unsafe {
+         LLVMRunPasses(
+             linked.get(),
+-            c"default<O3>".as_ptr(),
++            passes.as_ptr(),
+             target_machine.get(),
+             pb_options.get(),
+         )
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+index c889402..69d1faa 100644
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -77,7 +77,9 @@ then cd to the directory with this file and run this simple command:
+ #include <utility>
+ #include <hip/hip_runtime.h>
+ #include <hip/amd_detail/amd_device_functions.h>
++#include <hip/amd_detail/amd_surface_functions.h>
+ #include <hip/amd_detail/amd_warp_sync_functions.h>
++#include <hip/amd_detail/ockl_image.h>
+ #include <hip/hip_fp8.h>
+ 
+ #define GLOBAL_SPACE __attribute__((address_space(1)))
+@@ -87,6 +89,7 @@ then cd to the directory with this file and run this simple command:
+ typedef unsigned int v2u32 __attribute__((ext_vector_type(2)));
+ typedef int s32;
+ typedef int v1s32 __attribute__((ext_vector_type(1)));
++typedef short v2s16 __attribute__((ext_vector_type(2)));
+ typedef int v2s32 __attribute__((ext_vector_type(2)));
+ typedef int v4s32 __attribute__((ext_vector_type(4)));
+ typedef int v8s32 __attribute__((ext_vector_type(8)));
+@@ -97,6 +100,7 @@ typedef float v2f32 __attribute__((ext_vector_type(2)));
+ typedef float v4f32 __attribute__((ext_vector_type(4)));
+ typedef float float8 __attribute__((ext_vector_type(8)));
+ typedef _Float16 f16;
++typedef _Float16 v4f16 __attribute__((ext_vector_type(4)));
+ typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
+ typedef _Float16 f16x4 __attribute__((ext_vector_type(4)));
+ typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
+@@ -667,6 +671,12 @@ extern "C"
+         {
+             return sign; // +/- 0
+         }
++        // .satfinite maps infinities to the largest finite value (448 for
++        // E4M3, 57344 for E5M2); only NaN inputs produce NaN.
++        if (abs == 0x7f800000)
++        {
++            return sign | (interp == __HIP_E4M3 ? 0x7e : 0x7b);
++        }
+ 
+         return __hip_cvt_float_to_fp8(f, __HIP_SATFINITE, interp);
+     }
+@@ -688,6 +698,32 @@ extern "C"
+         return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
+     }
+ 
++    // .satfinite maps infinities to the largest finite value, but the HIP
++    // conversion turns them into NaN. Replace infinite halves with the
++    // destination format's largest finite value (exact in f16) first.
++    __device__ static __half2_raw saturate_infinite_halves(__half2 input, uint32_t max_finite_half)
++    {
++        uint32_t bits = std::bit_cast<uint32_t>(input);
++        uint32_t result = bits;
++        if ((bits & 0x7fffu) == 0x7c00u)
++            result = (result & 0xffff0000u) | (bits & 0x8000u) | max_finite_half;
++        if ((bits & 0x7fff0000u) == 0x7c000000u)
++            result = (result & 0x0000ffffu) | (bits & 0x80000000u) | (max_finite_half << 16);
++        return std::bit_cast<__half2_raw>(result);
++    }
++
++    Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f16x2)(__half2 input)
++    {
++        auto output = __hip_cvt_halfraw2_to_fp8x2(saturate_infinite_halves(input, 0x5f00u /* 448 */), __HIP_SATFINITE, __HIP_E4M3);
++        return std::bit_cast<Fp8x2>(output);
++    }
++
++    Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f16x2)(__half2 input)
++    {
++        auto output = __hip_cvt_halfraw2_to_fp8x2(saturate_infinite_halves(input, 0x7b00u /* 57344 */), __HIP_SATFINITE, __HIP_E5M2);
++        return std::bit_cast<Fp8x2>(output);
++    }
++
+     __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3 in)
+     {
+         return in;
+@@ -791,6 +827,35 @@ extern "C"
+         return std::bit_cast<uint32_t>(ushort2::Native_vec_{lo, hi});
+     }
+ 
++    __device__ static void cp_async_zfill(void SHARED_SPACE *dst, void GLOBAL_SPACE *src, uint32_t size, uint32_t Bytes)
++    {
++        auto *to = static_cast<uint8_t SHARED_SPACE *>(dst);
++        auto *from = static_cast<const uint8_t GLOBAL_SPACE *>(src);
++        if (size >= Bytes)
++        {
++            __builtin_memcpy(to, from, Bytes);
++            return;
++        }
++        // Bytes at and beyond src-size are not read.
++        for (uint32_t index = 0; index < Bytes; ++index)
++            to[index] = index < size ? from[index] : uint8_t(0);
++    }
++
++    void FUNC(cp_async_zfill_4)(void SHARED_SPACE *dst, void GLOBAL_SPACE *src, uint32_t size)
++    {
++        cp_async_zfill(dst, src, size, 4);
++    }
++
++    void FUNC(cp_async_zfill_8)(void SHARED_SPACE *dst, void GLOBAL_SPACE *src, uint32_t size)
++    {
++        cp_async_zfill(dst, src, size, 8);
++    }
++
++    void FUNC(cp_async_zfill_16)(void SHARED_SPACE *dst, void GLOBAL_SPACE *src, uint32_t size)
++    {
++        cp_async_zfill(dst, src, size, 16);
++    }
++
+     uint2::Native_vec_ FUNC(ldmatrix_m8n8_x2_b16)(void SHARED_SPACE *address)
+     {
+         uint32_t x0 = load_single_matrix(address, 0);
+@@ -816,6 +881,23 @@ extern "C"
+         return uint4::Native_vec_{x0, x1, x2, x3};
+     }
+ 
++    // movmatrix.sync.aligned.m8n8.trans.b16: lane L holds row L/4, columns
++    // 2*(L%4) and 2*(L%4)+1 of an 8x8 b16 matrix, and receives the same
++    // fragment of the transpose, i.e. elements [c][L/4] for both columns c.
++    // Element [i][j] lives in lane i*4 + j/2, half j%2.
++    uint32_t FUNC(movmatrix_m8n8_trans_b16)(uint32_t value)
++    {
++        uint32_t laneid = FUNC_CALL(sreg_laneid)();
++        uint32_t row = laneid / 4;
++        uint32_t column = (laneid % 4) * 2;
++        uint32_t low_source = column * 4 + row / 2;
++        uint32_t high_source = (column + 1) * 4 + row / 2;
++        uint32_t shift = (row % 2) * 16;
++        uint32_t low = uint32_t(__builtin_amdgcn_ds_bpermute(int(low_source << 2), int(value)));
++        uint32_t high = uint32_t(__builtin_amdgcn_ds_bpermute(int(high_source << 2), int(value)));
++        return ((low >> shift) & 0xffffu) | (((high >> shift) & 0xffffu) << 16);
++    }
++
+     struct byte4
+     {
+         union
+@@ -1077,6 +1159,80 @@ extern "C"
+         }
+         return std::bit_cast<uint4::Native_vec_>(fallback_mma_sync_aligned<int32_t, s8x4>(a_reg, b_reg, std::bit_cast<HIP_vector_base<int32_t, 4>>(c_reg)));
+     }
++
++    __device__ static float4::Native_vec_ unpack_f16_accumulator(uint2::Native_vec_ packed)
++    {
++        auto low = std::bit_cast<f16x2>(packed.x);
++        auto high = std::bit_cast<f16x2>(packed.y);
++        return {float(low.x), float(low.y), float(high.x), float(high.y)};
++    }
++
++    __device__ static uint2::Native_vec_ pack_f16_accumulator(float4::Native_vec_ values)
++    {
++        f16x2 low{static_cast<f16>(values.x), static_cast<f16>(values.y)};
++        f16x2 high{static_cast<f16>(values.z), static_cast<f16>(values.w)};
++        return {std::bit_cast<uint32_t>(low), std::bit_cast<uint32_t>(high)};
++    }
++
++    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
++    {
++        auto c = unpack_f16_accumulator(c_reg);
++        auto result = fallback_mma_sync_aligned<float, f16x2>(
++            a_reg, b_reg, HIP_vector_base<float, 4>(c.x, c.y, c.z, c.w));
++        return pack_f16_accumulator(result);
++    }
++
++    // m16n8k8 fragments are the first K half of m16n8k16 ones: A holds rows
++    // groupID and groupID+8 at columns 2*threadID+{0,1}, B holds K rows
++    // 2*threadID+{0,1}. Zero the second K half and reuse the k16 path.
++    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k8_row_col_f16_f16_f16_f16)(uint2::Native_vec_ a_reg, uint1::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
++    {
++        auto c = unpack_f16_accumulator(c_reg);
++        uint4::Native_vec_ a{a_reg.x, a_reg.y, 0u, 0u};
++        uint2::Native_vec_ b{b_reg.x, 0u};
++        auto result = fallback_mma_sync_aligned<float, f16x2>(
++            a, b, HIP_vector_base<float, 4>(c.x, c.y, c.z, c.w));
++        return pack_f16_accumulator(result);
++    }
++
++    __device__ static uint32_t e4m3x2_to_f16x2_bits(uint16_t packed)
++    {
++        __hip_fp8x2_e4m3 value;
++        value.__x = packed;
++        auto half_pair = FUNC_CALL(cvt_rn_f16x2_e4m3x2)(value);
++        return std::bit_cast<uint32_t>(half_pair);
++    }
++
++    // One K=16 half of an m16n8k32 8-bit A fragment as an m16n8k16 f16 A
++    // fragment. upper holds row groupID (4 columns from 4*threadID), lower
++    // holds row groupID+8. The f16 layout wants {upper, lower, upper, lower}
++    // rows, so the first column pair of each row goes to registers 0/1 and the
++    // second to 2/3. This permutes K the same way as e4m3_b_k16_fragment.
++    __device__ static uint4::Native_vec_ e4m3_a_k16_fragment(uint32_t upper, uint32_t lower)
++    {
++        return {e4m3x2_to_f16x2_bits(uint16_t(upper)),
++                e4m3x2_to_f16x2_bits(uint16_t(lower)),
++                e4m3x2_to_f16x2_bits(uint16_t(upper >> 16)),
++                e4m3x2_to_f16x2_bits(uint16_t(lower >> 16))};
++    }
++
++    __device__ static uint2::Native_vec_ e4m3_b_k16_fragment(uint32_t packed)
++    {
++        return {e4m3x2_to_f16x2_bits(uint16_t(packed)),
++                e4m3x2_to_f16x2_bits(uint16_t(packed >> 16))};
++    }
++
++    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
++    {
++        auto c = unpack_f16_accumulator(c_reg);
++        auto result0 = fallback_mma_sync_aligned<float, f16x2>(
++            e4m3_a_k16_fragment(a_reg.x, a_reg.y), e4m3_b_k16_fragment(b_reg.x),
++            HIP_vector_base<float, 4>(c.x, c.y, c.z, c.w));
++        auto result1 = fallback_mma_sync_aligned<float, f16x2>(
++            e4m3_a_k16_fragment(a_reg.z, a_reg.w), e4m3_b_k16_fragment(b_reg.y),
++            HIP_vector_base<float, 4>(result0.x, result0.y, result0.z, result0.w));
++        return pack_f16_accumulator(result1);
++    }
+ }
+ 
+ template <typename T, typename A, typename B, int BOffset, typename OcklFunc>
+@@ -1195,11 +1351,50 @@ extern "C"
+         GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
+         return __llvm_amdgcn_image_sample_lz_2d_v4f32_f32(0xf, coord.x, coord.y, *image_typed, *sampler_typed, false, 0, 0);
+     }
++
++    static v4f32 sample_2D_level(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord, float lod) __device__
++    {
++        __device__ v4f32 __llvm_amdgcn_image_sample_l_2d_v4f32_f32(uint32_t, float, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.l.2d.v4f32.f32");
++        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
++        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
++        return __llvm_amdgcn_image_sample_l_2d_v4f32_f32(0xf, coord.x, coord.y, lod, *image_typed, *sampler_typed, false, 0, 0);
++    }
++    // Integer texture coordinates address texels directly. NVIDIA compiles
++    // tex with .s32 coordinates to a texel load (TLD) that ignores the
++    // sampler's normalized-coordinate and filter modes; NGX creates every
++    // texture with normalized coordinates and reads per-pixel data this way.
++    static v4f32 fetch_2D(GLOBAL_SPACE void *image, v2s32 coord, int32_t mip) __device__
++    {
++        __device__ v4f32 __llvm_amdgcn_image_load_mip_2d_v4f32_i32(uint32_t, int32_t, int32_t, int32_t, v8s32, int, int) __asm("llvm.amdgcn.image.load.mip.2d.v4f32.i32");
++        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
++        return __llvm_amdgcn_image_load_mip_2d_v4f32_i32(0xf, coord.x, coord.y, mip, *image_typed, 0, 0);
++    }
++
++    static v4f32 sample_or_fetch_2D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord) __device__
++    {
++        return sample_2D(image, sampler, coord);
++    }
++
++    static v4f32 sample_or_fetch_2D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *, v2s32 coord) __device__
++    {
++        return fetch_2D(image, coord, 0);
++    }
++
++    static v4f32 sample_or_fetch_2D_level(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord, float lod) __device__
++    {
++        return sample_2D_level(image, sampler, coord, lod);
++    }
++
++    static v4f32 sample_or_fetch_2D_level(GLOBAL_SPACE void *image, GLOBAL_SPACE void *, v2s32 coord, float lod) __device__
++    {
++        return fetch_2D(image, coord, int32_t(lod));
++    }
++
+ #define tex_2d(RETURN_TYPE, COORD_TYPE)                                                                                                                                                 \
+     v4##RETURN_TYPE FUNC(texobj_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t texobj, v2##COORD_TYPE coord)                                                                              \
+     {                                                                                                                                                                                   \
+         auto [i, s] = get_image_and_sampler(texobj);                                                                                                                                    \
+-        auto result = sample_2D(i, s, v2f32{float(coord.x), float(coord.y)});                                                                                                           \
++        auto result = sample_or_fetch_2D(i, s, coord);                                                                                                                                  \
+         return v4##RETURN_TYPE{std::bit_cast<RETURN_TYPE>(result.x), std::bit_cast<RETURN_TYPE>(result.y), std::bit_cast<RETURN_TYPE>(result.z), std::bit_cast<RETURN_TYPE>(result.w)}; \
+     }                                                                                                                                                                                   \
+     v4##RETURN_TYPE FUNC(texref_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(struct textureReference GLOBAL_SPACE * texref, v2##COORD_TYPE coord)                                                \
+@@ -1212,6 +1407,54 @@ extern "C"
+     tex_2d(f32, s32);
+     tex_2d(s32, f32);
+ 
++    v4f16 FUNC(texobj_2d_v4_f16_s32)(uint64_t texobj, v2s32 coord)
++    {
++        auto [i, s] = get_image_and_sampler(texobj);
++        auto result = sample_or_fetch_2D(i, s, coord);
++        return {f16(result.x), f16(result.y), f16(result.z), f16(result.w)};
++    }
++    v4f16 FUNC(texref_2d_v4_f16_s32)(struct textureReference GLOBAL_SPACE *texref, v2s32 coord)
++    {
++        return FUNC_CALL(texobj_2d_v4_f16_s32)(uint64_t(texref->textureObject), coord);
++    }
++
++#define tex_2d_level(RETURN_TYPE, COORD_TYPE)                                                                                                                                           \
++    v4##RETURN_TYPE FUNC(texobj_level_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t texobj, v2##COORD_TYPE coord, float lod)                                                           \
++    {                                                                                                                                                                                   \
++        auto [i, s] = get_image_and_sampler(texobj);                                                                                                                                    \
++        auto result = sample_or_fetch_2D_level(i, s, coord, lod);                                                                                                                       \
++        return v4##RETURN_TYPE{std::bit_cast<RETURN_TYPE>(result.x), std::bit_cast<RETURN_TYPE>(result.y), std::bit_cast<RETURN_TYPE>(result.z), std::bit_cast<RETURN_TYPE>(result.w)}; \
++    }                                                                                                                                                                                   \
++    v4##RETURN_TYPE FUNC(texref_level_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(struct textureReference GLOBAL_SPACE * texref, v2##COORD_TYPE coord, float lod)                               \
++    {                                                                                                                                                                                   \
++        return FUNC_CALL(texobj_level_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t(texref->textureObject), coord, lod);                                                                \
++    }
++
++    tex_2d_level(f32, f32);
++    tex_2d_level(s32, s32);
++    tex_2d_level(f32, s32);
++    tex_2d_level(s32, f32);
++
++#define tex_2d_gather4(COMPONENT)                                                                                                     \
++    v4f32 FUNC(texobj_gather4##COMPONENT##_2d_v4_f32_f32)(uint64_t texobj, v2f32 coord)                                              \
++    {                                                                                                                                  \
++        auto image = reinterpret_cast<unsigned int CONSTANT_SPACE *>(static_cast<uintptr_t>(texobj));                                 \
++        auto sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;                                                                        \
++        float2 coordinates{coord.x, coord.y};                                                                                          \
++        auto result = __ockl_image_gather4##COMPONENT##_2D(image, sampler, get_native_vector(coordinates));                           \
++        return v4f32{result.x, result.y, result.z, result.w};                                                                          \
++    }                                                                                                                                  \
++    v4f32 FUNC(texref_gather4##COMPONENT##_2d_v4_f32_f32)(struct textureReference GLOBAL_SPACE *texref, v2f32 coord)                  \
++    {                                                                                                                                  \
++        return FUNC_CALL(texobj_gather4##COMPONENT##_2d_v4_f32_f32)(uint64_t(texref->textureObject), coord);                           \
++    }
++
++    tex_2d_gather4(r);
++    tex_2d_gather4(g);
++    tex_2d_gather4(b);
++    tex_2d_gather4(a);
++#undef tex_2d_gather4
++
+     static v4f32 sample_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v4f32 coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_sample_lz_3d_v4f32_f32(uint32_t, float, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.lz.3d.v4f32.f32");
+@@ -1219,11 +1462,23 @@ extern "C"
+         GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
+         return __llvm_amdgcn_image_sample_lz_3d_v4f32_f32(0xf, coord.x, coord.y, coord.z, *image_typed, *sampler_typed, false, 0, 0);
+     }
++    static v4f32 sample_or_fetch_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v4f32 coord) __device__
++    {
++        return sample_3D(image, sampler, coord);
++    }
++
++    static v4f32 sample_or_fetch_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *, v4s32 coord) __device__
++    {
++        __device__ v4f32 __llvm_amdgcn_image_load_3d_v4f32_i32(uint32_t, int32_t, int32_t, int32_t, v8s32, int, int) __asm("llvm.amdgcn.image.load.3d.v4f32.i32");
++        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
++        return __llvm_amdgcn_image_load_3d_v4f32_i32(0xf, coord.x, coord.y, coord.z, *image_typed, 0, 0);
++    }
++
+ #define tex_3d(RETURN_TYPE, COORD_TYPE)                                                                                                                                                 \
+     v4##RETURN_TYPE FUNC(texobj_3d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t texobj, v4##COORD_TYPE coord)                                                                              \
+     {                                                                                                                                                                                   \
+         auto [i, s] = get_image_and_sampler(texobj);                                                                                                                                    \
+-        auto result = sample_3D(i, s, v4f32{float(coord.x), float(coord.y), float(coord.z), float(coord.w)});                                                                           \
++        auto result = sample_or_fetch_3D(i, s, coord);                                                                                                                                  \
+         return v4##RETURN_TYPE{std::bit_cast<RETURN_TYPE>(result.x), std::bit_cast<RETURN_TYPE>(result.y), std::bit_cast<RETURN_TYPE>(result.z), std::bit_cast<RETURN_TYPE>(result.w)}; \
+     }                                                                                                                                                                                   \
+     v4##RETURN_TYPE FUNC(texref_3d_v4_##RETURN_TYPE##_##COORD_TYPE)(struct textureReference GLOBAL_SPACE * texref, v4##COORD_TYPE coord)                                                \
+@@ -1236,6 +1491,401 @@ extern "C"
+     tex_3d(f32, s32);
+     tex_3d(s32, f32);
+ 
++    // A ZLUDA surface object is a copy of HIP's image object (so the handle
++    // also works for texel fetches, as on NVIDIA), a zeroed sampler slot, then
++    // the original CUDA format: HIP integer backing alone cannot distinguish
++    // UNORM/SNORM from UINT/SINT. See zluda/src/impl/surf.rs.
++    struct D4rSurfaceHandle
++    {
++        uint64_t native; // address of the image descriptor
++        uint32_t cuda_format;
++    };
++
++    static D4rSurfaceHandle load_surface_handle(uint64_t surface_object) __device__
++    {
++        constexpr uint32_t format_offset_dwords = HIP_IMAGE_OBJECT_SIZE_DWORD + HIP_SAMPLER_OBJECT_SIZE_DWORD;
++        auto words = reinterpret_cast<GLOBAL_SPACE const uint32_t *>(static_cast<uintptr_t>(surface_object));
++        return {surface_object, words[format_offset_dwords]};
++    }
++
++    // PTX sust.p takes f32 values for UNORM/SNORM and integer values for
++    // UINT/SINT. Convert only arrays whose original CUDA descriptor was
++    // normalized; their HIP backing arrays are ordinary integer storage.
++    [[clang::noinline]]
++    static uint32_t surface_formatted_store_bits(uint32_t bits, uint32_t cuda_format,
++                                                 int channel) __device__
++    {
++        if (cuda_format == 80) // UNORM_INT101010_2, backed by RGBA32F
++        {
++            float value = std::bit_cast<float>(bits);
++            if (!(value == value) || value < 0.0f)
++                value = 0.0f;
++            if (value > 1.0f)
++                value = 1.0f;
++            int scale = channel == 3 ? 3 : 1023;
++            int quantized = int(floorf(value * float(scale) + 0.5f));
++            return std::bit_cast<uint32_t>(float(quantized) / float(scale));
++        }
++        int scale = 0;
++        bool signed_normalized = false;
++        if (cuda_format >= 192 && cuda_format <= 194)
++            scale = 255;
++        else if (cuda_format >= 195 && cuda_format <= 197)
++            scale = 65535;
++        else if (cuda_format >= 198 && cuda_format <= 200)
++        {
++            scale = 127;
++            signed_normalized = true;
++        }
++        else if (cuda_format >= 201 && cuda_format <= 203)
++        {
++            scale = 32767;
++            signed_normalized = true;
++        }
++        if (scale == 0)
++            return bits;
++        float value = std::bit_cast<float>(bits);
++        if (!(value == value))
++            value = 0.0f;
++        if (value < (signed_normalized ? -1.0f : 0.0f))
++            value = signed_normalized ? -1.0f : 0.0f;
++        if (value > 1.0f)
++            value = 1.0f;
++        float scaled = value * float(scale);
++        int32_t integer = scaled < 0.0f
++            ? -int32_t(floorf(-scaled + 0.5f))
++            : int32_t(floorf(scaled + 0.5f));
++        return uint32_t(integer);
++    }
++
++    void FUNC(surfobj_p_2d_b32_zero)(uint64_t surface_object, v2s32 coord, uint32_t value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto surface = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(static_cast<uintptr_t>(wrapper.native));
++        int2 coordinates{coord.x, coord.y};
++        float4 pixel{std::bit_cast<float>(surface_formatted_store_bits(value, wrapper.cuda_format, 0)),
++                     0.0f, 0.0f, 0.0f};
++        auto native_pixel = __hipMapTo<float4::Native_vec_>(pixel);
++        __ockl_image_store_2D(surface, get_native_vector(coordinates), native_pixel);
++    }
++
++    void FUNC(surfobj_p_2d_v4_b32_zero)(uint64_t surface_object, v2s32 coord, v4s32 value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto surface = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(static_cast<uintptr_t>(wrapper.native));
++        int2 coordinates{coord.x, coord.y};
++        v4s32 converted{
++            int32_t(surface_formatted_store_bits(uint32_t(value.x), wrapper.cuda_format, 0)),
++            int32_t(surface_formatted_store_bits(uint32_t(value.y), wrapper.cuda_format, 1)),
++            int32_t(surface_formatted_store_bits(uint32_t(value.z), wrapper.cuda_format, 2)),
++            int32_t(surface_formatted_store_bits(uint32_t(value.w), wrapper.cuda_format, 3))};
++        float4 pixel = std::bit_cast<float4>(converted);
++        auto native_pixel = __hipMapTo<float4::Native_vec_>(pixel);
++        __ockl_image_store_2D(surface, get_native_vector(coordinates), native_pixel);
++    }
++
++    // Unformatted (sust.b) stores write raw bytes at a byte-addressed X
++    // coordinate. AMD image stores always go through the format converter, so
++    // raw channel bits are decoded into the value the converter maps back to
++    // the same bits. Channel types use hsa_ext_image_channel_type_t numbering
++    // (see __hipGetPixelAddr), orders use hsa_ext_image_channel_order_t.
++    static int surface_channel_bytes(int data_type) __device__
++    {
++        switch (data_type)
++        {
++        case 0:  // SNORM_INT8
++        case 2:  // UNORM_INT8
++        case 8:  // SIGNED_INT8
++        case 11: // UNSIGNED_INT8
++            return 1;
++        case 1:  // SNORM_INT16
++        case 3:  // UNORM_INT16
++        case 9:  // SIGNED_INT16
++        case 12: // UNSIGNED_INT16
++        case 14: // HALF_FLOAT
++            return 2;
++        case 10: // SIGNED_INT32
++        case 13: // UNSIGNED_INT32
++        case 15: // FLOAT
++            return 4;
++        default: // packed formats have no per-channel byte layout
++            return 0;
++        }
++    }
++
++    static int surface_channel_count(int order) __device__
++    {
++        switch (order)
++        {
++        case 3: // RG
++        case 4: // RGX
++        case 5: // RA
++            return 2;
++        case 6:  // RGB
++        case 12: // SRGB
++            return 3;
++        case 7:  // RGBX
++        case 8:  // RGBA
++        case 9:  // BGRA
++        case 10: // ARGB
++        case 11: // ABGR
++        case 13: // SRGBX
++        case 14: // SRGBA
++        case 15: // SBGRA
++            return 4;
++        default:
++            return 1;
++        }
++    }
++
++    // Maps the Nth channel in memory to its float4 lane in image load/store.
++    static int surface_memory_channel_lane(int order, int channel) __device__
++    {
++        switch (order)
++        {
++        case 0: // A
++            return 3;
++        case 5: // RA
++            return channel == 0 ? 0 : 3;
++        case 9:  // BGRA
++        case 15: // SBGRA
++            return channel == 0 ? 2 : channel == 2 ? 0 : channel;
++        case 10: // ARGB
++            return channel == 0 ? 3 : channel - 1;
++        case 11: // ABGR
++            return 3 - channel;
++        default:
++            return channel;
++        }
++    }
++
++    // Exact half<->float conversions done on bits, so half subnormals survive
++    // even when the kernel is compiled with FP16 denormal flushing.
++    static float surface_half_bits_to_float(uint32_t bits) __device__
++    {
++        uint32_t sign = (bits & 0x8000u) << 16;
++        uint32_t exponent = (bits >> 10) & 0x1fu;
++        uint32_t mantissa = bits & 0x3ffu;
++        if (exponent == 0)
++        {
++            // Half subnormals are f32 normals: mantissa * 2^-24 is exact.
++            float magnitude = float(mantissa) * 0x1p-24f;
++            return std::bit_cast<float>(std::bit_cast<uint32_t>(magnitude) | sign);
++        }
++        if (exponent == 0x1f)
++            return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13));
++        return std::bit_cast<float>(sign | ((exponent + 112u) << 23) | (mantissa << 13));
++    }
++
++    static uint32_t surface_float_to_half_bits(float value) __device__
++    {
++        uint32_t bits = std::bit_cast<uint32_t>(value);
++        uint32_t sign = (bits >> 16) & 0x8000u;
++        uint32_t exponent = (bits >> 23) & 0xffu;
++        uint32_t mantissa = bits & 0x7fffffu;
++        if (exponent == 0xff)
++            return sign | 0x7c00u | (mantissa != 0 ? 0x200u | (mantissa >> 13) : 0u);
++        int half_exponent = int(exponent) - 112;
++        if (half_exponent >= 31)
++            return sign | 0x7c00u;
++        uint32_t shift = 13;
++        if (half_exponent <= 0)
++        {
++            if (half_exponent < -10)
++                return sign;
++            mantissa |= 0x800000u;
++            shift = uint32_t(14 - half_exponent);
++            half_exponent = 0;
++        }
++        uint32_t half_mantissa = mantissa >> shift;
++        uint32_t remainder = mantissa & ((1u << shift) - 1u);
++        uint32_t halfway = 1u << (shift - 1u);
++        uint32_t result = sign | (uint32_t(half_exponent) << 10);
++        // Round to nearest even; a mantissa carry correctly bumps the exponent.
++        result += half_mantissa & (half_exponent == 0 ? 0x7ffu : 0x3ffu);
++        if (remainder > halfway || (remainder == halfway && (half_mantissa & 1u)))
++            result++;
++        return result;
++    }
++
++    // The normalized conversions below stick to FP operations that the
++    // AMDGPU backend can lower in the strict-FP (constrained) helper build;
++    // constrained min/max/rint/fptoui and i8/i16 int-to-float become
++    // unsupported library calls there. Clamping is done on integers.
++    static int32_t surface_clamp(int32_t value, int32_t low, int32_t high) __device__
++    {
++        return value < low ? low : (value > high ? high : value);
++    }
++
++    static float surface_decode_channel(uint32_t bits, int data_type) __device__
++    {
++        switch (data_type)
++        {
++        case 0: // SNORM_INT8
++            return float(surface_clamp(int32_t(int8_t(bits)), -127, 127)) / 127.0f;
++        case 1: // SNORM_INT16
++            return float(surface_clamp(int32_t(int16_t(bits)), -32767, 32767)) / 32767.0f;
++        case 2: // UNORM_INT8
++            return float(int32_t(bits & 0xffu)) / 255.0f;
++        case 3: // UNORM_INT16
++            return float(int32_t(bits & 0xffffu)) / 65535.0f;
++        case 8: // SIGNED_INT8
++            return std::bit_cast<float>(int32_t(int8_t(bits)));
++        case 9: // SIGNED_INT16
++            return std::bit_cast<float>(int32_t(int16_t(bits)));
++        case 14: // HALF_FLOAT
++            return surface_half_bits_to_float(bits);
++        default: // unsigned integers and 32-bit types store their bits as-is
++            return std::bit_cast<float>(bits);
++        }
++    }
++
++    static uint32_t surface_encode_channel(float value, int data_type) __device__
++    {
++        switch (data_type)
++        {
++        // Loaded normalized values are already within range, so rounding to
++        // nearest via floor(x + 0.5) only has to undo the load conversion.
++        case 0: // SNORM_INT8
++            return uint32_t(surface_clamp(int32_t(floorf(value * 127.0f + 0.5f)), -127, 127)) & 0xffu;
++        case 1: // SNORM_INT16
++            return uint32_t(surface_clamp(int32_t(floorf(value * 32767.0f + 0.5f)), -32767, 32767)) & 0xffffu;
++        case 2: // UNORM_INT8
++            return uint32_t(surface_clamp(int32_t(floorf(value * 255.0f + 0.5f)), 0, 255));
++        case 3: // UNORM_INT16
++            return uint32_t(surface_clamp(int32_t(floorf(value * 65535.0f + 0.5f)), 0, 65535));
++        case 14: // HALF_FLOAT
++            return surface_float_to_half_bits(value);
++        default:
++            return std::bit_cast<uint32_t>(value);
++        }
++    }
++
++    // Inverse of surface_memory_channel_lane: the memory channel feeding a
++    // float4 lane, or -1 when the lane has no channel in this order.
++    static int surface_lane_channel(int order, int lane, int channels) __device__
++    {
++        switch (order)
++        {
++        case 0: // A
++            return lane == 3 ? 0 : -1;
++        case 5: // RA
++            return lane == 0 ? 0 : (lane == 3 ? 1 : -1);
++        case 9:  // BGRA
++        case 15: // SBGRA
++            return lane == 0 ? 2 : (lane == 2 ? 0 : lane);
++        case 10: // ARGB
++            return lane == 3 ? 0 : lane + 1;
++        case 11: // ABGR
++            return 3 - lane;
++        default:
++            return lane < channels ? lane : -1;
++        }
++    }
++
++    // The pixel is kept in scalar per-channel variables selected with
++    // conditionals. Byte arrays indexed at runtime turn into <16 x i8>
++    // vectors, which crash AMDGPU instruction selection (getRegClassFor from
++    // PostISelFolding) once inlined into large kernels such as rrlite_enc0.
++    static uint32_t surface_select_channel(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
++                                           int channel) __device__
++    {
++        return channel == 0 ? c0 : (channel == 1 ? c1 : (channel == 2 ? c2 : c3));
++    }
++
++    static float surface_select_lane(float4::Native_vec_ value, int lane) __device__
++    {
++        return lane == 0 ? value.x : (lane == 1 ? value.y : (lane == 2 ? value.z : value.w));
++    }
++
++    // Replaces the bytes of one channel that overlap the stored bytes.
++    static uint32_t surface_merge_channel(uint32_t bits, int channel, int channel_bytes, uint32_t data,
++                                          int byte_offset, int byte_count) __device__
++    {
++        for (int b = 0; b < 4; b++)
++        {
++            int relative = channel * channel_bytes + b - byte_offset;
++            if (b < channel_bytes && relative >= 0 && relative < byte_count)
++            {
++                uint32_t byte = (data >> (8 * relative)) & 0xffu;
++                bits = (bits & ~(0xffu << (8 * b))) | (byte << (8 * b));
++            }
++        }
++        return bits;
++    }
++
++    static float surface_lane_value(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, int order,
++                                    int lane, int channels, int data_type) __device__
++    {
++        int channel = surface_lane_channel(order, lane, channels);
++        if (channel < 0)
++            return 0.0f;
++        return surface_decode_channel(surface_select_channel(c0, c1, c2, c3, channel), data_type);
++    }
++
++    // Stores byte_count (at most 4) little-endian bytes of data at the byte
++    // offset coord.x of row coord.y.
++    static void surface_store_raw_2d(unsigned int ADDRESS_SPACE_CONSTANT *image, v2s32 coord,
++                                     uint32_t data, int byte_count) __device__
++    {
++        int data_type = __ockl_image_channel_data_type_2D(image);
++        int order = __ockl_image_channel_order_2D(image);
++        int channel_bytes = surface_channel_bytes(data_type);
++        // .zero clamping drops out-of-bounds stores; negative X never hits a pixel.
++        if (channel_bytes == 0 || coord.x < 0)
++            return;
++        int channels = surface_channel_count(order);
++        int pixel_bytes = channel_bytes * channels;
++        int pixel_x = coord.x / pixel_bytes;
++        int byte_offset = coord.x - pixel_x * pixel_bytes;
++        int2 coordinates{pixel_x, coord.y};
++        auto native_coordinates = get_native_vector(coordinates);
++        uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++        // Partial-pixel stores keep the untouched bytes of the existing pixel.
++        if (byte_offset != 0 || byte_count < pixel_bytes)
++        {
++            auto loaded = __ockl_image_load_2D(image, native_coordinates);
++            c0 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 0)), data_type);
++            c1 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 1)), data_type);
++            c2 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 2)), data_type);
++            c3 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 3)), data_type);
++        }
++        c0 = surface_merge_channel(c0, 0, channel_bytes, data, byte_offset, byte_count);
++        c1 = surface_merge_channel(c1, 1, channel_bytes, data, byte_offset, byte_count);
++        c2 = surface_merge_channel(c2, 2, channel_bytes, data, byte_offset, byte_count);
++        c3 = surface_merge_channel(c3, 3, channel_bytes, data, byte_offset, byte_count);
++        float4 value{surface_lane_value(c0, c1, c2, c3, order, 0, channels, data_type),
++                     surface_lane_value(c0, c1, c2, c3, order, 1, channels, data_type),
++                     surface_lane_value(c0, c1, c2, c3, order, 2, channels, data_type),
++                     surface_lane_value(c0, c1, c2, c3, order, 3, channels, data_type)};
++        __ockl_image_store_2D(image, native_coordinates, __hipMapTo<float4::Native_vec_>(value));
++    }
++
++    void FUNC(surfobj_b_2d_v2_b16_zero)(uint64_t surface_object, v2s32 coord, v2s16 value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto image = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(
++            static_cast<uintptr_t>(wrapper.native));
++        uint32_t data = uint32_t(uint16_t(value.x)) | (uint32_t(uint16_t(value.y)) << 16);
++        surface_store_raw_2d(image, coord, data, 4);
++    }
++
++    void FUNC(surfobj_b_2d_b32_zero)(uint64_t surface_object, v2s32 coord, uint32_t value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto image = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(
++            static_cast<uintptr_t>(wrapper.native));
++        surface_store_raw_2d(image, coord, value, 4);
++    }
++
++    // v_exp_f32 per half; ocml's f16 exp2 becomes a libcall the backend
++    // cannot lower in constrained floating-point mode.
++    f16x2 FUNC(ex2_approx_f16x2)(f16x2 a)
++    {
++        return f16x2{static_cast<_Float16>(__builtin_amdgcn_exp2f(static_cast<float>(a.x))),
++                     static_cast<_Float16>(__builtin_amdgcn_exp2f(static_cast<float>(a.y)))};
++    }
++
+     __device__ half __ocml_tanh_f16(half);
+     half FUNC(tanh_f16)(half a)
+     {
+diff --git a/ptx/src/pass/insert_implicit_conversions.rs b/ptx/src/pass/insert_implicit_conversions.rs
+index 1007bcc..f706a32 100644
+--- a/ptx/src/pass/insert_implicit_conversions.rs
++++ b/ptx/src/pass/insert_implicit_conversions.rs
+@@ -82,6 +82,24 @@ fn insert_implicit_conversions_impl<'input>(
+             data.type_ = ast::TexType::Texobj;
+         }
+     }
++    if let ExpandedStatement::Instruction(ast::Instruction::TexLevel {
++        ref mut data,
++        ref arguments,
++    }) = stmt
++    {
++        let (type_, space) = resolver.get_typed(arguments.src_ptr)?;
++        if matches!(
++            (type_, space),
++            (
++                ast::Type::Scalar(
++                    ast::ScalarType::B64 | ast::ScalarType::U64 | ast::ScalarType::S64
++                ),
++                ast::StateSpace::Reg
++            )
++        ) {
++            data.type_ = ast::TexType::Texobj;
++        }
++    }
+     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
+         &mut |operand,
+               type_state: Option<(&ast::Type, ast::StateSpace)>,
+diff --git a/ptx/src/pass/insert_post_saturation.rs b/ptx/src/pass/insert_post_saturation.rs
+index 0c92506..f93509f 100644
+--- a/ptx/src/pass/insert_post_saturation.rs
++++ b/ptx/src/pass/insert_post_saturation.rs
+@@ -133,7 +133,9 @@ fn run_instruction<'input>(
+         | ast::Instruction::Ex2 { .. }
+         | ast::Instruction::Fma {
+             data: ast::ArithFloat {
+-                saturate: false, ..
++                saturate: false,
++                relu: false,
++                ..
+             },
+             ..
+         }
+@@ -208,12 +210,29 @@ fn run_instruction<'input>(
+         | ast::Instruction::ReduxSync { .. }
+         | ast::Instruction::GridDepControl { .. }
+         | ast::Instruction::LdMatrix { .. }
++        | ast::Instruction::Movmatrix { .. }
+         | ast::Instruction::Prefetch { .. }
+         | ast::Instruction::Sad { .. }
+         | ast::Instruction::Dp2a { .. }
++        | ast::Instruction::Sust { .. }
++        | ast::Instruction::TexLevel { .. }
+         | ast::Instruction::Tex { .. }
+         | ast::Instruction::Mma { .. }
+         | ast::Instruction::Vshr { .. } => result.push(Statement::Instruction(instruction)),
++        ast::Instruction::Fma {
++            data:
++                ast::ArithFloat {
++                    saturate: false,
++                    relu: true,
++                    type_,
++                    ..
++                },
++            arguments: ast::FmaArgs { ref mut dst, .. },
++        } => {
++            let relu = get_post_clamp(resolver, type_, dst, true)?;
++            result.push(Statement::Instruction(instruction));
++            result.push(relu);
++        }
+         ast::Instruction::Add {
+             data:
+                 ast::ArithDetails::Float(ast::ArithFloat {
+@@ -316,6 +335,15 @@ fn get_post_saturation<'input>(
+     resolver: &mut GlobalStringIdentResolver2<'input>,
+     type_: ast::ScalarType,
+     old_dst: &mut SpirvWord,
++) -> Result<Statement<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
++    get_post_clamp(resolver, type_, old_dst, false)
++}
++
++fn get_post_clamp<'input>(
++    resolver: &mut GlobalStringIdentResolver2<'input>,
++    type_: ast::ScalarType,
++    old_dst: &mut SpirvWord,
++    relu: bool,
+ ) -> Result<Statement<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
+     let post_sat = resolver.register_unnamed(Some((type_.into(), ast::StateSpace::Reg)));
+     let dst = *old_dst;
+@@ -324,5 +352,6 @@ fn get_post_saturation<'input>(
+         dst,
+         src: post_sat,
+         type_,
++        relu,
+     })
+ }
+diff --git a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+index e68a19d..e6f22a6 100644
+--- a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
++++ b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+@@ -2179,11 +2179,14 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
+         | ast::Instruction::ReduxSync { .. }
+         | ast::Instruction::GridDepControl { .. }
+         | ast::Instruction::LdMatrix { .. }
++        | ast::Instruction::Movmatrix { .. }
+         | ast::Instruction::Mma { .. }
+         | ast::Instruction::Prefetch { .. }
+         | ast::Instruction::CreatePolicyFractional { .. }
+         | ast::Instruction::Dp2a { .. }
++        | ast::Instruction::Sust { .. }
+         | ast::Instruction::Sad { .. }
++        | ast::Instruction::TexLevel { .. }
+         | ast::Instruction::Tex { .. }
+         | ast::Instruction::Copysign { .. } => InstructionModes::none(),
+         ast::Instruction::Add {
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index cec8af4..5ab8985 100644
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -460,7 +460,10 @@ fn get_input_argument_type(
+     state_space: ast::StateSpace,
+ ) -> Result<LLVMTypeRef, TranslateError> {
+     match state_space {
+-        ast::StateSpace::ParamEntry | ast::StateSpace::Shared => {
++        // Helper functions such as cp_async_zfill_* take global pointers.
++        ast::StateSpace::ParamEntry | ast::StateSpace::Shared | ast::StateSpace::Global
++            if !matches!(v_type, ast::Type::Texref) =>
++        {
+             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
+         }
+         ast::StateSpace::Reg => get_type(context, v_type),
+@@ -530,7 +533,7 @@ impl<'a> MethodEmitContext<'a> {
+             Statement::VectorRead(vector_read) => self.emit_vector_read(vector_read)?,
+             Statement::VectorWrite(vector_write) => self.emit_vector_write(vector_write)?,
+             Statement::SetMode(mode_reg) => self.emit_set_mode(mode_reg)?,
+-            Statement::FpSaturate { dst, src, type_ } => self.emit_fp_saturate(type_, dst, src)?,
++            Statement::FpSaturate { dst, src, type_, relu } => self.emit_fp_saturate(type_, dst, src, relu)?,
+             Statement::FpModeRequired { .. } => {}
+         })
+     }
+@@ -699,10 +702,13 @@ impl<'a> MethodEmitContext<'a> {
+             | ast::Instruction::Nanosleep { .. }
+             | ast::Instruction::ReduxSync { .. }
+             | ast::Instruction::LdMatrix { .. }
++            | ast::Instruction::Movmatrix { .. }
+             | ast::Instruction::Prmt { .. }
+             | ast::Instruction::Mma { .. }
+             | ast::Instruction::Dp2a { .. }
+             | ast::Instruction::Tanh { .. }
++            | ast::Instruction::Sust { .. }
++            | ast::Instruction::TexLevel { .. }
+             | ast::Instruction::Tex { .. } => return Err(error_unreachable()),
+         }
+     }
+@@ -3175,13 +3181,35 @@ impl<'a> MethodEmitContext<'a> {
+         type_: ast::ScalarType,
+         dst: SpirvWord,
+         src: SpirvWord,
++        relu: bool,
+     ) -> Result<(), TranslateError> {
+         let llvm_type = get_scalar_type(self.context, type_);
+-        let zero = unsafe { LLVMConstReal(llvm_type, 0.0) };
+-        let one = unsafe { LLVMConstReal(llvm_type, 1.0) };
++        // Packed types (f16x2, bf16x2) need splatted constants.
++        let constant = |value: f64| unsafe {
++            if LLVMGetTypeKind(llvm_type) == LLVMTypeKind::LLVMVectorTypeKind {
++                let element = LLVMConstReal(LLVMGetElementType(llvm_type), value);
++                let mut elements = vec![element; LLVMGetVectorSize(llvm_type) as usize];
++                LLVMConstVector(elements.as_mut_ptr(), elements.len() as u32)
++            } else {
++                LLVMConstReal(llvm_type, value)
++            }
++        };
++        let zero = constant(0.0);
++        let one = constant(1.0);
++        let src = self.resolver.value(src)?;
++        if relu {
++            // PTX relu: max(x, +0) with NaN propagated, which is llvm.maximum.
++            let maximum_intrinsic = format!("llvm.maximum.{}\0", LLVMTypeDisplay(type_));
++            self.emit_intrinsic(
++                unsafe { CStr::from_bytes_with_nul_unchecked(maximum_intrinsic.as_bytes()) },
++                Some(dst),
++                vec![&type_.into()],
++                vec![(src, llvm_type), (zero, llvm_type)],
++            )?;
++            return Ok(());
++        }
+         let maxnum_intrinsic = format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(type_));
+         let minnum_intrinsic = format!("llvm.minimumnum.{}\0", LLVMTypeDisplay(type_));
+-        let src = self.resolver.value(src)?;
+         let maxnum = self.emit_intrinsic(
+             unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
+             None,
+diff --git a/ptx/src/pass/mod.rs b/ptx/src/pass/mod.rs
+index 4b54c9f..15dd9ba 100644
+--- a/ptx/src/pass/mod.rs
++++ b/ptx/src/pass/mod.rs
+@@ -323,10 +323,12 @@ enum Statement<I, P: ast::Operand> {
+         ftz_f16f64: Option<bool>,
+         rnd_f16f64: Option<ast::RoundingMode>,
+     },
++    // Clamps to [0, 1] (NaN -> 0), or with relu to [0, inf) keeping NaN.
+     FpSaturate {
+         dst: SpirvWord,
+         src: SpirvWord,
+         type_: ast::ScalarType,
++        relu: bool,
+     },
+ }
+ 
+@@ -632,7 +634,7 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
+                 Statement::FunctionPointer(FunctionPointerDetails { dst, src })
+             }
+             Statement::SetMode(mode_register) => Statement::SetMode(mode_register),
+-            Statement::FpSaturate { dst, src, type_ } => {
++            Statement::FpSaturate { dst, src, type_, relu } => {
+                 let dst = visitor.visit_ident(
+                     dst,
+                     Some((&type_.into(), ast::StateSpace::Reg)),
+@@ -645,7 +647,7 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
+                     false,
+                     false,
+                 )?;
+-                Statement::FpSaturate { dst, src, type_ }
++                Statement::FpSaturate { dst, src, type_, relu }
+             }
+             Statement::FpModeRequired {
+                 ftz_f32,
+diff --git a/ptx/src/pass/replace_instructions_with_functions.rs b/ptx/src/pass/replace_instructions_with_functions.rs
+index 5bd855f..023d14d 100644
+--- a/ptx/src/pass/replace_instructions_with_functions.rs
++++ b/ptx/src/pass/replace_instructions_with_functions.rs
+@@ -369,6 +369,7 @@ fn run_instruction<'input>(
+                     type_,
+                     ctype,
+                     dims,
++                    gather_comp,
+                 },
+             ..
+         } => {
+@@ -381,8 +382,53 @@ fn run_instruction<'input>(
+                 ast::TexType::Texref => "texref",
+                 ast::TexType::Texobj => "texobj",
+             };
++            let dims = match dims {
++                ast::TexDimensions::D1 => "1d",
++                ast::TexDimensions::D2 => "2d",
++                ast::TexDimensions::D3 => "3d",
++            };
++            let name = if let Some(component) = gather_comp {
++                let component = match component {
++                    ast::TexGatherComponent::R => "r",
++                    ast::TexGatherComponent::G => "g",
++                    ast::TexGatherComponent::B => "b",
++                    ast::TexGatherComponent::A => "a",
++                };
++                format!(
++                    "{prefix}_gather4{component}_{dims}_v4_{dtype}_{coord}",
++                    dtype = scalar_to_ptx_name(dtype),
++                    coord = scalar_to_ptx_name(ctype)
++                )
++            } else {
++                format!(
++                    "{prefix}_{dims}_v4_{dtype}_{coord}",
++                    dtype = scalar_to_ptx_name(dtype),
++                    coord = scalar_to_ptx_name(ctype)
++                )
++            };
++            to_call(resolver, fn_declarations, name.into(), i)?
++        }
++        i @ ptx_parser::Instruction::TexLevel {
++            data:
++                ast::TexData {
++                    dtype,
++                    type_,
++                    ctype,
++                    dims,
++                    ..
++                },
++            ..
++        } => {
++            let dtype = match dtype {
++                ast::ScalarType::U32 => ast::ScalarType::S32,
++                t => t,
++            };
++            let prefix = match type_ {
++                ast::TexType::Texref => "texref",
++                ast::TexType::Texobj => "texobj",
++            };
+             let name = format!(
+-                "{prefix}_{dims}_v4_{dtype}_{coord}",
++                "{prefix}_level_{dims}_v4_{dtype}_{coord}",
+                 dtype = scalar_to_ptx_name(dtype),
+                 dims = match dims {
+                     ast::TexDimensions::D1 => "1d",
+@@ -393,6 +439,38 @@ fn run_instruction<'input>(
+             );
+             to_call(resolver, fn_declarations, name.into(), i)?
+         }
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
++                vector_width: Some(4),
++                formatted: true,
++                ..
++            },
++            ..
++        } => to_call(resolver, fn_declarations, "surfobj_p_2d_v4_b32_zero".into(), i)?,
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
++                vector_width: Some(2),
++                scalar_type: ast::ScalarType::B16,
++                formatted: false,
++            },
++            ..
++        } => to_call(resolver, fn_declarations, "surfobj_b_2d_v2_b16_zero".into(), i)?,
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
++                vector_width: None,
++                scalar_type: ast::ScalarType::B32,
++                formatted: false,
++            },
++            ..
++        } => to_call(resolver, fn_declarations, "surfobj_b_2d_b32_zero".into(), i)?,
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
++                vector_width: None,
++                formatted: true,
++                ..
++            },
++            ..
++        } => to_call(resolver, fn_declarations, "surfobj_p_2d_b32_zero".into(), i)?,
+         i @ ptx_parser::Instruction::Sqrt {
+             data:
+                 ast::RcpData {
+@@ -427,6 +505,14 @@ fn run_instruction<'input>(
+                 },
+             ..
+         } => to_call(resolver, fn_declarations, "ex2_approx_f32".into(), i)?,
++        i @ ptx_parser::Instruction::Ex2 {
++            data:
++                ast::TypeFtz {
++                    type_: ast::ScalarType::F16x2,
++                    ..
++                },
++            ..
++        } => to_call(resolver, fn_declarations, "ex2_approx_f16x2".into(), i)?,
+         i @ ptx_parser::Instruction::Lg2 {
+             data: ast::FlushToZero {
+                 flush_to_zero: false,
+@@ -436,6 +522,9 @@ fn run_instruction<'input>(
+         i @ ptx_parser::Instruction::Activemask { .. } => {
+             to_call(resolver, fn_declarations, "activemask".into(), i)?
+         }
++        i @ ptx_parser::Instruction::Movmatrix { .. } => {
++            to_call(resolver, fn_declarations, "movmatrix_m8n8_trans_b16".into(), i)?
++        }
+         i @ ptx_parser::Instruction::Bfe { data, .. } => {
+             let name = ["bfe_", scalar_to_ptx_name(data)].concat();
+             to_call(resolver, fn_declarations, name.into(), i)?
+@@ -470,20 +559,20 @@ fn run_instruction<'input>(
+                 ast::MmaDetails {
+                     alayout,
+                     blayout,
++                    k_size,
+                     cd_type_scalar,
+                     ab_type_scalar,
+                 },
+             ..
+         } => {
+             let cd_type_name = scalar_to_ptx_name(cd_type_scalar);
+-            let ab_type_name = scalar_to_ptx_name(ab_type_scalar);
+-            let dimensions = if cd_type_scalar.kind() == ast::ScalarKind::Float {
+-                "m16n8k16"
+-            } else {
+-                "m16n8k32"
++            let ab_type_name = match ab_type_scalar {
++                ast::ScalarType::E4m3x2 => "e4m3".to_owned(),
++                ast::ScalarType::E5m2x2 => "e5m2".to_owned(),
++                other => scalar_to_ptx_name(other).to_owned(),
+             };
+             let name = format!(
+-                "mma_sync_aligned_{dimensions}_{}_{}_{cd_type_name}_{ab_type_name}_{ab_type_name}_{cd_type_name}",
++                "mma_sync_aligned_m16n8k{k_size}_{}_{}_{cd_type_name}_{ab_type_name}_{ab_type_name}_{cd_type_name}",
+                 match alayout {
+                     ast::MatrixLayout::Row => "row",
+                     ast::MatrixLayout::Col => "col",
+@@ -595,6 +684,27 @@ fn run_instruction<'input>(
+         i @ ptx_parser::Instruction::Nanosleep { .. } => {
+             to_call(resolver, fn_declarations, "nanosleep_u32".into(), i)?
+         }
++        i @ ptx_parser::Instruction::Cvt {
++            data:
++                ptx_parser::CvtDetails {
++                    from: ast::ScalarType::F16x2,
++                    to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
++                    mode: _,
++                },
++            arguments: _,
++        } => {
++            let to = match to {
++                ptx_parser::ScalarType::E4m3x2 => "e4m3x2",
++                ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
++                _ => unreachable!(),
++            };
++            to_call(
++                resolver,
++                fn_declarations,
++                format!("cvt_rn_satfinite_{}_f16x2", to).into(),
++                i,
++            )?
++        }
+         i @ ptx_parser::Instruction::Cvt {
+             data:
+                 ptx_parser::CvtDetails {
+@@ -642,6 +752,19 @@ fn run_instruction<'input>(
+                 i,
+             )?
+         }
++        // cp.async with a register src-size copies that many bytes and zero
++        // fills the rest of cp-size (used for padding at image borders).
++        i @ ptx_parser::Instruction::CpAsync {
++            arguments: ast::CpAsyncArgs { src_size: Some(_), .. },
++            ..
++        } => {
++            let bytes = match &i {
++                ptx_parser::Instruction::CpAsync { data, .. } => data.cp_size.as_u64(),
++                _ => return Err(error_unreachable()),
++            };
++            let name = format!("cp_async_zfill_{bytes}");
++            to_call(resolver, fn_declarations, name.into(), i)?
++        }
+         i @ ptx_parser::Instruction::Prmt { .. } => {
+             to_call(resolver, fn_declarations, "prmt_b32".into(), i)?
+         }
+diff --git a/ptx_parser/src/ast.rs b/ptx_parser/src/ast.rs
+index 53662f9..0d2ca3b 100644
+--- a/ptx_parser/src/ast.rs
++++ b/ptx_parser/src/ast.rs
+@@ -250,7 +250,9 @@ ptx_parser_macros::generate_instruction_type!(
+                 src_from: {
+                     repr: T,
+                     space: StateSpace::Global
+-                }
++                },
++                // Register src-size; immediates stay in CpAsyncDetails.
++                src_size: Option<T>,
+             }
+         },
+         CpAsyncCommitGroup { },
+@@ -450,6 +452,15 @@ ptx_parser_macros::generate_instruction_type!(
+             },
+             display: write!(f, "mov{}", data.typ)?
+         },
++        // movmatrix.sync.aligned.m8n8.trans.b16: warp-wide transpose of an 8x8
++        // b16 matrix held as one .b32 register per lane.
++        Movmatrix {
++            type: Type::Scalar(ScalarType::B32),
++            arguments<T>: {
++                dst: T,
++                src: T
++            }
++        },
+         Mul {
+             type: { Type::from(data.type_()) },
+             data: MulDetails,
+@@ -945,6 +956,65 @@ ptx_parser_macros::generate_instruction_type!(
+                 },
+             }
+         },
++        TexLevel {
++            type: !,
++            data: TexData,
++            arguments<T>: {
++                dst: {
++                    repr: T,
++                    type: { Type::Vector(4, data.dtype) },
++                },
++                src_ptr: {
++                    repr: T,
++                    type: {
++                        if data.type_ == TexType::Texref {
++                            Type::Texref
++                        } else {
++                            Type::Scalar(ScalarType::U64)
++                        }
++                    },
++                    space: {
++                        if data.type_ == TexType::Texref {
++                            StateSpace::Global
++                        } else {
++                            StateSpace::Reg
++                        }
++                    },
++                },
++                src_coord: {
++                    repr: T,
++                    type: { data.coord_type() },
++                },
++                src_lod: {
++                    repr: T,
++                    type: { Type::Scalar(ScalarType::F32) },
++                },
++            }
++        },
++        Sust {
++            type: !,
++            data: SustData,
++            arguments<T>: {
++                src_surf: {
++                    repr: T,
++                    type: { Type::Scalar(ScalarType::U64) },
++                    space: StateSpace::Reg,
++                },
++                src_coord: {
++                    repr: T,
++                    type: { Type::Vector(2, ScalarType::S32) },
++                },
++                src_value: {
++                    repr: T,
++                    type: {
++                        match data.vector_width {
++                            Some(width) => Type::Vector(width, data.scalar_type),
++                            None => Type::Scalar(data.scalar_type),
++                        }
++                    },
++                },
++            }
++        },
+         Bfind {
+             type: !,
+             data: (),
+@@ -1784,6 +1854,8 @@ pub struct ArithFloat {
+     pub rounding: RoundingMode,
+     pub flush_to_zero: Option<bool>,
+     pub saturate: bool,
++    // .relu (f16/bf16 fma): negative results clamp to +0, NaN stays NaN.
++    pub relu: bool,
+     // From PTX documentation: https://docs.nvidia.com/cuda/parallel-thread-execution/#mixed-precision-floating-point-instructions-add
+     // Note that an add instruction with an explicit rounding modifier is treated conservatively by
+     // the code optimizer. An add instruction with no rounding modifier defaults to
+@@ -2823,27 +2895,35 @@ pub struct MmaDetails {
+     pub blayout: MatrixLayout,
+     pub cd_type_scalar: ScalarType,
+     pub ab_type_scalar: ScalarType,
++    pub k_size: u8,
+ }
+ 
+ impl MmaDetails {
+     pub fn dtype(&self) -> Type {
+-        if self.cd_type_scalar.kind() == ScalarKind::Float {
+-            Type::Vector(4, ScalarType::F32)
+-        } else {
+-            Type::Vector(4, ScalarType::U32)
++        match self.cd_type_scalar {
++            ScalarType::F16 => Type::Vector(2, ScalarType::U32),
++            ScalarType::F32 => Type::Vector(4, ScalarType::F32),
++            _ => Type::Vector(4, ScalarType::U32),
+         }
+     }
++    // m16n8k8 16-bit fragments are half the size of the k16 (and 8-bit k32) ones.
+     pub fn atype(&self) -> Type {
+-        Type::Vector(4, ScalarType::U32)
++        match self.k_size {
++            8 => Type::Vector(2, ScalarType::U32),
++            _ => Type::Vector(4, ScalarType::U32),
++        }
+     }
+     pub fn btype(&self) -> Type {
+-        Type::Vector(2, ScalarType::U32)
++        match self.k_size {
++            8 => Type::Vector(1, ScalarType::U32),
++            _ => Type::Vector(2, ScalarType::U32),
++        }
+     }
+     pub fn ctype(&self) -> Type {
+-        if self.cd_type_scalar.kind() == ScalarKind::Float {
+-            Type::Vector(4, ScalarType::F32)
+-        } else {
+-            Type::Vector(4, ScalarType::U32)
++        match self.cd_type_scalar {
++            ScalarType::F16 => Type::Vector(2, ScalarType::U32),
++            ScalarType::F32 => Type::Vector(4, ScalarType::F32),
++            _ => Type::Vector(4, ScalarType::U32),
+         }
+     }
+ }
+@@ -2887,6 +2967,22 @@ pub struct TexData {
+     pub dtype: ScalarType,
+     pub ctype: ScalarType,
+     pub dims: TexDimensions,
++    pub gather_comp: Option<TexGatherComponent>,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
++pub enum TexGatherComponent {
++    R,
++    G,
++    B,
++    A,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub struct SustData {
++    pub vector_width: Option<u8>,
++    pub scalar_type: ScalarType,
++    pub formatted: bool,
+ }
+ 
+ impl TexData {
+diff --git a/ptx_parser/src/lib.rs b/ptx_parser/src/lib.rs
+index d9f3d84..6820a55 100644
+--- a/ptx_parser/src/lib.rs
++++ b/ptx_parser/src/lib.rs
+@@ -2089,6 +2089,20 @@ derive_parser!(
+         Add
+     }
+ 
++    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-transpose-instruction-movmatrix
++    // The transpose moves elements between lanes: lane L receives column L / 4 of the source
++    // matrix, so this cannot be a register move.
++    movmatrix.sync.trans.aligned.m8n8.b16 d, a => {
++        Instruction::Movmatrix {
++            arguments: MovmatrixArgs { dst: d, src: a },
++        }
++    }
++    movmatrix.sync.aligned.m8n8.trans.b16 d, a => {
++        Instruction::Movmatrix {
++            arguments: MovmatrixArgs { dst: d, src: a },
++        }
++    }
++
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-mov
+     mov{.vec}.type  d, a => {
+         Instruction::Mov {
+@@ -2144,9 +2158,8 @@ derive_parser!(
+         }
+     }
+     st.release.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
+-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
+-            state.errors.push(PtxError::Todo("st.release instruction with cache policy/eviction priority/cache hints".to_string()));
+-        }
++        // Preserve release ordering; eviction/cache hints are performance-only metadata.
++        let _ = (level_eviction_priority, level_cache_hint, cache_policy);
+         Instruction::St {
+             data: StData {
+                 qualifier: ast::LdStQualifier::Release(scope),
+@@ -2216,9 +2229,8 @@ derive_parser!(
+         }
+     }
+     ld.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
+-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
+-            state.errors.push(PtxError::Todo("ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
+-        }
++        // Relaxed ordering remains in the AST; eviction/cache/prefetch hints only tune locality.
++        let _ = (level_eviction_priority, level_cache_hint, level_prefetch_size, cache_policy);
+         Instruction::Ld {
+             data: LdDetails {
+                 qualifier: ast::LdStQualifier::Relaxed(scope),
+@@ -2348,7 +2360,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2364,7 +2376,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2384,7 +2396,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2400,7 +2412,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2416,7 +2428,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2432,7 +2444,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: AddArgs {
+@@ -2480,7 +2492,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2494,7 +2506,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2511,7 +2523,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2525,7 +2537,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2539,7 +2551,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2553,7 +2565,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: MulArgs { dst: d, src1: a, src2: b }
+@@ -2679,9 +2691,15 @@ derive_parser!(
+     call <= { call(stream) }
+ 
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cvt
+-    cvt{.ifrnd}{.ftz}{.sat}.dtype.atype         d, a => {
++    cvt{.ifrnd}{.ftz}{.sat}{.satfinite}.dtype.atype d, a{, b} => {
++        if satfinite && !matches!(
++            (dtype, atype),
++            (ScalarType::E4m3x2 | ScalarType::E5m2x2, ScalarType::F32 | ScalarType::F16x2)
++        ) {
++            state.errors.push(PtxError::Todo("cvt.satfinite is only implemented for E4M3/E5M2 destinations".to_string()));
++        }
+         let data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, false, dtype, atype);
+-        let arguments = ast::CvtArgs { dst: d, src: a, src2: None };
++        let arguments = ast::CvtArgs { dst: d, src: a, src2: b };
+         ast::Instruction::Cvt {
+             data, arguments
+         }
+@@ -2701,39 +2719,17 @@ derive_parser!(
+     }
+     // cvt.rna{.satfinite}.tf32.f32               d, a;
+     // cvt.frnd2{.relu}.tf32.f32                   d, a;
+-    cvt.rn.satfinite{.relu}.f8x2type.f32       d, a, b => {
+-        if relu {
+-            state.errors.push(PtxError::Todo("cvt.rn.satfinite.f8x2 instruction with relu modifier".to_string()));
+-        }
+-        let data = ast::CvtDetails::new(&mut state.errors, Some(rn), false, false, false, f8x2type, ScalarType::F32);
+-        ast::Instruction::Cvt {
+-            data,
+-            arguments: ast::CvtArgs { dst: d, src: a, src2: Some(b) }
+-        }
+-    }
+-    // cvt.rn.satfinite{.relu}.f8x2type.f16x2     d, a;
+-    /*
+-    cvt.rn{.relu}.f16x2.f8x2type              d, a => {
+-        if relu {
+-            state.errors.push(PtxError::Todo("cvt.rn.f16x2.f8x2 instruction with relu modifier".to_string()));
+-        }
+-        let data = ast::CvtDetails::new(&mut state.errors, Some(rn), false, false, ScalarType::F16x2, f8x2type);
+-        ast::Instruction::Cvt {
+-            data,
+-            arguments: ast::CvtArgs { dst: d, src: a, src2: None }
+-        }
+-    }
+-    */
+-
+     .ifrnd: RawRoundingMode =   { .rn,  .rz,  .rm,  .rp,  .rni, .rzi, .rmi, .rpi };
+     .frnd2: RawRoundingMode =   { .rn,  .rz };
+     RawRoundingMode =           { .rn };
+     .dtype: ScalarType =        { .u8,   .u16, .u32, .u64,
+                                   .s8,   .s16, .s32, .s64,
+-                                  .bf16, .f16, .f32, .f64 };
++                                  .bf16, .f16, .f16x2, .f32, .f64,
++                                  .e4m3x2, .e5m2x2 };
+     .atype: ScalarType =        { .u8,   .u16, .u32, .u64,
+                                   .s8,   .s16, .s32, .s64,
+-                                  .bf16, .f16, .f32, .f64 };
++                                  .bf16, .f16, .f16x2, .f32, .f64,
++                                  .e4m3x2, .e5m2x2 };
+     .f8x2type: ScalarType =         { .e4m3x2, .e5m2x2 };
+     .x2_to_type: ScalarType =      { .f16x2, .bf16x2 };
+     .x2_from_type: ScalarType =    { .e4m3x2, .e5m2x2, .f32 };
+@@ -2941,7 +2937,7 @@ derive_parser!(
+                     rounding: ast::RoundingMode::NearestEven,
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: false
++                    is_fusable: false, relu: false
+                 }
+             ),
+             arguments: MadArgs { dst: d, src1: a, src2: b, src3: c  }
+@@ -2955,7 +2951,7 @@ derive_parser!(
+                     rounding: rnd.into(),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: false
++                    is_fusable: false, relu: false
+                 }
+             ),
+             arguments: MadArgs { dst: d, src1: a, src2: b, src3: c  }
+@@ -2969,7 +2965,7 @@ derive_parser!(
+                     rounding: rnd.into(),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: false
++                    is_fusable: false, relu: false
+                 }
+             ),
+             arguments: MadArgs { dst: d, src1: a, src2: b, src3: c  }
+@@ -2987,7 +2983,7 @@ derive_parser!(
+                 rounding: rnd.into(),
+                 flush_to_zero: Some(ftz),
+                 saturate: sat,
+-                is_fusable: false
++                is_fusable: false, relu: false
+             },
+             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
+         }
+@@ -2999,7 +2995,7 @@ derive_parser!(
+                 rounding: rnd.into(),
+                 flush_to_zero: None,
+                 saturate: false,
+-                is_fusable: false
++                is_fusable: false, relu: false
+             },
+             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
+         }
+@@ -3014,7 +3010,7 @@ derive_parser!(
+                 rounding: rnd.into(),
+                 flush_to_zero: Some(ftz),
+                 saturate: sat,
+-                is_fusable: false
++                is_fusable: false, relu: false
+             },
+             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
+         }
+@@ -3025,17 +3021,14 @@ derive_parser!(
+     //fma.rnd{.ftz}.relu.f16      d, a, b, c;
+     //fma.rnd{.ftz}.relu.f16x2    d, a, b, c;
+     //fma.rnd{.relu}.bf16         d, a, b, c;
+-    fma.rnd{.relu}.type_x2       d, a, b, c => {
+-        if relu {
+-            state.errors.push(PtxError::Todo("fma instruction with relu modifier for bf16x2/f16x2 types".to_string()));
+-        }
++    fma.rnd{.ftz}{.sat}{.relu}.type_x2       d, a, b, c => {
+         ast::Instruction::Fma {
+             data: ast::ArithFloat {
+                 type_: type_x2,
+                 rounding: rnd.into(),
+-                flush_to_zero: None,
+-                saturate: false,
+-                is_fusable: false
++                flush_to_zero: Some(ftz),
++                saturate: sat,
++                is_fusable: false, relu
+             },
+             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
+         }
+@@ -3081,7 +3074,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -3095,7 +3088,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -3112,7 +3105,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -3126,7 +3119,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: Some(ftz),
+                     saturate: sat,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -3140,7 +3133,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -3154,7 +3147,7 @@ derive_parser!(
+                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
+                     flush_to_zero: None,
+                     saturate: false,
+-                    is_fusable: rnd.is_none()
++                    is_fusable: rnd.is_none(), relu: false
+                 }
+             ),
+             arguments: SubArgs { dst: d, src1: a, src2: b  }
+@@ -4029,9 +4022,12 @@ derive_parser!(
+                 CpAsyncCpSize::Bytes4
+             });
+ 
+-        let src_size = src_size
++        let src_size_immediate = src_size
++            .as_ref()
+             .and_then(|op| op.as_immediate())
+             .and_then(|imm| imm.as_u64());
++        let src_size_register = if src_size_immediate.is_none() { src_size } else { None };
++        let src_size = src_size_immediate;
+ 
+         Instruction::CpAsync {
+             data: CpAsyncDetails {
+@@ -4043,6 +4039,7 @@ derive_parser!(
+             arguments: CpAsyncArgs {
+                 src_to: dst,
+                 src_from: src,
++                src_size: src_size_register,
+             }
+         }
+     }
+@@ -4198,6 +4195,7 @@ derive_parser!(
+             data: MmaDetails {
+                 alayout,
+                 blayout,
++                k_size: 16,
+                 cd_type_scalar: ScalarType::F32,
+                 ab_type_scalar: ScalarType::BF16,
+             },
+@@ -4210,6 +4208,7 @@ derive_parser!(
+             data: MmaDetails {
+                 alayout,
+                 blayout,
++                k_size: 16,
+                 cd_type_scalar: ScalarType::F32,
+                 ab_type_scalar: ScalarType::F16,
+             },
+@@ -4222,6 +4221,7 @@ derive_parser!(
+             data: MmaDetails {
+                 alayout,
+                 blayout,
++                k_size: 32,
+                 cd_type_scalar: ScalarType::S32,
+                 ab_type_scalar: ScalarType::S8,
+             },
+@@ -4229,6 +4229,45 @@ derive_parser!(
+         }
+     }
+ 
++    mma.sync.aligned.m16n8k16.alayout.blayout.f16.f16.f16.f16 d, a, b, c => {
++        Instruction::Mma {
++            data: MmaDetails {
++                alayout,
++                blayout,
++                k_size: 16,
++                cd_type_scalar: ScalarType::F16,
++                ab_type_scalar: ScalarType::F16,
++            },
++            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
++        }
++    }
++
++    mma.sync.aligned.m16n8k8.alayout.blayout.f16.f16.f16.f16 d, a, b, c => {
++        Instruction::Mma {
++            data: MmaDetails {
++                alayout,
++                blayout,
++                k_size: 8,
++                cd_type_scalar: ScalarType::F16,
++                ab_type_scalar: ScalarType::F16,
++            },
++            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
++        }
++    }
++
++    mma.sync.aligned.m16n8k32.alayout.blayout.f16.e4m3.e4m3.f16 d, a, b, c => {
++        Instruction::Mma {
++            data: MmaDetails {
++                alayout,
++                blayout,
++                k_size: 32,
++                cd_type_scalar: ScalarType::F16,
++                ab_type_scalar: ScalarType::E4m3x2,
++            },
++            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
++        }
++    }
++
+     .alayout: MatrixLayout = {.row};
+     .blayout: MatrixLayout = {.col};
+ 
+@@ -4405,43 +4444,117 @@ derive_parser!(
+     }
+ 
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
+-    tex.1d.v4.dtype.ctype  d, [a, c] => {
++    // PTX base mode selects mip level zero. ZLUDA's texture-object lowering
++    // uses the AMD image.sample.lz intrinsic, which has the same behavior.
++    tex{.base}.1d.v4.dtype.ctype  d, [a, c] => {
++        let _ = base;
+         Instruction::Tex {
+             data: TexData {
+                 dtype,
+                 ctype,
+                 dims: TexDimensions::D1,
+-                type_: TexType::Texref
++                type_: TexType::Texref,
++                gather_comp: None,
+             },
+             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+         }
+     }
+-    tex.2d.v4.dtype.ctype  d, [a, c] => {
++    tex{.base}.2d.v4.dtype.ctype  d, [a, c] => {
++        let _ = base;
+         Instruction::Tex {
+             data: TexData {
+                 dtype,
+                 ctype,
+                 dims: TexDimensions::D2,
+-                type_: TexType::Texref
++                type_: TexType::Texref,
++                gather_comp: None,
+             },
+             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+         }
+     }
+-    tex.3d.v4.dtype.ctype  d, [a, c] => {
++    tex{.base}.3d.v4.dtype.ctype  d, [a, c] => {
++        let _ = base;
+         Instruction::Tex {
+             data: TexData {
+                 dtype,
+                 ctype,
+                 dims: TexDimensions::D3,
+-                type_: TexType::Texref
++                type_: TexType::Texref,
++                gather_comp: None,
+             },
+             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+         }
+     }
+ 
+-    .dtype: ScalarType = { .u32, .s32, .f32 };
++    // Explicit LOD sampling maps to the AMD image.sample.l intrinsic.
++    tex.level.2d.v4.dtype.ctype d, [a, c], lod => {
++        Instruction::TexLevel {
++            data: TexData {
++                dtype,
++                ctype,
++                dims: TexDimensions::D2,
++                type_: TexType::Texref,
++                gather_comp: None,
++            },
++            arguments: TexLevelArgs { dst: d, src_ptr: a, src_coord: c, src_lod: lod }
++        }
++    }
++
++    .dtype: ScalarType = { .u32, .s32, .f32, .f16 };
+     .ctype: ScalarType = { .s32, .f32 };
+ 
++    // NVIDIA texture gathers return four float samples from the bilerp footprint.
++    tld4.comp.2d.v4.f32.f32 d, [a, c] => {
++        let gather_comp = match comp {
++            TexGatherChannel::R => ast::TexGatherComponent::R,
++            TexGatherChannel::G => ast::TexGatherComponent::G,
++            TexGatherChannel::B => ast::TexGatherComponent::B,
++            TexGatherChannel::A => ast::TexGatherComponent::A,
++        };
++        Instruction::Tex {
++            data: TexData {
++                dtype: ScalarType::F32,
++                ctype: ScalarType::F32,
++                dims: TexDimensions::D2,
++                type_: TexType::Texref,
++                gather_comp: Some(gather_comp),
++            },
++            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
++        }
++    }
++
++    .comp: TexGatherChannel = { .r, .g, .b, .a };
++    // This is the formatted 2D store used by the captured DLSS auto-exposure kernels.
++    sust.p.2d.b32.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: None, scalar_type: ScalarType::B32, formatted: true },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    sust.p.2d.v4.b32.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(4), scalar_type: ScalarType::B32, formatted: true },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    // Unformatted 32-bit store used by the DLTSS model kernels.
++    sust.b.2d.b32.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: None, scalar_type: ScalarType::B32, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    // Unformatted packed-half store used by the RRLite model kernels.
++    sust.b.2d.v2.b16.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(2), scalar_type: ScalarType::B16, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/
+     match.any.sync.type  d, a, membermask => {
+         Instruction::MatchSync {
+diff --git a/ptx_parser_macros/src/lib.rs b/ptx_parser_macros/src/lib.rs
+index 51ad91e..e67e14d 100644
+--- a/ptx_parser_macros/src/lib.rs
++++ b/ptx_parser_macros/src/lib.rs
+@@ -33,7 +33,7 @@ struct OpcodeDefinitions {
+ }
+ 
+ impl OpcodeDefinitions {
+-    fn new(opcode: &IdentLike, definitions: Vec<SingleOpcodeDefinition>) -> Self {
++    fn new(_opcode: &IdentLike, definitions: Vec<SingleOpcodeDefinition>) -> Self {
+         let mut selections = vec![None; definitions.len()];
+         let mut generation = 0usize;
+         loop {
+@@ -102,11 +102,13 @@ impl OpcodeDefinitions {
+                 }
+             }
+             if !selected_something {
+-                panic!(
+-                    "Failed to generate pattern selection for `{}`. State: {:?}",
+-                    opcode,
+-                    selections.into_iter().rev().collect::<Vec<_>>()
+-                );
++                // If required modifiers cannot uniquely separate the remaining
++                // alternatives, let their full parsers disambiguate by suffix
++                // and argument shape at runtime.
++                for index in unselected {
++                    selections[index] = Some((None, generation));
++                }
++                break;
+             }
+             generation += 1;
+         }
+@@ -504,7 +506,20 @@ fn emit_parse_function(
+         .to_tokens(&mut selectors);
+         let mut has_default_selector = false;
+         for selection_layer in def.block_selection.iter() {
++            let default_definitions = selection_layer
++                .iter()
++                .filter_map(|(selection_key, selected_definition)| {
++                    if selection_key.is_none() {
++                        Some(*selected_definition)
++                    } else {
++                        None
++                    }
++                })
++                .collect::<Vec<_>>();
+             for (selection_key, selected_definition) in selection_layer {
++                if selection_key.is_none() {
++                    continue;
++                }
+                 let def_parser = emit_definition_parser(type_name,  (opcode,*selected_definition), &def.definitions[*selected_definition]);
+                 match selection_key {
+                     Some(selection_keys) => {
+@@ -516,16 +531,27 @@ fn emit_parse_function(
+                         }
+                         .to_tokens(&mut selectors);
+                     }
+-                    None => {
+-                        has_default_selector = true;
+-                        quote! {
+-                            else {
+-                                #def_parser
+-                            }
+-                        }
+-                        .to_tokens(&mut selectors);
++                    None => unreachable!(),
++                }
++            }
++            if !default_definitions.is_empty() {
++                has_default_selector = true;
++                let attempts = default_definitions.iter().map(|selected_definition| {
++                    let def_parser = emit_definition_parser(
++                        type_name,
++                        (opcode, *selected_definition),
++                        &def.definitions[*selected_definition],
++                    );
++                    quote! {
++                        |stream: &mut PtxParser<'a, 'input>| { Ok({ #def_parser }) }
++                    }
++                });
++                quote! {
++                    else {
++                        alt((#(#attempts,)* )).parse_next(stream)?
+                     }
+                 }
++                .to_tokens(&mut selectors);
+             }
+         }
+         if !has_default_selector {
+diff --git a/zluda/src/impl/array.rs b/zluda/src/impl/array.rs
+index 70bc9e6..96d01ed 100644
+--- a/zluda/src/impl/array.rs
++++ b/zluda/src/impl/array.rs
+@@ -1,14 +1,69 @@
+ use hip_runtime_sys::*;
++use std::collections::HashMap;
++use std::sync::{Mutex, OnceLock};
++
++fn original_formats() -> &'static Mutex<HashMap<usize, u32>> {
++    static FORMATS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
++    FORMATS.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++pub(crate) fn original_format(array: hipArray_t) -> Result<Option<u32>, hipErrorCode_t> {
++    original_formats()
++        .lock()
++        .map(|formats| formats.get(&(array as usize)).copied())
++        .map_err(|_| hipErrorCode_t::Unknown)
++}
+ 
+ pub(crate) unsafe fn create_v2(
+     handle: *mut hipArray_t,
+     desc: *const HIP_ARRAY_DESCRIPTOR,
+ ) -> hipError_t {
+-    hipArrayCreate(handle, desc)
++    // HIP's legacy descriptor enum omits CUDA's packed and normalized formats.
++    // Use equivalent integer channel storage for normalized 8/16-bit arrays;
++    // the texture object's normalized-float read mode supplies the conversion.
++    // For packed UNORM 10:10:10:2, use RGBA32F storage. The copy path expands
++    // public four-byte pixels to backing float channels.
++    let descriptor = &*desc;
++    let (format, channels) = match descriptor.Format.0 {
++        80 if descriptor.NumChannels == 4 => (hipArray_Format(32), 4), // RGBA32F backing
++        192 => (hipArray_Format(1), 1),                                // UNORM_INT8X1
++        193 => (hipArray_Format(1), 2),                                // UNORM_INT8X2
++        194 => (hipArray_Format(1), 4),                                // UNORM_INT8X4
++        195 => (hipArray_Format(2), 1),                                // UNORM_INT16X1
++        196 => (hipArray_Format(2), 2),                                // UNORM_INT16X2
++        197 => (hipArray_Format(2), 4),                                // UNORM_INT16X4
++        198 => (hipArray_Format(8), 1),                                // SNORM_INT8X1
++        199 => (hipArray_Format(8), 2),                                // SNORM_INT8X2
++        200 => (hipArray_Format(8), 4),                                // SNORM_INT8X4
++        201 => (hipArray_Format(9), 1),                                // SNORM_INT16X1
++        202 => (hipArray_Format(9), 2),                                // SNORM_INT16X2
++        203 => (hipArray_Format(9), 4),                                // SNORM_INT16X4
++        _ => return hipArrayCreate(handle, desc),
++    };
++    let backing = HIP_ARRAY_DESCRIPTOR {
++        Width: descriptor.Width,
++        Height: descriptor.Height,
++        Format: format,
++        NumChannels: channels,
++    };
++    hipArrayCreate(handle, &backing)?;
++    if let Ok(mut formats) = original_formats().lock() {
++        formats.insert(*handle as usize, descriptor.Format.0);
++        Ok(())
++    } else {
++        let _ = hipArrayDestroy(*handle);
++        Err(hipErrorCode_t::Unknown)
++    }
+ }
+ 
+ pub(crate) unsafe fn destroy(array: hipArray_t) -> hipError_t {
+-    hipArrayDestroy(array)
++    hipArrayDestroy(array)?;
++    original_formats()
++        .lock()
++        .map(|mut formats| {
++            formats.remove(&(array as usize));
++        })
++        .map_err(|_| hipErrorCode_t::Unknown)
+ }
+ 
+ pub(crate) unsafe fn _3d_create_v2(
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index aea11d5..b441dde 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -1,4 +1,7 @@
+-use cuda_types::cuda::{CUfunction, CUfunction_attribute, CUkernel};
++use cuda_types::cuda::{
++    CUfunction, CUfunction_attribute, CUkernel, CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT,
++    CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT, CU_LAUNCH_PARAM_END_AS_INT,
++};
+ use dark_api::FunctionArgInfo;
+ use hip_runtime_sys::*;
+ use std::mem;
+@@ -86,10 +89,45 @@ pub(crate) fn launch_kernel(
+     kernel_params: *mut *mut ::core::ffi::c_void,
+     extra: *mut *mut ::core::ffi::c_void,
+ ) -> hipError_t {
+-    // TODO: fix constants in extra
+-    if !extra.is_null() {
+-        return hipError_t::ErrorNotSupported;
+-    }
++    let mut translated_extra_storage = [std::ptr::null_mut::<std::ffi::c_void>(); 8];
++    let extra_for_hip = if extra.is_null() {
++        extra
++    } else {
++        let mut input_index = 0usize;
++        let mut output_index = 0usize;
++        let mut terminated = false;
++        while input_index < translated_extra_storage.len()
++            && output_index < translated_extra_storage.len()
++        {
++            let token = unsafe { *extra.add(input_index) } as usize;
++            if token == CU_LAUNCH_PARAM_END_AS_INT as usize {
++                translated_extra_storage[output_index] = 3usize as *mut std::ffi::c_void;
++                terminated = true;
++                break;
++            }
++            if token == CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as usize
++                || token == CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT as usize
++            {
++                if input_index + 1 >= translated_extra_storage.len()
++                    || output_index + 1 >= translated_extra_storage.len()
++                {
++                    return hipError_t::ErrorInvalidValue;
++                }
++                translated_extra_storage[output_index] =
++                    unsafe { *extra.add(input_index) };
++                translated_extra_storage[output_index + 1] =
++                    unsafe { *extra.add(input_index + 1) };
++                input_index += 2;
++                output_index += 2;
++                continue;
++            }
++            return hipError_t::ErrorNotSupported;
++        }
++        if !terminated {
++            return hipError_t::ErrorInvalidValue;
++        }
++        translated_extra_storage.as_mut_ptr()
++    };
+     unsafe {
+         hipModuleLaunchKernel(
+             f.base,
+@@ -102,7 +140,7 @@ pub(crate) fn launch_kernel(
+             shared_mem_bytes,
+             stream,
+             kernel_params,
+-            extra,
++            extra_for_hip,
+         )
+     }
+ }
+diff --git a/zluda/src/impl/memory.rs b/zluda/src/impl/memory.rs
+index 800fad6..b724942 100644
+--- a/zluda/src/impl/memory.rs
++++ b/zluda/src/impl/memory.rs
+@@ -1,5 +1,5 @@
+ use crate::r#impl::{
+-    context,
++    array, context,
+     driver::{self},
+ };
+ use cuda_types::cuda::{CUerror, CUresult, CUresultConsts};
+@@ -279,8 +279,193 @@ pub(crate) unsafe fn alloc_pitch_v2(
+     Ok(())
+ }
+ 
++fn packed_1010102_component(value: f32, scale: u32) -> u32 {
++    let clamped = if value.is_nan() {
++        0.0
++    } else {
++        value.clamp(0.0, 1.0)
++    };
++    (clamped * scale as f32 + 0.5).floor() as u32
++}
++
++unsafe fn packed_1010102_external_to_host(memcpy: hip_Memcpy2D, packed: &mut [u8]) -> CUresult {
++    let width = memcpy.WidthInBytes;
++    match memcpy.srcMemoryType {
++        hipMemoryType::hipMemoryTypeHost => {
++            if memcpy.srcHost.is_null()
++                || memcpy
++                    .srcXInBytes
++                    .checked_add(width)
++                    .is_none_or(|end| end > memcpy.srcPitch)
++            {
++                return Err(CUerror::INVALID_VALUE);
++            }
++            for row in 0..memcpy.Height {
++                let source_row = memcpy.srcY.checked_add(row).ok_or(CUerror::INVALID_VALUE)?;
++                let offset = source_row
++                    .checked_mul(memcpy.srcPitch)
++                    .and_then(|value| value.checked_add(memcpy.srcXInBytes))
++                    .ok_or(CUerror::INVALID_VALUE)?;
++                ptr::copy_nonoverlapping(
++                    memcpy.srcHost.cast::<u8>().add(offset),
++                    packed.as_mut_ptr().add(row * width),
++                    width,
++                );
++            }
++        }
++        hipMemoryType::hipMemoryTypeDevice | hipMemoryType::hipMemoryTypeUnified => {
++            let mut staging = memcpy;
++            staging.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
++            staging.dstHost = packed.as_mut_ptr().cast();
++            staging.dstXInBytes = 0;
++            staging.dstY = 0;
++            staging.dstPitch = width;
++            hipMemcpyParam2D(&staging)?;
++        }
++        _ => return Err(CUerror::NOT_SUPPORTED),
++    }
++    Ok(())
++}
++
++unsafe fn packed_1010102_host_to_external(memcpy: hip_Memcpy2D, packed: &[u8]) -> CUresult {
++    let width = memcpy.WidthInBytes;
++    match memcpy.dstMemoryType {
++        hipMemoryType::hipMemoryTypeHost => {
++            if memcpy.dstHost.is_null()
++                || memcpy
++                    .dstXInBytes
++                    .checked_add(width)
++                    .is_none_or(|end| end > memcpy.dstPitch)
++            {
++                return Err(CUerror::INVALID_VALUE);
++            }
++            for row in 0..memcpy.Height {
++                let destination_row = memcpy.dstY.checked_add(row).ok_or(CUerror::INVALID_VALUE)?;
++                let offset = destination_row
++                    .checked_mul(memcpy.dstPitch)
++                    .and_then(|value| value.checked_add(memcpy.dstXInBytes))
++                    .ok_or(CUerror::INVALID_VALUE)?;
++                ptr::copy_nonoverlapping(
++                    packed.as_ptr().add(row * width),
++                    memcpy.dstHost.cast::<u8>().add(offset),
++                    width,
++                );
++            }
++        }
++        hipMemoryType::hipMemoryTypeDevice | hipMemoryType::hipMemoryTypeUnified => {
++            let mut staging = memcpy;
++            staging.srcMemoryType = hipMemoryType::hipMemoryTypeHost;
++            staging.srcHost = packed.as_ptr().cast();
++            staging.srcXInBytes = 0;
++            staging.srcY = 0;
++            staging.srcPitch = width;
++            hipMemcpyParam2D(&staging)?;
++        }
++        _ => return Err(CUerror::NOT_SUPPORTED),
++    }
++    Ok(())
++}
++
+ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
+-    hipMemcpyParam2D(&memcpy)?;
++    let src_packed = memcpy.srcMemoryType == hipMemoryType::hipMemoryTypeArray
++        && array::original_format(memcpy.srcArray)? == Some(80);
++    let dst_packed = memcpy.dstMemoryType == hipMemoryType::hipMemoryTypeArray
++        && array::original_format(memcpy.dstArray)? == Some(80);
++    if !src_packed && !dst_packed {
++        hipMemcpyParam2D(&memcpy)?;
++        return Ok(());
++    }
++    if memcpy.WidthInBytes % 4 != 0
++        || (src_packed && memcpy.srcXInBytes % 4 != 0)
++        || (dst_packed && memcpy.dstXInBytes % 4 != 0)
++    {
++        return Err(CUerror::INVALID_VALUE);
++    }
++    let backing_width = memcpy
++        .WidthInBytes
++        .checked_mul(4)
++        .ok_or(CUerror::INVALID_VALUE)?;
++    let backing_bytes = backing_width
++        .checked_mul(memcpy.Height)
++        .ok_or(CUerror::INVALID_VALUE)?;
++    if src_packed && dst_packed {
++        let mut backing = memcpy;
++        backing.srcXInBytes = memcpy
++            .srcXInBytes
++            .checked_mul(4)
++            .ok_or(CUerror::INVALID_VALUE)?;
++        backing.dstXInBytes = memcpy
++            .dstXInBytes
++            .checked_mul(4)
++            .ok_or(CUerror::INVALID_VALUE)?;
++        backing.WidthInBytes = backing_width;
++        hipMemcpyParam2D(&backing)?;
++        return Ok(());
++    }
++    // A packed array and a different array format have incompatible pixels.
++    if (src_packed && memcpy.dstMemoryType == hipMemoryType::hipMemoryTypeArray)
++        || (dst_packed && memcpy.srcMemoryType == hipMemoryType::hipMemoryTypeArray)
++    {
++        return Err(CUerror::INVALID_VALUE);
++    }
++    let mut backing = Vec::<f32>::new();
++    backing
++        .try_reserve_exact(backing_bytes / 4)
++        .map_err(|_| CUerror::OUT_OF_MEMORY)?;
++    backing.resize(backing_bytes / 4, 0.0);
++    let mut packed = Vec::<u8>::new();
++    let packed_bytes = memcpy
++        .WidthInBytes
++        .checked_mul(memcpy.Height)
++        .ok_or(CUerror::INVALID_VALUE)?;
++    packed
++        .try_reserve_exact(packed_bytes)
++        .map_err(|_| CUerror::OUT_OF_MEMORY)?;
++    packed.resize(packed_bytes, 0);
++    if dst_packed {
++        packed_1010102_external_to_host(memcpy, &mut packed)?;
++        for (pixel, word) in packed.chunks_exact(4).enumerate() {
++            let bits = u32::from_le_bytes(word.try_into().unwrap());
++            backing[pixel * 4] = (bits & 1023) as f32 / 1023.0;
++            backing[pixel * 4 + 1] = ((bits >> 10) & 1023) as f32 / 1023.0;
++            backing[pixel * 4 + 2] = ((bits >> 20) & 1023) as f32 / 1023.0;
++            backing[pixel * 4 + 3] = (bits >> 30) as f32 / 3.0;
++        }
++        let mut transfer = memcpy;
++        transfer.srcMemoryType = hipMemoryType::hipMemoryTypeHost;
++        transfer.srcHost = backing.as_ptr().cast();
++        transfer.srcXInBytes = 0;
++        transfer.srcY = 0;
++        transfer.srcPitch = backing_width;
++        transfer.dstXInBytes = memcpy
++            .dstXInBytes
++            .checked_mul(4)
++            .ok_or(CUerror::INVALID_VALUE)?;
++        transfer.WidthInBytes = backing_width;
++        hipMemcpyParam2D(&transfer)?;
++    } else {
++        let mut transfer = memcpy;
++        transfer.srcXInBytes = memcpy
++            .srcXInBytes
++            .checked_mul(4)
++            .ok_or(CUerror::INVALID_VALUE)?;
++        transfer.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
++        transfer.dstHost = backing.as_mut_ptr().cast();
++        transfer.dstXInBytes = 0;
++        transfer.dstY = 0;
++        transfer.dstPitch = backing_width;
++        transfer.WidthInBytes = backing_width;
++        hipMemcpyParam2D(&transfer)?;
++        for (pixel, word) in packed.chunks_exact_mut(4).enumerate() {
++            let channels = &backing[pixel * 4..pixel * 4 + 4];
++            let bits = packed_1010102_component(channels[0], 1023)
++                | packed_1010102_component(channels[1], 1023) << 10
++                | packed_1010102_component(channels[2], 1023) << 20
++                | packed_1010102_component(channels[3], 3) << 30;
++            word.copy_from_slice(&bits.to_le_bytes());
++        }
++        packed_1010102_host_to_external(memcpy, &packed)?;
++    }
+     Ok(())
+ }
+ 
+diff --git a/zluda/src/impl/mod.rs b/zluda/src/impl/mod.rs
+index 0cf20cd..5329d32 100644
+--- a/zluda/src/impl/mod.rs
++++ b/zluda/src/impl/mod.rs
+@@ -15,6 +15,7 @@ pub(super) mod memory;
+ pub(super) mod module;
+ pub(super) mod pointer;
+ pub(super) mod stream;
++pub(super) mod surf;
+ pub(super) mod tex;
+ 
+ #[cfg(debug_assertions)]
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index c9d4bbd..a6adeef 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -185,6 +185,23 @@ fn get_best_ptx_and_compile(
+             _ => {}
+         })
+     };
++    if let Some(dump_dir) = std::env::var_os("D4R_ZLUDA_DUMP_PTX_DIR") {
++        let dump_dir = std::path::PathBuf::from(dump_dir);
++        let _ = fs::create_dir_all(&dump_dir);
++        for (index, source) in ptx_modules.iter().enumerate() {
++            let stem = format!("module-{index:04}");
++            let _ = fs::write(dump_dir.join(format!("{stem}.ptx")), source.as_bytes());
++            let diagnostic = match ptx_parser::parse_module_checked(source.as_ref()) {
++                Ok(ast) => format!(
++                    "checked parse: success\ndirectives={}\ninvalid_directives={}\n",
++                    ast.directives.len(),
++                    ast.invalid_directives
++                ),
++                Err(errors) => format!("checked parse: {} errors\n{errors:#?}\n", errors.len()),
++            };
++            let _ = fs::write(dump_dir.join(format!("{stem}.parse.txt")), diagnostic);
++        }
++    }
+     let maybe_module = ptx_modules
+         .iter()
+         .rev() // TODO: actually sort by SM
+@@ -293,6 +310,43 @@ fn get_gcn_arch<'a>(props: &'a hipDeviceProp_tR0600) -> Result<&'a str, CUerror>
+     gcn_arch.to_str().map_err(|_| CUerror::UNKNOWN)
+ }
+ 
++// The git SHA alone does not change for uncommitted translator or helper
++// changes, so stale compiled modules would be served after a rebuild. Mix in
++// the size and modification time of the loaded ZLUDA library itself.
++fn zluda_build_version() -> &'static str {
++    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++    VERSION.get_or_init(|| {
++        let sha = env!("VERGEN_GIT_SHA");
++        match loaded_library_fingerprint() {
++            Some(fingerprint) => format!("{sha}+{fingerprint}"),
++            None => sha.to_string(),
++        }
++    })
++}
++
++#[cfg(not(windows))]
++fn loaded_library_fingerprint() -> Option<String> {
++    use std::os::unix::fs::MetadataExt;
++    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
++    let address = zluda_build_version as *const libc::c_void;
++    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
++        return None;
++    }
++    let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_str().ok()?;
++    let metadata = fs::metadata(path).ok()?;
++    Some(format!(
++        "{:x}.{:x}.{:x}",
++        metadata.len(),
++        metadata.mtime(),
++        metadata.mtime_nsec()
++    ))
++}
++
++#[cfg(windows)]
++fn loaded_library_fingerprint() -> Option<String> {
++    None
++}
++
+ fn get_cache_key<'a, 'b>(
+     isa: &'a str,
+     text: &str,
+@@ -307,7 +361,7 @@ fn get_cache_key<'a, 'b>(
+     Some(zluda_cache::ModuleKey {
+         hash: blake3::hash(text.as_bytes()).to_hex(),
+         compiler_version: "builtin",
+-        zluda_version: env!("VERGEN_GIT_SHA"),
++        zluda_version: zluda_build_version(),
+         device: isa,
+         backend_key: serialized_attributes,
+         last_access: zluda_cache::ModuleCache::time_now(),
+@@ -334,6 +388,24 @@ fn compile_and_cache(
+     ast: ptx_parser::Module,
+     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
+ ) -> Result<(Vec<u8>, u32, Option<Metadata32Bit>), CUerror> {
++    let d4r_dump_dir = std::env::var_os("D4R_ZLUDA_DUMP_DIR").map(std::path::PathBuf::from);
++    let d4r_compiler_hook = |data: &Vec<u8>, stage: String| {
++        if let Some(dir) = d4r_dump_dir.as_ref() {
++            let _ = fs::create_dir_all(dir);
++            let filename = match stage.as_str() {
++                "linked.ll" => "linked.ll",
++                "opt.ll" => "opt.ll",
++                "asm" => "asm.s",
++                "o" => "object.o",
++                _ => return,
++            };
++            let _ = fs::write(dir.join(filename), data);
++        }
++    };
++    let compiler_hook: Option<&dyn Fn(&Vec<u8>, String)> =
++        d4r_dump_dir
++            .as_ref()
++            .map(|_| &d4r_compiler_hook as &dyn Fn(&Vec<u8>, String));
+     let llvm_module = ptx::to_llvm_module(
+         ast,
+         ptx::Attributes {
+@@ -341,7 +413,10 @@ fn compile_and_cache(
+         },
+         |_| {},
+     )
+-    .map_err(|_| CUerror::UNKNOWN)?;
++    .map_err(|error| {
++        eprintln!("[zluda] PTX translation failed: {error:?}");
++        CUerror::UNKNOWN
++    })?;
+     let ptx_impl = llvm_module.linked_bitcode();
+     let sm_version = llvm_module.metadata.sm_version;
+     let metadata32 = llvm_module.metadata32.as_ref().map(Metadata32Bit::new);
+@@ -353,9 +428,16 @@ fn compile_and_cache(
+         llvm_module.attributes_ir,
+         llvm_module.metadata,
+         llvm_module.metadata32,
+-        None,
++        compiler_hook,
+     )
+-    .map_err(|_| CUerror::UNKNOWN)?;
++    .map_err(|error| {
++        eprintln!("[zluda] AMDGPU compilation failed: {error}");
++        CUerror::UNKNOWN
++    })?;
++    if let Some(dir) = d4r_dump_dir.as_ref() {
++        let _ = fs::create_dir_all(dir);
++        let _ = fs::write(dir.join("module.hsaco"), &elf_module);
++    }
+     if let Some((cache, key)) = cache_with_key {
+         key.last_access = zluda_cache::ModuleCache::time_now();
+         cache.insert_module(key, &elf_module);
+diff --git a/zluda/src/lib.rs b/zluda/src/lib.rs
+index ed2df7a..10f3609 100644
+--- a/zluda/src/lib.rs
++++ b/zluda/src/lib.rs
+@@ -200,6 +200,9 @@ cuda_macros::cuda_function_declarations!(
+             cuStreamQuery,
+             cuStreamSynchronize,
+             cuStreamWaitEvent,
++            cuSurfObjectCreate,
++            cuSurfObjectDestroy,
++            cuSurfObjectGetResourceDesc,
+             cuTexObjectCreate,
+             cuTexObjectDestroy,
+             cuTexRefSetAddress_v2,
+diff --git a/zluda_common/src/lib.rs b/zluda_common/src/lib.rs
+index be0a72a..a7863c5 100644
+--- a/zluda_common/src/lib.rs
++++ b/zluda_common/src/lib.rs
+@@ -301,6 +301,7 @@ from_cuda_transmute!(
+     cusparseIndexBase_t => rocsparse_index_base,
+     cusparseMatDescr_t => rocsparse_mat_descr,
+     CUtexObject => hipTextureObject_t,
++    CUsurfObject => hipSurfaceObject_t,
+     CUDA_RESOURCE_DESC => HIP_RESOURCE_DESC,
+     CUDA_TEXTURE_DESC => HIP_TEXTURE_DESC,
+     CUDA_RESOURCE_VIEW_DESC => HIP_RESOURCE_VIEW_DESC,
+diff --git a/ptx/examples/d4r_emit.rs b/ptx/examples/d4r_emit.rs
+new file mode 100644
+index 0000000..d89069d
+--- /dev/null
++++ b/ptx/examples/d4r_emit.rs
+@@ -0,0 +1,37 @@
++use std::{env, fs, path::PathBuf};
++use ptx_parser::parse_module_checked;
++
++fn main() {
++    let input = env::args().nth(1).expect("PTX path");
++    let outdir = PathBuf::from(env::args().nth(2).unwrap_or_else(|| "/tmp/d4r-autoexposure-emitted".into()));
++    fs::create_dir_all(&outdir).expect("create output directory");
++    let bytes = fs::read(&input).expect("read PTX");
++    let text = std::str::from_utf8(&bytes).expect("PTX UTF-8").trim_end_matches('\0');
++    let ast = parse_module_checked(text).unwrap_or_else(|e| panic!("PTX parse failed: {e:?}"));
++    let module = ptx::to_llvm_module(ast, ptx::Attributes { clock_rate: 2_500_000 }, |_| {})
++        .unwrap_or_else(|e| panic!("PTX translation failed: {e:?}"));
++    fs::write(outdir.join("ptx.ll"), module.llvm_ir.print_module_to_string().to_bytes()).expect("write translated IR");
++    let linked_helpers = module.linked_bitcode();
++    let hook = |data: &Vec<u8>, stage: String| {
++        let filename = match stage.as_str() {
++            "linked.ll" => "linked.ll",
++            "opt.ll" => "opt.ll",
++            "asm" => "asm.s",
++            "o" => "object.o",
++            other => panic!("unexpected stage: {other}"),
++        };
++        fs::write(outdir.join(filename), data).expect("write compiler stage");
++    };
++    let elf = llvm_zluda::compile(
++        &module.context,
++        "gfx1101",
++        module.llvm_ir,
++        linked_helpers,
++        module.attributes_ir,
++        module.metadata,
++        module.metadata32,
++        Some(&hook),
++    ).unwrap_or_else(|e| panic!("AMDGPU code generation failed: {e}"));
++    fs::write(outdir.join("module.hsaco"), &elf).expect("write linked code object");
++    println!("emitted AMDGPU code object: {}", outdir.join("module.hsaco").display());
++}
+diff --git a/ptx_parser/examples/d4r_inspect.rs b/ptx_parser/examples/d4r_inspect.rs
+new file mode 100644
+index 0000000..92bdaa9
+--- /dev/null
++++ b/ptx_parser/examples/d4r_inspect.rs
+@@ -0,0 +1,19 @@
++use std::{env, fs};
++use ptx_parser::{parse_module_checked, parse_module_unchecked};
++
++fn main() {
++    for path in env::args().skip(1) {
++        let bytes = fs::read(&path).expect("read PTX");
++        let text = std::str::from_utf8(&bytes).expect("PTX UTF-8").trim_end_matches('\0');
++        let unchecked = parse_module_unchecked(text);
++        println!("{}: version={:?} sm={} directives={} invalid_directives={}",
++            path, unchecked.ptx_version, unchecked.sm_version, unchecked.directives.len(), unchecked.invalid_directives);
++        match parse_module_checked(text) {
++            Ok(module) => println!("  checked: OK directives={}", module.directives.len()),
++            Err(errors) => {
++                println!("  checked: {} parser errors", errors.len());
++                for error in errors { println!("    {error:?}"); }
++            }
++        }
++    }
++}
+diff --git a/zluda/src/impl/surf.rs b/zluda/src/impl/surf.rs
+new file mode 100644
+index 0000000..5ef0f53
+--- /dev/null
++++ b/zluda/src/impl/surf.rs
+@@ -0,0 +1,113 @@
++use crate::r#impl::array;
++use hip_runtime_sys::*;
++use std::collections::HashMap;
++use std::sync::{Mutex, OnceLock};
++
++// Device layout of a ZLUDA surface object. It starts with a copy of HIP's
++// image object so the handle is also a valid texture object for integer
++// (texel) fetches: NVIDIA shares descriptors between the two, and NGX reads
++// in-place-updated arrays through surface handles with tex. The CUDA format
++// follows the (zeroed) sampler slot.
++const IMAGE_OBJECT_BYTES: usize = 48; // HIP_IMAGE_OBJECT_SIZE_DWORD * 4
++const SAMPLER_OBJECT_BYTES: usize = 32; // HIP_SAMPLER_OBJECT_SIZE_DWORD * 4
++const FORMAT_OFFSET: usize = IMAGE_OBJECT_BYTES + SAMPLER_OBJECT_BYTES;
++const HANDLE_BYTES: usize = FORMAT_OFFSET + 16;
++
++struct SurfaceInfo {
++    native: usize,
++    descriptor: Vec<u8>,
++}
++
++fn surface_resources() -> &'static Mutex<HashMap<usize, SurfaceInfo>> {
++    static RESOURCES: OnceLock<Mutex<HashMap<usize, SurfaceInfo>>> = OnceLock::new();
++    RESOURCES.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++pub(crate) unsafe fn object_create(
++    surface: &mut hipSurfaceObject_t,
++    resource: *const HIP_RESOURCE_DESC,
++) -> hipError_t {
++    let descriptor = match resource.as_ref() {
++        Some(value) => value,
++        None => return Err(hipErrorCode_t::r#InvalidValue),
++    };
++    let cuda_format = if descriptor.resType == HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY {
++        array::original_format(descriptor.res.array.hArray)?.unwrap_or(0)
++    } else {
++        0
++    };
++    let mut native = std::ptr::null_mut();
++    hipCreateSurfaceObject(&mut native, resource.cast::<hipResourceDesc>())?;
++    let mut device_handle = std::ptr::null_mut();
++    if let Err(error) = hipMalloc(&mut device_handle, HANDLE_BYTES) {
++        let _ = hipDestroySurfaceObject(native);
++        return Err(error);
++    }
++    let mut tail = [0u32; (HANDLE_BYTES - IMAGE_OBJECT_BYTES) / 4];
++    tail[(FORMAT_OFFSET - IMAGE_OBJECT_BYTES) / 4] = cuda_format;
++    let written = hipMemcpyDtoD(
++        hipDeviceptr_t(device_handle),
++        hipDeviceptr_t(native.cast()),
++        IMAGE_OBJECT_BYTES,
++    )
++    .and_then(|()| {
++        hipMemcpyHtoD(
++            hipDeviceptr_t(device_handle.cast::<u8>().add(IMAGE_OBJECT_BYTES).cast()),
++            tail.as_mut_ptr().cast(),
++            HANDLE_BYTES - IMAGE_OBJECT_BYTES,
++        )
++    });
++    if let Err(error) = written {
++        let _ = hipFree(device_handle);
++        let _ = hipDestroySurfaceObject(native);
++        return Err(error);
++    }
++    *surface = device_handle.cast();
++    let key = device_handle as usize;
++    let bytes = std::slice::from_raw_parts(
++        (descriptor as *const HIP_RESOURCE_DESC).cast::<u8>(),
++        std::mem::size_of::<HIP_RESOURCE_DESC>(),
++    )
++    .to_vec();
++    if let Ok(mut resources) = surface_resources().lock() {
++        resources.insert(key, SurfaceInfo { native: native as usize, descriptor: bytes });
++        Ok(())
++    } else {
++        let _ = hipFree(device_handle);
++        let _ = hipDestroySurfaceObject(native);
++        Err(hipErrorCode_t::r#Unknown)
++    }
++}
++
++pub(crate) unsafe fn object_destroy(surface: hipSurfaceObject_t) -> hipError_t {
++    let info = surface_resources()
++        .lock()
++        .map_err(|_| hipErrorCode_t::Unknown)?
++        .remove(&(surface as usize))
++        .ok_or(hipErrorCode_t::InvalidValue)?;
++    let native_result = hipDestroySurfaceObject(info.native as hipSurfaceObject_t);
++    let free_result = hipFree(surface.cast());
++    native_result?;
++    free_result
++}
++
++pub(crate) unsafe fn object_get_resource_desc(
++    output: &mut HIP_RESOURCE_DESC,
++    surface: hipSurfaceObject_t,
++) -> hipError_t {
++    let resources = match surface_resources().lock() {
++        Ok(value) => value,
++        Err(_) => return Err(hipErrorCode_t::r#Unknown),
++    };
++    let bytes = match resources.get(&(surface as usize)) {
++        Some(value) if value.descriptor.len() == std::mem::size_of::<HIP_RESOURCE_DESC>() =>
++            &value.descriptor,
++        _ => return Err(hipErrorCode_t::r#InvalidValue),
++    };
++    std::ptr::copy_nonoverlapping(
++        bytes.as_ptr(),
++        (output as *mut HIP_RESOURCE_DESC).cast::<u8>(),
++        bytes.len(),
++    );
++    Ok(())
++}

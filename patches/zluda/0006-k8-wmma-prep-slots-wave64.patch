@@ -1,0 +1,444 @@
+diff --git a/llvm_zluda/src/compile.rs b/llvm_zluda/src/compile.rs
+index 5d8c0a5..b2870e5 100644
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -70,8 +70,10 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
+     let module = Module::new(ctx, c"oclc_constants");
+ 
+     // used by ockl
+-    add_constant(ctx, &module, c"__oclc_wavefrontsize64", 0);
+-    add_constant(ctx, &module, c"__oclc_wavefrontsize_log2", 5);
++    // d4r: D4R_ZLUDA_WAVE64=1 (see ptx::pass::wave64_requested)
++    let wave64 = std::env::var("D4R_ZLUDA_WAVE64").map_or(false, |v| v.trim() == "1");
++    add_constant(ctx, &module, c"__oclc_wavefrontsize64", if wave64 { 1 } else { 0 });
++    add_constant(ctx, &module, c"__oclc_wavefrontsize_log2", if wave64 { 6 } else { 5 });
+     add_constant(ctx, &module, c"__oclc_ABI_version", 500);
+     add_constant(
+         ctx,
+@@ -174,7 +176,13 @@ pub fn compile(
+ 
+     let triple = c"amdgcn-amd-amdhsa";
+     let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
+-    let features = c"-wavefrontsize64,+cumode";
++    // functions without their own target features (the linked helper libraries) take these, so under
++    // D4R_ZLUDA_WAVE64 they must be optimised as wave64 too (lane-id and ballot folding)
++    let features = if std::env::var("D4R_ZLUDA_WAVE64").map_or(false, |v| v.trim() == "1") {
++        c"-wavefrontsize32,+wavefrontsize64,+cumode"
++    } else {
++        c"-wavefrontsize64,+cumode"
++    };
+ 
+     let mut target = unsafe { std::mem::zeroed() };
+     let mut err = std::ptr::null_mut();
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+index 88848b1..0d1f9cf 100644
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -869,10 +869,111 @@ unsigned LLVMZludaSplitWmmaM16n16k16(LLVMModuleRef ModuleRef)
+     return static_cast<unsigned>(Calls.size());
+ }
+ 
++// d4r: an m16n8k8 f16 MMA is an m16n8k16 one whose second K half is zero (its A fragment is the k16
++// A's registers 0-1, its B the k16 B's register 0), and adding zero products is exact. Each k8 call
++// becomes a k16 call so the WMMA rewrite below lowers it too. Zero halves are loads of one zeroed
++// register, so the operands stay "loads of plain registers" and two k8 MMAs that share A still fuse
++// into one WMMA. Returns the number of calls converted.
++static unsigned widenMmaK8(Module *M)
++{
++    Function *K8 = M->getFunction("__zluda_ptx_impl_mma_sync_aligned_m16n8k8_row_col_f16_f16_f16_f16");
++    if (K8 == nullptr || K8->use_empty())
++        return 0;
++    LLVMContext &Context = M->getContext();
++    Type *I32 = Type::getInt32Ty(Context);
++    Type *V2 = FixedVectorType::get(I32, 2);
++    Type *V4 = FixedVectorType::get(I32, 4);
++    AttributeList Attributes = AttributeList::get(Context, AttributeList::FunctionIndex,
++                                                  AttrBuilder(Context, K8->getAttributes().getFnAttrs()));
++    FunctionCallee K16 = M->getOrInsertFunction(kMmaF16, Attributes, V2, V4, V2, V2);
++    SmallVector<CallInst *, 64> Calls;
++    for (User *U : K8->users())
++        if (auto *Call = dyn_cast<CallInst>(U); Call != nullptr && Call->getCalledFunction() == K8)
++            Calls.push_back(Call);
++    DenseMap<Function *, AllocaInst *> Zeros;
++    for (CallInst *Call : Calls)
++    {
++        Function *F = Call->getFunction();
++        AllocaInst *&Zero = Zeros[F];
++        if (Zero == nullptr)
++        {
++            // an alloca like ZLUDA's register allocas (same address space), stored once at entry
++            AllocaInst *Like = nullptr;
++            for (Instruction &I : F->getEntryBlock())
++                if ((Like = dyn_cast<AllocaInst>(&I)) != nullptr)
++                    break;
++            IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
++            Zero = Entry.CreateAlloca(I32, Like != nullptr ? Like->getAddressSpace() : 5, nullptr, "d4r.k8.zero");
++            Entry.CreateStore(Entry.getInt32(0), Zero);
++        }
++        IRBuilder<> Builder(Call);
++        SmallVector<AllocaInst *, 2> ARegisters, BRegisters;
++        auto build = [&](ArrayRef<Value *> Elements) {
++            Value *Vector = UndefValue::get(FixedVectorType::get(I32, Elements.size()));
++            for (unsigned Index = 0; Index < Elements.size(); ++Index)
++                Vector = Builder.CreateInsertElement(Vector, Elements[Index], Builder.getInt8(Index));
++            return Vector;
++        };
++        auto zero = [&]() { return Builder.CreateLoad(I32, Zero); };
++        // the registers may be reloaded at the call only if no store reaches them after their original loads
++        auto unchangedSinceLoads = [&](Value *Vector) {
++            for (Value *V = Vector; auto *Insert = dyn_cast<InsertElementInst>(V); V = Insert->getOperand(0))
++            {
++                auto *Load = cast<LoadInst>(Insert->getOperand(1));
++                if (Load->getParent() != Call->getParent() ||
++                    storesBetween(Load, Call, {cast<AllocaInst>(Load->getPointerOperand())}))
++                    return false;
++            }
++            return true;
++        };
++        // B is one register: a <1 x i32> vector or a plain i32
++        Value *BArg = Call->getArgOperand(1);
++        auto bRegister = [&]() {
++            if (BArg->getType()->isVectorTy())
++                return matchLoadedVector(BArg, 1, BRegisters) && unchangedSinceLoads(BArg);
++            auto *Load = dyn_cast<LoadInst>(BArg);
++            auto *Register = Load != nullptr ? dyn_cast<AllocaInst>(Load->getPointerOperand()) : nullptr;
++            if (Register == nullptr || !Register->getAllocatedType()->isIntegerTy(32) || !isPlainRegister(Register) ||
++                Load->getParent() != Call->getParent() || storesBetween(Load, Call, {Register}))
++                return false;
++            BRegisters.assign(1, Register);
++            return true;
++        };
++        auto element = [&](Value *V, unsigned Index) -> Value * {
++            return V->getType()->isVectorTy() ? Builder.CreateExtractElement(V, Builder.getInt8(Index)) : V;
++        };
++        Value *A, *B;
++        if (matchLoadedVector(Call->getArgOperand(0), 2, ARegisters) && bRegister() &&
++            unchangedSinceLoads(Call->getArgOperand(0)))
++        {
++            // reload the same registers right at the call (nothing lies between these loads and it)
++            Value *A0 = Builder.CreateLoad(I32, ARegisters[0]), *A1 = Builder.CreateLoad(I32, ARegisters[1]);
++            Value *B0 = Builder.CreateLoad(I32, BRegisters[0]);
++            A = build({A0, A1, zero(), zero()});
++            B = build({B0, zero()});
++        }
++        else
++        {
++            Value *A0 = Builder.CreateExtractElement(Call->getArgOperand(0), Builder.getInt8(0));
++            Value *A1 = Builder.CreateExtractElement(Call->getArgOperand(0), Builder.getInt8(1));
++            Value *B0 = element(BArg, 0);
++            A = build({A0, A1, Builder.getInt32(0), Builder.getInt32(0)});
++            B = build({B0, Builder.getInt32(0)});
++        }
++        CallInst *Wide = Builder.CreateCall(K16, {A, B, Call->getArgOperand(2)});
++        Call->replaceAllUsesWith(Wide);
++        Call->eraseFromParent();
++    }
++    return static_cast<unsigned>(Calls.size());
++}
++
+ // Flags bit 0: also lower m16n8k32 e4m3 MMAs (D4R_ZLUDA_WMMA_FP8=1).
+ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+     Module *M = unwrap(ModuleRef);
++    // D4R_ZLUDA_WMMA_K8=0 keeps m16n8k8 on the dot-product fallback
++    if (const char *K8Env = getenv("D4R_ZLUDA_WMMA_K8"); K8Env == nullptr || K8Env[0] != '0')
++        widenMmaK8(M);
+     Function *Mma = M->getFunction(kMmaF16);
+     Function *MmaE4m3 = (Flags & 1) != 0 ? M->getFunction(kMmaE4m3) : nullptr;
+     if (Mma != nullptr && Mma->use_empty())
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+index cdefdf1..74cf36f 100644
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -127,9 +127,32 @@ extern "C"
+ {
+     extern "C" __attribute__((constant)) uint32_t __oclc_ISA_version __device__;
+ 
++    // d4r: kernels may be compiled as wave64 (D4R_ZLUDA_WAVE64, offline texture-kernel builds, linked with
++    // the zluda_ptx_impl*_w64.bc helpers built with -DD4R_WAVE64), where each wave holds two CUDA warps:
++    // lanes 0-31 and 32-63. Warp-level helpers then act on the lane's own 32-lane half.
++#ifdef D4R_WAVE64
++    __device__ static inline uint32_t d4r_wave_lane()
++    {
++        return __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
++    }
++    __device__ static inline uint32_t d4r_warp_base()
++    {
++        return d4r_wave_lane() & 32u;
++    }
++#else
++    __device__ static inline uint32_t d4r_warp_base()
++    {
++        return 0u;
++    }
++#endif
++
+     uint32_t FUNC(activemask)()
+     {
++#ifdef D4R_WAVE64
++        return (uint32_t)(__builtin_amdgcn_read_exec() >> d4r_warp_base());
++#else
+         return __builtin_amdgcn_read_exec_lo();
++#endif
+     }
+ 
+     size_t __ockl_get_local_id(uint32_t) __device__;
+@@ -158,7 +181,11 @@ extern "C"
+ 
+     uint32_t FUNC(sreg_laneid)()
+     {
++#ifdef D4R_WAVE64
++        return d4r_wave_lane() & 31u;
++#else
+         return __lane_id();
++#endif
+     }
+ 
+     uint32_t FUNC(sreg_lanemask_le)()
+@@ -322,7 +349,7 @@ extern "C"
+         int32_t section_mask = (opts >> 8) & 0b11111;                                                                                           \
+         int32_t warp_end = opts & 0b11111;                                                                                                      \
+         delta &= 0b11111;                                                                                                                       \
+-        int32_t self = (int32_t)__lane_id();                                                                                                    \
++        int32_t self = (int32_t)__zluda_ptx_impl_sreg_laneid();                                                                                 \
+         int32_t subsection = section_mask & self;                                                                                               \
+         int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                       \
+         int32_t idx = calculate_index;                                                                                                          \
+@@ -331,7 +358,7 @@ extern "C"
+         {                                                                                                                                       \
+             idx = self;                                                                                                                         \
+         }                                                                                                                                       \
+-        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
++        int32_t output = __builtin_amdgcn_ds_bpermute((int32_t)(d4r_warp_base() | (uint32_t)idx) << 2, (int32_t)input);                         \
+         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
+     }                                                                                                                                           \
+                                                                                                                                                 \
+@@ -850,7 +877,11 @@ extern "C"
+     __device__ static inline uint32_t ballot(bool value, bool negate)
+     {
+         __builtin_amdgcn_wave_barrier();
++#ifdef D4R_WAVE64
++        return (uint32_t)(__builtin_amdgcn_ballot_w64(negate ? !value : value) >> d4r_warp_base());
++#else
+         return __builtin_amdgcn_ballot_w32(negate ? !value : value);
++#endif
+     }
+ 
+     bool FUNC(vote_sync_any_pred)(bool value, uint32_t membermask __attribute__((unused)))
+@@ -866,7 +897,7 @@ extern "C"
+     // IMPORTANT: exec mask must be a subset of membermask, the behavior is undefined otherwise
+     bool FUNC(vote_sync_all_pred)(bool value, uint32_t membermask __attribute__((unused)))
+     {
+-        return ballot(value, false) == __builtin_amdgcn_read_exec_lo();
++        return ballot(value, false) == __zluda_ptx_impl_activemask();
+     }
+ 
+     // also known as "none"
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index 8294bb4..6af2495 100644
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -397,7 +397,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+ 
+     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
+         let value = format!(
+-            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
++            "{},+cumode{}",
++            if crate::pass::wave64_requested() {
++                "-wavefrontsize32,+wavefrontsize64"
++            } else {
++                "+wavefrontsize32,-wavefrontsize64"
++            },
+             if cfg!(debug_assertions) {
+                 ",+precise-memory"
+             } else {
+diff --git a/ptx/src/pass/mod.rs b/ptx/src/pass/mod.rs
+index 63aa98c..e3baa72 100644
+--- a/ptx/src/pass/mod.rs
++++ b/ptx/src/pass/mod.rs
+@@ -37,6 +37,18 @@ mod test;
+ static ZLUDA_PTX_IMPL: &'static [u8] = include_bytes!("../../lib/zluda_ptx_impl.bc");
+ static ZLUDA_PTX_IMPL_CONSTRAINED: &'static [u8] =
+     include_bytes!("../../lib/zluda_ptx_impl_constrained.bc");
++static ZLUDA_PTX_IMPL_W64: &'static [u8] = include_bytes!("../../lib/zluda_ptx_impl_w64.bc");
++static ZLUDA_PTX_IMPL_CONSTRAINED_W64: &'static [u8] =
++    include_bytes!("../../lib/zluda_ptx_impl_constrained_w64.bc");
++
++/// d4r: D4R_ZLUDA_WAVE64=1 compiles kernels as wave64: each wave runs two CUDA warps (lanes 0-31 and
++/// 32-63; the warp-level helpers act on the lane's own half) and RDNA3 issues most FP32 VALU work for all
++/// 64 lanes at once. Meant for offline builds of texture kernels whose warp operations are limited to
++/// lane ids, shuffles and votes; not for MMA/matrix kernels (their helpers assume one warp per wave).
++pub fn wave64_requested() -> bool {
++    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_WAVE64").map_or(false, |v| v.trim() == "1"))
++}
+ const ZLUDA_PTX_PREFIX: &'static str = "__zluda_ptx_impl_";
+ 
+ quick_error! {
+@@ -194,10 +206,11 @@ pub struct Module {
+ 
+ impl Module {
+     pub fn linked_bitcode(&self) -> &'static [u8] {
+-        if self.constrained_fp {
+-            ZLUDA_PTX_IMPL_CONSTRAINED
+-        } else {
+-            ZLUDA_PTX_IMPL
++        match (self.constrained_fp, wave64_requested()) {
++            (true, false) => ZLUDA_PTX_IMPL_CONSTRAINED,
++            (false, false) => ZLUDA_PTX_IMPL,
++            (true, true) => ZLUDA_PTX_IMPL_CONSTRAINED_W64,
++            (false, true) => ZLUDA_PTX_IMPL_W64,
+         }
+     }
+ }
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index bacb93d..033d9a0 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -18,9 +18,14 @@ pub(crate) struct Function {
+     /// d4r native override: persistent kernels launch this many workgroups in x (0 = as launched)
+     pub(crate) grid_x: u32,
+     /// d4r native override: byte offset of the u64 parameter that keys the prep kernel's output
+-    /// (0 = run the prep before every launch) and the key of the last prep launched
+-    pub(crate) prep_key: u32,
++    /// (None = run the prep before every launch) and the key of the last prep launched
++    pub(crate) prep_key: Option<u32>,
+     pub(crate) prep_last: std::sync::atomic::AtomicU64,
++    /// d4r native override: with N > 0 prep slots the kernel keeps one prepared image per key for
++    /// up to N keys, so the prep runs only for keys not seen yet (and for every key beyond N, which
++    /// the kernel prepares into a shared overflow slot). 0 = only the last key is kept.
++    pub(crate) prep_slots: u32,
++    pub(crate) prep_seen: std::sync::Mutex<Vec<u64>>,
+ }
+ 
+ impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
+@@ -140,7 +145,7 @@ pub(crate) fn launch_kernel(
+         translated_extra_storage.as_mut_ptr()
+     };
+     // the parameter block: kernel_params[0] (a single struct parameter) or the extra buffer
+-    let prep_key = if f.prep.is_some() && f.prep_key != 0 {
++    let prep_key = if let (Some(_), Some(key_offset)) = (f.prep, f.prep_key) {
+         let mut block: *const u8 = std::ptr::null();
+         if !extra.is_null() {
+             let mut i = 0usize;
+@@ -160,12 +165,27 @@ pub(crate) fn launch_kernel(
+         if block.is_null() {
+             0
+         } else {
+-            unsafe { std::ptr::read_unaligned(block.add(f.prep_key as usize) as *const u64) }
++            unsafe { std::ptr::read_unaligned(block.add(key_offset as usize) as *const u64) }
+         }
+     } else {
+         0
+     };
+-    let run_prep = prep_key == 0 || f.prep_last.load(std::sync::atomic::Ordering::Relaxed) != prep_key;
++    let run_prep = if prep_key == 0 {
++        true
++    } else if f.prep_slots == 0 {
++        f.prep_last.load(std::sync::atomic::Ordering::Relaxed) != prep_key
++    } else {
++        // prepared once per key while slots last; keys beyond them are prepared on every launch
++        let mut seen = f.prep_seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++        if seen.contains(&prep_key) {
++            false
++        } else {
++            if seen.len() < f.prep_slots as usize {
++                seen.push(prep_key);
++            }
++            true
++        }
++    };
+     if let (Some((prep, blocks)), true) = (f.prep, run_prep) {
+         unsafe {
+             hipModuleLaunchKernel(
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 5db5ace..c5a39c9 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -37,12 +37,12 @@ impl ModuleMutable {
+         Ok(match self.functions.entry(name) {
+             hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+             hash_map::Entry::Vacant(entry) => {
+-                let (func_handle, prep, block_z, grid_x, prep_key) = match native_override(entry.key()) {
++                let (func_handle, prep, block_z, grid_x, prep_key, prep_slots) = match native_override(entry.key()) {
+                     Some(native) => native,
+                     None => {
+                         let mut func_handle = unsafe { std::mem::zeroed() };
+                         unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
+-                        (func_handle, None, 0, 0, 0)
++                        (func_handle, None, 0, 0, None, 0)
+                     }
+                 };
+                 let func = Box::new(Function {
+@@ -54,6 +54,8 @@ impl ModuleMutable {
+                     grid_x,
+                     prep_key,
+                     prep_last: std::sync::atomic::AtomicU64::new(0),
++                    prep_slots,
++                    prep_seen: std::sync::Mutex::new(Vec::new()),
+                 });
+                 &*entry.insert(func)
+             }
+@@ -67,7 +69,9 @@ impl ModuleMutable {
+ /// same stream with `d4r_prep_blocks` (a u32 global in the code object) blocks of 128 threads.
+ /// An optional u32 global `d4r_block_z` replaces the launch's block z dimension, and `d4r_grid_x`
+ /// (persistent kernels, which derive the original grid from their parameters) the grid.
+-fn native_override(name: &CStr) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, u32)> {
++fn native_override(
++    name: &CStr,
++) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, Option<u32>, u32)> {
+     let dir = std::env::var_os("D4R_ZLUDA_NATIVE_DIR")?;
+     let path = std::path::Path::new(&dir).join(format!("{}.hsaco", name.to_str().ok()?));
+     let image = fs::read(&path).ok()?;
+@@ -103,34 +107,38 @@ fn native_override(name: &CStr) -> Option<(hipFunction_t, Option<(hipFunction_t,
+     } else {
+         None
+     };
+-    let read_u32 = |symbol: &CStr| -> u32 {
++    let read_u32_opt = |symbol: &CStr| -> Option<u32> {
+         let mut ptr = unsafe { mem::zeroed() };
+         let mut size = 0usize;
+         let mut value = 0u32;
+-        if unsafe { hipModuleGetGlobal(&mut ptr, &mut size, native_module, symbol.as_ptr()) }.is_ok()
++        (unsafe { hipModuleGetGlobal(&mut ptr, &mut size, native_module, symbol.as_ptr()) }.is_ok()
+             && size == 4
+-            && unsafe { hipMemcpyDtoH((&mut value as *mut u32).cast(), ptr, 4) }.is_ok()
+-        {
+-            value
+-        } else {
+-            0
+-        }
++            && unsafe { hipMemcpyDtoH((&mut value as *mut u32).cast(), ptr, 4) }.is_ok())
++        .then_some(value)
+     };
++    let read_u32 = |symbol: &CStr| -> u32 { read_u32_opt(symbol).unwrap_or(0) };
+     let block_z = read_u32(c"d4r_block_z");
+     let grid_x = read_u32(c"d4r_grid_x");
+     // byte offset of a u64 in the parameter block that fully determines the prep kernel's output
+-    // (the weights pointer): the prep is skipped while it repeats (0 = prep before every launch)
+-    let prep_key = read_u32(c"d4r_prep_key_offset");
++    // (the weights pointer): the prep is skipped while it repeats. d4r_prep_key_at holds offset + 1
++    // (so a key at offset 0 is possible); the older d4r_prep_key_offset uses 0 for "no key".
++    let prep_key = match read_u32_opt(c"d4r_prep_key_at") {
++        Some(at) if at > 0 => Some(at - 1),
++        _ => Some(read_u32(c"d4r_prep_key_offset")).filter(|&offset| offset != 0),
++    };
++    // d4r_prep_key_slots: the kernel keeps one prepared image per key (see Function::prep_slots)
++    let prep_slots = read_u32(c"d4r_prep_key_slots");
+     eprintln!(
+-        "[d4r-native] {:?} -> {} (prep: {:?}, block_z: {}, grid_x: {}, prep_key: {})",
++        "[d4r-native] {:?} -> {} (prep: {:?}, block_z: {}, grid_x: {}, prep_key: {:?}, prep_slots: {})",
+         name,
+         path.display(),
+         prep.map(|p| p.1),
+         block_z,
+         grid_x,
+-        prep_key
++        prep_key,
++        prep_slots
+     );
+-    Some((func, prep, block_z, grid_x, prep_key))
++    Some((func, prep, block_z, grid_x, prep_key, prep_slots))
+ }
+ 
+ impl ZludaObject for Module {

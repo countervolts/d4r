@@ -1,0 +1,1672 @@
+diff --git a/llvm_zluda/src/compile.rs b/llvm_zluda/src/compile.rs
+index 1284cbc..e268eaf 100644
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -94,6 +94,23 @@ pub fn wmma_rewrite_requested() -> bool {
+     *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_WMMA").map_or(false, |value| value.trim() == "1"))
+ }
+ 
++/// D4R_ZLUDA_WMMA_FP8=1 (with D4R_ZLUDA_WMMA=1) also lowers m16n8k32 e4m3
++/// MMAs to pairs of f16 WMMAs (experimental).
++pub fn wmma_fp8_rewrite_requested() -> bool {
++    static VALUE: OnceLock<bool> = OnceLock::new();
++    *VALUE.get_or_init(|| {
++        wmma_rewrite_requested()
++            && std::env::var("D4R_ZLUDA_WMMA_FP8").map_or(false, |value| value.trim() == "1")
++    })
++}
++
++/// Recovers kernel-parameter provenance of computed parameter addresses (on by
++/// default; D4R_ZLUDA_PARAM_PROVENANCE=0 disables it).
++pub fn param_provenance_enabled() -> bool {
++    static VALUE: OnceLock<bool> = OnceLock::new();
++    *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_PARAM_PROVENANCE").map_or(true, |value| value.trim() != "0"))
++}
++
+ fn wmma_rewrite_enabled(gcn_arch: &str) -> bool {
+     // The helpers assume RDNA3's wave32 WMMA register layout.
+     wmma_rewrite_requested() && gcn_arch.starts_with("gfx11")
+@@ -118,16 +135,35 @@ pub fn compile(
+ 
+     let oclc_constants = create_oclc_constants(ctx, gcn_arch)?;
+ 
++    // wmma.mma m16n16k16 always becomes m16n8k16 MMAs (there is no helper for it).
++    unsafe { crate::ffi::LLVMZludaSplitWmmaM16n16k16(main.get()) };
+     if wmma_rewrite_enabled(gcn_arch) {
+-        unsafe { crate::ffi::LLVMZludaRewriteMmaF16Wmma(main.get()) };
++        let flags = if wmma_fp8_rewrite_requested() { 1 } else { 0 };
++        unsafe { crate::ffi::LLVMZludaRewriteMmaF16Wmma(main.get(), flags) };
+     }
+     linked.link(main)?;
++    // d4r: offline builds of native kernel tails (D4R_ZLUDA_EXTRA_BC=file.bc defines the extern
++    // functions a hand-edited PTX kernel calls; the resulting code object is served through
++    // D4R_ZLUDA_NATIVE_DIR). Linked before the helper libraries so its
++    // references pull in their linkonce_odr definitions. Part of the module cache key through the D4R_ZLUDA_* environment.
++    if let Some(path) = std::env::var_os("D4R_ZLUDA_EXTRA_BC") {
++        let bytes = std::fs::read(&path).map_err(|error| format!("D4R_ZLUDA_EXTRA_BC: {error}"))?;
++        let extra = load_module(ctx, &bytes, c"d4r_extra.bc")?;
++        linked.link(extra)?;
++    }
+     linked.link(attributes)?;
+     linked.link(oclc_constants)?;
+     linked.link(ptx_impl)?;
+     linked.link(ockl)?;
+ 
+     linked.verify()?;
++    // d4r: inline the device-library image wrappers (D4R_ZLUDA_INLINE_IMAGE=0 disables it)
++    if std::env::var("D4R_ZLUDA_INLINE_IMAGE").map_or(true, |value| value.trim() != "0") {
++        unsafe { crate::ffi::LLVMZludaInlineImageHelpers(linked.get()) };
++    }
++    if std::env::var("D4R_ZLUDA_FAST_MATH").map_or(false, |value| value.trim() == "1") {
++        unsafe { crate::ffi::LLVMZludaRelaxFastMath(linked.get()) };
++    }
+ 
+     if let Some(hook) = compiler_hook {
+         // Run compiler hook on human-readable LLVM IR
+@@ -181,6 +217,21 @@ pub fn compile(
+         return Err(message.to_str().to_string());
+     }
+ 
++    // Loads through computed kernel parameter addresses become constant
++    // address space loads again (see LLVMZludaRecoverPointerProvenance);
++    // D4R_ZLUDA_PARAM_PROVENANCE=0 turns it off.
++    if param_provenance_enabled() && unsafe { crate::ffi::LLVMZludaRecoverPointerProvenance(linked.get()) } != 0 {
++        let cleanup = c"function(infer-address-spaces,instcombine,simplifycfg)";
++        let error = unsafe {
++            LLVMRunPasses(linked.get(), cleanup.as_ptr(), target_machine.get(), pb_options.get())
++        };
++        if !error.is_null() {
++            let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
++            let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
++            return Err(message.to_str().to_string());
++        }
++    }
++
+     if let Some(hook) = compiler_hook {
+         // Run compiler hook on optimized human-readable LLVM IR
+         let message = linked.print_module_to_string();
+diff --git a/llvm_zluda/src/ffi.rs b/llvm_zluda/src/ffi.rs
+index 6bf0d30..a434065 100644
+--- a/llvm_zluda/src/ffi.rs
++++ b/llvm_zluda/src/ffi.rs
+@@ -43,7 +43,15 @@ pub type LLVMZludaFastMathFlags = std::ffi::c_uint;
+ 
+ extern "C" {
+     /// See LLVMZludaRewriteMmaF16Wmma in lib.cpp.
+-    pub fn LLVMZludaRewriteMmaF16Wmma(M: LLVMModuleRef) -> u32;
++    pub fn LLVMZludaRewriteMmaF16Wmma(M: LLVMModuleRef, Flags: u32) -> u32;
++    /// See LLVMZludaSplitWmmaM16n16k16 in lib.cpp.
++    pub fn LLVMZludaSplitWmmaM16n16k16(M: LLVMModuleRef) -> u32;
++    /// See LLVMZludaRecoverPointerProvenance in lib.cpp.
++    pub fn LLVMZludaRecoverPointerProvenance(M: LLVMModuleRef) -> u32;
++    /// See LLVMZludaInlineImageHelpers in lib.cpp.
++    pub fn LLVMZludaInlineImageHelpers(M: LLVMModuleRef) -> u32;
++    /// See LLVMZludaRelaxFastMath in lib.cpp.
++    pub fn LLVMZludaRelaxFastMath(M: LLVMModuleRef) -> u32;
+ 
+     pub fn LLVMZludaBuildAlloca(
+         B: LLVMBuilderRef,
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+index 30d5490..10dc53c 100644
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -14,6 +14,8 @@
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/IR/InstIterator.h>
++#include <llvm/IR/Operator.h>
++#include <llvm/IR/IntrinsicInst.h>
+ #pragma GCC diagnostic pop
+ 
+ #include <mutex>
+@@ -275,6 +277,7 @@ int LLVMZludaLinkWithLLD(uint32_t inputs, const char **input_paths, const char *
+ namespace
+ {
+ constexpr const char *kMmaF16 = "__zluda_ptx_impl_mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16";
++constexpr const char *kMmaE4m3 = "__zluda_ptx_impl_mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16";
+ 
+ struct RegisterPair
+ {
+@@ -388,6 +391,10 @@ static bool storesBetween(Instruction *From, Instruction *To, ArrayRef<AllocaIns
+ struct Helpers
+ {
+     FunctionCallee AFromB, BFromA, Mma, FromNv, ToNv, AFromBPair, MmaPair;
++    // m16n8k32 e4m3 MMAs: fragment widening and the two-WMMA products.
++    FunctionCallee E4m3AToF16, E4m3BToF16, MmaE4m3, MmaE4m3Pair;
++    // f32 accumulator shadows (D4R_ZLUDA_WMMA_F32ACC=1): see d4r_wmma_s_* in zluda_ptx_impl.cpp.
++    FunctionCallee SFromT, TFromS, MmaS, MmaPairS, MmaE4m3S, MmaE4m3PairS;
+ };
+ 
+ static Value *loadPair(IRBuilder<> &Builder, const RegisterPair &Pair)
+@@ -398,12 +405,16 @@ static Value *loadPair(IRBuilder<> &Builder, const RegisterPair &Pair)
+     return Builder.CreateInsertElement(Vector, Builder.CreateLoad(I32, Pair.High), Builder.getInt8(1));
+ }
+ 
+-static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
++// MmaE4m3 may be null. Both MMA kinds take (<4 x i32> A, <2 x i32> B,
++// <2 x i32> C) and share the 16x8 f16 accumulator layout, so they share the
++// accumulator shadows; only same-kind MMAs are fused into one WMMA pair.
++static unsigned rewriteFunction(Function &F, Function *Mma, Function *MmaE4m3, const Helpers &H)
+ {
+     SmallVector<CallInst *, 64> Calls;
+     for (Instruction &I : instructions(F))
+         if (auto *Call = dyn_cast<CallInst>(&I))
+-            if (Call->getCalledFunction() == Mma && Call->arg_size() == 3)
++            if (Call->getCalledFunction() != nullptr && Call->arg_size() == 3 &&
++                (Call->getCalledFunction() == Mma || Call->getCalledFunction() == MmaE4m3))
+                 Calls.push_back(Call);
+     if (Calls.empty())
+         return 0;
+@@ -411,6 +422,7 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+     struct Site
+     {
+         CallInst *Call;
++        bool Fp8;
+         bool HasC;
+         RegisterPair C;
+         bool HasD;
+@@ -420,7 +432,7 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+     SmallVector<Site, 64> Sites;
+     for (CallInst *Call : Calls)
+     {
+-        Site S{Call, false, {}, false, {}, {nullptr, nullptr}};
++        Site S{Call, Call->getCalledFunction() == MmaE4m3, false, {}, false, {}, {nullptr, nullptr}};
+         S.HasC = matchLoadedPair(Call->getArgOperand(2), Call, S.C);
+         S.HasD = matchStoredPair(Call, S.D, S.DStores);
+         Sites.push_back(S);
+@@ -457,13 +469,36 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+     };
+ 
+     Type *Pair32 = FixedVectorType::get(Type::getInt32Ty(F.getContext()), 2);
++    // With D4R_ZLUDA_WMMA_F32ACC=1 a shadow is <4 x float> (f32, rounded to f16
++    // only where the NVIDIA registers are read), scaled by 2^-16 in functions
++    // with e4m3 MMAs.
++    static const bool F32Acc = [] {
++        const char *Value = getenv("D4R_ZLUDA_WMMA_F32ACC");
++        return Value != nullptr && Value[0] == '1';
++    }();
++    const bool F32 = F32Acc; // the s_* helpers are always declared
++    bool AnyFp8 = false;
++    for (const Site &S : Sites)
++        AnyFp8 |= S.Fp8;
++    Type *F32Ty = Type::getFloatTy(F.getContext());
++    Value *Scale = ConstantFP::get(F32Ty, AnyFp8 ? 0x1p-16 : 1.0);
++    Value *Inverse = ConstantFP::get(F32Ty, AnyFp8 ? 0x1p16 : 1.0);
++    Type *ShadowTy = F32 ? static_cast<Type *>(FixedVectorType::get(F32Ty, 4)) : Pair32;
++    auto fromNv = [&](IRBuilder<> &Builder, Value *Nv) -> Value * {
++        Value *T = Builder.CreateCall(H.FromNv, {Nv});
++        return F32 ? Builder.CreateCall(H.SFromT, {T, Scale}) : T;
++    };
++    auto toNv = [&](IRBuilder<> &Builder, Value *Shadowed) -> Value * {
++        Value *T = F32 ? Builder.CreateCall(H.TFromS, {Shadowed, Inverse}) : Shadowed;
++        return Builder.CreateCall(H.ToNv, {T});
++    };
+     SmallVector<AllocaInst *, 32> Shadows;
+     {
+         IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
+         for (size_t Index = 0; Index < Shadowed.size(); ++Index)
+             Shadows.push_back(
+                 shadowOf(Shadowed[Index]) == static_cast<int>(Index)
+-                    ? Builder.CreateAlloca(Pair32, Shadowed[Index].Low->getAddressSpace(), nullptr, "wmma.shadow")
++                    ? Builder.CreateAlloca(ShadowTy, Shadowed[Index].Low->getAddressSpace(), nullptr, "wmma.shadow")
+                     : nullptr);
+     }
+     auto shadowFor = [&](const RegisterPair &Pair) -> AllocaInst * {
+@@ -491,8 +526,52 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+     auto accumulator = [&](const Site &S, IRBuilder<> &Builder) -> Value * {
+         if (S.HasC)
+             if (AllocaInst *Shadow = shadowFor(S.C))
+-                return Builder.CreateLoad(Pair32, Shadow);
+-        return Builder.CreateCall(H.FromNv, {S.Call->getArgOperand(2)});
++                return Builder.CreateLoad(ShadowTy, Shadow);
++        return fromNv(Builder, S.Call->getArgOperand(2));
++    };
++    // The accumulator of the second MMA of a pair, built at the first one:
++    // its shadow, a reload of its (unshadowed) registers, or its C operand
++    // when that already exists there (see accumulatorAvailable).
++    auto earlyAccumulator = [&](const Site &S, IRBuilder<> &Builder) -> Value * {
++        if (S.HasC)
++        {
++            if (AllocaInst *Shadow = shadowFor(S.C))
++                return Builder.CreateLoad(ShadowTy, Shadow);
++            return fromNv(Builder, loadPair(Builder, S.C));
++        }
++        SmallVector<AllocaInst *, 2> Registers;
++        if (matchLoadedVector(S.Call->getArgOperand(2), 2, Registers))
++            return fromNv(Builder, loadPair(Builder, RegisterPair{Registers[0], Registers[1]}));
++        return fromNv(Builder, S.Call->getArgOperand(2));
++    };
++    auto unshadowed = [&](ArrayRef<AllocaInst *> Registers) {
++        for (AllocaInst *Register : Registers)
++        {
++            auto Found = Owner.find(Register);
++            if (Found != Owner.end() && Found->second >= 0 && Shadows[Found->second] != nullptr)
++                return false;
++        }
++        return true;
++    };
++    auto accumulatorAvailable = [&](const Site &First, const Site &Second) {
++        if (Second.HasC)
++        {
++            if (shadowFor(Second.C) != nullptr)
++                return true;
++            // Registers that belong to a shadow are no longer written.
++            return unshadowed({Second.C.Low, Second.C.High});
++        }
++        // Loads of plain registers (possibly one register twice, e.g. a
++        // zeroed accumulator), reloaded at the first MMA.
++        SmallVector<AllocaInst *, 2> Registers;
++        if (matchLoadedVector(Second.Call->getArgOperand(2), 2, Registers))
++            return unshadowed(Registers);
++        Value *C = Second.Call->getArgOperand(2);
++        if (isa<Constant>(C))
++            return true;
++        auto *Defined = dyn_cast<Instruction>(C);
++        return Defined != nullptr && Defined->getParent() == First.Call->getParent() &&
++               Defined->comesBefore(First.Call);
+     };
+     auto finish = [&](const Site &S, Value *D, IRBuilder<> &Builder) {
+         if (S.HasD)
+@@ -505,37 +584,122 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+                 ResultStores.insert(S.DStores[0]);
+                 ResultStores.insert(S.DStores[1]);
+             }
+-        return Builder.CreateCall(H.ToNv, {D});
++        return toNv(Builder, D);
+     };
+     // Two MMAs that share A (same registers, no store in between to anything
+     // the second one reads) run as one 16x16x16 WMMA placed at the first.
++    // D4R_ZLUDA_WMMA_DEBUG=1 counts why adjacent MMAs were not fused.
++    static const bool Debug = getenv("D4R_ZLUDA_WMMA_DEBUG") != nullptr;
++    unsigned Reasons[8] = {};
+     auto pairable = [&](const Site &First, const Site &Second) {
+-        SmallVector<AllocaInst *, 4> AFirst, ASecond, BSecond;
+-        if (First.Call->getParent() != Second.Call->getParent() || !Second.HasC ||
+-            shadowFor(Second.C) == nullptr || !First.Call->comesBefore(Second.Call) ||
+-            !matchLoadedVector(First.Call->getArgOperand(0), 4, AFirst) ||
+-            !matchLoadedVector(Second.Call->getArgOperand(0), 4, ASecond) || AFirst != ASecond ||
+-            !matchLoadedVector(Second.Call->getArgOperand(1), 2, BSecond))
++        auto fail = [&](unsigned Reason) {
++            ++Reasons[Reason];
+             return false;
++        };
++        SmallVector<AllocaInst *, 4> AFirst, ASecond, BSecond;
++        if (First.Fp8 != Second.Fp8)
++            return fail(0);
++        if (First.Call->getParent() != Second.Call->getParent() || !First.Call->comesBefore(Second.Call))
++            return fail(1);
++        if (!matchLoadedVector(First.Call->getArgOperand(0), 4, AFirst) ||
++            !matchLoadedVector(Second.Call->getArgOperand(0), 4, ASecond))
++            return fail(2);
++        if (AFirst != ASecond)
++            return fail(3);
++        if (!matchLoadedVector(Second.Call->getArgOperand(1), 2, BSecond))
++            return fail(4);
++        if (!accumulatorAvailable(First, Second))
++        {
++            if (Debug)
++            {
++                Value *C = Second.Call->getArgOperand(2);
++                errs() << "[d4r wmma] C unavailable: HasC=" << Second.HasC << " C=";
++                if (auto *I = dyn_cast<Instruction>(C))
++                    errs() << I->getOpcodeName() << (I->getParent() == First.Call->getParent() ? " same-block" : " other-block")
++                           << (I->getParent() == First.Call->getParent() && I->comesBefore(First.Call) ? " before" : " after");
++                else
++                    errs() << "non-instruction";
++                if (auto *Insert = dyn_cast<InsertElementInst>(C))
++                    if (auto *Loaded = dyn_cast<LoadInst>(Insert->getOperand(1)))
++                        errs() << " loads " << (isa<AllocaInst>(Loaded->getPointerOperand()) ? "alloca" : "other")
++                               << (Loaded->getParent() == Second.Call->getParent() ? " (call block)" : " (other block)");
++                errs() << "\n";
++            }
++            return fail(5);
++        }
+         // The second B is reloaded at the first MMA, so it must not live in a
+         // shadow (those registers are no longer kept up to date).
+         for (AllocaInst *Register : BSecond)
+         {
+             auto Found = Owner.find(Register);
+             if (Found != Owner.end() && Found->second >= 0 && Shadows[Found->second] != nullptr)
+-                return false;
++                return fail(6);
+         }
+         SmallVector<AllocaInst *, 8> Read(AFirst.begin(), AFirst.end());
+         Read.append(BSecond.begin(), BSecond.end());
+-        Read.push_back(Second.C.Low);
+-        Read.push_back(Second.C.High);
+-        return !storesBetween(First.Call, Second.Call, Read);
++        if (Second.HasC)
++        {
++            Read.push_back(Second.C.Low);
++            Read.push_back(Second.C.High);
++        }
++        else
++        {
++            SmallVector<AllocaInst *, 2> CRegisters;
++            if (matchLoadedVector(Second.Call->getArgOperand(2), 2, CRegisters))
++                Read.append(CRegisters.begin(), CRegisters.end());
++        }
++        if (storesBetween(First.Call, Second.Call, Read))
++            return fail(7);
++        return true;
+     };
++
+     for (size_t Index = 0; Index < Sites.size(); ++Index)
+     {
+         const Site &S = Sites[Index];
+         CallInst *Call = S.Call;
+         IRBuilder<> Builder(Call);
++        if (S.Fp8)
++        {
++            // Widen A and B to f16 K halves (low = K 0..15, high = K 16..31).
++            auto half = [&](Value *Vector, unsigned Half, unsigned Elements) {
++                SmallVector<int, 4> Indices;
++                for (unsigned Element = 0; Element < Elements; ++Element)
++                    Indices.push_back(static_cast<int>(Half * Elements + Element));
++                return Builder.CreateShuffleVector(Vector, Indices);
++            };
++            Value *AF16 = Builder.CreateCall(H.E4m3AToF16, {Call->getArgOperand(0)});
++            Value *BF16 = Builder.CreateCall(H.E4m3BToF16, {Call->getArgOperand(1)});
++            Value *BTLow = Builder.CreateCall(H.BFromA, {half(AF16, 0, 4)});
++            Value *BTHigh = Builder.CreateCall(H.BFromA, {half(AF16, 1, 4)});
++            if (Index + 1 < Sites.size() && pairable(S, Sites[Index + 1]))
++            {
++                const Site &Next = Sites[Index + 1];
++                SmallVector<AllocaInst *, 2> BNext;
++                matchLoadedVector(Next.Call->getArgOperand(1), 2, BNext);
++                Value *B1F16 = Builder.CreateCall(H.E4m3BToF16, {loadPair(Builder, RegisterPair{BNext[0], BNext[1]})});
++                Value *ATLow = Builder.CreateCall(H.AFromBPair, {half(BF16, 0, 2), half(B1F16, 0, 2)});
++                Value *ATHigh = Builder.CreateCall(H.AFromBPair, {half(BF16, 1, 2), half(B1F16, 1, 2)});
++                Value *C0 = accumulator(S, Builder);
++                Value *C1 = earlyAccumulator(Next, Builder);
++                Value *D = Builder.CreateCall(F32 ? H.MmaE4m3PairS : H.MmaE4m3Pair, {ATLow, BTLow, ATHigh, BTHigh, C0, C1});
++                Value *D0 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1, 2, 3})
++                                : Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1});
++                Value *D1 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{4, 5, 6, 7})
++                                : Builder.CreateShuffleVector(D, ArrayRef<int>{2, 3});
++                Call->replaceAllUsesWith(finish(S, D0, Builder));
++                Next.Call->replaceAllUsesWith(finish(Next, D1, Builder));
++                Call->eraseFromParent();
++                Next.Call->eraseFromParent();
++                ++Index;
++                continue;
++            }
++            Value *ATLow = Builder.CreateCall(H.AFromB, {half(BF16, 0, 2)});
++            Value *ATHigh = Builder.CreateCall(H.AFromB, {half(BF16, 1, 2)});
++            Value *D = Builder.CreateCall(F32 ? H.MmaE4m3S : H.MmaE4m3, {ATLow, BTLow, ATHigh, BTHigh, accumulator(S, Builder)});
++            Call->replaceAllUsesWith(finish(S, D, Builder));
++            Call->eraseFromParent();
++            continue;
++        }
+         Value *BTransposed = Builder.CreateCall(H.BFromA, {Call->getArgOperand(0)});
+         if (Index + 1 < Sites.size() && pairable(S, Sites[Index + 1]))
+         {
+@@ -545,10 +709,13 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+             Value *B1 = loadPair(Builder, RegisterPair{BNext[0], BNext[1]});
+             Value *ATransposed = Builder.CreateCall(H.AFromBPair, {Call->getArgOperand(1), B1});
+             Value *C0 = accumulator(S, Builder);
+-            Value *C1 = accumulator(Next, Builder);
+-            Value *D = Builder.CreateCall(H.MmaPair, {ATransposed, BTransposed, C0, C1});
+-            Value *D0 = Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1});
+-            Value *D1 = Builder.CreateShuffleVector(D, ArrayRef<int>{2, 3});
++            Value *C1 = earlyAccumulator(Next, Builder);
++            Value *D = F32 ? Builder.CreateCall(H.MmaPairS, {ATransposed, BTransposed, C0, C1, Inverse, Scale})
++                           : Builder.CreateCall(H.MmaPair, {ATransposed, BTransposed, C0, C1});
++            Value *D0 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1, 2, 3})
++                            : Builder.CreateShuffleVector(D, ArrayRef<int>{0, 1});
++            Value *D1 = F32 ? Builder.CreateShuffleVector(D, ArrayRef<int>{4, 5, 6, 7})
++                            : Builder.CreateShuffleVector(D, ArrayRef<int>{2, 3});
+             Call->replaceAllUsesWith(finish(S, D0, Builder));
+             Next.Call->replaceAllUsesWith(finish(Next, D1, Builder));
+             Call->eraseFromParent();
+@@ -557,7 +724,8 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+             continue;
+         }
+         Value *ATransposed = Builder.CreateCall(H.AFromB, {Call->getArgOperand(1)});
+-        Value *D = Builder.CreateCall(H.Mma, {ATransposed, BTransposed, accumulator(S, Builder)});
++        Value *D = F32 ? Builder.CreateCall(H.MmaS, {ATransposed, BTransposed, accumulator(S, Builder), Inverse, Scale})
++                       : Builder.CreateCall(H.Mma, {ATransposed, BTransposed, accumulator(S, Builder)});
+         Call->replaceAllUsesWith(finish(S, D, Builder));
+         Call->eraseFromParent();
+     }
+@@ -568,7 +736,7 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+         auto *Register = cast<AllocaInst>(Load->getPointerOperand());
+         const RegisterPair &Pair = Shadowed[Owner[Register]];
+         IRBuilder<> Builder(Load);
+-        Value *Nv = Builder.CreateCall(H.ToNv, {Builder.CreateLoad(Pair32, shadowFor(Pair))});
++        Value *Nv = toNv(Builder, Builder.CreateLoad(ShadowTy, shadowFor(Pair)));
+         Load->replaceAllUsesWith(Builder.CreateExtractElement(Nv, Builder.getInt8(Register == Pair.High)));
+         Load->eraseFromParent();
+     }
+@@ -580,32 +748,147 @@ static unsigned rewriteFunction(Function &F, Function *Mma, const Helpers &H)
+             const RegisterPair &Pair = Shadowed[Owner[Register]];
+             AllocaInst *Shadow = shadowFor(Pair);
+             IRBuilder<> Builder(Store);
+-            Value *Nv = Builder.CreateCall(H.ToNv, {Builder.CreateLoad(Pair32, Shadow)});
++            Value *Nv = toNv(Builder, Builder.CreateLoad(ShadowTy, Shadow));
+             Nv = Builder.CreateInsertElement(Nv, Store->getValueOperand(), Builder.getInt8(Register == Pair.High));
+-            Builder.CreateStore(Builder.CreateCall(H.FromNv, {Nv}), Shadow);
++            Builder.CreateStore(fromNv(Builder, Nv), Shadow);
+         }
+         auto *Operand = dyn_cast<Instruction>(Store->getValueOperand());
+         Store->eraseFromParent();
+         if (Operand != nullptr && Operand->use_empty() && !Operand->mayHaveSideEffects())
+             Operand->eraseFromParent();
+     }
++    if (Debug)
++        errs() << "[d4r wmma] " << F.getName() << ": sites " << Sites.size() << " not fused: kind " << Reasons[0]
++               << " block/order " << Reasons[1] << " A-not-registers " << Reasons[2] << " different-A " << Reasons[3]
++               << " B-not-registers " << Reasons[4] << " C-unavailable " << Reasons[5] << " B-shadowed "
++               << Reasons[6] << " stores-between " << Reasons[7] << " shadows " << Shadows.size() << " f32 " << F32
++               << "\n";
+     return Calls.size();
+ }
+ } // namespace
+ 
+-unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef)
++// wmma.mma.sync.aligned.row.col.m16n16k16.f16.f16 on sm_80+ is two m16n8k16
++// MMAs sharing A: a[0..3] x b[0..1] + c[0..1] -> d[0..1] and a[0..3] x b[2..3] +
++// c[2..3] -> d[2..3] (a[4..7] and b[4..7] are not read; DLSS passes filler
++// there). Each call to the wmma helper becomes those two m16n8k16 helper calls.
++// When the operands are loads of plain registers the split calls load the same
++// registers, so LLVMZludaRewriteMmaF16Wmma can fuse the pair into one gfx11 WMMA.
++// Returns the number of calls split.
++unsigned LLVMZludaSplitWmmaM16n16k16(LLVMModuleRef ModuleRef)
++{
++    Module *M = unwrap(ModuleRef);
++    Function *Wmma = M->getFunction("__zluda_ptx_impl_wmma_mma_sync_aligned_row_col_m16n16k16_f16_f16");
++    if (Wmma == nullptr)
++        return 0;
++    LLVMContext &Context = M->getContext();
++    Type *I32 = Type::getInt32Ty(Context);
++    Type *V2 = FixedVectorType::get(I32, 2);
++    Type *V4 = FixedVectorType::get(I32, 4);
++    AttributeList Attributes = AttributeList::get(Context, AttributeList::FunctionIndex,
++                                                  AttrBuilder(Context, Wmma->getAttributes().getFnAttrs()));
++    FunctionCallee Mma = M->getOrInsertFunction(kMmaF16, Attributes, V2, V4, V2, V2);
++    // D4R_ZLUDA_WMMA16_MAP="a0a1a2a3,bLbL,bHbH" (default "0123,01,23") picks which
++    // fragment registers feed the low and high m16n8k16 halves (layout experiments).
++    unsigned AMap[4] = {0, 1, 2, 3}, BLow[2] = {0, 1}, BHigh[2] = {2, 3};
++    if (const char *Map = getenv("D4R_ZLUDA_WMMA16_MAP"); Map != nullptr && strlen(Map) == 10 && Map[4] == ',' &&
++                                                          Map[7] == ',')
++    {
++        for (unsigned Index = 0; Index < 4; ++Index)
++            AMap[Index] = Map[Index] - '0';
++        BLow[0] = Map[5] - '0', BLow[1] = Map[6] - '0', BHigh[0] = Map[8] - '0', BHigh[1] = Map[9] - '0';
++    }
++    SmallVector<CallInst *, 64> Calls;
++    for (User *U : Wmma->users())
++        if (auto *Call = dyn_cast<CallInst>(U); Call != nullptr && Call->getCalledFunction() == Wmma)
++            Calls.push_back(Call);
++    for (CallInst *Call : Calls)
++    {
++        IRBuilder<> Builder(Call);
++        SmallVector<AllocaInst *, 8> A, B, C;
++        const bool Loaded = matchLoadedVector(Call->getArgOperand(0), 8, A) &&
++                            matchLoadedVector(Call->getArgOperand(1), 8, B) &&
++                            matchLoadedVector(Call->getArgOperand(2), 4, C);
++        auto load = [&](ArrayRef<AllocaInst *> Registers) {
++            Value *Vector = UndefValue::get(FixedVectorType::get(I32, Registers.size()));
++            for (unsigned Index = 0; Index < Registers.size(); ++Index)
++                Vector = Builder.CreateInsertElement(Vector, Builder.CreateLoad(I32, Registers[Index]),
++                                                     Builder.getInt8(Index));
++            return Vector;
++        };
++        auto slice = [&](unsigned Operand, ArrayRef<int> Indices) {
++            return Builder.CreateShuffleVector(Call->getArgOperand(Operand), Indices);
++        };
++        CallInst *Low, *High;
++        AllocaInst *AParts[4] = {A.empty() ? nullptr : A[AMap[0]], A.empty() ? nullptr : A[AMap[1]],
++                                 A.empty() ? nullptr : A[AMap[2]], A.empty() ? nullptr : A[AMap[3]]};
++        if (Loaded)
++        {
++            Value *ALow = load(AParts);
++            Value *BLowV = load({B[BLow[0]], B[BLow[1]]});
++            Value *CLow = load(ArrayRef<AllocaInst *>(C).slice(0, 2));
++            Value *AHigh = load(AParts);
++            Value *BHighV = load({B[BHigh[0]], B[BHigh[1]]});
++            Value *CHigh = load(ArrayRef<AllocaInst *>(C).slice(2, 2));
++            Low = Builder.CreateCall(Mma, {ALow, BLowV, CLow});
++            High = Builder.CreateCall(Mma, {AHigh, BHighV, CHigh});
++        }
++        else
++        {
++            Value *ASlice = slice(0, {int(AMap[0]), int(AMap[1]), int(AMap[2]), int(AMap[3])});
++            Low = Builder.CreateCall(Mma, {ASlice, slice(1, {int(BLow[0]), int(BLow[1])}), slice(2, {0, 1})});
++            High = Builder.CreateCall(Mma, {ASlice, slice(1, {int(BHigh[0]), int(BHigh[1])}), slice(2, {2, 3})});
++        }
++        // Results: per-lane extracts keep their shape (extract -> store), which
++        // the WMMA rewrite matches; anything else gets the concatenation.
++        SmallVector<User *, 8> Users(Call->users());
++        Value *Joined = nullptr;
++        for (User *U : Users)
++        {
++            auto *Extract = dyn_cast<ExtractElementInst>(U);
++            auto *Index = Extract != nullptr ? dyn_cast<ConstantInt>(Extract->getIndexOperand()) : nullptr;
++            if (Index != nullptr && Index->getZExtValue() < 4)
++            {
++                IRBuilder<> At(Extract);
++                const unsigned Lane = static_cast<unsigned>(Index->getZExtValue());
++                Value *Replacement = At.CreateExtractElement(Lane < 2 ? Low : High, At.getInt8(Lane % 2));
++                Extract->replaceAllUsesWith(Replacement);
++                Extract->eraseFromParent();
++                continue;
++            }
++            if (Joined == nullptr)
++            {
++                IRBuilder<> After(Call->getNextNode());
++                Joined = After.CreateShuffleVector(Low, High, ArrayRef<int>{0, 1, 2, 3});
++            }
++            U->replaceUsesOfWith(Call, Joined);
++        }
++        Call->eraseFromParent();
++    }
++    if (Wmma->use_empty())
++        Wmma->eraseFromParent();
++    return static_cast<unsigned>(Calls.size());
++}
++
++// Flags bit 0: also lower m16n8k32 e4m3 MMAs (D4R_ZLUDA_WMMA_FP8=1).
++unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+     Module *M = unwrap(ModuleRef);
+     Function *Mma = M->getFunction(kMmaF16);
+-    if (Mma == nullptr || Mma->use_empty())
++    Function *MmaE4m3 = (Flags & 1) != 0 ? M->getFunction(kMmaE4m3) : nullptr;
++    if (Mma != nullptr && Mma->use_empty())
++        Mma = nullptr;
++    if (MmaE4m3 != nullptr && MmaE4m3->use_empty())
++        MmaE4m3 = nullptr;
++    if (Mma == nullptr && MmaE4m3 == nullptr)
+         return 0;
++    Function *Reference = Mma != nullptr ? Mma : MmaE4m3;
+     LLVMContext &Context = M->getContext();
+     Type *I32 = Type::getInt32Ty(Context);
+     Type *V2 = FixedVectorType::get(I32, 2);
+     Type *V4 = FixedVectorType::get(I32, 4);
+     Type *V8 = FixedVectorType::get(I32, 8);
+     AttributeList Attributes = AttributeList::get(Context, AttributeList::FunctionIndex,
+-                                                  AttrBuilder(Context, Mma->getAttributes().getFnAttrs()));
++                                                  AttrBuilder(Context, Reference->getAttributes().getFnAttrs()));
+     Helpers H;
+     H.AFromB = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_a_from_b", Attributes, V8, V2);
+     H.BFromA = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_b_from_a", Attributes, V8, V4);
+@@ -614,10 +897,30 @@ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef)
+     H.ToNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_to_nv", Attributes, V2, V2);
+     H.AFromBPair = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_a_from_b_pair", Attributes, V8, V2, V2);
+     H.MmaPair = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_f16_pair", Attributes, V4, V8, V8, V2, V2);
++    {
++        Type *F = Type::getFloatTy(Context);
++        Type *V4F = FixedVectorType::get(F, 4);
++        Type *V8F = FixedVectorType::get(F, 8);
++        H.SFromT = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_from_t", Attributes, V4F, V2, F);
++        H.TFromS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_s", Attributes, V2, V4F, F);
++        H.MmaS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_f16", Attributes, V4F, V8, V8, V4F, F, F);
++        H.MmaPairS = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_f16_pair", Attributes, V8F, V8, V8, V4F, V4F, F, F);
++        H.MmaE4m3S = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_e4m3", Attributes, V4F, V8, V8, V8, V8, V4F);
++        H.MmaE4m3PairS =
++            M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_s_mma_e4m3_pair", Attributes, V8F, V8, V8, V8, V8, V4F, V4F);
++    }
++    if (MmaE4m3 != nullptr)
++    {
++        H.E4m3AToF16 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_e4m3_a_to_f16", Attributes, V8, V4);
++        H.E4m3BToF16 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_e4m3_b_to_f16", Attributes, V4, V2);
++        H.MmaE4m3 = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_e4m3", Attributes, V2, V8, V8, V8, V8, V2);
++        H.MmaE4m3Pair =
++            M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_mma_e4m3_pair", Attributes, V4, V8, V8, V8, V8, V2, V2);
++    }
+     unsigned Rewritten = 0;
+     for (Function &F : *M)
+         if (!F.isDeclaration())
+-            Rewritten += rewriteFunction(F, Mma, H);
++            Rewritten += rewriteFunction(F, Mma, MmaE4m3, H);
+     return Rewritten;
+ }
+ 
+@@ -635,3 +938,133 @@ bool LLVMZludaParseCommandLineOptions(int argc, const char *const *argv,
+ }
+ 
+ LLVM_C_EXTERN_C_END
++
++// PTX that takes a kernel parameter's address (mov.b64 %rd, param; ld.param
++// [%rd+N]) reaches LLVM as inttoptr(ptrtoint(addrspacecast(kernarg)) + N):
++// a flat pointer whose origin the integer round trip hides, so the loads are
++// flat loads that the backend treats as divergent (texture handles read that
++// way force a readfirstlane waterfall around every image instruction). This
++// rewrites inttoptr(ptrtoint(P) + offsets) into a GEP on P, the same address
++// with P's provenance, so infer-address-spaces can turn such loads back into
++// constant-address-space loads. Returns the number of rewrites.
++namespace
++{
++static Value *provenanceBase(Value *V, SmallVectorImpl<Value *> &Offsets, unsigned Depth)
++{
++    if (Depth > 8)
++        return nullptr;
++    if (auto *Cast = dyn_cast<PtrToIntInst>(V))
++        return Cast->getType()->isIntegerTy(64) ? Cast->getPointerOperand() : nullptr;
++    auto *Binary = dyn_cast<BinaryOperator>(V);
++    if (Binary == nullptr)
++        return nullptr;
++    const bool IsAdd = Binary->getOpcode() == Instruction::Add;
++    const bool IsDisjointOr = Binary->getOpcode() == Instruction::Or && cast<PossiblyDisjointInst>(Binary)->isDisjoint();
++    if (!IsAdd && !IsDisjointOr)
++        return nullptr;
++    for (unsigned Side = 0; Side < 2; ++Side)
++    {
++        SmallVector<Value *, 4> Nested;
++        if (Value *Base = provenanceBase(Binary->getOperand(Side), Nested, Depth + 1))
++        {
++            Offsets.append(Nested.begin(), Nested.end());
++            Offsets.push_back(Binary->getOperand(1 - Side));
++            return Base;
++        }
++    }
++    return nullptr;
++}
++} // namespace
++
++extern "C" unsigned LLVMZludaRecoverPointerProvenance(LLVMModuleRef ModuleRef)
++{
++    Module *M = unwrap(ModuleRef);
++    unsigned Rewritten = 0;
++    for (Function &F : *M)
++    {
++        SmallVector<IntToPtrInst *, 32> Casts;
++        for (Instruction &I : instructions(F))
++            if (auto *Cast = dyn_cast<IntToPtrInst>(&I))
++                Casts.push_back(Cast);
++        for (IntToPtrInst *Cast : Casts)
++        {
++            SmallVector<Value *, 4> Offsets;
++            Value *Base = provenanceBase(Cast->getOperand(0), Offsets, 0);
++            if (Base == nullptr || !Base->getType()->isPointerTy())
++                continue;
++            IRBuilder<> Builder(Cast);
++            Value *Offset = nullptr;
++            for (Value *Part : Offsets)
++            {
++                Value *Wide = Builder.CreateSExtOrTrunc(Part, Builder.getInt64Ty());
++                Offset = Offset == nullptr ? Wide : Builder.CreateAdd(Offset, Wide);
++            }
++            Value *Pointer = Offset == nullptr ? Base : Builder.CreateGEP(Builder.getInt8Ty(), Base, Offset);
++            if (Pointer->getType() != Cast->getType())
++                Pointer = Builder.CreateAddrSpaceCast(Pointer, Cast->getType());
++            Cast->replaceAllUsesWith(Pointer);
++            Cast->eraseFromParent();
++            ++Rewritten;
++        }
++    }
++    return Rewritten;
++}
++
++// d4r: device-library image wrappers (__llvm_amdgcn_image_*, called by ZLUDA's texture/surface
++// helpers) were left as calls: their FP attributes did not match the strictfp kernels, so the
++// inliner refused them. Each call then began with a full s_waitcnt and a readfirstlane
++// waterfall over the (actually uniform) resource descriptor. The wrappers contain no FP math,
++// so give them the caller-compatible "dynamic" denormal mode and strictfp, and force inlining.
++extern "C" unsigned LLVMZludaInlineImageHelpers(LLVMModuleRef ModuleRef)
++{
++    Module* M = unwrap(ModuleRef);
++    unsigned Changed = 0;
++    for (Function& F : *M)
++    {
++        const StringRef N = F.getName();
++        if (F.isDeclaration() || !N.starts_with("__llvm_amdgcn_image_"))
++            continue;
++        F.removeFnAttr(Attribute::NoInline);
++        F.removeFnAttr(Attribute::OptimizeNone);
++        F.addFnAttr(Attribute::AlwaysInline);
++        F.addFnAttr("denormal-fp-math", "dynamic,dynamic");
++        F.addFnAttr("denormal-fp-math-f32", "dynamic,dynamic");
++        F.addFnAttr(Attribute::StrictFP); // no FP math inside
++        for (User* U : F.users())
++            if (auto* CB = dyn_cast<CallBase>(U))
++                CB->removeFnAttr(Attribute::NoInline);
++        ++Changed;
++    }
++    return Changed;
++}
++
++// d4r: D4R_ZLUDA_FAST_MATH=1 lets LLVM contract/approximate FP arithmetic (contract, afn, arcp,
++// nsz). NaN/Inf semantics are kept (DLSS sanitises NaN inputs explicitly). Not part of the JIT
++// cache key: use a fresh cache when toggling it.
++extern "C" unsigned LLVMZludaRelaxFastMath(LLVMModuleRef ModuleRef)
++{
++    Module* M = unwrap(ModuleRef);
++    unsigned Changed = 0;
++    for (Function& F : *M)
++    {
++        if (F.isDeclaration())
++            continue;
++        for (BasicBlock& BB : F)
++            for (Instruction& I : BB)
++            {
++                if (!isa<FPMathOperator>(&I))
++                    continue;
++                // constrained (strictfp) intrinsics carry their own semantics
++                if (isa<ConstrainedFPIntrinsic>(&I))
++                    continue;
++                FastMathFlags FMF = I.getFastMathFlags();
++                FMF.setAllowContract(true);
++                FMF.setApproxFunc(true);
++                FMF.setAllowReciprocal(true);
++                FMF.setNoSignedZeros(true);
++                I.setFastMathFlags(FMF);
++                ++Changed;
++            }
++    }
++    return Changed;
++}
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+index c11e06a..d8a1f26 100644
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -83,6 +83,12 @@ then cd to the directory with this file and run this simple command:
+ #include <hip/hip_fp8.h>
+ 
+ #define GLOBAL_SPACE __attribute__((address_space(1)))
++// Texture and surface descriptors are never written while a kernel runs.
++// Reading them through the constant address space lets the backend use
++// scalar loads for uniform handles; through the global address space it
++// emits vector loads and a readfirstlane waterfall loop around every image
++// instruction (image resources must live in SGPRs).
++#define CONSTANT_DESCRIPTOR __attribute__((address_space(4)))
+ #define SHARED_SPACE __attribute__((address_space(3)))
+ #define CONSTANT_SPACE __attribute__((address_space(4)))
+ 
+@@ -698,6 +704,34 @@ extern "C"
+         return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
+     }
+ 
++    // .relu clamps negative results (including -0) to +0 and keeps NaN.
++    // Rounding preserves the sign, so clamping the inputs is equivalent.
++    __device__ static float relu_keep_nan(float value)
++    {
++        uint32_t bits = std::bit_cast<uint32_t>(value);
++        return (bits & 0x80000000u) != 0 && (bits & 0x7fffffffu) <= 0x7f800000u ? 0.0f : value;
++    }
++
++    __device__ static __half2 relu_keep_nan_halves(__half2 input)
++    {
++        uint32_t bits = std::bit_cast<uint32_t>(input);
++        if ((bits & 0x8000u) != 0 && (bits & 0x7fffu) <= 0x7c00u)
++            bits &= 0xffff0000u;
++        if ((bits & 0x80000000u) != 0 && (bits & 0x7fff0000u) <= 0x7c000000u)
++            bits &= 0x0000ffffu;
++        return std::bit_cast<__half2>(bits);
++    }
++
++    Fp8x2 FUNC(cvt_rn_satfinite_relu_e4m3x2_f32)(float a, float b)
++    {
++        return {cvt_float_to_fp8(relu_keep_nan(b), __HIP_E4M3), cvt_float_to_fp8(relu_keep_nan(a), __HIP_E4M3)};
++    }
++
++    Fp8x2 FUNC(cvt_rn_satfinite_relu_e5m2x2_f32)(float a, float b)
++    {
++        return {cvt_float_to_fp8(relu_keep_nan(b), __HIP_E5M2), cvt_float_to_fp8(relu_keep_nan(a), __HIP_E5M2)};
++    }
++
+     // .satfinite maps infinities to the largest finite value, but the HIP
+     // conversion turns them into NaN. Replace infinite halves with the
+     // destination format's largest finite value (exact in f16) first.
+@@ -712,10 +746,65 @@ extern "C"
+         return std::bit_cast<__half2_raw>(result);
+     }
+ 
++    // f16 -> E4M3 with round-to-nearest-even and .satfinite, on the f16 bits
++    // (HIP's software conversion is ~100 instructions with divergent branches
++    // per value on gfx11, and DLSS's FP8 layers requantize every activation).
++    // |x| > 448 (including infinity) gives 448, NaN gives 0x7f.
++    __device__ static uint32_t f16_to_e4m3_satfinite_bits(uint32_t half)
++    {
++        uint32_t magnitude = half & 0x7fffu;
++        // Normal E4M3 (|x| >= 2^-6, f16 bits >= 0x2400): rebias 15 -> 7 and
++        // drop 7 mantissa bits, rounding to nearest even (a carry correctly
++        // bumps the exponent).
++        uint32_t normal = (magnitude - 0x2000u + 0x3fu + ((magnitude >> 7) & 1u)) >> 7;
++        // Subnormal E4M3 (|x| < 2^-6): the code is RNE(|x| * 2^9). With f16
++        // exponent e (1..8) that is (0x400 | m) >> (16 - e); f16 subnormals
++        // (e = 0) are below 2^-14 and round to 0 with the same formula.
++        uint32_t exponent = magnitude >> 10;
++        uint32_t significand = (magnitude & 0x3ffu) | (exponent != 0 ? 0x400u : 0u);
++        uint32_t clamped = exponent < 1u ? 1u : (exponent > 8u ? 8u : exponent);
++        uint32_t shift = 16u - clamped;
++        uint32_t subnormal = (significand + (1u << (shift - 1u)) - 1u + ((significand >> shift) & 1u)) >> shift;
++        uint32_t code = magnitude >= 0x2400u ? normal : subnormal;
++        code = magnitude > 0x5f00u ? 0x7eu : code;
++        code = magnitude > 0x7c00u ? 0x7fu : code;
++        return ((half >> 8) & 0x80u) | code;
++    }
++
++    typedef uint16_t fp8_u16x2 __attribute__((ext_vector_type(2)));
++    typedef int16_t fp8_s16x2 __attribute__((ext_vector_type(2)));
++
++    // f16_to_e4m3_satfinite_bits for both halves at once with packed 16-bit
++    // operations (v_pk_*); selections are sign masks instead of compares.
++    __device__ static uint32_t f16x2_to_e4m3x2_satfinite_bits(uint32_t bits)
++    {
++        fp8_u16x2 half = std::bit_cast<fp8_u16x2>(bits);
++        fp8_u16x2 magnitude = half & (uint16_t)0x7fffu;
++        // magnitude - 0x2000 + 0x3f wraps modulo 2^16 below 2^-6, where the
++        // subnormal result is selected instead.
++        fp8_u16x2 normal = (magnitude + ((magnitude >> (uint16_t)7) & (uint16_t)1) + (uint16_t)0xe03fu) >> (uint16_t)7;
++        fp8_u16x2 exponent = magnitude >> (uint16_t)10;
++        fp8_u16x2 clamped = __builtin_elementwise_max(__builtin_elementwise_min(exponent, (fp8_u16x2)8), (fp8_u16x2)1);
++        fp8_u16x2 shift = (uint16_t)16 - clamped;
++        fp8_u16x2 significand = (magnitude & (uint16_t)0x3ffu) |
++                                (__builtin_elementwise_min(magnitude, (fp8_u16x2)0x400) & (uint16_t)0x400u);
++        fp8_u16x2 subnormal = (significand + (((fp8_u16x2)1 << (shift - (uint16_t)1)) - (uint16_t)1) +
++                               ((significand >> shift) & (uint16_t)1)) >> shift;
++        // All ones where |x| < 2^-6 (magnitude - 0x2400 is negative as int16).
++        fp8_u16x2 below = std::bit_cast<fp8_u16x2>(std::bit_cast<fp8_s16x2>(magnitude - (uint16_t)0x2400u) >> (int16_t)15);
++        fp8_u16x2 code = (subnormal & below) | (normal & ~below);
++        code = __builtin_elementwise_min(code, (fp8_u16x2)0x7e);
++        // All ones for NaN (magnitude above 0x7c00).
++        fp8_u16x2 nan = std::bit_cast<fp8_u16x2>(std::bit_cast<fp8_s16x2>((uint16_t)0x7c00u - magnitude) >> (int16_t)15);
++        code |= nan & (uint16_t)0x7fu;
++        code |= (half >> (uint16_t)8) & (uint16_t)0x80u;
++        return uint32_t(code.x) | (uint32_t(code.y) << 8);
++    }
++
+     Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f16x2)(__half2 input)
+     {
+-        auto output = __hip_cvt_halfraw2_to_fp8x2(saturate_infinite_halves(input, 0x5f00u /* 448 */), __HIP_SATFINITE, __HIP_E4M3);
+-        return std::bit_cast<Fp8x2>(output);
++        uint16_t packed = uint16_t(f16x2_to_e4m3x2_satfinite_bits(std::bit_cast<uint32_t>(input)));
++        return std::bit_cast<Fp8x2>(packed);
+     }
+ 
+     Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f16x2)(__half2 input)
+@@ -724,9 +813,33 @@ extern "C"
+         return std::bit_cast<Fp8x2>(output);
+     }
+ 
++    Fp8x2 FUNC(cvt_rn_satfinite_relu_e4m3x2_f16x2)(__half2 input)
++    {
++        return FUNC_CALL(cvt_rn_satfinite_e4m3x2_f16x2)(relu_keep_nan_halves(input));
++    }
++
++    Fp8x2 FUNC(cvt_rn_satfinite_relu_e5m2x2_f16x2)(__half2 input)
++    {
++        return FUNC_CALL(cvt_rn_satfinite_e5m2x2_f16x2)(relu_keep_nan_halves(input));
++    }
++
++    // E4M3 -> f16 is exact. Normals rebias on the bits; the 7 subnormal
++    // codes (m * 2^-9) are f16 normals, computed in f32 so no denormal mode
++    // is involved. NaN (magnitude 0x7f) gives the canonical f16 NaN.
++    __device__ static uint32_t e4m3_to_f16_bits(uint32_t code)
++    {
++        uint32_t magnitude = code & 0x7fu;
++        uint32_t normal = (magnitude << 7) + 0x2000u;
++        uint32_t subnormal = std::bit_cast<uint16_t>(static_cast<_Float16>(float(magnitude & 7u) * 0x1p-9f));
++        uint32_t half = magnitude >= 8u ? normal : subnormal;
++        half = magnitude == 0x7fu ? 0x7fffu : half;
++        return ((code & 0x80u) << 8) | half;
++    }
++
+     __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3 in)
+     {
+-        return in;
++        uint32_t packed = in.__x;
++        return std::bit_cast<__half2>(e4m3_to_f16_bits(packed & 0xffu) | (e4m3_to_f16_bits((packed >> 8) & 0xffu) << 16));
+     }
+ 
+     __half2 FUNC(cvt_rn_f16x2_e5m2x2)(__hip_fp8x2_e5m2 in)
+@@ -1251,6 +1364,7 @@ extern "C"
+ // within one MMA differs from the dot-product fallback.
+ typedef _Float16 wmma_half16 __attribute__((ext_vector_type(16)));
+ typedef float wmma_float8 __attribute__((ext_vector_type(8)));
++typedef float wmma_float4 __attribute__((ext_vector_type(4)));
+ typedef uint32_t wmma_uint8 __attribute__((ext_vector_type(8)));
+ __device__ wmma_float8 __zluda_wmma_f32_16x16x16_f16(wmma_half16 a, wmma_half16 b, wmma_float8 c) __asm("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16");
+ 
+@@ -1377,6 +1491,144 @@ extern "C"
+         return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
+     }
+ 
++    // gfx11 lowering of mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16
++    // (LLVMZludaRewriteMmaF16Wmma with D4R_ZLUDA_WMMA_FP8=1). RDNA3 has no FP8
++    // WMMA, so each K=16 half of the fragments is widened to an m16n8k16 f16
++    // fragment (with the same K permutation as e4m3_a_k16_fragment, applied to
++    // A and B alike), gathered by the f16 helpers above, and the two halves
++    // run as chained f32 WMMAs rounded to f16 once, like the fallback.
++    //
++    // The widening works on bits so it does not depend on the f16 denormal
++    // mode: an E4M3 magnitude placed at f16 bits 7..14 reads as value * 2^-8,
++    // for normals and subnormals alike (both formats keep the implicit bit
++    // rule, exponent biases 7 and 15). Magnitude 0x7f is NaN; widening it to
++    // 0xff sets f16 bit 14 as well, which makes the f16 a NaN too. The 2^-16
++    // scale of each product is undone in f32, where it is exact.
++    __device__ static uint2::Native_vec_ e4m3x4_to_scaled_f16x2x2(uint32_t packed)
++    {
++        uint32_t magnitude = packed & 0x7f7f7f7fu;
++        magnitude |= (magnitude + 0x01010101u) & 0x80808080u;
++        uint32_t sign = packed & 0x80808080u;
++        // v_perm_b32 selector byte 0x0c yields zero; 0..3 pick source bytes.
++        uint32_t low = (__builtin_amdgcn_perm(0u, magnitude, 0x0c010c00u) << 7) |
++                       __builtin_amdgcn_perm(0u, sign, 0x010c000cu);
++        uint32_t high = (__builtin_amdgcn_perm(0u, magnitude, 0x0c030c02u) << 7) |
++                        __builtin_amdgcn_perm(0u, sign, 0x030c020cu);
++        return {low, high};
++    }
++
++    // A fragment (4 words of e4m3) -> K 0..15 then K 16..31 f16 A fragments.
++    wmma_uint8 FUNC(d4r_wmma_e4m3_a_to_f16)(uint4::Native_vec_ a)
++    {
++        auto x = e4m3x4_to_scaled_f16x2x2(a.x);
++        auto y = e4m3x4_to_scaled_f16x2x2(a.y);
++        auto z = e4m3x4_to_scaled_f16x2x2(a.z);
++        auto w = e4m3x4_to_scaled_f16x2x2(a.w);
++        return {x.x, y.x, x.y, y.y, z.x, w.x, z.y, w.y};
++    }
++
++    // B fragment (2 words of e4m3) -> K 0..15 then K 16..31 f16 B fragments.
++    uint4::Native_vec_ FUNC(d4r_wmma_e4m3_b_to_f16)(uint2::Native_vec_ b)
++    {
++        auto x = e4m3x4_to_scaled_f16x2x2(b.x);
++        auto y = e4m3x4_to_scaled_f16x2x2(b.y);
++        return {x.x, x.y, y.x, y.y};
++    }
++
++    __device__ static wmma_float8 wmma_e4m3_k32(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                wmma_uint8 b_t_high, wmma_float8 c)
++    {
++        c *= 0x1p-16f;
++        c = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_low), std::bit_cast<wmma_half16>(b_t_low), c);
++        c = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_high), std::bit_cast<wmma_half16>(b_t_high), c);
++        return c * 0x1p16f;
++    }
++
++    uint2::Native_vec_ FUNC(d4r_wmma_t_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                 wmma_uint8 b_t_high, uint2::Native_vec_ c_t)
++    {
++        f16x2 c01 = std::bit_cast<f16x2>(c_t.x);
++        f16x2 c23 = std::bit_cast<f16x2>(c_t.y);
++        wmma_float8 c = {float(c01.x), float(c01.y), float(c23.x), float(c23.y), 0.0f, 0.0f, 0.0f, 0.0f};
++        wmma_float8 d = wmma_e4m3_k32(a_t_low, b_t_low, a_t_high, b_t_high, c);
++        f16x2 d01{static_cast<f16>(d[0]), static_cast<f16>(d[1])};
++        f16x2 d23{static_cast<f16>(d[2]), static_cast<f16>(d[3])};
++        return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma_t_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                                      wmma_uint8 b_t_high, uint2::Native_vec_ c0_t,
++                                                      uint2::Native_vec_ c1_t)
++    {
++        f16x2 c01 = std::bit_cast<f16x2>(c0_t.x);
++        f16x2 c23 = std::bit_cast<f16x2>(c0_t.y);
++        f16x2 c45 = std::bit_cast<f16x2>(c1_t.x);
++        f16x2 c67 = std::bit_cast<f16x2>(c1_t.y);
++        wmma_float8 c = {float(c01.x), float(c01.y), float(c23.x), float(c23.y),
++                         float(c45.x), float(c45.y), float(c67.x), float(c67.y)};
++        wmma_float8 d = wmma_e4m3_k32(a_t_low, b_t_low, a_t_high, b_t_high, c);
++        f16x2 d01{static_cast<f16>(d[0]), static_cast<f16>(d[1])};
++        f16x2 d23{static_cast<f16>(d[2]), static_cast<f16>(d[3])};
++        f16x2 d45{static_cast<f16>(d[4]), static_cast<f16>(d[5])};
++        f16x2 d67{static_cast<f16>(d[6]), static_cast<f16>(d[7])};
++        return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23),
++                std::bit_cast<uint32_t>(d45), std::bit_cast<uint32_t>(d67)};
++    }
++
++    // f32 accumulator shadows (LLVMZludaRewriteMmaF16Wmma): chained MMAs keep
++    // their accumulator as f32 in the transposed WMMA layout (element i is
++    // half i of the f16 layout) and round to f16 only where the NVIDIA
++    // registers are read. In functions with e4m3 MMAs the shadow holds
++    // value * 2^-16, the domain the scaled e4m3 widening accumulates in, so
++    // those MMAs need no scaling at all; f16 MMAs there scale around their
++    // WMMA (up = 2^16, down = 2^-16). Elsewhere both scales are 1.
++    wmma_float4 FUNC(d4r_wmma_s_from_t)(uint2::Native_vec_ t, float scale)
++    {
++        f16x2 c01 = std::bit_cast<f16x2>(t.x);
++        f16x2 c23 = std::bit_cast<f16x2>(t.y);
++        return wmma_float4{float(c01.x), float(c01.y), float(c23.x), float(c23.y)} * scale;
++    }
++
++    uint2::Native_vec_ FUNC(d4r_wmma_t_from_s)(wmma_float4 s, float inverse)
++    {
++        s *= inverse;
++        f16x2 d01{static_cast<f16>(s[0]), static_cast<f16>(s[1])};
++        f16x2 d23{static_cast<f16>(s[2]), static_cast<f16>(s[3])};
++        return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
++    }
++
++    wmma_float4 FUNC(d4r_wmma_s_mma_e4m3)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                          wmma_uint8 b_t_high, wmma_float4 c)
++    {
++        wmma_float8 acc = {c[0], c[1], c[2], c[3], 0.0f, 0.0f, 0.0f, 0.0f};
++        acc = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_low), std::bit_cast<wmma_half16>(b_t_low), acc);
++        acc = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_high), std::bit_cast<wmma_half16>(b_t_high), acc);
++        return wmma_float4{acc[0], acc[1], acc[2], acc[3]};
++    }
++
++    wmma_float8 FUNC(d4r_wmma_s_mma_e4m3_pair)(wmma_uint8 a_t_low, wmma_uint8 b_t_low, wmma_uint8 a_t_high,
++                                               wmma_uint8 b_t_high, wmma_float4 c0, wmma_float4 c1)
++    {
++        wmma_float8 acc = {c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3]};
++        acc = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_low), std::bit_cast<wmma_half16>(b_t_low), acc);
++        return __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t_high), std::bit_cast<wmma_half16>(b_t_high), acc);
++    }
++
++    wmma_float4 FUNC(d4r_wmma_s_mma_f16)(wmma_uint8 a_t, wmma_uint8 b_t, wmma_float4 c, float up, float down)
++    {
++        wmma_float8 acc = {c[0] * up, c[1] * up, c[2] * up, c[3] * up, 0.0f, 0.0f, 0.0f, 0.0f};
++        acc = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t), std::bit_cast<wmma_half16>(b_t), acc);
++        return wmma_float4{acc[0], acc[1], acc[2], acc[3]} * down;
++    }
++
++    wmma_float8 FUNC(d4r_wmma_s_mma_f16_pair)(wmma_uint8 a_t, wmma_uint8 b_t, wmma_float4 c0, wmma_float4 c1, float up,
++                                              float down)
++    {
++        wmma_float8 acc = {c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3]};
++        acc = __zluda_wmma_f32_16x16x16_f16(std::bit_cast<wmma_half16>(a_t), std::bit_cast<wmma_half16>(b_t), acc * up);
++        return acc * down;
++    }
++
+     // NVIDIA accumulator fragment (lane 4g+t: D[g][2t..2t+1] in .x,
+     // D[g+8][2t..2t+1] in .y) -> transposed WMMA layout.
+     uint2::Native_vec_ FUNC(d4r_wmma_t_from_nv)(uint2::Native_vec_ c)
+@@ -1483,15 +1735,15 @@ extern "C"
+     static v4f32 sample_1D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, float coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_sample_lz_1d_v4f32_f32(uint32_t, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.lz.1d.v4f32.f32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
+-        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
++        CONSTANT_DESCRIPTOR v4s32 *sampler_typed = (CONSTANT_DESCRIPTOR v4s32 *)(uintptr_t)sampler;
+         return __llvm_amdgcn_image_sample_lz_1d_v4f32_f32(0xf, coord, *image_typed, *sampler_typed, false, 0, 0);
+     }
+ 
+     static v4f32 sample_1Db(GLOBAL_SPACE void *image, s32 coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_struct_buffer_load_format_v4f32(v4s32, int, int, int, int) __asm("llvm.amdgcn.struct.buffer.load.format.v4f32");
+-        GLOBAL_SPACE v4s32 *image_typed = (GLOBAL_SPACE v4s32 *)image;
++        CONSTANT_DESCRIPTOR v4s32 *image_typed = (CONSTANT_DESCRIPTOR v4s32 *)(uintptr_t)image;
+         return __llvm_amdgcn_struct_buffer_load_format_v4f32(*image_typed, coord, 0, 0, 0);
+     }
+ #define tex_1d(RETURN_TYPE)                                                                                                                                                             \
+@@ -1525,16 +1777,16 @@ extern "C"
+     static v4f32 sample_2D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_sample_lz_2d_v4f32_f32(uint32_t, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.lz.2d.v4f32.f32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
+-        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
++        CONSTANT_DESCRIPTOR v4s32 *sampler_typed = (CONSTANT_DESCRIPTOR v4s32 *)(uintptr_t)sampler;
+         return __llvm_amdgcn_image_sample_lz_2d_v4f32_f32(0xf, coord.x, coord.y, *image_typed, *sampler_typed, false, 0, 0);
+     }
+ 
+     static v4f32 sample_2D_level(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord, float lod) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_sample_l_2d_v4f32_f32(uint32_t, float, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.l.2d.v4f32.f32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
+-        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
++        CONSTANT_DESCRIPTOR v4s32 *sampler_typed = (CONSTANT_DESCRIPTOR v4s32 *)(uintptr_t)sampler;
+         return __llvm_amdgcn_image_sample_l_2d_v4f32_f32(0xf, coord.x, coord.y, lod, *image_typed, *sampler_typed, false, 0, 0);
+     }
+     // Integer texture coordinates address texels directly. NVIDIA compiles
+@@ -1544,7 +1796,7 @@ extern "C"
+     static v4f32 fetch_2D(GLOBAL_SPACE void *image, v2s32 coord, int32_t mip) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_load_mip_2d_v4f32_i32(uint32_t, int32_t, int32_t, int32_t, v8s32, int, int) __asm("llvm.amdgcn.image.load.mip.2d.v4f32.i32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
+         return __llvm_amdgcn_image_load_mip_2d_v4f32_i32(0xf, coord.x, coord.y, mip, *image_typed, 0, 0);
+     }
+ 
+@@ -1636,8 +1888,8 @@ extern "C"
+     static v4f32 sample_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v4f32 coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_sample_lz_3d_v4f32_f32(uint32_t, float, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.lz.3d.v4f32.f32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
+-        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
++        CONSTANT_DESCRIPTOR v4s32 *sampler_typed = (CONSTANT_DESCRIPTOR v4s32 *)(uintptr_t)sampler;
+         return __llvm_amdgcn_image_sample_lz_3d_v4f32_f32(0xf, coord.x, coord.y, coord.z, *image_typed, *sampler_typed, false, 0, 0);
+     }
+     static v4f32 sample_or_fetch_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v4f32 coord) __device__
+@@ -1648,7 +1900,7 @@ extern "C"
+     static v4f32 sample_or_fetch_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *, v4s32 coord) __device__
+     {
+         __device__ v4f32 __llvm_amdgcn_image_load_3d_v4f32_i32(uint32_t, int32_t, int32_t, int32_t, v8s32, int, int) __asm("llvm.amdgcn.image.load.3d.v4f32.i32");
+-        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
++        CONSTANT_DESCRIPTOR v8s32 *image_typed = (CONSTANT_DESCRIPTOR v8s32 *)(uintptr_t)image;
+         return __llvm_amdgcn_image_load_3d_v4f32_i32(0xf, coord.x, coord.y, coord.z, *image_typed, 0, 0);
+     }
+ 
+@@ -1682,7 +1934,7 @@ extern "C"
+     static D4rSurfaceHandle load_surface_handle(uint64_t surface_object) __device__
+     {
+         constexpr uint32_t format_offset_dwords = HIP_IMAGE_OBJECT_SIZE_DWORD + HIP_SAMPLER_OBJECT_SIZE_DWORD;
+-        auto words = reinterpret_cast<GLOBAL_SPACE const uint32_t *>(static_cast<uintptr_t>(surface_object));
++        auto words = reinterpret_cast<CONSTANT_DESCRIPTOR const uint32_t *>(static_cast<uintptr_t>(surface_object));
+         return {surface_object, words[format_offset_dwords]};
+     }
+ 
+@@ -2014,29 +2266,40 @@ extern "C"
+             return;
+         int channels = surface_channel_count(order);
+         int pixel_bytes = channel_bytes * channels;
+-        int pixel_x = coord.x / pixel_bytes;
+-        int byte_offset = coord.x - pixel_x * pixel_bytes;
+-        int2 coordinates{pixel_x, coord.y};
+-        auto native_coordinates = get_native_vector(coordinates);
+-        uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+-        // Partial-pixel stores keep the untouched bytes of the existing pixel.
+-        if (byte_offset != 0 || byte_count < pixel_bytes)
++        // An unformatted 32-bit store can span two R16F pixels. Process each
++        // touched pixel so neither half of the PTX byte-addressed write is lost.
++        for (int consumed = 0; consumed < byte_count;)
+         {
+-            auto loaded = __ockl_image_load_2D(image, native_coordinates);
+-            c0 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 0)), data_type);
+-            c1 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 1)), data_type);
+-            c2 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 2)), data_type);
+-            c3 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 3)), data_type);
++            int byte_x = coord.x + consumed;
++            int pixel_x = byte_x / pixel_bytes;
++            int byte_offset = byte_x - pixel_x * pixel_bytes;
++            int chunk_bytes = pixel_bytes - byte_offset;
++            if (chunk_bytes > byte_count - consumed)
++                chunk_bytes = byte_count - consumed;
++            uint32_t fragment = data >> (8 * consumed);
++            int2 coordinates{pixel_x, coord.y};
++            auto native_coordinates = get_native_vector(coordinates);
++            uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++            // Partial-pixel stores keep the untouched bytes of the pixel.
++            if (byte_offset != 0 || chunk_bytes < pixel_bytes)
++            {
++                auto loaded = __ockl_image_load_2D(image, native_coordinates);
++                c0 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 0)), data_type);
++                c1 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 1)), data_type);
++                c2 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 2)), data_type);
++                c3 = surface_encode_channel(surface_select_lane(loaded, surface_memory_channel_lane(order, 3)), data_type);
++            }
++            c0 = surface_merge_channel(c0, 0, channel_bytes, fragment, byte_offset, chunk_bytes);
++            c1 = surface_merge_channel(c1, 1, channel_bytes, fragment, byte_offset, chunk_bytes);
++            c2 = surface_merge_channel(c2, 2, channel_bytes, fragment, byte_offset, chunk_bytes);
++            c3 = surface_merge_channel(c3, 3, channel_bytes, fragment, byte_offset, chunk_bytes);
++            float4 value{surface_lane_value(c0, c1, c2, c3, order, 0, channels, data_type),
++                         surface_lane_value(c0, c1, c2, c3, order, 1, channels, data_type),
++                         surface_lane_value(c0, c1, c2, c3, order, 2, channels, data_type),
++                         surface_lane_value(c0, c1, c2, c3, order, 3, channels, data_type)};
++            __ockl_image_store_2D(image, native_coordinates, __hipMapTo<float4::Native_vec_>(value));
++            consumed += chunk_bytes;
+         }
+-        c0 = surface_merge_channel(c0, 0, channel_bytes, data, byte_offset, byte_count);
+-        c1 = surface_merge_channel(c1, 1, channel_bytes, data, byte_offset, byte_count);
+-        c2 = surface_merge_channel(c2, 2, channel_bytes, data, byte_offset, byte_count);
+-        c3 = surface_merge_channel(c3, 3, channel_bytes, data, byte_offset, byte_count);
+-        float4 value{surface_lane_value(c0, c1, c2, c3, order, 0, channels, data_type),
+-                     surface_lane_value(c0, c1, c2, c3, order, 1, channels, data_type),
+-                     surface_lane_value(c0, c1, c2, c3, order, 2, channels, data_type),
+-                     surface_lane_value(c0, c1, c2, c3, order, 3, channels, data_type)};
+-        __ockl_image_store_2D(image, native_coordinates, __hipMapTo<float4::Native_vec_>(value));
+     }
+ 
+     void FUNC(surfobj_b_2d_v2_b16_zero)(uint64_t surface_object, v2s32 coord, v2s16 value)
+diff --git a/ptx/src/pass/insert_post_saturation.rs b/ptx/src/pass/insert_post_saturation.rs
+index f93509f..05f8709 100644
+--- a/ptx/src/pass/insert_post_saturation.rs
++++ b/ptx/src/pass/insert_post_saturation.rs
+@@ -211,6 +211,7 @@ fn run_instruction<'input>(
+         | ast::Instruction::GridDepControl { .. }
+         | ast::Instruction::LdMatrix { .. }
+         | ast::Instruction::Movmatrix { .. }
++        | ast::Instruction::WmmaMma { .. }
+         | ast::Instruction::Prefetch { .. }
+         | ast::Instruction::Sad { .. }
+         | ast::Instruction::Dp2a { .. }
+diff --git a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+index e6f22a6..4256ae5 100644
+--- a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
++++ b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+@@ -2124,7 +2124,45 @@ enum ExtendedMode<T: Eq + PartialEq> {
+     Kernel(SpirvWord),
+ }
+ 
++// d4r: D4R_ZLUDA_IGNORE_DENORMAL=1 drops only FP32 denormal (.ftz) requirements to avoid mode switches.
++// Keep FP16/FP64 requirements: flushing FP16 values below 2^-14 corrupts K's output and can make its
++// translated attention layers non-finite. The runtime fingerprints code-generation switches in the
++// JIT cache key; native texture code objects must also be rebuilt after changing this policy.
++fn ignore_denormal_modes() -> bool {
++    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *VALUE.get_or_init(|| std::env::var("D4R_ZLUDA_IGNORE_DENORMAL").map_or(false, |v| v.trim() == "1"))
++}
++
+ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
++    let mut modes = get_modes_inner(inst);
++    if ignore_denormal_modes() {
++        modes.denormal_f32 = None;
++    }
++    // d4r: D4R_ZLUDA_DEBUG_MODES=1 prints instructions that need a non-default rounding mode
++    if std::env::var("D4R_ZLUDA_DEBUG_MODES").map_or(false, |v| v == "1") {
++        let odd = |r: Option<RoundingMode>| r.map_or(false, |r| r != RoundingMode::NearestEven);
++        if odd(modes.rounding_f32) || odd(modes.rounding_f16f64) {
++            let what = match inst {
++                ast::Instruction::Cvt { data, .. } => match data.mode {
++                    ast::CvtMode::FPTruncate { is_integer_rounding, .. } => format!("cvt FPTruncate integer_rounding={is_integer_rounding}"),
++                    ast::CvtMode::FPFromSigned { .. } => "cvt FPFromSigned".to_string(),
++                    ast::CvtMode::FPFromUnsigned { .. } => "cvt FPFromUnsigned".to_string(),
++                    _ => "cvt other".to_string(),
++                },
++                ast::Instruction::Div { .. } => "div".to_string(),
++                ast::Instruction::Rcp { .. } => "rcp".to_string(),
++                ast::Instruction::Sqrt { .. } => "sqrt".to_string(),
++                ast::Instruction::Add { .. } | ast::Instruction::Sub { .. } | ast::Instruction::Mul { .. }
++                | ast::Instruction::Fma { .. } | ast::Instruction::Mad { .. } => "arith".to_string(),
++                _ => "other".to_string(),
++            };
++            eprintln!("[d4r-modes] rounding {:?}/{:?}: {what}", modes.rounding_f32, modes.rounding_f16f64);
++        }
++    }
++    modes
++}
++
++fn get_modes_inner<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
+     match inst {
+         // TODO: review it when implementing virtual calls
+         ast::Instruction::Call { .. }
+@@ -2180,6 +2218,7 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
+         | ast::Instruction::GridDepControl { .. }
+         | ast::Instruction::LdMatrix { .. }
+         | ast::Instruction::Movmatrix { .. }
++        | ast::Instruction::WmmaMma { .. }
+         | ast::Instruction::Mma { .. }
+         | ast::Instruction::Prefetch { .. }
+         | ast::Instruction::CreatePolicyFractional { .. }
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index e891c34..8294bb4 100644
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -720,6 +720,7 @@ impl<'a> MethodEmitContext<'a> {
+             | ast::Instruction::ReduxSync { .. }
+             | ast::Instruction::LdMatrix { .. }
+             | ast::Instruction::Movmatrix { .. }
++        | ast::Instruction::WmmaMma { .. }
+             | ast::Instruction::Prmt { .. }
+             | ast::Instruction::Mma { .. }
+             | ast::Instruction::Dp2a { .. }
+diff --git a/ptx/src/pass/replace_instructions_with_functions.rs b/ptx/src/pass/replace_instructions_with_functions.rs
+index 023d14d..77c979f 100644
+--- a/ptx/src/pass/replace_instructions_with_functions.rs
++++ b/ptx/src/pass/replace_instructions_with_functions.rs
+@@ -525,6 +525,12 @@ fn run_instruction<'input>(
+         i @ ptx_parser::Instruction::Movmatrix { .. } => {
+             to_call(resolver, fn_declarations, "movmatrix_m8n8_trans_b16".into(), i)?
+         }
++        i @ ptx_parser::Instruction::WmmaMma { .. } => to_call(
++            resolver,
++            fn_declarations,
++            "wmma_mma_sync_aligned_row_col_m16n16k16_f16_f16".into(),
++            i,
++        )?,
+         i @ ptx_parser::Instruction::Bfe { data, .. } => {
+             let name = ["bfe_", scalar_to_ptx_name(data)].concat();
+             to_call(resolver, fn_declarations, name.into(), i)?
+@@ -689,7 +695,7 @@ fn run_instruction<'input>(
+                 ptx_parser::CvtDetails {
+                     from: ast::ScalarType::F16x2,
+                     to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+-                    mode: _,
++                    mode,
+                 },
+             arguments: _,
+         } => {
+@@ -698,10 +704,11 @@ fn run_instruction<'input>(
+                 ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
+                 _ => unreachable!(),
+             };
++            let relu = fp8_relu_suffix(&mode);
+             to_call(
+                 resolver,
+                 fn_declarations,
+-                format!("cvt_rn_satfinite_{}_f16x2", to).into(),
++                format!("cvt_rn_satfinite{}_{}_f16x2", relu, to).into(),
+                 i,
+             )?
+         }
+@@ -710,7 +717,7 @@ fn run_instruction<'input>(
+                 ptx_parser::CvtDetails {
+                     from: ast::ScalarType::F32,
+                     to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+-                    mode: _,
++                    mode,
+                 },
+             arguments: _,
+         } => {
+@@ -719,12 +726,13 @@ fn run_instruction<'input>(
+                 ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
+                 _ => unreachable!(),
+             };
++            let relu = fp8_relu_suffix(&mode);
+             // Conversions from f32 to f8 must have two source arguments.
+             // satfinite is mandatory for conversions to e4m3x2.
+             to_call(
+                 resolver,
+                 fn_declarations,
+-                format!("cvt_rn_satfinite_{}_f32", to).into(),
++                format!("cvt_rn_satfinite{}_{}_f32", relu, to).into(),
+                 i,
+             )?
+         }
+@@ -853,3 +861,11 @@ fn to_variables<'input>(
+         })
+         .collect::<Vec<_>>()
+ }
++
++// cvt.rn.satfinite.relu to FP8 clamps negative results to +0.
++fn fp8_relu_suffix(mode: &ptx_parser::CvtMode) -> &'static str {
++    match mode {
++        ptx_parser::CvtMode::FPTruncate { relu: true, .. } => "_relu",
++        _ => "",
++    }
++}
+diff --git a/ptx_parser/src/ast.rs b/ptx_parser/src/ast.rs
+index 0d2ca3b..3116b1d 100644
+--- a/ptx_parser/src/ast.rs
++++ b/ptx_parser/src/ast.rs
+@@ -461,6 +461,29 @@ ptx_parser_macros::generate_instruction_type!(
+                 src: T
+             }
+         },
++        // wmma.mma.sync.aligned.row.col.m16n16k16.f16.f16 (d4r): fragments are
++        // 8/8/4/4 .b32 registers; on sm_80+ only a[0..3] and b[0..3] are read,
++        // as two m16n8k16 MMAs sharing A (split in llvm_zluda before WMMA lowering).
++        WmmaMma {
++            arguments<T>: {
++                dst: {
++                    repr: T,
++                    type: { Type::Vector(4, ScalarType::U32) },
++                },
++                src1: {
++                    repr: T,
++                    type: { Type::Vector(8, ScalarType::U32) },
++                },
++                src2: {
++                    repr: T,
++                    type: { Type::Vector(8, ScalarType::U32) },
++                },
++                src3: {
++                    repr: T,
++                    type: { Type::Vector(4, ScalarType::U32) },
++                }
++            }
++        },
+         Mul {
+             type: { Type::from(data.type_()) },
+             data: MulDetails,
+diff --git a/ptx_parser/src/lib.rs b/ptx_parser/src/lib.rs
+index 6820a55..1aa5492 100644
+--- a/ptx_parser/src/lib.rs
++++ b/ptx_parser/src/lib.rs
+@@ -2103,6 +2103,14 @@ derive_parser!(
+         }
+     }
+ 
++    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-wmma-mma
++    // Only the f16 row.col m16n16k16 form (DLSS transformer presets) is supported.
++    wmma.mma.sync.aligned.row.col.m16n16k16.f16.f16 d, a, b, c => {
++        Instruction::WmmaMma {
++            arguments: WmmaMmaArgs { dst: d, src1: a, src2: b, src3: c },
++        }
++    }
++
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-mov
+     mov{.vec}.type  d, a => {
+         Instruction::Mov {
+@@ -2717,10 +2725,22 @@ derive_parser!(
+             arguments:  ast::CvtArgs { dst: d, src: a, src2: b }
+         }
+     }
++    // cvt.rn.satfinite{.relu}.f8x2type.f32       d, a, b;
++    // cvt.rn.satfinite{.relu}.f8x2type.f16x2     d, a;
++    // The form without .relu is handled by the generic rule above.
++    cvt.f8rnd.satfinite.relu.f8x2type.f8_from_type    d, a {, b} => {
++        let data = ast::CvtDetails::new(&mut state.errors, Some(f8rnd), false, false, true, f8x2type, f8_from_type);
++        ast::Instruction::Cvt {
++            data,
++            arguments:  ast::CvtArgs { dst: d, src: a, src2: b }
++        }
++    }
+     // cvt.rna{.satfinite}.tf32.f32               d, a;
+     // cvt.frnd2{.relu}.tf32.f32                   d, a;
+     .ifrnd: RawRoundingMode =   { .rn,  .rz,  .rm,  .rp,  .rni, .rzi, .rmi, .rpi };
+     .frnd2: RawRoundingMode =   { .rn,  .rz };
++    .f8rnd: RawRoundingMode =   { .rn };
++    .f8_from_type: ScalarType = { .f32, .f16x2 };
+     RawRoundingMode =           { .rn };
+     .dtype: ScalarType =        { .u8,   .u16, .u32, .u64,
+                                   .s8,   .s16, .s32, .s64,
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index b441dde..11e7fd5 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -10,6 +10,17 @@ pub(crate) struct Function {
+     pub(crate) base: hipFunction_t,
+     pub(crate) sm_version: u32,
+     pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
++    /// d4r native override: companion kernel (and its grid size, 128 threads per block)
++    /// launched on the same stream, with the same parameters, before every launch.
++    pub(crate) prep: Option<(hipFunction_t, u32)>,
++    /// d4r native override: block z dimension the native kernel is built for (0 = as launched)
++    pub(crate) block_z: u32,
++    /// d4r native override: persistent kernels launch this many workgroups in x (0 = as launched)
++    pub(crate) grid_x: u32,
++    /// d4r native override: byte offset of the u64 parameter that keys the prep kernel's output
++    /// (0 = run the prep before every launch) and the key of the last prep launched
++    pub(crate) prep_key: u32,
++    pub(crate) prep_last: std::sync::atomic::AtomicU64,
+ }
+ 
+ impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
+@@ -128,6 +139,53 @@ pub(crate) fn launch_kernel(
+         }
+         translated_extra_storage.as_mut_ptr()
+     };
++    // the parameter block: kernel_params[0] (a single struct parameter) or the extra buffer
++    let prep_key = if f.prep.is_some() && f.prep_key != 0 {
++        let mut block: *const u8 = std::ptr::null();
++        if !extra.is_null() {
++            let mut i = 0usize;
++            while i + 1 < translated_extra_storage.len() {
++                let token = unsafe { *extra.add(i) } as usize;
++                if token == CU_LAUNCH_PARAM_END_AS_INT as usize {
++                    break;
++                }
++                if token == CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as usize {
++                    block = unsafe { *extra.add(i + 1) } as *const u8;
++                }
++                i += 2;
++            }
++        } else if !kernel_params.is_null() {
++            block = unsafe { *kernel_params } as *const u8;
++        }
++        if block.is_null() {
++            0
++        } else {
++            unsafe { std::ptr::read_unaligned(block.add(f.prep_key as usize) as *const u64) }
++        }
++    } else {
++        0
++    };
++    let run_prep = prep_key == 0 || f.prep_last.load(std::sync::atomic::Ordering::Relaxed) != prep_key;
++    if let (Some((prep, blocks)), true) = (f.prep, run_prep) {
++        unsafe {
++            hipModuleLaunchKernel(
++                prep,
++                blocks,
++                1,
++                1,
++                128,
++                1,
++                1,
++                0,
++                stream,
++                kernel_params,
++                extra_for_hip,
++            )
++        }?;
++        f.prep_last.store(prep_key, std::sync::atomic::Ordering::Relaxed);
++    }
++    let block_dim_z = if f.block_z != 0 { f.block_z } else { block_dim_z };
++    let (grid_dim_x, grid_dim_y, grid_dim_z) = if f.grid_x != 0 { (f.grid_x, 1, 1) } else { (grid_dim_x, grid_dim_y, grid_dim_z) };
+     unsafe {
+         hipModuleLaunchKernel(
+             f.base,
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 0fbc7f7..ea47914 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -37,12 +37,23 @@ impl ModuleMutable {
+         Ok(match self.functions.entry(name) {
+             hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+             hash_map::Entry::Vacant(entry) => {
+-                let mut func_handle = unsafe { std::mem::zeroed() };
+-                unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
++                let (func_handle, prep, block_z, grid_x, prep_key) = match native_override(entry.key()) {
++                    Some(native) => native,
++                    None => {
++                        let mut func_handle = unsafe { std::mem::zeroed() };
++                        unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
++                        (func_handle, None, 0, 0, 0)
++                    }
++                };
+                 let func = Box::new(Function {
+                     base: func_handle,
+                     sm_version,
+                     explicit_args_size_align,
++                    prep,
++                    block_z,
++                    grid_x,
++                    prep_key,
++                    prep_last: std::sync::atomic::AtomicU64::new(0),
+                 });
+                 &*entry.insert(func)
+             }
+@@ -50,6 +61,78 @@ impl ModuleMutable {
+     }
+ }
+ 
++/// d4r: hand-written native replacement for a PTX kernel. With D4R_ZLUDA_NATIVE_DIR set, a kernel
++/// NAME is served from DIR/NAME.hsaco when that file exists (same name, launch shape and parameter
++/// block as the PTX kernel). An optional NAME_prep kernel in the same code object runs first on the
++/// same stream with `d4r_prep_blocks` (a u32 global in the code object) blocks of 128 threads.
++/// An optional u32 global `d4r_block_z` replaces the launch's block z dimension, and `d4r_grid_x`
++/// (persistent kernels, which derive the original grid from their parameters) the grid.
++fn native_override(name: &CStr) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, u32)> {
++    let dir = std::env::var_os("D4R_ZLUDA_NATIVE_DIR")?;
++    let path = std::path::Path::new(&dir).join(format!("{}.hsaco", name.to_str().ok()?));
++    let image = fs::read(&path).ok()?;
++    // HIP may reference the image after loading; the override lives for the whole process.
++    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
++    let mut native_module = unsafe { mem::zeroed() };
++    if unsafe { hipModuleLoadData(&mut native_module, image.as_ptr().cast()) }.is_err() {
++        eprintln!("[d4r-native] failed to load {}", path.display());
++        return None;
++    }
++    let mut func = unsafe { mem::zeroed() };
++    if unsafe { hipModuleGetFunction(&mut func, native_module, name.as_ptr()) }.is_err() {
++        eprintln!("[d4r-native] {} has no kernel {:?}", path.display(), name);
++        return None;
++    }
++    let prep_name = CString::new(format!("{}_prep", name.to_str().ok()?)).ok()?;
++    let mut prep_func = unsafe { mem::zeroed() };
++    let prep = if unsafe { hipModuleGetFunction(&mut prep_func, native_module, prep_name.as_ptr()) }.is_ok() {
++        let mut blocks_ptr = unsafe { mem::zeroed() };
++        let mut size = 0usize;
++        let mut blocks = 0u32;
++        let found = unsafe {
++            hipModuleGetGlobal(&mut blocks_ptr, &mut size, native_module, c"d4r_prep_blocks".as_ptr())
++        }
++        .is_ok()
++            && size == 4
++            && unsafe { hipMemcpyDtoH((&mut blocks as *mut u32).cast(), blocks_ptr, 4) }.is_ok();
++        if !found || blocks == 0 {
++            eprintln!("[d4r-native] {} has {:?} but no d4r_prep_blocks", path.display(), prep_name);
++            return None;
++        }
++        Some((prep_func, blocks))
++    } else {
++        None
++    };
++    let read_u32 = |symbol: &CStr| -> u32 {
++        let mut ptr = unsafe { mem::zeroed() };
++        let mut size = 0usize;
++        let mut value = 0u32;
++        if unsafe { hipModuleGetGlobal(&mut ptr, &mut size, native_module, symbol.as_ptr()) }.is_ok()
++            && size == 4
++            && unsafe { hipMemcpyDtoH((&mut value as *mut u32).cast(), ptr, 4) }.is_ok()
++        {
++            value
++        } else {
++            0
++        }
++    };
++    let block_z = read_u32(c"d4r_block_z");
++    let grid_x = read_u32(c"d4r_grid_x");
++    // byte offset of a u64 in the parameter block that fully determines the prep kernel's output
++    // (the weights pointer): the prep is skipped while it repeats (0 = prep before every launch)
++    let prep_key = read_u32(c"d4r_prep_key_offset");
++    eprintln!(
++        "[d4r-native] {:?} -> {} (prep: {:?}, block_z: {}, grid_x: {}, prep_key: {})",
++        name,
++        path.display(),
++        prep.map(|p| p.1),
++        block_z,
++        grid_x,
++        prep_key
++    );
++    Some((func, prep, block_z, grid_x, prep_key))
++}
++
+ impl ZludaObject for Module {
+     const COOKIE: usize = 0xe9138bd040487d4a;
+ 
+@@ -263,6 +346,8 @@ fn get_best_ptx_and_compile(
+         implicit_max_block: ptx::implicit_max_block(),
+         sched_strategy: ptx::sched_strategy(),
+         wmma: llvm_zluda::compile::wmma_rewrite_requested(),
++        wmma_fp8: llvm_zluda::compile::wmma_fp8_rewrite_requested(),
++        param_provenance: llvm_zluda::compile::param_provenance_enabled(),
+     };
+     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
+         (Some(text), Some(p)) => (|| {
+@@ -302,6 +387,8 @@ struct ExtraCacheAttributes {
+     implicit_max_block: Option<u32>,
+     sched_strategy: Option<&'static str>,
+     wmma: bool,
++    wmma_fp8: bool,
++    param_provenance: bool,
+ }
+ 
+ fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
+@@ -323,9 +410,27 @@ fn zluda_build_version() -> &'static str {
+     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+     VERSION.get_or_init(|| {
+         let sha = env!("VERGEN_GIT_SHA");
+-        match loaded_library_fingerprint() {
++        let base = match loaded_library_fingerprint() {
+             Some(fingerprint) => format!("{sha}+{fingerprint}"),
+             None => sha.to_string(),
++        };
++        // d4r: code-generation switches (D4R_ZLUDA_WMMA, _WMMA_FP8, _IGNORE_DENORMAL, ...) are part of
++        // the key, so toggling one never reuses modules compiled under another setting.
++        let mut switches: Vec<String> = std::env::vars()
++            .filter(|(key, _)| {
++                key.starts_with("D4R_ZLUDA_")
++                    && !matches!(
++                        key.as_str(),
++                        "D4R_ZLUDA_NATIVE_DIR" | "D4R_ZLUDA_DIR" | "D4R_ZLUDA_DUMP_DIR" | "D4R_ZLUDA_DUMP_PTX_DIR" | "D4R_ZLUDA_LIBCUDA"
++                    )
++            })
++            .map(|(key, value)| format!("{key}={}", value.trim()))
++            .collect();
++        switches.sort();
++        if switches.is_empty() {
++            base
++        } else {
++            format!("{base}+{}", switches.join(","))
+         }
+     })
+ }

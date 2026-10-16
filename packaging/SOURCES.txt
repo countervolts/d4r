@@ -1,0 +1,46 @@
+d4r @VERSION@: where every file in this release comes from
+============================================================
+
+Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
+  d4r/nvngx.dll          NGX shim            tools/d4r_nvngx_shim.cpp in the d4r repository
+  d4r/nvcuda.dll         Wine CUDA bridge    tools/wine_nvcuda_bridge.c
+  d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
+                         (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
+  d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
+
+Third-party software, unmodified or patched by d4r:
+  d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0007 applied.
+                         It contains LLVM (Apache License 2.0 with LLVM exceptions).
+                         Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
+  d3d12.dll, d3d12core.dll
+                         vkd3d-proton (GNU LGPL 2.1), https://github.com/HansKristian-Work/vkd3d-proton
+                         commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 and 0002 applied,
+                         built with its build-win64.txt cross file (meson --buildtype release).
+                         Licenses: d4r/licenses/vkd3d-proton-*.txt
+  d4r/rocm/lib/          ROCm 7.2.4 runtime, unmodified, from AMD's Ubuntu 22.04 packages
+                         (https://repo.radeon.com/rocm/apt/7.2.4): HIP (hip-runtime-amd, MIT),
+                         comgr (NCSA; contains LLVM, Apache License 2.0 with LLVM exceptions),
+                         ROCr (hsa-rocr, NCSA) and rocprofiler-register (MIT).
+                         Sources: https://github.com/ROCm/rocm-systems and https://github.com/ROCm/llvm-project,
+                         tag rocm-7.2.4. Licenses: d4r/licenses/ROCm-*
+                         libelf.so.1 (elfutils 0.186, GNU LGPL 3.0 or GPL 2.0) and libnuma.so.1 (numactl 2.0.14,
+                         GNU LGPL 2.1), unmodified, from Ubuntu 22.04's libelf1 and libnuma1 packages; their
+                         sources are Ubuntu's elfutils 0.186-1ubuntu0.1 and numactl 2.0.14-3ubuntu2 source packages.
+                         Licenses: d4r/licenses/ROCm-lib*-copyright.txt
+  dxgi.dll               OptiScaler 0.9.4 (GNU GPL 3.0), unmodified OptiScaler.dll renamed to dxgi.dll.
+                         Source: https://github.com/optiscaler/OptiScaler/tree/v0.9.4
+                         License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
+  OptiScaler.ini         OptiScaler 0.9.4's OptiScaler.ini with the values d4r needs set
+                         (packaging/optiscaler.settings in the d4r repository)
+
+@clean Not included: NVIDIA's DLSS library (nvngx_dlss.dll) and NGX runtime (_nvngx.dll). You supply them
+@clean and are responsible for complying with NVIDIA's license terms.
+@full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever distributes
+@full this zip, not by NVIDIA:
+@full   d4r/nvngx_dlss.dll   NVIDIA DLSS Super Resolution library @DLSS_VERSION@
+@full   d4r/ngx/_nvngx.dll   NVIDIA NGX runtime from NVIDIA's Windows display driver, @NGX_VERSION@
+@full   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code
+@full                        (kernels/tex in the d4r repository), compiled by ZLUDA
+d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.

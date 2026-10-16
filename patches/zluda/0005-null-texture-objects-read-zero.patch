@@ -1,0 +1,40 @@
+From: d4r
+Subject: [PATCH] null texture objects read as zero
+
+CUDA texture object 0 reads as zeros on NVIDIA GPUs, and DLSS samples absent optional inputs
+(its exposure scales, with the flags Ghost of Tsushima uses) that way. A ZLUDA texture object is a
+descriptor pointer, so handle 0 made the GPU read address 0 and fault. Handle 0 now points at an
+all-zero descriptor, which AMD hardware treats as a null resource. Rebuild ptx/lib/*.bc after
+applying (scripts/build_zluda_ptx_helpers.sh).
+---
+--- a/ptx/lib/zluda_ptx_impl.cpp	2026-09-27 16:47:02.815623944 -0400
++++ b/ptx/lib/zluda_ptx_impl.cpp	2026-09-27 16:47:02.815623944 -0400
+@@ -1725,9 +1725,18 @@
+                c;
+     }
+ 
++    // d4r: CUDA texture object 0 reads as zeros on NVIDIA GPUs, and DLSS samples absent optional inputs
++    // (exposure scales) that way. A ZLUDA texture object is a descriptor pointer, so 0 is redirected to
++    // an all-zero descriptor, which AMD hardware treats as a null resource (reads return 0).
++    __device__ static unsigned int d4r_null_texture[32];
++    static uint64_t texture_or_null(uint64_t texobj) __device__
++    {
++        return texobj != 0 ? texobj : uint64_t(uintptr_t(d4r_null_texture));
++    }
++
+     static std::pair<GLOBAL_SPACE void *, GLOBAL_SPACE void *> get_image_and_sampler(uint64_t texobj) __device__
+     {
+-        unsigned int GLOBAL_SPACE *image = (unsigned int GLOBAL_SPACE *)texobj;
++        unsigned int GLOBAL_SPACE *image = (unsigned int GLOBAL_SPACE *)texture_or_null(texobj);
+         unsigned int GLOBAL_SPACE *sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;
+         return {image, sampler};
+     }
+@@ -1868,7 +1877,7 @@
+ #define tex_2d_gather4(COMPONENT)                                                                                                     \
+     v4f32 FUNC(texobj_gather4##COMPONENT##_2d_v4_f32_f32)(uint64_t texobj, v2f32 coord)                                              \
+     {                                                                                                                                  \
+-        auto image = reinterpret_cast<unsigned int CONSTANT_SPACE *>(static_cast<uintptr_t>(texobj));                                 \
++        auto image = reinterpret_cast<unsigned int CONSTANT_SPACE *>(static_cast<uintptr_t>(texture_or_null(texobj)));                                 \
+         auto sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;                                                                        \
+         float2 coordinates{coord.x, coord.y};                                                                                          \
+         auto result = __ockl_image_gather4##COMPONENT##_2D(image, sampler, get_native_vector(coordinates));                           \

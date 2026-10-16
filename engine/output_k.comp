@@ -1,0 +1,397 @@
+#version 460
+// d4r engine, preset K: the output stage (temporal accumulation and upsampling), written from the algorithm
+// described in OUTPUT_K_NOTES.md. One 16x16 workgroup shades a 16x16 block of output pixels.
+//   1. The block's footprint of the render-resolution colour (up to 24x24 texels) is range-compressed, converted to
+//      YCoCg and staged in shared memory (with depth, unless the motion is display-resolution).
+//   2. Motion comes from the nearest of the diagonal depth neighbours (display-resolution: the pixel's own vector); it locates the history.
+//   3. The 2x-resolution luma history is resampled with a sharpened Catmull-Rom filter at the four sub-pixels.
+//   4. The current luma is filtered at the four sub-pixels with twelve taps of an anisotropic Gaussian whose shape
+//      comes from a table indexed by two network outputs.
+//   5. History and current are blended per sub-pixel with a confidence from the tap geometry; chroma follows luma.
+// Not handled (the reference kernel has them, the captured frames do not use them): blocks whose footprint exceeds
+// 24x24 texels, and the alternative output modes selected by three flag bytes.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_GOOGLE_include_directive : require
+#include "output_store.glsl"
+#include "round_half.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    vec2 out2rnd, rndOffs;          // render position = (pixel + .5) * out2rnd + rndOffs
+    vec2 near2rnd, sub2rnd;         // the same scale for the nearest-texel lookup; for 2x sub-pixels
+    vec2 out2tok;                   // token column = int(pixel * out2tok) / 2
+    vec2 mvScale, mvOffs;           // previous position = pixel + .5 + mvScale * (mv + mvOffs)
+    vec2 invOut, invOutValid;       // 1 / output size, for the history uv and for the on-screen test
+    ivec2 colOrigin, colMax, depOrigin, depMax, mvOrigin, mvMax, outOrigin, outSize;
+    int tokW, tokH;
+    uint flags;                     // bit 0: reset; bit 1: regular depth (larger is farther), otherwise inverted;
+                                    // bit 2: display-resolution motion (one vector per output pixel, no depth);
+                                    // bits 8..11: which of the model's reconstruction tables this frame uses
+    float expo, expoRatio;          // exposure scale of this frame; previous / current
+    float sharp, minAlpha, alphaThr;
+    float lutScale, kA, kB, c184, c186;
+} p;
+layout(set = 0, binding = 1) uniform sampler2D colorTex;      // render resolution, linear RGB + alpha
+layout(set = 0, binding = 2) uniform sampler2D histTex;       // output resolution: compressed Y, Co, Cg, alpha (bilinear)
+layout(set = 0, binding = 3) uniform sampler2D hiresTex;      // 2x output resolution: compressed luma
+layout(set = 0, binding = 4) uniform sampler2D motionTex;
+layout(set = 0, binding = 5) uniform sampler2D depthTex;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D histOut;
+layout(set = 0, binding = 7, r16ui) uniform writeonly uimage2D hiresOut;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D tokOut;
+layout(set = 0, binding = 9, FINAL_OUTPUT_FORMAT) uniform writeonly image2D finalOut;
+layout(set = 0, binding = 10, std430) readonly buffer Head { float16_t h[]; } head;       // 40 values per token: 4 sub-blocks x 10
+layout(set = 0, binding = 11, std430) readonly buffer Lut { uvec4 e[]; } lut;
+shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
+shared float tileD[576];
+
+// LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no range compression
+#ifndef LDR
+#define LDR 0
+#endif
+#if LDR
+float compressK(float L) { return 1.0; }
+float expandK(float v) { return 1.0; }
+#else
+// The reference's constants and association (output_color_pack): rcp.approx(y + 1), or above 1000
+// rcp.approx(y) * (lg2.approx(fma(y, 9, 1)) * ln2 / 9 + 0xBC4FAE29). Its offset differs by 1.7e-5
+// relative from 0.012676, and folding ln2/9 into one constant moves the result a further ulp.
+float compressK(float L)       // L * compressK(L) maps [0, inf) to [0, 1): Reinhard below 1000, logarithmic above
+{
+    if (L < 1000.0)
+        return 1.0 / (L + 1.0);
+    precise const float t = (log2(fma(L, 9.0, 1.0)) * uintBitsToFloat(0x3F317218u)) / 9.0
+                          + uintBitsToFloat(0xBC4FAE29u);
+    return t / L;
+}
+float expandK(float v)         // v * expandK(v) is the inverse
+{
+    if (v < uintBitsToFloat(0x3F7FBE88u))
+        return 1.0 / (1.0 - v);
+    precise const float y = (v + uintBitsToFloat(0x3C4FAE29u)) * 9.0;
+    return (exp2(y * uintBitsToFloat(0x3FB8AA3Bu)) - 1.0) / (9.0 * v);
+}
+#endif
+float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
+ivec2 clampOrigin(ivec2 v, ivec2 origin, ivec2 hi)      // the reference's clamp: origin for v <= 0, else min(v + origin, hi)
+{
+    return ivec2(v.x > 0 ? min(v.x + origin.x, hi.x) : origin.x, v.y > 0 ? min(v.y + origin.y, hi.y) : origin.y);
+}
+vec4 softIn(vec4 v) { return mix(0.99 + (v - 0.99) * 0.001, v, lessThan(v, vec4(0.99))); }      // stored luma -> working luma
+// Catmull-Rom weights of the four taps around a fraction t
+void crWeights(float t, out float w0, out float w1, out float w2, out float w3)
+{
+    const float t2 = t * t, t3 = t2 * t;
+    w0 = t2 - 0.5 * (t + t3);
+    w1 = 1.5 * t3 - 2.5 * t2 + 1.0;
+    w3 = 0.5 * (t3 - t2);
+    w2 = 1.0 - w0 - w1 - w3;
+}
+// The reference's six coefficients for one filter axis, computed once per pixel: the bilinear split
+// mid = w1 / (w1 + w2) and the four sharpened weights, kept separate from the bilinear pair (folding
+// sharp*(w1-mid) into mid changes the row result by up to a few ulp, which the half-encoded highlight
+// range then amplifies).
+struct CrAxis { float mid, split, s0, s1, s2, s3; };
+CrAxis crAxis(float w0, float w1, float w2, float w3, float mid)
+{
+    return CrAxis(mid, 1.0 - mid, p.sharp * w0, p.sharp * (w1 - mid), p.sharp * (w2 - (1.0 - mid)), p.sharp * w3);
+}
+// One pass along one axis: the two middle taps are bilinear, the four sharpened taps are saturated, and
+// every term is the reference's own rounded product/fma.
+float crPass(float t0, float t1, float t2, float t3, CrAxis c)
+{
+    float t = c.split * t2;
+    t = fma(c.mid, t1, t);
+    t = fma(c.s0, clamp(t0, 0.0, 1.0), t);
+    t = fma(c.s1, clamp(t1, 0.0, 1.0), t);
+    t = fma(c.s2, clamp(t2, 0.0, 1.0), t);
+    t = fma(c.s3, clamp(t3, 0.0, 1.0), t);
+    return t;
+}
+void main()
+{
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    const vec2 pc = vec2(pix) + 0.5;
+    const bool displayMv = (p.flags & 4u) != 0u;
+    // ---------------------------------------------------------------- 1. footprint of the block
+    const vec2 b0 = (vec2(gl_WorkGroupID.xy * 16u) + 0.5) * p.out2rnd + p.rndOffs;
+    const vec2 b1 = (vec2(gl_WorkGroupID.xy * 16u + 15u) + 0.5) * p.out2rnd + p.rndOffs;
+    const ivec2 t0 = ivec2(vec2(roundHalfAway(b0.x), roundHalfAway(b0.y)) - 4.0);
+    const ivec2 t1 = ivec2(vec2(roundHalfAway(b1.x), roundHalfAway(b1.y)) + 4.0);
+    const int tw = t1.x - t0.x + 1, th = t1.y - t0.y + 1;
+    for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256)
+    {
+        const ivec2 t = ivec2(i % tw, i / tw), g = t + t0;
+        const vec4 c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
+        const vec3 rgb = max(c.rgb, 0.0);
+        const float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
+        const float L = p.expo * Y;
+        const float k = compressK(L);
+        tileC[t.y * 24 + t.x] = f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a);
+        // larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones
+        if (!displayMv)
+        {
+            const float depth = texelFetch(depthTex, clampOrigin(g, p.depOrigin, p.depMax), 0).r;
+            tileD[t.y * 24 + t.x] = (p.flags & 2u) != 0u ? -depth : depth;
+        }
+    }
+    memoryBarrierShared(); barrier();
+    // ---------------------------------------------------------------- network outputs of this pixel's 2x2 sub-block
+    const ivec2 tk = ivec2(vec2(pix) * p.out2tok);
+    const uint hbase = uint((tk.y / 2) * p.tokW + tk.x / 2) * 40u + uint((tk.y & 1) * 2 + (tk.x & 1)) * 10u;
+    // sigmoid of a head word (the reference's fma chain: y = x * (x^2 + 27) / fma(x^2, 9, 27), sat(0.5*y + 0.5))
+    const float x = 0.5 * float(head.h[hbase + 9u]);
+    precise const float x2 = x * x;
+    const float sig = clamp(x < -3.0 ? 0.0 : x > 3.0 ? 1.0
+                          : fma((x * (x2 + 27.0)) / fma(x2, 9.0, 27.0), 0.5, 0.5), 0.0, 1.0);
+    // ---------------------------------------------------------------- 2. motion
+    // Render-resolution vectors come from the nearest diagonal depth neighbour; display-resolution ones belong to the pixel.
+    ivec2 mvAt = pix;
+    if (!displayMv)
+    {
+        const vec2 nr = pc * p.near2rnd + p.rndOffs;
+        const ivec2 ni = ivec2(roundHalfAway(nr.x), roundHalfAway(nr.y));
+        const int di = (ni.y - t0.y) * 24 + (ni.x - t0.x);
+        const float d0 = tileD[di], dmm = tileD[di - 25], dpp = tileD[di + 25], dpm = tileD[di - 23], dmp = tileD[di + 23];
+        ivec2 dsel = ivec2(0);
+        if (d0 < 0.5 * (dmm + dpp) - 0.001 * abs(d0) || d0 < 0.5 * (dpm + dmp) - 0.001 * abs(d0))
+        {
+            float m = d0;
+            if (dmm > m) { m = dmm; dsel = ivec2(-1, -1); }
+            if (dpm > m) { m = dpm; dsel = ivec2(1, -1); }
+            if (dmp > m) { m = dmp; dsel = ivec2(-1, 1); }
+            if (dpp > m) { dsel = ivec2(1, 1); }
+        }
+        mvAt = ni + dsel;
+    }
+    const vec2 mv = texelFetch(motionTex, clampOrigin(mvAt, p.mvOrigin, p.mvMax), 0).xy;
+    const vec2 q = pc + p.mvScale * (mv + p.mvOffs);          // where this pixel was, in output pixels
+    const vec2 qv = q * p.invOutValid;
+    bool noHist = (p.flags & 1u) != 0u || qv.x < 0.0 || qv.x > 1.0 || qv.y < 0.0 || qv.y > 1.0;
+    const vec4 hist = textureLod(histTex, q * p.invOut, 0.0);
+    // ---------------------------------------------------------------- 3. luma history at the four sub-pixels
+    vec4 Hq;
+    {
+        const vec2 h = (q - 0.5) * 2.0 + 0.5;
+        const vec2 base = floor(h - 0.5) + 0.5;
+        const vec2 fr = clamp(h - base, 0.0, 1.0);
+        float x0, x1, x2, x3, y0, y1, y2, y3;
+        crWeights(fr.x, x0, x1, x2, x3); crWeights(fr.y, y0, y1, y2, y3);
+        const float mx = x1 / (x1 + x2), my = y1 / (y1 + y2);
+        const vec2 ts = p.invOut * 0.5;
+        // 5x5 texels T[col][row] from nine gathers (gather: x = (0,1), y = (1,1), z = (1,0), w = (0,0))
+        vec4 g00 = textureGather(hiresTex, ts * (base + vec2(-0.5, -0.5)), 0);
+        vec4 g10 = textureGather(hiresTex, ts * (base + vec2(1.5, -0.5)), 0);
+        vec4 g20 = textureGather(hiresTex, ts * (base + vec2(3.5, -0.5)), 0);
+        vec4 g01 = textureGather(hiresTex, ts * (base + vec2(-0.5, 1.5)), 0);
+        vec4 g11 = textureGather(hiresTex, ts * (base + vec2(1.5, 1.5)), 0);
+        vec4 g21 = textureGather(hiresTex, ts * (base + vec2(3.5, 1.5)), 0);
+        vec4 g02 = textureGather(hiresTex, ts * (base + vec2(-0.5, 3.5)), 0);
+        vec4 g12 = textureGather(hiresTex, ts * (base + vec2(1.5, 3.5)), 0);
+        vec4 g22 = textureGather(hiresTex, ts * (base + vec2(3.5, 3.5)), 0);
+        // stored luma at 0.99 and above is an encoding of [0.99, 1): rare enough to branch on
+        const vec4 gm = max(max(max(g00, g10), max(g20, g01)), max(max(g11, g21), max(max(g02, g12), g22)));
+        if (!(max(max(gm.x, gm.y), max(gm.z, gm.w)) < 0.99))
+        {
+            g00 = softIn(g00); g10 = softIn(g10); g20 = softIn(g20); g01 = softIn(g01); g11 = softIn(g11);
+            g21 = softIn(g21); g02 = softIn(g02); g12 = softIn(g12); g22 = softIn(g22);
+        }
+        float T[5][5];      // [row][col]
+        T[0][0] = g00.w; T[0][1] = g00.z; T[1][0] = g00.x; T[1][1] = g00.y;
+        T[0][2] = g10.w; T[0][3] = g10.z; T[1][2] = g10.x; T[1][3] = g10.y;
+        T[0][4] = g20.w; T[1][4] = g20.x;
+        T[2][0] = g01.w; T[2][1] = g01.z; T[3][0] = g01.x; T[3][1] = g01.y;
+        T[2][2] = g11.w; T[2][3] = g11.z; T[3][2] = g11.x; T[3][3] = g11.y;
+        T[2][4] = g21.w; T[3][4] = g21.x;
+        T[4][0] = g02.w; T[4][1] = g02.z; T[4][2] = g12.w; T[4][3] = g12.z; T[4][4] = g22.w;
+        // Each row filtered for the two sub-pixel columns. Stored luma lies in [0, 1), so the clamps of the
+        // sharpened taps do nothing here; the column pass below keeps them (rows can overshoot).
+        const CrAxis cx = crAxis(x0, x1, x2, x3, mx), cy = crAxis(y0, y1, y2, y3, my);
+        float R[5][2];
+        for (int r = 0; r < 5; ++r)
+            for (int c = 0; c < 2; ++c)
+                R[r][c] = crPass(T[r][c], T[r][c + 1], T[r][c + 2], T[r][c + 3], cx);
+        for (int sy = 0; sy < 2; ++sy)
+            for (int sx = 0; sx < 2; ++sx)
+            {
+                const float v = crPass(R[sy][sx], R[sy + 1][sx], R[sy + 2][sx], R[sy + 3][sx], cy);
+                const float lo = min(min(T[sy + 1][sx + 1], T[sy + 1][sx + 2]), min(T[sy + 2][sx + 1], T[sy + 2][sx + 2]));
+                const float hi = max(max(T[sy + 1][sx + 1], T[sy + 1][sx + 2]), max(T[sy + 2][sx + 1], T[sy + 2][sx + 2]));
+                Hq[sy * 2 + sx] = max(min(v, hi), lo);
+            }
+        // the history was compressed with last frame's exposure. The reference always re-exposes
+        // (v' = L * k(L) with L = ratio * (v * g(v))); skipping it when the ratio is exactly 1 leaves the
+        // pre-rounding value, which is not what k(g(v)) costs on a real frame.
+        for (int s = 0; s < 4; ++s)
+        {
+            const float L = p.expoRatio * (Hq[s] * expandK(Hq[s]));
+            Hq[s] = L * compressK(L);
+        }
+    }
+    {
+        precise const float chk = fma(sig, hist.b, fma(hist.r, hist.g, fma(Hq.x, Hq.y, Hq.z * Hq.w)));
+        noHist = noHist || !(abs(chk) < uintBitsToFloat(0x7F800000u));
+    }
+    const float s1 = noHist ? 1.0 : sig, ha = noHist ? 1.0 : hist.a;
+    precise const float f343 = fma(s1, 1.0 - ha, ha);
+    precise const float f344 = fma(ha, 1.0 - s1 * s1, s1 * s1);
+    if (noHist) Hq = vec4(0.0);
+    const vec3 hc = noHist ? vec3(0.0) : hist.rgb;
+    // ---------------------------------------------------------------- current colour, bilinear from the tile
+    // Positions, weights and sums of this part are half floats, as in the reference: the filter below is sensitive
+    // to where the samples sit, and half precision moves them by up to 1/64 texel.
+    const f16vec2 u = f16vec2(pc * p.out2rnd + p.rndOffs - vec2(t0));
+    const ivec2 ui = ivec2(floor(vec2(u)));
+    const f16vec2 uf = clamp(u - f16vec2(ui), float16_t(0.0), float16_t(1.0)), ug = float16_t(1.0) - uf;
+    const int ci = ui.y * 24 + ui.x;
+    f16vec4 curh = tileC[ci] * (ug.x * ug.y);
+    curh = fma(tileC[ci + 1], f16vec4(uf.x * ug.y), curh);
+    curh = fma(tileC[ci + 24], f16vec4(ug.x * uf.y), curh);
+    curh = fma(tileC[ci + 25], f16vec4(uf.x * uf.y), curh);
+    vec4 cur = vec4(curh);
+    // "bright" over the 2x2 pixel quad: the lanes of a subgroup are the pixels of two rows, x + 16 * (y & 1)
+    uint bright = cur.x > 0.8 ? 1u : 0u;
+    bright |= subgroupShuffleXor(bright, 16u);
+    bright |= subgroupShuffleXor(bright, 1u);
+    // ---------------------------------------------------------------- 4. kernel-predicted luma filter
+    const f16vec2 hm = f16vec2(head.h[hbase], head.h[hbase + 1u]);
+    const f16vec2 m = f16vec2(vec2(hm) / vec2(float16_t(1.0) + abs(hm)));
+    const ivec2 mi = clamp(ivec2(roundEven(vec2(m * float16_t(p.lutScale)))) + 8, 0, 15);
+    const uint fl = (bright << 2) | ((sig < 0.25 && f343 < 0.25) ? 2u : 0u) | (p.alphaThr > f343 ? 1u : 0u);
+    const uvec4 le = lut.e[(((p.flags >> 8) & 15u) << 11) | (fl << 8) | uint(mi.x << 4) | uint(mi.y)];
+    const float16_t e0 = uint16BitsToFloat16(uint16_t(le.x & 0xffffu)), e1 = uint16BitsToFloat16(uint16_t(le.x >> 16));
+    const float16_t e2 = uint16BitsToFloat16(uint16_t(le.y & 0xffffu)), slope = uint16BitsToFloat16(uint16_t(le.y >> 16));
+    const bool alongX = (le.z & 0xffffu) == 0u;          // rows of taps step in y, taps within a row step in x
+    const float16_t e5 = uint16BitsToFloat16(uint16_t(le.z >> 16)), e6 = uint16BitsToFloat16(uint16_t(le.w & 0xffffu));
+    // sub-pixel positions in tile coordinates: s = sy * 2 + sx
+    // The reference fuses the scale and the offset and subtracts the tile origin afterwards. The order matters
+    // where a position falls on a half-float rounding tie (a whole output column at some size ratios): any other
+    // order moves those samples by one half-float step, which the recurrent history then spreads over the frame.
+    precise const vec2 sa0 = fma(vec2(pix * 2) + 0.5, p.sub2rnd, p.rndOffs), sa1 = fma(vec2(pix * 2 + 1) + 0.5, p.sub2rnd, p.rndOffs);
+    precise const vec2 sq0 = sa0 - vec2(t0), sq1 = sa1 - vec2(t0);
+    const f16vec2 sp0 = f16vec2(sq0), sp1 = f16vec2(sq1);
+    const f16vec4 subX = f16vec4(sp0.x, sp1.x, sp0.x, sp1.x), subY = f16vec4(sp0.y, sp0.y, sp1.y, sp1.y);
+    const f16vec4 subA = alongX ? subY : subX, subB = alongX ? subX : subY;
+    const float16_t cA = alongX ? u.y : u.x, cB = alongX ? u.x : u.y;
+    const int stepB = alongX ? 1 : 24, stepA = alongX ? 24 : 1;
+    const int a0 = int(floor(float(cA))) - 1;
+    // Every product and sum of the filter is rounded to half precision, as in the reference: with single precision
+    // the result differs visibly more (49 dB against 116 dB on the luma history of the test frames).
+    f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0);
+    const float16_t line0 = cB + (float16_t(a0) - cA) * slope;
+    float16_t line = line0;
+    for (int r = 0; r < 4; ++r)
+    {
+        const int bs = int(roundEven(float(line))) - 1;
+        const f16vec4 dA = float16_t(a0 + r) - subA;
+        f16vec4 db = float16_t(bs) - subB;
+        const f16vec4 cross = dA * e2;
+        f16vec4 lin = fma(db, cross, (dA * dA) * e0);
+        const int ti = (a0 + r) * stepA + bs * stepB;
+        for (int j = 0; j < 3; ++j)
+        {
+            // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
+            const f16vec4 w = exp2(fma(db * db, f16vec4(e1), lin));
+            sumY = fma(w, f16vec4(tileC[ti + j * stepB].x), sumY); sumW += w;
+            db += float16_t(1.0); lin += cross;
+        }
+        line += slope;
+    }
+    vec4 F = vec4(sumY) / vec4(sumW);
+    // Where every exponent is below -12 the result is the tap with the largest exponent instead. That needs all
+    // twelve weights below 2^-12, so the sum of weights rules it out for almost every pixel.
+    if (any(lessThan(sumW, f16vec4(12.5 / 4096.0))))
+    {
+        f16vec4 eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
+        line = line0;
+        for (int r = 0; r < 4; ++r)
+        {
+            const int bs = int(roundEven(float(line))) - 1;
+            const f16vec4 dA = float16_t(a0 + r) - subA;
+            f16vec4 db = float16_t(bs) - subB;
+            const f16vec4 cross = dA * e2;
+            f16vec4 lin = fma(db, cross, (dA * dA) * e0);
+            const int ti = (a0 + r) * stepA + bs * stepB;
+            for (int j = 0; j < 3; ++j)
+            {
+                const f16vec4 E = fma(db * db, f16vec4(e1), lin);
+                const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
+                eMax = mix(eMax, E, gt); yMax = mix(yMax, f16vec4(tileC[ti + j * stepB].x), gt);
+                db += float16_t(1.0); lin += cross;
+            }
+            line += slope;
+        }
+        F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
+    }
+    // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads
+    // it as an f16 value widened to f32 (dlss-0046 converts every lane with cvt.rn.f16.f32 before the
+    // `fma bl, F - Hq, Hq` that forms N), and the normalisation and the low-exponent fallback also produce
+    // halves. Keeping it f32 pulls N a fraction of a half code towards the current luma wherever the history
+    // and the current frame differ, which the recurrent history then carries into the next frames.
+    F = roundHalfValue(F);
+    // ---------------------------------------------------------------- 5. blend
+    f16vec4 conf;
+    {
+        const f16vec4 dA = roundEven(subA) - subA;
+        const f16vec4 ln = fma(dA, f16vec4(slope), subB);
+        const f16vec4 dB = abs(roundEven(ln) - ln);
+        const float16_t kA = float16_t(alongX ? p.kB : p.kA), kB = float16_t(alongX ? p.kA : p.kB);
+        const f16vec4 sA = clamp(fma(abs(dA), f16vec4(kA), f16vec4(4.5)), float16_t(0.0), float16_t(1.0));
+        const f16vec4 sB = clamp(fma(dB, f16vec4(kB), f16vec4(4.5)), float16_t(0.0), float16_t(1.0));
+        conf = fma(sA, f16vec4(e5), f16vec4(e6)) * sB;
+    }
+    const float16_t hv = float16_t(f343), hv2 = float16_t(0.1) + float16_t(0.9) * hv;
+    const float16_t lo = (hv - float16_t(p.c184)) * float16_t(p.c186), hi = (hv2 - float16_t(p.c184)) * float16_t(p.c186);
+    const float16_t avg = float16_t(0.25) * ((conf.x + conf.y) + (conf.z + conf.w));
+    const float alphaC = float(clamp(fma(avg, hv2 - hi, hi), float16_t(0.0), float16_t(1.0)));
+    const vec4 bl = vec4(clamp(fma(conf, f16vec4(hv - lo), f16vec4(lo)), float16_t(0.0), float16_t(1.0)));
+    if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
+    // a single-rounded fma, as the reference: fma.rn.ftz.f32 N, bl, F - Hq, Hq
+    const vec4 N = fma(bl, F - Hq, Hq);
+    // Native averages the four f32 blend registers, before the encoded half-surface stores.
+    {
+        const vec4 enc = mix(fma(N - 0.99, vec4(1000.0), vec4(0.99)), N, lessThan(N, vec4(0.99)));
+        const u16vec4 b = float16BitsToUint16(f16vec4(enc));
+        imageStore(hiresOut, pix * 2, uvec4(b.x)); imageStore(hiresOut, pix * 2 + ivec2(1, 0), uvec4(b.y));
+        imageStore(hiresOut, pix * 2 + ivec2(0, 1), uvec4(b.z)); imageStore(hiresOut, pix * 2 + ivec2(1, 1), uvec4(b.w));
+    }
+    // the reference fuses the history product: fma(hc, 1 - alphaC, alphaC * cur)
+    precise const vec3 C = fma(hc, vec3(1.0 - alphaC), alphaC * cur.xyz);
+    precise const float Nm = 0.25 * (((N.x + N.y) + N.z) + N.w);
+    const vec2 chroma = C.yz / max(C.x, 1e-5) * Nm;
+    {
+        // history colour: chroma limited so that the RGB it stands for stays non-negative
+        const float Y = max(Nm, 0.0);
+        float lim = Y;
+        if (chroma.y - 1e-5 < -Y) lim = 1e-5 - chroma.y;
+        if (chroma.x - chroma.y - 1e-5 < -lim) lim = chroma.y - chroma.x + 1e-5;
+        if (-chroma.x - chroma.y - 1e-5 < -lim) lim = chroma.x + chroma.y + 1e-5;
+        const float sc = lim <= Y ? 1.0 : Y / lim;
+        imageStore(histOut, pix, vec4(Y, chroma * sc, clamp(max(f344 / (f344 + 1.0), p.minAlpha), 0.0, 1.0)));
+    }
+    if (pix.x < p.outSize.x && pix.y < p.outSize.y)
+    {
+        // the reference multiplies by ginv(Nm) first and divides by the exposure afterwards; the other
+        // association (ginv / exposure first) rounds differently before the RGB reconstruction
+        const vec3 ycc = vec3(Nm, chroma) * expandK(Nm) / p.expo;
+        imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(ycc.x + ycc.y - ycc.z, ycc.x + ycc.z, ycc.x - ycc.y - ycc.z, cur.a)));
+    }
+    // ---------------------------------------------------------------- per-token feature for the next frame's input stage
+    if (pix.x < p.tokW && pix.y < p.tokH)
+    {
+        const uint tb = uint(pix.y * p.tokW + pix.x) * 40u;
+        precise vec4 ms;
+        for (uint s = 0u; s < 4u; ++s)
+            ms[s] = 0.2 * (float(head.h[tb + s * 10u + 3u]) + float(head.h[tb + s * 10u + 4u]) + float(head.h[tb + s * 10u + 5u])
+                         + float(head.h[tb + s * 10u + 6u]) + float(head.h[tb + s * 10u + 7u]));
+        // Match the native scalar FMA chain; dot() permits a different association at half-store boundaries.
+        precise float norm = fma(ms.x, ms.x, ms.y * ms.y);
+        norm = fma(ms.z, ms.z, norm);
+        norm = fma(ms.w, ms.w, norm);
+        norm += 1.0;
+        precise const vec4 feature = ms * inversesqrt(norm);
+        imageStore(tokOut, pix, feature);
+    }
+}

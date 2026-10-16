@@ -1,0 +1,160 @@
+#version 460
+// d4r engine, preset M: the input stage, written from the algorithm in M_NOTES.md. Per render pixel it gathers
+// 20 features (the colour, four colours of the previous result along three motion candidates, the recurrent
+// feature, a motion-change measure), rounds them to FP8 with NGX's dither, and embeds each 2x2-pixel token
+// (128 feature slots) into 64 channels with one matrix product per 4x4-token block. It also writes the three
+// motion candidates the reconstruction uses.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_GOOGLE_include_directive : require
+#include "round_half.glsl"
+layout(local_size_x = 32) in;       // one wave: 16 tokens = 8x8 render pixels, two pixels per lane
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 size;             // render size
+    ivec2 shift;            // pixels the block grid is shifted by
+    ivec2 tok;              // token grid
+    vec2 jitter, prevJitter;
+    vec2 mvScale, mvOffs;   // motion texel -> pixels of the 3x image
+    vec2 rnd2hi, hi2rnd;
+    vec2 hiSize;
+    float changeScale, changeGain;
+    uint depthFlag, reset, frame;
+    float expo, expoPrev;
+    float halfInvX, halfInvY, renderInvX, renderInvY; // host-rounded CUDA texture coordinates
+} p;
+layout(set = 0, binding = 1) uniform sampler2D colorTex;
+layout(set = 0, binding = 2) uniform sampler2D motionTex;
+layout(set = 0, binding = 3) uniform sampler2D depthTex;
+layout(set = 0, binding = 4) uniform sampler2D prevMvTex;      // candidate A of the previous frame, bilinear
+layout(set = 0, binding = 5) uniform sampler2D halfTex;        // half-resolution previous result, bilinear
+layout(set = 0, binding = 6) uniform sampler2D featTex;        // recurrent feature, bilinear
+layout(set = 0, binding = 7, rg16f) uniform writeonly image2D mvAOut;
+layout(set = 0, binding = 8, rg16f) uniform writeonly image2D mvBOut;
+layout(set = 0, binding = 9, rg16f) uniform writeonly image2D mvCOut;
+layout(set = 0, binding = 10, std430) readonly buffer W8 { floate4m3_t w[]; } w8;      // [128][64]
+layout(set = 0, binding = 11, std430) readonly buffer W16 { f16vec4 w[]; } w16;        // bias, 16 equal rows of 64
+layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
+layout(set = 0, binding = 13, std430) writeonly buffer Out { floate4m3_t a[]; } outb;  // [tok.y][tok.x][64]
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define HACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define RM gl_CooperativeMatrixLayoutRowMajor
+// NVIDIA's embedding GEMM is chained m16n8k32 mma with an f16 accumulator: the bias is the initial C and every
+// 32 products are summed with one f16 rounding (swin_model.py mma_chain; the same k32 step the native kernels'
+// SWIN_EXACT build implements). K32_ROUND reproduces that: after each pair of k16 cooperative products the
+// accumulator is rounded to f16 through a per-invocation f16 scratch slot (ROUND_HALF_SHARED).
+#ifndef K32_ROUND
+#define K32_ROUND 1
+#endif
+#if K32_ROUND
+#define R32(m) ROUND_HALF_SHARED(m, RS)
+#else
+#define R32(m)
+#endif
+shared floate4m3_t FE[16 * 136];
+shared float16_t RS[gl_WorkGroupSize.x * 8u];
+// PLANES: the tokens in NGX's layout, two planes of 32 channels ([2][tok.y][tok.x][32]), for the HIP network
+#ifndef PLANES
+#define PLANES 0
+#endif
+#include "enc0_features.glsl"
+void gatherPixel(uint pi, ivec2 block, float e1, float e2, bool fusedFourth)
+{
+    floate4m3_t fe[32];
+    gatherFeatures(pi, block, e1, e2, fusedFourth, fe);
+    const uint px = pi & 7u, py = pi >> 3;
+    const uint at = ((py >> 1) * 4u + (px >> 1)) * 136u + ((py & 1u) * 2u + (px & 1u)) * 32u;
+    for (uint k = 0u; k < 32u; ++k) FE[at + k] = fe[k];
+}
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const ivec2 block = 8 * ivec2(gl_WorkGroupID.xy) - p.shift;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    // Static variants preserve the first pixel's FMA; RADV merges a runtime FMA/mul-add selection.
+    gatherPixel(lane, block, e1, e2, true);
+    gatherPixel(lane + 32u, block, e1, e2, false);
+    memoryBarrierShared(); barrier();
+    // Four output accumulators live at once: every FE k16 A operand is loaded once and applied to the four
+    // weight B operands. Each output column group keeps its own K32 chain: two k16 products, then the previous
+    // accumulator added and rounded to f16 (ROUND_HALF_SHARED), exactly as the sequential version did.
+    HACC b0; coopMatLoad(b0, w16.w, 0u, 16u, RM);
+    HACC b1; coopMatLoad(b1, w16.w, 4u, 16u, RM);
+    HACC b2; coopMatLoad(b2, w16.w, 8u, 16u, RM);
+    HACC b3; coopMatLoad(b3, w16.w, 12u, 16u, RM);
+    ACC a0 = ACC(b0), a1 = ACC(b1), a2 = ACC(b2), a3 = ACC(b3);
+    for (uint kt = 0u; kt < 8u; kt += 2u)
+    {
+        A8 x0, x1;
+        coopMatLoad(x0, FE, kt * 16u, 136u, RM);
+        coopMatLoad(x1, FE, (kt + 1u) * 16u, 136u, RM);
+        ACC p0 = ACC(0.0), p1 = ACC(0.0), p2 = ACC(0.0), p3 = ACC(0.0);
+        B8 w0; coopMatLoad(w0, w8.w, kt * 16u * 64u + 0u, 64u, RM); p0 = coopMatMulAdd(x0, w0, p0);
+        B8 w1; coopMatLoad(w1, w8.w, kt * 16u * 64u + 16u, 64u, RM); p1 = coopMatMulAdd(x0, w1, p1);
+        B8 w2; coopMatLoad(w2, w8.w, kt * 16u * 64u + 32u, 64u, RM); p2 = coopMatMulAdd(x0, w2, p2);
+        B8 w3; coopMatLoad(w3, w8.w, kt * 16u * 64u + 48u, 64u, RM); p3 = coopMatMulAdd(x0, w3, p3);
+        B8 y0; coopMatLoad(y0, w8.w, (kt + 1u) * 16u * 64u + 0u, 64u, RM); p0 = coopMatMulAdd(x1, y0, p0);
+        B8 y1; coopMatLoad(y1, w8.w, (kt + 1u) * 16u * 64u + 16u, 64u, RM); p1 = coopMatMulAdd(x1, y1, p1);
+        B8 y2; coopMatLoad(y2, w8.w, (kt + 1u) * 16u * 64u + 32u, 64u, RM); p2 = coopMatMulAdd(x1, y2, p2);
+        B8 y3; coopMatLoad(y3, w8.w, (kt + 1u) * 16u * 64u + 48u, 64u, RM); p3 = coopMatMulAdd(x1, y3, p3);
+        // The k32 product is independent of C: add the previous half accumulator only after both k16s.
+        a0 = p0 + a0; R32(a0);
+        a1 = p1 + a1; R32(a1);
+        a2 = p2 + a2; R32(a2);
+        a3 = p3 + a3; R32(a3);
+    }
+    // Each lane owns one accumulator column (lane & 15) and eight rows (lane >= 16 ? 8..15 : 0..7). The clamped
+    // accumulator is converted to FP8 straight into the packed token, so no staging region or second barrier.
+    //
+    // A lane's eight rows are the tokens (block >> 1) + (r & 3, r >> 2) in the low half and (r & 3, 2 + (r >> 2))
+    // in the high half, so their byte offsets from the lane's first row are affine in r, (r >> 2) * tok.x +
+    // (r & 3) tokens. One base word and eight constants therefore address all eight rows, and a block whose
+    // whole 4x4 token square is on screen (every block but the image border) needs no per-row bounds test.
+#if PLANES
+#define TOK_STRIDE 32u
+#else
+#define TOK_STRIDE 64u
+#endif
+    const uint c16 = lane & 15u, rbase = (lane >> 4u) << 3u;
+    const ivec2 bt = block >> 1;
+    const uint b8 = uint((int(bt.y) + int(rbase >> 2)) * p.tok.x + int(bt.x)) * TOK_STRIDE + c16;
+    const uint X8 = uint(p.tok.x) * TOK_STRIDE;
+#if PLANES
+#define DO_STORE(r, off) { \
+        const uint tb_ = b8 + (off), pb_ = uint(p.tok.x * p.tok.y) * 32u; \
+        outb.a[tb_] = floate4m3_t(clamp(a0[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + 16u] = floate4m3_t(clamp(a1[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + pb_] = floate4m3_t(clamp(a2[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + pb_ + 16u] = floate4m3_t(clamp(a3[r], -6.2831855, 6.2831855)); }
+#else
+#define DO_STORE(r, off) { \
+        const uint tb_ = b8 + (off); \
+        outb.a[tb_] = floate4m3_t(clamp(a0[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + 16u] = floate4m3_t(clamp(a1[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + 32u] = floate4m3_t(clamp(a2[r], -6.2831855, 6.2831855)); \
+        outb.a[tb_ + 48u] = floate4m3_t(clamp(a3[r], -6.2831855, 6.2831855)); }
+#endif
+#define ROW_OFF(r) ((r) < 4 ? (r) * TOK_STRIDE : X8 + ((r) - 4) * TOK_STRIDE)
+    if (bt.x >= 0 && bt.y >= 0 && bt.x + 3 < p.tok.x && bt.y + 3 < p.tok.y)
+    {
+        DO_STORE(0, ROW_OFF(0)); DO_STORE(1, ROW_OFF(1)); DO_STORE(2, ROW_OFF(2)); DO_STORE(3, ROW_OFF(3));
+        DO_STORE(4, ROW_OFF(4)); DO_STORE(5, ROW_OFF(5)); DO_STORE(6, ROW_OFF(6)); DO_STORE(7, ROW_OFF(7));
+    }
+    else
+    {
+#define STORE_ROW(r) { \
+        const ivec2 t_ = bt + ivec2(int(rbase + uint(r)) & 3, int(rbase + uint(r)) >> 2); \
+        if (t_.x >= 0 && t_.y >= 0 && t_.x < p.tok.x && t_.y < p.tok.y) DO_STORE(r, ROW_OFF(r)) }
+        STORE_ROW(0); STORE_ROW(1); STORE_ROW(2); STORE_ROW(3);
+        STORE_ROW(4); STORE_ROW(5); STORE_ROW(6); STORE_ROW(7);
+#undef STORE_ROW
+    }
+#undef DO_STORE
+#undef ROW_OFF
+#undef TOK_STRIDE
+}

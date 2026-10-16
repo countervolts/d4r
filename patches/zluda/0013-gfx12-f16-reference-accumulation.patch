@@ -1,0 +1,151 @@
+﻿diff --git a/llvm_zluda/src/compile.rs b/llvm_zluda/src/compile.rs
+index 5a54417..90c0034 100644
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -158,6 +158,10 @@ fn wmma_rewrite_flags(gcn_arch: &str) -> Option<u32> {
+     let mut flags = if wmma_fp8_rewrite_requested() { 1 } else { 0 };
+     if family == 12 {
+         flags |= 2;
++        // Explicit diagnostic/correctness mode; retain upstream's fast default.
++        if std::env::var("D4R_ZLUDA_WMMA_F16_REFERENCE").is_ok_and(|value| value.trim() == "1") {
++            flags |= 8;
++        }
+         // native FP8 needs gfx12 hardware; the layout shim on gfx11 takes it only for tests (D4R_WMMA12_SHIM)
+         if flags & 1 != 0 && wmma_fp8_native_requested() {
+             flags |= 4;
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+index 07238db..d262fc6 100644
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -970,6 +970,7 @@ static unsigned widenMmaK8(Module *M)
+ // Flags bit 0: also lower m16n8k32 e4m3 MMAs (D4R_ZLUDA_WMMA_FP8=1).
+ // Flags bit 1: gfx12 (RDNA4) WMMA layout: the d4r_wmma12_* helpers.
+ // Flags bit 2 (with bit 1): e4m3 MMAs on native FP8 WMMA: the d4r_wmma12f8_* e4m3 helpers.
++// Flags bit 3 (with bit 1): f64 sum / one f16 round for f16 accumulator MMAs.
+ // The helper sets share one contract (see zluda_ptx_impl.cpp), so only their names change here.
+ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+@@ -999,14 +1000,15 @@ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+     const std::string Arch = Gfx12 ? "__zluda_ptx_impl_d4r_wmma12_" : "__zluda_ptx_impl_d4r_wmma_";
+     const std::string E4m3 = NativeFp8 ? "__zluda_ptx_impl_d4r_wmma12f8_" : Arch;
+     const std::string Widen = NativeFp8 ? E4m3 : "__zluda_ptx_impl_d4r_wmma_";
++    const std::string F16 = Arch + (Gfx12 && (Flags & 8) != 0 ? "t_mma_f16_reference" : "t_mma_f16");
+     Helpers H;
+     H.AFromB = M->getOrInsertFunction((Arch + "t_a_from_b").c_str(), Attributes, V8, V2);
+     H.BFromA = M->getOrInsertFunction((Arch + "t_b_from_a").c_str(), Attributes, V8, V4);
+-    H.Mma = M->getOrInsertFunction((Arch + "t_mma_f16").c_str(), Attributes, V2, V8, V8, V2);
++    H.Mma = M->getOrInsertFunction(F16.c_str(), Attributes, V2, V8, V8, V2);
+     H.FromNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_from_nv", Attributes, V2, V2);
+     H.ToNv = M->getOrInsertFunction("__zluda_ptx_impl_d4r_wmma_t_to_nv", Attributes, V2, V2);
+     H.AFromBPair = M->getOrInsertFunction((Arch + "t_a_from_b_pair").c_str(), Attributes, V8, V2, V2);
+-    H.MmaPair = M->getOrInsertFunction((Arch + "t_mma_f16_pair").c_str(), Attributes, V4, V8, V8, V2, V2);
++    H.MmaPair = M->getOrInsertFunction((F16 + "_pair").c_str(), Attributes, V4, V8, V8, V2, V2);
+     {
+         Type *F = Type::getFloatTy(Context);
+         Type *V4F = FixedVectorType::get(F, 4);
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+index 4ff25dd..36bd6b1 100644
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -1801,6 +1801,78 @@ __device__ static wmma_float8 wmma12_f16(wmma_uint8 a, wmma_uint8 b, wmma_float8
+ #endif
+ }
+ 
++// Correctness baseline for f16-accumulator MMAs. f32 WMMA accumulation may
++// reach the other f16 neighbour around cancellation-heavy rounding midpoints.
++// Keep the existing gfx12 gathers/layout; sum their f16 operands in f64 and
++// round directly to f16 once, matching d4r's independent NumPy/PTX reference.
++// The e4m3 and f32-shadow paths continue using native WMMA.
++__device__ static double wmma12_half_value(uint32_t bits)
++{
++    const uint32_t magnitude = bits & 0x7fffu, exponent = magnitude >> 10;
++    const double value = exponent == 0 ? double(magnitude) * 0x1p-24 :
++        double(std::bit_cast<float>(exponent == 31 ? (0x7f800000u | ((magnitude & 1023u) << 13)) :
++                                     ((magnitude << 13) + 0x38000000u)));
++    return bits & 0x8000u ? -value : value;
++}
++
++// Preserve f16 subnormal result bits even when the target's default f16
++// arithmetic mode flushes them. No intermediate f32 rounding is involved.
++__device__ static uint32_t wmma12_half_round(double value)
++{
++    const uint64_t bits = std::bit_cast<uint64_t>(value);
++    const uint32_t sign = uint32_t(bits >> 48) & 0x8000u;
++    const uint32_t exponent = uint32_t((bits >> 52) & 2047u);
++    const uint64_t fraction = bits & 0xfffffffffffffu;
++    if (exponent == 2047u) return sign | (fraction ? 0x7e00u : 0x7c00u);
++    const int power = int(exponent) - 1023;
++    if (power < -25) return sign;
++    if (power > 15) return sign | 0x7c00u;
++    const unsigned shift = power < -14 ? unsigned(28 - power) : 42u;
++    const uint64_t significand = fraction | 0x10000000000000ull;
++    uint32_t code = uint32_t(significand >> shift);
++    const uint64_t tail = significand & ((uint64_t(1) << shift) - 1);
++    const uint64_t midpoint = uint64_t(1) << (shift - 1);
++    code += tail > midpoint || (tail == midpoint && (code & 1u));
++    if (power >= -14) code += uint32_t(power + 14) << 10;
++    return sign | code;
++}
++
++__device__ static wmma_uint4 wmma12_reference_c(uint2::Native_vec_ c0, uint2::Native_vec_ c1, bool paired)
++{
++    const bool high = wmma12_half() != 0;
++    const uint2::Native_vec_ own = paired && high ? c1 : c0;
++    const uint2::Native_vec_ send = paired && !high ? c1 : c0;
++    const uint2::Native_vec_ other = {wmma12_other_half(send.x), wmma12_other_half(send.y)};
++    const uint2::Native_vec_ even = paired && high ? other : own;
++    const uint2::Native_vec_ odd = paired && high ? own : other;
++    return {(even.x & 0xffffu) | (odd.x << 16), (even.x >> 16) | (odd.x & 0xffff0000u),
++            (even.y & 0xffffu) | (odd.y << 16), (even.y >> 16) | (odd.y & 0xffff0000u)};
++}
++
++__device__ static wmma_uint4 wmma12_f16_reference(wmma_uint8 a, wmma_uint8 b, wmma_uint4 c)
++{
++    // x/y: packed even rows, z/w: packed odd rows, in this half-wave.
++    wmma_uint4 result = {};
++    const uint32_t half = wmma12_half();
++    for (uint32_t i = 0; i < 8; ++i)
++    {
++        const uint32_t row = i + 8 * half;
++        double sum = wmma12_half_value((c[i / 2] >> (16 * (i & 1))) & 0xffffu);
++        for (uint32_t khalf = 0; khalf < 2; ++khalf)
++            for (uint32_t j = 0; j < 4; ++j)
++            {
++                const uint32_t av = wmma_from_lane(row + 16 * khalf, a[j]);
++                const uint32_t other = wmma12_other_half(b[j]);
++                const uint32_t bv = half == khalf ? b[j] : other;
++                sum += wmma12_half_value(av & 0xffffu) * wmma12_half_value(bv & 0xffffu);
++                sum += wmma12_half_value(av >> 16) * wmma12_half_value(bv >> 16);
++            }
++        // Do not round through f32: that can reintroduce the midpoint error.
++        result[(i & 1) * 2 + i / 4] |= wmma12_half_round(sum) << (16 * ((i / 2) & 1));
++    }
++    return result;
++}
++
+ // f32 D' = A' B' + C' for operands whose dwords hold two e4m3 bytes in their low 16 bits (the d4r_wmma12f8
+ // e4m3 "widening" below keeps the bytes): true e4m3 values, no scaling
+ __device__ static wmma_float8 wmma12_e4m3(wmma_uint8 a, wmma_uint8 b, wmma_float8 c)
+@@ -1959,6 +2031,22 @@ extern "C"
+         return wmma12_t_from_d_pair(wmma12_f16(a_t, b_t, wmma12_c_from_t_pair(c0_t, c1_t)));
+     }
+ 
++    uint2::Native_vec_ FUNC(d4r_wmma12_t_mma_f16_reference)(wmma_uint8 a_t, wmma_uint8 b_t, uint2::Native_vec_ c_t)
++    {
++        const wmma_uint4 rows = wmma12_f16_reference(a_t, b_t, wmma12_reference_c(c_t, c_t, false));
++        const uint2::Native_vec_ other = {wmma12_other_half(rows.z), wmma12_other_half(rows.w)};
++        return wmma12_half() ? other : uint2::Native_vec_{rows.x, rows.y};
++    }
++
++    uint4::Native_vec_ FUNC(d4r_wmma12_t_mma_f16_reference_pair)(wmma_uint8 a_t, wmma_uint8 b_t, uint2::Native_vec_ c0_t, uint2::Native_vec_ c1_t)
++    {
++        const wmma_uint4 rows = wmma12_f16_reference(a_t, b_t, wmma12_reference_c(c0_t, c1_t, true));
++        const bool high = wmma12_half() != 0;
++        const uint32_t r0 = wmma12_other_half(high ? rows.x : rows.z);
++        const uint32_t r1 = wmma12_other_half(high ? rows.y : rows.w);
++        return high ? uint4::Native_vec_{r0, r1, rows.z, rows.w} : uint4::Native_vec_{rows.x, rows.y, r0, r1};
++    }
++
+     wmma_float4 FUNC(d4r_wmma12_s_mma_f16)(wmma_uint8 a_t, wmma_uint8 b_t, wmma_float4 c, float up, float down)
+     {
+         return wmma12_s_from_d(wmma12_f16(a_t, b_t, wmma12_c_from_s(c * up))) * down;

@@ -1,0 +1,7 @@
+#pragma once
+#include <array>
+namespace d4r::diag {
+struct GpuTarget { const char* architecture; unsigned elf_machine; unsigned isa_major; const char* family; };
+inline constexpr std::array<GpuTarget, @d4r_target_count@> gpu_targets = {{
+@d4r_target_cpp_entries@}};
+}

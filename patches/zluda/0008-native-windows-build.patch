@@ -1,0 +1,203 @@
+Windows LLVM-MinGW build, portable helper assertions and optional diagnostic UI.
+Apply after upstream d4r patches 0002 through 0007, on ZLUDA ee2f25a.
+
+diff --git a/ext/highs-sys/build.rs b/ext/highs-sys/build.rs
+--- a/ext/highs-sys/build.rs
++++ b/ext/highs-sys/build.rs
+@@ -66,11 +66,12 @@
+     let linux = target.contains("linux");
+     let mingw = target.contains("pc-windows-gnu");
+     if apple {
+         println!("cargo:rustc-link-lib=dylib=c++");
+     } else if linux || mingw {
+-        println!("cargo:rustc-link-lib=dylib=stdc++");
++        let cxx_library = env::var("CXXSTDLIB").unwrap_or_else(|_| "stdc++".to_owned());
++        println!("cargo:rustc-link-lib=dylib={cxx_library}");
+     }
+     println!("cargo:rerun-if-changed=../HiGHS/highs/interfaces/highs_c_api.h");
+ 
+     true
+ }
+diff --git a/ext/hip_runtime-sys/build.rs b/ext/hip_runtime-sys/build.rs
+--- a/ext/hip_runtime-sys/build.rs
++++ b/ext/hip_runtime-sys/build.rs
+@@ -1,8 +1,12 @@
+ fn main() {
+     if cfg!(windows) {
+-        println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
++        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
++            println!("cargo:rustc-link-arg=-Wl,--delayload=amdhip64_7.dll");
++        } else {
++            println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
++        }
+     } else {
+         println!("cargo:rustc-link-lib=dylib=amdhip64");
+         println!("cargo:rustc-link-search=native=/opt/rocm/lib/");
+     }
+ }
+diff --git a/llvm_zluda/build.rs b/llvm_zluda/build.rs
+--- a/llvm_zluda/build.rs
++++ b/llvm_zluda/build.rs
+@@ -19,10 +19,18 @@
+ 
+ fn main() {
+     let bc_path1 = "src/device-libs/ockl.bc";
+     println!("cargo:rerun-if-changed={}", bc_path1);
+     check_lfs_file(bc_path1);
++
++    println!("cargo:rerun-if-env-changed=ZLUDA_LLVM_BUILD_DIR");
++    if let Some(directory) = env::var_os("ZLUDA_LLVM_BUILD_DIR") {
++        let llvm_build_path = PathBuf::from(directory);
++        println!("cargo:build-path={}", llvm_build_path.display());
++        link_prebuilt_llvm(&llvm_build_path);
++        return;
++    }
+ 
+     let mut cmake = Config::new(r"../ext/llvm-project/llvm");
+     try_use_sccache(&mut cmake);
+     try_use_ninja(&mut cmake);
+     cmake
+@@ -57,16 +65,31 @@
+         cmake.build();
+     }
+     let cmake_profile = cmake.get_profile();
+     let llvm_build_path = get_llvm_build_path(&llvm_dir, cmake_profile);
+     println!("cargo:build-path={}", llvm_build_path.display());
++    link_prebuilt_llvm(&llvm_build_path);
++}
++
++fn link_prebuilt_llvm(llvm_build_path: &PathBuf) {
+     let (cxxflags, ldflags, libdir, lib_names, system_libs) =
+         llvm_config(&llvm_build_path.join("bin/llvm-config")).unwrap();
+     println!("cargo:rustc-link-arg={ldflags}");
+     println!("cargo:rustc-link-search=native={libdir}");
+     for lib in system_libs.split_ascii_whitespace() {
+-        println!("cargo:rustc-link-arg={lib}");
++        if let Some(name) = lib.strip_prefix("-l") {
++            println!("cargo:rustc-link-lib={name}");
++        } else {
++            println!("cargo:rustc-link-arg={lib}");
++        }
++    }
++    // llvm-config omits system libraries on Windows. Propagate these through
++    // this rlib to its final cdylib consumer (link-arg alone cannot do that).
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
++        for library in ["psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll"] {
++            println!("cargo:rustc-link-lib={library}");
++        }
+     }
+     link_lld_components();
+     link_llvm_components(lib_names);
+     compile_cxx_lib(cxxflags, &llvm_build_path);
+ }
+diff --git a/zluda/build.rs b/zluda/build.rs
+--- a/zluda/build.rs
++++ b/zluda/build.rs
+@@ -1,11 +1,15 @@
+ use vergen_gix::{Emitter, Gix};
+ 
+ fn main() {
+     if cfg!(windows) {
+-        println!("cargo:rustc-link-arg=delayimp.lib");
+-        println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
++        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
++            println!("cargo:rustc-link-arg=-Wl,--delayload=amdhip64_7.dll");
++        } else {
++            println!("cargo:rustc-link-arg=delayimp.lib");
++            println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
++        }
+         let dll_path = "bin/nvcudart_hybrid64.dll";
+         println!("cargo:rerun-if-changed={}", dll_path);
+         check_lfs_file(dll_path);
+     }
+     let git = Gix::builder().sha(false).build();
+diff --git a/zluda_windows/src/lib.rs b/zluda_windows/src/lib.rs
+--- a/zluda_windows/src/lib.rs
++++ b/zluda_windows/src/lib.rs
+@@ -11,27 +11,27 @@
+ use uuid::uuid;
+ use widestring::{u16str, U16Str, U16String};
+ use windows::{
+     core::{w, HRESULT, PCWSTR},
+     Win32::{
+-        Foundation::{HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, S_OK, WPARAM},
++        Foundation::{FreeLibrary, HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, S_OK, WPARAM},
+         System::{
+             JobObjects::{
+                 AssignProcessToJobObject, JobObjectExtendedLimitInformation,
+                 SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+             },
+             LibraryLoader::{
+-                GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleExW, LoadLibraryExW,
++                GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LoadLibraryExW,
+                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
++                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+             },
+         },
+         UI::{
+             Controls::{
+-                TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
++                TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+                 TASKDIALOG_NOTIFICATIONS, TDCBF_CLOSE_BUTTON, TDF_ENABLE_HYPERLINKS,
+                 TDN_HYPERLINK_CLICKED, TD_ERROR_ICON,
+             },
+             WindowsAndMessaging::IDCLOSE,
+         },
+@@ -487,11 +487,23 @@
+             pszFooter: PCWSTR::null(),
+             pfCallback: Some(task_dialog_callback),
+             lpCallbackData: 0,
+             cxWidth: 0,
+         };
+-        TaskDialogIndirect(&config, None, None, None).ok();
++        // A CUDA DLL may be loaded by an executable with no Common Controls
++        // v6 activation manifest. Do not make its diagnostic UI an eager DLL
++        // import: comctl32 v5 has no TaskDialogIndirect export.
++        if let Ok(controls) = LoadLibraryExW(w!("comctl32.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) {
++            if let Some(raw) = GetProcAddress(controls, windows::core::s!("TaskDialogIndirect")) {
++                let show: unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> HRESULT =
++                    mem::transmute(raw);
++                let _ = show(&config, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
++            } else {
++                eprintln!("ZLUDA failed to load {}; set HIP_PATH to the selected HIP SDK", redirect_names[0]);
++            }
++            let _ = FreeLibrary(controls);
++        }
+     }
+     result
+ }
+ 
+ unsafe extern "system" fn task_dialog_callback(
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -405,11 +405,26 @@
+                             uint32_t line,
+                             uint64_t function,
+                             uint64_t char_size)
+     {
+         (void)char_size;
++#if defined(_WIN32) || defined(_WIN64)
++        // HIP on Windows only supplies the wide _wassert entry point. Keep the
++        // CUDA assertion's ASCII diagnostics and trap through public OCKL APIs.
++        auto output = __ockl_fprintf_stderr_begin();
++        const char* parts[] = {"CUDA assertion: ", (const char*)message, " at ", (const char*)file,
++                               " in ", (const char*)function, "\n"};
++        for (const char* part : parts) {
++            const char* end = part;
++            while (*end) ++end;
++            output = __ockl_fprintf_append_string_n(output, part, end - part, 0);
++        }
++        __ockl_fprintf_append_args(output, 1, line, 0, 0, 0, 0, 0, 0, 1);
++        __builtin_trap();
++#else
+         [[clang::noinline]] __assert_fail((const char *)message, (const char *)file, line, (const char *)function);
++#endif
+     }
+ 
+     // * Smallest denormal is 1.4 × 10^-45
+     // * Smallest normal is ~1.175494351 × 10^(-38)
+     // * Now, 1.175494351×10^-38 / 1.4 × 10^-45  = 8396388 + 31/140

@@ -1,0 +1,93 @@
+From fb0adc8714f57647320f0601533ec50331e378b0 Mon Sep 17 00:00:00 2001
+From: xdfnx-dev <b99814152@gmail.com>
+Date: Fri, 2 Oct 2026 14:40:56 +0300
+Subject: [PATCH] Add opt-in RDNA CU/WGP placement for matched native
+ experiments
+
+---
+ llvm_zluda/src/compile.rs | 42 ++++++++++++++++++++++++++++++++++-----
+ ptx/src/pass/llvm/emit.rs |  3 ++-
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/llvm_zluda/src/compile.rs b/llvm_zluda/src/compile.rs
+index 90c0034..6a2f452 100644
+--- a/llvm_zluda/src/compile.rs
++++ b/llvm_zluda/src/compile.rs
+@@ -24,6 +24,37 @@ const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
+ // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
+ const CONSTANT_ADDRESS_SPACE: u32 = 4;
+ 
++/// Opt-in RDNA scheduling experiment; changes placement, not FP semantics.
++pub fn wgp_requested() -> bool {
++    std::env::var("D4R_ZLUDA_WGP").is_ok_and(|value| value.trim() == "1")
++}
++
++fn target_features(wave64: bool, wgp: bool) -> &'static CStr {
++    match (wave64, wgp) {
++        (false, false) => c"-wavefrontsize64,+cumode",
++        (true, false) => c"-wavefrontsize32,+wavefrontsize64,+cumode",
++        (false, true) => c"-wavefrontsize64,-cumode",
++        (true, true) => c"-wavefrontsize32,+wavefrontsize64,-cumode",
++    }
++}
++
++#[cfg(test)]
++mod shader_mode_tests {
++    use super::target_features;
++
++    #[test]
++    fn wgp_changes_only_cu_placement_in_both_wave_modes() {
++        for wave64 in [false, true] {
++            let cu = target_features(wave64, false).to_str().unwrap();
++            let wgp = target_features(wave64, true).to_str().unwrap();
++            assert_eq!(cu.replace("+cumode", "-cumode"), wgp);
++            assert_eq!(cu.contains("+wavefrontsize64"), wave64);
++            assert_eq!(wgp.contains("+wavefrontsize64"), wave64);
++        }
++        assert_eq!(target_features(false, false), c"-wavefrontsize64,+cumode");
++    }
++}
++
+ fn load_module(ctx: &Context, bc: &[u8], name: &std::ffi::CStr) -> Result<Module, String> {
+     let module = Module::try_from_bitcode(ctx, bc, Some(name))
+         .ok_or(("Failed to parse bitcode").to_string())?;
+@@ -229,11 +260,12 @@ pub fn compile(
+     let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
+     // functions without their own target features (the linked helper libraries) take these, so under
+     // D4R_ZLUDA_WAVE64 they must be optimised as wave64 too (lane-id and ballot folding)
+-    let features = if std::env::var("D4R_ZLUDA_WAVE64").map_or(false, |v| v.trim() == "1") {
+-        c"-wavefrontsize32,+wavefrontsize64,+cumode"
+-    } else {
+-        c"-wavefrontsize64,+cumode"
+-    };
++    let wgp = wgp_requested();
++    if wgp && !gcn_arch.starts_with("gfx11") && !gcn_arch.starts_with("gfx12") {
++        return Err(format!("D4R_ZLUDA_WGP requires RDNA3/4, got {gcn_arch}"));
++    }
++    let features = target_features(
++        std::env::var("D4R_ZLUDA_WAVE64").is_ok_and(|v| v.trim() == "1"), wgp);
+ 
+     let mut target = unsafe { std::mem::zeroed() };
+     let mut err = std::ptr::null_mut();
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index 6af2495..8b67c93 100644
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -397,12 +397,13 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+ 
+     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
+         let value = format!(
+-            "{},+cumode{}",
++            "{},{}{}",
+             if crate::pass::wave64_requested() {
+                 "-wavefrontsize32,+wavefrontsize64"
+             } else {
+                 "+wavefrontsize32,-wavefrontsize64"
+             },
++            if llvm_zluda::compile::wgp_requested() { "-cumode" } else { "+cumode" },
+             if cfg!(debug_assertions) {
+                 ",+precise-memory"
+             } else {
+-- 
+2.55.0.windows.5
+

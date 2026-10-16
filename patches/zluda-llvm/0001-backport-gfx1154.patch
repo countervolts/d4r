@@ -1,0 +1,128 @@
+diff --git a/llvm/include/llvm/BinaryFormat/ELF.h b/llvm/include/llvm/BinaryFormat/ELF.h
+index e619b186d..dd3e9d92b 100644
+--- a/llvm/include/llvm/BinaryFormat/ELF.h
++++ b/llvm/include/llvm/BinaryFormat/ELF.h
+@@ -856,7 +856,7 @@ enum : unsigned {
+   EF_AMDGPU_MACH_AMDGCN_GFX11_GENERIC   = 0x054,
+   EF_AMDGPU_MACH_AMDGCN_GFX1152         = 0x055,
+   EF_AMDGPU_MACH_AMDGCN_RESERVED_0X56   = 0x056,
+-  EF_AMDGPU_MACH_AMDGCN_RESERVED_0X57   = 0x057,
++  EF_AMDGPU_MACH_AMDGCN_GFX1154         = 0x057,
+   EF_AMDGPU_MACH_AMDGCN_GFX1153         = 0x058,
+   EF_AMDGPU_MACH_AMDGCN_GFX12_GENERIC   = 0x059,
+   EF_AMDGPU_MACH_AMDGCN_GFX1251         = 0x05a,
+diff --git a/llvm/include/llvm/TargetParser/TargetParser.h b/llvm/include/llvm/TargetParser/TargetParser.h
+index aad985926..c0aaa465b 100644
+--- a/llvm/include/llvm/TargetParser/TargetParser.h
++++ b/llvm/include/llvm/TargetParser/TargetParser.h
+@@ -109,6 +109,7 @@ enum GPUKind : uint32_t {
+   GK_GFX1151,
+   GK_GFX1152,
+   GK_GFX1153,
++  GK_GFX1154,
+ 
+   GK_GFX1200,
+   GK_GFX1201,
+diff --git a/llvm/lib/Object/ELFObjectFile.cpp b/llvm/lib/Object/ELFObjectFile.cpp
+index f9fda2346..70ddaae22 100644
+--- a/llvm/lib/Object/ELFObjectFile.cpp
++++ b/llvm/lib/Object/ELFObjectFile.cpp
+@@ -591,6 +591,8 @@ StringRef ELFObjectFileBase::getAMDGPUCPUName() const {
+     return "gfx1152";
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1153:
+     return "gfx1153";
++  case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1154:
++    return "gfx1154";
+ 
+   // AMDGCN GFX12.
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1200:
+diff --git a/llvm/lib/ObjectYAML/ELFYAML.cpp b/llvm/lib/ObjectYAML/ELFYAML.cpp
+index d9cce1eb7..7936876f4 100644
+--- a/llvm/lib/ObjectYAML/ELFYAML.cpp
++++ b/llvm/lib/ObjectYAML/ELFYAML.cpp
+@@ -632,6 +632,7 @@ void ScalarBitSetTraits<ELFYAML::ELF_EF>::bitset(IO &IO,
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1151, EF_AMDGPU_MACH);
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1152, EF_AMDGPU_MACH);
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1153, EF_AMDGPU_MACH);
++    BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1154, EF_AMDGPU_MACH);
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1200, EF_AMDGPU_MACH);
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1201, EF_AMDGPU_MACH);
+     BCaseMask(EF_AMDGPU_MACH_AMDGCN_GFX1250, EF_AMDGPU_MACH);
+diff --git a/llvm/lib/Target/AMDGPU/GCNProcessors.td b/llvm/lib/Target/AMDGPU/GCNProcessors.td
+index c6fb31f9c..5d21894a3 100644
+--- a/llvm/lib/Target/AMDGPU/GCNProcessors.td
++++ b/llvm/lib/Target/AMDGPU/GCNProcessors.td
+@@ -304,7 +304,12 @@ def : ProcessorModel<"gfx1153", GFX11SpeedModel,
+   FeatureISAVersion11_5_3.Features
+ >;
+ 
+-// [gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1152, gfx1153]
++// Backported from LLVM 7a0829e41228: actual gfx1154 features and identity.
++def : ProcessorModel<"gfx1154", GFX11SpeedModel,
++  FeatureISAVersion11_5_Common.Features
++>;
++
++// [gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1152, gfx1153, gfx1154]
+ def : ProcessorModel<"gfx11-generic", GFX11SpeedModel,
+   FeatureISAVersion11_Generic.Features
+ >;
+diff --git a/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUTargetStreamer.cpp b/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUTargetStreamer.cpp
+index 5a0857322..c506fc308 100644
+--- a/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUTargetStreamer.cpp
++++ b/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUTargetStreamer.cpp
+@@ -114,6 +114,7 @@ StringRef AMDGPUTargetStreamer::getArchNameFromElfMach(unsigned ElfMach) {
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1151: AK = GK_GFX1151; break;
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1152: AK = GK_GFX1152; break;
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1153: AK = GK_GFX1153; break;
++  case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1154: AK = GK_GFX1154; break;
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1200: AK = GK_GFX1200; break;
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1201: AK = GK_GFX1201; break;
+   case ELF::EF_AMDGPU_MACH_AMDGCN_GFX1250: AK = GK_GFX1250; break;
+@@ -201,6 +202,7 @@ unsigned AMDGPUTargetStreamer::getElfMach(StringRef GPU) {
+   case GK_GFX1151: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1151;
+   case GK_GFX1152: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1152;
+   case GK_GFX1153: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1153;
++  case GK_GFX1154: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1154;
+   case GK_GFX1200: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1200;
+   case GK_GFX1201: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1201;
+   case GK_GFX1250: return ELF::EF_AMDGPU_MACH_AMDGCN_GFX1250;
+diff --git a/llvm/lib/TargetParser/TargetParser.cpp b/llvm/lib/TargetParser/TargetParser.cpp
+index 34b09b14b..39acbb942 100644
+--- a/llvm/lib/TargetParser/TargetParser.cpp
++++ b/llvm/lib/TargetParser/TargetParser.cpp
+@@ -172,6 +172,7 @@ constexpr GPUInfo AMDGCNGPUs[] = {
+     {{"gfx1151"},   {"gfx1151"}, GK_GFX1151, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
+     {{"gfx1152"},   {"gfx1152"}, GK_GFX1152, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
+     {{"gfx1153"},   {"gfx1153"}, GK_GFX1153, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
++    {{"gfx1154"},   {"gfx1154"}, GK_GFX1154, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
+     {{"gfx1200"},   {"gfx1200"}, GK_GFX1200, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
+     {{"gfx1201"},   {"gfx1201"}, GK_GFX1201, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32|FEATURE_WGP},
+     {{"gfx1250"},   {"gfx1250"}, GK_GFX1250, FEATURE_FAST_FMA_F32|FEATURE_FAST_DENORMAL_F32|FEATURE_WAVE32},
+@@ -328,6 +329,7 @@ AMDGPU::IsaVersion AMDGPU::getIsaVersion(StringRef GPU) {
+   case GK_GFX1151: return {11, 5, 1};
+   case GK_GFX1152: return {11, 5, 2};
+   case GK_GFX1153: return {11, 5, 3};
++  case GK_GFX1154: return {11, 5, 4};
+   case GK_GFX1200: return {12, 0, 0};
+   case GK_GFX1201: return {12, 0, 1};
+   case GK_GFX1250: return {12, 5, 0};
+@@ -475,6 +477,7 @@ static void fillAMDGCNFeatureMap(StringRef GPU, const Triple &T,
+     Features["atomic-fmin-fmax-global-f32"] = true;
+     break;
+   case GK_GFX1153:
++  case GK_GFX1154:
+   case GK_GFX1152:
+   case GK_GFX1151:
+   case GK_GFX1150:
+diff --git a/llvm/tools/llvm-readobj/ELFDumper.cpp b/llvm/tools/llvm-readobj/ELFDumper.cpp
+index ab9331690..0ade2d412 100644
+--- a/llvm/tools/llvm-readobj/ELFDumper.cpp
++++ b/llvm/tools/llvm-readobj/ELFDumper.cpp
+@@ -1655,6 +1655,7 @@ const EnumEntry<unsigned> ElfHeaderMipsFlags[] = {
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1151, "gfx1151"),                          \
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1152, "gfx1152"),                          \
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1153, "gfx1153"),                          \
++  ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1154, "gfx1154"),                          \
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1200, "gfx1200"),                          \
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1201, "gfx1201"),                          \
+   ENUM_ENT(EF_AMDGPU_MACH_AMDGCN_GFX1250, "gfx1250"),                          \

@@ -1,0 +1,370 @@
+#version 460
+// Decoder 0's first kernel of preset F (rr2_m.comp KIND 2 with C = 32) for D4R_RR_RELAXED=3, with ONE wave per
+// 8x8-token window where rr2_m.comp uses four. The wave walks the four 16-token slices itself, so every weight, key
+// and value tile is read once per window; the expansion plus skip is computed once and kept in registers; the scores'
+// cross quadrant is computed once and reused transposed (the scores are symmetric); FP8 values are converted in pairs.
+// Shared memory stays at 4 KiB, above which this GPU runs fewer waves (engine/rr/README.md). The arithmetic is
+// rr2_m.comp's with -DRR_RELAXED=2 -DRR_NATIVE and the arena comes out byte-identical to that build
+// (build/rr/f/nv/invest-20261013/REPORT.md: 453 us against 581 us at 1280x720). compile_rr2.py uses it for dec0_0.
+// KIND 4 is encoder 0's block the same way (the embedding of the gather pass's record, the tokens, the guide head to
+// HD), included with RR2_EMBED and RR2_XF_ARENA by the shader engine/rr/gen_rr2_enc0.py --one-wave generates.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#ifndef RR2_EMBED
+layout(local_size_x = 32) in;
+#endif
+#include "rr2_stage.h"
+#include "rr_exact.glsl"
+#if !(KIND == 2 || KIND == 4) || CM != 0 || GUIDE != 0 || C != 32
+#error rr2_w.comp: a 32-channel decoder's first kernel, or encoder 0's block
+#endif
+#if KIND == 4 && !(defined(RR2_EMBED) && defined(RR2_XF_ARENA))
+#error rr2_w.comp: encoder 0's block reads the gather pass's record (gen_rr2_enc0.py --split block --one-wave)
+#endif
+#define MT (C / 16)
+#ifdef RR2_EMBED
+#define PRM(i) param.w[i]
+#define RR2_WGX gl_WorkGroupID.x
+#else
+layout(set = 0, binding = 0, std430) readonly buffer ParamBlock { uint p[]; } param;
+#define PRM(i) param.p[i]
+#define RR2_WGX gl_WorkGroupID.x
+#endif
+layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
+layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
+layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
+layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define HAC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define RM gl_CooperativeMatrixLayoutRowMajor
+#define CMJ gl_CooperativeMatrixLayoutColumnMajor
+#define LDA(dst, base, k, mt, kt) coopMatLoad((dst), w8.w, (base) + 256u * ((mt) * ((k) / 16u) + (kt)), 16u, RM)
+#define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
+#define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); }
+#define Q8(dst, src) Q8PAIRS(dst, src)
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
+
+shared uint XT[16 * C];
+shared uint KVS[512];          // the expansion (input phase), then per head V^T, then QK
+// Shared memory is what limits how many waves this GPU keeps running: above about 4 KiB per wave the rate falls in
+// proportion (build/rr/f/nv/cost/occ2.py). So the input phase borrows KVS, which the attention only needs later
+// (LOW at word 0, EX at word 512), and the block's unquantised input stays in registers (xr), not in memory.
+// (4 KiB in all: the low tokens borrow XT, which is only written after they are in registers; the expansion borrows
+// KVS; V^T is stored, read into registers, and then overwritten by QK.)
+#if KIND == 2 && (4 * CL > 16 * C || 16 * C > 512)
+#error rr2_w.comp: the input phase no longer fits
+#endif
+#define EX_AT 0u
+#if KIND == 4
+uint rr2_xf;                     // the window's record from the gather pass: the index of its first arena word
+shared float16_t HD[64 * 4];     // the guide head per token (raster order), for the translated tail
+const uint EBRANCH = W_EWD1 - W_EWD0;
+#endif
+
+uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
+{
+    return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
+}
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u*h)), uint8_t(w >> (16u*h+8u))))); }
+float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
+
+#ifdef RR2_EMBED
+void rr2_block()
+#else
+void main()
+#endif
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint hl = lane >> 4u, col = lane & 15u;
+    RR_ZERO16 = uint16_t(gl_NumWorkGroups.z - 1u);
+    const int ex = int(PRM(0)), ey = int(PRM(1)), hx = ex / 2, hy = ey / 2;
+    const uint inOff = PRM(2), skOff = PRM(4), outOff = PRM(8), shift = PRM(20);
+    const float16_t s1 = hb(PRM(23) >> 16u), s2 = hb(PRM(24) & 0xffffu), s3 = hb(PRM(24) >> 16u);
+    const int x0 = 8 * int(RR2_WGX) - int(shift & 0xffffu), y0 = 8 * int(gl_WorkGroupID.y) - int(shift >> 16u);
+    const uint plane = uint(ex * ey) * 32u, lplane = uint(hx * hy) * 32u;
+
+#if KIND == 4
+    // ---------------------------------------------------------------- the block's input: x = bu + sum over two
+    // branches of Wu . act(Wd . features + bd); the features are the gather pass's record, read once per slice
+    B8 qx[4][MT];             // x as FP8, this lane's part per token slice (the residual step decodes it again)
+    {
+        B8 fb[4][4];
+        ACC X[4][MT];
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], arena.w, rr2_xf + wv * 256u + 4u * kt, 16u, CMJ);
+            [[unroll]] for (uint m = 0u; m < MT; ++m)
+                [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = float(w16.w[W_EBU / 2u + 16u * m + 8u * hl + uint(i)]);
+        }
+        [[unroll]] for (uint br = 0u; br < 2u; ++br) {
+            A8 ewd[2][4], ewu0[MT], ewu1[MT];
+            [[unroll]] for (uint c = 0u; c < 2u; ++c)
+                [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) LDA(ewd[c][kt], W_EWD0 + EBRANCH * br, 64u, c, kt);
+            [[unroll]] for (uint m = 0u; m < MT; ++m) {
+                LDA(ewu0[m], W_EWU0 + EBRANCH * br, 32u, m, 0u); LDA(ewu1[m], W_EWU0 + EBRANCH * br, 32u, m, 1u);
+            }
+            [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+                B8 Hb[2];
+                [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+                    ACC h;
+                    [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[(W_EBD0 + EBRANCH * br) / 2u + 16u * c + 8u * hl + uint(i)]);
+                    [[unroll]] for (uint kt = 0u; kt < 4u; kt += 2u) K32(h, ewd[c][kt], fb[wv][kt], ewd[c][kt + 1u], fb[wv][kt + 1u])
+                    ACT8(Hb[c], h)
+                }
+                [[unroll]] for (uint m = 0u; m < MT; ++m) K32(X[wv][m], ewu0[m], Hb[0], ewu1[m], Hb[1])
+            }
+        }
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+            [[unroll]] for (uint m = 0u; m < MT; ++m) {
+                Q8(qx[wv][m], X[wv][m])
+                coopMatStore(qx[wv][m], XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
+            }
+    }
+#else
+    // ---------------------------------------------------------------- the block's input: expansion plus skip
+    float16_t xr[4][MT][8];   // this lane's part of x for each token slice: [slice][channel tile][element]
+    {
+        const int X0 = x0 >> 1, Y0 = y0 >> 1;
+        for (uint i = lane; i < 4u * CL; i += 32u) {
+            const uint r = i / (CL / 4u), wd = i % (CL / 4u);
+            const int X = mirror(X0 + int(r & 3u), hx), Y = mirror(Y0 + int(r >> 2u), hy);
+            XT[i] = arena.w[(inOff + (wd >> 3u) * lplane + uint(Y * hx + X) * 32u) / 4u + (wd & 7u)];
+        }
+        B8 lb[CL / 16];
+        [[unroll]] for (uint kt = 0u; kt < CL / 16; ++kt) coopMatLoad(lb[kt], XT, 4u * kt, CL / 4u, CMJ);
+        for (uint m = 0u; m < 4u * MT; ++m) {
+            ACC a;
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (uint kt = 0u; kt < CL / 16; kt += 2u) {
+                A8 w0, w1;
+                LDA(w0, W_WE, CL, m, kt); LDA(w1, W_WE, CL, m, kt + 1u);
+                K32(a, w0, lb[kt], w1, lb[kt + 1u])
+            }
+            B8 q;
+            Q8(q, a)
+            coopMatStore(q, KVS, EX_AT + 4u * m, C, CMJ);
+        }
+        // the same x for the residual step, in this lane's own layout (token slot 16 wv + col, channel slots
+        // 16 m + 8 hl + i = bytes of the words 4 m + 2 hl and 4 m + 2 hl + 1)
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+            const uint k = inter(16u * wv + col);
+            const int kx = x0 + int(k & 7u), ky = y0 + int(k >> 3u);
+            const uint tb = (skOff + uint(mirror(ky, ey) * ex + mirror(kx, ex)) * 32u) / 4u;
+            const uint r = uint(((ky >> 1) - Y0) * 4 + ((kx >> 1) - X0)), s = uint(2 * (ky & 1) + (kx & 1));
+            [[unroll]] for (uint m = 0u; m < MT; ++m)
+                [[unroll]] for (uint h2 = 0u; h2 < 2u; ++h2) {
+                    const uint wd = 4u * m + 2u * hl + h2;
+                    const uint sk = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
+                    const uint e = KVS[EX_AT + r * C + s * (C / 4u) + wd];
+                    [[unroll]] for (uint pair = 0u; pair < 2u; ++pair) {
+                        precise f16vec2 x_p = e4pair(sk, pair) * f16vec2(s3);
+                        precise f16vec2 x = e4pair(e, pair) + x_p;
+                        xr[wv][m][4u * h2 + 2u*pair] = x.x;
+                        xr[wv][m][4u * h2 + 2u*pair+1u] = x.y;
+                    }
+                }
+            [[unroll]] for (uint m = 0u; m < MT; ++m) {
+                B8 q;
+                Q8(q, xr[wv][m])
+                coopMatStore(q, XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
+            }
+        }
+    }
+#endif
+
+    // ---------------------------------------------------------------- attention
+    ACC AT[4][MT];
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+        [[unroll]] for (uint m = 0u; m < MT; ++m)
+            [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = float(w16.w[W_BO / 2u + 16u * m + 8u * hl + uint(i)]);
+    [[unroll]] for (uint hd = 0u; hd < NH; ++hd) {
+        // V^T of every token tile first: stored, read back as the product's A operands, then QK takes its place
+        A8 kt0[4], kt1[4], v0[2][2], v1[2][2], wo0[MT], wo1[MT];
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+            B8 wvt[MT];
+            [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDB(wvt[kt], W_WV0 + HEAD * hd, 32u, kt, c);
+            [[unroll]] for (uint n = 0u; n < 4u; ++n) {
+                ACC v = ACC(0.0);
+                [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
+                    A8 xa0, xa1;
+                    coopMatLoad(xa0, XT, n * 4u * C + 4u * kt, C / 4u, RM);
+                    coopMatLoad(xa1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, RM);
+                    K32(v, xa0, wvt[kt], xa1, wvt[kt + 1u])
+                }
+                A8 va;
+                Q8(va, v)
+                coopMatStore(va, KVS, c * 256u + 4u * n, 16u, RM);
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < 2u; ++c)
+            [[unroll]] for (uint ks = 0u; ks < 2u; ++ks) {
+                coopMatLoad(v0[c][ks], KVS, c * 256u + 8u * ks, 16u, RM);
+                coopMatLoad(v1[c][ks], KVS, c * 256u + 8u * ks + 4u, 16u, RM);
+            }
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+            A8 wk[MT];
+            [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wk[kt], W_WQK0 + HEAD * hd, C, c, kt);
+            [[unroll]] for (uint n = 0u; n < 4u; ++n) {
+                ACC a = ACC(0.0);
+                [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
+                    B8 xb0, xb1;
+                    coopMatLoad(xb0, XT, n * 4u * C + 4u * kt, C / 4u, CMJ);
+                    coopMatLoad(xb1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, CMJ);
+                    K32(a, wk[kt], xb0, wk[kt + 1u], xb1)
+                }
+                A8 ka;
+                Q8(ka, a)
+                coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
+            }
+        }
+        [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
+            coopMatLoad(kt0[kt], KVS, kt * 128u, 8u, RM);
+            coopMatLoad(kt1[kt], KVS, kt * 128u + 4u, 8u, RM);
+        }
+        [[unroll]] for (uint m = 0u; m < MT; ++m) {
+            LDA(wo0[m], W_WO0 + HEAD * hd, 32u, m, 0u); LDA(wo1[m], W_WO0 + HEAD * hd, 32u, m, 1u);
+        }
+        // Preserve all query operands before KVS becomes a 32x32 f16 numerator cache.
+        B8 allQ[4][2];
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(allQ[wv][c], KVS, wv * 128u + 4u * c, 8u, CMJ);
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+            if (wv == 2u) memoryBarrierShared();
+            B8 Pb[4];
+            {
+                float16_t e[4][8];
+                [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
+                    if (wv >= 2u && kt < 2u) {
+                        HAC cached;
+                        // Transpose keys/query roles. Stride is measured in uint words.
+                        coopMatLoad(cached, KVS, (wv - 2u) * 256u + kt * 8u, 16u, CMJ);
+                        [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = cached[i];
+                    } else {
+                        HAC c;
+                        coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
+                        ACC p_ = coopMatMulAdd(kt1[kt], allQ[wv][1], coopMatMulAdd(kt0[kt], allQ[wv][0], ACC(c)));
+                        [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(float16_t(p_[i]))]));
+                        if (wv < 2u && kt >= 2u) {
+                            HAC cached;
+                            [[unroll]] for (int i = 0; i < 8; ++i) cached[i] = e[kt][i];
+                            coopMatStore(cached, KVS, (kt - 2u) * 256u + wv * 8u, 16u, RM);
+                        }
+                    }
+                }
+                f16vec2 ep[4][4];
+                [[unroll]] for (uint kt = 0u; kt < 4u; ++kt)
+                    [[unroll]] for (uint q = 0u; q < 4u; ++q) ep[kt][q] = f16vec2(e[kt][2u * q], e[kt][2u * q + 1u]);
+                precise f16vec2 st[2];
+                [[unroll]] for (uint tq = 0u; tq < 2u; ++tq) {
+                    const uint q0 = 2u * tq, q1 = q0 + 1u;
+                    precise f16vec2 ev = (ep[0][q0] + ep[0][q1]) + (ep[2][q0] + ep[2][q1]);
+                    precise f16vec2 od = (ep[1][q0] + ep[1][q1]) + (ep[3][q0] + ep[3][q1]);
+                    st[tq] = ev + od;
+                }
+                precise f16vec2 loc = st[0] + st[1];
+                const uint other = subgroupShuffleXor(packFloat2x16(loc), 16u);
+                precise f16vec2 o = hl == 0u ? loc + unpackFloat2x16(other) : unpackFloat2x16(other) + loc;
+                precise float16_t rs = o.x + o.y;
+                const float16_t r = float16_t(1.0 / float(rs));
+                const f16vec2 r2 = f16vec2(r, r);
+                [[unroll]] for (uint kt = 0u; kt < 4u; ++kt)
+                    [[unroll]] for (uint q = 0u; q < 4u; ++q) {
+                        precise f16vec2 pv = ep[kt][q] * r2;
+                        { const fe4m3vec2 t_ = fe4m3vec2(pv); Pb[kt][2u * q] = t_.x; Pb[kt][2u * q + 1u] = t_.y; }
+                    }
+            }
+            B8 Ob[2];
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+                ACC o = ACC(0.0);
+                [[unroll]] for (uint ks = 0u; ks < 2u; ++ks) K32(o, v0[c][ks], Pb[2u * ks], v1[c][ks], Pb[2u * ks + 1u])
+                Q8(Ob[c], o)
+            }
+            [[unroll]] for (uint m = 0u; m < MT; ++m) K32(AT[wv][m], wo0[m], Ob[0], wo1[m], Ob[1])
+        }
+    }
+
+    // ---------------------------------------------------------------- r = x + attention * s1; the MLP
+    float rv[4][MT][8];
+    B8 Nb[4][MT];
+    ACC ML[4][MT];
+    const float f1 = float(s1), f2 = float(s2);
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+        [[unroll]] for (uint m = 0u; m < MT; ++m) {
+            [[unroll]] for (int i = 0; i < 8; ++i) {
+#if KIND == 4
+                const float xb = float(qx[wv][m][i]);
+#else
+                const float xb = float(xr[wv][m][i]);
+#endif
+                const float r = fma(AT[wv][m][i], f1, xb);
+                rv[wv][m][i] = r;
+                
+                ML[wv][m][i] = float(w16.w[W_BU / 2u + 16u * m + 8u * hl + uint(i)]);
+            }
+            Q8(Nb[wv][m], rv[wv][m])
+        }
+    [[unroll]] for (uint br = 0u; br < NB; ++br) {
+        const uint w1 = W_WD0 + BRANCH * br, b1 = W_BD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
+        A8 wd[2][MT], wu0[MT], wu1[MT];
+        [[unroll]] for (uint c = 0u; c < 2u; ++c)
+            [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wd[c][kt], w1, C, c, kt);
+        [[unroll]] for (uint m = 0u; m < MT; ++m) { LDA(wu0[m], w2, 32u, m, 0u); LDA(wu1[m], w2, 32u, m, 1u); }
+        [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+            B8 Hb[2];
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+                ACC h;
+                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+                [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(h, wd[c][kt], Nb[wv][kt], wd[c][kt + 1u], Nb[wv][kt + 1u])
+                ACT8(Hb[c], h)
+            }
+            [[unroll]] for (uint m = 0u; m < MT; ++m) K32(ML[wv][m], wu0[m], Hb[0], wu1[m], Hb[1])
+        }
+    }
+
+    // ---------------------------------------------------------------- y = r + MLP * s2: the stage's tokens
+#if KIND == 4
+    A8 wh[MT];
+    [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wh[kt], W_WH, C, 0u, kt);
+#endif
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+        const uint t = inter(16u * wv + col);
+        const int tx = x0 + int(t & 7u), ty = y0 + int(t >> 3u);
+        const bool inside = tx >= 0 && ty >= 0 && tx < ex && ty < ey;
+        const uint o = (outOff + uint(ty * ex + tx) * 32u) >> 2u;
+#if KIND == 4
+        B8 Tm[MT];
+#endif
+        [[unroll]] for (uint m = 0u; m < MT; ++m) {
+            floate4m3_t Tb[8];
+            [[unroll]] for (int i = 0; i < 8; i += 2) {
+                fe4m3vec2 q; saturatedConvertEXT(q, vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1])));
+                Tb[i] = q.x; Tb[i+1] = q.y;
+            }
+#if KIND == 4
+            [[unroll]] for (int i = 0; i < 8; ++i) Tm[m][i] = Tb[i];
+#endif
+            const uint w0 = pack4(Tb[0], Tb[1], Tb[2], Tb[3]), w1 = pack4(Tb[4], Tb[5], Tb[6], Tb[7]);
+            const uint at = 4u * (m & 1u) + 2u * hl;
+            if (inside) { arena.w[o + (m >> 1u) * (plane >> 2u) + at] = w0; arena.w[o + (m >> 1u) * (plane >> 2u) + at + 1u] = w1; }
+        }
+#if KIND == 4
+        {   // the guide head (rows 0-3 on lanes 0-15), for the translated tail
+            ACC hv;
+            [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = float(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+            [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(hv, wh[kt], Tm[kt], wh[kt + 1u], Tm[kt + 1u])
+            if (hl == 0u) [[unroll]] for (uint c = 0u; c < 4u; ++c) HD[t * 4u + c] = float16_t(hv[c]);
+        }
+#endif
+    }
+}

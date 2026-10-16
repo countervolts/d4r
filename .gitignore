@@ -1,0 +1,48 @@
+# Generated artifacts and machine-local dependencies
+/build/
+/dist/
+*.dll
+*.exe
+*.hsaco
+*.cubin
+*.fatbin
+*.obj
+*.o
+*.log
+*.trace
+*.dump
+__pycache__/
+.venv/
+.tools/
+/external/MinHook/
+.vscode/
+/windows/m11/build/
+/windows/m11/.tools/
+/windows/m11/results/**/*.log
+
+# Local agent configuration, instructions, and conversation state (any directory)
+.agents/
+.codex/
+.claude/
+.cursor/
+.gemini/
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+GEMINI.md
+
+# Windows development
+/windows/
+docs/archive
+docs/windows-parity-checklist.md
+test-results/
+
+# Additional compiler, Python, and editor output
+*.pdb
+*.ilk
+*.exp
+*.py[cod]
+.pytest_cache/
+.vs/
+Thumbs.db
+.DS_Store

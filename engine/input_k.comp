@@ -1,0 +1,180 @@
+#version 460
+// d4r engine, preset K: the input stage, written from the algorithm described in INPUT_K_NOTES.md. It turns the frame
+// into the network's input: 16 values per token (4x4 output pixels), four per 2x2-pixel sub-block:
+//   the current luma and the reprojected history luma of one pixel (range-compressed, sRGB-encoded),
+//   one channel of the previous frame's token feature, reprojected and averaged over the token,
+//   and how far the history's colour lies outside the current 3x3 neighbourhood.
+// One thread computes one token (the reference uses one thread per sub-block and warp shuffles for the average).
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    vec2 out2rnd, rndOffs;          // render position = (pixel + .5) * out2rnd - .5 + rndOffs
+    vec2 mvScale, mvOffs;           // previous position = pixel + .5 + mvScale * (mv + mvOffs)
+    vec2 invHist, invValid;         // previous position -> history uv; -> [0, 1] on-screen test
+    vec2 tok2uv;                    // output pixels -> uv of the token feature texture
+    ivec2 colOrigin, colSize, depOrigin, depSize, mvOrigin, mvSize;
+    int tokW;
+    uint flags;                     // bit 0: reset; bit 1: regular depth (larger is farther), otherwise inverted;
+                                    // bit 2: display-resolution motion (one vector per output pixel, no depth)
+    float expo, expoIn, expoRatio;  // exposure of the statistics; of the luma channels; previous / current
+    float minW;
+} p;
+layout(set = 0, binding = 1) uniform sampler2D colorTex;
+layout(set = 0, binding = 2) uniform sampler2D histTex;        // compressed Y, Co, Cg; bilinear, as NGX creates it
+layout(set = 0, binding = 3) uniform sampler2D motionTex;
+layout(set = 0, binding = 4) uniform sampler2D depthTex;
+layout(set = 0, binding = 5) uniform sampler2D featTex;        // previous frame's token feature; bilinear
+layout(set = 0, binding = 6, std430) writeonly buffer Out { f16vec4 v[]; } outb;
+
+float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
+int clamp1(int v, int origin, int hi) { return v > 0 ? min(v + origin, hi) : origin; }
+// The reference's expansion of the stored history luma: rcp.approx(1 - v) below 0.99900102 (its threshold,
+// one ulp above 0.999), otherwise ex2(((v + 0x3C4FAE29) * 9) * log2e) - 1) / (9 v).
+float expandK(float v)
+{
+    if (v < uintBitsToFloat(0x3F7FBE88u))
+        return 1.0 / (1.0 - v);
+    precise const float y = (v + uintBitsToFloat(0x3C4FAE29u)) * 9.0;
+    return (exp2(y * uintBitsToFloat(0x3FB8AA3Bu)) - 1.0) / (9.0 * v);
+}
+vec3 ycocg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, 0.5 * c.g - 0.25 * c.r - 0.25 * c.b); }
+// LDR (the game did not set the HDR flag; NGX's *_ldr_* kernels): the colour is display-referred, so there is no
+// exposure and no range compression: plain averages, a linear contrast weight, and the luma channels go through
+// an inverse and a forward Reinhard curve.
+#ifndef LDR
+#define LDR 0
+#endif
+#if LDR
+float logK(float Y) { return fma(Y, 3.0, 1.0); }
+#else
+float logK(float Y) { precise const float m = max(Y, 0.0); return (log2(fma(m, 12.0, 1.0)) * uintBitsToFloat(0x3F317218u)) / (m + 1e-6); }
+#endif
+float srgb(float v) { const float x = clamp(v, 0.0, 1.0); return x > 0.0031308 ? fma(exp2(log2(x) * (1.0 / 2.4)), 1.055, -0.055) : 12.92 * x; }
+ivec2 nearest(vec2 pixCentre) { const vec2 r = pixCentre * p.out2rnd - 0.5 + p.rndOffs; return ivec2(roundHalfAway(r.x), roundHalfAway(r.y)); }
+// Depth with larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones.
+float depthAt(ivec2 t)
+{
+    const ivec2 hi = p.depOrigin + p.depSize;
+    const float d = texelFetch(depthTex, ivec2(clamp1(t.x, p.depOrigin.x, hi.x), clamp1(t.y, p.depOrigin.y, hi.y)), 0).r;
+    return (p.flags & 2u) != 0u ? -d : d;
+}
+// motion vector of a texel, clamped to the motion rectangle, in output pixels
+vec2 motionTexel(ivec2 t)
+{
+    const ivec2 hi = p.mvOrigin + p.mvSize;
+    return p.mvScale * (texelFetch(motionTex, ivec2(clamp1(t.x, p.mvOrigin.x, hi.x), clamp1(t.y, p.mvOrigin.y, hi.y)), 0).xy + p.mvOffs);
+}
+// motion of the render texel nearest to a pixel, taken from the nearest of its diagonal depth neighbours;
+// with display-resolution vectors (flag 4) t is the pixel itself, and its own vector is used
+vec2 motionOf(ivec2 t)
+{
+    if ((p.flags & 4u) != 0u) return motionTexel(t);
+    const float d0 = depthAt(t), dmm = depthAt(t + ivec2(-1, -1)), dpm = depthAt(t + ivec2(1, -1)), dmp = depthAt(t + ivec2(-1, 1)), dpp = depthAt(t + ivec2(1, 1));
+    ivec2 d = ivec2(0);
+    if (d0 < 0.5 * (dmm + dpp) - 0.001 * abs(d0) || d0 < 0.5 * (dpm + dmp) - 0.001 * abs(d0))
+    {
+        float m = d0;
+        if (dmm > m) { m = dmm; d = ivec2(-1, -1); }
+        if (dpm > m) { m = dpm; d = ivec2(1, -1); }
+        if (dmp > m) { m = dmp; d = ivec2(-1, 1); }
+        if (dpp > m) { d = ivec2(1, 1); }
+    }
+    const ivec2 v = t + d, hi = p.mvOrigin + p.mvSize;
+    return p.mvScale * (texelFetch(motionTex, ivec2(clamp1(v.x, p.mvOrigin.x, hi.x), clamp1(v.y, p.mvOrigin.y, hi.y)), 0).xy + p.mvOffs);
+}
+vec3 colourAt(ivec2 t)       // exposed, non-negative
+{
+    const ivec2 hi = p.colOrigin + p.colSize;
+    return p.expo * max(texelFetch(colorTex, ivec2(clamp1(t.x, p.colOrigin.x, hi.x), clamp1(t.y, p.colOrigin.y, hi.y)), 0).rgb, 0.0);
+}
+void main()
+{
+    const ivec2 tok = ivec2(gl_GlobalInvocationID.xy);
+    const vec2 tokCentre = (vec2(tok) + 0.5) * 4.0;
+    vec4 feat[4];       // the token feature seen from each sub-block
+    vec4 res[4];
+    for (int s = 0; s < 4; ++s)
+    {
+        const ivec2 sub = ivec2(s & 1, s >> 1);
+        const ivec2 X = tok * 4 + sub * 2;                    // top-left pixel of the sub-block
+        // history colour of the four pixels, in linear exposed units of this frame
+        vec3 lin[4];
+        vec2 dq[4];
+        bool invalid = (p.flags & 1u) != 0u;
+        for (int j = 0; j < 4; ++j)
+        {
+            const vec2 pc = vec2(X + ivec2(j & 1, j >> 1)) + 0.5;
+            // display-resolution vectors belong to the pixel itself; render-resolution ones to its nearest texel
+            dq[j] = motionOf((p.flags & 4u) != 0u ? X + ivec2(j & 1, j >> 1) : nearest(pc));
+            const vec2 q = pc + dq[j], qv = q * p.invValid;
+            invalid = invalid || qv.x < 0.0 || qv.x > 1.0 || qv.y < 0.0 || qv.y > 1.0;
+            const vec3 h = textureLod(histTex, q * p.invHist, 0.0).rgb;
+#if LDR
+            lin[j] = h;
+#else
+            lin[j] = (h * expandK(h.r)) * p.expoRatio;
+#endif
+        }
+        // the current 3x3 neighbourhood around the sub-block's centre
+        const ivec2 c0 = nearest(vec2(X) + 1.0);
+        precise vec3 S = vec3(0.0);
+        vec3 lo = vec3(1e30), hi = vec3(-1e30);
+        for (int k = 0; k < 9; ++k)
+        {
+            const vec3 c = ycocg(colourAt(c0 + ivec2(k % 3 - 1, k / 3 - 1)));
+#if LDR
+            S += c;
+#else
+            S = fma(vec3(max(1.0 / (c.x + 1.0), p.minW)), c, S);   // fused in the reference
+#endif
+            const vec3 L = c * logK(c.x);
+            lo = min(lo, L); hi = max(hi, L);
+        }
+        const vec3 m = S * (1.0 / 9.0);
+#if LDR
+        const vec3 avg = m;
+#else
+        const vec3 avg = m / max(1.0 - m.x, p.minW);
+#endif
+        const vec3 A = avg * logK(avg.x);
+        const vec3 halfr = 0.5 * (hi - lo), den = 8.0 * (hi - lo) + 1.0;
+        precise float mismatch = 0.0;
+        for (int j = 0; j < 4; ++j)
+        {
+            // The reference rounds the compressed history before subtracting it. Left to the compiler, the product
+            // is fused into the subtraction, and after the cancellation that leaves the mismatch one half-float
+            // code off in about 3% of the sub-blocks, which the recurrent network then spreads over the frame.
+            precise const vec3 Hl = lin[j] * logK(lin[j].x);
+            precise const vec3 diff = A - Hl;
+            const vec3 d = max(abs(diff) - halfr, 0.0) / den;
+            precise const float e = fma(d.z, 0.5, fma(d.x, 2.0, d.y * 0.5));
+            mismatch += min(e, 1.0);
+        }
+        mismatch *= 0.25;
+        // the sub-block's representative pixel
+        const int jr = 2 * sub.x + (1 - sub.y);
+        const ivec2 pr = X + ivec2(1 - sub.y, sub.x);
+        const vec3 cr = colourAt(nearest(vec2(pr) + 0.5));
+        const float Yc = 0.25 * cr.r + 0.5 * cr.g + 0.25 * cr.b;
+        feat[s] = invalid ? vec4(0.0) : textureLod(featTex, (tokCentre + dq[jr]) * p.tok2uv, 0.0);
+        const float Yh = invalid ? Yc : lin[jr].x;
+        if (invalid) mismatch = 0.0;
+        // luma channels: exposure ratio of the network's own scale (p.expoIn relative to p.expo)
+#if LDR
+        const float tc = p.expoIn * (Yc / max(1.0 - Yc, 0.2)), th = p.expoIn * (Yh / max(1.0 - Yh, 0.2));
+#else
+        const float tc = p.expoIn * Yc, th = p.expoIn * Yh;
+#endif
+        res[s] = vec4(srgb(tc * max(1.0 / (tc + 1.0), p.minW)), srgb(th * max(1.0 / (th + 1.0), p.minW)), 0.0, mismatch);
+    }
+    const vec4 fs = 0.25 * (feat[0] + feat[1] + feat[2] + feat[3]);
+    const uint o = uint(tok.y * p.tokW + tok.x) * 4u;
+    for (int s = 0; s < 4; ++s)
+    {
+        float f = fs[s], mm = res[s].w;
+        if (!(abs(f) < uintBitsToFloat(0x7F800000u))) f = 0.0;
+        if (!(abs(mm) < uintBitsToFloat(0x7F800000u))) mm = 0.0;
+        outb.v[o + uint(s)] = f16vec4(res[s].x, res[s].y, f, mm);
+    }
+}

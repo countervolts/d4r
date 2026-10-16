@@ -1,0 +1,390 @@
+#version 460
+// Native decoder 0 of the DLSS-D (preset E) denoiser, register-resident: cuda_dldn_engine_swin_dec0_kernel computed
+// like engine/rr/enc1_m.comp (whose header explains the transposed products and the slot orders). The arithmetic is
+// engine/rr/dec0_ref.py's (bit-exact to NVIDIA except surface 112's bilinear taps, which NVIDIA's texture unit rounds
+// differently in a few percent of the values by one ulp); binding 1 holds engine/rr/dec0_pack.py's packing.
+//
+// One workgroup per 8x8-token window at the render resolution, four waves:
+//   expand    the 6 x 6 low-resolution tokens under the window and its border (dec1's 64 channels) -> 4 sub-positions
+//             x 32 channels; wave w computes sub-position w, FP8 into EX in slot order
+//   prologue  one key token per thread: expanded + skip (enc0's tokens), RMS norm -> XT; window tokens -> XR (f16)
+//   block     two 32-channel heads and four MLP branches of 32 -> 32 -> 32, as enc1_m with C = 32
+//   outputs   one token per thread: 8 FP8 channels for the output stage (argument 48, [y][x][8]), tanh of four
+//             channels to surface 144, and the kernel-prediction filter of texture 88 (bilinear from half resolution)
+//             blended with textures 96 / 104 to surface 112
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#ifndef RR_GFX11
+#extension GL_EXT_float_e4m3 : require
+#endif
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 128) in;
+#include "dec0_m_w.h"
+#include "rr_exact.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer ParamBlock { uint p[]; } param;
+#ifndef RR_GFX11
+layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
+#endif
+layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
+layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
+layout(set = 0, binding = 1, std430) readonly buffer W8U { uint8_t w[]; } w8u;
+layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
+layout(set = 0, binding = 3) uniform sampler2D T88;
+layout(set = 0, binding = 4) uniform sampler2D T96;
+layout(set = 0, binding = 5) uniform sampler2D T104;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D S112;
+layout(set = 0, binding = 7, rgba8_snorm) uniform writeonly image2D S144;
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define HAC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#ifndef RR_GFX11
+#define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#endif
+#define RM gl_CooperativeMatrixLayoutRowMajor
+#define CM gl_CooperativeMatrixLayoutColumnMajor
+#ifdef RR_GFX11
+#include "rr_gfx11_k32.glsl"
+#else
+#define LDA(dst, base, k, mt, kt) coopMatLoad((dst), w8.w, (base) + 256u * ((mt) * ((k) / 16u) + (kt)), 16u, RM)
+#define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
+#define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
+#define Q8(dst, src) Q8PAIRS(dst, src)
+// One 32-deep step onto an accumulator that holds binary16 values. The reference (and the default here) adds the
+// accumulator inside the f32 products and rounds the result to binary16. RR_MIX (build_native_model.sh with
+// D4R_RR_MIX=1) keeps the accumulator as binary16, sums the products from zero and takes f16(P + acc), which the
+// driver compiles to one v_fma_mix per element in place of two conversions: about 5% faster, but a single rounding
+// where the reference has two, so a value can come out one binary16 step away (engine/rr/README.md).
+// RAC is the accumulator type, RV(x) a binary16 value as its element; K32H is the step on a binary16 matrix.
+#ifdef RR_MIX
+#define RAC HAC
+#define RV(x) (x)
+#define K32(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(0.0))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_] + float((acc)[i_])); }
+#define K32H(acc, a0, b0, a1, b1) K32(acc, a0, b0, a1, b1)
+#else
+#define RAC ACC
+#define RV(x) float(x)
+#define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); RND(acc) }
+#define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
+#endif
+#endif
+const uint HEAD = W_WK1 - W_WK0, BRANCH = W_W1_1 - W_W1_0;
+
+// shared memory, aliased by phase: expand and prologue [LOW | EX], then the attention [K | V^T]
+shared uint POOL[48 * 16 + 48 * 32];
+#define LOW POOL                 // the low-resolution tokens (6 x 6, padded to 48): 64 FP8 channels, arena order
+#define EX_AT 768u               // their expansion: 4 sub-positions x 32 FP8 channels in slot order (32 words a row)
+#define RR_KS POOL               // the current head's K
+#define RR_KS0 0u
+#define RR_VS POOL               // the current head's V^T
+#define RR_VS0 768u
+shared uint XT[96 * 8];          // the normalised key tokens: slot-major, 32 FP8 channels in slot order
+shared float16_t XR[64 * 32];    // the window tokens before the norm (the residual), slot-major
+shared float16_t TAP[100 * 4];   // texture 88 bilinear at the window's 10 x 10 filter tap positions
+#define OUTF XR                  // after the block: the final tokens, token-major, natural channels (f16)
+
+// the window's key tokens: the 8x8 window, then a border row above, below, a column left and right
+ivec2 keyXY(uint t, int x0, int y0)
+{
+    if (t < 64u) return ivec2(x0 + int(t & 7u), y0 + int(t >> 3u));
+    const int i = int(t & 7u), side = int((t - 64u) >> 3u);
+    return ivec2(side < 2 ? x0 + i : (side == 2 ? x0 - 1 : x0 + 8), side == 0 ? y0 - 1 : (side == 1 ? y0 + 8 : y0 + i));
+}
+int clampTap(int v, int n) { return v < 0 ? 1 : (v >= n ? n - 2 : v); }
+float tanhNV(float t)
+{
+    const float m = abs(t), s = t * t;
+    const float big = m >= 9.0109138 ? 1.0 : fma(1.0 / (exp2(m * 2.885390043258667) + 1.0), -2.0, 1.0);
+    return m >= 0.6 ? (t < 0.0 ? -big : big) :
+        fma(fma(fma(fma(fma(0.01573968306183815, s, -0.05230396240949631), s, 0.13315297663211823), s, -0.33332768082618713), s, 0.0), t, t);
+}
+
+void main()
+{
+    const uint tid = gl_LocalInvocationIndex, wv = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint hl = lane >> 4u, col = lane & 15u;
+    RR_ZERO16 = uint16_t(gl_NumWorkGroups.z - 1u);
+    const int ex = int(param.p[0]), ey = int(param.p[1]), hx = ex / 2, hy = ey / 2;
+    const uint loOff = param.p[2], skOff = param.p[6], outOff = param.p[12], shift = param.p[20];
+    const int x0 = 8 * int(gl_WorkGroupID.x) - int(shift & 0xffffu), y0 = 8 * int(gl_WorkGroupID.y) - int(shift >> 16u);
+    const int X0 = (x0 >> 1) - 1, Y0 = (y0 >> 1) - 1;
+    const uint lplane = uint(hx * hy) * 32u;
+
+    // ---------------------------------------------------------------- expand
+    for (uint i = tid; i < 48u * 16u; i += 128u) {
+        const uint r = i >> 4u, wd = i & 15u;
+        uint u = 0u;
+        if (r < 36u) {
+            const int X = mirror(X0 + int(r % 6u), hx), Y = mirror(Y0 + int(r / 6u), hy);
+            u = arena.w[(loOff + (wd >> 3u) * lplane + uint(Y * hx + X) * 32u) / 4u + (wd & 7u)];
+        }
+        LOW[i] = u;
+    }
+    barrier();
+    {
+        A8 we[2][4];
+        [[unroll]] for (uint mm = 0u; mm < 2u; ++mm)
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) LDA(we[mm][kt], W_WE, 64u, 2u * wv + mm, kt);
+        [[unroll]] for (uint n = 0u; n < 3u; ++n) {
+            B8 lb[4];
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) LDS8B(lb[kt], LOW, n * 256u + 4u * kt, 16u);
+            [[unroll]] for (uint mm = 0u; mm < 2u; ++mm) {
+                const uint m = 2u * wv + mm;
+                RAC a;
+                [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+                K32(a, we[mm][0], lb[0], we[mm][1], lb[1])
+                K32(a, we[mm][2], lb[2], we[mm][3], lb[3])
+                Q8STB(a, POOL, EX_AT + n * 512u + 4u * m, 32u)
+            }
+        }
+    }
+    barrier();
+
+    // ---------------------------------------------------------------- prologue: one key token per thread
+    if (tid < 96u) {
+        const ivec2 k = keyXY(inter(tid), x0, y0);
+        const uint r = uint(((k.y >> 1) - Y0) * 6 + ((k.x >> 1) - X0)), s = uint(2 * (k.y & 1) + (k.x & 1));
+        const int xx = mirror(k.x, ex), yy = mirror(k.y, ey);
+        const uint sb = (skOff + uint(yy * ex + xx) * 32u) / 4u;
+        float16_t v[32];
+        [[unroll]] for (uint wd = 0u; wd < 8u; ++wd) {
+            const uint e = POOL[EX_AT + r * 32u + 8u * s + wd], sk = arena.w[sb + wd];
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+#ifdef RR_GFX11
+                precise float16_t x = g11_e4h((e >> (8u * b)) & 0xffu) + g11_e4h((sk >> (8u * b)) & 0xffu);
+#else
+                precise float16_t x = float16_t(uintBitsToFloate4m3EXT(uint8_t((e >> (8u * b)) & 0xffu)))
+                                    + float16_t(uintBitsToFloate4m3EXT(uint8_t((sk >> (8u * b)) & 0xffu)));
+#endif
+                v[4u * wd + b] = x;
+            }
+        }
+        // dec0_ref.norm_plane: per word t the pair sums, words t and t + 4, then t ^ 1, t ^ 2, the halves
+        precise f16vec2 h[4];
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+            precise f16vec2 p0 = f16vec2(v[4u * t], v[4u * t + 1u]) * f16vec2(v[4u * t], v[4u * t + 1u])
+                               + f16vec2(v[4u * t + 2u], v[4u * t + 3u]) * f16vec2(v[4u * t + 2u], v[4u * t + 3u]);
+            precise f16vec2 p1 = f16vec2(v[16u + 4u * t], v[17u + 4u * t]) * f16vec2(v[16u + 4u * t], v[17u + 4u * t])
+                               + f16vec2(v[18u + 4u * t], v[19u + 4u * t]) * f16vec2(v[18u + 4u * t], v[19u + 4u * t]);
+            h[t] = p0 + p1;
+        }
+        precise f16vec2 h0 = h[0] + h[1], h2_ = h[2] + h[3];
+        precise f16vec2 hs = h0 + h2_;
+        precise float16_t sm = hs.x + hs.y;
+        precise float16_t se = sm + float16_t(0.0001220703125);
+        const float16_t rr = rsq16(se);
+        [[unroll]] for (uint wd = 0u; wd < 8u; ++wd) {
+            F8 c[4];
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                const uint j = 4u * wd + b;
+                precise float16_t g = rr * w16.w[W_GAIN0 / 2u + inter(j)];
+                precise float16_t n = v[j] * g;
+                c[b] = q8h(n);
+            }
+            XT[tid * 8u + wd] = code(c[0]) | (code(c[1]) << 8u) | (code(c[2]) << 16u) | (code(c[3]) << 24u);
+        }
+        if (tid < 64u) [[unroll]] for (uint j = 0u; j < 32u; ++j) XR[tid * 32u + j] = v[j];
+    }
+    barrier();
+
+    // ---------------------------------------------------------------- the residual: window tokens + table 0
+    RAC R[2];
+    [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+        HAC x;
+#ifdef RR_GFX11
+        [[unroll]] for (int i = 0; i < 8; ++i) x[i] = XR[wv * 512u + 16u * m + col * 32u + 8u * hl + uint(i)];
+#else
+        coopMatLoad(x, XR, wv * 512u + 16u * m, 32u, CM);
+#endif
+        [[unroll]] for (int i = 0; i < 8; ++i) {
+            precise float16_t c = float16_t(x[i]) + w16.w[W_TABLE0 / 2u + 16u * m + 8u * hl + uint(i)];
+            R[m][i] = RV(c);
+        }
+    }
+
+    // ---------------------------------------------------------------- attention, two heads
+    [[unroll]] for (uint hd = 0u; hd < 2u; ++hd) {
+        if (hd == 1u) barrier();
+        for (uint j = 0u; j < 3u; ++j) {   // 12 jobs (token tile n, channel tile c)
+            const uint job = wv + 4u * j, n = job >> 1u, c = job & 1u;
+            A8 wk[2], xa[2];
+            B8 wvb[2], xb[2];
+            [[unroll]] for (uint kt = 0u; kt < 2u; ++kt) {
+                LDS8B(xb[kt], XT, n * 128u + 4u * kt, 8u);
+                LDS8A(xa[kt], XT, n * 128u + 4u * kt, 8u);
+                LDA(wk[kt], W_WK0 + HEAD * hd, 32u, c, kt);
+                LDB(wvb[kt], W_WV0 + HEAD * hd, 32u, kt, c);
+            }
+            RAC a = RAC(RV(float16_t(0.0)));
+            K32(a, wk[0], xb[0], wk[1], xb[1])
+            Q8STA(a, POOL, n * 128u + 4u * c, 8u)
+            RAC v = RAC(RV(float16_t(0.0)));
+            K32(v, xa[0], wvb[0], xa[1], wvb[1])
+            Q8STA(v, POOL, 768u + c * 384u + 4u * n, 24u)
+        }
+        barrier();
+#include "rr_attn.glsl"
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+            A8 a0, a1;
+            LDA(a0, W_WO0 + HEAD * hd, 32u, m, 0u); LDA(a1, W_WO0 + HEAD * hd, 32u, m, 1u);
+            K32(R[m], a0, Ob[0], a1, Ob[1])
+        }
+    }
+
+    // ---------------------------------------------------------------- MLP
+    B8 Nb[2];
+#ifdef RR_GFX11
+    F8V NbC[2] = F8V[2](uvec2(0u), uvec2(0u));
+#endif
+    {
+        float16_t rv[2][8];
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) [[unroll]] for (int i = 0; i < 8; ++i) rv[m][i] = float16_t(R[m][i]);
+        // dec0_ref.norm_plane on slot order: lane half hl holds words 2hl, 2hl + 1 (tile 0) and 4 + 2hl, 5 + 2hl (tile 1)
+        float16_t h1[2];
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+            float16_t ht[2];
+            [[unroll]] for (uint tq = 0u; tq < 2u; ++tq) {
+                const uint i0 = 4u * tq + c, i1 = i0 + 2u;
+                precise float16_t p0 = rv[0][i0] * rv[0][i0] + rv[0][i1] * rv[0][i1];
+                precise float16_t p1 = rv[1][i0] * rv[1][i0] + rv[1][i1] * rv[1][i1];
+                precise float16_t hv = p0 + p1;
+                ht[tq] = hv;
+            }
+            precise float16_t hh = ht[0] + ht[1];
+            h1[c] = hh;
+        }
+        const uint other = subgroupShuffleXor(bh(h1[0]) | (bh(h1[1]) << 16u), 16u);
+        precise float16_t g0 = h1[0] + hb(other & 0xffffu), g1 = h1[1] + hb(other >> 16u);
+        precise float16_t s = g0 + g1;
+        precise float16_t se = s + float16_t(0.0001220703125);
+        const float16_t r = rsq16(se);
+        [[unroll]] for (uint m = 0u; m < 2u; ++m)
+            [[unroll]] for (int i = 0; i < 8; ++i) {
+                const uint k = 16u * m + 8u * hl + uint(i);
+                precise float16_t g = r * w16.w[W_GAIN1 / 2u + k];
+                precise float16_t n = rv[m][i] * g;
+#ifdef RR_GFX11
+                NbC[m][i >> 2] |= q8h(n) << (8u * uint(i & 3));
+#else
+                Nb[m][i] = q8h(n);
+#endif
+                precise float16_t a = rv[m][i] + w16.w[W_TABLE1 / 2u + k];
+                R[m][i] = RV(a);
+            }
+#ifdef RR_GFX11
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) G11_B(Nb[m], NbC[m])
+#endif
+    }
+    for (uint br = 0u; br < 4u; ++br) {
+        const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
+        B8 Hb[2];
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+            RAC h;
+            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+            A8 a0, a1;
+            LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
+            K32(h, a0, Nb[0], a1, Nb[1])
+#ifdef RR_GFX11
+            { F8V hc_; ACTQ8C(hc_, h) G11_B(Hb[c], hc_) }
+#else
+            ACTQ8(Hb[c], h)
+#endif
+        }
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+            A8 a0, a1;
+            LDA(a0, w2, 32u, m, 0u); LDA(a1, w2, 32u, m, 1u);
+            K32(R[m], a0, Hb[0], a1, Hb[1])
+        }
+    }
+
+    // ---------------------------------------------------------------- outputs, one token per thread
+    {
+        const uint t = inter(16u * wv + col);
+        [[unroll]] for (uint m = 0u; m < 2u; ++m)
+            [[unroll]] for (int i = 0; i < 8; ++i) OUTF[t * 32u + inter(16u * m + 8u * hl + uint(i))] = float16_t(R[m][i]);
+    }
+    barrier();
+    // texture 88 (one level down) at the window's 10 x 10 full-resolution tap positions (clamped like the filter's
+    // coordinates), through the bilinear sampler at NVIDIA's coordinates: the reference's texture unit does not round
+    // like f32 arithmetic (computing the 1/4, 3/4 blend by hand left ~0.2% of surface 112 one ulp off, capDT 2026-10-12)
+    if (tid < 100u) {
+        const int xi = clampTap(x0 - 1 + int(tid % 10u), ex), yi = clampTap(y0 - 1 + int(tid / 10u), ey);
+        const float iw = uintBitsToFloat(param.p[34]), ih = uintBitsToFloat(param.p[35]);
+        precise float cu = fma(iw, float(xi), iw * 0.5), cv = fma(ih, float(yi), ih * 0.5);
+        const vec4 bl = textureLod(T88, vec2(cu, cv), 0.0);
+        [[unroll]] for (uint c = 0u; c < 3u; ++c) TAP[tid * 4u + c] = float16_t(bl[c]);
+    }
+    barrier();
+    // two threads per token: half 0 filters channels 0 and 1, half 1 channel 2 and writes the output stage's codes
+    // and surface 144
+    {
+        const uint t = tid >> 1u, hf = tid & 1u;
+        const int x = x0 + int(t & 7u), y = y0 + int(t >> 3u);
+        if (x < 0 || y < 0 || x >= ex || y >= ey) return;
+        float16_t a[10];
+        [[unroll]] for (uint c = 0u; c < 10u; ++c) a[c] = OUTF[t * 32u + c];
+        if (hf == 1u) {
+            float16_t b[12];
+            [[unroll]] for (uint c = 0u; c < 12u; ++c) b[c] = OUTF[t * 32u + 12u + c];
+            const uint o = (outOff + uint(y * ex + x) * 8u) / 4u;
+#ifdef RR_PRESET_D
+            // cuda_dldn_engine_swin_dec0_diamond_wallaby_kernel: channels 12, 13, 0, 18, 19, 20, 21, 0 (its only
+            // difference from the preset E kernel; capDT, 2026-10-12)
+            arena.w[o] = code(q8h(b[0])) | (code(q8h(b[1])) << 8u) | (code(q8h(b[6])) << 24u);
+            arena.w[o + 1u] = code(q8h(b[7])) | (code(q8h(b[8])) << 8u) | (code(q8h(b[9])) << 16u);
+#else
+            arena.w[o] = code(q8h(b[0])) | (code(q8h(b[1])) << 8u) | (code(q8h(b[6])) << 16u) | (code(q8h(b[7])) << 24u);
+            arena.w[o + 1u] = code(q8h(b[8])) | (code(q8h(b[9])) << 8u) | (code(q8h(b[10])) << 16u) | (code(q8h(b[11])) << 24u);
+#endif
+            imageStore(S144, ivec2(x, y), vec4(tanhNV(float(b[2])), tanhNV(float(b[3])), tanhNV(float(b[4])), tanhNV(float(b[5]))));
+        }
+        // surface 112: softmax of channels 0-8 over the 3x3 taps, one f16 fma chain per channel; the gate (channel 9)
+        // blends it with texture 96; + texture 104
+        const float16_t ma = max(max(max(a[0], a[2]), a[4]), a[6]), mb = max(max(max(a[1], a[3]), a[5]), a[7]);
+        const float16_t mx = max(max(ma, mb), a[8]);
+        float e[9];
+        [[unroll]] for (uint i = 0u; i < 9u; ++i) { precise float16_t d = a[i] - mx; e[i] = exp2(float(d) * 1.4426950216293335); }
+        precise float s = (e[0] + e[1]) + 0.0;
+        s = s + (e[2] + e[3]);
+        s = s + (e[4] + e[5]);
+        s = s + (e[6] + e[7]);
+        s = s + e[8];
+        const float16_t rr = rcp16(s);
+        float16_t wg[9];
+        [[unroll]] for (uint i = 0u; i < 9u; ++i) wg[i] = h16(r16(e[i]) * float(rr));
+        const uint tx = uint(x - x0), ty = uint(y - y0), c0 = 2u * hf, nc = 2u - hf;
+        float16_t f[2] = float16_t[2](0.0hf, 0.0hf);
+        bool mid = false;
+        [[unroll]] for (uint k = 0u; k < 9u; ++k) {
+            const uint at = ((ty + k / 3u) * 10u + tx + k % 3u) * 4u + c0;
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) f[c] = fma16q(TAP[at + c], wg[k], f[c], mid);
+        }
+        if (mid) {   // an f32 result on a binary16 midpoint: redo the chain with the exact fma (rare)
+            f[0] = 0.0hf; f[1] = 0.0hf;
+            for (uint k = 0u; k < 9u; ++k) {
+                const uint at = ((ty + k / 3u) * 10u + tx + k % 3u) * 4u + c0;
+                for (uint c = 0u; c < 2u; ++c) f[c] = fma16(TAP[at + c], wg[k], f[c]);
+            }
+        }
+        const float16_t g = sig(a[9]);
+        precise float16_t om = float16_t(1.0) - g;
+        const vec4 t96 = texelFetch(T96, ivec2(x, y), 0), t104 = texelFetch(T104, ivec2(x, y), 0);
+        float16_t o[2];
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+            precise float16_t fg = f[c] * g;
+            float16_t v = fma16(float16_t(t96[c0 + c]), om, fg);
+            const float16_t t4 = float16_t(t104[c0 + c]);
+            if (!isnan(t4)) { precise float16_t vv = v + t4; v = vv; }
+            o[c] = v;
+        }
+        const uint other = subgroupShuffleXor(bh(o[0]), 1u);
+        if (hf == 0u) imageStore(S112, ivec2(x, y), vec4(o[0], o[1], hb(other), 0.0));
+    }
+}

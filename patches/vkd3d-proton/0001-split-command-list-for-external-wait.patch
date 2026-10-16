@@ -1,0 +1,304 @@
+diff --git a/include/vkd3d_device_vkd3d_ext.idl b/include/vkd3d_device_vkd3d_ext.idl
+index 680f2c96..1fddc28e 100644
+--- a/include/vkd3d_device_vkd3d_ext.idl
++++ b/include/vkd3d_device_vkd3d_ext.idl
+@@ -104,6 +104,21 @@ interface ID3D12DXVKInteropDevice3 : ID3D12DXVKInteropDevice2
+             UINT32 *vk_memory_type);
+ }
+ 
++[
++    uuid(5a7c8b3e-2f61-4d0e-9c1a-7e3b52d4a901),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDeviceD4R : ID3D12DXVKInteropDevice3
++{
++    /* d4r: ends the command list's current Vulkan command buffer. Everything
++     * recorded afterwards is submitted separately and waits (as a queue
++     * submission wait, not a GPU-side wait) until the timeline semaphore
++     * vk_semaphore reaches value. */
++    HRESULT SplitCommandListForExternalWait(ID3D12CommandList *list, UINT64 vk_semaphore, UINT64 value);
++}
++
+ [
+     uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
+     object,
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 611e373b..23af78a5 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2557,6 +2557,38 @@ static void d3d12_command_list_consider_new_sequence(struct d3d12_command_list *
+     }
+ }
+ 
++HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *list,
++        VkSemaphore semaphore, uint64_t value)
++{
++    struct d3d12_command_list_iteration *iteration;
++    unsigned int count;
++
++    if (!list->is_recording)
++        return E_INVALIDARG;
++    if (!d3d12_command_list_allows_new_sequence(list))
++    {
++        WARN("Cannot split command list for external wait with a running query.\n");
++        return E_FAIL;
++    }
++
++    /* Flush everything recorded so far into the current command buffer. */
++    d3d12_command_list_decay_tracked_state(list);
++    d3d12_command_list_invalidate_all_state(list);
++
++    count = list->cmd.iteration_count;
++    d3d12_command_list_begin_new_sequence(list, false);
++    if (list->cmd.iteration_count == count)
++    {
++        WARN("Out of command list sequences for external wait.\n");
++        return E_FAIL;
++    }
++
++    iteration = &list->cmd.iterations[list->cmd.iteration_count - 1];
++    iteration->external_wait_semaphore = semaphore;
++    iteration->external_wait_value = value;
++    return S_OK;
++}
++
+ static void d3d12_command_list_copy_queue_fallback(struct d3d12_command_list *list)
+ {
+     if (!list->cmd.iterations[list->cmd.iteration_count - 1].fallback)
+@@ -22769,6 +22801,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+     struct vkd3d_initial_transition *transitions;
+     size_t num_transitions, num_command_buffers;
+     VkCommandBufferSubmitInfo *buffers, *buffer;
++    VkSemaphoreSubmitInfo *external_waits = NULL;
+     struct d3d12_command_allocator **allocators;
+     struct d3d12_command_queue_submission sub;
+     unsigned int indirect_barrier_hoist_index;
+@@ -22954,6 +22987,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+             vkd3d_free(allocators);
+             vkd3d_free(buffers);
+             vkd3d_free(cmd_cost);
++            vkd3d_free(external_waits);
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+             vkd3d_free(breadcrumb_indices);
+ #endif
+@@ -23036,6 +23070,21 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+             buffer->commandBuffer = cmd_list->cmd.iterations[iter].vk_command_buffer;
+             /* Pilfer this for purposes of signalling aux data. No need to allocate more stuff just to signal this. */
+             buffer->deviceMask = cmd_list->cmd.iterations[iter].fallback ? VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE : 0;
++
++            if (cmd_list->cmd.iterations[iter].external_wait_semaphore)
++            {
++                if (!external_waits)
++                    external_waits = vkd3d_calloc(num_command_buffers, sizeof(*external_waits));
++                if (external_waits)
++                {
++                    VkSemaphoreSubmitInfo *wait = &external_waits[cmd_submit_count - 1];
++                    wait->sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
++                    wait->semaphore = cmd_list->cmd.iterations[iter].external_wait_semaphore;
++                    wait->value = cmd_list->cmd.iterations[iter].external_wait_value;
++                    wait->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++                    buffer->deviceMask |= VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_EXTERNAL_WAIT;
++                }
++            }
+         }
+ 
+         need_suspend_fixup = cmd_list->cmd.suspend_resume.suspend.vk_fixup_cmd_buffer && (i + 1 == command_list_count ||
+@@ -23155,6 +23204,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+     sub.type = VKD3D_SUBMISSION_EXECUTE;
+     sub.execute.cmd = buffers;
+     sub.execute.cmd_cost = cmd_cost;
++    sub.execute.external_waits = external_waits;
+     sub.execute.cmd_count = cmd_submit_count;
+     sub.execute.command_allocators = allocators;
+     sub.execute.num_command_allocators = command_list_count;
+@@ -24377,6 +24427,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+     VkSemaphoreSubmitInfo *binary_semaphore_info;
+     bool stagger_submissions, is_first, is_last;
+     VkSemaphoreSubmitInfo wait_semaphore_info;
++    VkSemaphoreSubmitInfo combined_wait_infos[2];
++    bool external_wait;
+     uint32_t cmd_index, cmd_count, total_cost;
+     struct vkd3d_fence_wait_info fence_info;
+     VkSubmitInfo2 submit_desc[2], *submit;
+@@ -24516,7 +24568,15 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+             total_cost = 0;
+ 
+             for (i = cmd_index + cmd_count; i < exec->cmd_count && total_cost < VKD3D_COMMAND_COST_MERGE_THRESHOLD; i++)
++            {
++                /* d4r: never merge across an external wait. */
++                if (exec->cmd[i].deviceMask & VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_EXTERNAL_WAIT)
++                {
++                    total_cost = VKD3D_COMMAND_COST_MERGE_THRESHOLD;
++                    break;
++                }
+                 total_cost += exec->cmd_cost[i];
++            }
+ 
+             if (total_cost < VKD3D_COMMAND_COST_MERGE_THRESHOLD)
+                 cmd_count = exec->cmd_count - cmd_index;
+@@ -24525,8 +24585,14 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+         {
+             /* Submit everything at once, until we hit a fallback queue submission. Pick that up next iteration. */
+             for (cmd_count = 0; cmd_index + cmd_count < exec->cmd_count; cmd_count++)
++            {
+                 if (exec->cmd[cmd_index + cmd_count].deviceMask & VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE)
+                     break;
++                /* d4r: an external wait starts a new submit. */
++                if (cmd_count && (exec->cmd[cmd_index + cmd_count].deviceMask &
++                        VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_EXTERNAL_WAIT))
++                    break;
++            }
+         }
+ 
+         submit = &submit_desc[num_submits++];
+@@ -24536,6 +24602,9 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+         submit->signalSemaphoreInfoCount = 1;
+         submit->pSignalSemaphoreInfos = signal_semaphore_infos;
+ 
++        external_wait = cmd_count && exec->external_waits &&
++                (exec->cmd[cmd_index].deviceMask & VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_EXTERNAL_WAIT);
++
+         /* Clear out any shenanigans we added due to fallback submit. */
+         for (i = 0; i < cmd_count; i++)
+             exec->cmd[cmd_index + i].deviceMask = 0;
+@@ -24555,6 +24624,23 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+             submit->pWaitSemaphoreInfos = &wait_semaphore_info;
+         }
+ 
++        if (external_wait)
++        {
++            /* d4r: a queue-level wait-before-signal; the host signals the value later. */
++            if (submit->waitSemaphoreInfoCount)
++            {
++                combined_wait_infos[0] = submit->pWaitSemaphoreInfos[0];
++                combined_wait_infos[1] = exec->external_waits[cmd_index];
++                submit->waitSemaphoreInfoCount = 2;
++                submit->pWaitSemaphoreInfos = combined_wait_infos;
++            }
++            else
++            {
++                submit->waitSemaphoreInfoCount = 1;
++                submit->pWaitSemaphoreInfos = &exec->external_waits[cmd_index];
++            }
++        }
++
+         cmd_index += cmd_count;
+         is_last = cmd_index == exec->cmd_count;
+ 
+@@ -25347,6 +25433,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
+              * On error, the counters are freed early, so there is no risk of leak. */
+             vkd3d_free(submission.execute.cmd);
+             vkd3d_free(submission.execute.cmd_cost);
++            vkd3d_free(submission.execute.external_waits);
+             vkd3d_free(submission.execute.transitions);
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+             for (i = 0; i < submission.execute.breadcrumb_indices_count; i++)
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index f6db6954..06955941 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4657,7 +4657,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
+     if (IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice1)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice2)
+-            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3))
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3)
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R))
+     {
+         d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
+         *object = &device->ID3D12DXVKInteropDevice_iface;
+@@ -11379,7 +11380,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
+ }
+ 
+ extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
+-extern CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl;
++extern CONST_VTBL struct ID3D12DXVKInteropDeviceD4RVtbl d3d12_dxvk_interop_device_vtbl;
+ extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
+ extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
+ 
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index 94818b9a..bd5dd7a5 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -1145,7 +1145,19 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanHeapInfo(d3d
+     return S_OK;
+ }
+ 
+-CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl =
++static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_SplitCommandListForExternalWait(
++        d3d12_dxvk_interop_device_iface *iface, ID3D12CommandList *list, UINT64 vk_semaphore, UINT64 value)
++{
++    struct d3d12_command_list *cmd_list = d3d12_command_list_from_iface(list);
++
++    TRACE("iface %p, list %p, vk_semaphore 0x%"PRIx64", value %"PRIu64".\n", iface, list, vk_semaphore, value);
++
++    if (!cmd_list || !vk_semaphore)
++        return E_INVALIDARG;
++    return d3d12_command_list_split_for_external_wait(cmd_list, (VkSemaphore)vk_semaphore, value);
++}
++
++CONST_VTBL struct ID3D12DXVKInteropDeviceD4RVtbl d3d12_dxvk_interop_device_vtbl =
+ {
+     /* IUnknown methods */
+     d3d12_dxvk_interop_device_QueryInterface,
+@@ -1177,6 +1189,9 @@ CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl =
+ 
+     /* ID3D12DXVKInteropDevice3 methods */
+     d3d12_dxvk_interop_device_GetVulkanHeapInfo,
++
++    /* ID3D12DXVKInteropDeviceD4R methods */
++    d3d12_dxvk_interop_device_SplitCommandListForExternalWait,
+ };
+ 
+ static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a2a78000..64338585 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3207,6 +3207,9 @@ struct d3d12_command_list_iteration
+     uint32_t estimated_cost;
+     bool fallback; /* Only applies to vk_command_buffer. */
+     struct d3d12_command_list_iteration_indirect_meta indirect_meta;
++    /* d4r: vk_command_buffer is submitted separately, after this timeline value is reached. */
++    VkSemaphore external_wait_semaphore;
++    uint64_t external_wait_value;
+ };
+ 
+ enum
+@@ -3216,9 +3219,12 @@ enum
+      * without having to add more allocations. */
+     VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_DEFAULT = 0,
+     VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE = 1u << 0,
++    /* d4r: starts a new submit that waits for submission_execute::external_waits[index]. */
++    VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_EXTERNAL_WAIT = 1u << 1,
+ };
+ 
+-#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 2
++/* d4r: 4 so an external-wait split fits next to DGC and fallback splits. */
++#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 4
+ 
+ #define VKD3D_COMMAND_COST_LOW              (1u)
+ #define VKD3D_COMMAND_COST_HIGH             (16u)
+@@ -3737,6 +3743,8 @@ struct d3d12_command_queue_submission_execute
+ {
+     VkCommandBufferSubmitInfo *cmd;
+     uint32_t *cmd_cost;
++    /* d4r: indexed like cmd, only allocated when a command buffer waits externally. */
++    VkSemaphoreSubmitInfo *external_waits;
+     struct d3d12_command_allocator **command_allocators;
+     UINT cmd_count;
+     UINT num_command_allocators;
+@@ -5463,7 +5471,10 @@ struct vkd3d_timestamp_profiler;
+ typedef ID3D12DeviceExt5 d3d12_device_vkd3d_ext_iface;
+ 
+ /* ID3D12DXVKInteropDevice */
+-typedef ID3D12DXVKInteropDevice3 d3d12_dxvk_interop_device_iface;
++HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *list,
++        VkSemaphore semaphore, uint64_t value);
++
++typedef ID3D12DXVKInteropDeviceD4R d3d12_dxvk_interop_device_iface;
+ 
+ /* ID3DLowLatencyDevice */
+ typedef ID3DLowLatencyDevice d3d_low_latency_device_iface;

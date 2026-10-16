@@ -1,0 +1,148 @@
+diff --git a/include/vkd3d_device_vkd3d_ext.idl b/include/vkd3d_device_vkd3d_ext.idl
+--- a/include/vkd3d_device_vkd3d_ext.idl
++++ b/include/vkd3d_device_vkd3d_ext.idl
+@@ -120,6 +120,19 @@
+ }
+ 
+ [
++    uuid(4f8c9462-8197-4dc1-a584-cf44d9706db2),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDeviceD4R2 : ID3D12DXVKInteropDeviceD4R
++{
++    /* Retain external resources until the allocator can safely reset or is
++     * destroyed. Pending submissions already retain the allocator. */
++    HRESULT RetainExternalResources(ID3D12CommandList *list, IUnknown *resources);
++}
++
++[
+     uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
+     object,
+     local,
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2791,6 +2791,24 @@
+     }
+ }
+ 
++HRESULT d3d12_command_list_retain_external_resources(struct d3d12_command_list *list, IUnknown *resources)
++{
++    struct d3d12_command_allocator *allocator = list->allocator;
++    size_t i;
++
++    if (!list->is_recording || !allocator)
++        return E_INVALIDARG;
++    for (i = 0; i < allocator->external_resources_count; i++)
++        if (allocator->external_resources[i] == resources)
++            return S_OK;
++    if (!vkd3d_array_reserve((void **)&allocator->external_resources, &allocator->external_resources_size,
++            allocator->external_resources_count + 1, sizeof(*allocator->external_resources)))
++        return E_OUTOFMEMORY;
++    IUnknown_AddRef(resources);
++    allocator->external_resources[allocator->external_resources_count++] = resources;
++    return S_OK;
++}
++
+ static bool d3d12_command_allocator_add_view(struct d3d12_command_allocator *allocator,
+         struct vkd3d_view *view)
+ {
+@@ -2858,6 +2876,10 @@
+     struct d3d12_device *device = allocator->device;
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     unsigned int i;
++
++    for (i = 0; i < allocator->external_resources_count; ++i)
++        IUnknown_Release(allocator->external_resources[i]);
++    allocator->external_resources_count = 0;
+ 
+     for (i = 0; i < allocator->buffer_view_count; ++i)
+     {
+@@ -2993,6 +3015,7 @@
+             d3d12_command_list_allocator_destroyed(allocator->current_command_list);
+ 
+         d3d12_command_allocator_free_resources(allocator);
++        vkd3d_free(allocator->external_resources);
+         vkd3d_free(allocator->buffer_views);
+         vkd3d_free(allocator->views);
+         vkd3d_free(allocator->pipelines);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4658,7 +4658,8 @@
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice1)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice2)
+             || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3)
+-            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R))
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R)
++            || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R2))
+     {
+         d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
+         *object = &device->ID3D12DXVKInteropDevice_iface;
+@@ -11380,7 +11381,7 @@
+ }
+ 
+ extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
+-extern CONST_VTBL struct ID3D12DXVKInteropDeviceD4RVtbl d3d12_dxvk_interop_device_vtbl;
++extern CONST_VTBL struct ID3D12DXVKInteropDeviceD4R2Vtbl d3d12_dxvk_interop_device_vtbl;
+ extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
+ extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
+ 
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -1157,7 +1157,16 @@
+     return d3d12_command_list_split_for_external_wait(cmd_list, (VkSemaphore)vk_semaphore, value);
+ }
+ 
+-CONST_VTBL struct ID3D12DXVKInteropDeviceD4RVtbl d3d12_dxvk_interop_device_vtbl =
++static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_RetainExternalResources(
++        d3d12_dxvk_interop_device_iface *iface, ID3D12CommandList *list, IUnknown *resources)
++{
++    struct d3d12_command_list *cmd_list = d3d12_command_list_from_iface(list);
++    if (!cmd_list || !resources)
++        return E_INVALIDARG;
++    return d3d12_command_list_retain_external_resources(cmd_list, resources);
++}
++
++CONST_VTBL struct ID3D12DXVKInteropDeviceD4R2Vtbl d3d12_dxvk_interop_device_vtbl =
+ {
+     /* IUnknown methods */
+     d3d12_dxvk_interop_device_QueryInterface,
+@@ -1192,6 +1201,9 @@
+ 
+     /* ID3D12DXVKInteropDeviceD4R methods */
+     d3d12_dxvk_interop_device_SplitCommandListForExternalWait,
++
++    /* ID3D12DXVKInteropDeviceD4R2 methods */
++    d3d12_dxvk_interop_device_RetainExternalResources,
+ };
+ 
+ static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2758,6 +2758,10 @@
+     LONG refcount;
+     LONG internal_refcount;
+ 
++    IUnknown **external_resources;
++    size_t external_resources_size;
++    size_t external_resources_count;
++
+     D3D12_COMMAND_LIST_TYPE type;
+ 
+     struct vkd3d_view **views;
+@@ -5474,7 +5478,9 @@
+ HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *list,
+         VkSemaphore semaphore, uint64_t value);
+ 
+-typedef ID3D12DXVKInteropDeviceD4R d3d12_dxvk_interop_device_iface;
++HRESULT d3d12_command_list_retain_external_resources(struct d3d12_command_list *list, IUnknown *resources);
++
++typedef ID3D12DXVKInteropDeviceD4R2 d3d12_dxvk_interop_device_iface;
+ 
+ /* ID3DLowLatencyDevice */
+ typedef ID3DLowLatencyDevice d3d_low_latency_device_iface;

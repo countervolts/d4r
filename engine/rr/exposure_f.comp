@@ -1,0 +1,93 @@
+#version 460
+// Ray Reconstruction preset F (rr2_*): the auto exposure of rr2_histogram_auto_exposure_basic_kernel, in two passes.
+//
+// NVIDIA's kernel sums a clamped luma per 16x16 block (a pairwise tree over the block's threads), converts each block
+// sum to fixed point (x 2^32 / 10000, round to nearest) and adds them with a 64-bit atomic; the last block to finish
+// turns the total into the exposure. The integer total does not depend on the order of the blocks, so PASS 0 writes
+// every block's fixed-point sum and PASS 1 (one workgroup) adds them and does what the last block does:
+//   exposure = 0.23547088 / max(mean luma, 0.005)               -> the 1x1 exposure image of this frame
+//   values   = { e, p, 1 / e, clamp(log2(e / p), -6, 6) / 6 }   -> the 16-byte buffer encoder 0 and the output passes read
+// with e the exposure truncated to binary16 and p the previous frame's (1 where either is zero).
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef PASS
+#define PASS 0
+#endif
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+    ivec2 last;        // render size - 1
+    uint blocksX, blocks;
+    float invCount;    // 10000 / (2^32 * render pixels)
+    uint reset;        // the kernel's argument 32: no log ratio when set
+} p;
+#if PASS == 0
+// One thread per column of the 16x16 block. NVIDIA's tree over the block's 256 threads (index 16 y + x: i += i + 128,
+// then 64, 32, ... 1) is, per column, ((r0 + r8) + (r4 + r12)) + ((r2 + r10) + (r6 + r14)) of the even rows plus the
+// same of the odd rows, and then the columns (c + c8, + 4, + 2, + 1).
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 1) uniform sampler2D color;
+layout(set = 0, binding = 2, std430) writeonly buffer Sums { uint64_t s[]; } sums;
+shared float col[16];
+void main()
+{
+    const uint tx = gl_LocalInvocationID.x;
+    const int x = int(gl_GlobalInvocationID.x), y0 = int(gl_WorkGroupID.y) * 16;
+    float r[16];
+    [[unroll]] for (int k = 0; k < 16; ++k) {
+        float v = 0.0;
+        if (x <= p.last.x && y0 + k <= p.last.y) {
+            const vec3 t = texelFetch(color, ivec2(x, y0 + k), 0).rgb;
+            precise float l = fma(t.b, 0.25, fma(t.r, 0.25, t.g * 0.5));
+            v = min(max(l, 0.0), 10000.0);
+        }
+        r[k] = v;
+    }
+    precise float u[8];
+    [[unroll]] for (int k = 0; k < 8; ++k) u[k] = r[k + 8] + r[k];
+    precise float v4[4];
+    [[unroll]] for (int k = 0; k < 4; ++k) v4[k] = u[k + 4] + u[k];
+    precise float w0 = v4[2] + v4[0], w1 = v4[3] + v4[1];
+    precise float c = w1 + w0;
+    col[tx] = c;
+    barrier();
+    if (tx == 0u) {
+        precise float d[8];
+        [[unroll]] for (int k = 0; k < 8; ++k) d[k] = col[k + 8] + col[k];
+        precise float e0 = d[4] + d[0], e1 = d[5] + d[1], e2 = d[6] + d[2], e3 = d[7] + d[3];
+        precise float f0 = e2 + e0, f1 = e3 + e1;
+        precise float g = f1 + f0;
+        sums.s[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = uint64_t(roundEven(g * 429496.71875));
+    }
+}
+#else
+layout(local_size_x = 64) in;
+shared uint64_t part[64];
+layout(set = 0, binding = 1, std430) readonly buffer Sums { uint64_t s[]; } sums;
+layout(set = 0, binding = 2, std430) writeonly buffer Values { vec4 v; } values;
+layout(set = 0, binding = 3) uniform sampler2D previous;
+layout(set = 0, binding = 4, r16f) uniform writeonly image2D current;
+void main()
+{
+    // the block sums are integers: any order. 64 strided partial sums, then thread 0 finishes
+    const uint tid = gl_LocalInvocationID.x;
+    uint64_t mine = 0ul;
+    for (uint b = tid; b < p.blocks; b += 64u) mine += sums.s[b];
+    part[tid] = mine;
+    barrier();
+    if (tid != 0u) return;
+    uint64_t total = 0ul;
+    for (uint b = 0u; b < 64u; ++b) total += part[b];
+    precise float mean = p.invCount * float(total);
+    precise float e = 0.23547088 / max(mean, 0.005);
+    imageStore(current, ivec2(0), vec4(e));
+    // cvt.rz.f16.f32: toward zero (e > 0)
+    float16_t h = float16_t(e);
+    if (float(h) > e) h = uint16BitsToFloat16(float16BitsToUint16(h) - uint16_t(1));
+    float cur = float(h);
+    if (cur == 0.0) cur = 1.0;
+    float prev = texelFetch(previous, ivec2(0), 0).r;
+    if (prev == 0.0) prev = 1.0;
+    float ratio = 0.0;
+    if (p.reset == 0u) ratio = clamp(log2(max(cur, 1e-8) / max(prev, 1e-8)), -6.0, 6.0) * 0.16666667;
+    values.v = vec4(cur, prev, 1.0 / cur, ratio);
+}
+#endif

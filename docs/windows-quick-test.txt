@@ -1,0 +1,27 @@
+d4r Windows quick test
+======================
+
+This private test package supports native Windows D3D12 on the GPU target in
+its manifest. It needs the matching original NVIDIA _nvngx.dll and
+nvngx_dlss.dll supplied by the tester. Those DLLs are not in d4r source or
+public packages.
+
+Run START-K.cmd, START-M.cmd, START-E.cmd, or START-L.cmd. The launcher checks
+the package hashes, detects the real HIP target, and rejects a package/GPU
+mismatch before changing the game folder. It backs up only files it replaces
+in .d4r-backup. The run lasts up to 180 seconds by default; use the PowerShell
+launcher with -RunSeconds to choose another bounded run.
+
+Preset E uses NGX preset 5 and has no native Windows CNN kernels. K uses preset
+11 and the native K transformer. L uses preset 12 and currently relies on the
+M-family Swin layers plus translated texture kernels. M uses preset 13. E and L
+are experimental Windows paths; a selected hint or successful DLL load is not
+frame proof. Reports must show completed DLSS frames and output checks.
+
+After the game exits, run RESTORE-GAME.cmd before using the game normally. The
+restore checks installed-file hashes and restores only the entries recorded in
+.d4r-backup. It preserves unrelated mods, shared loaders, game files and saves.
+Keep the printed diagnostic ZIP for any failed or inconclusive run.
+
+Do not enable async interop for first tests. Do not change drivers, TDR values,
+Windows security policy or GPU tuning as part of this test.
