@@ -60,6 +60,28 @@ int wmain(int argc, wchar_t** argv) {
     expect(!s.showWatermark && has_note(notes, "ShowWatermark must be true or false"), "invalid ShowWatermark falls back to hidden with a note");
     s = settings("[Paths]\nCacheDir = D:\\d4r-cache\n", notes);
     expect(s.cacheDir == L"D:\\d4r-cache" && notes.empty(), "CacheDir path");
+    s = settings("[Paths]\nNativeDir = private-native\n", notes);
+    expect(s.nativeDir == L"private-native" && notes.empty(), "NativeDir path");
+    expect(player::native_code_object_dir(dir, &s) == dir / L"private-native", "relative NativeDir resolves beside d4r.ini");
+    expect(!error_of([&] { player::verify_code_objects(dir, &s); }).empty(), "incomplete private native directory rejected");
+    s.cacheDir = (dir / L"cache").wstring();
+    player::apply(dir, s);
+    expect(std::wstring(_wgetenv(L"D4R_ZLUDA_NATIVE_DIR")) == (dir / L"private-native").wstring(),
+        "player environment selects configured private native directory");
+    s = settings("[Paths]\nNativeDir = auto\n", notes);
+    expect(s.nativeDir.empty() && notes.empty(), "NativeDir auto preserves packaged kernels");
+    s = settings("[RayReconstruction]\nBackend = NATIVE\nModelDir = local-rr\n", notes);
+    expect(s.rrBackend == "native" && s.rrModelDir == L"local-rr" && notes.empty(), "native RR settings parse independently of SR");
+    expect(player::rr_model_directory(dir, s) == std::filesystem::absolute(dir / L"local-rr").lexically_normal(), "relative RR model resolves beside d4r.ini");
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(std::string(std::getenv("D4R_RR_BACKEND")) == "native" &&
+        std::filesystem::path(_wgetenv(L"D4R_RR_MODEL_DIR")) == player::rr_model_directory(dir, s), "native RR environment selected without a launcher");
+    s = settings("[RayReconstruction]\nBackend = fsr\n", notes);
+    expect(s.rrBackend == "fsr" && has_note(notes, "FSR RR is unavailable"), "unavailable FSR selection remains explicit");
+    s = settings("[RayReconstruction]\nBackend = typo\n", notes);
+    expect(s.rrBackend == "off" && has_note(notes, "Backend must be"), "invalid RR backend stays off");
+    s = settings("", notes); s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(!std::getenv("D4R_RR_BACKEND") && !std::getenv("D4R_RR_MODEL_DIR"), "default RR off clears stale selection");
 
     std::filesystem::create_directories(dir / L"nvapi");
     { std::ofstream(dir / L"nvapi" / L"nvapi64.dll", std::ios::binary) << "generic nvapi fixture"; }

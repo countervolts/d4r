@@ -15,6 +15,7 @@ __pycache__/
 .venv/
 .tools/
 /external/MinHook/
+/external/ZLUDA/
 .vscode/
 /windows/m11/build/
 /windows/m11/.tools/

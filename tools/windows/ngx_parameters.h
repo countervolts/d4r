@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <initializer_list>
 struct ID3D12Resource;
 extern "C" {
 void d4r_ngx_set_ull(void*, const char*, unsigned long long);

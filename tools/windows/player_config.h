@@ -26,6 +26,9 @@ struct Settings {
     bool nativeFp8 = false;
     bool asyncInterop = false, validateOutput = false, verbose = false, showWatermark = false;
     std::wstring cacheDir;
+    std::wstring nativeDir;
+    std::string rrBackend = "off";
+    std::wstring rrModelDir;
 };
 struct State {
     bool active = false;
@@ -122,6 +125,17 @@ inline Settings read_settings(const std::vector<IniEntry>& ini, std::vector<std:
                 notes.push_back("d4r.ini: [Debug] Log must be normal or verbose, not '" + entry.value + "'; using normal");
         } else if (name == "paths.cachedir") {
             if (!entry.value.empty() && lower(entry.value) != "auto") settings.cacheDir = diag::wide(entry.value);
+        } else if (name == "paths.nativedir") {
+            if (!entry.value.empty() && lower(entry.value) != "auto") settings.nativeDir = diag::wide(entry.value);
+        } else if (name == "rayreconstruction.backend") {
+            const auto value = lower(entry.value);
+            if (value.empty() || value == "auto" || value == "off") settings.rrBackend = "off";
+            else if (value == "native" || value == "fsr") {
+                settings.rrBackend = value;
+                if (value == "fsr") notes.push_back("d4r.ini: native Windows FSR RR is unavailable; RR requests will be rejected");
+            } else { settings.rrBackend = "off"; notes.push_back("d4r.ini: [RayReconstruction] Backend must be off, native or fsr; using off"); }
+        } else if (name == "rayreconstruction.modeldir") {
+            settings.rrModelDir = !entry.value.empty() && lower(entry.value) != "auto" ? diag::wide(entry.value) : L"";
         } else notes.push_back("d4r.ini: [" + entry.section + "] " + entry.key + " is not a Windows setting; ignored");
     }
     return settings;
@@ -192,14 +206,31 @@ inline void verify_dll(const std::filesystem::path& dir, const std::vector<Pin>&
 
 // The installer used to check these before touching the game; a drag-in
 // install checks them at startup instead.
-inline std::filesystem::path native_code_object_dir(const std::filesystem::path& dir) {
+inline std::filesystem::path native_code_object_dir(const std::filesystem::path& dir, const Settings* settings = nullptr) {
+    if (settings && !settings->nativeDir.empty()) {
+        auto root = std::filesystem::path(settings->nativeDir);
+        if (root.is_relative()) root = dir / root;
+        const auto arch = root / diag::wide(diag::HipApi::target_arch());
+        return std::filesystem::is_directory(arch) ? arch : root;
+    }
     const auto arch = dir / L"native" / diag::wide(diag::HipApi::target_arch());
     return std::filesystem::is_directory(arch) ? arch : dir / L"native";
 }
-inline void verify_code_objects(const std::filesystem::path& dir) {
+inline void verify_code_objects(const std::filesystem::path& dir, const Settings* settings = nullptr) {
     const std::string arch = diag::HipApi::target_arch();
     std::vector<std::filesystem::path> objects{dir / (L"pixel_convert_" + diag::wide(arch) + L".hsaco")};
-    const auto native = native_code_object_dir(dir);
+    const auto native = native_code_object_dir(dir, settings);
+    if (settings && !settings->nativeDir.empty() &&
+        (!std::filesystem::is_directory(native) || !std::filesystem::is_regular_file(native / L"d4r-kernels.txt")))
+        throw std::runtime_error("[Paths] NativeDir must contain the complete native kernel set and d4r-kernels.txt");
+    if (settings && !settings->nativeDir.empty()) {
+        for (const char* name : {"dltss_pwin_enc0_layer", "dltss_pwin_enc1_layer", "dltss_pwin_enc2_layer",
+            "dltss_pwin_enc3_layer", "dltss_pwin_enc4_layer", "dltss_pwin_dec5_layer", "dltss_pwin_dec4_layer",
+            "dltss_pwin_dec3_layer", "dltss_pwin_dec2_layer", "dltss_pwin_dec1_layer", "dltss_pwin_dec0_layer",
+            "rrlite_enc1_4x4", "rrlite_enc2_4x4", "rrlite_enc3_tube_4x4", "rrlite_dec2_4x4", "rrlite_dec1_4x4"})
+            if (!std::filesystem::is_regular_file(native / (std::string(name) + ".hsaco")))
+                throw std::runtime_error(std::string("[Paths] NativeDir is incomplete; missing ") + name);
+    }
     if (!std::filesystem::is_directory(native)) throw std::runtime_error("d4r\\native (or d4r\\native\\" + arch + ") is missing; extract the d4r ZIP again");
     for (const auto& entry : std::filesystem::directory_iterator(native))
         if (entry.path().extension() == L".hsaco") objects.push_back(entry.path());
@@ -212,9 +243,9 @@ inline void verify_code_objects(const std::filesystem::path& dir) {
     }
 }
 
-inline void verify_native_fp8_bundle(const std::filesystem::path& dir) {
+inline void verify_native_fp8_bundle(const std::filesystem::path& dir, const Settings* settings = nullptr) {
     const auto arch = diag::HipApi::target_arch();
-    const auto marker = native_code_object_dir(dir) / L"d4r-native-fp8.txt";
+    const auto marker = native_code_object_dir(dir, settings) / L"d4r-native-fp8.txt";
     if (!std::filesystem::is_regular_file(marker))
         throw std::runtime_error("[Kernels] NativeFp8=true needs a matching gfx12 token-lane M bundle; rebuild with -TokenLanes and restart.");
     const auto contents = read_text(marker);
@@ -260,6 +291,10 @@ inline void redirect(FILE* crt, DWORD stream, const std::filesystem::path& path)
     SetStdHandle(stream, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(crt))));
 }
 
+inline std::filesystem::path rr_model_directory(const std::filesystem::path& dir, const Settings& settings) {
+    const std::filesystem::path model = settings.rrModelDir.empty() ? std::filesystem::path(L"engine/rr-d") : std::filesystem::path(settings.rrModelDir);
+    return std::filesystem::absolute(model.is_relative() ? dir / model : model).lexically_normal();
+}
 inline void apply(const std::filesystem::path& dir, const Settings& settings) {
     std::filesystem::path cache = settings.cacheDir;
     if (cache.empty()) {
@@ -276,6 +311,8 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
     const auto compatNvapi = compat_nvapi_path(dir);
     // Same codegen and paths as windows-game.ps1; only diagnostics differ.
     const std::pair<const wchar_t*, std::optional<std::wstring>> values[] = {
+        {L"D4R_RR_BACKEND", settings.rrBackend == "off" ? unset : std::optional<std::wstring>(diag::wide(settings.rrBackend))},
+        {L"D4R_RR_MODEL_DIR", settings.rrBackend == "native" ? std::optional<std::wstring>(rr_model_directory(dir, settings).wstring()) : unset},
         {L"D4R_HIP_ROOT", p(L"hip")}, {L"HIP_PATH", p(L"hip")},
         {L"D4R_NVCUDA_DLL", p(L"zluda\\nvcuda.dll")}, {L"ZLUDA_CUDA_LIB", p(L"zluda\\nvcuda.dll")},
         {L"D4R_NVAPI_DLL", std::optional<std::wstring>(compatNvapi.wstring())},
@@ -283,7 +320,7 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
         {L"D4R_NGX_CORE", p(L"ngx\\_nvngx.dll")}, {L"D4R_DLSS_DLL", p(L"dlss\\nvngx_dlss.dll")},
         {L"D4R_NGX_DATA_DIR", std::optional<std::wstring>(ngxData.wstring())},
         {L"D4R_FORMAT_MODULE", p(L"pixel_convert_" + diag::wide(diag::HipApi::target_arch()) + L".hsaco")},
-        {L"D4R_ZLUDA_NATIVE_DIR", std::optional<std::wstring>(native_code_object_dir(dir).wstring())},{L"D4R_D3D12_COMMAND_BACKEND", on},
+        {L"D4R_ZLUDA_NATIVE_DIR", std::optional<std::wstring>(native_code_object_dir(dir, &settings).wstring())},{L"D4R_D3D12_COMMAND_BACKEND", on},
         {L"D4R_ZLUDA_WMMA", on}, {L"D4R_ZLUDA_WMMA_FP8", on},
         {L"D4R_ZLUDA_WMMA_FP8_NATIVE", settings.nativeFp8 ? on : off},
         {L"D4R_ZLUDA_WMMA_F16_REFERENCE", on},
@@ -328,8 +365,8 @@ inline void ensure_environment() {
             verify_dll(dir, pins, "dlss", L"dlss\\nvngx_dlss.dll", "nvngx_dlss.dll", current.notes);
             verify_dll(dir, pins, "ngx", L"ngx\\_nvngx.dll", "_nvngx.dll", current.notes);
             reject_translation_layer();
-            if (settings.nativeFp8) verify_native_fp8_bundle(dir);
-            verify_code_objects(dir);
+            if (settings.nativeFp8) verify_native_fp8_bundle(dir, &settings);
+            verify_code_objects(dir, &settings);
             apply(dir, settings);
             current.active = true; current.preset = settings.preset;
             const char* model = settings.preset == 5 ? "E" : settings.preset == 12 ? "L" : settings.preset == 13 ? "M" : "K";

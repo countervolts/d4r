@@ -119,6 +119,7 @@ struct Args {
     std::string pixel_profile = "baseline";
     std::string barrier_mode = "legacy";
     bool early_indirect = false;
+    bool player_mode = false;
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
@@ -160,6 +161,7 @@ struct Args {
                 barrier_mode = value;
             }
             else if (key == "--early-indirect") early_indirect = value == "1";
+            else if (key == "--player-mode") player_mode = value == "1";
             else if (key == "--ngx-core") ngx_core = value;
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;

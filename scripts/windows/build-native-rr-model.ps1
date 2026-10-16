@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory=$true)][string]$DlssdDll,
     [ValidateSet('D','E')][string]$Preset='D',
     [string]$OutputDirectory,
-    [string]$GitBash='C:\Program Files\Git\bin\bash.exe'
+    [string]$GitBash='C:\Program Files\Git\bin\bash.exe',
+    [switch]$ReuseCache
 )
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -18,7 +19,7 @@ $buildRoot=[IO.Path]::GetFullPath((Join-Path $repo 'build'))
 if(!$OutputDirectory.StartsWith($buildRoot+'\',[StringComparison]::OrdinalIgnoreCase)){
     throw "RR model output must stay under the ignored build directory: $OutputDirectory"
 }
-if(Test-Path -LiteralPath $OutputDirectory){throw "Use a new RR model output directory: $OutputDirectory"}
+if((Test-Path -LiteralPath $OutputDirectory) -and !$ReuseCache){throw "Use a new RR model output directory or -ReuseCache: $OutputDirectory"}
 $glslang=Join-Path $repo '.tools/glslang-16.6.0/bin'
 $pythonHome=Split-Path (Get-Command python.exe -ErrorAction Stop).Source
 $pythonShim=Join-Path $repo '.tools/rr-build-bin'
@@ -35,6 +36,8 @@ $unixOut=(& $cygpath -u $OutputDirectory).Trim()
 if(!$unixRepo -or !$unixDll -or !$unixOut){throw 'Git Bash path conversion failed.'}
 $oldPath=$env:PATH
 $oldPythonPath=$env:PYTHONPATH
+$oldGfx11=$env:D4R_RR_GFX11
+$oldRelaxed=$env:D4R_RR_RELAXED
 $env:PATH="$pythonShim;$pythonHome;$glslang;$(Split-Path $GitBash -Parent);$oldPath"
 $env:PYTHONPATH=$pythonVendor
 $env:D4R_RR_GFX11='1'
@@ -43,7 +46,16 @@ $log=Join-Path $buildRoot ("native-rr-$($Preset.ToLower())-windows-build.log")
 try{
     & $python3 -c 'import numpy; print("numpy", numpy.__version__)'
     if($LASTEXITCODE){throw 'Pinned NumPy could not load in the Windows RR build environment.'}
-    $command="cd '$unixRepo' && D4R_RR_GFX11=1 D4R_RR_RELAXED=0 bash engine/rr/build_native_model.sh --dll '$unixDll' '$Preset' '$unixOut'"
+    $cacheArguments=@('--model',$OutputDirectory,'--dll',$DlssdDll,'--preset',$Preset,
+        '--glslang',(Join-Path $glslang 'glslangValidator.exe'),'--bash',$GitBash)
+    $cacheTool=Join-Path $PSScriptRoot 'rr-model-cache.py'
+    if(Test-Path -LiteralPath $OutputDirectory){
+        & $python3 $cacheTool check @cacheArguments
+        if($LASTEXITCODE){throw 'RR model cache is absent, stale or changed. Use a new output directory.'}
+        return
+    }
+    function Quote-Bash([string]$Value){return "'"+$Value.Replace("'","'\''")+"'"}
+    $command="cd $(Quote-Bash $unixRepo) && D4R_RR_GFX11=1 D4R_RR_RELAXED=0 bash engine/rr/build_native_model.sh --dll $(Quote-Bash $unixDll) '$Preset' $(Quote-Bash $unixOut)"
     $previousPreference=$ErrorActionPreference
     try{
         $ErrorActionPreference='Continue'
@@ -54,6 +66,8 @@ try{
     foreach($required in @('rr.txt','model.json','enc0_m.spv','dec0_m.spv','hkpn.spv','enc0.args','hkpn.args')){
         if(!(Test-Path -LiteralPath (Join-Path $OutputDirectory $required))){throw "RR build incomplete; missing $required"}
     }
+    & $python3 $cacheTool write @cacheArguments
+    if($LASTEXITCODE){throw 'RR build completed but cache manifest could not be written.'}
     Write-Host "Built local preset $Preset native RR model: $OutputDirectory"
     Write-Host "DLL SHA256: $hash. Build log: $log"
-}finally{$env:PATH=$oldPath;$env:PYTHONPATH=$oldPythonPath}
+}finally{$env:PATH=$oldPath;$env:PYTHONPATH=$oldPythonPath;$env:D4R_RR_GFX11=$oldGfx11;$env:D4R_RR_RELAXED=$oldRelaxed}

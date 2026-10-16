@@ -1,10 +1,10 @@
 [CmdletBinding()]
-param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [switch]$CacheTestsOnly, [switch]$CompilerTestsOnly, [int]$Jobs = 4)
+param([string]$SourceRoot, [string]$LlvmBuildRoot, [string]$InstallRoot, [switch]$FetchOnly, [switch]$CacheTestsOnly, [switch]$CompilerTestsOnly, [switch]$EmitterOnly, [int]$Jobs = 4)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$SourceRoot) { $SourceRoot = Join-Path $repo 'external/ZLUDA' }
 if (!$LlvmBuildRoot) { $LlvmBuildRoot = Join-Path $repo 'build/zluda-llvm-windows-gnu' }
-if (!$InstallRoot) { $InstallRoot = Join-Path $repo 'dist/zluda-windows-final' }
+if (!$InstallRoot) { $InstallRoot = Join-Path $repo $(if ($EmitterOnly) { 'dist/zluda-windows-emitter' } else { 'dist/zluda-windows-final' }) }
 $rust = Join-Path $repo '.tools/rust-1.98.1-gnu'
 $toolchain = Join-Path $repo '.tools/llvm-mingw-20260922-ucrt-x86_64'
 $target = Join-Path $repo 'build/zluda-rust-windows-gnu'
@@ -60,28 +60,41 @@ try {
     foreach ($variant in @('','_constrained','_w64','_constrained_w64')) {
         if (!(Test-Path "ptx/lib/zluda_ptx_impl$variant.bc")) { throw 'Run build-zluda-helpers.ps1 first.' }
     }
-    $ErrorActionPreference = 'Continue'
-    & $cargo build --locked --release --target x86_64-pc-windows-gnu -p zluda -p nvapi -p zluda_trace `
-        2>&1 | Tee-Object (Join-Path $target 'build.log')
-    $ErrorActionPreference = 'Stop'
-    if ($LASTEXITCODE) { throw "ZLUDA build failed ($LASTEXITCODE)" }
+    if (!$EmitterOnly) {
+        $ErrorActionPreference = 'Continue'
+        & $cargo build --locked --release --target x86_64-pc-windows-gnu -p zluda -p nvapi -p zluda_trace `
+            2>&1 | Tee-Object (Join-Path $target 'build.log')
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE) { throw "ZLUDA build failed ($LASTEXITCODE)" }
+    }
     $ErrorActionPreference = 'Continue'
     & $cargo build --locked --release --target x86_64-pc-windows-gnu -p ptx --example d4r_emit `
         2>&1 | Tee-Object (Join-Path $target 'emit-build.log')
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "d4r_emit build failed ($LASTEXITCODE)" }
     $release = Join-Path $target 'x86_64-pc-windows-gnu/release'
-    Copy-Item -LiteralPath (Join-Path $release 'nvcuda.dll') -Destination $InstallRoot -Force
-    Copy-Item -LiteralPath (Join-Path $release 'nvapi64.dll') -Destination $InstallRoot -Force
+    if (!$EmitterOnly) {
+        Copy-Item -LiteralPath (Join-Path $release 'nvcuda.dll') -Destination $InstallRoot -Force
+        Copy-Item -LiteralPath (Join-Path $release 'nvapi64.dll') -Destination $InstallRoot -Force
+    }
     # The C++ dependencies select libc++ dynamically even when Rust requests
     # static GNU support libraries. Keep these portable runtime DLLs local.
     foreach ($runtime in @('libc++.dll', 'libunwind.dll')) {
         Copy-Item -LiteralPath (Join-Path $toolchain "bin/$runtime") -Destination $InstallRoot -Force
     }
-    New-Item -ItemType Directory -Force (Join-Path $InstallRoot 'trace') | Out-Null
-    Copy-Item -LiteralPath (Join-Path $release 'zluda_trace.dll') -Destination (Join-Path $InstallRoot 'trace/nvcuda.dll') -Force
+    if (!$EmitterOnly) {
+        New-Item -ItemType Directory -Force (Join-Path $InstallRoot 'trace') | Out-Null
+        Copy-Item -LiteralPath (Join-Path $release 'zluda_trace.dll') -Destination (Join-Path $InstallRoot 'trace/nvcuda.dll') -Force
+    }
     Copy-Item -LiteralPath (Join-Path $release 'examples/d4r_emit.exe') -Destination $InstallRoot -Force
-    @{base='ee2f25a180099fa42f36b2346732e1f2470a03ad'; target='x86_64-pc-windows-gnu';
+    if(Test-Path -LiteralPath (Join-Path $LlvmBuildRoot 'bin/llvm-as.exe')){
+        Copy-Item -LiteralPath (Join-Path $LlvmBuildRoot 'bin/llvm-as.exe') -Destination $InstallRoot -Force
+    }
+    @{base='ee2f25a180099fa42f36b2346732e1f2470a03ad'; target='x86_64-pc-windows-gnu'; emitterOnly=[bool]$EmitterOnly;
+        emitterSha256=(Get-FileHash -LiteralPath (Join-Path $InstallRoot 'd4r_emit.exe') -Algorithm SHA256).Hash;
+        assemblerSha256=$(if(Test-Path -LiteralPath (Join-Path $InstallRoot 'llvm-as.exe')){
+            (Get-FileHash -LiteralPath (Join-Path $InstallRoot 'llvm-as.exe') -Algorithm SHA256).Hash
+        }else{$null});
         sourceCommit=(& git rev-parse HEAD); workingTreeDirty=[bool](& git status --porcelain);
         rust='1.98.1'; llvm=(& (Join-Path $LlvmBuildRoot 'bin/llvm-config.exe') --version);
         llvmSource=$(if (Test-Path (Join-Path $LlvmBuildRoot 'd4r-llvm-build-info.json')) {
@@ -89,7 +102,7 @@ try {
         } else { $null });
         files=@(Get-ChildItem -LiteralPath $InstallRoot -Filter '*.dll' | Get-FileHash -Algorithm SHA256)} |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallRoot 'build-info.json') -Encoding UTF8
-    Write-Host "Native Windows d4r ZLUDA runtime: $InstallRoot"
+    Write-Host "Native Windows d4r ZLUDA $(if ($EmitterOnly) { 'offline emitter' } else { 'runtime' }): $InstallRoot"
 } finally {
     Pop-Location
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name],'Process') }

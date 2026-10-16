@@ -107,5 +107,36 @@ try { Invoke-Package $prefix (Join-Path $OutputDirectory 'release-runtime') } ca
 if (!$rejected) { throw 'A differing shared runtime was not rejected.' }
 $results+=@{case='shared-runtime-mismatch-rejected'; passed=$true}
 
+# Local ZIPs may include uncommitted inputs, but remain under ignored build/ and
+# preserve all target/hash/runtime checks. This fixture is never a usable game ZIP.
+$prefix=Join-Path $OutputDirectory 'inputs/development/game'
+New-Inputs $prefix
+foreach($target in $targets){
+    $metadataPath="$prefix-$($target.architecture)/package.json"
+    $metadata=Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $metadata.d4rWorkingTreeDirty=$true
+    $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
+}
+$developmentRoot=Join-Path $repo ('build/release-development-fixture-'+[Guid]::NewGuid().ToString('N'))
+$zip=Join-Path $developmentRoot 'fixture.zip'
+& (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $prefix -LoaderDll $loader `
+    -PackageRoot (Join-Path $developmentRoot 'package') -ArchivePath $zip -LocalDevelopment | Out-Null
+$metadata=Get-Content -LiteralPath (Join-Path $developmentRoot 'package/d4r/package.json') -Raw | ConvertFrom-Json
+if(!$metadata.localDevelopment){throw 'Local ZIP lacks development marker.'}
+$archive=[IO.Compression.ZipFile]::OpenRead($zip)
+try{
+    foreach($required in @('install.bat','install-dlss.ps1','d4r/d4r.ini')){
+        if(!$archive.GetEntry($required)){throw "Local ZIP lacks $required"}
+    }
+}finally{$archive.Dispose()}
+$results+=@{case='local-development-zip'; passed=$true}
+$rejected=$false
+try{
+    & (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $prefix -LoaderDll $loader `
+        -PackageRoot (Join-Path $repo 'dist/rejected-local-fixture') -LocalDevelopment | Out-Null
+}catch{$rejected=$_.Exception.Message -match 'must stay under ignored build/'}
+if(!$rejected){throw 'Local package escaped build/.'}
+$results+=@{case='local-development-path-rejected'; passed=$true}
+
 $results | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
 Write-Host "PASS WINDOWS_RELEASE_PACKAGE cases=$($results.Count) Report: $OutputDirectory"

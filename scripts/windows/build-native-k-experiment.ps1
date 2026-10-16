@@ -4,12 +4,17 @@ param([ValidateSet('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2
     [ValidateSet('baseline','load','store','both')][string]$NonTemporal='baseline',
     [ValidateSet(0,1,2,4)][int]$PosTiles=0, [switch]$ShareValues, [switch]$PrivateValues,
     [switch]$PackedAccumulator,
+    [ValidateSet('gfx1100','gfx1101','gfx1102','gfx1103','gfx1150','gfx1151','gfx1152','gfx1153','gfx1154','gfx1200','gfx1201')]
+    [string]$GpuArch='gfx1201',
     [string]$HipRoot, [string]$OutputDirectory)
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot=Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if ($ShareValues -and $PrivateValues) { throw 'Choose shared or private V storage.' }
-if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/native-k-experiment-$Layer-$Mode-$NonTemporal-pos$PosTiles-share$([int][bool]$ShareValues)-private$([int][bool]$PrivateValues)-packed$([int][bool]$PackedAccumulator)" }
+if ($GpuArch -notmatch '^gfx12' -and ($PosTiles -or $ShareValues -or $PrivateValues -or $PackedAccumulator)) {
+    throw 'Token tiling and accumulator/storage experiments require gfx12.'
+}
+if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/native-k-experiment-$GpuArch-$Layer-$Mode-$NonTemporal-pos$PosTiles-share$([int][bool]$ShareValues)-private$([int][bool]$PrivateValues)-packed$([int][bool]$PackedAccumulator)" }
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 foreach ($baseline in @('build/native-k-gfx1201','build/windows-rdna4-therock','dist/windows-rdna4-command-list')) {
     if ($OutputDirectory.StartsWith([IO.Path]::GetFullPath((Join-Path $repo $baseline)), [StringComparison]::OrdinalIgnoreCase)) {
@@ -40,22 +45,23 @@ if ($ShareValues) {
 }
 if ($PackedAccumulator) { $flags+='-DD4R_K_PACKED_ACC' }
 if ($PrivateValues) { $flags+='-DD4R_K_PRIVATE_V' }
+if ($GpuArch -match '^gfx11') { $flags+='-DD4R_WINDOWS_GFX11_LANE_EXCHANGE' }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $object=Join-Path $OutputDirectory "$name.hsaco"
-$arguments=@('-x','hip','-std=c++17','--offload-arch=gfx1201','--offload-device-only',
+$arguments=@('-x','hip','-std=c++17',"--offload-arch=$GpuArch",'--offload-device-only',
     '--no-gpu-bundle-output','-mno-wavefrontsize64','-nogpuinc','-nogpulib','-O3',
     '-DD4R_DEVICE_ONLY_MINIMAL','-DD4R_K_FP16_BASELINE')+$flags+@($source,'-o',$object)
 $ErrorActionPreference='Continue'
 & $compiler @arguments > (Join-Path $OutputDirectory "$name.build.stdout.log") 2> (Join-Path $OutputDirectory "$name.build.stderr.log")
 $ErrorActionPreference='Stop'
 if ($LASTEXITCODE) { throw "Experimental K compile failed: $Layer" }
-& (Join-Path (Split-Path $compiler) 'llvm-objdump.exe') --disassemble --mcpu=gfx1201 $object `
+& (Join-Path (Split-Path $compiler) 'llvm-objdump.exe') --disassemble "--mcpu=$GpuArch" $object `
     > (Join-Path $OutputDirectory "$name.isa.txt")
 if ($LASTEXITCODE) { throw 'Native object ISA extraction failed.' }
 & (Join-Path (Split-Path $compiler) 'llvm-readobj.exe') --notes $object `
     > (Join-Path $OutputDirectory "$name.metadata.txt")
 if ($LASTEXITCODE) { throw 'Native object metadata extraction failed.' }
-@{layer=$Layer; architecture='gfx1201'; experimental=$true; numericalValidation='pending';
+@{layer=$Layer; architecture=$GpuArch; experimental=$true; numericalValidation='pending';
     mode=$Mode; nonTemporal=$NonTemporal; tokenTilesPerWave=$PosTiles; shareValues=[bool]$ShareValues;
     privateValues=[bool]$PrivateValues;
     packedAccumulator=[bool]$PackedAccumulator;
@@ -64,5 +70,5 @@ if ($LASTEXITCODE) { throw 'Native object metadata extraction failed.' }
     compilerVersion=(& $compiler --version | Out-String).Trim();
     sha256=(Get-FileHash -LiteralPath $object -Algorithm SHA256).Hash} |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory "$name.build-info.json") -Encoding UTF8
-Write-Host "Compiled gfx1201 K experiment: $Layer mode=$Mode nonTemporal=$NonTemporal posTiles=$PosTiles shareValues=$([bool]$ShareValues). Validate before installing."
+Write-Host "Compiled $GpuArch K experiment: $Layer mode=$Mode nonTemporal=$NonTemporal posTiles=$PosTiles shareValues=$([bool]$ShareValues). Validate before installing."
 # No override manifest or game installation is produced by this script.

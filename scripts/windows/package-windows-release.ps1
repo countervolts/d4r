@@ -1,6 +1,6 @@
-# Builds the Windows drag-in release: extract it into the game folder, copy
-# the two NVIDIA DLLs, edit d4r\d4r.ini. Like the Linux release, no installer
-# or launcher is involved. Inputs are the per-target game packages that
+# Builds the Windows drag-in release: extract it into the game folder and run
+# install.bat for the pinned local NVIDIA dependencies. No game launcher is
+# required. Inputs are the per-target game packages that
 # package-windows-game.ps1 produces (the same inputs as the quick test).
 [CmdletBinding()]
 param(
@@ -8,17 +8,27 @@ param(
     [Parameter(Mandatory=$true)][string]$LoaderDll,
     [Parameter(Mandatory=$true)][string]$PackageRoot,
     [string[]]$Architectures,   # default: every target in gpu-targets.json; a subset makes a smaller release
-    [string]$ArchivePath
+    [string]$ArchivePath,
+    [switch]$LocalDevelopment
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$GamePackagePrefix) { $GamePackagePrefix=Join-Path $repo 'dist/windows-gpu-coverage-game' }
 $PackageRoot=[IO.Path]::GetFullPath($PackageRoot)
+if($LocalDevelopment){
+    $buildRoot=[IO.Path]::GetFullPath((Join-Path $repo 'build'))+'\'
+    foreach($candidate in @($PackageRoot,$ArchivePath) | Where-Object { $_ }){
+        if(!([IO.Path]::GetFullPath($candidate)).StartsWith($buildRoot,[StringComparison]::OrdinalIgnoreCase)){
+            throw 'Local development packages and ZIPs must stay under ignored build/.'
+        }
+    }
+}
 if (Test-Path -LiteralPath $PackageRoot) { throw 'Use a new output directory to avoid mixing releases.' }
 $git=Get-Command git -ErrorAction SilentlyContinue
+$workingTreeDirty=(!$git -or [bool](& git -C $repo status --porcelain))
 $commit=if ($git) { (& git -C $repo rev-parse HEAD).Trim() } else { $null }
-if ($ArchivePath -and (!$git -or [bool](& git -C $repo status --porcelain))) { throw 'A public ZIP needs git and committed sources.' }
+if ($ArchivePath -and !$LocalDevelopment -and (!$git -or [bool](& git -C $repo status --porcelain))) { throw 'A public ZIP needs git and committed sources.' }
 New-Item -ItemType Directory -Force $PackageRoot | Out-Null
 $files=[Collections.Generic.List[object]]::new()
 function Stage([string]$Source,[string]$Relative) {
@@ -35,7 +45,7 @@ if (!$selected.Count -or ($Architectures -and $selected.Count -ne @($Architectur
 foreach ($gpu in $selected) {
     $arch=$gpu.architecture; $source="$GamePackagePrefix-$arch"
     $metadata=Get-Content -LiteralPath (Join-Path $source 'package.json') -Raw | ConvertFrom-Json
-    if ($metadata.architecture -ne $arch -or $metadata.d4rWorkingTreeDirty) { throw "Uncommitted or wrong-target input: $source" }
+    if ($metadata.architecture -ne $arch -or ($metadata.d4rWorkingTreeDirty -and !$LocalDevelopment)) { throw "Uncommitted or wrong-target input: $source" }
     if (!$baseline) { $baseline=$metadata }
     if ($metadata.dlssSha256 -ne $baseline.dlssSha256 -or $metadata.zludaBuild.sourceCommit -ne $baseline.zludaBuild.sourceCommit) { throw 'Input packages do not use the same validated dependencies.' }
     $objects=0
@@ -83,11 +93,12 @@ $placeholder=Join-Path $PackageRoot 'd4r/ngx/PUT _nvngx.dll HERE.txt'
 New-Item -ItemType Directory -Force (Split-Path $placeholder) | Out-Null
 "Copy NVIDIA's _nvngx.dll into this folder. See WINDOWS_README.txt." | Set-Content -LiteralPath $placeholder -Encoding ASCII
 $files.Add(@{path='d4r/ngx/PUT _nvngx.dll HERE.txt'; sha256=(Get-FileHash -LiteralPath $placeholder -Algorithm SHA256).Hash; version=$null})
-if (Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Where-Object { $_.Name -eq 'nvngx_dlss.dll' -or ($_.Name -eq '_nvngx.dll' -and $_.DirectoryName -ne (Join-Path $PackageRoot 'd4r')) }) {
+if (Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Where-Object { $_.Name -in @('nvngx_dlss.dll','nvngx_dlssd.dll') -or ($_.Name -eq '_nvngx.dll' -and $_.DirectoryName -ne (Join-Path $PackageRoot 'd4r')) }) {
     throw 'Proprietary NVIDIA binaries must not be in the release.'
 }
 # Read by d4r-check.ps1: every shipped file's hash, so a damaged or mixed install is reported.
-$manifest=[ordered]@{schema=1; kind='windows-drag-in'; packageCommit=$commit; binarySourceCommit=$baseline.d4rCommit;
+$manifest=[ordered]@{schema=1; kind='windows-drag-in'; localDevelopment=[bool]$LocalDevelopment;
+    packageWorkingTreeDirty=[bool]$workingTreeDirty; packageCommit=$commit; binarySourceCommit=$baseline.d4rCommit;
     dependencies=@{optiScalerSourceCommit=$baseline.optiScaler.sourceCommit; zludaSourceCommit=$baseline.zludaBuild.sourceCommit; hipRuntime=$baseline.hipRuntime};
     targets=$targets; files=$files}
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $PackageRoot 'd4r/package.json') -Encoding UTF8

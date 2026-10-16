@@ -1,0 +1,20 @@
+These headers are copied unmodified from the AMD FidelityFX SDK
+(https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK), commit
+60f4ea81909200d8542eca14dccb2628b763a9a3 (SDK 2.3.0, FSR Ray Regeneration 1.2.0):
+
+  api/include/ffx_api.h
+  api/include/ffx_api_types.h
+  denoisers/include/ffx_denoiser.h
+
+The SDK license (Kits/FidelityFX/docs/license.md) lists these files as exceptions
+that are subject to the following MIT license. The AMD runtime DLLs
+(amd_fidelityfx_*_dx12.dll) are NOT part of this repository and are governed by
+AMD's binary-only terms.
+
+Copyright (C) Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: 
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. 
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. 

@@ -31,7 +31,7 @@ try {
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "LLVM configure failed ($LASTEXITCODE)" }
     $ErrorActionPreference = 'Continue'
-    & $cmake --build $BuildRoot --parallel $Jobs --target llvm-config llvm-libraries lldCommon lldELF `
+    & $cmake --build $BuildRoot --parallel $Jobs --target llvm-config llvm-libraries lldCommon lldELF llvm-as `
         2>&1 | Tee-Object (Join-Path $BuildRoot 'build.log')
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "LLVM build failed ($LASTEXITCODE)" }

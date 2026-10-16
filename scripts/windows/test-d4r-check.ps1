@@ -57,7 +57,7 @@ function Expect([string]$case,$run,[int]$exit,[string[]]$patterns) {
 $game=New-Install 'healthy'; $inv=Write-Inventory 'a' 'gfx1101'
 Expect 'healthy-install' (Run-Check $game $inv) 0 @('ok\s+d4r\\dlss\\nvngx_dlss\.dll \(nvngx_dlss\.dll 310\.9\.1, tested on Windows\)','ok\s+d4r\\ngx\\_nvngx\.dll',
     'ok\s+GPU AMD Radeon RX 7700 XT \(gfx1101\): build present, 16 native kernels','ok\s+all 17 GPU code objects are built for gfx1101',
-    'ok\s+no vkd3d/Wine d3d12\.dll','ok\s+d4r\.ini is valid \(model K\)','compile-tested','Everything d4r needs is in place')
+    'ok\s+no vkd3d/Wine d3d12\.dll','ok\s+d4r\.ini is valid \(model K\)','RX 7700 XT has passed native Windows synthetic checks','Everything d4r needs is in place')
 
 # 2. NVIDIA DLL problems, each with the fix.
 $game=New-Install 'dll-missing'; Remove-Item -LiteralPath (Join-Path $game 'd4r/dlss/nvngx_dlss.dll')
@@ -78,8 +78,8 @@ $game=New-Install 'opti-path'; (Get-Content -LiteralPath (Join-Path $game 'OptiS
 Expect 'optiscaler-ini-path' (Run-Check $game $inv) 1 @('MISSING\s+OptiScaler\.ini NvngxPath = nowhere does not hold _nvngx\.dll')
 
 # 4. d4r.ini mistakes are notes with what will happen instead.
-$game=New-Install 'ini'; Set-Content -LiteralPath (Join-Path $game 'd4r/d4r.ini') "[DLSS]`nModel = E`nShowWatermark = sometimes`n[Latency]`nFrameAge = 1`n[Debug]`nLog = loud`n" -Encoding ASCII
-Expect 'ini-mistakes' (Run-Check $game $inv) 0 @("note\s+d4r\.ini: \[DLSS\] Model 'E' is not available on Windows",'must be true or false, not ''sometimes''','\[Latency\] FrameAge is not a Windows setting','Log must be normal or verbose')
+$game=New-Install 'ini'; Set-Content -LiteralPath (Join-Path $game 'd4r/d4r.ini') "[DLSS]`nModel = Z`nShowWatermark = sometimes`n[Latency]`nFrameAge = 1`n[Debug]`nLog = loud`n" -Encoding ASCII
+Expect 'ini-mistakes' (Run-Check $game $inv) 0 @("note\s+d4r\.ini: \[DLSS\] Model 'Z' is not available on Windows",'must be true or false, not ''sometimes''','\[Latency\] FrameAge is not a Windows setting','Log must be normal or verbose')
 
 # 5. GPU cases.
 $game=New-Install 'gpu-no-build'; Remove-Item -LiteralPath (Join-Path $game 'd4r/_nvngx_gfx1103.dll')
@@ -118,6 +118,23 @@ $text=& $powershell -NoProfile -ExecutionPolicy Bypass -File $check -GameFolder 
 $exitEmpty=$LASTEXITCODE; $ErrorActionPreference='Stop'
 if ($exitEmpty -ne 1 -or $text -notmatch 'no d4r folder here') { throw "A folder without d4r must be reported.`n$text" }
 $results+=@{case='no-d4r-folder'; passed=$true}
+
+foreach($preset in @('E','L')){
+    $game=New-Install "ini-$preset"
+    Set-Content -LiteralPath (Join-Path $game 'd4r/d4r.ini') "[DLSS]`nModel=$preset`n" -Encoding ASCII
+    Expect "ini-$preset" (Run-Check $game $inv) 0 @("d4r.ini is valid \(model $preset\)")
+}
+$game=New-Install 'private-native'
+$private=Join-Path $game 'd4r/private-native'
+New-Item -ItemType Directory -Path $private | Out-Null
+Copy-Item (Join-Path $game 'd4r/native/gfx1101/*') $private
+Set-Content -LiteralPath (Join-Path $game 'd4r/d4r.ini') "[Paths]`nNativeDir=private-native`n" -Encoding ASCII
+Expect 'private-native-valid' (Run-Check $game $inv) 0 @('ok\s+private native kernel directory')
+$object=Get-ChildItem -LiteralPath $private -Filter '*.hsaco' | Select-Object -First 1
+$header=[IO.File]::ReadAllBytes($object.FullName);$header[48]=0;[IO.File]::WriteAllBytes($object.FullName,$header)
+Expect 'private-native-target-rejected' (Run-Check $game $inv) 1 @('NativeDir .* is not built for gfx1101')
+Remove-Item -LiteralPath $object.FullName
+Expect 'private-native-incomplete-rejected' (Run-Check $game $inv) 1 @('NativeDir is incomplete')
 
 $results | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'summary.json') -Encoding UTF8
 Write-Host "PASS D4R_CHECK cases=$($results.Count) Report: $OutputDirectory"

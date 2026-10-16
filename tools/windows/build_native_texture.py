@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from gpu_targets import TARGETS
+from llvm22_ir import compatible_ir
 
 
 def require_code_object_target(path, target):
@@ -39,6 +40,8 @@ def main():
         parser.error('this private experimental build recipe supports K v2 input/output variants only')
     repo = pathlib.Path(__file__).resolve().parents[2]
     output = args.output_directory.resolve()
+    if not output.is_relative_to((repo / 'build').resolve()):
+        parser.error('private texture outputs must stay under the repository ignored build directory')
     output.mkdir(parents=True, exist_ok=True)
     for existing in output.glob('*.hsaco'):
         require_code_object_target(existing, args.gpu_arch)
@@ -46,8 +49,16 @@ def main():
     work.mkdir(exist_ok=True)
     hip = args.hip_root.resolve()
     zluda = args.zluda_root.resolve()
-    tools = {name: hip / 'bin' / (name + '.exe') for name in ('clang++', 'llvm-dis', 'llvm-as')}
+    tools = {}
+    for name in ('clang++', 'llvm-dis', 'llvm-as'):
+        candidates = [hip / folder / (name + '.exe') for folder in ('lib/llvm/bin', 'bin')]
+        tools[name] = next((path for path in candidates if path.is_file()), candidates[0])
     emitter = zluda / 'd4r_emit.exe'
+    # The emitter's LLVM reader must consume the helper bitcode. A newer HIP
+    # compiler can emit textual IR, but its bitcode attributes may be unreadable.
+    emitter_assembler = zluda / 'llvm-as.exe'
+    if emitter_assembler.is_file():
+        tools['llvm-as'] = emitter_assembler
     for path in [args.dlss_dll, emitter, *tools.values()]:
         if not path.is_file():
             parser.error(f'missing dependency: {path}')
@@ -63,7 +74,8 @@ def main():
 
     def run(label, command):
         with (work / (label + '.log')).open('wb') as log:
-            result = subprocess.run([str(arg) for arg in command], env=env, stdout=log, stderr=subprocess.STDOUT)
+            result = subprocess.run([str(arg) for arg in command], env=env, stdout=log,
+                                    stderr=subprocess.STDOUT, timeout=600)
         if result.returncode:
             print((work / (label + '.log')).read_text(errors='replace')[-8000:], file=sys.stderr)
             raise RuntimeError(f'{label} failed ({result.returncode}); see {work}')
@@ -89,11 +101,16 @@ def main():
     run('disassemble', [tools['llvm-dis'], raw, '-o', ir])
     lines = []
     for line in ir.read_text().splitlines():
+        # Helpers are linked directly into the translated module. Their ThinLTO
+        # index becomes stale when the unused HIP/LLVM globals below are removed.
+        if re.match(r'^\^\d+\s*=', line):
+            continue
         if re.search(r'@llvm.used|wchar_size|llvm.module.flags|__hip_cuid', line):
             continue
         line = line.replace('optnone', '').replace(f'"target-cpu"="{args.gpu_arch}"', '')
         lines.append(re.sub(r'"target-features"="[^"]+"', '', line))
-    ir.write_text('\n'.join(lines) + '\n')
+    ir.write_text(compatible_ir('\n'.join(lines) + '\n') if emitter_assembler.is_file()
+                  else '\n'.join(lines) + '\n')
     run('assemble', [tools['llvm-as'], ir, '-o', extra])
     env['D4R_ZLUDA_EXTRA_BC'] = str(extra)
     run('emit', [emitter, edited, work / 'emitted', args.gpu_arch])

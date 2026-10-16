@@ -1,14 +1,26 @@
 [CmdletBinding()]
-param([string]$SourceRoot, [string]$HipRoot = 'C:\Program Files\AMD\ROCm\7.2', [string]$WorkRoot)
+param([string]$SourceRoot, [string]$HipRoot = 'C:\Program Files\AMD\ROCm\7.2', [string]$WorkRoot, [string]$LlvmBuildRoot)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$SourceRoot) { $SourceRoot = Join-Path $repo 'external/ZLUDA' }
 if (!$WorkRoot) { $WorkRoot = Join-Path $repo 'build/zluda-helpers-windows' }
 $toolchain = Join-Path $repo '.tools/llvm-mingw-20260922-ucrt-x86_64'
-$compiler = Join-Path $HipRoot 'bin/clang++.exe'
-$dis = Join-Path $HipRoot 'bin/llvm-dis.exe'
-$assembler = Join-Path $HipRoot 'bin/llvm-as.exe'
-$ocml = Join-Path $HipRoot 'amdgcn/bitcode/ocml.bc'
+function Find-HipHelperTool([string]$Name) {
+    foreach ($folder in @('lib/llvm/bin','bin')) {
+        $candidate=Join-Path $HipRoot "$folder/$Name.exe"
+        if(Test-Path -LiteralPath $candidate){return $candidate}
+    }
+    throw "HIP helper tool missing: $Name under $HipRoot"
+}
+$compiler = Find-HipHelperTool 'clang++'
+$dis = Find-HipHelperTool 'llvm-dis'
+$assembler = Find-HipHelperTool 'llvm-as'
+if(!$LlvmBuildRoot){$LlvmBuildRoot=Join-Path $repo 'build/zluda-llvm-windows-gnu'}
+$pinnedAssembler=Join-Path $LlvmBuildRoot 'bin/llvm-as.exe'
+if(!(Test-Path -LiteralPath $pinnedAssembler)){throw 'Build the pinned LLVM llvm-as target before the PTX helpers.'}
+$assembler=$pinnedAssembler
+$ocml = Join-Path $HipRoot 'lib/llvm/amdgcn/bitcode/ocml.bc'
+if(!(Test-Path -LiteralPath $ocml)){$ocml=Join-Path $HipRoot 'amdgcn/bitcode/ocml.bc'}
 foreach ($file in @($compiler,$dis,$assembler,$ocml)) {
     if (!(Test-Path $file)) { throw "HIP helper dependency missing: $file" }
 }
@@ -58,13 +70,24 @@ foreach ($variant in $variants) {
     if ($LASTEXITCODE) { throw "Disassemble failed: $raw" }
     $clean = [Collections.Generic.List[string]]::new()
     foreach ($line in [IO.File]::ReadLines($ir)) {
+        # Directly linked helpers do not need a ThinLTO index, which may retain
+        # references to the stripped HIP/LLVM globals.
+        if ($line -match '^\^\d+\s*=') { continue }
         if ($line -match '@llvm.used|wchar_size|llvm.module.flags|__hip_cuid') { continue }
         $line = $line -replace 'optnone','' -replace 'define hidden','define linkonce_odr'
         $line = $line -replace '"target-cpu"="gfx1030"','' -replace '"target-features"="[^"]+"',''
         $clean.Add($line)
     }
     [IO.File]::WriteAllLines($ir,$clean,[Text.UTF8Encoding]::new($false))
+    if($assembler -eq $pinnedAssembler){
+        & python (Join-Path $repo 'tools/windows/llvm22_ir.py') $ir $ir
+        if($LASTEXITCODE){throw 'LLVM 22 helper IR compatibility conversion failed.'}
+    }
+    $previousPath=$env:PATH
+    $env:PATH="$(Join-Path $toolchain 'bin');$previousPath"
+    try {
     & $assembler $ir -o $output
     if ($LASTEXITCODE) { throw "Assemble failed: $ir" }
+    } finally {$env:PATH=$previousPath}
     Write-Host "Built $output ($((Get-Item $output).Length) bytes)"
 }

@@ -158,7 +158,8 @@ else {
                 Ok "GPU $($device.name) ($a): build present, $native native kernels"
                 if (!$arch) { $arch = $a }
             }
-            if ($a -ne 'gfx1201') { Note "only the RX 9070 XT (gfx1201) has been tested on real hardware; $a is compile-tested" }
+            if ($a -eq 'gfx1101') { Note 'RX 7700 XT has passed native Windows synthetic checks and limited game-frame tests; broad game validation remains incomplete' }
+            elseif ($a -ne 'gfx1201') { Note "$a is compile-tested; no native Windows hardware validation is recorded for this target" }
         }
     }
     if (@($inventory.devices | Where-Object { $_.wavefrontSize -eq 32 }).Count -gt 1) { Note 'several GPUs found; d4r uses the one the game renders on' }
@@ -197,7 +198,7 @@ $iniPath = Join-Path $d4r 'd4r.ini'
 $model = 'K'
 if (Test-Path -LiteralPath $iniPath) {
     $section = ''; $iniProblems = 0
-    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'kernels.nativefp8' = 1 }
+    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'paths.nativedir' = 1; 'kernels.nativefp8' = 1; 'rayreconstruction.backend' = 1; 'rayreconstruction.modeldir' = 1 }
     $boolean = @('dlss.showwatermark', 'interop.asyncinterop', 'debug.validateoutput', 'kernels.nativefp8')
     foreach ($raw in (Read-TextFile $iniPath).TrimStart([char]0xFEFF) -split "`n") {
         $line = $raw.Trim()
@@ -212,10 +213,40 @@ if (Test-Path -LiteralPath $iniPath) {
         elseif ($name -eq 'dlss.model') {
             if (@('', 'auto', 'k', 'dlss4', '11') -contains $v) { $model = 'K' }
             elseif (@('m', 'dlss4.5', '13') -contains $v) { $model = 'M' }
-            else { Note "d4r.ini: [DLSS] Model '$value' is not available on Windows (use K or M); K will be used"; $iniProblems++ }
+            elseif (@('e', '5') -contains $v) { $model = 'E' }
+            elseif (@('l', '12') -contains $v) { $model = 'L' }
+            else { Note "d4r.ini: [DLSS] Model '$value' is not available on Windows (use E, K, L or M); K will be used"; $iniProblems++ }
         }
         elseif ($boolean -contains $name) {
             if (@('', 'auto', '1', 'true', 'yes', 'on', '0', 'false', 'no', 'off') -notcontains $v) { Note "d4r.ini: [$section] $key must be true or false, not '$value'; the default will be used"; $iniProblems++ }
+        }
+        elseif ($name -eq 'rayreconstruction.backend') {
+            if ($v -notin @('', 'auto', 'off', 'native', 'fsr')) { Note 'd4r.ini: [RayReconstruction] Backend must be off, native or fsr; off will be used'; $iniProblems++ }
+            elseif ($v -eq 'fsr') { Note 'Native Windows FSR RR is unavailable; RR requests will be rejected' }
+        }
+        elseif ($name -eq 'paths.nativedir' -and $v -notin @('', 'auto')) {
+            $privateNative=if([IO.Path]::IsPathRooted($value)){$value}else{Join-Path $d4r $value}
+            if($arch -and (Test-Path -LiteralPath (Join-Path $privateNative $arch))){$privateNative=Join-Path $privateNative $arch}
+            $privateObjects=@(Get-ChildItem -LiteralPath $privateNative -Filter '*.hsaco' -ErrorAction SilentlyContinue)
+            if(!$privateObjects.Count -or !(Test-Path -LiteralPath (Join-Path $privateNative 'd4r-kernels.txt'))){
+                Bad '[Paths] NativeDir must contain the complete native kernel set and d4r-kernels.txt';$iniProblems++
+            }else{
+                foreach($requiredNative in @(Get-ChildItem -LiteralPath (Join-Path $d4r "native\$arch") -Filter '*.hsaco' -ErrorAction SilentlyContinue)){
+                    if(!(Test-Path -LiteralPath (Join-Path $privateNative $requiredNative.Name))){
+                        Bad "NativeDir is incomplete; missing $($requiredNative.Name)";$iniProblems++
+                    }
+                }
+                $privateTarget=@($registry | Where-Object architecture -eq $arch) | Select-Object -First 1
+                foreach($object in $privateObjects){
+                    $stream=[IO.File]::OpenRead($object.FullName)
+                    try{$header=New-Object byte[] 64;$read=$stream.Read($header,0,64)}finally{$stream.Dispose()}
+                    if($privateTarget -and ($read -ne 64 -or $header[0] -ne 127 -or $header[1] -ne 69 -or
+                        $header[2] -ne 76 -or $header[3] -ne 70 -or $header[48] -ne $privateTarget.elfMachine)){
+                        Bad "NativeDir $($object.Name) is not built for $arch";$iniProblems++
+                    }
+                }
+                if(!$iniProblems){Ok "private native kernel directory: $privateNative"}
+            }
         }
         elseif ($name -eq 'debug.log' -and @('', 'auto', 'normal', 'verbose') -notcontains $v) { Note "d4r.ini: [Debug] Log must be normal or verbose, not '$value'; normal will be used"; $iniProblems++ }
     }

@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
         for (const auto& pair : {std::make_pair("D4R_HIP_ROOT", args.hip_root),
              std::make_pair("D4R_NVCUDA_DLL", args.cuda_dll), std::make_pair("D4R_NVAPI_DLL", args.nvapi_dll),
              std::make_pair("D4R_NGX_CORE", args.ngx_core), std::make_pair("D4R_DLSS_DLL", args.dlss_dll)})
-            if (_putenv_s(pair.first, pair.second.c_str())) throw std::runtime_error("Cannot set runtime environment");
+            if (_putenv_s(pair.first, args.player_mode ? "" : pair.second.c_str())) throw std::runtime_error("Cannot set runtime environment");
         HipApi hip(args.hip_root); hipDeviceProp_t props{}; hip.select_architecture(args.device, props);
         ComPtr<IDXGIFactory4> factory; dx(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "CreateDXGIFactory1");
         ComPtr<IDXGIAdapter1> adapter;
