@@ -61,6 +61,21 @@ def select_native(data, model):
     return (b'\xef\xbb\xbf' if bom else b'') + ''.join(result).encode('utf-8')
 
 
+def model_arithmetic(identity, runtime):
+    """Check the model's arithmetic and target before copying any products."""
+    architecture = identity.get('architecture')
+    arithmetic = {'gfx1101': 'gfx11', 'gfx1200': 'gfx12', 'gfx1201': 'gfx12'}.get(architecture)
+    if identity.get('preset') not in ('D', 'E') or not arithmetic or identity.get('arithmetic') != 'exact-' + arithmetic:
+        raise RuntimeError('Unsupported local RR cache identity')
+    target_file = runtime / 'gpu-target.json'
+    if target_file.is_file():
+        if json.loads(target_file.read_text(encoding='utf-8-sig')).get('architecture') != architecture:
+            raise RuntimeError('RR model architecture does not match runtime target')
+    elif arithmetic == 'gfx12':
+        raise RuntimeError('RDNA4 RR deployment requires runtime gpu-target.json')
+    return arithmetic
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True, type=lambda p: Path(p).resolve())
@@ -77,8 +92,7 @@ def main():
     cache_data = (args.model / 'windows-native-python-cache.json').read_bytes()
     cache = json.loads(cache_data)
     identity = cache['identity']
-    if identity.get('preset') not in ('D', 'E') or identity.get('architecture') != 'gfx1101' or identity.get('arithmetic') != 'exact-gfx11':
-        raise RuntimeError('Unsupported local RR cache identity')
+    arithmetic = model_arithmetic(identity, args.runtime)
     products = cache['products']
     if not {'rr.txt', 'enc0.args', 'hkpn.args'}.issubset(products):
         raise RuntimeError('RR cache omits required manifest/templates')
@@ -92,7 +106,8 @@ def main():
     expected_stages = {'enc0', 'enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4', 'dec3', 'dec2', 'dec1', 'dec0', 'hkpn'}
     if (not manifest.startswith('D4RR0001\n') or
         f'preset {4 if identity["preset"] == "D" else 5}' not in manifest.splitlines() or
-        len(stages) != 12 or {fields[1] for fields in stages} != expected_stages or 'arithmetic gfx11' not in manifest):
+        len(stages) != 12 or {fields[1] for fields in stages} != expected_stages or
+        f'arithmetic {arithmetic}' not in manifest.splitlines()):
         raise RuntimeError('Incomplete RR model manifest')
     for fields in stages:
         if fields[2] not in products or fields[4] not in products:

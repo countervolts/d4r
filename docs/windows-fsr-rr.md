@@ -1,5 +1,66 @@
 # Native Windows FSR Ray Regeneration
 
+## Native D3D12 route for RDNA4 (2026-10-17)
+
+The source now selects **native D3D12 on gfx1200/gfx1201** when
+`[RayReconstruction] Backend = fsr`. AMD's original denoiser receives the game's
+real D3D12 device and records on its queue. D3D12 compute shaders perform the
+guide conversion and composition on that same device. This route does not load
+the vkd3d core, the amdxc shim, or Vulkan; it does not redirect AMD's driver lookup
+or apply the RDNA3 compiler workaround.
+
+Guides are copied into shader-readable textures on the same device, including
+depth resources that deny shader reads. This retains subrect and guide-format
+handling while removing the shared cross-API packet. Composition goes directly
+to the internal SR stage, or copies into the game's output without SR. RGBA32F
+output widens the completed half image on the GPU. Evaluation remains synchronous:
+one completion wait retires the denoiser list before resource reuse and SR; this
+is not an asynchronous backend. AMD's denoiser/context may still compile shaders
+on first use. No RDNA4 timing or quality improvement has been measured.
+
+RDNA3 keeps the existing vkd3d compatibility route below. Diagnostic environment
+`D4R_FSR_RR_DEVICE=auto|native|vkd3d` overrides selection; `auto` is the default.
+Native provider/context failures are reported explicitly. An override can select
+the compatibility route for diagnosis. Readiness checks require only AMD's
+denoiser DLL for native D3D12, and retain the extra payload requirements for vkd3d.
+The dependency installer permits omitting that payload only for explicitly
+RDNA4-only packages; mixed packages still require it. The native adapter compiles
+its embedded conversion shaders with Windows' system `d3dcompiler_47.dll`.
+
+Validation on the available RX 7700 XT (gfx1101):
+
+- Six native conversion tests pass, including WARP, hardware depth, depth-stencil
+  with denied shader reads, subrects with sentinel padding, invalid-normal sky
+  passthrough, and exact half-to-float output widening. Each case checks all
+  4,355 pixels against independent expected values. These tests do **not** execute
+  AMD's denoiser. Native D3D12 float-to-half stores use their specified truncation;
+  cross-backend bit equality is not asserted.
+- All 22 CTest checks, 13 RR Python tests and 13 installer tests pass.
+- The automatic RDNA3 compatibility route passes 24 moving frames with guide and
+  output format switching, typeless D32S8 depth and exact same-frame widening
+  (`build/fsr-native-rdna3-compat-formats-v1/`). Another 24 frames pass dynamic
+  render extents, retained creation-sized resources, SR-bound rejection and SR
+  output (`build/fsr-native-rdna3-compat-dynamic-sr-v1/`).
+- Explicit native selection on gfx1101 without the compatibility DLLs reaches
+  AMD's provider query and returns `no FSR Ray Regeneration provider for this
+  device`, as expected. It does not silently switch routes.
+- The gfx1200/gfx1201 shims and gfx1201 native conversion probe compile successfully. **Full native
+  RDNA4 denoising, SR handoff, temporal quality, real games and performance still
+  require hardware validation.** Existing installed packages were not replaced.
+
+Run the conversion checks with:
+
+```powershell
+cmake --build BUILD --target d4r_fsr_rr_native_probe
+ctest --test-dir BUILD -R fsr_rr_native --output-on-failure
+```
+
+For an RDNA4 synthetic integration run, use a matching target shim/probe and
+`tools/windows/test_fsr_rr_ngx.py --device native` with its usual fixture/runtime
+arguments. That mode removes compatibility DLLs from the private staged runtime
+and verifies the logged route. Include ordinary SR and dynamic-resolution runs
+before claiming end-to-end validation.
+
 ## Status (2026-10-17): runs on RDNA3 through vkd3d-proton; synthetic validation only
 
 `[RayReconstruction] Backend = fsr` answers a game's DLSS RR request (NGX feature 13) with AMD's FSR Ray
@@ -13,7 +74,7 @@ Windows drivers therefore offer no provider. Linux gets one through vkd3d-proton
 fallback and a Proton `amdxc64.dll` shim. The Windows route reproduces that:
 
 1. **vkd3d-proton for Windows** (`tools/windows/build_fsr_payload.py`): vkd3d-proton `3dfc6f07` plus dxil-spirv
-   PR 307 (`f9f6294f`) and `-Denable_extended_emulation=true`, built with llvm-mingw clang; two libc++ include
+   PR 307 (`f9f6294f`) and `-Denable_extended_emulation=true`, built with llvm-mingw clang; local Windows
    patches in `patches/vkd3d-proton-windows/`. The shipped `d4r\fsr\d4r_vkd3d_core.dll` is `d3d12core.dll`
    renamed and loaded by path; `IVKD3DCoreInterface::CreateDevice` is called directly (the IDL has no base
    interface, so it is vtable slot 0). `DXIL_SPIRV_CONFIG=wmma_rdna3_workaround` is set in-process.
@@ -132,6 +193,40 @@ Evidence: `build/fsr-perf-720-{baseline-v2,baseline-repeat-v1,unroll-v2,wave32-v
 `build/fsr-perf-static-720-{baseline,unroll}-v1/`. Experimental binaries remain private under build/;
 the shipped payload stays `build/fsr-payload-v1`. The two third-party source files edited for experiments
 were restored; pre-existing libc++ include fixes remain. Linux denoiser performance parity is still open.
+
+## Local shader optimization payload (2026-10-17)
+
+The payload builder now preserves dxil-spirv's reflected shader metadata when replacing compute shaders.
+An earlier replacement path returned before reflecting the required wave size; even a byte-identical
+replacement could therefore change the output. Patch `0003-preserve-meta-for-shader-overrides.patch`
+moves all replacement to the existing late path.
+
+Optional local optimizations use `--shader-dump DIR --spirv-opt PATH --optimize-shader HASH` (repeat
+the final argument for each measured shader). `--shader-variant DIR` adds another exact original
+translation, such as the existing NGX rounding-mode variant, without changing its arithmetic settings.
+The builder runs `spirv-opt --target-env=vulkan1.3 -O`,
+validates each result, and embeds the original and optimized modules in the private core. A replacement
+requires both the DXIL shader hash and a byte-for-byte match of the original translation. Different
+translator options, resource layouts, or devices that produce different SPIR-V retain their original
+translation. No precision-widening flag or change to FP8 conversion/quantization is added.
+
+The source inputs, generated header, optimizer hash, and output hashes are saved in `shader-sources/`
+and `fsr-payload.json`. The cache build ID incorporates local patches and the optimization manifest,
+so the new core rejects the old payload's compiled shader cache. No external shader folder or global
+override environment is needed at runtime. `D4R_FSR_DISABLE_BUILTIN_SHADERS=1` selects an unmodified
+control; use a separate cache directory when comparing this control with enabled replacements.
+
+On this RX 7700 XT, applying `-O` to every shader helps some layers and hurts others. The local payload
+selects seven measured winners: `09749b7dfc3a7804`, `430ab44dc42ba8b5`, `5bec91d51f1d2038`,
+`c7a9797f50bb6526`, `e34e88f998f02da9`, `e7d13b75c921986c`, and `f8459f275005d65e`.
+At 1280x720 with two direct signals and NGX's existing arithmetic settings, the probe GPU median is
+34.374 -> 32.846 ms (4.4% lower). Full NGX late-frame denoiser medians are 31.58 -> 30.88 ms and
+31.81 -> 31.04 ms on a repeat (2.2-2.4% lower). NGX tail RMSE changes by +0.41% / +0.33%, within the
+existing run-to-run noise; all seven replacements activate. These are synthetic GPU timings, not game FPS.
+This is a modest Windows optimization, not Linux performance parity. Actual loop expansion and
+straight-line cooperative-matrix component conversion did not improve the measured result beyond `-O`
+and are not included. Full measurements and deployment details are in
+`C:\Users\ayo\Desktop\d4r-windows-fsr-results-20261017-0333\SUMMARY-selected-O.md`.
 
 ## History: the investigation before the vkd3d route
 

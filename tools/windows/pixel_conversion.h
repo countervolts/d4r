@@ -19,8 +19,12 @@ inline PixelSpec pixel_spec(unsigned plane, DXGI_FORMAT format) {
         case DXGI_FORMAT_R32G32B32A32_FLOAT: return {rgba32f, 16, false};
         case DXGI_FORMAT_R11G11B10_FLOAT: return {r11g11b10f, 4, false};
         case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS: return {rgb10a2, 4, false};
-        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_TYPELESS: return {rgba8, 4, false};
-        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: return {bgra8, 4, false};
+        // sRGB views are read as their stored UNORM values, as the Linux shim does.
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            return {rgba8, 4, false};
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            return {bgra8, 4, false};
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return {rgb9e5, 4, false};
         case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_TYPELESS: return {rg16f, 4, plane == motion};
         case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_TYPELESS: return {rg32f, 8, false};
         case DXGI_FORMAT_R16G16_SNORM: return {rg16snorm, 4, false};
@@ -42,9 +46,10 @@ inline PixelSpec pixel_spec(unsigned plane, DXGI_FORMAT format) {
 inline bool pixel_supported(unsigned plane, pixel::Storage storage) {
     using namespace pixel;
     switch (plane) {
-        case color: case output: return storage <= rgb10a2;
-        case motion: return storage == rgba16f || storage == rgba32f || (storage >= rg16f && storage <= rg16unorm);
-        case depth: return storage == r32f || storage == depth24 || storage == r16unorm;
+        // The Linux shim's supported_input/supported_output sets, plus the RG16 SNORM/UNORM motion formats.
+        case color: case output: return storage <= rgb10a2 || storage == rgb9e5;
+        case motion: return storage == rgba16f || storage == rgba32f || storage == rgba8 || (storage >= rg16f && storage <= rg16unorm);
+        case depth: return storage == r32f || storage == depth24 || storage == r16unorm || storage == r16f;
         case exposure: return storage == r32f || storage == r16f || storage == rgba16f || storage == rgba32f ||
             storage == rgba8 || storage == bgra8;
         default: return false;

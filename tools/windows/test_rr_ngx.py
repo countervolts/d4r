@@ -11,6 +11,7 @@ import struct
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--gpu-arch', choices=('gfx1101', 'gfx1200', 'gfx1201'), default='gfx1101')
     parser.add_argument('--contracts', action='store_true', help='also check capability readiness and negative contracts')
     parser.add_argument('--inherited', action='store_true', help='inherit access from a preceding list in the same submission batch')
     parser.add_argument('--enhanced', action='store_true', help='exercise enhanced texture access and restoration')
@@ -55,13 +56,13 @@ def main():
            if not key.startswith('D4R_') and key not in ('ZLUDA_CUDA_LIB', 'ZLUDA_LOG_DIR', 'ZLUDA_CACHE_DIR')}
     runtime = args.runtime
     native = runtime / 'native'
-    if (native / 'gfx1101').is_dir():
-        native = native / 'gfx1101'
+    if (native / args.gpu_arch).is_dir():
+        native = native / args.gpu_arch
     env.update(HIP_PATH=str(runtime / 'hip'), D4R_HIP_ROOT=str(runtime / 'hip'), D4R_NVCUDA_DLL=str(runtime / 'zluda/nvcuda.dll'),
                ZLUDA_CUDA_LIB=str(runtime / 'zluda/nvcuda.dll'), D4R_DLSS_DLL=str(args.dlss),
                D4R_NGX_CORE=str(args.core), D4R_NVAPI_DLL=str(runtime / 'nvapi/nvapi64.dll'),
                D4R_NVAPI_BACKEND=str(runtime / 'nvapi/backend/nvapi64.dll'),
-               D4R_FORMAT_MODULE=str(runtime / 'pixel_convert_gfx1101.hsaco'),
+               D4R_FORMAT_MODULE=str(runtime / f'pixel_convert_{args.gpu_arch}.hsaco'),
                D4R_ZLUDA_NATIVE_DIR=str(native), D4R_QUIET_API='1',
                D4R_ZLUDA_WMMA='1', D4R_ZLUDA_WMMA_F16_REFERENCE='1',
                D4R_NGX_DATA_DIR=str(args.output / 'ngx-data'), D4R_RR_BACKEND='native', D4R_RR_MODEL_DIR=str(args.model))

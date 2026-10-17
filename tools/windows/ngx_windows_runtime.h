@@ -691,10 +691,10 @@ private:
         mark("ngx_all_stream_completion");
         auto& output = planes_[3];
         output.image->download_device(reinterpret_cast<uintptr_t>(output.canonical ? output.canonical->data : output.shared->mapped),
-            output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch);
-        rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM output completion");
+            output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch, true);
         mark("output_array_download");
         if (std::getenv("D4R_VALIDATE_OUTPUT")) {
+            rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM diagnostic output completion");
             if (!rt_->pixels) rt_->pixels = std::make_unique<PixelProgram>(rt_->hip, pixel_module_path());
             const auto counts = rt_->pixels->validate(output.canonical ? output.canonical->data : output.shared->mapped,
                 output.canonical ? output.canonical->pitch : output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height);
@@ -702,8 +702,11 @@ private:
             if (counts[0] || counts[1]) throw std::runtime_error("DLSS output contains NaN/Inf");
         }
         mark("output_diagnostic");
-        if (output.canonical) rt_->pixels->convert(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
+        if (output.canonical) rt_->pixels->convert_deferred(true, output.canonical->data, output.canonical->pitch, output.shared->mapped,
             output.shared->footprint.Footprint.RowPitch, unsigned(output.desc.Width), output.desc.Height, output.spec.storage, 3);
+        // One completion covers the array download and optional format encode.
+        // NGX's nonblocking streams were completed before this ordered batch.
+        rt_->cuda.check(rt_->cuda.cuCtxSynchronize(), "VRAM output batch completion");
         if (ticket) rt_->timeline->signal_ready(ticket->output); else rt_->timeline->signal_output(queue);
         mark("output_conversion_fence_signal");
         const double frameMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();

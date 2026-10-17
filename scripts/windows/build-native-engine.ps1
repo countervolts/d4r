@@ -35,7 +35,7 @@ try {
     $build = Join-Path $repo "build/native-engine-windows-$GpuArch"
     $headers = Join-Path $tools 'Vulkan-Headers-v1.4.341'
     $volk = Join-Path $tools 'volk'
-    & $cmake --fresh -S $repo -B $build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" `
+    & $cmake --fresh -S $repo -B $build -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_MAKE_PROGRAM=$ninja" `
         "-DCMAKE_C_COMPILER=$cCompiler" "-DCMAKE_CXX_COMPILER=$cxxCompiler" `
         "-DD4R_HIP_ROOT=$HipRoot" "-DD4R_GPU_ARCH=$GpuArch" `
         '-DD4R_BUILD_NATIVE_ENGINE=ON' "-DD4R_VULKAN_HEADERS_ROOT=$headers" "-DD4R_VOLK_ROOT=$volk" `

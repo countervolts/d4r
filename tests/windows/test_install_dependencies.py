@@ -15,6 +15,58 @@ spec.loader.exec_module(installer)
 
 
 class InstallTests(unittest.TestCase):
+    def test_download_prompt_and_default_install_for_every_gpu(self):
+        targets = json.loads((REPO / 'tools/windows/gpu-targets.json').read_text())['targets']
+        (self.runtime / 'd4r.ini').write_text('[RayReconstruction]\nBackend = off\n')
+        (self.runtime / 'dll-pins.txt').write_text('')
+        for target in targets:
+            (self.runtime / 'package.json').write_text(json.dumps({'targets': {target['architecture']: {}}}))
+            for answer, proceeds in (('y', True), ('Y', True), ('', True), ('n', False), (' N ', False)):
+                with self.subTest(target=target['architecture'], answer=answer), \
+                        patch('sys.argv', ['install-dependencies.py', '--package-root', str(self.runtime),
+                                           '--cache-root', str(self.root / 'cache'),
+                                           '--backup-root', str(self.backups)]), \
+                        patch('builtins.input', return_value=answer), \
+                        patch('builtins.print'), patch.object(installer, 'PINS', {}), \
+                        patch.object(installer, 'collect', return_value=[]) as collect, \
+                        patch.object(installer, 'transaction', return_value={}) as transaction, \
+                        patch.object(installer, 'absolutize_library_paths'), \
+                        patch.object(installer, 'install_model') as model:
+                    installer.main()
+                    self.assertEqual(collect.called, proceeds)
+                    self.assertEqual(transaction.called, proceeds)
+                    model.assert_not_called()
+
+    def test_yes_installs_without_prompt_or_model(self):
+        (self.runtime / 'd4r.ini').write_text('[RayReconstruction]\nBackend = off\n')
+        (self.runtime / 'dll-pins.txt').write_text('')
+        with patch('sys.argv', ['install-dependencies.py', '--package-root', str(self.runtime), '--yes',
+                                '--cache-root', str(self.root / 'cache'), '--backup-root', str(self.backups)]), \
+                patch('builtins.input', side_effect=AssertionError('Unexpected prompt')), \
+                patch('builtins.print'), patch.object(installer, 'PINS', {}), \
+                patch.object(installer, 'collect', return_value=[]), \
+                patch.object(installer, 'transaction', return_value={}) as transaction, \
+                patch.object(installer, 'absolutize_library_paths'), \
+                patch.object(installer, 'install_model') as model:
+            installer.main()
+            transaction.assert_called_once()
+            model.assert_not_called()
+
+    def test_native_fsr_requires_explicit_rdna4_only_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            self.assertFalse(installer.native_fsr_package(runtime))
+            metadata = runtime / 'package.json'
+            for targets, wanted in (({}, False), ({'gfx1201': {}}, True),
+                                    ({'gfx1200': {}, 'gfx1201': {}}, True),
+                                    ({'gfx1101': {}, 'gfx1201': {}}, False)):
+                metadata.write_text(json.dumps({'targets': targets}))
+                self.assertEqual(installer.native_fsr_package(runtime), wanted)
+            (runtime / 'gpu-target.json').write_text(json.dumps({'architecture': 'gfx1101'}))
+            self.assertFalse(installer.native_fsr_package(runtime))
+            (runtime / 'gpu-target.json').write_text(json.dumps({'architecture': 'gfx1201'}))
+            self.assertFalse(installer.native_fsr_package(runtime))  # mixed package still includes RDNA3
+
     def setUp(self):
         self.work = tempfile.TemporaryDirectory(prefix='d4r-installer-test-')
         self.addCleanup(self.work.cleanup)

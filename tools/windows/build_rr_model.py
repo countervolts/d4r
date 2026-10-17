@@ -1,4 +1,4 @@
-"""Build exact gfx11 RR D/E models natively on Windows, without Git Bash.
+"""Build exact gfx11/gfx12 RR D/E models natively on Windows, without Git Bash.
 
 Derived weights/shaders remain under ignored build/. Nothing is installed into
 a game or bundled. Uses the same packers and compiler recipe as the Linux shell.
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -19,11 +20,33 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def require_fp8_matrices(path):
+    """Reject an RDNA4 candidate that lost native FP8 cooperative matrices."""
+    data = path.read_bytes()
+    if len(data) < 20 or len(data) % 4:
+        raise RuntimeError('Invalid SPIR-V: ' + str(path))
+    words = struct.unpack('<' + 'I' * (len(data) // 4), data)
+    if words[0] != 0x07230203:
+        raise RuntimeError('Invalid SPIR-V magic: ' + str(path))
+    capabilities = set()
+    offset = 5
+    while offset < len(words):
+        size, opcode = words[offset] >> 16, words[offset] & 0xffff
+        if not size or offset + size > len(words):
+            raise RuntimeError('Invalid SPIR-V instruction: ' + str(path))
+        if opcode == 17 and size == 2:  # OpCapability
+            capabilities.add(words[offset + 1])
+        offset += size
+    if not {4212, 4213, 6022}.issubset(capabilities):
+        raise RuntimeError('Native FP8 cooperative matrices are absent: ' + str(path))
+
+
 def main():
     repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dll', required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--preset', choices=('D', 'E'), default='D')
+    parser.add_argument('--gpu-arch', choices=('gfx1101', 'gfx1200', 'gfx1201'), default='gfx1101')
     parser.add_argument('--output', required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--glslang', type=lambda p: Path(p).resolve(), default=repo / '.tools/glslang-16.6.0/bin/glslangValidator.exe')
     parser.add_argument('--reuse', action='store_true')
@@ -38,7 +61,9 @@ def main():
     for key in tuple(env):
         if key.startswith('D4R_RR_'):
             del env[key]
-    env.update(D4R_RR_GFX11='1', D4R_RR_RELAXED='0', PYTHONPATH=str(repo / '.tools/python/vendor'))
+    gfx11 = args.gpu_arch.startswith('gfx11')
+    env.update(D4R_RR_GFX11='1' if gfx11 else '0', D4R_RR_RELAXED='0',
+               PYTHONPATH=str(repo / '.tools/python/vendor'))
     env['PATH'] = str(args.glslang.parent) + os.pathsep + env['PATH']
     numpy_version = subprocess.check_output([sys.executable, '-c', 'import numpy; print(numpy.__version__)'], env=env, text=True, timeout=30).strip()
     sources = {str(Path(__file__).relative_to(repo)).replace('\\', '/'): sha(Path(__file__))}
@@ -46,7 +71,8 @@ def main():
         for path in sorted((repo / directory).rglob('*')):
             if path.is_file() and path.suffix in ('.py', '.comp', '.glsl', '.h', '.inc', '.sh', '.txt'):
                 sources[path.relative_to(repo).as_posix()] = sha(path)
-    identity = {'schema': 1, 'preset': args.preset, 'architecture': 'gfx1101', 'arithmetic': 'exact-gfx11',
+    identity = {'schema': 1, 'preset': args.preset, 'architecture': args.gpu_arch,
+                'arithmetic': 'exact-gfx11' if gfx11 else 'exact-gfx12',
                 'dll': sha(args.dll), 'glslang': sha(args.glslang), 'python': sha(Path(sys.executable)),
                 'numpy': numpy_version, 'sources': sources}
     stamp = args.output / 'windows-native-python-cache.json'
@@ -91,16 +117,24 @@ def main():
     python(repo / 'engine/compile_rr.py', '--dll', args.dll, '--preset', args.preset, out,
            '--ptx-dir', work / 'ptx', '--network-bindings-only', label='bindings')
     python(rr / 'dll_weights.py', args.dll, work / 'dll', '--model', '0' if args.preset == 'D' else '1', label='weights')
-    manifest = (out / 'rr.txt').read_text().replace(f'preset {4 if args.preset == "D" else 5}\n',
-                                                          f'preset {4 if args.preset == "D" else 5}\narithmetic gfx11\n')
-    defines = ['-DRR_EXACT_CONVERT', '-DRR_GFX11'] + (['-DRR_PRESET_D'] if args.preset == 'D' else [])
+    manifest = (out / 'rr.txt').read_text()
+    arithmetic = 'gfx11' if gfx11 else 'gfx12'
+    manifest = manifest.replace(f'preset {4 if args.preset == "D" else 5}\n',
+                                f'preset {4 if args.preset == "D" else 5}\narithmetic {arithmetic}\n')
+    defines = ['-DRR_EXACT_CONVERT'] + (['-DRR_GFX11'] if gfx11 else [])
+    defines += ['-DRR_PRESET_D'] if args.preset == 'D' else []
     def native(stage, shader, include):
         nonlocal manifest
         weights = out / f'weights-{stage}m.bin'
-        wide = int(python(rr / 'widen_weights.py', weights, label='widen-' + stage).splitlines()[-1])
-        run([args.glslang, '--target-env', 'vulkan1.3', '-V', *defines, f'-DW_WIDE={wide}u',
+        widening = []
+        if gfx11:
+            wide = int(python(rr / 'widen_weights.py', weights, label='widen-' + stage).splitlines()[-1])
+            widening = [f'-DW_WIDE={wide}u']
+        run([args.glslang, '--target-env', 'vulkan1.3', '-V', *defines, *widening,
              '-I' + str(include), '-I' + str(rr), '-o', out / f'{stage}_m.spv', shader], 'compile-' + stage)
         python(rr / 'spv_exact_convert.py', out / f'{stage}_m.spv', label='exact-' + stage)
+        if not gfx11:
+            require_fp8_matrices(out / f'{stage}_m.spv')
         pattern = rf'^stage {stage} {stage}\.spv 32 weights-{stage}\.bin (.*)$'
         def replacement(match):
             tail = match[1].removesuffix(' noopt')
@@ -139,7 +173,7 @@ def main():
             path.unlink()
     (out / 'rr.txt').write_text(manifest, newline='\n')
     stages = [line.split() for line in manifest.splitlines() if line.startswith('stage ')]
-    if len(stages) != 12 or 'arithmetic gfx11' not in manifest:
+    if len(stages) != 12 or f'arithmetic {arithmetic}' not in manifest.splitlines():
         raise RuntimeError('Incomplete native manifest')
     for fields in stages:
         if not (out / fields[2]).is_file() or not (out / fields[4]).is_file():

@@ -6,7 +6,8 @@ param(
     [string]$ZludaRoot,
     [ValidateSet('cu','wgp')][string]$ShaderMode='cu',
     [string]$GpuArch='gfx1201',
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [switch]$Wave64
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
@@ -14,6 +15,8 @@ $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$ZludaRoot) { $ZludaRoot=Join-Path $repo 'dist/zluda-windows-final' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/private-textures-$GpuArch" }
+$waveFlags=@()
+if ($Wave64) { $waveFlags+='--wave64' }
 & python (Join-Path $repo 'tools/windows/build_native_texture.py') --dlss-dll $DlssDll --hip-root $HipRoot `
-    --zluda-root $ZludaRoot --kernel $Kernel --output-directory $OutputDirectory --shader-mode $ShaderMode --gpu-arch $GpuArch
+    --zluda-root $ZludaRoot --kernel $Kernel --output-directory $OutputDirectory --shader-mode $ShaderMode --gpu-arch $GpuArch @waveFlags
 if ($LASTEXITCODE) { throw "Native texture build failed ($LASTEXITCODE); inspect the output work directory." }

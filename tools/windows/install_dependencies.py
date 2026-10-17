@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 import uuid
 
@@ -47,6 +48,41 @@ def external(path, game):
         raise RuntimeError('Cache and backups must stay outside game directory: ' + str(path))
 
 
+def format_eta(seconds):
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return '{}h {:02d}m {:02d}s'.format(hours, minutes, seconds)
+    if minutes:
+        return '{}m {:02d}s'.format(minutes, seconds)
+    return str(seconds) + 's'
+
+
+def copy_with_progress(response, out, name, chunk=1 << 20):
+    """Copy a download to `out`, rewriting one status line with percent, speed and ETA."""
+    total = int(response.headers.get('Content-Length') or 0)
+    done, start, last = 0, time.monotonic(), 0.0
+    while True:
+        block = response.read(chunk)
+        if not block:
+            break
+        out.write(block)
+        done += len(block)
+        now = time.monotonic()
+        if now - last >= 0.25 or (total and done >= total):
+            last = now
+            speed = done / max(now - start, 1e-6)
+            line = '  {} {:.1f} MiB'.format(name, done / 1048576)
+            if total:
+                line += ' / {:.1f} MiB ({:.0f}%)'.format(total / 1048576, 100 * done / total)
+            line += ' at {:.1f} MiB/s'.format(speed / 1048576)
+            if total and done < total:
+                line += ', ETA ' + format_eta((total - done) / speed)
+            print('\r' + line.ljust(79), end='', flush=True)
+    print(flush=True)
+
+
 def verified_download(path, url, expected, offline=False):
     if path.exists():
         if path.is_file() and sha(path) == expected:
@@ -61,13 +97,24 @@ def verified_download(path, url, expected, offline=False):
     try:
         print('DOWNLOAD ' + path.name, flush=True)
         with urllib.request.urlopen(url, timeout=60) as response, temporary.open('xb') as out:
-            shutil.copyfileobj(response, out)
+            copy_with_progress(response, out, path.name)
         if sha(temporary) != expected:
             raise RuntimeError('Download SHA256 mismatch: ' + path.name)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return path
+
+
+def native_fsr_package(runtime):
+    """Only explicit RDNA4-only packages can omit the compatibility payload."""
+    target = runtime / 'gpu-target.json'
+    architectures = set()
+    if target.is_file():
+        architectures.add(json.loads(target.read_text(encoding='utf-8-sig')).get('architecture'))
+    if (runtime / 'package.json').is_file():
+        architectures.update(json.loads((runtime / 'package.json').read_text(encoding='utf-8-sig')).get('targets', {}))
+    return bool(architectures) and architectures <= {'gfx1200', 'gfx1201'}
 
 
 def ini_selects_fsr(runtime):
@@ -135,6 +182,48 @@ def enable_fsr(runtime, backup_root):
     if config.read_bytes() != original:
         temporary.unlink()
         raise RuntimeError('d4r.ini changed during installation; preserved current configuration')
+    os.replace(temporary, config)
+    return backup
+
+
+def absolutize_library_paths(game, backup_root):
+    """Make OptiScaler.ini's [Libraries] folders absolute for this game folder.
+
+    OptiScaler builds without patch 0006 reject a relative NvngxPath ("AllowExternalBackend requires an
+    absolute NvngxPath"), which leaves the AMD GPU DLSS-incapable and hides DLSS in its menu. Idempotent;
+    the previous file is kept outside the game.
+    """
+    config = game / 'OptiScaler.ini'
+    if not config.is_file():
+        return None
+    original = config.read_bytes()
+    text = original.decode('utf-8-sig')
+    section, changed, lines = '', False, []
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip().lower()
+        elif section == 'libraries' and '=' in line and not stripped.startswith((';', '#')):
+            key, value = line.split('=', 1)
+            ending = line[len(line.rstrip('\r\n')):]
+            value = value.strip()
+            if (key.strip().lower() in ('nvngxpath', 'nvngxdlsspath', 'nvngxfeaturepath')
+                    and value and not Path(value).is_absolute()):
+                line = key.rstrip() + '=' + str((game / value).resolve()) + ending
+                changed = True
+        lines.append(line)
+    if not changed:
+        return None
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / ('optiscaler-config-' + uuid.uuid4().hex + '.ini')
+    with backup.open('xb') as stream:
+        stream.write(original)
+    temporary = config.with_name(config.name + '.' + uuid.uuid4().hex + '.tmp')
+    with temporary.open('xb') as stream:
+        stream.write((b'\xef\xbb\xbf' if original.startswith(b'\xef\xbb\xbf') else b'') + ''.join(lines).encode('utf-8'))
+    if config.read_bytes() != original:
+        temporary.unlink()
+        raise RuntimeError('OptiScaler.ini changed during installation; preserved current configuration')
     os.replace(temporary, config)
     return backup
 
@@ -293,6 +382,12 @@ def install_model(runtime, cache, backup, preset, enable):
     python = tools / 'python/python.exe'
     recipe = tools / 'recipe'
     output = recipe / 'build' / ('rr-' + preset.lower())
+    # An interrupted build (window closed, Ctrl+C) leaves products without the builder's cache
+    # stamp, which --reuse rejects on every later run. Keep it aside and build afresh.
+    if output.exists() and not (output / 'windows-native-python-cache.json').is_file():
+        aside = output.with_name(output.name + '.incomplete-' + uuid.uuid4().hex)
+        output.rename(aside)
+        print('Previous RR model build was incomplete; kept at ' + str(aside) + ' and rebuilding.', flush=True)
     # Each builder child has its own 600s deadline and kills a timed-out tree.
     subprocess.run([str(python), str(recipe / 'tools/windows/build_rr_model.py'),
                     '--dll', str(runtime / 'rr/nvngx_dlssd.dll'), '--preset', preset,
@@ -316,7 +411,7 @@ def main():
     parser.add_argument('--enable-rr', action='store_true', help='select generated native RR model in d4r.ini')
     parser.add_argument('--enable-fsr', action='store_true', help='install the FSR denoiser and select Backend = fsr in d4r.ini')
     parser.add_argument('--install-fsr', action='store_true',
-                        help="also install AMD's pinned FSR Ray Regeneration denoiser (automatic when d4r.ini selects Backend = fsr)")
+                        help="require AMD's pinned FSR Ray Regeneration denoiser (installed automatically whenever the release has its d4r/fsr payload)")
     args = parser.parse_args()
     runtime = args.package_root / 'd4r' if (args.package_root / 'd4r/d4r.ini').is_file() else args.package_root
     if not (runtime / 'd4r.ini').is_file():
@@ -332,13 +427,18 @@ def main():
             raise RuntimeError('Release does not recognize pinned ' + kind)
     if args.enable_fsr and args.rr_preset:
         parser.error('--enable-fsr and --rr-preset select different RR backends')
-    fsr = args.install_fsr or args.enable_fsr or ini_selects_fsr(runtime)
-    if fsr and not all((runtime / 'fsr' / name).is_file() for name in ('d4r_vkd3d_core.dll', 'amdxc64.dll')):
+    # Install every backend's files up front so switching [RayReconstruction] Backend later needs no rerun.
+    # AMD's denoiser comes along whenever the release carries the FSR payload; requesting FSR without it fails.
+    fsr_payload = all((runtime / 'fsr' / name).is_file() for name in ('d4r_vkd3d_core.dll', 'amdxc64.dll'))
+    native_fsr = native_fsr_package(runtime)
+    if (args.install_fsr or args.enable_fsr or ini_selects_fsr(runtime)) and not (fsr_payload or native_fsr):
         parser.error("FSR Ray Regeneration needs this release's d4r/fsr payload (d4r_vkd3d_core.dll, amdxc64.dll); extract the complete ZIP")
-    if not args.yes and input('Download pinned DLSS/RR 310.9.1 and NGX 617.14 (~945 MiB archive)? [Y/n] ').lower().startswith('n'):
+    fsr = fsr_payload or native_fsr
+    if not args.yes and input('Download pinned DLSS/RR 310.9.1 and NGX 617.14 (~945 MiB archive)? [Y/n] ').strip().lower().startswith('n'):
         return
     result = transaction(runtime, collect(args.cache_root, args.offline, fsr), args.backup_root)
     print(json.dumps(result, indent=2))
+    absolutize_library_paths(game, args.backup_root)
     if args.enable_fsr:
         backup = enable_fsr(runtime, args.backup_root)
         print(json.dumps({'fsrBackendSelected': True, 'configBackup': str(backup) if backup else None}, indent=2))

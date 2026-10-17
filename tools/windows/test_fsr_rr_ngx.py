@@ -28,9 +28,13 @@ def main():
     for name in ('probe', 'shim', 'runtime', 'core', 'dlss', 'fsr-dir', 'denoiser', 'fixture', 'output'):
         parser.add_argument('--' + name, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument('--timeout', type=int, default=1500)
+    parser.add_argument('--device', choices=('auto', 'native', 'vkd3d'), default='auto', help='select the native D3D12 or compatibility route for this diagnostic')
     parser.add_argument('--without-sr', action='store_true', help='omit SR/core dependencies and require the same-size FSR-only fallback')
     parser.add_argument('--cache-dir', type=lambda value: Path(value).resolve(), help='isolated cache for shader/compiler experiments')
     parser.add_argument('--vkd3d-config', help='diagnostic per-process vkd3d configuration')
+    parser.add_argument('--vkd3d-debug', choices=('none', 'err', 'warn', 'fixme', 'info', 'trace'), help='diagnostic vkd3d logging level')
+    parser.add_argument('--shader-dump', type=lambda value: Path(value).resolve(), help='diagnostic original shader dump into a new directory')
+    parser.add_argument('--disable-builtin-shaders', action='store_true', help='diagnostic control: use the original translations in a locally optimized payload')
     parser.add_argument('--fp16-rte', action='store_true', help='experimental dxil-spirv payload: retain layout workaround but omit global FP16 RTZ')
     parser.add_argument('--float-guides', action='store_true')
     parser.add_argument('--switch-guides', action='store_true')
@@ -69,7 +73,12 @@ def main():
     fsr = staged / 'fsr'
     fsr.mkdir(exist_ok=True)
     for name in ('d4r_vkd3d_core.dll', 'amdxc64.dll'):
-        shutil.copy2(args.fsr_dir / name, fsr / name)
+        source = args.fsr_dir / name
+        if args.device == 'native':
+            (fsr / name).unlink(missing_ok=True)
+            continue  # prove that the direct route has no compatibility payload dependency
+        if source.is_file():
+            shutil.copy2(source, fsr / name)
     shutil.copy2(args.denoiser, staged / 'amd_fidelityfx_denoiser_dx12.dll')
     config = (repo / 'packaging/windows/d4r.ini').read_text()
     if 'Backend = off' not in config:
@@ -87,8 +96,17 @@ def main():
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(('D4R_', 'VKD3D_', 'DXIL_')) and key not in ('HIP_PATH', 'ZLUDA_CUDA_LIB', 'ZLUDA_LOG_DIR', 'ZLUDA_CACHE_DIR')}
     env['D4R_FSR_RR_LOG'] = '1'  # per-frame stage timings in stderr; selection itself comes only from d4r.ini
+    if args.device != 'auto':
+        env['D4R_FSR_RR_DEVICE'] = args.device
     if args.vkd3d_config:
         env['VKD3D_CONFIG'] = args.vkd3d_config
+    if args.vkd3d_debug:
+        env['VKD3D_DEBUG'] = args.vkd3d_debug
+    if args.shader_dump:
+        args.shader_dump.mkdir(parents=True, exist_ok=False)
+        env['VKD3D_SHADER_DUMP_PATH'] = str(args.shader_dump)
+    if args.disable_builtin_shaders:
+        env['D4R_FSR_DISABLE_BUILTIN_SHADERS'] = '1'
     if args.fp16_rte:
         env['D4R_DXIL_F16_RTE'] = '1'
     if args.verify_output_widening:
@@ -126,8 +144,9 @@ def main():
         command.append('-'.join(modes))
     report = {'passed': False, 'gameAccessed': False, 'qualityReference': False, 'synthetic': True,
               'selectionMode': 'diagnostic environment without SR' if args.without_sr else 'player INI',
+              'requestedDevice': args.device,
               'artifacts': {str(path): sha(path) for path in (args.probe, args.shim, args.core, args.dlss, args.denoiser,
-                                                              args.fsr_dir / 'd4r_vkd3d_core.dll', args.fsr_dir / 'amdxc64.dll')}}
+                                                              args.fsr_dir / 'd4r_vkd3d_core.dll', args.fsr_dir / 'amdxc64.dll') if path.is_file()}}
     try:
         with (args.output / 'stdout.log').open('wb') as out, (args.output / 'stderr.log').open('wb') as err:
             result = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=args.timeout)
@@ -184,11 +203,22 @@ def main():
                 raise RuntimeError('FSR output differs from the same-frame composed half image')
         # player mode redirects the shim's stderr into its own log beside d4r_nvngx.dll
         err_text = (args.output / 'stderr.log').read_text(errors='replace')
+        device_modes = re.findall(r'D4R_FSR_RR_DEVICE (native-d3d12|vkd3d) ', err_text)
+        if not device_modes:
+            raise RuntimeError('FSR RR did not identify its device route')
+        report['selectedDevice'] = device_modes[-1]
+        requested = {'native': 'native-d3d12', 'vkd3d': 'vkd3d'}.get(args.device)
+        if requested and report['selectedDevice'] != requested:
+            raise RuntimeError('FSR RR used a different device route than requested')
         playerLog = staged / 'd4r_nvngx.log'
         if playerLog.exists():
             err_text += playerLog.read_text(errors='replace')
             shutil.copy2(playerLog, args.output / 'd4r_nvngx.log')
         report['superSamplingUsed'] = 'FSR_RR super sampling submitted' in err_text
+        report['builtinShaderOptimizations'] = (sorted(set(re.findall(
+            r'using validated local optimization for shader ([0-9a-f]{16})', err_text)))
+            if args.vkd3d_debug in ('info', 'trace') else None)
+        report['builtinShadersDisabled'] = args.disable_builtin_shaders
         if args.without_sr and report['superSamplingUsed']:
             raise RuntimeError('SR ran in the FSR-only test')
         report['superSamplingFrames'] = err_text.count('FSR_RR super sampling submitted')
@@ -202,6 +232,8 @@ def main():
                                    for i, name in enumerate(('prepareMedianMs', 'denoiseMedianMs', 'composeCopyMedianMs', 'totalMedianMs'))}
             report['gpuTiming']['warmupFrames'] = 4
             report['gpuTiming']['measuredFrames'] = len(timings) - 4
+            report['gpuTiming']['tailDenoiseMedianMs'] = statistics.median(float(row[1]) for row in timings[-7:])
+            report['gpuTiming']['tailFrames'] = min(7, len(timings))
         report.update(passed=True)
         print('PASS FSR_RR_NGX super_sampling=%d tail_rmse=%.4f input_rmse=%.4f ideal_nearest_rmse=%.4f' % (
             report['superSamplingUsed'], report['quality']['tailOutputRmse'], report['quality']['tailInputRmse'], report['quality'].get('idealNearestRmse', float('nan'))))

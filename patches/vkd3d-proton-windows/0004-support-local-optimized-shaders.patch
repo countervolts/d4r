@@ -1,0 +1,22 @@
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -26,6 +26,8 @@
+ #include <inttypes.h>
+ #include <stdio.h>
+ #include <dxil_spirv_c.h>
++#include "vkd3d_platform.h"
++#include "d4r_shader_overrides.h"
+ 
+ static bool dxil_match_shader_visibility(enum vkd3d_shader_visibility visibility,
+                                          dxil_spv_shader_stage stage)
+@@ -1599,7 +1600,8 @@
+     }
+ 
+     /* Late replacement, keeping the meta computed above. */
+-    if (vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
++    if (vkd3d_shader_replace(hash, &spirv->code, &spirv->size) ||
++            d4r_shader_replace_builtin(hash, compiled.data, compiled.size, &spirv->code, &spirv->size))
+     {
+         spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
+     }

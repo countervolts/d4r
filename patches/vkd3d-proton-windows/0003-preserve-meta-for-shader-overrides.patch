@@ -1,0 +1,33 @@
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index b28b9a65..385eb87f 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -1459,13 +1459,9 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     memset(&spirv->meta, 0, sizeof(spirv->meta));
+     spirv->meta.hash = hash;
+ 
+-    /* Cannot replace mesh shaders until we have reflected the IO layout. */
+-    if (shader_interface_info->stage != VK_SHADER_STAGE_MESH_BIT_EXT &&
+-            vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
+-    {
+-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
+-        return ret;
+-    }
++    /* d4r: every stage is replaced late (below), after dxil-spirv has computed the shader's meta
++     * (wave size range, workgroup size, flags). Early replacement returned zeroed meta, so a replaced
++     * compute shader lost its required wave size. */
+ 
+     dxil_spv_begin_thread_allocator_context();
+ 
+@@ -1602,9 +1598,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+         goto end;
+     }
+ 
+-    /* Late replacement for mesh shaders. */
+-    if (shader_interface_info->stage == VK_SHADER_STAGE_MESH_BIT_EXT &&
+-            vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
++    /* Late replacement, keeping the meta computed above. */
++    if (vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
+     {
+         spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
+     }

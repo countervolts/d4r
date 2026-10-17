@@ -6,7 +6,8 @@ param(
     [string]$ZludaRoot,
     [string]$ToolchainRoot,
     [string]$BuildDirectory,
-    [string]$InstallDirectory
+    [string]$InstallDirectory,
+    [switch]$KernelsOnly
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'gpu-target.ps1')
@@ -23,6 +24,10 @@ if (!$InstallDirectory) { $InstallDirectory = Join-Path $repo 'dist/windows-rdna
 if ($GpuArch -ne 'gfx1201') {
     if (!$PSBoundParameters.ContainsKey('BuildDirectory')) { $BuildDirectory += "-$GpuArch" }
     if (!$PSBoundParameters.ContainsKey('InstallDirectory')) { $InstallDirectory += "-$GpuArch" }
+}
+if ($KernelsOnly) {
+    if (!$PSBoundParameters.ContainsKey('BuildDirectory')) { $BuildDirectory=Join-Path $repo "build/windows-kernels-$GpuArch" }
+    if (!$PSBoundParameters.ContainsKey('InstallDirectory')) { $InstallDirectory=Join-Path $repo "dist/windows-kernels-$GpuArch" }
 }
 $HipRoot = [IO.Path]::GetFullPath($HipRoot).TrimEnd('\', '/')
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory).TrimEnd('\', '/')
@@ -43,18 +48,21 @@ if (!(Test-Path $cmake) -or !(Test-Path $ninja)) {
 }
 New-Item -ItemType Directory -Force $BuildDirectory | Out-Null
 $minhook = Join-Path $repo 'external/MinHook'
-if (!(Test-Path (Join-Path $minhook 'include/MinHook.h'))) {
-    & git clone --depth 1 --branch v1.3.4 https://github.com/TsudaKageyu/minhook.git $minhook
-    if ($LASTEXITCODE) { throw 'MinHook 1.3.4 source download failed.' }
-}
-$minhookCommit = (& git -C $minhook rev-parse HEAD).Trim()
-if ($minhookCommit -ne 'c3fcafdc10146beb5919319d0683e44e3c30d537') {
-    throw "Expected audited MinHook 1.3.4 source, found $minhookCommit"
+if (!$KernelsOnly) {
+    if (!(Test-Path (Join-Path $minhook 'include/MinHook.h'))) {
+        & git clone --depth 1 --branch v1.3.4 https://github.com/TsudaKageyu/minhook.git $minhook
+        if ($LASTEXITCODE) { throw 'MinHook 1.3.4 source download failed.' }
+    }
+    $minhookCommit = (& git -C $minhook rev-parse HEAD).Trim()
+    if ($minhookCommit -ne 'c3fcafdc10146beb5919319d0683e44e3c30d537') {
+        throw "Expected audited MinHook 1.3.4 source, found $minhookCommit"
+    }
 }
 $originalPath = $env:PATH
 try {
     $configure = @('--fresh', '-S', $repo, '-B', $BuildDirectory, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
         "-DCMAKE_MAKE_PROGRAM=$ninja", "-DD4R_HIP_ROOT=$HipRoot", "-DD4R_GPU_ARCH=$GpuArch", "-DCMAKE_INSTALL_PREFIX=$InstallDirectory")
+    $configure += "-DD4R_KERNELS_ONLY=$([int][bool]$KernelsOnly)"
     if ($ToolchainRoot) {
         $compiler = Join-Path $ToolchainRoot 'bin/x86_64-w64-mingw32-clang++.exe'
         if (!(Test-Path $compiler)) { throw "Compiler missing: $compiler" }
@@ -68,12 +76,19 @@ try {
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "CMake configure exit=$LASTEXITCODE" }
     $ErrorActionPreference = 'Continue'
-    & $cmake --build $BuildDirectory --parallel 4 2>&1 | Tee-Object (Join-Path $BuildDirectory 'build.log')
+    $buildArgs=@('--build', $BuildDirectory, '--parallel', '4')
+    if ($KernelsOnly) { $buildArgs+=@('--target', 'd4r_native_compile', 'd4r_probe_code_object', 'd4r_pixel_code_object', 'd4r_wmma_code_object') }
+    & $cmake @buildArgs 2>&1 | Tee-Object (Join-Path $BuildDirectory 'build.log')
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "Build exit=$LASTEXITCODE" }
     $ErrorActionPreference = 'Continue'
-    & $cmake --install $BuildDirectory 2>&1 | Tee-Object (Join-Path $BuildDirectory 'install.log')
+    $installArgs=@('--install', $BuildDirectory)
+    if ($KernelsOnly) { $installArgs+=@('--component', 'kernels') }
+    & $cmake @installArgs 2>&1 | Tee-Object (Join-Path $BuildDirectory 'install.log')
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE) { throw "Install exit=$LASTEXITCODE" }
-    Write-Host "Built diagnostics: $InstallDirectory"
+    foreach ($object in Get-ChildItem -LiteralPath $BuildDirectory -Filter '*.hsaco') {
+        Assert-D4RCodeObjectTarget $object.FullName $GpuArch
+    }
+    Write-Host "Built $GpuArch artifacts: $InstallDirectory"
 } finally { $env:PATH = $originalPath }

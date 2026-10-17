@@ -52,6 +52,13 @@ int main(int argc, char** argv) {
         if (!found) throw std::runtime_error("HIP adapter missing from DXGI");
         ComPtr<ID3D12Device> device;
         dx(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(device.GetAddressOf())), "D3D12CreateDevice");
+        // D4R_DIAG_VRAM_BALLAST_MB: occupy that much VRAM first, reproducing a game near its memory budget.
+        std::vector<ComPtr<ID3D12Resource>> ballast;
+        if (const char* mb = std::getenv("D4R_DIAG_VRAM_BALLAST_MB")) {
+            for (unsigned long long used = 0, total = std::stoull(mb); used + 256 <= total; used += 256)
+                ballast.push_back(make_buffer(device.Get(), 256ull << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON));
+            std::printf("D3D12_VRAM_BALLAST buffers=%zu mib=%zu\n", ballast.size(), ballast.size() * 256);
+        }
         if (enhanced) { D3D12_FEATURE_DATA_D3D12_OPTIONS12 support{}; dx(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &support, sizeof(support)), "Enhanced barrier support"); if (!support.EnhancedBarriersSupported) throw std::runtime_error("Enhanced barriers unavailable"); }
         auto enhancedBarrier = [&](ID3D12GraphicsCommandList* command, ID3D12Resource* texture, unsigned plane, bool initial) {
             ComPtr<ID3D12GraphicsCommandList7> newer; dx(command->QueryInterface(IID_PPV_ARGS(newer.GetAddressOf())), "Harness enhanced list");

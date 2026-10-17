@@ -1,6 +1,19 @@
-# d4r (dlss 4 radeon)
+## Windows
 
-d4r is currently overhauling the windows build.
+Extract the Windows release ZIP beside the game's main executable, run `install.bat`,
+then launch the game normally and select DLSS. The installer downloads and verifies
+the required dependencies; Python and a compiler are included where needed.
+Super Resolution setup needs no GPU selection or Ray Reconstruction model build.
+See [Windows installation and settings](packaging/windows/WINDOWS_README.txt).
+
+To compile the Windows K/M kernels for every registered RDNA 3, 3.5 and 4 target,
+run `build-kernels.bat` from the source checkout. On a new build machine, first run
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\setup-windows-tools.ps1 -RuntimeProfile therock`
+(requires Python). Outputs go to `dist/windows-kernels-<gfx target>`;
+`build/windows-kernels/matrix-build.json` records hashes and target checks.
+No GPU or NVIDIA DLL is required for this kernel build. These kernel outputs are
+build artifacts; use the release ZIP to install into a game.
+See [GPU coverage and full release builds](docs/windows-gpu-support.md).
 
 > **Not affiliated with NVIDIA or AMD.**
 
@@ -10,7 +23,7 @@ RX 7700 XT on the linux build, windows should get similar performance (plus ts l
 
 [DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
 
-More up to date videols (0.1.4), still linux build
+More up to date videos (0.1.4), still linux build
 
 **Ready or Not**
 

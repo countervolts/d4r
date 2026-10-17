@@ -2,6 +2,7 @@
 #include "rr_native_backend.h"
 #include "rr_native_packet.h"
 #include "rr_bridge_replay.h"
+#include "rr_input_formats.h"
 #include "d3d12_command_hooks.h"
 #include <mutex>
 
@@ -13,32 +14,7 @@ std::mutex dispatchMutex;
 using Packet = rr_bridge::NativePacket;
 using Device = rr_bridge::NativeDevice;
 size_t resource_index(size_t plane) { return plane < 7 ? plane : plane + 2; }
-rr_bridge::Plane input_format(DXGI_FORMAT format, size_t plane) {
-    // Match Linux's direct sampled-image route. These formats preserve the
-    // stored texel values; no CPU conversion or reinterpretation is involved.
-    if (plane == Snapshot::Motion) {
-        if (format == DXGI_FORMAT_R16G16_FLOAT) return {nullptr, VK_FORMAT_R16G16_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R32G32_FLOAT) return {nullptr, VK_FORMAT_R32G32_SFLOAT, 8};
-    } else if (plane == Snapshot::Depth || plane == Snapshot::HitDistance || plane == Snapshot::Disocclusion || plane == Snapshot::Subsurface) {
-        if (plane == Snapshot::Depth && (format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_D32_FLOAT ||
-            format == DXGI_FORMAT_R32G8X24_TYPELESS || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS))
-            return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R32_FLOAT) return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R16_FLOAT) return {nullptr, VK_FORMAT_R16_SFLOAT, 2};
-        if (plane != Snapshot::Depth && format == DXGI_FORMAT_R8_UNORM) return {nullptr, VK_FORMAT_R8_UNORM, 1};
-    } else {
-        if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return {nullptr, VK_FORMAT_R16G16B16A16_SFLOAT, 8};
-        if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) return {nullptr, VK_FORMAT_R32G32B32A32_SFLOAT, 16};
-        if (format == DXGI_FORMAT_R8G8B8A8_UNORM) return {nullptr, VK_FORMAT_R8G8B8A8_UNORM, 4};
-        if (format == DXGI_FORMAT_R10G10B10A2_UNORM) return {nullptr, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
-        if (plane == Snapshot::Roughness) {
-            if (format == DXGI_FORMAT_R16_FLOAT) return {nullptr, VK_FORMAT_R16_SFLOAT, 2};
-            if (format == DXGI_FORMAT_R32_FLOAT) return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-            if (format == DXGI_FORMAT_R8_UNORM) return {nullptr, VK_FORMAT_R8_UNORM, 1};
-        }
-    }
-    throw std::runtime_error("Unsupported native RR sampled input format");
-}
+rr_bridge::Plane input_format(DXGI_FORMAT format, size_t plane) { return guide_format(format, plane, "native RR"); }
 DXGI_FORMAT copy_format(ID3D12Device* device, ID3D12Resource* texture, size_t plane) {
     const auto desc = resource_desc(texture);
     if (plane != Snapshot::Depth) return desc.Format;
@@ -111,7 +87,11 @@ struct Backend::Impl {
         replay = std::make_unique<rr_bridge::Replay>(layout, native->physical, native->device, directory);
         const unsigned indices[] = {3, 2, 1, 4, 5, 0};
         const auto requested = creation.presets[indices[creation.quality]];
-        if (requested && requested != replay->model->preset()) throw std::runtime_error("Configured RR model differs from requested preset");
+        // The preset is a hint (Cyberpunk 2077 asks for one per quality mode). Serve the locally
+        // built model rather than failing RR; the log names both so the user can build that preset.
+        if (requested && requested != replay->model->preset())
+            std::fprintf(stderr, "d4r: RR preset %u requested; serving the configured preset %u model (build the requested one with install.bat to match)\n",
+                unsigned(requested), unsigned(replay->model->preset()));
         shared = make_buffer(d3d.Get(), layout.bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON);
         dx(d3d->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence)), "RR shared fence");
         Handle memoryHandle, fenceHandle;

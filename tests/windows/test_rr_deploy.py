@@ -1,9 +1,38 @@
 import sys
+import json
+import tempfile
 from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools/windows'))
-from deploy_rr_model import select_native
+from deploy_rr_model import select_native, model_arithmetic
+
+
+class ModelTargetTests(unittest.TestCase):
+    def test_rdna4_targets_require_exact_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            for target in ('gfx1200', 'gfx1201'):
+                identity = {'preset': 'D', 'architecture': target, 'arithmetic': 'exact-gfx12'}
+                (runtime / 'gpu-target.json').write_text(json.dumps({'architecture': target}))
+                self.assertEqual(model_arithmetic(identity, runtime), 'gfx12')
+                identity['architecture'] = 'gfx1201' if target == 'gfx1200' else 'gfx1200'
+                with self.assertRaisesRegex(RuntimeError, 'does not match'):
+                    model_arithmetic(identity, runtime)
+
+    def test_rdna4_requires_target_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity = {'preset': 'E', 'architecture': 'gfx1201', 'arithmetic': 'exact-gfx12'}
+            with self.assertRaisesRegex(RuntimeError, 'gpu-target.json'):
+                model_arithmetic(identity, Path(directory))
+
+    def test_wrong_arithmetic_rejected_and_legacy_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity = {'preset': 'E', 'architecture': 'gfx1101', 'arithmetic': 'exact-gfx11'}
+            self.assertEqual(model_arithmetic(identity, Path(directory)), 'gfx11')
+            identity['architecture'] = 'gfx1201'
+            with self.assertRaisesRegex(RuntimeError, 'identity'):
+                model_arithmetic(identity, Path(directory))
 
 
 class ConfigSelectionTests(unittest.TestCase):

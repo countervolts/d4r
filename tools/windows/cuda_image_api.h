@@ -145,13 +145,17 @@ public:
             api_.cuda.check(api_.cuMemcpy2DAsync_v2(&copy, nullptr), "cuMemcpy2DAsync_v2(external VRAM to array)");
         } else api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(external VRAM to array)");
     }
-    void download_device(CUdeviceptr destination, size_t pitch) {
+    void download_device(CUdeviceptr destination, size_t pitch, bool deferred = false) {
         if (pitch < rowBytes_) throw std::runtime_error("Device output pitch is smaller than its row");
         Copy2D copy{};
         copy.srcType = 3; copy.srcArray = array_;
         copy.dstType = 2; copy.dstDevice = destination; copy.dstPitch = pitch;
         copy.widthBytes = rowBytes_; copy.height = height_;
-        api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(array to external VRAM)");
+        if (deferred) {
+            // Match input batching: conversion follows on the shared legacy
+            // default stream, and the caller completes the batch before D3D12.
+            api_.cuda.check(api_.cuMemcpy2DAsync_v2(&copy, nullptr), "cuMemcpy2DAsync_v2(array to external VRAM)");
+        } else api_.cuda.check(api_.cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(array to external VRAM)");
     }
 };
 }

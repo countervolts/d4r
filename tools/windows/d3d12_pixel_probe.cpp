@@ -32,6 +32,9 @@ const Case cases[] = {
     {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, 4, "exposure-rgba32f"},
     {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, 4, "exposure-rgba8"},
     {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, 4, "exposure-bgra8"},
+    {DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 0, "rgb9e5"},
+    {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, 1, "depth-r16f"},
+    {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, 2, "motion-rgba8"},
 };
 struct List {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -93,6 +96,7 @@ void fixture(uint8_t* row, unsigned y, PixelSpec spec) {
             case d4r::pixel::rg16snorm: case d4r::pixel::rg16unorm: case d4r::pixel::r16unorm:
                 for (unsigned c = 0; c < spec.bytes / 2; ++c) reinterpret_cast<uint16_t*>(p)[c] = uint16_t(i < 4 ? i * 32767 : i * 193 + c * 37); break;
             case d4r::pixel::depth24: *reinterpret_cast<uint32_t*>(p) = (i * 3791) | ((i % 256) << 24); break;
+            case d4r::pixel::rgb9e5: *reinterpret_cast<uint32_t*>(p) = i * 2654435761u; break; // every exponent and mantissa
             default: throw std::runtime_error("Missing diagnostic fixture");
         }
     }
@@ -231,7 +235,8 @@ int main(int argc, char** argv) {
                 if (mismatch && differs++ < 5) std::fprintf(stderr, "PIXEL_DIFFERENT format=%s pixel=%u channel=%u expected=%08x actual=%08x\n", item.name, y * width + x, c, expected[i], got);
             }
             if (differs) throw std::runtime_error(std::string("D3D12 typed decode mismatch: ") + item.name + " count=" + std::to_string(differs));
-            if (item.plane == 0) {
+            // D3D12 has no typed UAV store for R9G9B9E5, so its encoder has no hardware reference here.
+            if (item.plane == 0 && spec.storage != d4r::pixel::rgb9e5) {
                 // BGRA uses the identical UNORM converter through an RGBA UAV;
                 // the consumer SRV independently tests the channel permutation.
                 DXGI_FORMAT encodedFormat = spec.storage == d4r::pixel::bgra8 ? DXGI_FORMAT_R8G8B8A8_UNORM : item.view;

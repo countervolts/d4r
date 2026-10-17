@@ -1,4 +1,6 @@
 // FSR Ray Regeneration as the native Windows Ray Reconstruction backend (experimental). See fsr_rr_backend.h.
+// RDNA4 records conversion, AMD denoising and composition on the game's native D3D12 device.
+// The compatibility route described below remains the RDNA3 default.
 //
 // Data path of one evaluation (every hand-off is CPU-synchronized; no vkd3d-proton patch is needed):
 //   game queue : guides -> shared packet (D3D12 copies, as the native DLSS backend), signal, CPU waits
@@ -11,9 +13,12 @@
 #include "../d4r_fsr_rr.h"
 #include "../d4r_vkd3d_interop.h"
 #include "fsr_rr_passes.h"
+#include "fsr_rr_native_passes.h"
+#include "fsr_rr_route.h"
 #include "d3d12_command_hooks.h"
 #include <volk.h>
 #include "rr_bridge_replay.h"
+#include "rr_input_formats.h"
 #include <vulkan/vulkan_win32.h>
 #include <dxgi1_4.h>
 #include <chrono>
@@ -134,35 +139,9 @@ void multiply(const double (&a)[16], const double (&b)[16], double (&out)[16]) {
         double sum = 0; for (int k = 0; k < 4; ++k) sum += a[r * 4 + k] * b[k * 4 + c]; out[r * 4 + c] = sum;
     }
 }
-bool unorm(VkFormat format) {
-    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-}
 size_t resource_index(size_t plane) { return plane < 7 ? plane : plane + 2; }
-// Same sampled-input formats as the native backend: the texel values reach Vulkan unchanged.
-rr_bridge::Plane input_format(DXGI_FORMAT format, size_t plane) {
-    if (plane == Snapshot::Motion) {
-        if (format == DXGI_FORMAT_R16G16_FLOAT) return {nullptr, VK_FORMAT_R16G16_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R32G32_FLOAT) return {nullptr, VK_FORMAT_R32G32_SFLOAT, 8};
-    } else if (plane == Snapshot::Depth || plane == Snapshot::HitDistance || plane == Snapshot::Disocclusion || plane == Snapshot::Subsurface) {
-        if (plane == Snapshot::Depth && (format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_D32_FLOAT ||
-            format == DXGI_FORMAT_R32G8X24_TYPELESS || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS))
-            return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R32_FLOAT) return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-        if (format == DXGI_FORMAT_R16_FLOAT) return {nullptr, VK_FORMAT_R16_SFLOAT, 2};
-        if (plane != Snapshot::Depth && format == DXGI_FORMAT_R8_UNORM) return {nullptr, VK_FORMAT_R8_UNORM, 1};
-    } else {
-        if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return {nullptr, VK_FORMAT_R16G16B16A16_SFLOAT, 8};
-        if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) return {nullptr, VK_FORMAT_R32G32B32A32_SFLOAT, 16};
-        if (format == DXGI_FORMAT_R8G8B8A8_UNORM) return {nullptr, VK_FORMAT_R8G8B8A8_UNORM, 4};
-        if (format == DXGI_FORMAT_R10G10B10A2_UNORM) return {nullptr, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
-        if (plane == Snapshot::Roughness) {
-            if (format == DXGI_FORMAT_R16_FLOAT) return {nullptr, VK_FORMAT_R16_SFLOAT, 2};
-            if (format == DXGI_FORMAT_R32_FLOAT) return {nullptr, VK_FORMAT_R32_SFLOAT, 4};
-            if (format == DXGI_FORMAT_R8_UNORM) return {nullptr, VK_FORMAT_R8_UNORM, 1};
-        }
-    }
-    throw std::runtime_error("Unsupported FSR RR sampled input format");
-}
+// Same sampled-input formats as the native backend (rr_input_formats.h).
+rr_bridge::Plane input_format(DXGI_FORMAT format, size_t plane) { return guide_format(format, plane, "FSR RR"); }
 DXGI_FORMAT copy_format(ID3D12Device* device, ID3D12Resource* texture, size_t plane) {
     const auto desc = resource_desc(texture);
     if (plane != Snapshot::Depth) return desc.Format;
@@ -213,8 +192,14 @@ FsrConfig FsrConfig::from_environment() {
     config.cacheDir = env_wide("D4R_FSR_CACHE_DIR");
     return config;
 }
+bool FsrConfig::use_native_device() {
+    return native_fsr_route(D4R_TARGET_ARCH, std::getenv("D4R_FSR_RR_DEVICE"));
+}
 
 struct FsrBackend::Impl {
+    bool nativeD3d12 = FsrConfig::use_native_device();
+    NativeFsrPasses nativePasses;
+    std::array<NativeFsrPasses::Guide, 11> nativeGuides{};
     Creation creation;
     rr_bridge::Layout layout;
     ComPtr<ID3D12Device> d3d;           // the game's device
@@ -226,6 +211,7 @@ struct FsrBackend::Impl {
     Handle event;
     uint64_t sequence = 0;
     bool pending = false, failed = false;
+    std::unique_ptr<Snapshot> retained;
     // --- private vkd3d-proton side ---
     HMODULE core = nullptr;
     ComPtr<ID3D12Device> vdev;
@@ -306,6 +292,26 @@ struct FsrBackend::Impl {
         if ((creation.flags & 3u) != 3u) throw std::runtime_error("FSR RR requires HDR and render-resolution motion vectors");
         if (creation.flags & 4u) throw std::runtime_error("FSR RR does not convert jittered motion vectors");
         if (creation.quality < 0 || creation.quality > 5) throw std::runtime_error("Unsupported RR quality mode");
+        if (nativeD3d12) {
+            // AMD sees the game's real D3D12 device and its real driver extension.
+            // No vkd3d core, amdxc shim, external packet or Vulkan device is loaded.
+            std::fprintf(stderr, "D4R_FSR_RR_DEVICE native-d3d12 target=%s cross_api_copies=0\n", D4R_TARGET_ARCH);
+            vdev = d3d;
+            vevent.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!vevent.value) throw std::runtime_error("FSR RR native event creation failed");
+            dx(vdev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&vfence)), "FSR RR native fence");
+            dx(vdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&vallocator)), "FSR RR native allocator");
+            dx(vdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, vallocator.Get(), nullptr, IID_PPV_ARGS(&vlist)), "FSR RR native list");
+            dx(vlist->Close(), "FSR RR native initial close");
+            if (!runtime.load(config.denoiserDll)) throw std::runtime_error(std::string("FSR RR denoiser DLL: ") + fsr_rr_stage_name(runtime.stage));
+            if (!runtime.query_providers(vdev.Get())) throw std::runtime_error(std::string("FSR RR native D3D12 provider: ") + fsr_rr_stage_name(runtime.stage));
+            nativePasses.initialize(vdev.Get());
+            create_intermediates();
+            create_context();
+            std::fprintf(stderr, "FSR_RR provider \"%s\" on native D3D12\n", runtime.providerName.c_str());
+            return;
+        }
+        std::fprintf(stderr, "D4R_FSR_RR_DEVICE vkd3d target=%s\n", D4R_TARGET_ARCH);
         if (config.vkd3dCore.empty() || config.denoiserDll.empty() || config.amdxcShim.empty())
             throw std::runtime_error("FSR RR needs D4R_FSR_VKD3D_CORE, D4R_FSR_RR_DLL and D4R_FSR_AMDXC_SHIM");
         // --- the game-device packet, fence and copy lists (as the native backend) ---
@@ -337,7 +343,23 @@ struct FsrBackend::Impl {
 
     void start_vkd3d() {
         // vkd3d-proton's own environment: the dxil-spirv RDNA3 WMMA/FP8 emulation, and a cache for its shaders.
-        SetEnvironmentVariableA("DXIL_SPIRV_CONFIG", "wmma_rdna3_workaround");
+        // gfx12 uses the native FP8 matrix layout. Applying the gfx11 layout rewrite
+        // there also forces FP16 RTZ in dxil-spirv. Preserve explicit diagnostic overrides.
+        // Read the Windows environment: the C runtime's getenv snapshot does not
+        // reflect SetEnvironmentVariable calls made by other DLLs in this process.
+        DWORD configLength = GetEnvironmentVariableA("DXIL_SPIRV_CONFIG", nullptr, 0);
+        if (!configLength && GetLastError() == ERROR_ENVVAR_NOT_FOUND &&
+            std::string(D4R_TARGET_ARCH).rfind("gfx11", 0) == 0) {
+            if (!SetEnvironmentVariableA("DXIL_SPIRV_CONFIG", "wmma_rdna3_workaround"))
+                throw std::runtime_error("FSR RR shader compiler configuration failed");
+            configLength = GetEnvironmentVariableA("DXIL_SPIRV_CONFIG", nullptr, 0);
+        }
+        if (log_enabled()) {
+            std::vector<char> compilerConfig(configLength ? configLength : 1, '\0');
+            GetEnvironmentVariableA("DXIL_SPIRV_CONFIG", compilerConfig.data(), DWORD(compilerConfig.size()));
+            std::fprintf(stderr, "FSR_RR compiler: target=%s DXIL_SPIRV_CONFIG=%s\n",
+                D4R_TARGET_ARCH, compilerConfig[0] ? compilerConfig.data() : "<default>");
+        }
         if (!config.cacheDir.empty() && !std::getenv("VKD3D_SHADER_CACHE_PATH")) {
             CreateDirectoryW(config.cacheDir.c_str(), nullptr);
             SetEnvironmentVariableW(L"VKD3D_SHADER_CACHE_PATH", config.cacheDir.c_str());
@@ -435,6 +457,7 @@ struct FsrBackend::Impl {
             t.desc.SampleDesc.Count = 1; t.desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             dx(vdev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &t.desc, t.state, nullptr, IID_PPV_ARGS(&t.resource)), "FSR RR intermediate texture");
+            if (nativeD3d12) return;
             UINT64 handle = 0, offset = 0; VkFormat format = VK_FORMAT_UNDEFINED;
             dx(interop->GetVulkanResourceInfo1(t.resource.Get(), &handle, &offset, &format), "FSR RR intermediate Vulkan info");
             if (!handle) throw std::runtime_error("FSR RR intermediate has no Vulkan image");
@@ -522,10 +545,9 @@ struct FsrBackend::Impl {
         if (superSampling && (frame.renderWidth < srRenderLimits[0] || frame.renderHeight < srRenderLimits[1] ||
             frame.renderWidth > srRenderLimits[2] || frame.renderHeight > srRenderLimits[3]))
             throw std::runtime_error("FSR RR render size is outside the Super Sampling dynamic render range");
-        if (frame.exposureScale != 1 || frame.depthType || frame.normalsType || frame.roughnessType || frame.diffuseType || frame.specularType)
-            throw std::runtime_error("FSR RR guide encoding or exposure scale requires conversion");
-        if (frame.resources[Snapshot::Disocclusion] || frame.resources[Snapshot::Subsurface])
-            throw std::runtime_error("FSR RR does not use the disocclusion or subsurface guides");
+        // Like the Linux FSR backend: the exposure scale goes to the Super Sampling stage (it receives
+        // frame.exposureScale), and the NGX guide encoding hints (DLSS.*.Type) are not read.
+        if (frame.exposureScale != 1 && !superSampling) throw std::runtime_error("FSR RR exposure scale needs the Super Sampling stage");
         if (!superSampling && (frame.renderWidth != creation.outWidth || frame.renderHeight != creation.outHeight))
             throw std::runtime_error("FSR RR upscaling needs a Super Sampling stage (none is installed) or output size == render size");
         for (size_t i = 0; i < Snapshot::Count; ++i) {
@@ -551,7 +573,7 @@ struct FsrBackend::Impl {
                 frame.origins[i][0] > desc.Width || width > desc.Width - frame.origins[i][0] ||
                 frame.origins[i][1] > desc.Height || height > desc.Height - frame.origins[i][1])
                 throw std::runtime_error("Unsupported FSR RR texture format or subrect (FSR-only output must be RGBA16F or RGBA32F)");
-            if (i == Snapshot::Output && !superSampling && desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+            if (!nativeD3d12 && i == Snapshot::Output && !superSampling && desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
                 VkFormatProperties source{}, destination{};
                 api.formatProperties(vkPhysical, VK_FORMAT_R16G16B16A16_SFLOAT, &source);
                 api.formatProperties(vkPhysical, VK_FORMAT_R32G32B32A32_SFLOAT, &destination);
@@ -593,6 +615,14 @@ struct FsrBackend::Impl {
         if (WaitForSingleObject(vevent.value, 60000) != WAIT_OBJECT_0) throw std::runtime_error("FSR RR vkd3d completion timeout");
         if (vfence->GetCompletedValue() == UINT64_MAX) throw std::runtime_error("FSR RR vkd3d device removed");
     }
+    void prepare_native_guides(const Snapshot& frame, const std::array<ResourceAccess, Snapshot::Count>& access) {
+        for (size_t i : {0, 1, 2, 3, 4, 5, 6, 7, 9, 10}) {
+            if (!layout.planes[i].enabled) continue;
+            const size_t index = resource_index(i);
+            nativePasses.copy_guide(vlist.Get(), frame.resources[index].Get(), access[index], index == Snapshot::Depth,
+                layout.rw, layout.rh, creation.width, creation.height, frame.origins[index][0], frame.origins[index][1], nativeGuides[i]);
+        }
+    }
     void wait_game(ID3D12CommandQueue* q, uint64_t value) {
         dx(q->Signal(fence.Get(), value), "FSR RR game signal");
         dx(fence->SetEventOnCompletion(value, event.value), "FSR RR game completion event");
@@ -618,6 +648,7 @@ struct FsrBackend::Impl {
 
     void evaluate(ID3D12CommandQueue* q, const Snapshot& frame, const std::array<ResourceAccess, Snapshot::Count>& access) {
         validate(q, frame, access);
+        retained = std::make_unique<Snapshot>(frame);
         failed = true;
         const auto begin = Clock::now();
         layout.rw = frame.renderWidth; layout.rh = frame.renderHeight;
@@ -634,6 +665,27 @@ struct FsrBackend::Impl {
         layout.outputFormat = floatOutput ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         const auto outputFormat = floatOutput ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
         commands::InternalScope internal;
+        if (nativeD3d12) {
+            vqueue = q;
+            if (log_enabled() && !stamps) {
+                D3D12_QUERY_HEAP_DESC heap{}; heap.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; heap.Count = 4;
+                if (SUCCEEDED(vdev->CreateQueryHeap(&heap, IID_PPV_ARGS(&stamps))) &&
+                    SUCCEEDED(q->GetTimestampFrequency(&stampFrequency)) && stampFrequency)
+                    stampReadback = make_buffer(vdev.Get(), 4 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                else stamps.Reset();
+            }
+            pending = true; queue = q;
+            run_vkd3d(frame, &access);
+            if (superSampling) {
+                const auto upscaleStart = Clock::now();
+                superSampling(q, textures[Composed].resource.Get(), frame, access);
+                if (log_enabled()) std::fprintf(stderr, "FSR_RR super sampling submitted in %.2f ms\n", since(upscaleStart));
+            }
+            pending = false; failed = false; queue.Reset(); retained.reset();
+            if (log_enabled()) std::fprintf(stderr, "FSR_RR native frame %u: %ux%u total %.2f ms\n", frameIndex, layout.rw, layout.rh, since(begin));
+            ++frameIndex;
+            return;
+        }
         // --- 1. the game's guides into the shared packet ---
         dx(producerAllocator->Reset(), "FSR RR producer allocator reset"); dx(producer->Reset(producerAllocator.Get(), nullptr), "FSR RR producer reset");
         transition(producer.Get(), shared.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -695,19 +747,20 @@ struct FsrBackend::Impl {
             superSampling(q, denoised.Get(), frame, access);
             if (log_enabled()) std::fprintf(stderr, "FSR_RR super sampling submitted in %.2f ms\n", since(upscaleStart));
         }
-        pending = false; failed = false; queue.Reset();
+        pending = false; failed = false; queue.Reset(); retained.reset();
         if (log_enabled())
             std::fprintf(stderr, "FSR_RR frame %u: %ux%u produce %.2f ms, vkd3d (convert+denoise+compose) %.2f ms, total %.2f ms\n",
                          frameIndex, layout.rw, layout.rh, producedMs, vkd3dMs, since(begin));
         ++frameIndex;
     }
 
-    void run_vkd3d(const Snapshot& frame) {
+    void run_vkd3d(const Snapshot& frame, const std::array<ResourceAccess, Snapshot::Count>* access = nullptr) {
         const auto& s = frame.settings;
         const uint32_t rw = layout.rw, rh = layout.rh;
-        // which game planes exist decides the context's specular signal once
-        const bool specularHit = layout.planes[7].enabled;
-        const uint32_t wanted = FFX_DENOISER_SIGNAL_DIRECT_DIFFUSE |
+        // which hit distances the game passes decides the context's signals once (as on Linux): a lobe with a
+        // ray length is an indirect signal. Layout plane 9 is the Subsurface slot, carrying the diffuse hit.
+        const bool specularHit = layout.planes[7].enabled, diffuseHit = frame.diffuseHit && layout.planes[9].enabled;
+        const uint32_t wanted = (diffuseHit ? FFX_DENOISER_SIGNAL_INDIRECT_DIFFUSE : FFX_DENOISER_SIGNAL_DIRECT_DIFFUSE) |
             (specularHit ? FFX_DENOISER_SIGNAL_INDIRECT_SPECULAR : FFX_DENOISER_SIGNAL_DIRECT_SPECULAR);
         if (wanted != signals) {
             if (frameIndex == 0) {
@@ -715,9 +768,13 @@ struct FsrBackend::Impl {
                 const ffxReturnCode_t created = fsr_rr_create_context(runtime, vdev.Get(), creation.width, creation.height, signals, 0, context);
                 if (created != FFX_API_RETURN_OK) throw std::runtime_error(std::string("FSR RR ffxCreateContext failed: ") + fsr_rr_return_name(created));
                 apply_denoiser_keys();
+                std::fprintf(stderr, "d4r: FSR RR diffuse %s, specular %s\n",
+                    diffuseHit ? (frame.diffuseHitInW ? "indirect (hit distance in ray direction w)" : "indirect (hit distance)") : "direct (no hit distance)",
+                    specularHit ? (frame.specularHitInW ? "indirect (hit distance in ray direction w)" : "indirect (hit distance)") : "direct (no hit distance)");
             } else throw std::runtime_error("FSR RR: the game's hit-distance guide changed after the denoiser was created (recreate the feature)");
         }
-        for (size_t plane : {0, 1, 2, 3, 4, 5, 6, 7, 10}) if (layout.planes[plane].enabled) ensure_staging(plane);
+        if (!nativeD3d12)
+            for (size_t plane : {0, 1, 2, 3, 4, 5, 6, 7, 9, 10}) if (layout.planes[plane].enabled) ensure_staging(plane);
         double clipToView[16], viewToWorld[16];
         if (!invert(s.viewToClip, clipToView) || !invert(s.worldToView, viewToWorld)) throw std::runtime_error("FSR RR camera matrix is not invertible");
         const bool reset = s.reset || !havePrevious;
@@ -731,8 +788,9 @@ struct FsrBackend::Impl {
         uint32_t flags = 0;
         if (s.hardwareDepth) flags |= kFsrRrHardwareDepth;
         if (s.roughnessPacked) flags |= kFsrRrRoughnessPacked;
-        if (specularHit) flags |= kFsrRrSpecularHit;
-        if (unorm(layout.planes[3].format)) flags |= kFsrRrNormalsUnorm;
+        if (specularHit) flags |= kFsrRrSpecularHit | (frame.specularHitInW ? kFsrRrSpecularHitInW : 0u);
+        if (diffuseHit) flags |= kFsrRrDiffuseHit | (frame.diffuseHitInW ? kFsrRrDiffuseHitInW : 0u);
+        if (unorm_guide(layout.planes[3].format)) flags |= kFsrRrNormalsUnorm;
         if (layout.planes[10].enabled) flags |= kFsrRrBeforeParticles;
         flags |= kFsrRrInvalidNormalPassthrough;
         c.motionBaseFlags[2] = flags;
@@ -748,39 +806,54 @@ struct FsrBackend::Impl {
             if (t.resource) { transition(vlist.Get(), t.resource.Get(), t.state, state); t.state = state; }
         };
         for (int i = 0; i < TexCount; ++i) setState(i, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        VkCommandBuffer command = VK_NULL_HANDLE;
-        dx(interop->BeginVkCommandBufferInterop(vlist.Get(), &command), "FSR RR Vulkan interop begin");
-        // the packet comes in from the game's device
-        VkBufferMemoryBarrier acquire{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}; acquire.buffer = packetBuffer; acquire.size = VK_WHOLE_SIZE;
-        acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL; acquire.dstQueueFamilyIndex = vkFamily;
-        acquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        api.barrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &acquire, 0, nullptr);
-        for (size_t plane : {0, 1, 2, 3, 4, 5, 6, 7, 10}) {
-            if (!layout.planes[plane].enabled) continue;
-            const auto& st = staging[plane];
-            VkImageMemoryBarrier toCopy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; toCopy.image = st.image;
-            toCopy.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; toCopy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toCopy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; toCopy.srcQueueFamilyIndex = toCopy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toCopy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toCopy);
-            VkBufferImageCopy region{}; region.bufferOffset = layout.planes[plane].offset;
-            region.bufferRowLength = uint32_t(layout.planes[plane].pitch / layout.planes[plane].bytes);
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; region.imageExtent = {rw, rh, 1};
-            api.copyBufferToImage(command, packetBuffer, st.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-            VkImageMemoryBarrier toRead = toCopy; toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRead);
-        }
-        auto sampled = [&](size_t plane) { return D4rFsrRrImage{staging[plane].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}; };
-        const bool hasHit = layout.planes[7].enabled, hasParticles = layout.planes[10].enabled;
-        D4rFsrRrImage images[D4rFsrRrPasses::kPrepareInputs + D4rFsrRrPasses::kPrepareOutputs] = {
-            sampled(0), sampled(2), sampled(1), sampled(3), sampled(4), sampled(5), sampled(6),
-            hasHit ? sampled(7) : sampled(3), sampled(3), hasParticles ? sampled(10) : sampled(0)};
         static const int targets[D4rFsrRrPasses::kPrepareOutputs] = {LinearDepth, MotionT, NormalsT, DiffuseAlbedo, SpecularAlbedo, DiffuseT, SpecularT, Residual};
-        for (uint32_t i = 0; i < D4rFsrRrPasses::kPrepareOutputs; ++i)
-            images[D4rFsrRrPasses::kPrepareInputs + i] = {textures[targets[i]].view, textures[targets[i]].layout};
-        passes.record_prepare(command, images, c, rw, rh);
-        dx(interop->EndVkCommandBufferInterop(vlist.Get()), "FSR RR Vulkan interop end");
+        VkCommandBuffer command = VK_NULL_HANDLE;
+        VkBufferMemoryBarrier acquire{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        if (nativeD3d12) {
+            prepare_native_guides(frame, *access);
+            ID3D12Resource* resources[18]{}; DXGI_FORMAT formats[18]{};
+            const size_t planes[10] = {0, 2, 1, 3, 4, 5, 6, specularHit ? 7u : 3u,
+                diffuseHit ? 9u : 3u, layout.planes[10].enabled ? 10u : 0u};
+            for (size_t i = 0; i < 10; ++i) {
+                resources[i] = nativeGuides[planes[i]].resource.Get(); formats[i] = nativeGuides[planes[i]].format;
+            }
+            for (size_t i = 0; i < 8; ++i) {
+                resources[10 + i] = textures[targets[i]].resource.Get(); formats[10 + i] = textures[targets[i]].desc.Format;
+            }
+            nativePasses.record(vlist.Get(), nativePasses.prepare, &c, resources, formats, rw, rh);
+        } else {
+            dx(interop->BeginVkCommandBufferInterop(vlist.Get(), &command), "FSR RR Vulkan interop begin");
+            // the packet comes in from the game's device
+            acquire.buffer = packetBuffer; acquire.size = VK_WHOLE_SIZE;
+            acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL; acquire.dstQueueFamilyIndex = vkFamily;
+            acquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            api.barrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &acquire, 0, nullptr);
+            for (size_t plane : {0, 1, 2, 3, 4, 5, 6, 7, 9, 10}) {
+                if (!layout.planes[plane].enabled) continue;
+                const auto& st = staging[plane];
+                VkImageMemoryBarrier toCopy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; toCopy.image = st.image;
+                toCopy.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; toCopy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toCopy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; toCopy.srcQueueFamilyIndex = toCopy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toCopy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toCopy);
+                VkBufferImageCopy region{}; region.bufferOffset = layout.planes[plane].offset;
+                region.bufferRowLength = uint32_t(layout.planes[plane].pitch / layout.planes[plane].bytes);
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; region.imageExtent = {rw, rh, 1};
+                api.copyBufferToImage(command, packetBuffer, st.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                VkImageMemoryBarrier toRead = toCopy; toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRead);
+            }
+            auto sampled = [&](size_t plane) { return D4rFsrRrImage{staging[plane].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}; };
+            const bool hasHit = layout.planes[7].enabled, hasParticles = layout.planes[10].enabled;
+            D4rFsrRrImage images[D4rFsrRrPasses::kPrepareInputs + D4rFsrRrPasses::kPrepareOutputs] = {
+                sampled(0), sampled(2), sampled(1), sampled(3), sampled(4), sampled(5), sampled(6),
+                hasHit ? sampled(7) : sampled(3), diffuseHit ? sampled(9) : sampled(3), hasParticles ? sampled(10) : sampled(0)};
+            for (uint32_t i = 0; i < D4rFsrRrPasses::kPrepareOutputs; ++i)
+                images[D4rFsrRrPasses::kPrepareInputs + i] = {textures[targets[i]].view, textures[targets[i]].layout};
+            passes.record_prepare(command, images, c, rw, rh);
+            dx(interop->EndVkCommandBufferInterop(vlist.Get()), "FSR RR Vulkan interop end");
+        }
         stamp(1);
 
         // --- AMD FSR Ray Regeneration (D3D12 on vkd3d-proton) ---
@@ -811,9 +884,13 @@ struct FsrBackend::Impl {
         desc.frameIndex = frameIndex;
         desc.flags = uint32_t(FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO) | (reset ? uint32_t(FFX_DENOISER_DISPATCH_RESET) : 0u);
         ffxDispatchDescDenoiserDirectDiffuse directDiffuse = {}; ffxDispatchDescDenoiserDirectSpecular directSpecular = {};
-        ffxDispatchDescDenoiserIndirectSpecular indirectSpecular = {};
-        directDiffuse.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_DIRECT_DIFFUSE;
-        FfxApiDenoiserSignal* diffuseSignal = &directDiffuse.signal;
+        ffxDispatchDescDenoiserIndirectDiffuse indirectDiffuse = {}; ffxDispatchDescDenoiserIndirectSpecular indirectSpecular = {};
+        FfxApiDenoiserSignal* diffuseSignal; ffxApiHeader* diffuseHeader;
+        if (diffuseHit) {
+            indirectDiffuse.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_INDIRECT_DIFFUSE; diffuseSignal = &indirectDiffuse.signal; diffuseHeader = &indirectDiffuse.header;
+        } else {
+            directDiffuse.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_DIRECT_DIFFUSE; diffuseSignal = &directDiffuse.signal; diffuseHeader = &directDiffuse.header;
+        }
         FfxApiDenoiserSignal* specularSignal; ffxApiHeader* specularHeader;
         if (specularHit) {
             indirectSpecular.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_INDIRECT_SPECULAR; specularSignal = &indirectSpecular.signal; specularHeader = &indirectSpecular.header;
@@ -822,7 +899,7 @@ struct FsrBackend::Impl {
         }
         diffuseSignal->input = ffx(DiffuseT, ffxRead); diffuseSignal->output = ffx(DiffuseOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         specularSignal->input = ffx(SpecularT, ffxRead); specularSignal->output = ffx(SpecularOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-        desc.header.pNext = &directDiffuse.header; directDiffuse.header.pNext = specularHeader;
+        desc.header.pNext = diffuseHeader; diffuseHeader->pNext = specularHeader;
         const ffxReturnCode_t dispatched = runtime.dispatch(&context, &desc.header);
         if (dispatched != FFX_API_RETURN_OK) throw std::runtime_error(std::string("FSR RR ffxDispatch failed: ") + fsr_rr_return_name(dispatched));
         D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; vlist->ResourceBarrier(1, &uav);
@@ -830,30 +907,62 @@ struct FsrBackend::Impl {
 
         // --- composition, then the composed image into the packet's output region ---
         for (int i = 0; i < TexCount; ++i) setState(i, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const D4rFsrRrImage compose[D4rFsrRrPasses::kComposeImages] = {
-            {textures[DiffuseOut].view, textures[DiffuseOut].layout}, {textures[SpecularOut].view, textures[SpecularOut].layout},
-            {textures[DiffuseAlbedo].view, textures[DiffuseAlbedo].layout}, {textures[SpecularAlbedo].view, textures[SpecularAlbedo].layout},
-            {textures[Residual].view, textures[Residual].layout}, {textures[Composed].view, textures[Composed].layout},
-            {textures[DiffuseT].view, textures[DiffuseT].layout}, {textures[SpecularT].view, textures[SpecularT].layout}};
-        dx(interop->BeginVkCommandBufferInterop(vlist.Get(), &command), "FSR RR Vulkan interop begin (compose)");
-        passes.record_compose(command, compose, rw, rh, env_float("D4R_FSR_RR_HALO_LIMIT", 1.0f, 0.0f, 1000.0f));
-        int copiedImage = Composed;
-        if (layout.outputBytes == 16) {
-            // Preserve the denoiser/composition's half arithmetic; widen only the completed output on the GPU.
-            VkImageBlit region{}; region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.srcOffsets[1] = region.dstOffsets[1] = {int32_t(rw), int32_t(rh), 1};
-            api.blitImage(command, textures[Composed].image, textures[Composed].layout,
-                textures[Widened].image, textures[Widened].layout, 1, &region, VK_FILTER_NEAREST);
-            passes.full_barrier(command);
-            copiedImage = Widened;
+        if (nativeD3d12) {
+            ID3D12Resource* resources[8]{}; DXGI_FORMAT formats[8]{};
+            const int indices[8] = {DiffuseOut, SpecularOut, DiffuseAlbedo, SpecularAlbedo, Residual, Composed, DiffuseT, SpecularT};
+            for (size_t i = 0; i < 8; ++i) {
+                resources[i] = textures[indices[i]].resource.Get(); formats[i] = textures[indices[i]].desc.Format;
+            }
+            struct { uint32_t width, height; float haloLimit; uint32_t unused; } composeConstants =
+                {rw, rh, env_float("D4R_FSR_RR_HALO_LIMIT", 1.0f, 0.0f, 1000.0f), 0};
+            nativePasses.record(vlist.Get(), nativePasses.compose, &composeConstants, resources, formats, rw, rh);
+            int copiedImage = Composed;
+            if (layout.outputBytes == 16) {
+                setState(Composed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                ID3D12Resource* widening[] = {textures[Composed].resource.Get(), textures[Widened].resource.Get()};
+                DXGI_FORMAT wideningFormats[] = {textures[Composed].desc.Format, textures[Widened].desc.Format};
+                const uint32_t extent[2] = {rw, rh};
+                nativePasses.record(vlist.Get(), nativePasses.widen, extent, widening, wideningFormats, rw, rh);
+                copiedImage = Widened;
+            }
+            if (superSampling) {
+                setState(Composed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            } else {
+                setState(copiedImage, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                auto* output = frame.resources[Snapshot::Output].Get();
+                texture_copy_barrier(vlist.Get(), output, (*access)[Snapshot::Output], true, false);
+                auto source = rr_bridge::D3D12Frames::texture(textures[copiedImage].resource.Get());
+                auto destination = rr_bridge::D3D12Frames::texture(output);
+                D3D12_BOX box{0, 0, 0, rw, rh, 1};
+                vlist->CopyTextureRegion(&destination, frame.origins[Snapshot::Output][0], frame.origins[Snapshot::Output][1], 0, &source, &box);
+                texture_copy_barrier(vlist.Get(), output, (*access)[Snapshot::Output], true, true);
+            }
+        } else {
+            const D4rFsrRrImage compose[D4rFsrRrPasses::kComposeImages] = {
+                {textures[DiffuseOut].view, textures[DiffuseOut].layout}, {textures[SpecularOut].view, textures[SpecularOut].layout},
+                {textures[DiffuseAlbedo].view, textures[DiffuseAlbedo].layout}, {textures[SpecularAlbedo].view, textures[SpecularAlbedo].layout},
+                {textures[Residual].view, textures[Residual].layout}, {textures[Composed].view, textures[Composed].layout},
+                {textures[DiffuseT].view, textures[DiffuseT].layout}, {textures[SpecularT].view, textures[SpecularT].layout}};
+            dx(interop->BeginVkCommandBufferInterop(vlist.Get(), &command), "FSR RR Vulkan interop begin (compose)");
+            passes.record_compose(command, compose, rw, rh, env_float("D4R_FSR_RR_HALO_LIMIT", 1.0f, 0.0f, 1000.0f));
+            int copiedImage = Composed;
+            if (layout.outputBytes == 16) {
+                // Preserve the denoiser/composition's half arithmetic; widen only the completed output on the GPU.
+                VkImageBlit region{}; region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.srcOffsets[1] = region.dstOffsets[1] = {int32_t(rw), int32_t(rh), 1};
+                api.blitImage(command, textures[Composed].image, textures[Composed].layout,
+                    textures[Widened].image, textures[Widened].layout, 1, &region, VK_FILTER_NEAREST);
+                passes.full_barrier(command);
+                copiedImage = Widened;
+            }
+            VkBufferImageCopy back{}; back.bufferOffset = layout.outputOffset; back.bufferRowLength = uint32_t(layout.outputPitch / layout.outputBytes);
+            back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; back.imageExtent = {rw, rh, 1};
+            api.copyImageToBuffer(command, textures[copiedImage].image, textures[copiedImage].layout, packetBuffer, 1, &back);
+            VkBufferMemoryBarrier release = acquire; release.srcQueueFamilyIndex = vkFamily; release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; release.dstAccessMask = 0;
+            api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 1, &release, 0, nullptr);
+            dx(interop->EndVkCommandBufferInterop(vlist.Get()), "FSR RR Vulkan interop end (compose)");
         }
-        VkBufferImageCopy back{}; back.bufferOffset = layout.outputOffset; back.bufferRowLength = uint32_t(layout.outputPitch / layout.outputBytes);
-        back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; back.imageExtent = {rw, rh, 1};
-        api.copyImageToBuffer(command, textures[copiedImage].image, textures[copiedImage].layout, packetBuffer, 1, &back);
-        VkBufferMemoryBarrier release = acquire; release.srcQueueFamilyIndex = vkFamily; release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-        release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; release.dstAccessMask = 0;
-        api.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 1, &release, 0, nullptr);
-        dx(interop->EndVkCommandBufferInterop(vlist.Get()), "FSR RR Vulkan interop end (compose)");
         // Diagnostic (D4R_FSR_RR_DUMP_DIR, first D4R_FSR_RR_DUMP_FRAMES frames, default 3): raw copies of the converted
         // linear depth and motion textures, to check the DLSS -> FFX guide conversion numerically.
         stamp(3);
@@ -917,13 +1026,26 @@ FsrBackend::~FsrBackend() {
         (void)impl.release();
     } else impl.reset();
 }
+namespace {
+// AMD's denoiser has no disocclusion or subsurface inputs. Games pass them anyway (Cyberpunk 2077 sends
+// both every frame), so they are dropped rather than failing the frame. The shim reuses the Subsurface
+// slot for the diffuse hit distance (frame.diffuseHit); a real subsurface guide is dropped here.
+Snapshot without_unused_guides(const Snapshot& frame) {
+    Snapshot used = frame;
+    used.resources[Snapshot::Disocclusion].Reset();
+    if (!used.diffuseHit) used.resources[Snapshot::Subsurface].Reset();
+    return used;
+}
+}
 void FsrBackend::evaluate(ID3D12CommandQueue* queue, const Snapshot& frame, const std::array<ResourceAccess, Snapshot::Count>& access) {
-    std::lock_guard<std::mutex> lock(hostMutex); impl->evaluate(queue, frame, access);
+    std::lock_guard<std::mutex> lock(hostMutex); impl->evaluate(queue, without_unused_guides(frame), access);
 }
 void FsrBackend::set_super_sampling(SuperSampling stage, const std::array<unsigned, 4>& renderLimits) {
     std::lock_guard<std::mutex> lock(hostMutex); impl->superSampling = std::move(stage); impl->srRenderLimits = renderLimits;
 }
-void FsrBackend::validate_frame(const Snapshot& frame) { std::lock_guard<std::mutex> lock(hostMutex); impl->validate_frame(frame); }
+void FsrBackend::validate_frame(const Snapshot& frame) {
+    std::lock_guard<std::mutex> lock(hostMutex); impl->validate_frame(without_unused_guides(frame));
+}
 void FsrBackend::drain() {
     std::lock_guard<std::mutex> lock(hostMutex);
     if (impl->pending || impl->failed) throw std::runtime_error("FSR RR backend cannot retire failed GPU work");

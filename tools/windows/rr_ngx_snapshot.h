@@ -54,6 +54,9 @@ struct Snapshot {
     unsigned renderWidth = 0, renderHeight = 0;
     unsigned depthType = 0, normalsType = 0, roughnessType = 0, diffuseType = 0, specularType = 0;
     float exposureScale = 1;
+    // FSR RR only (set by the shim, as the Linux FSR backend reads them): the hit distance is the w of a
+    // ray-direction texture, and the Subsurface slot carries the diffuse hit distance instead.
+    bool specularHitInW = false, diffuseHit = false, diffuseHitInW = false;
     static ID3D12Resource* resource(void* parameters, const char* name, const char* alias = nullptr) {
         ID3D12Resource* value = nullptr;
         (void)d4r_ngx_get_d3d12_resource(parameters, name, &value);

@@ -114,6 +114,16 @@ compatibility; actual targets follow the selected architecture.
 
 One command compiles all eleven targets without GPU workloads:
 
+For just the K/M kernels, pixel conversion and two device probes, run
+`build-kernels.bat` at the repository root after tool setup. It compiles 19
+code objects for each target using the same CMake flags as the full build,
+checks their actual ELF targets, and writes per-object SHA256 hashes to
+`build/windows-kernels/matrix-build.json`. Outputs are separate under
+`dist/windows-kernels-<target>`. No ZLUDA, NVIDIA DLL or GPU execution is
+required. This does not produce an installable game release.
+
+For the complete host diagnostics and kernels:
+
 ```powershell
 .\scripts\windows\build-windows-gpu-matrix.ps1 -ZludaRoot "$PWD\dist\zluda-windows-final"
 ```

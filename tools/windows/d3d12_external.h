@@ -4,6 +4,8 @@
 #endif
 #include "hip_api.h"
 #include <d3d12.h>
+#include <dxgi1_4.h>
+#include <mutex>
 #include <wrl/client.h>
 
 namespace d4r::win {
@@ -103,9 +105,105 @@ inline void texture_copy_barrier(ID3D12GraphicsCommandList* list, ID3D12Resource
 class SharedPlane {
     ExternalApi& api_;
     hipExternalMemory_t memory_ = nullptr;
+    ComPtr<ID3D12Heap> heap_; // only for the explicit-heap export; outlives buffer (declared first)
     void release() noexcept {
         if (mapped) { (void)api_.hip.hipFree(mapped); mapped = nullptr; }
         if (memory_) { (void)api_.hipDestroyExternalMemory(memory_); memory_ = nullptr; }
+    }
+    // Export a committed shared buffer (the tested path). Returns false when the driver refuses
+    // the export: Cyberpunk 2077 saw CreateSharedHandle E_INVALIDARG on a fresh shared buffer
+    // after a DLSS feature recreate, although the same sequence works outside the game.
+    bool export_committed(ID3D12Device* device, Handle& handle, UINT64& importBytes) {
+        buffer = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON);
+        const auto desc = resource_desc(buffer.Get());
+        D3D12_RESOURCE_ALLOCATION_INFO allocation{};
+#if defined(__MINGW32__)
+        device->GetResourceAllocationInfo(&allocation, 0, 1, &desc);
+#else
+        allocation = device->GetResourceAllocationInfo(0, 1, &desc);
+#endif
+        const HRESULT result = device->CreateSharedHandle(buffer.Get(), nullptr, GENERIC_ALL, nullptr, &handle.value);
+        if (SUCCEEDED(result)) { importBytes = allocation.SizeInBytes; return true; }
+        // A wrapping layer can hand back a resource whose owner is not the device it was created on.
+        ComPtr<ID3D12Device> owner; (void)buffer->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()));
+        std::fprintf(stderr, "D4R_SHARED_PLANE_EXPORT committed HRESULT=0x%08lx bytes=%llu allocation=%llu device_removed=0x%08lx owner_matches=%d\n",
+            static_cast<unsigned long>(result), static_cast<unsigned long long>(bytes),
+            static_cast<unsigned long long>(allocation.SizeInBytes), static_cast<unsigned long>(device->GetDeviceRemovedReason()),
+            owner.Get() == device);
+        buffer.Reset(); handle.value = nullptr;
+        return false;
+    }
+    // Last resort when the device refuses every export (Cyberpunk 2077 with the FSR RR backend refused
+    // both the committed and the heap export): allocate and export on a private device of the same
+    // adapter, then open that allocation on the caller's device for the copies. HIP imports the
+    // private device's handle, which names the same memory.
+    ComPtr<ID3D12Device> privateDevice_;
+    ComPtr<ID3D12Resource> privateBuffer_;
+    static ComPtr<ID3D12Device> private_device(ID3D12Device* device) {
+        static std::mutex lock; static ComPtr<ID3D12Device> cached; static LUID cachedLuid{};
+        std::lock_guard<std::mutex> guard(lock);
+        const LUID luid = adapter_luid(device);
+        if (cached && cachedLuid.LowPart == luid.LowPart && cachedLuid.HighPart == luid.HighPart) return cached;
+        using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+        HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+        auto create = dxgi ? reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) : nullptr;
+        if (!create) throw std::runtime_error("CreateDXGIFactory1 unavailable (private shared-plane device)");
+        ComPtr<IDXGIFactory4> factory; dx(create(IID_PPV_ARGS(factory.GetAddressOf())), "CreateDXGIFactory1(private shared-plane device)");
+        ComPtr<IDXGIAdapter1> adapter; dx(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(adapter.GetAddressOf())), "EnumAdapterByLuid(private shared-plane device)");
+        // D3D12CreateDevice returns the adapter's existing singleton (the game's own device), so an
+        // independent device comes from the device factory, neither reusing nor replacing the singleton.
+        using GetInterface = HRESULT(WINAPI*)(REFCLSID, REFIID, void**);
+        HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+        auto getInterface = d3d12 ? reinterpret_cast<GetInterface>(reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12GetInterface"))) : nullptr;
+        if (!getInterface) throw std::runtime_error("D3D12GetInterface unavailable (private shared-plane device)");
+        static const GUID deviceFactoryClsid = {0x114863bf, 0xc386, 0x4aee, {0xb3, 0x9d, 0x8f, 0x0b, 0xbb, 0x06, 0x29, 0x55}};
+        ComPtr<ID3D12DeviceFactory> deviceFactory;
+        dx(getInterface(deviceFactoryClsid, IID_PPV_ARGS(deviceFactory.GetAddressOf())), "D3D12GetInterface(device factory)");
+        dx(deviceFactory->SetFlags(D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON), "Device factory flags");
+        ComPtr<ID3D12Device> created;
+        dx(deviceFactory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(created.GetAddressOf())), "Create private shared-plane device");
+        ComPtr<IUnknown> createdIdentity, callerIdentity;
+        (void)created->QueryInterface(IID_PPV_ARGS(createdIdentity.GetAddressOf()));
+        (void)device->QueryInterface(IID_PPV_ARGS(callerIdentity.GetAddressOf()));
+        std::fprintf(stderr, "D4R_SHARED_PLANE_PRIVATE_DEVICE independent=%d\n", createdIdentity.Get() != callerIdentity.Get());
+        cached = created; cachedLuid = luid;
+        return cached;
+    }
+    void export_private(ID3D12Device* device, Handle& handle, UINT64& importBytes) {
+        privateDevice_ = private_device(device);
+        privateBuffer_ = make_buffer(privateDevice_.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON);
+        const auto desc = resource_desc(privateBuffer_.Get());
+        D3D12_RESOURCE_ALLOCATION_INFO allocation{};
+#if defined(__MINGW32__)
+        privateDevice_->GetResourceAllocationInfo(&allocation, 0, 1, &desc);
+#else
+        allocation = privateDevice_->GetResourceAllocationInfo(0, 1, &desc);
+#endif
+        dx(privateDevice_->CreateSharedHandle(privateBuffer_.Get(), nullptr, GENERIC_ALL, nullptr, &handle.value), "CreateSharedHandle(private device)");
+        dx(device->OpenSharedHandle(handle.value, IID_PPV_ARGS(buffer.GetAddressOf())), "OpenSharedHandle(private shared plane)");
+        importBytes = allocation.SizeInBytes;
+    }
+    // Fallback: share an explicit heap that holds the buffer as a placed resource.
+    bool export_heap(ID3D12Device* device, Handle& handle, UINT64& importBytes) {
+        constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        D3D12_HEAP_DESC heap{};
+        heap.SizeInBytes = (bytes + alignment - 1) / alignment * alignment;
+        heap.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.Properties.CreationNodeMask = heap.Properties.VisibleNodeMask = 1;
+        heap.Alignment = alignment;
+        heap.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        dx(device->CreateHeap(&heap, IID_PPV_ARGS(heap_.GetAddressOf())), "CreateHeap(shared plane)");
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        dx(device->CreatePlacedResource(heap_.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(buffer.GetAddressOf())), "CreatePlacedResource(shared plane)");
+        const HRESULT result = device->CreateSharedHandle(heap_.Get(), nullptr, GENERIC_ALL, nullptr, &handle.value);
+        if (SUCCEEDED(result)) { importBytes = heap.SizeInBytes; return true; }
+        std::fprintf(stderr, "D4R_SHARED_PLANE_EXPORT heap HRESULT=0x%08lx\n", static_cast<unsigned long>(result));
+        buffer.Reset(); heap_.Reset(); handle.value = nullptr;
+        return false;
     }
 public:
     ComPtr<ID3D12Resource> buffer;
@@ -124,28 +222,28 @@ public:
         }
         if (!bytes || bytes == UINT64_MAX || !footprint.Footprint.RowPitch)
             throw std::runtime_error("Invalid shared texture footprint");
-        buffer = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON);
-        const auto desc = resource_desc(buffer.Get());
-        D3D12_RESOURCE_ALLOCATION_INFO allocation{};
-#if defined(__MINGW32__)
-        device->GetResourceAllocationInfo(&allocation, 0, 1, &desc);
-#else
-        allocation = device->GetResourceAllocationInfo(0, 1, &desc);
-#endif
         Handle handle;
-        dx(device->CreateSharedHandle(buffer.Get(), nullptr, GENERIC_ALL, nullptr, &handle.value), "CreateSharedHandle(VRAM)");
+        UINT64 importBytes = 0;
+        // D4R_SHARED_PLANE_EXPORT=heap or =private forces that fallback, for testing it.
+        const char* forcedValue = std::getenv("D4R_SHARED_PLANE_EXPORT");
+        const std::string forced = forcedValue ? forcedValue : "";
+        const char* path = "committed";
+        bool exported = forced.empty() && (export_committed(device, handle, importBytes) || export_committed(device, handle, importBytes));
+        if (!exported && forced != "private") { path = "heap"; exported = export_heap(device, handle, importBytes); }
+        if (!exported) { path = "private"; export_private(device, handle, importBytes); }
+        const bool heapImport = std::string(path) == "heap";
         try {
             hipExternalMemoryHandleDesc import{};
-            import.type = hipExternalMemoryHandleTypeD3D12Resource;
+            import.type = heapImport ? hipExternalMemoryHandleTypeD3D12Heap : hipExternalMemoryHandleTypeD3D12Resource;
             import.handle.win32.handle = handle.value;
-            import.size = allocation.SizeInBytes; import.flags = hipExternalMemoryDedicated;
+            import.size = importBytes; import.flags = heapImport ? 0 : hipExternalMemoryDedicated;
             api.hip.check(api.hipImportExternalMemory(&memory_, &import), "hipImportExternalMemory(D3D12)");
             hipExternalMemoryBufferDesc map{}; map.size = bytes;
             api.hip.check(api.hipExternalMemoryGetMappedBuffer(&mapped, memory_, &map), "hipExternalMemoryGetMappedBuffer");
         } catch (...) { release(); throw; }
         // Win32 imports retain their own reference; the exporter closes its HANDLE.
-        std::printf("D4R_IMPORT width=%u height=%u pitch=%u allocation=%llu cpu_copy=0\n",
-            footprint.Footprint.Width, footprint.Footprint.Height, footprint.Footprint.RowPitch, allocation.SizeInBytes);
+        std::printf("D4R_IMPORT width=%u height=%u pitch=%u allocation=%llu export=%s cpu_copy=0\n",
+            footprint.Footprint.Width, footprint.Footprint.Height, footprint.Footprint.RowPitch, importBytes, path);
     }
     SharedPlane(const SharedPlane&) = delete;
     ~SharedPlane() { release(); }

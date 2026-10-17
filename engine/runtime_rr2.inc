@@ -561,7 +561,12 @@ struct R2Engine {
         };
         auto found = std::find_if(bindings.begin(), bindings.end(), same);
         if (found == bindings.end()) {
-            if (bindings.size() >= 16) throw std::runtime_error("too many distinct Ray Reconstruction input view sets");
+            // Evict the oldest set rather than failing (see runtime_rr.inc); drain its in-flight uses first.
+            if (bindings.size() >= 16) {
+                VKCHECK(vkDeviceWaitIdle(d.handle));
+                vkDestroyDescriptorPool(d.handle, bindings.front().pool, nullptr);
+                bindings.erase(bindings.begin());
+            }
             Bindings b;
             b.images = images; b.finalOutput = finalOutput;
             const uint32_t tiles = static_cast<uint32_t>(src.size());

@@ -122,8 +122,8 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         if (key == "preset") f >> m.preset;
         else if (key == "arithmetic") {
             std::string arithmetic; f >> arithmetic;
-            if (arithmetic != "gfx11") throw std::runtime_error("rr.txt: unknown arithmetic " + arithmetic);
-            m.gfx11 = true;
+            if (arithmetic != "gfx11" && arithmetic != "gfx12") throw std::runtime_error("rr.txt: unknown arithmetic " + arithmetic);
+            m.gfx11 = arithmetic == "gfx11";
         }
         else if (key == "stage") {
             std::string name, shader, weightFile, textureList, surfaceList, option; uint32_t subgroup = 32;
@@ -519,7 +519,14 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
     };
     auto found = std::find_if(e.bindings.begin(), e.bindings.end(), same);
     if (found == e.bindings.end()) {
-        if (e.bindings.size() >= 16) throw std::runtime_error("too many distinct Ray Reconstruction input view sets");
+        // Games toggle optional guides and change guide formats (Cyberpunk 2077 passed 16 distinct sets within
+        // seconds). Evict the oldest set instead of failing: its descriptors may still be referenced by submitted
+        // work, so the device drains first. Eviction is rare once the working set is cached.
+        if (e.bindings.size() >= 16) {
+            VKCHECK(vkDeviceWaitIdle(d.handle));
+            vkDestroyDescriptorPool(d.handle, e.bindings.front().pool, nullptr);
+            e.bindings.erase(e.bindings.begin());
+        }
         Impl::Bindings b;
         b.images = images; b.finalOutput = finalOutput;
         uint32_t textures = 0, surfaces = 0;

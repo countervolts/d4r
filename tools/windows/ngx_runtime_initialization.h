@@ -35,8 +35,21 @@ struct RuntimeInitialization {
     RuntimeInitialization(const RuntimeInitialization&) = delete;
     RuntimeInitialization& operator=(const RuntimeInitialization&) = delete;
     std::shared_ptr<Runtime> create() const {
-        return std::make_shared<Runtime>(device.Get(), application, data.c_str(), sdk,
-            hasCommon ? &common : nullptr, hasProject ? &project : nullptr);
+        try {
+            return std::make_shared<Runtime>(device.Get(), application, data.c_str(), sdk,
+                hasCommon ? &common : nullptr, hasProject ? &project : nullptr);
+        } catch (const std::exception& error) {
+            if (hasProject) throw;
+            // NGX 617.14 rejects application-ID initialization on this path (Cyberpunk 2077:
+            // 0xBAD0000C, or SR unavailable with 0xBAD00004). Streamline's RR plugin reads
+            // capabilities right after that first Init, so a failure there hides RR for the
+            // session even though the game's later project-ID Init works. Retry with d4r's
+            // own project identity (the diagnostics' default) so the first Init succeeds.
+            std::fprintf(stderr, "D4R_NGX_IDENTITY_FALLBACK application=%llu: %s\n", application, error.what());
+            const ngx::ProjectIdentity fallback{"24480451-f00d-face-1304-0308dabad187", 0, "1.0"};
+            return std::make_shared<Runtime>(device.Get(), application, data.c_str(), sdk,
+                hasCommon ? &common : nullptr, &fallback);
+        }
     }
 };
 }

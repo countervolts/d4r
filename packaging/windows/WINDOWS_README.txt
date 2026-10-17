@@ -11,7 +11,9 @@ SUPPORTED_GAMES.md in the source repository lists the tested games. Expect probl
 
 What you need
 -------------
-- Windows 11, a Radeon RX 7000 or RX 9000 series GPU, a current AMD Adrenalin driver.
+- Windows 11, a Radeon RDNA 3, RDNA 3.5 or RDNA 4 GPU, and a current AMD Adrenalin driver.
+  Desktop, mobile, workstation and integrated GPUs use their actual gfx target automatically.
+  The full release covers gfx1100-1103, gfx1150-1154 and gfx1200-1201; smaller ZIPs may cover a subset.
 - A DirectX 12 game without anti-cheat (OptiScaler injects a DLL; it can get an account banned).
 - NVIDIA DLSS files. The ZIP does not include them. Run install.bat to download official, pinned files.
   It downloads DLSS SR 310.9.1, Ray Reconstruction 310.9.1, and extracts _nvngx.dll from the
@@ -30,7 +32,9 @@ Install
    folder with their original paths and SHA256 hashes. Verified downloads are cached in
    %LOCALAPPDATA%\d4r\cache.
    Bundled isolated Python runs the installer; system Python, PowerShell and Git Bash are not required.
-   Choose N to keep RR off, or D/E to build and enable an experimental private native RR model.
+   Super Resolution is ready after this step; no architecture selection or model build is required.
+   Ray Reconstruction stays off by default. To build and enable an experimental private native RR
+   model, run install.bat --yes --rr-preset D --enable-rr (or use E instead of D).
    Automatic RR building currently requires the gfx1101-only package. Model tools run from the
    external cache. Existing models remain intact; d4r.ini receives an exact external backup before
    selecting the new relative model path. Game compatibility and reference quality remain unverified.
@@ -52,12 +56,12 @@ Edit d4r\d4r.ini (it is commented) and restart the game. Each game has its own c
 - AsyncInterop, ValidateOutput, Log: for testing and bug reports; the defaults are the tested setting.
 - RayReconstruction/Backend: off by default. native selects experimental native D3D12/Vulkan RR;
   ModelDir selects your locally generated D/E model (auto: d4r\engine\rr-d). Relative paths resolve
-  beside d4r.ini. No model is bundled; install.bat can optionally generate and select D/E locally.
+  beside d4r.ini. No model is bundled; install.bat --yes --rr-preset D --enable-rr can generate D locally.
   fsr (experimental) answers the game's DLSS RR request with AMD's FSR Ray Regeneration denoiser,
   then DLSS Super Sampling upscales the result. AMD does not support FSR RR on RDNA3, so d4r runs
   AMD's unmodified denoiser DLL on a private vkd3d-proton device (d4r\fsr, built by d4r, LGPL; see
   d4r\fsr\SOURCE.txt) that emulates the FP8 math on RDNA3. AMD's amd_fidelityfx_denoiser_dx12.dll is
-  not bundled: install.bat [F] downloads the pinned file (SHA256 48f1e588...), or set FsrDenoiser.
+  not bundled: install.bat --yes --enable-fsr downloads the pinned file (SHA256 48f1e588...), or set FsrDenoiser.
   FsrStabilityBias (default auto = AMD's 1; 0 is much sharper without upscaling, see d4r.ini) and
   FsrDetail (0-1) tune the denoiser.
   The first RR start compiles AMD's shaders and can freeze the game for about a minute; they are

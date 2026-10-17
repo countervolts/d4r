@@ -3,7 +3,7 @@ param([ValidateSet('enc0','enc1','enc2','enc3','enc4','dec5','dec4','dec3','dec2
     [string]$Layer='enc1', [ValidateSet('source','cu','wgp')][string]$Mode='source',
     [ValidateSet('baseline','load','store','both')][string]$NonTemporal='baseline',
     [ValidateSet(0,1,2,4)][int]$PosTiles=0, [switch]$ShareValues, [switch]$PrivateValues,
-    [switch]$PackedAccumulator, [ValidateSet('lds','ds')][string]$LaneExchange='lds',
+    [switch]$PackedAccumulator, [switch]$F16Wmma, [ValidateSet('lds','ds','native')][string]$LaneExchange='lds',
     [ValidateSet('gfx1100','gfx1101','gfx1102','gfx1103','gfx1150','gfx1151','gfx1152','gfx1153','gfx1154','gfx1200','gfx1201')]
     [string]$GpuArch='gfx1201',
     [string]$HipRoot, [string]$OutputDirectory)
@@ -11,10 +11,12 @@ $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$HipRoot) { $HipRoot=Join-Path $repo '.tools/therock-10.2.0a20260929/_rocm_sdk_core' }
 if ($ShareValues -and $PrivateValues) { throw 'Choose shared or private V storage.' }
-if ($GpuArch -notmatch '^gfx12' -and $PackedAccumulator) {
-    throw 'Packed accumulator experiments require gfx12.'
+if ($GpuArch -notmatch '^gfx12' -and ($PackedAccumulator -or $F16Wmma)) {
+    throw 'Packed accumulator and F16 WMMA experiments require gfx12.'
 }
+if ($PackedAccumulator -and $F16Wmma) { throw 'Packed accumulator storage requires F32 WMMA.' }
 if (!$OutputDirectory) { $OutputDirectory=Join-Path $repo "build/native-k-experiment-$GpuArch-$Layer-$Mode-$NonTemporal-pos$PosTiles-share$([int][bool]$ShareValues)-private$([int][bool]$PrivateValues)-packed$([int][bool]$PackedAccumulator)" }
+if ($F16Wmma -and !$PSBoundParameters.ContainsKey('OutputDirectory')) { $OutputDirectory+='-f16-wmma' }
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 foreach ($baseline in @('build/native-k-gfx1201','build/windows-rdna4-therock','dist/windows-rdna4-command-list')) {
     if ($OutputDirectory.StartsWith([IO.Path]::GetFullPath((Join-Path $repo $baseline)), [StringComparison]::OrdinalIgnoreCase)) {
@@ -44,8 +46,9 @@ if ($ShareValues) {
     $flags+='-DPOS_VSHARE'
 }
 if ($PackedAccumulator) { $flags+='-DD4R_K_PACKED_ACC' }
+if ($F16Wmma) { $flags+='-DD4R_K_F16_WMMA' }
 if ($PrivateValues) { $flags+='-DD4R_K_PRIVATE_V' }
-if ($GpuArch -match '^gfx11') { $flags+='-DD4R_WINDOWS_GFX11_LANE_EXCHANGE' }
+if ($GpuArch -match '^gfx11' -and $LaneExchange -ne 'native') { $flags+='-DD4R_WINDOWS_GFX11_LANE_EXCHANGE' }
 if ($LaneExchange -eq 'ds') {
     if ($GpuArch -notmatch '^gfx11') { throw 'DS lane exchange experiment requires gfx11.' }
     $flags+='-DD4R_WINDOWS_GFX11_DS_EXCHANGE'
@@ -69,6 +72,7 @@ if ($LASTEXITCODE) { throw 'Native object metadata extraction failed.' }
     mode=$Mode; nonTemporal=$NonTemporal; tokenTilesPerWave=$PosTiles; shareValues=[bool]$ShareValues;
     privateValues=[bool]$PrivateValues;
     packedAccumulator=[bool]$PackedAccumulator; laneExchange=$LaneExchange;
+    f16Wmma=[bool]$F16Wmma;
     compiler=$compiler; arguments=$arguments;
     sourceCommit=(git -C $repo rev-parse HEAD); workingTreeDirty=[bool](& git -C $repo status --porcelain);
     compilerVersion=(& $compiler --version | Out-String).Trim();

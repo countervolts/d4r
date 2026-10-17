@@ -525,7 +525,9 @@ void STDMETHODCALLTYPE hook_execute(ID3D12CommandQueue* queue, UINT count, ID3D1
                 milliseconds(submitStart), boundaryMs, publishMs, drainMs);
         }
     } catch (const std::exception& failure) {
-        { std::lock_guard<std::mutex> lock(error_mutex); last_error = failure.what(); }
+        // Only this submission fails. Command tracking is intact, so later frames
+        // record and run normally; a transient failure (one refused shared-buffer
+        // export after a feature recreate) must not disable DLSS for the session.
         std::fprintf(stderr, "D4R_D3D12_SUBMIT_FAILURE %s\n", failure.what());
         try { complete(queue); } catch (...) {}
         // Do not submit a consumer suffix after a failed DLSS boundary.

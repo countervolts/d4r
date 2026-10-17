@@ -47,13 +47,28 @@ struct NativeDevice {
         for (uint32_t i = 0; i < countFamilies; ++i)
             if (properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { family = i; break; }
         if (family == countFamilies) throw std::runtime_error("No Vulkan compute queue");
-        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        const bool fp8 = inference && std::string(D4R_TARGET_ARCH).rfind("gfx12", 0) == 0;
+        if (fp8) {
+            uint32_t extensionCount = 0;
+            check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr), "RR extension count");
+            std::vector<VkExtensionProperties> available(extensionCount);
+            check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, available.data()), "RR extensions");
+            bool supported = false;
+            for (const auto& extension : available)
+                supported |= std::strcmp(extension.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0;
+            if (!supported) throw std::runtime_error("RDNA4 native RR requires VK_EXT_shader_float8");
+        }
+        VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+            fp8 ? &f8 : nullptr};
         VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &cm};
         VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
         VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
         vkGetPhysicalDeviceFeatures2(physical, &features);
         if (!v12.timelineSemaphore) throw std::runtime_error("Timeline semaphore unsupported");
+        if (fp8 && (!f8.shaderFloat8 || !f8.shaderFloat8CooperativeMatrix))
+            throw std::runtime_error("RDNA4 native RR requires FP8 cooperative matrices");
         if (inference && (!cm.cooperativeMatrix || !v12.shaderFloat16 || !v11.storageBuffer16BitAccess || !v13.subgroupSizeControl))
             throw std::runtime_error("Missing RR cooperative-matrix/fp16/subgroup feature");
         if (!inference) v13.pNext = nullptr;
@@ -62,6 +77,7 @@ struct NativeDevice {
         qi.queueFamilyIndex = family; qi.queueCount = 1; qi.pQueuePriorities = &priority;
         std::vector<const char*> extensions{"VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32"};
         if (inference) extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        if (fp8) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features};
         di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
         di.enabledExtensionCount = uint32_t(extensions.size()); di.ppEnabledExtensionNames = extensions.data();

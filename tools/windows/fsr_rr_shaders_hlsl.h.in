@@ -1,0 +1,4 @@
+#pragma once
+// Embedded at CMake configure time; native conversion never reads source files at runtime.
+static const char d4r_hlsl_fsr_rr_prepare[] = R"D4RHLSL(@d4r_hlsl_fsr_rr_prepare@)D4RHLSL";
+static const char d4r_hlsl_fsr_rr_compose[] = R"D4RHLSL(@d4r_hlsl_fsr_rr_compose@)D4RHLSL";

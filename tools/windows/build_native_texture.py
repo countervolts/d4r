@@ -34,10 +34,14 @@ def main():
     parser.add_argument('--output-directory', type=pathlib.Path, required=True)
     parser.add_argument('--gpu-arch', choices=tuple(TARGETS), default='gfx1201')
     parser.add_argument('--shader-mode', choices=['cu', 'wgp'], default='cu')
+    parser.add_argument('--wave64', action='store_true', help='experimental wave64 for M post kernels without matrix operations')
     args = parser.parse_args()
-    if not re.fullmatch(r'hiluma_engine_(?:output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?|'
-                        r'input_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr))_v2_rel', args.kernel):
-        parser.error('this private experimental build recipe supports K v2 input/output variants only')
+    is_m_post = bool(re.fullmatch(r'rrlite_post_3_[12]_mv(?:hi|lo)_(?:hdr|ldr)_folded', args.kernel))
+    if not is_m_post and not re.fullmatch(r'hiluma_engine_(?:output_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr)(?:_max)?|'
+                                        r'input_depth(?:inv|reg)_mv(?:hi|lo)_(?:hdr|ldr))_v2_rel', args.kernel):
+        parser.error('this private experimental build recipe supports K v2 input/output and M folded post variants only')
+    if args.wave64 and not is_m_post:
+        parser.error('--wave64 is restricted to M post kernels without matrix operations')
     repo = pathlib.Path(__file__).resolve().parents[2]
     output = args.output_directory.resolve()
     if not output.is_relative_to((repo / 'build').resolve()):
@@ -70,6 +74,8 @@ def main():
     for name in ('D4R_ZLUDA_IGNORE_DENORMAL', 'D4R_ZLUDA_FAST_MATH', 'D4R_ZLUDA_WMMA_F32ACC',
                  'D4R_ZLUDA_WAVE64', 'D4R_ZLUDA_PROFILE'):
         env.pop(name, None)
+    if args.wave64:
+        env['D4R_ZLUDA_WAVE64'] = '1'
     env['PATH'] = str(zluda) + os.pathsep + str(hip / 'bin') + os.pathsep + env['PATH']
 
     def run(label, command):
@@ -94,7 +100,8 @@ def main():
         raise RuntimeError('PTX recipe made no changes; refuse a no-op override')
     raw, ir, extra = work / 'raw.bc', work / 'raw.ll', work / 'extra.bc'
     run('compile-helper', [tools['clang++'], '-x', 'hip', '-std=c++20', '-nogpuinc', '-nogpulib', '-O3',
-                          '-mno-wavefrontsize64', '--offload-device-only', '--offload-arch=' + args.gpu_arch,
+                          '-mwavefrontsize64' if args.wave64 else '-mno-wavefrontsize64',
+                          '--offload-device-only', '--offload-arch=' + args.gpu_arch,
                           '-fgpu-rdc', '-emit-llvm', '-c', '-Xclang', '-fdenormal-fp-math=dynamic',
                           '-DD4R_ACCURACY', '-DD4R_KERNEL_NAME=' + args.kernel,
                           '-o', raw, repo / 'kernels/tex/sust_only.hip'])
@@ -122,10 +129,13 @@ def main():
     expected_mode = '-cumode' if args.shader_mode == 'wgp' else '+cumode'
     if not attributes or expected_mode not in attributes[1]:
         raise RuntimeError(f'Emitter did not honor {args.shader_mode} mode; build the corresponding ZLUDA patch first')
+    if args.wave64 and '+wavefrontsize64' not in attributes[1]:
+        raise RuntimeError('Emitter did not honor wave64; candidate is not accepted')
     require_code_object_target(work / 'emitted/module.hsaco', args.gpu_arch)
     shutil.copyfile(work / 'emitted/module.hsaco', output / (args.kernel + '.hsaco'))
     run('manifest', [sys.executable, repo / 'kernels/tools/kernel_manifest.py', output, args.dlss_dll])
     metadata = dict(architecture=args.gpu_arch, accuracy=True, nativeFP8=False, shaderMode=args.shader_mode,
+                    wave64=args.wave64,
                     lastBuiltKernel=args.kernel, lastRecipeRewrites=rewrite_counts,
                     privateNvidiaDerivedCode=True, validation='not yet validated; do not install before comparison',
                     dlssSha256=hashlib.sha256(args.dlss_dll.read_bytes()).hexdigest(),

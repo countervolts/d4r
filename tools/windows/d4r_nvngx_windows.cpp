@@ -27,17 +27,26 @@ void initialize(ID3D12Device* device, unsigned long long app, const wchar_t* dat
     const d4r::ngx::FeatureCommonInfo* common, const d4r::ngx::ProjectIdentity* project = nullptr) {
     if (initialization) {
         if (initialization->device.Get() != device) throw std::runtime_error("NGX already initialized on another device");
-        return;
+        // A deferred initialization whose SR runtime could not start yields to a later Init.
+        if (runtime || !deferredSr) return;
     }
     auto candidate = std::make_shared<d4r::win::RuntimeInitialization>(device, app, data, sdk, common, project);
     bool native = false;
 #if defined(D4R_NATIVE_RR_BACKEND)
     const char* backend = std::getenv("D4R_RR_BACKEND"); native = backend && (std::string(backend) == "native" || std::string(backend) == "fsr");
 #endif
-    // Default SR startup remains eager. Native RR owns its Vulkan execution
-    // independently; SR initializes only when its capabilities/feature are used.
-    if (!native) runtime = candidate->create();
-    initialization = std::move(candidate); deferredSr = native;
+    // SR starts eagerly; RuntimeInitialization::create falls back to d4r's project identity when
+    // NGX rejects the game's application ID, so Streamline's first capability query sees SR and RR.
+    // Native RR owns its Vulkan execution independently, so with an RR backend a failed SR start
+    // (no SR files installed) keeps the initialization for RR alone, and a later Init replaces it.
+    try { runtime = candidate->create(); }
+    catch (const std::exception& error) {
+        if (!native) throw;
+        std::fprintf(stderr, "D4R_SR_UNAVAILABLE %s\n", error.what());
+        initialization = std::move(candidate); deferredSr = true;
+        return;
+    }
+    initialization = std::move(candidate); deferredSr = false;
 }
 struct Handle { unsigned Id; };
 unsigned nextId = 1;
@@ -161,26 +170,25 @@ bool fsr_ready() {
 #if defined(D4R_FSR_RR_BACKEND)
     const auto config = d4r::win::rr::FsrConfig::from_environment();
     auto present = [](const std::wstring& path) { return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; };
-    const bool ready = present(config.vkd3dCore) && present(config.denoiserDll) && present(config.amdxcShim);
-    if (!ready) std::fprintf(stderr, "D4R_RR_UNAVAILABLE FSR RR needs D4R_FSR_VKD3D_CORE, D4R_FSR_RR_DLL and D4R_FSR_AMDXC_SHIM to exist\n");
+    const bool native = d4r::win::rr::FsrConfig::use_native_device();
+    const bool ready = present(config.denoiserDll) && (native || (present(config.vkd3dCore) && present(config.amdxcShim)));
+    if (!ready) std::fprintf(stderr, "D4R_RR_UNAVAILABLE FSR RR needs %s\n", native ? "D4R_FSR_RR_DLL to exist" :
+        "D4R_FSR_VKD3D_CORE, D4R_FSR_RR_DLL and D4R_FSR_AMDXC_SHIM to exist");
     return ready;
 #else
     return false;
 #endif
 }
-bool rr_ready(ID3D12Device* device) {
+// Readiness is a file check, like fsr_ready. Building a Backend here created a Vulkan device inside
+// the game during Streamline's startup capability queries (about 30 s in Cyberpunk 2077), and
+// OptiScaler's Streamline hooks then crashed when Streamline reloaded its plugins. The model, adapter
+// and interop are validated when the game creates the RR feature; a failure there fails that call.
+bool rr_ready() {
     if (rr_is_fsr()) return fsr_ready();
     try {
-        const auto directory = rr_directory();
-        void* p = d4r_ngx_parameters_create();
-        if (!p) return false;
-        struct Cleanup { void* p; ~Cleanup() { d4r_ngx_parameters_destroy(p); } } cleanup{p};
-        for (const char* name : {"Width", "Height", "OutWidth", "OutHeight"}) d4r_ngx_set_uint(p, name, 64);
-        d4r_ngx_set_uint(p, "DLSS.Feature.Create.Flags", 3);
-        d4r::win::rr::Creation creation(p);
-        // Readiness checks the actual configured model's pipeline/weight load,
-        // adapter features and packet/fence import. No synthetic frame runs.
-        d4r::win::rr::Backend candidate(device, creation, directory);
+        const auto directory = std::filesystem::path(d4r::diag::wide(rr_directory()));
+        if (!std::filesystem::is_regular_file(directory / L"d4r-private-rr.json"))
+            throw std::runtime_error("RR model manifest missing: " + (directory / L"d4r-private-rr.json").string());
         return true;
     } catch (const std::exception& error) {
         if (std::getenv("D4R_RR_BACKEND")) std::fprintf(stderr, "D4R_RR_UNAVAILABLE %s\n", error.what());
@@ -193,6 +201,7 @@ struct RrSnapshot {
     std::array<bool, d4r::win::rr::Snapshot::Count> explicitState{};
     RrSnapshot(const d4r::win::rr::Creation& creation, void* p, ID3D12GraphicsCommandList* list)
         : frame(creation, p) {
+        if (rr_is_fsr()) use_fsr_hit_distances(p);
         const char* names[] = {"D4R.Color.State", "D4R.Motion.State", "D4R.Depth.State", "D4R.Normals.State",
             "D4R.Roughness.State", "D4R.Diffuse.State", "D4R.Specular.State", "D4R.Output.State", "D4R.Exposure.State",
             "D4R.HitDistance.State", "D4R.Disocclusion.State", "D4R.Subsurface.State", "D4R.BeforeParticles.State"};
@@ -211,6 +220,33 @@ struct RrSnapshot {
         }
         if (frame.settings.roughnessPacked) {
             access[4] = access[3]; explicitState[4] = explicitState[3];
+        }
+    }
+    // The Linux FSR backend's guide reading: a specular or diffuse hit distance may come as the w of a
+    // ray-direction texture, and either one makes that lobe an indirect signal, which AMD's denoiser filters
+    // far more strongly than a direct one. FSR has no disocclusion or subsurface input, so the diffuse hit
+    // distance travels in the Subsurface slot. Done before the access states below are captured.
+    void use_fsr_hit_distances(void* p) {
+        using d4r::win::rr::Snapshot;
+        auto origin = [&](const char* prefix) {
+            return std::array<unsigned, 2>{d4r::win::rr::number(p, (std::string(prefix) + ".Subrect.Base.X").c_str()),
+                                           d4r::win::rr::number(p, (std::string(prefix) + ".Subrect.Base.Y").c_str())};
+        };
+        if (!frame.resources[Snapshot::HitDistance]) {
+            if (auto* ray = Snapshot::resource(p, "DLSSD.SpecularRayDirectionHitDistance")) {
+                frame.resources[Snapshot::HitDistance] = ray; frame.specularHitInW = true;
+                frame.origins[Snapshot::HitDistance] = origin("DLSSD.SpecularRayDirectionHitDistance");
+            }
+        }
+        frame.resources[Snapshot::Disocclusion].Reset(); frame.resources[Snapshot::Subsurface].Reset();
+        const char* diffuseName = "DLSSD.DiffuseHitDistance";
+        ID3D12Resource* diffuse = Snapshot::resource(p, diffuseName);
+        if (!diffuse && (diffuse = Snapshot::resource(p, "DLSSD.DiffuseRayDirectionHitDistance"))) {
+            diffuseName = "DLSSD.DiffuseRayDirectionHitDistance"; frame.diffuseHitInW = true;
+        }
+        if (diffuse) {
+            frame.resources[Snapshot::Subsurface] = diffuse; frame.diffuseHit = true;
+            frame.origins[Snapshot::Subsurface] = origin(diffuseName);
         }
     }
     void resolve() {
@@ -273,7 +309,7 @@ unsigned allocate(void** out, bool caps) {
         }
         bool rrAvailable = false;
 #if defined(D4R_NATIVE_RR_BACKEND)
-        rrAvailable = rr_ready(initialization->device.Get());
+        rrAvailable = rr_ready();
 #endif
         d4r_ngx_set_int(value, "SuperSamplingDenoising.Available", rrAvailable ? 1 : 0);
         d4r_ngx_set_int(value, "SuperSamplingDenoising.NeedsUpdatedDriver", 0);
@@ -320,8 +356,7 @@ API unsigned NVSDK_NGX_D3D12_GetFeatureRequirements(IDXGIAdapter* adapter, const
 #if defined(D4R_NATIVE_RR_BACKEND)
             if (info->FeatureID == 13) {
                 d4r::win::player::ensure_environment();
-                d4r::win::ComPtr<ID3D12Device> device;
-                if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))) && rr_ready(device.Get())) {
+                if (rr_ready()) {
                     requirements->FeatureSupported = 0;
                     std::strcpy(requirements->MinOSVersion, "10.0.22000.0");
                 }

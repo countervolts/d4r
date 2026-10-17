@@ -37,6 +37,24 @@
 #include "windows/fsr_rr_identity.h"
 #include "fsr_rr_scene.h"
 
+// Per-dispatch GPU timing of AMD's denoiser (D4R_FSR_RR_DISPATCH_PROFILE=1), shared with the Linux shim.
+inline void logf(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+}
+inline std::string env_string(const char* name) { const char* v = std::getenv(name); return v ? v : ""; }
+inline uint32_t env_uint(const char* name, uint32_t fallback)
+{
+    const char* v = std::getenv(name);
+    return v && *v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : fallback;
+}
+inline uint32_t profile_log_every() { return env_uint("D4R_PROFILE_LOG_EVERY", 1000000); }
+#include "d4r_fsr_rr_dispatch_profile.h"
+
 namespace
 {
 using namespace fsr_scene;
@@ -425,6 +443,7 @@ int wmain(int argc, wchar_t** argv)
     // 3. Context (shader pipelines are created here: the slow and the most likely to fail part).
     ffxContext context = nullptr;
     const auto createStart = std::chrono::steady_clock::now();
+    fsr_rr_dp::hook_device(g_device);
     const ffxReturnCode_t created = fsr_rr_create_context(runtime, g_device, width, height, signals, 0, context);
     const double createMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
@@ -574,7 +593,9 @@ int wmain(int argc, wchar_t** argv)
         }
         list->EndQuery(timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const auto cpuStart = std::chrono::steady_clock::now();
+        fsr_rr_dp::begin(g_device, list, f);
         const ffxReturnCode_t dispatched = runtime.dispatch(&context, &desc.header);
+        fsr_rr_dp::end(list);
         cpuMs.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
         list->EndQuery(timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
         list->ResolveQueryData(timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, timestampBuffer, 0);
@@ -666,7 +687,9 @@ int wmain(int argc, wchar_t** argv)
         }
         previousCamera = camera;
     }
-    json_field("frame_log", frameLog + "\n  ]");
+    if (fsr_rr_dp::enabled())
+        fsr_rr_dp::log_stats();
+    json_field("frame_log", frameLog +"\n  ]");
     if (dispatchOk)
     {
         std::vector<double> warm(gpuMs.begin() + std::min<size_t>(gpuMs.size(), 3), gpuMs.end());

@@ -458,10 +458,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 // FP16 neighbour at a midpoint, then flip the FP8 output code.
                 // This baseline sums the 16 FP16 products before one FP16 round.
                 for (int i = 0; i < 8; ++i) {
-                    double dot = 0.0;
-                    for (int k = 0; k < 16; ++k)
-                        dot += (double)Qs[mrow(i) * PST + k] * (double)Vs[k * 32 + 16 * nt + l16];
-                    o[i] = (float)(half_t)dot;
+                    o[i] = (float)exact_pv_dot(Qs + mrow(i) * PST, Vs + 16 * nt + l16);
                 }
 #endif
                 const int ocol = apos(32 * h + ginv(16 * nt + l16));

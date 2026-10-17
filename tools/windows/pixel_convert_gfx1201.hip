@@ -85,6 +85,14 @@ __device__ inline void decode(const u8* p, Storage fmt, float* value) {
         case r32f: value[0] = singles[0]; break;
         case depth24: value[0] = float(*reinterpret_cast<const u32*>(p) & 0xffffffu) / 16777215.f; break;
         case r16unorm: value[0] = float(halves[0]) / 65535.f; break;
+        case rgb9e5: {
+            // Microsoft spec: c = (p >> offset) & 0x1FF, E = p >> 27, v = c * 2^(E - 24);
+            // no implicit leading bit. 2^(E - 24) is a normal float for every E.
+            u32 packed = *reinterpret_cast<const u32*>(p);
+            const float scale = as_float(((packed >> 27) + 103u) << 23);
+            for (unsigned i = 0; i < 3; ++i) value[i] = float((packed >> (9 * i)) & 511u) * scale;
+            break;
+        }
         default: break; // Host rejects formats which have no tested decoder.
     }
 }
@@ -103,6 +111,20 @@ __device__ inline void encode(u8* p, Storage fmt, const float* value) {
         case rgb10a2:
             *reinterpret_cast<u32*>(p) = quantize(value[0], 1023) | (quantize(value[1], 1023) << 10) |
                 (quantize(value[2], 1023) << 20) | (quantize(value[3], 3) << 30); break;
+        case rgb9e5: {
+            // Shared exponent from the largest channel (D3D11.3 spec 3.2.2): negative and
+            // NaN clamp to 0, the maximum is (511/512) * 2^16.
+            float c[3];
+            for (unsigned i = 0; i < 3; ++i) c[i] = value[i] > 0 ? (value[i] < 65408.f ? value[i] : 65408.f) : 0.f;
+            float largest = c[0] > c[1] ? c[0] : c[1]; largest = largest > c[2] ? largest : c[2];
+            int floorLog2 = int((as_uint(largest) >> 23) & 255u) - 127;
+            int shared = (floorLog2 < -16 ? -16 : floorLog2) + 16; // biased exponent, 0..31
+            float step = as_float(u32(shared - 24 + 127) << 23); // 2^(shared - 24)
+            if (u32(largest / step + .5f) == 512u) { ++shared; step *= 2.f; }
+            u32 packed = u32(shared) << 27;
+            for (unsigned i = 0; i < 3; ++i) packed |= (u32(c[i] / step + .5f) & 511u) << (9 * i);
+            *reinterpret_cast<u32*>(p) = packed; break;
+        }
         default: break; // Only color/output formats are encoded in the runtime.
     }
 }

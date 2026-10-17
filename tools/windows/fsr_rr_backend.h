@@ -7,18 +7,21 @@
 
 namespace d4r::win::rr {
 // Where the experimental FSR Ray Regeneration backend finds its pieces. All paths are explicit: nothing is
-// searched for, and AMD's amdxc64.dll is never loaded.
+// searched for. The compatibility route uses d4r's amdxc64 shim; native D3D12 uses AMD's real driver.
 struct FsrConfig {
     std::wstring vkd3dCore;    // d4r's vkd3d-proton d3d12core.dll, renamed so it cannot collide with the system's
     std::wstring denoiserDll;  // AMD's amd_fidelityfx_denoiser_dx12.dll (FidelityFX SDK 2.3), unmodified
     std::wstring amdxcShim;    // d4r's amdxc64 shim (tools/windows/amdxc64_shim)
     std::wstring cacheDir;     // vkd3d-proton's shader cache: the denoiser's shaders are compiled once
     static FsrConfig from_environment();
+    static bool use_native_device();
 };
 
 // FSR Ray Regeneration as the Ray Reconstruction backend on native Windows. The game's guides cross to a private
 // vkd3d-proton device (D3D12 over Vulkan, dxil-spirv FP8 emulation) through the same shared packet the native
 // DLSS backend uses; AMD's denoiser runs there. Evaluation is synchronous, as the native backend's is.
+// That is the RDNA3 compatibility route. RDNA4 instead records all three passes on the game's
+// D3D12 device and queue, with no Vulkan device or cross-API packet.
 // The denoiser works at render resolution. When the output is larger (or a Super Sampling stage is wanted at all),
 // the owner installs one with set_super_sampling(): the denoised colour is then copied into a texture on the game's
 // device and handed to that callback together with the frame, which must record/submit the upscale into the game's

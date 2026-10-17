@@ -1,5 +1,7 @@
 # Windows K performance work
 
+Latest K/M follow-up: [Windows SR optimization](windows-sr-optimization.md) records output batching, bounded strict M attention, the local v20 package, and exact final-loader checks. Linux parity remains unverified.
+
 ## Current optimization pass: strict DS exchange, 1080p and 1440p (2026-10-17)
 
 After the position-layer barrier fix, the explicit gfx11 DS cross-half exchange passes the strict gate.

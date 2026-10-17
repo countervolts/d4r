@@ -206,6 +206,40 @@ __device__ __forceinline__ half_t f16(float v)
     return (half_t)v;
 }
 
+// FP16 products are exact in FP32. Bound the error of the 16 additions,
+// including the reference's FP64 additions, before accepting an FP16 round.
+// Cancellation and midpoint cases retain the original FP64 summation order.
+template <int VStride = 32>
+__device__ __forceinline__ half_t exact_pv_dot(const half_t* p, const half_t* v)
+{
+#if defined(SWIN_BOUNDED_PV) && !defined(SWIN_EXACT_PV_REFERENCE)
+    float sum = 0.0f, magnitude = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const float product = (float)p[k] * (float)v[k * VStride];
+        sum += product;
+        magnitude += __builtin_fabsf(product);
+    }
+    const half_t rounded = (half_t)sum;
+    const uint16_t bits = __builtin_bit_cast(uint16_t, rounded) & 0x7fffu;
+    if (bits < 0x7bffu) {
+        const float center = (float)__builtin_bit_cast(half_t, bits);
+        const float next = (float)__builtin_bit_cast(half_t, (uint16_t)(bits + 1));
+        const float previous = bits ? (float)__builtin_bit_cast(half_t, (uint16_t)(bits - 1)) : -next;
+        const float absolute = __builtin_fabsf(sum);
+        const float distance = __builtin_fminf(absolute - (previous + center) * 0.5f,
+                                               (center + next) * 0.5f - absolute);
+        // 2^-18 exceeds gamma(16) plus the error in the magnitude sum.
+        // The bound is normal FP32 even for the smallest FP16 product.
+        if (distance > magnitude * 0x1p-18f) return rounded;
+    }
+#endif
+    double dot = 0.0;
+    for (int k = 0; k < 16; ++k)
+        dot += (double)p[k] * (double)v[k * VStride];
+    return (half_t)dot;
+}
+
 __device__ __forceinline__ half_t rsqrt16(half_t s)
 {
     return f16(1.0f / __builtin_sqrtf((float)(s + (half_t)(1.0f / 8192.0f))));

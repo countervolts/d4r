@@ -25,6 +25,7 @@ def main():
     for name in ('runner', 'model', 'case', 'output'):
         parser.add_argument('--' + name, required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--candidate', action='append', default=[], metavar='LABEL=OBJECT_DIRECTORY')
+    parser.add_argument('--candidate-runner', action='append', default=[], metavar='LABEL=EXECUTABLE')
     parser.add_argument('--repeats', type=int, default=25)
     args = parser.parse_args()
     if not args.output.is_relative_to((repo / 'build').resolve()):
@@ -43,14 +44,16 @@ def main():
               'runnerSha256': hashlib.sha256(args.runner.read_bytes()).hexdigest(),
               'caseSha256': hashlib.sha256(args.case.read_bytes()).hexdigest(), 'runs': []}
     reference = None
-    variants = [('baseline', None)] + [tuple(s.split('=', 1)) for s in args.candidate]
-    for label, source in variants:
+    variants = [('baseline', None, args.runner)]
+    variants += [(label, source, args.runner) for label, source in (s.split('=', 1) for s in args.candidate)]
+    variants += [(label, None, Path(runner).resolve()) for label, runner in (s.split('=', 1) for s in args.candidate_runner)]
+    for label, source, runner in variants:
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', label):
             parser.error('candidate label must be letters, digits, underscores or hyphens')
         output = args.output / label
         output.mkdir()
         model = args.model
-        row = {'label': label, 'objects': {}}
+        row = {'label': label, 'objects': {}, 'runnerSha256': hashlib.sha256(runner.read_bytes()).hexdigest()}
         if source:
             model = output / 'model'
             shutil.copytree(args.model, model)
@@ -68,7 +71,7 @@ def main():
                 manifest['sha256'][name] = digest
             manifest['experimentalOverlay'] = row['objects']
             (model / 'model.json').write_text(json.dumps(manifest, indent=2) + '\n')
-        command = [str(args.runner), str(model), str(args.case), str(output / 'frames'), str(args.repeats), 'hip']
+        command = [str(runner), str(model), str(args.case), str(output / 'frames'), str(args.repeats), 'hip']
         with (output / 'stdout.log').open('wb') as out, (output / 'stderr.log').open('wb') as err:
             result = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=240)
         row['exitCode'] = result.returncode

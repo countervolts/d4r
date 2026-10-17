@@ -273,8 +273,10 @@ struct Replay {
         : layout(l), physical(physical), device(device) {
         const auto data = read(std::filesystem::path(directory) / "rr.txt");
         const std::string manifest(data.begin(), data.end());
-        if (manifest.rfind("D4RR0001", 0) != 0 || manifest.find("arithmetic gfx11") == std::string::npos)
-            throw std::runtime_error("This canonical RR bridge gate requires a D/E gfx11 model");
+        const bool gfx12 = std::string(D4R_TARGET_ARCH).rfind("gfx12", 0) == 0;
+        const char* arithmetic = gfx12 ? "\narithmetic gfx12\n" : "\narithmetic gfx11\n";
+        if (manifest.rfind("D4RR0001", 0) != 0 || manifest.find(arithmetic) == std::string::npos)
+            throw std::runtime_error("RR bridge model arithmetic does not match the package GPU family");
         for (size_t i = 0; i < images.size(); ++i) if (l.planes[i].enabled) configure(i, l.planes[i].format);
         model = std::make_unique<d4r::RModel>(physical, device, directory);
         engine = std::make_unique<d4r::REngine>(*model, l.rw, l.rh, l.ow, l.oh);

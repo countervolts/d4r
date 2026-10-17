@@ -1,4 +1,4 @@
-"""Compare K input batching using identical synthetic frames and alternating runs.
+"""Compare K/M interop and native candidates on identical alternating synthetic runs.
 
 Uses an existing private runtime; never installs into a game. CPU interop timing
 includes synchronization and NGX execution, and is not a GPU network-only time.
@@ -19,8 +19,13 @@ def main():
     for key in ('probe', 'shim', 'runtime', 'core', 'dlss', 'output'):
         parser.add_argument('--' + key, type=lambda s: Path(s).resolve(), required=True)
     parser.add_argument('--resolution', default='1920x1080')
+    parser.add_argument('--model', choices=('K', 'M'), default='K')
+    parser.add_argument('--pixel-profile', choices=('baseline', 'packed', 'unorm', 'depth-stencil'), default='baseline')
+    parser.add_argument('--candidate-shim', type=lambda s: Path(s).resolve(), help='compare a rebuilt shim with the same native kernels')
+    parser.add_argument('--candidate-batch-inputs', action='store_true', help='also batch input copies in candidate shim/native runs')
     parser.add_argument('--input-resolution', help='defaults to nominal Quality (two-thirds per axis)')
     parser.add_argument('--frames', type=int, default=16)
+    parser.add_argument('--timeout', type=int, default=300, help='per-process limit, including cold shader compilation')
     parser.add_argument('--profile-stages', action='store_true',
                         help='diagnostic CPU stage logging; adds overhead to timings')
     parser.add_argument('--candidate-native', type=lambda s: Path(s).resolve(),
@@ -41,8 +46,12 @@ def main():
     if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*', args.resolution):
         parser.error('resolution must be WIDTHxHEIGHT')
     ow, oh = map(int, args.resolution.split('x'))
+    preset = 11 if args.model == 'K' else 13
+    comparing = bool(args.candidate_native or args.candidate_shim)
+    if args.candidate_batch_inputs and not comparing:
+        parser.error('--candidate-batch-inputs requires a candidate shim or native directory')
     if not args.input_resolution:
-        args.input_resolution = f'{ow * 2 // 3}x{oh * 2 // 3}'
+        args.input_resolution = f'{ow * 2 // 3}x{oh * 2 // 3}' if args.model == 'K' else f'{ow // 2}x{oh // 2}'
     if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*', args.input_resolution):
         parser.error('input-resolution must be WIDTHxHEIGHT')
     build_root = Path(__file__).resolve().parents[2] / 'build'
@@ -53,7 +62,8 @@ def main():
               'inputResolution': args.input_resolution,
               'stageProfiling': args.profile_stages,
               'kernelProfiling': args.profile_kernels,
-              'comparison': 'native kernels' if args.candidate_native else 'input batching',
+              'model': args.model, 'pixelProfile': args.pixel_profile,
+              'comparison': 'shim' if args.candidate_shim else 'native kernels' if args.candidate_native else 'input batching',
               'timing': 'CPU interop including NGX and synchronization', 'runs': []}
     runtime = args.runtime
     native = runtime / 'native'
@@ -64,6 +74,7 @@ def main():
     report['playerConfig'] = args.player_config
     report['sequence'] = args.sequence
     report['resetEveryFrame'] = args.reset_every_frame
+    report['candidateBatchInputs'] = args.candidate_batch_inputs
     module = args.shim
     if args.player_config:
         runtime = args.output / 'player'
@@ -79,6 +90,8 @@ def main():
         nvapi = runtime / 'nvapi/gfx1101/nvapi64.dll'
     report['artifacts'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in (args.probe, args.shim, args.core, args.dlss)}
+    if args.candidate_shim:
+        report['candidateShimSha256'] = hashlib.sha256(args.candidate_shim.read_bytes()).hexdigest()
     report['nativeArtifacts'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                  for p in sorted(native.glob('*')) if p.is_file()}
     if args.candidate_native:
@@ -108,26 +121,34 @@ def main():
         reference = None
         variants = {'abba': (False, True, True, False), 'controls': (False,) * 4, 'batches': (True,) * 4}
         for index, batched in enumerate(variants[args.sequence]):
-            label = ('native-candidate' if args.candidate_native else 'batch') if batched else 'control'
+            use_batch = batched and (not comparing or args.candidate_batch_inputs)
+            label = ('candidate' if comparing else 'batch') if batched else 'control'
             output = args.output / f'{index}-{label}'
             output.mkdir()
             env['D4R_DIAG_DIR'] = str(output)
-            if batched and not args.candidate_native:
+            if use_batch:
                 env['D4R_BATCH_INPUT_COPIES'] = '1'
             else:
                 env.pop('D4R_BATCH_INPUT_COPIES', None)
             env['D4R_ZLUDA_NATIVE_DIR'] = str(args.candidate_native if batched and args.candidate_native else native)
             if args.player_config:
                 config = (Path(__file__).resolve().parents[2] / 'packaging/windows/d4r.ini').read_text()
+                config = re.sub(r'(?m)^Model\s*=\s*K\s*$', 'Model = ' + args.model, config)
                 config = re.sub(r'(?m)^BatchInputCopies\s*=\s*(?:true|false)\s*$',
-                                'BatchInputCopies = ' + str(batched and not args.candidate_native).lower(), config)
+                                'BatchInputCopies = ' + str(use_batch).lower(), config)
                 selected_native = args.candidate_native if batched and args.candidate_native else native
                 config = config.replace('NativeDir = auto', 'NativeDir = ' + str(selected_native))
                 (runtime / 'd4r.ini').write_text(config)
-            command = [str(args.probe), '--module', str(module), '--hip-root', str(runtime / 'hip'),
+                if args.candidate_shim:
+                    shutil.copy2(args.candidate_shim if batched else args.shim, module)
+            selected_module = module if args.player_config else args.candidate_shim if batched and args.candidate_shim else module
+            command = [str(args.probe), '--module', str(selected_module), '--hip-root', str(runtime / 'hip'),
                        '--cuda-dll', str(runtime / 'zluda/nvcuda.dll'), '--ngx-core', str(args.core),
                        '--dlss-dll', str(args.dlss), '--nvapi-dll', str(nvapi),
-                       '--ngx-abi', 'project', '--interop-mode', 'command-list', '--preset', '11',
+                       '--ngx-abi', 'project', '--interop-mode', 'command-list', '--preset', str(preset),
+                       '--ngx-quality', '2' if args.model == 'K' else '0',
+                       '--ngx-create-flags', '0' if args.model == 'K' else '11',
+                       '--pixel-profile', args.pixel_profile,
                        '--ngx-output-resolution', args.resolution,
                        '--ngx-input-resolution', args.input_resolution, '--iterations', str(args.frames)]
             if args.player_config:
@@ -135,7 +156,7 @@ def main():
             if args.reset_every_frame:
                 command += ['--reset-every-frame', '1']
             with (output / 'stdout.log').open('wb') as out, (output / 'stderr.log').open('wb') as err:
-                result = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=180)
+                result = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=args.timeout)
             if args.player_config and (runtime / 'd4r_nvngx.log').exists():
                 shutil.copy2(runtime / 'd4r_nvngx.log', output / 'player.log')
             text = (output / 'stdout.log').read_text(errors='replace')
@@ -143,17 +164,21 @@ def main():
                 raise RuntimeError(f'run {index} failed ({result.returncode}); inspect {output}')
             if args.reset_every_frame and 'D3D12_RESET every_frame=1' not in text:
                 raise RuntimeError('Requested reset diagnostic was not applied')
+            if 'D3D12_PIXEL_PROFILE ' + args.pixel_profile not in text:
+                raise RuntimeError('Requested pixel formats were not applied')
             iw, ih = map(int, args.input_resolution.split('x'))
             expected_size = f'D3D12_NGX_DIMENSIONS input={iw}x{ih} output={ow}x{oh}'
-            if expected_size not in text or f'D4R_INTEROP async=0 batch_inputs={int(batched and not args.candidate_native)}' not in text:
+            if expected_size not in text or f'D4R_INTEROP async=0 batch_inputs={int(use_batch)}' not in text:
                 raise RuntimeError(f'run {index}: requested dimensions/interop mode not applied')
-            if len(re.findall(r'D3D12_OUTPUT preset=11 frame=\d+ finite=1 ', text)) != args.frames:
+            if len(re.findall(rf'D3D12_OUTPUT preset={preset} frame=\d+ finite=1 ', text)) != args.frames:
                 raise RuntimeError(f'run {index}: missing finite-output checks')
             times = [float(x) for x in re.findall(r'D4R_FRAME .*?interop_ngx_ms=([0-9.]+)', text)]
             if len(times) != args.frames:
                 raise RuntimeError(f'run {index}: incomplete frame timing')
-            hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output.glob('output-*.rgba16f')}
-            if len(hashes) != args.frames:
+            hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output.glob('output-*')
+                      if p.suffix in ('.rgba16f', '.r11g11b10f', '.bgra8')}
+            expected_products = args.frames * (2 if args.pixel_profile in ('packed', 'unorm') else 1)
+            if len(hashes) != expected_products:
                 raise RuntimeError(f'run {index}: incomplete output readback')
             if reference is None:
                 reference = hashes
@@ -162,7 +187,7 @@ def main():
                 report['differentFrames'] = [name for name, digest in hashes.items() if reference.get(name) != digest]
                 report['mismatchedOutputHashes'] = hashes
                 raise RuntimeError(f'run {index}: output differs from control')
-            report['runs'].append({'batch': batched and not bool(args.candidate_native),
+            report['runs'].append({'batch': use_batch,
                                    'candidate': batched, 'allFrameMs': times,
                                    'medianMs': statistics.median(times[4:]), 'outputHashes': hashes})
             print(f'run={index} variant={label} warmed_cpu_interop_ms={statistics.median(times[4:]):.3f}', flush=True)
@@ -170,7 +195,7 @@ def main():
             values = [t for row in report['runs'] if row['candidate'] == mode for t in row['allFrameMs'][4:]]
             if not values:
                 continue
-            key = ('candidateMedianMs' if args.candidate_native else 'batchMedianMs') if mode else 'controlMedianMs'
+            key = ('candidateMedianMs' if comparing else 'batchMedianMs') if mode else 'controlMedianMs'
             report[key] = statistics.median(values)
         report['passed'] = True
     except Exception as error:
