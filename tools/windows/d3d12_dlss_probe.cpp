@@ -13,6 +13,15 @@ int main(int argc, char** argv) {
     start();
     try {
         Args args(argc, argv);
+        unsigned subrectWidth = 0, subrectHeight = 0;
+        if (const char* subrect = std::getenv("D4R_PROBE_RENDER_SUBRECT")) {
+            char extra = 0;
+            if (std::sscanf(subrect, "%ux%u%c", &subrectWidth, &subrectHeight, &extra) != 2 ||
+                subrectWidth < 64 || subrectHeight < 64 ||
+                subrectWidth > (args.input_width ? args.input_width : args.output_width / 2) ||
+                subrectHeight > (args.input_height ? args.input_height : args.output_height / 2))
+                throw std::runtime_error("D4R_PROBE_RENDER_SUBRECT must be WIDTHxHEIGHT within 64x64..creation size");
+        }
         if (args.cuda_dll.empty() || (args.interop_mode != "images" && (args.module.empty() || args.ngx_core.empty() || args.dlss_dll.empty())))
             throw std::runtime_error("--module shim DLL, --cuda-dll, --ngx-core and --dlss-dll required");
         const char* diagDir = std::getenv("D4R_DIAG_DIR");
@@ -243,7 +252,8 @@ int main(int argc, char** argv) {
         for (const auto& pair : {std::make_pair("Width", width), std::make_pair("Height", height),
              std::make_pair("OutWidth", outWidth), std::make_pair("OutHeight", outHeight),
              std::make_pair("CreationNodeMask", 1u), std::make_pair("VisibilityNodeMask", 1u)}) d4r_ngx_set_uint(parameters, pair.first, pair.second);
-        d4r_ngx_set_int(parameters, "PerfQualityValue", 2); d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", args.ngx_create_flags);
+        d4r_ngx_set_int(parameters, "PerfQualityValue", int(args.ngx_quality)); d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", args.ngx_create_flags);
+        std::printf("D3D12_NGX_QUALITY value=%u\n", args.ngx_quality);
         std::printf("D3D12_NGX_CREATE_FLAGS value=%u\n", args.ngx_create_flags);
         for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
              "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"}) d4r_ngx_set_uint(parameters, name, args.preset);
@@ -342,6 +352,7 @@ int main(int argc, char** argv) {
             std::printf("D3D12_OUTPUT preset=%u frame=%u finite=1 mean=%.9g variance=%.9g frame_age=0\n", args.preset, frame, sum/count, variance);
             if (variance < 1e-6) throw std::runtime_error("D3D12 output lost the synthetic pattern");
         };
+        std::printf("D3D12_RESET every_frame=%u\n", unsigned(args.reset_each_frame));
         for (unsigned frame = 0; frame < args.iterations; ++frame) {
             if (burst) {
                 dx(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.ReleaseAndGetAddressOf())), "Burst allocator");
@@ -349,7 +360,15 @@ int main(int argc, char** argv) {
                 dx(list->Close(), "Burst initial Close");
                 readback = make_buffer(device.Get(), textures[3].bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
             }
-            d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
+            d4r_ngx_set_int(parameters, "Reset", args.reset_each_frame || frame == 0 ? 1 : 0);
+            // Diagnostic: D4R_PROBE_RENDER_SUBRECT=WxH evaluates with that render rectangle on frames >= 1 (the
+            // feature keeps its creation size), to exercise dynamic-resolution Super Sampling.
+            const unsigned renderWidth = subrectWidth && frame >= 1 ? subrectWidth : width;
+            const unsigned renderHeight = subrectHeight && frame >= 1 ? subrectHeight : height;
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", renderWidth);
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", renderHeight);
+            std::printf("D3D12_RENDER_SUBRECT frame=%u size=%ux%u reset=%u retained_resources=1\n",
+                frame, renderWidth, renderHeight, unsigned(args.reset_each_frame || frame == 0));
             if (commandBackend) {
                 dx(allocator->Reset(), "Reset(game-style allocator)"); dx(list->Reset(allocator.Get(), nullptr), "Reset(game-style list)");
                 if (earlySignature) {

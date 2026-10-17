@@ -45,6 +45,8 @@ struct Layout {
         {"sss", VK_FORMAT_R16_SFLOAT, 2, 0, 0, false},
         {"particles", VK_FORMAT_R16G16B16A16_SFLOAT, 8, 0, 0, false}}};
     VkDeviceSize bytes = 0, outputOffset = 0, outputPitch = 0;
+    VkFormat outputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    uint32_t outputBytes = 8;
     std::filesystem::path inputs, output, reference;
     std::vector<Frame> frames;
     // Runtime layout construction performs no fixture I/O. Both callers use
@@ -63,14 +65,14 @@ struct Layout {
             bytes += plane.pitch * rh;
         }
         outputOffset = (bytes + 511) & ~VkDeviceSize(511);
-        outputPitch = (VkDeviceSize(ow) * 8 + 255) & ~VkDeviceSize(255);
+        outputPitch = (VkDeviceSize(ow) * outputBytes + 255) & ~VkDeviceSize(255);
         bytes = outputOffset + outputPitch * oh;
     }
     Layout(const std::string& inputDir, const std::string& outputDir, const std::string& referenceDir)
         : inputs(inputDir), output(outputDir), reference(referenceDir) {
         std::ifstream f(inputs / "frames.txt"); std::string token;
         if (!(f >> token >> rw >> rh >> ow >> oh) || token != "size" || rw < 32 || rh < 32 ||
-            rw > 1024 || rh > 1024 || !ow || !oh || ow > 2560 || oh > 1440)
+            rw > 2560 || rh > 1440 || !ow || !oh || ow > 2560 || oh > 1440)
             throw std::runtime_error("Invalid bounded RR replay geometry");
         while (f >> token) {
             Frame frame{}; int reset, mode;
@@ -119,21 +121,34 @@ struct Layout {
         }
     }
     void validate(const void* source, unsigned frame) const {
-        std::vector<char> packed(size_t(ow) * oh * 8);
+        std::vector<char> packed(size_t(ow) * oh * outputBytes);
         for (uint32_t y = 0; y < oh; ++y)
-            std::memcpy(packed.data() + size_t(y) * ow * 8,
-                        static_cast<const char*>(source) + outputOffset + y * outputPitch, size_t(ow) * 8);
+            std::memcpy(packed.data() + size_t(y) * ow * outputBytes,
+                        static_cast<const char*>(source) + outputOffset + y * outputPitch, size_t(ow) * outputBytes);
         double low = std::numeric_limits<double>::infinity(), high = -low;
-        for (size_t i = 0; i < packed.size() / 2; ++i) {
-            uint16_t bits; std::memcpy(&bits, packed.data() + i * 2, 2);
-            const double value = d4r::diag::binary16::half_value(bits);
+        for (size_t i = 0; i < size_t(ow) * oh * 4; ++i) {
+            double value;
+            if (outputBytes == 16) { float v; std::memcpy(&v, packed.data() + i * 4, 4); value = v; }
+            else { uint16_t bits; std::memcpy(&bits, packed.data() + i * 2, 2); value = d4r::diag::binary16::half_value(bits); }
             if (!std::isfinite(value)) throw std::runtime_error("RR output contains NaN/Inf");
             if (i % 4 != 3) { low = std::min(low, value); high = std::max(high, value); }
         }
         if (!(high - low > 1e-5)) throw std::runtime_error("RR output is uniform");
         const auto name = std::to_string(frames.at(frame).id) + "-out.bin";
-        if (!reference.empty() && read(reference / name) != packed)
-            throw std::runtime_error("Bridged RR output differs from standalone replay");
+        if (!reference.empty()) {
+            auto expected = read(reference / name);
+            if (outputBytes == 16) {
+                if (expected.size() != size_t(ow) * oh * 8) throw std::runtime_error("Invalid half output reference size");
+                std::vector<char> widened(packed.size());
+                for (size_t i = 0; i < expected.size() / 2; ++i) {
+                    uint16_t bits; std::memcpy(&bits, expected.data() + i * 2, 2);
+                    const float value = float(d4r::diag::binary16::half_value(bits));
+                    std::memcpy(widened.data() + i * 4, &value, 4);
+                }
+                expected = std::move(widened);
+            }
+            if (expected != packed) throw std::runtime_error("Bridged RR output differs from standalone replay");
+        }
         std::ofstream file(output / name, std::ios::binary); file.write(packed.data(), std::streamsize(packed.size()));
         if (!file) throw std::runtime_error("RR output write failed");
         std::printf("RR_BRIDGED_FRAME id=%u finite=1 nonuniform=1 standalone_exact=%u output=%ux%u\n",
@@ -187,7 +202,7 @@ struct D3D12Frames {
         };
         for (size_t i = 0; i < inputs.size(); ++i) if (l.planes[i].enabled)
             create(i == 2 && depthFormat != DXGI_FORMAT_UNKNOWN ? depthFormat : format(l.planes[i].format), l.rw, l.rh, false, inputs[i].GetAddressOf());
-        create(DXGI_FORMAT_R16G16B16A16_FLOAT, l.ow, l.oh, true, output.GetAddressOf());
+        create(format(l.outputFormat), l.ow, l.oh, true, output.GetAddressOf());
     }
     void recordInputs(ID3D12GraphicsCommandList* cb, ID3D12Resource* upload, ID3D12Resource* shared, uint32_t optionalMask = 15) {
         for (size_t i = 0; i < inputs.size(); ++i) {
@@ -213,7 +228,18 @@ struct D3D12Frames {
             cb->CopyTextureRegion(&image, 0, 0, 0, &src, nullptr);
             barrier(cb, input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
             auto dst = placed(shared, plane.offset, plane.pitch, copyFormat, layout.rw, layout.rh);
-            cb->CopyTextureRegion(&dst, 0, 0, 0, &image, nullptr);
+            // A dynamic subrect can occupy a creation-sized fixture texture.
+            // Only depth-stencil resources require whole-subresource copies.
+            Microsoft::WRL::ComPtr<ID3D12Device> owner; checkD3D(input->GetDevice(IID_PPV_ARGS(&owner)));
+            D3D12_RESOURCE_DESC description{};
+#if defined(__MINGW32__)
+            input->GetDesc(&description);
+#else
+            description = input->GetDesc();
+#endif
+            D3D12_BOX box{0, 0, 0, layout.rw, layout.rh, 1};
+            cb->CopyTextureRegion(&dst, 0, 0, 0, &image,
+                (description.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ? nullptr : &box);
             barrier(cb, input, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
     }
@@ -240,7 +266,9 @@ struct Replay {
     std::array<std::vector<std::unique_ptr<Image>>, 11> alternatives;
     std::unique_ptr<d4r::RModel> model;
     std::unique_ptr<d4r::REngine> engine;
+    std::unique_ptr<Image> convertedOutput;
     bool first = true;
+    bool modelUploaded = false;
     Replay(const Layout& l, VkPhysicalDevice physical, VkDevice device, const std::string& directory)
         : layout(l), physical(physical), device(device) {
         const auto data = read(std::filesystem::path(directory) / "rr.txt");
@@ -250,6 +278,45 @@ struct Replay {
         for (size_t i = 0; i < images.size(); ++i) if (l.planes[i].enabled) configure(i, l.planes[i].format);
         model = std::make_unique<d4r::RModel>(physical, device, directory);
         engine = std::make_unique<d4r::REngine>(*model, l.rw, l.rh, l.ow, l.oh);
+    }
+    // Caller retires all submissions before changing layout extents. Pipelines
+    // and uploaded weights survive; descriptors/views and temporal state do not.
+    void resize() {
+        engine.reset();
+        for (auto& image : images) image.reset();
+        for (auto& cached : alternatives) cached.clear();
+        for (size_t i = 0; i < images.size(); ++i)
+            if (layout.planes[i].enabled) configure(i, layout.planes[i].format);
+        engine = std::make_unique<d4r::REngine>(*model, layout.rw, layout.rh, layout.ow, layout.oh);
+        first = true;
+    }
+    void configureOutput() {
+        if (layout.outputFormat == VK_FORMAT_R16G16B16A16_SFLOAT) return;
+        if (layout.outputFormat != VK_FORMAT_R32G32B32A32_SFLOAT)
+            throw std::runtime_error("Unsupported RR output conversion");
+        if (convertedOutput) return;
+        VkFormatProperties source{}, target{};
+        vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R16G16B16A16_SFLOAT, &source);
+        vkGetPhysicalDeviceFormatProperties(physical, layout.outputFormat, &target);
+        if (!(source.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+            (target.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) !=
+                (VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT))
+            throw std::runtime_error("RR float32 output blit unsupported");
+        auto image = std::make_unique<Image>(); image->device = device; image->format = layout.outputFormat;
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = image->format; ci.extent = {layout.ow, layout.oh, 1}; ci.mipLevels = ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        check(vkCreateImage(device, &ci, nullptr, &image->image), "RR converted output image");
+        VkMemoryRequirements req; vkGetImageMemoryRequirements(device, image->image, &req);
+        VkPhysicalDeviceMemoryProperties memory; vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+        uint32_t type = memory.memoryTypeCount;
+        for (uint32_t n = 0; n < memory.memoryTypeCount; ++n)
+            if ((req.memoryTypeBits & (1u << n)) && (memory.memoryTypes[n].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = n; break; }
+        if (type == memory.memoryTypeCount) throw std::runtime_error("No converted RR output memory type");
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+        check(vkAllocateMemory(device, &ai, nullptr, &image->memory), "RR converted output memory");
+        check(vkBindImageMemory(device, image->image, image->memory, 0), "RR converted output bind");
+        convertedOutput = std::move(image);
     }
     // Cache views by format: REngine caches descriptors referencing old views,
     // so they must remain alive until the engine is destroyed.
@@ -312,15 +379,34 @@ struct Replay {
         VkImageView* optional[] = {&inputs.specularHitDistance, &inputs.disocclusionMask, &inputs.subsurfaceGuide, &inputs.colorBeforeParticles};
         for (size_t i = 7; i < images.size(); ++i) if (layout.planes[i].enabled && (optionalMask & (1u << (i - 7)))) *optional[i - 7] = images[i]->view;
         engine->setFrame(inputs, settings);
-        if (first) { model->recordUpload(cb); engine->recordInitialize(cb); first = false; }
+        if (first) {
+            if (!modelUploaded) { model->recordUpload(cb); modelUploaded = true; }
+            engine->recordInitialize(cb); first = false;
+        }
         engine->recordFrame(cb);
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; b.image = engine->outputImage();
         b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-        VkBufferImageCopy copy{}; copy.bufferOffset = layout.outputOffset; copy.bufferRowLength = uint32_t(layout.outputPitch / 8);
+        VkImage output = engine->outputImage();
+        if (layout.outputFormat != VK_FORMAT_R16G16B16A16_SFLOAT) {
+            if (!convertedOutput) throw std::runtime_error("RR converted output was not configured");
+            VkImageMemoryBarrier target = b; target.image = convertedOutput->image;
+            target.oldLayout = convertedOutput->initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            target.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            target.srcAccessMask = convertedOutput->initialized ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+            target.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &target);
+            VkImageBlit region{}; region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.srcOffsets[1] = region.dstOffsets[1] = {int32_t(layout.ow), int32_t(layout.oh), 1};
+            vkCmdBlitImage(cb, output, VK_IMAGE_LAYOUT_GENERAL, convertedOutput->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+            target.oldLayout = target.newLayout; target.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; target.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &target);
+            convertedOutput->initialized = true; output = convertedOutput->image;
+        }
+        VkBufferImageCopy copy{}; copy.bufferOffset = layout.outputOffset; copy.bufferRowLength = uint32_t(layout.outputPitch / layout.outputBytes);
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {layout.ow, layout.oh, 1};
-        vkCmdCopyImageToBuffer(cb, engine->outputImage(), VK_IMAGE_LAYOUT_GENERAL, shared, 1, &copy);
+        vkCmdCopyImageToBuffer(cb, output, VK_IMAGE_LAYOUT_GENERAL, shared, 1, &copy);
     }
 };
 }

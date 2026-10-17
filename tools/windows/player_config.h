@@ -13,6 +13,8 @@
 #include "hip_api.h"
 #include "ngx_parameters.h"
 #include <bcrypt.h>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -25,10 +27,14 @@ struct Settings {
     unsigned preset = 11; // K
     bool nativeFp8 = false;
     bool asyncInterop = false, validateOutput = false, verbose = false, showWatermark = false;
+    bool batchInputCopies = false;
     std::wstring cacheDir;
     std::wstring nativeDir;
     std::string rrBackend = "off";
     std::wstring rrModelDir;
+    std::string fsrStabilityBias = "auto"; // [RayReconstruction] FsrStabilityBias: auto (AMD's default 1) or a number
+    std::string fsrDetail;                  // [RayReconstruction] FsrDetail: 0-1 share of the colour that bypasses the denoiser
+    std::wstring fsrDenoiser; // [RayReconstruction] FsrDenoiser: AMD's amd_fidelityfx_denoiser_dx12.dll (default: beside the shim)
 };
 struct State {
     bool active = false;
@@ -117,6 +123,7 @@ inline Settings read_settings(const std::vector<IniEntry>& ini, std::vector<std:
         } else if (name == "kernels.nativefp8") settings.nativeFp8 = flag(entry, false);
         else if (name == "dlss.showwatermark") settings.showWatermark = flag(entry, false);
         else if (name == "interop.asyncinterop") settings.asyncInterop = flag(entry, false);
+        else if (name == "interop.batchinputcopies") settings.batchInputCopies = flag(entry, false);
         else if (name == "debug.validateoutput") settings.validateOutput = flag(entry, false);
         else if (name == "debug.log") {
             const auto value = lower(entry.value);
@@ -132,8 +139,18 @@ inline Settings read_settings(const std::vector<IniEntry>& ini, std::vector<std:
             if (value.empty() || value == "auto" || value == "off") settings.rrBackend = "off";
             else if (value == "native" || value == "fsr") {
                 settings.rrBackend = value;
-                if (value == "fsr") notes.push_back("d4r.ini: native Windows FSR RR is unavailable; RR requests will be rejected");
+                if (value == "fsr") notes.push_back("d4r.ini: native Windows FSR RR is experimental: it runs AMD's denoiser on a private vkd3d-proton device (d4r\\fsr) and needs AMD's amd_fidelityfx_denoiser_dx12.dll");
             } else { settings.rrBackend = "off"; notes.push_back("d4r.ini: [RayReconstruction] Backend must be off, native or fsr; using off"); }
+        } else if (name == "rayreconstruction.fsrstabilitybias" || name == "rayreconstruction.fsrdetail") {
+            const bool bias = name == "rayreconstruction.fsrstabilitybias";
+            const auto value = lower(entry.value);
+            char* end = nullptr; const float number = std::strtof(value.c_str(), &end);
+            const bool numeric = !value.empty() && end == value.c_str() + value.size() && std::isfinite(number) && number >= 0.0f && (bias || number <= 1.0f);
+            if (bias && (value.empty() || value == "auto")) settings.fsrStabilityBias = "auto";
+            else if (numeric) (bias ? settings.fsrStabilityBias : settings.fsrDetail) = value;
+            else notes.push_back(std::string("d4r.ini: [RayReconstruction] ") + entry.key + " must be " + (bias ? "auto or a number >= 0" : "a number from 0 to 1") + ", not '" + entry.value + "'; using the default");
+        } else if (name == "rayreconstruction.fsrdenoiser") {
+            settings.fsrDenoiser = !entry.value.empty() && lower(entry.value) != "auto" ? diag::wide(entry.value) : L"";
         } else if (name == "rayreconstruction.modeldir") {
             settings.rrModelDir = !entry.value.empty() && lower(entry.value) != "auto" ? diag::wide(entry.value) : L"";
         } else notes.push_back("d4r.ini: [" + entry.section + "] " + entry.key + " is not a Windows setting; ignored");
@@ -313,6 +330,13 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
     const std::pair<const wchar_t*, std::optional<std::wstring>> values[] = {
         {L"D4R_RR_BACKEND", settings.rrBackend == "off" ? unset : std::optional<std::wstring>(diag::wide(settings.rrBackend))},
         {L"D4R_RR_MODEL_DIR", settings.rrBackend == "native" ? std::optional<std::wstring>(rr_model_directory(dir, settings).wstring()) : unset},
+        {L"D4R_FSR_VKD3D_CORE", settings.rrBackend == "fsr" ? p(L"fsr\\d4r_vkd3d_core.dll") : unset},
+        {L"D4R_FSR_AMDXC_SHIM", settings.rrBackend == "fsr" ? p(L"fsr\\amdxc64.dll") : unset},
+        {L"D4R_FSR_RR_DLL", settings.rrBackend == "fsr" ? (settings.fsrDenoiser.empty() ? p(L"amd_fidelityfx_denoiser_dx12.dll") :
+            std::optional<std::wstring>(std::filesystem::absolute(std::filesystem::path(settings.fsrDenoiser).is_relative() ? dir / settings.fsrDenoiser : std::filesystem::path(settings.fsrDenoiser)).lexically_normal().wstring())) : unset},
+        {L"D4R_FSR_RR_STABILITY_BIAS", settings.rrBackend == "fsr" && settings.fsrStabilityBias != "auto" ? std::optional<std::wstring>(diag::wide(settings.fsrStabilityBias)) : unset},
+        {L"D4R_FSR_RR_DETAIL", settings.rrBackend == "fsr" && !settings.fsrDetail.empty() ? std::optional<std::wstring>(diag::wide(settings.fsrDetail)) : unset},
+        {L"D4R_FSR_CACHE_DIR", settings.rrBackend == "fsr" ? std::optional<std::wstring>((cache / L"vkd3d").wstring()) : unset},
         {L"D4R_HIP_ROOT", p(L"hip")}, {L"HIP_PATH", p(L"hip")},
         {L"D4R_NVCUDA_DLL", p(L"zluda\\nvcuda.dll")}, {L"ZLUDA_CUDA_LIB", p(L"zluda\\nvcuda.dll")},
         {L"D4R_NVAPI_DLL", std::optional<std::wstring>(compatNvapi.wstring())},
@@ -331,11 +355,12 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
         {L"D4R_QUIET_API", settings.verbose ? unset : on},
         {L"D4R_VALIDATE_OUTPUT", settings.validateOutput ? on : unset},
         {L"D4R_ASYNC_INTEROP", settings.asyncInterop ? on : unset},
+        {L"D4R_BATCH_INPUT_COPIES", settings.batchInputCopies ? on : unset},
         {L"D4R_SHIM_WATERMARK", settings.showWatermark ? on : unset},
         {L"D4R_PROFILE_STAGES", unset}, {L"D4R_ZLUDA_PROFILE", unset}, {L"D4R_ZLUDA_PROFILE_DEFERRED", unset},
         {L"D4R_ZLUDA_PROFILE_ALLOW_LEGACY", unset}, {L"D4R_ZLUDA_PROFILE_EVERY", unset},
         {L"D4R_PROFILE_COMMAND_HOOKS", unset}, {L"D4R_ZLUDA_PROFILE_API", unset}, {L"D4R_PROFILE_GPU_BOUNDARY", unset},
-        {L"D4R_DISABLE_INTEROP_LIST_CACHE", unset}, {L"D4R_BATCH_INPUT_COPIES", unset}, {L"D4R_INTEROP_VERIFY", unset},
+        {L"D4R_DISABLE_INTEROP_LIST_CACHE", unset}, {L"D4R_INTEROP_VERIFY", unset},
         {L"D4R_DIAG_DIR", unset}, {L"ZLUDA_LOG_DIR", unset},
         {L"ZLUDA_CACHE_DIR", std::optional<std::wstring>(cache.wstring())},
         {L"PATH", std::optional<std::wstring>((dir / L"hip\\bin").wstring() + L";" + (dir / L"zluda").wstring() +

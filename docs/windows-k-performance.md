@@ -1,5 +1,150 @@
 # Windows K performance work
 
+## Current optimization pass: strict DS exchange, 1080p and 1440p (2026-10-17)
+
+After the position-layer barrier fix, the explicit gfx11 DS cross-half exchange passes the strict gate.
+`kernels/common/wave32_exchange.h` uses `ds_bpermute` with the current wave's lane XOR 16 instead of the
+volatile LDS array and its fences. No arithmetic, half rounding, weights or tensor layouts change.
+Windows gfx11 K selects it through `D4R_WINDOWS_GFX11_DS_EXCHANGE`; M retains its validated LDS path.
+The experimental builder retains explicit `-LaneExchange lds|ds` selection for comparisons.
+
+Final CMake-built candidates, authentic private K model, synthetic 24-frame temporal cases, 25 frames/submit,
+12 timing trials with three warmup trials excluded. Timestamps span Vulkan front, HIP network, Vulkan back
+and the CPU synchronization gaps; these are not network-only or game timings:
+
+| Output | Fixed LDS baseline | Strict DS candidate | Change |
+|---|---:|---:|---:|
+| 1920x1080 | 2286.4 us | 1811.9 us | 20.8% faster |
+| 2560x1440 | 3587.7 us | 2885.4 us | 19.6% faster |
+
+All five frame products match baseline hashes exactly at both sizes (120 products per case).
+Evidence: `build/k-ds-cmake-1080-final-v1/summary.json`, `build/k-ds-cmake-1440-final-v1/summary.json`.
+Independent manual-build comparisons also pass, at 1808.7/2877.0 us. CMake/manual code objects differ as
+artifacts; the actual CMake objects receive their own full output checks. Final native objects are under
+`build/k-ds-native-cmake-v2/`. The v1 CMake candidate is rejected: an intermediate CMake regex overwrote the
+captured per-source flags; the capture is now saved immediately, preserving CU and QKV-split flags.
+
+Further experiments retained no reliable additional gain: position token counts 1/2/4, shared V values,
+SPIR-V size optimization of input/output, and all-WGP scheduling. Every compared candidate here is exact;
+many are slower. WGP measured 2862.3 vs 2847.2 us at 1440p and 1795.7 vs 1813.9 at 1080p, within small
+run-to-run differences and inconsistent across sizes. It is not promoted. Evidence is under
+`build/k-hip-opt-sweep-v1/`, `k-hip-opt-ds-share-v1/`, `k-hip-opt-stage-mt1-v1/`, and `k-ds-wgp-*-v1/`.
+
+The HIP standalone engine/model is still separate from the package's NGX feature-1 path. The package can
+use the same faster K layer objects through its existing ZLUDA/NGX route; that route requires separate
+whole-frame validation and CPU interop timing. Linux targets of 1.5/2.47 ms remain unmet. Further substantial
+work would require the Vulkan front/output stages or the cross-API synchronization path; it is outside this
+bounded optimization pass. Broader K temporal/reference-quality and production-adapter work remains open.
+
+The final v14 ZIP's loader/INI passes 64 exact synthetic NGX K frames per size in control/candidate/candidate/control
+order. CPU interop medians: 1080p 3.900 -> 3.3915 ms (13.0%); 1440p 5.4015 -> 4.820 ms (10.8%). Unlike the
+standalone timestamp table, these include CPU API/copy/synchronization/NGX overhead. They are not game FPS.
+Evidence: `build/k-ds-local-v14-{1080,1440}-v1/summary.json`. An earlier legacy 1080p run overlaps build activity;
+its exactness evidence remains valid, but the packaged player runs supersede its timings.
+
+Stability diagnostic: `build/k-ds-repeat-node-final-v1.log`, 300 frozen-input rounds x 8 window phases (2,400
+launches), zero output-hash mismatches. Its individually instrumented network nodes total 1,926.04 us at 1440p.
+That instrumentation is separate from accepted frame timings. Raw readbacks created by this pass were checked
+against recorded hashes and pruned to recover 5.05 GiB; logs, summaries, hashes and final previews remain.
+Cleanup inventory: `build/k-opt-readback-cleanup-v1.json`. No earlier artifacts were deleted.
+
+## Temporal isolation follow-up
+
+The intermittent drift is not fixed or attributed to a specific layer. New
+`benchmark_k_interop.py --reset-every-frame` passes an explicit diagnostic option
+to the D3D12 harness, verifies its application and records it in the report.
+This mode does not represent normal temporal inference or game performance.
+
+With the validated private CU output, 16 frames per run and four player runs:
+
+| Isolation | Exact evaluations | Evidence under build/ |
+|---|---:|---|
+| Reset every frame, ABBA input batching | 64 | k-player-reset-every-frame-1080-v1 |
+| All K network layers translated, CU output retained, temporal ABBA | 64 | k-player-translated-network-temporal-v2 |
+| All native K, unbatched identical controls | 64 | k-player-native-temporal-controls-v1 |
+| Native encoders only, translated decoders, temporal ABBA | 64 | k-player-native-encoders-temporal-v1 |
+| Translated encoders, native decoders only, temporal ABBA | 64 | k-player-native-decoders-temporal-v1 |
+| All native K and CU output, temporal ABBA rerun | 64 | k-player-native-temporal-abba-v2 |
+
+Each row has an authoritative `summary.json`. Reset-every-frame also produces
+one identical output hash across all frames within each run. Thus accumulated
+state matters in the earlier failing case, but that alone does not establish a
+history implementation defect. The mixed native/translated cases do not isolate
+an individual layer, and the full native ABBA rerun passes after the earlier
+failure. Initialization, cache state, scheduling and arithmetic remain possible
+investigation targets; no one cause is demonstrated.
+
+Diagnostic manifests select translated or native K layers while preserving the
+same object files, private CU output, dependencies and baseline. Runtime logs
+verify actual translated enc0/dec0 selection for the all-translated case. Those
+manifest variants remain private under `build/k-network-*-native-output-cu-v1/`
+and `build/k-translated-network-output-cu-v1/`; no source kernel, runtime default,
+game or delivered ZIP was changed to use them. First translated-network fixture
+v1 failed before NGX because its setup command had a quoting error and did not
+create the selected directory. A native Python fixture setup corrected it; v2
+passes. No security policy block or bypass occurred.
+
+The reset diagnostic's timings are not normal K timings. Mixed/translated cases
+also are not proposed performance configurations. The full native rerun records
+CPU medians 3.018/2.9155 ms, unbatched/batched, but earlier drift still prevents
+promoting a default or claiming deterministic behavior. No GPU-time/Linux parity,
+image-quality or real-game speed conclusion follows from these isolation runs.
+
+## Latest: rejected kernel candidates and unresolved player temporal exactness
+
+No new kernel or batching default is promoted. The current delivered ZIP remains
+v8 with batching off. The working tree adds an experimental
+`[Interop] BatchInputCopies` switch, default false, plus parser/environment tests
+and checker support. Missing/invalid values keep older unbatched behavior.
+CPU player-config tests pass; checker syntax parses. Exactness in the player
+performance fixture remains unresolved, so keep the switch false.
+
+`benchmark_k_interop.py --control-native DIR` selects an explicit verified native
+baseline. `--player-config` stages dependencies and selects batching/native paths
+through actual INI. It preserves per-run player logs. `--sequence controls` or
+`batches` repeats identical settings to diagnose determinism. Failed comparisons
+record mismatching frame names and hashes; they do not receive accepted timing.
+`compare_k_outputs.py` measures preserved half-output differences without GPU work.
+
+New private experiments, all artifacts retained and excluded from ZIPs:
+
+- WGP scheduling for the existing native output override: 64 exact 1080p frames,
+  with CU/WGP warmed CPU interop medians 3.048/3.0455 ms (no reliable gain).
+  At 1440p the candidate failed the exact-output gate: five of 16 compared
+  frames differ, 14,836 components, max absolute difference 0.00537109375;
+  all values finite. Candidate rejected. Evidence:
+  `build/k-output-wgp-vs-cu-{1080,1440}-v1/` and 1440p `mismatch-analysis.json`.
+- CU input override: recipe changes only eight round-to-zero idioms; no surface
+  stores matched this LDR input variant. Four of 16 frames differ, 993 components,
+  max absolute difference 0.00048828125; finite. Candidate rejected. Evidence:
+  `build/k-input-cu-vs-output-cu-1080-v1/mismatch-analysis.json`.
+- Legacy/environment mode with validated private CU output plus existing input
+  batching: 128 exact frames across 1080p/1440p ABBA comparisons. Warmed CPU
+  interop medians: 3.072/2.9305 ms at 1080p, 4.4605/4.3345 ms at 1440p,
+  unbatched/batched. `build/k-output-cu-batch-{1080,1440}-v1/summary.json`.
+
+Player-mode checks exposed an important limit to those narrow successful runs:
+
+- In the baseline-kernel 16-frame ABBA run, both batched runs match first control
+  exactly, but the final unbatched control differs in 15 frames, 38,472
+  components, max absolute difference 0.01318359375. This does not isolate a
+  batching defect. `build/k-batch-player-1080-v1/repeat-analysis.json`.
+- Four identical unbatched player runs of eight frames each pass all 32 exact
+  frames. `build/k-player-control-repeat-1080-v1/summary.json`.
+- A 16-frame player comparison using the validated private CU output differs
+  between control and batched run in eight frames, 1,416 components, max absolute
+  difference 0.00048828125. First difference is frame 8, with RGB differences
+  spread across the image and unchanged alpha. Candidate is not accepted.
+  `build/k-batch-player-output-cu-1080-v1/difference-locations.json`.
+
+These results leave temporal determinism, arithmetic/initialization and ordering
+as investigation targets. They do not prove any one of those causes. The kernel
+candidates failed acceptance, but baseline drift prevents attributing every
+difference solely to a candidate. No relaxed tolerance was substituted for the
+exact gate. Private candidates, validated CU control and original runtime remain
+separate. No GPU-time/Linux parity or game-speed claim, game access, driver/GPU/
+security change, commit or publication occurred.
+
 Linux's reported 1.5 ms at 1080p and 2.47 ms at 1440p remain targets, not verified
 Windows results. The synthetic measurements below include CPU synchronization,
 format/array copies and NGX execution. They are not directly comparable to a

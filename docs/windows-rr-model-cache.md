@@ -1,5 +1,25 @@
 # Local Windows RR model cache
 
+## Installer integration (supersedes earlier integration gaps below)
+
+The local v6 runtime ZIP now includes clean portable tools and
+`tools/windows/install_dependencies.py` as `install-dependencies.py`.
+`install.bat` uses bundled Python to install all three pinned NVIDIA dependencies,
+including `d4r/rr/nvngx_dlssd.dll`. It optionally builds/deploys/enables D/E.
+No system Python, pip, PowerShell build wrapper or Git Bash is required.
+Only gfx1101-only packages support automatic RR building at present.
+
+Tool sources copy by verified manifest to the external dependency cache;
+private model products stay outside package inputs. D and E actual installer
+builds complete 48 steps. D deployment verifies all 66 products and repeats
+without new backups or INI changes. V6 interactive DLL-only installation and E
+cache reuse pass. A modified bundled tool is rejected without runtime changes.
+The installer-deployed E model passes six exact synthetic NGX hardware-depth
+frames through packaged loader/INI selection. Model-build failure leaves the
+separately verified DLL installation in place. See `windows-local-package.md`
+for archive identity, commands and evidence. No new inference speed or image
+quality claim follows from this installer integration.
+
 ## Native Python builder without Git Bash
 
 `tools/windows/build_rr_model.py` now runs the extraction, template generation,

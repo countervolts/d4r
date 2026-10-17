@@ -4,8 +4,8 @@
 #define PWIN_F32ACC
 #ifndef D4R_K_POS_MT
 #define D4R_K_POS_MT 2
-#elif !defined(__GFX12__) || !defined(D4R_K_FP16_BASELINE)
-#error "experimental position token tiling requires gfx12 strict K baseline"
+#elif (!defined(__GFX12__) && !defined(__GFX11__)) || !defined(D4R_K_FP16_BASELINE)
+#error "experimental position token tiling requires gfx11/gfx12 strict K baseline"
 #endif
 // Reuse V across the window's waves. Paired gfx1201 replays retain every half
 // code and reduce enc0 time by about 5%; gfx11 and arithmetic experiments keep

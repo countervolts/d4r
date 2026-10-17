@@ -9,6 +9,7 @@
 #include "hip_net.h"
 #include <hip/hip_runtime_api.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -64,8 +65,13 @@ uint32_t global32(hipModule_t module, const char* name, uint32_t fallback) {
     }
     return v;
 }
-void* import(int fd, uint64_t bytes, hipExternalMemory_t& memory) {
-    hipExternalMemoryHandleDesc desc{}; desc.type = hipExternalMemoryHandleTypeOpaqueFd; desc.handle.fd = fd; desc.size = bytes;
+void* import(intptr_t fd, uint64_t bytes, hipExternalMemory_t& memory) {
+    hipExternalMemoryHandleDesc desc{}; desc.size = bytes;
+#ifdef _WIN32
+    desc.type = hipExternalMemoryHandleTypeOpaqueWin32; desc.handle.win32.handle = reinterpret_cast<void*>(fd);
+#else
+    desc.type = hipExternalMemoryHandleTypeOpaqueFd; desc.handle.fd = int(fd);
+#endif
     HIPCHECK(hipImportExternalMemory(&memory, &desc));
     hipExternalMemoryBufferDesc buffer{}; buffer.offset = 0; buffer.size = bytes;
     void* at = nullptr; HIPCHECK(hipExternalMemoryGetMappedBuffer(&at, memory, &buffer));
@@ -101,6 +107,7 @@ struct HipNetwork::Impl {
     std::vector<Node> preps;
     std::vector<Node> nodes[MaxGraphs];
     std::vector<void*> owned;
+    std::vector<uint64_t> ownedBytes;
     hipExternalMemory_t shared[2]{};
     hipStream_t stream = nullptr;
     hipGraph_t graph[MaxGraphs]{};
@@ -108,6 +115,7 @@ struct HipNetwork::Impl {
     uint32_t graphs = 2, frame = 0;
     hipEvent_t start = nullptr, stop = nullptr;
     bool pending = false;
+    void* outputPtr = nullptr; uint64_t outputBytes = 0;
     ~Impl() {
         if (stream) (void)hipStreamSynchronize(stream);
         for (auto e : executable) if (e) (void)hipGraphExecDestroy(e);
@@ -125,7 +133,7 @@ struct HipNetwork::Impl {
     }
 };
 
-HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t height, int tokensFd, int outputFd,
+HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t height, intptr_t tokensFd, intptr_t outputFd,
                        uint64_t tokensBytes, uint64_t outputBytes) : impl(std::make_unique<Impl>()) {
     auto& n = *impl;
     HIPCHECK(hipInit(0));
@@ -143,6 +151,7 @@ HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t he
     if (count != layers || file.size() < 16 + 64ull * count) throw std::runtime_error("invalid hipnet.bin");
     void* tokens = import(tokensFd, tokensBytes, n.shared[0]);
     void* output = import(outputFd, outputBytes, n.shared[1]);
+    n.outputPtr = output; n.outputBytes = outputBytes;
     // Both dimensions describe the layer-0 token grid: preset M's render dimensions, preset K's output
     // dimensions (makeKShape: max 256, align 32 of the output quarter resolution).
     uint32_t tw = 0, th = 0;
@@ -191,7 +200,7 @@ HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t he
         return uint32_t(names.size() - 1);
     };
     auto allocate = [&](uint64_t bytes) {
-        void* p = nullptr; HIPCHECK(hipMalloc(&p, size_t(bytes) + 4096)); n.owned.push_back(p); return p;
+        void* p = nullptr; HIPCHECK(hipMalloc(&p, size_t(bytes) + 4096)); n.owned.push_back(p); n.ownedBytes.push_back(bytes); return p;
     };
     std::vector<uint32_t> layerKernel(layers), divisor(layers);
     std::vector<int32_t> shiftX(layers), shiftY(layers);
@@ -328,5 +337,41 @@ bool HipNetwork::done() {
     check(e, "hipEventQuery"); n.pending = false; return true;
 }
 void HipNetwork::wait() { HIPCHECK(hipStreamSynchronize(impl->stream)); impl->pending = false; }
+std::vector<uint64_t> HipNetwork::debugRepeatHashes(uint32_t rounds) {
+    // per launch: the output buffer hash, then one hash per owned allocation (weights and activations)
+    auto& n = *impl; std::vector<uint64_t> hashes; std::vector<unsigned char> host;
+    auto hash = [&](void* p, uint64_t bytes) {
+        host.resize(size_t(bytes)); HIPCHECK(hipMemcpyDtoH(host.data(), p, host.size()));
+        uint64_t h = 1469598103934665603ull;
+        // 64-bit words: byte-wise FNV over the ~18 MB head buffer cost more than the network itself
+        const size_t words = host.size() / 8; const uint64_t* data = reinterpret_cast<const uint64_t*>(host.data());
+        for (size_t i = 0; i < words; ++i) { h ^= data[i]; h *= 1099511628211ull; h ^= h >> 29; }
+        for (size_t i = words * 8; i < host.size(); ++i) { h ^= host[i]; h *= 1099511628211ull; }
+        hashes.push_back(h);
+    };
+    for (uint32_t r = 0; r < rounds; ++r)
+        for (uint32_t i = 0; i < 8; ++i) {
+            launch(); wait();
+            hash(n.outputPtr, n.outputBytes);
+            if (std::getenv("D4R_HIP_REPEAT_ALL"))
+                for (size_t k = 0; k < n.owned.size(); ++k) hash(n.owned[k], n.ownedBytes[k]);
+        }
+    return hashes;
+}
+std::vector<float> HipNetwork::debugNodeMicros(uint32_t phase, uint32_t trials) {
+    auto& n = *impl; const auto& nodes = n.nodes[phase % n.graphs];
+    std::vector<std::vector<float>> samples(nodes.size());
+    hipEvent_t a = nullptr, b = nullptr; HIPCHECK(hipEventCreate(&a)); HIPCHECK(hipEventCreate(&b));
+    for (uint32_t t = 0; t < trials + 2; ++t)
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            HIPCHECK(hipEventRecord(a, n.stream)); n.run(nodes[i]); HIPCHECK(hipEventRecord(b, n.stream));
+            HIPCHECK(hipEventSynchronize(b)); float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, a, b));
+            if (t >= 2) samples[i].push_back(ms * 1000.0f);
+        }
+    (void)hipEventDestroy(a); (void)hipEventDestroy(b);
+    std::vector<float> result;
+    for (auto& s : samples) { std::sort(s.begin(), s.end()); result.push_back(s[s.size() / 2]); }
+    return result;
+}
 float HipNetwork::lastMilliseconds() { float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, impl->start, impl->stop)); return ms; }
 } // namespace d4r

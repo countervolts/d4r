@@ -6,6 +6,14 @@
 #ifdef D4R_ENGINE_HIP
 #include "hip_net.h"
 #endif
+// Opaque memory handle shared with HIP: a file descriptor on Linux, a Win32 NT handle on Windows.
+#ifdef _WIN32
+#define D4R_EXT_MEMORY_EXTENSION "VK_KHR_external_memory_win32"
+#define D4R_EXT_MEMORY_HANDLE VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+#else
+#define D4R_EXT_MEMORY_EXTENSION VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+#define D4R_EXT_MEMORY_HANDLE VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -87,8 +95,8 @@ struct Context {
             throw std::runtime_error("VK_KHR_cooperative_matrix required");
         if (fp8 && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME); }))
             throw std::runtime_error("VK_EXT_shader_float8 required for M");
-        if (externalMemory && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); }))
-            throw std::runtime_error("VK_KHR_external_memory_fd required for the native HIP network");
+        if (externalMemory && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, D4R_EXT_MEMORY_EXTENSION); }))
+            throw std::runtime_error("external memory extension required for the native HIP network");
         VkPhysicalDeviceShaderFloat8FeaturesEXT float8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR matrix{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr};
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &matrix};
@@ -137,7 +145,7 @@ struct Context {
         const char* enabled[3] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
         uint32_t enabledCount = 1;
         if (fp8) enabled[enabledCount++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
-        if (externalMemory) enabled[enabledCount++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        if (externalMemory) enabled[enabledCount++] = D4R_EXT_MEMORY_EXTENSION;
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features};
         di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi; di.enabledExtensionCount = enabledCount;
         di.ppEnabledExtensionNames = enabled;
@@ -212,16 +220,16 @@ struct Buffer {
 };
 #ifdef D4R_ENGINE_HIP
 // A storage buffer whose memory another API (HIP) imports through a file descriptor, for the native network.
-struct Shared { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize allocation = 0; int fd = -1; };
+struct Shared { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize allocation = 0; intptr_t fd = -1; };
 static Shared shared(const Context& c, VkDeviceSize size) {
     Shared s;
     VkExternalMemoryBufferCreateInfo ei{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
-    ei.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    ei.handleTypes = D4R_EXT_MEMORY_HANDLE;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ei}; bi.size = size; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     CK(vkCreateBuffer(c.device, &bi, nullptr, &s.buffer));
     VkMemoryRequirements r; vkGetBufferMemoryRequirements(c.device, s.buffer, &r);
     VkExportMemoryAllocateInfo xi{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
-    xi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    xi.handleTypes = D4R_EXT_MEMORY_HANDLE;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &xi}; ai.allocationSize = s.allocation = r.size;
     uint32_t index = c.memory.memoryTypeCount;
     for (uint32_t i = 0; i < c.memory.memoryTypeCount; ++i)
@@ -229,11 +237,19 @@ static Shared shared(const Context& c, VkDeviceSize size) {
     if (index == c.memory.memoryTypeCount) throw std::runtime_error("no device-local memory type");
     ai.memoryTypeIndex = index;
     CK(vkAllocateMemory(c.device, &ai, nullptr, &s.memory)); CK(vkBindBufferMemory(c.device, s.buffer, s.memory, 0));
+#ifdef _WIN32
+    VkMemoryGetWin32HandleInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR};
+    gi.memory = s.memory; gi.handleType = D4R_EXT_MEMORY_HANDLE;
+    const auto getHandle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(vkGetDeviceProcAddr(c.device, "vkGetMemoryWin32HandleKHR"));
+    if (!getHandle) throw std::runtime_error("vkGetMemoryWin32HandleKHR is unavailable");
+    HANDLE handle = nullptr; CK(getHandle(c.device, &gi, &handle)); s.fd = reinterpret_cast<intptr_t>(handle);
+#else
     VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
-    gi.memory = s.memory; gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    gi.memory = s.memory; gi.handleType = D4R_EXT_MEMORY_HANDLE;
     const auto getFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(c.device, "vkGetMemoryFdKHR"));
     if (!getFd) throw std::runtime_error("vkGetMemoryFdKHR is unavailable");
-    CK(getFd(c.device, &gi, &s.fd));
+    int fd = -1; CK(getFd(c.device, &gi, &fd)); s.fd = fd;
+#endif
     return s;
 }
 #endif
@@ -419,6 +435,31 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         context.submit();
 #ifdef D4R_ENGINE_HIP
         network->launch(); network->wait();
+        static bool nodesProfiled = false;
+        if (!nodesProfiled && std::getenv("D4R_HIP_NODE_PROFILE")) {
+            nodesProfiled = true; float total = 0;
+            auto micros = network->debugNodeMicros(0, 30);
+            for (size_t k = 0; k < micros.size(); ++k) { std::cout << "  node " << k << ": " << micros[k] << " us\n"; total += micros[k]; }
+            std::cout << "hip node profile total (individually launched, phase 0): " << total << " us\n";
+        }
+        static bool repeatChecked = false;
+        if (!repeatChecked && std::getenv("D4R_HIP_REPEAT_CHECK")) {
+            repeatChecked = true;
+            const uint32_t rounds = uint32_t(std::atoi(std::getenv("D4R_HIP_REPEAT_CHECK")));
+            auto hashes = network->debugRepeatHashes(rounds); unsigned bad = 0;
+            const size_t stride = hashes.size() / (size_t(rounds) * 8);  // 1 unless D4R_HIP_REPEAT_ALL
+            for (uint32_t phase = 0; phase < 8; ++phase)
+                for (uint32_t r = 1; r < rounds; ++r) {
+                    bool any = false;
+                    for (size_t k = 0; k < stride; ++k)
+                        if (hashes[(size_t(r) * 8 + phase) * stride + k] != hashes[size_t(phase) * stride + k]) {
+                            any = true; std::cout << "  mismatch round " << r << " phase " << phase << " slot " << k << " (0=output, 1+=owned alloc)\n";
+                        }
+                    if (any) ++bad;
+                }
+            std::cout << "hip repeat check: " << rounds << " rounds x 8 phases, mismatching launches vs round 0: " << bad << '\n';
+        }
+        if (profile) std::cout << "  hip network GPU: " << network->lastMilliseconds() * 1000.0 << " us\n";
 #else
         throw std::runtime_error("this build has no HIP support");
 #endif

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <array>
 
 namespace d4r::win {
 inline std::string env_path(const char* name) {
@@ -312,6 +313,34 @@ public:
         std::lock_guard<std::mutex> lock(rt_->mutex); cleanup();
     }
     Feature(const Feature&) = delete;
+    // Query the loaded SR library, using NVIDIA's optimal-settings callback contract.
+    // An unavailable/invalid query keeps the conservative creation-size-only range.
+    std::array<unsigned, 4> render_limits() {
+        std::lock_guard<std::mutex> lock(rt_->mutex);
+        rt_->current();
+        std::array<unsigned, 4> limits{width, height, width, height};
+        void* caps = nullptr;
+        if (rt_->capabilities(&caps) != 1 || !caps) return limits;
+        struct Guard { Runtime& rt; void* p; ~Guard() { (void)rt.destroy(p); } } guard{*rt_, caps};
+        void* callback = nullptr;
+        if (d4r_ngx_get_void(caps, "DLSSOptimalSettingsCallback", &callback) != 1 || !callback) return limits;
+        d4r_ngx_set_uint(caps, "Width", ngx::uint_value(parameters_, "OutWidth"));
+        d4r_ngx_set_uint(caps, "Height", ngx::uint_value(parameters_, "OutHeight"));
+        d4r_ngx_set_int(caps, "PerfQualityValue", ngx::int_value(parameters_, "PerfQualityValue"));
+        d4r_ngx_set_int(caps, "RTXValue", 0);
+        using Optimal = unsigned(*)(void*);
+        if (reinterpret_cast<Optimal>(callback)(caps) != 1) return limits;
+        const unsigned optimalWidth = ngx::uint_value(caps, "OutWidth");
+        const unsigned optimalHeight = ngx::uint_value(caps, "OutHeight");
+        const std::array<unsigned, 4> queried{
+            ngx::uint_value(caps, "DLSS.Get.Dynamic.Min.Render.Width", optimalWidth),
+            ngx::uint_value(caps, "DLSS.Get.Dynamic.Min.Render.Height", optimalHeight),
+            ngx::uint_value(caps, "DLSS.Get.Dynamic.Max.Render.Width", optimalWidth),
+            ngx::uint_value(caps, "DLSS.Get.Dynamic.Max.Render.Height", optimalHeight)};
+        if (queried[0] && queried[1] && queried[2] >= queried[0] && queried[3] >= queried[1]) limits = queried;
+        std::fprintf(stderr, "D4R_SR_RENDER_LIMITS min=%ux%u max=%ux%u\n", limits[0], limits[1], limits[2], limits[3]);
+        return limits;
+    }
     void drain() {
         if (!std::getenv("D4R_ASYNC_INTEROP")) return;
         wait_worker();

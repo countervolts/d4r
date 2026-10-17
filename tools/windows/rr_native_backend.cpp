@@ -81,6 +81,7 @@ struct Backend::Impl {
             offset = plane.offset + plane.pitch * layout.rh;
         }
         layout.outputOffset = (offset + 511) & ~VkDeviceSize(511);
+        layout.outputPitch = (VkDeviceSize(layout.ow) * 16 + 255) & ~VkDeviceSize(255);
         layout.bytes = layout.outputOffset + layout.outputPitch * layout.oh;
     }
     void dispatch() {
@@ -151,8 +152,8 @@ struct Backend::Impl {
     }
     void validate_frame(const Snapshot& frame) {
         if (failed) throw std::runtime_error("Native RR backend is poisoned after failed submission");
-        if (frame.renderWidth != layout.rw || frame.renderHeight != layout.rh)
-            throw std::runtime_error("Dynamic RR render extent requires engine reconfiguration");
+        if (frame.renderWidth < 64 || frame.renderHeight < 64 || frame.renderWidth > creation.width || frame.renderHeight > creation.height)
+            throw std::runtime_error("RR render extent must be at least 64 and within creation geometry");
         if (frame.resources[Snapshot::Exposure]) throw std::runtime_error("RR exposure texture is not implemented");
         if (frame.exposureScale != 1 || frame.depthType || frame.normalsType || frame.roughnessType || frame.diffuseType || frame.specularType)
             throw std::runtime_error("RR guide encoding or exposure scale requires conversion");
@@ -170,12 +171,13 @@ struct Backend::Impl {
                 // D3D12 requires whole-subresource copies for depth-stencil.
                 // The copied subresource is depth plane 0, never stencil.
                 if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
-                    (frame.origins[i][0] || frame.origins[i][1] || layout.rw != desc.Width || layout.rh != desc.Height))
+                    (frame.origins[i][0] || frame.origins[i][1] || frame.renderWidth != desc.Width || frame.renderHeight != desc.Height))
                     throw std::runtime_error("RR depth-stencil requires a full depth-plane rectangle");
             }
-            const uint32_t width = i == Snapshot::Output ? layout.ow : layout.rw;
-            const uint32_t height = i == Snapshot::Output ? layout.oh : layout.rh;
-            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || (i == Snapshot::Output && desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
+            const uint32_t width = i == Snapshot::Output ? layout.ow : frame.renderWidth;
+            const uint32_t height = i == Snapshot::Output ? layout.oh : frame.renderHeight;
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || (i == Snapshot::Output &&
+                desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R32G32B32A32_FLOAT) || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
                 frame.origins[i][0] > desc.Width || width > desc.Width - frame.origins[i][0] ||
                 frame.origins[i][1] > desc.Height || height > desc.Height - frame.origins[i][1])
                 throw std::runtime_error("Unsupported native RR texture format or subrect");
@@ -187,6 +189,17 @@ struct Backend::Impl {
     }
     void evaluate(ID3D12CommandQueue* q, const Snapshot& frame, const std::array<ResourceAccess, Snapshot::Count>& access) {
         validate(q, frame, access); dispatch();
+        // Any mutation below may invalidate descriptors or engine bookkeeping;
+        // a failed reconfiguration must never reuse a partially rebuilt engine.
+        failed = true;
+        if (frame.renderWidth != layout.rw || frame.renderHeight != layout.rh) {
+            if (pending) throw std::runtime_error("RR resize requires retired GPU work");
+            layout.rw = frame.renderWidth; layout.rh = frame.renderHeight;
+            // Keep creation-sized packet pitches/offsets and imported fence.
+            // Rebuild only size-dependent views/history, retaining model data.
+            replay->resize();
+            std::fprintf(stderr, "D4R_RR_RESIZE render=%ux%u history_reset=1 model_reused=1 packet_reused=1\n", layout.rw, layout.rh);
+        }
         for (size_t i = 0; i < layout.planes.size(); ++i) {
             const auto resource = resource_index(i);
             layout.planes[i].enabled = frame.resources[resource] != nullptr;
@@ -195,6 +208,10 @@ struct Backend::Impl {
             replay->configure(i, format.format);
             layout.planes[i].format = format.format; layout.planes[i].bytes = format.bytes;
         }
+        const auto outputFormat = resource_desc(frame.resources[Snapshot::Output].Get()).Format;
+        layout.outputBytes = outputFormat == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : 8;
+        layout.outputFormat = layout.outputBytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+        replay->configureOutput();
         // Recording mutates engine upload/history bookkeeping. Any later error
         // requires recreation, even if no GPU submission has started yet.
         failed = true;
@@ -222,7 +239,7 @@ struct Backend::Impl {
         auto* output = frame.resources[Snapshot::Output].Get();
         texture_copy_barrier(consumer.Get(), output, access[Snapshot::Output], true, false);
         auto source = rr_bridge::D3D12Frames::placed(shared.Get(), layout.outputOffset, layout.outputPitch,
-            DXGI_FORMAT_R16G16B16A16_FLOAT, layout.ow, layout.oh);
+            outputFormat, layout.ow, layout.oh);
         auto dest = rr_bridge::D3D12Frames::texture(output);
         consumer->CopyTextureRegion(&dest, frame.origins[Snapshot::Output][0], frame.origins[Snapshot::Output][1], 0, &source, nullptr);
         texture_copy_barrier(consumer.Get(), output, access[Snapshot::Output], true, true);

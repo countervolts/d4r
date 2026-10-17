@@ -21,6 +21,13 @@ int main(int argc, char** argv) try {
     const bool floatGuides = mode.find("float-guides") != std::string::npos;
     const bool switchGuides = mode.find("switch-guides") != std::string::npos;
     const bool autoExposure = mode.find("auto-exposure") != std::string::npos;
+    const bool dynamicExtents = mode.find("dynamic-extents") != std::string::npos;
+    const bool twoFeatures = mode.find("two-features") != std::string::npos;
+    const bool maxResources = mode.find("max-resources") != std::string::npos;
+    const bool outputFloat32 = mode.find("output-float32") != std::string::npos;
+    const bool switchOutput = mode.find("switch-output") != std::string::npos;
+    if (switchOutput && (!outputFloat32 || maxResources)) throw std::runtime_error("Output switching requires float32 mode and resized resources");
+    if (maxResources && !dynamicExtents) throw std::runtime_error("Creation-sized resources require dynamic fixture");
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     if (mode.find("depth-d32s8-typeless") != std::string::npos) depthFormat = DXGI_FORMAT_R32G8X24_TYPELESS;
     else if (mode.find("depth-d32s8") != std::string::npos) depthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -29,7 +36,25 @@ int main(int argc, char** argv) try {
     const bool stencil = depthFormat == DXGI_FORMAT_R32G8X24_TYPELESS || depthFormat == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     if (enhanced && split) throw std::runtime_error("The split fixture currently tests legacy split barriers only");
     rr_bridge::Layout layout(argv[2], argv[4], argv[3]);
+    if (outputFloat32) {
+        layout.outputFormat = VK_FORMAT_R32G32B32A32_SFLOAT; layout.outputBytes = 16;
+        layout.initializePacket();
+    }
     const auto canonical = layout;
+    std::vector<std::array<uint32_t, 2>> extents;
+    if (dynamicExtents) {
+        if (switchGuides || floatGuides || depthFormat != DXGI_FORMAT_UNKNOWN)
+            throw std::runtime_error("Dynamic fixture currently uses canonical guides and R32 depth");
+        std::ifstream sizes(layout.inputs / "dynamic-extents.txt");
+        uint32_t width, height;
+        while (sizes >> width >> height) {
+            if (width < 64 || height < 64 || width > layout.rw || height > layout.rh)
+                throw std::runtime_error("Invalid bounded dynamic fixture extent");
+            extents.push_back({width, height});
+        }
+        if (!sizes.eof() || extents.size() != layout.frames.size())
+            throw std::runtime_error("Dynamic fixture extent count differs from frames");
+    }
     if (floatGuides) {
         for (size_t i : {size_t(0), size_t(3)}) {
             layout.planes[i].format = VK_FORMAT_R32G32B32A32_SFLOAT; layout.planes[i].bytes = 16;
@@ -170,6 +195,8 @@ int main(int argc, char** argv) try {
         d4r_ngx_set_uint(p, "DLSS.Feature.Create.Flags", creationFlags);
     }
     void* feature = nullptr; check(create(nullptr, 13, p, &feature), "RR CreateFeature");
+    void* peerFeature = nullptr;
+    if (twoFeatures) check(create(nullptr, 13, p, &peerFeature), "RR peer CreateFeature");
     auto textures = std::make_unique<rr_bridge::D3D12Frames>(layout, device.Get(), depthFormat);
     ComPtr<ID3D12Resource> stencilUpload, stencilReadback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT stencilFootprint{}; UINT64 stencilBytes = 0;
@@ -196,12 +223,28 @@ int main(int argc, char** argv) try {
     auto upload = make_buffer(device.Get(), layout.bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto scratch = make_buffer(device.Get(), layout.bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     auto readback = make_buffer(device.Get(), layout.bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ComPtr<ID3D12Resource> peerReadback;
+    if (twoFeatures) {
+        peerReadback = make_buffer(device.Get(), layout.bytes, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::filesystem::create_directories(layout.output / "peer");
+    }
     ComPtr<ID3D12Fence> fence; dx(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "NGX RR fixture fence");
     Handle event; event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event.value) throw std::runtime_error("NGX RR fixture event");
     for (unsigned index = 0; index < layout.frames.size(); ++index) {
+        if (dynamicExtents) {
+            layout.rw = extents[index][0]; layout.rh = extents[index][1];
+            layout.initializePacket();
+            if (!maxResources) textures = std::make_unique<rr_bridge::D3D12Frames>(layout, device.Get(), depthFormat);
+        }
         if (switchGuides) {
             layout = index % 2 ? floatLayout : canonical;
+            textures = std::make_unique<rr_bridge::D3D12Frames>(layout, device.Get(), depthFormat);
+        }
+        if (switchOutput) {
+            layout.outputBytes = index % 2 ? 16 : 8;
+            layout.outputFormat = index % 2 ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+            layout.initializePacket();
             textures = std::make_unique<rr_bridge::D3D12Frames>(layout, device.Get(), depthFormat);
         }
         void* mapped = nullptr; D3D12_RANGE noRead{};
@@ -246,6 +289,8 @@ int main(int argc, char** argv) try {
         for (size_t i = 0; i < 4; ++i)
             d4r_ngx_set_d3d12_resource(p, optionalNames[i], layout.frames[index].optional[i] ? textures->inputs[i + 7].Get() : nullptr);
         auto settings = layout.frames[index].settings;
+        d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.rw);
+        d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", layout.rh);
         d4r_ngx_set_float(p, "Jitter.Offset.X", settings.jitter[0]); d4r_ngx_set_float(p, "Jitter.Offset.Y", settings.jitter[1]);
         d4r_ngx_set_float(p, "MV.Scale.X", settings.motionScale[0]); d4r_ngx_set_float(p, "MV.Scale.Y", settings.motionScale[1]);
         d4r_ngx_set_float(p, "DLSS.Pre.Exposure", settings.preExposure);
@@ -256,6 +301,18 @@ int main(int argc, char** argv) try {
         if (!inherited) {
             for (const auto* state : states) d4r_ngx_set_uint(p, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             d4r_ngx_set_uint(p, "D4R.Output.State", D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        if (mode.find("sr-bounds") != std::string::npos && index == 0) {
+            // This synthetic Quality fixture uses the pinned SR library's half-output minimum.
+            // Reject each axis below that minimum, then submit a valid frame on the same list.
+            require(layout.ow / 2 > 64 && layout.oh / 2 > 64, "SR bounds fixture is too small");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.ow / 2 - 1);
+            require(evaluate(list.Get(), feature, p, nullptr) != 1, "SR width below dynamic minimum accepted");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.rw);
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", layout.oh / 2 - 1);
+            require(evaluate(list.Get(), feature, p, nullptr) != 1, "SR height below dynamic minimum accepted");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", layout.rh);
+            std::puts("RR_NGX_SR_BOUNDS width_below_min_rejected=1 height_below_min_rejected=1 command_list_preserved=1");
         }
         if (contracts && index == 0) {
             auto rejects = [&](const char* name) { require(evaluate(list.Get(), feature, p, nullptr) != 1, name); };
@@ -268,15 +325,20 @@ int main(int argc, char** argv) try {
             d4r_ngx_set_void(p, "ViewToClipMatrix", settings.viewToClip);
             d4r_ngx_set_d3d12_resource(p, "DLSSD.SpecularHitDistance", textures->inputs[0].Get()); rejects("Invalid RR scalar guide format accepted");
             d4r_ngx_set_d3d12_resource(p, "DLSSD.SpecularHitDistance", layout.frames[index].optional[0] ? textures->inputs[7].Get() : nullptr);
-            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.rw + 1); rejects("Unsupported RR dynamic extent accepted");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", canonical.rw + 1); rejects("RR extent exceeding creation size accepted");
             d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.rw);
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", canonical.rh + 1); rejects("RR height exceeding creation size accepted");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", layout.rh);
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", 63); rejects("RR width below engine minimum accepted");
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", layout.rw);
+            std::puts("RR_NGX_EXTENT_BOUNDS creation_max_rejected=1 engine_min_rejected=1 command_list_preserved=1");
             d4r_ngx_set_uint(p, "DLSS.Depth.Type", 1); rejects("Unsupported RR encoding accepted");
             d4r_ngx_set_uint(p, "DLSS.Depth.Type", 0);
             d4r_ngx_set_uint(p, "DLSS.Input.Color.Subrect.Base.X", layout.rw); rejects("Invalid RR subrect accepted");
             d4r_ngx_set_uint(p, "DLSS.Input.Color.Subrect.Base.X", 0);
             d4r_ngx_set_d3d12_resource(p, "Output", textures->inputs[0].Get()); rejects("Aliased or invalid RR output accepted");
             d4r_ngx_set_d3d12_resource(p, "Output", textures->output.Get());
-            std::puts("RR_NGX_NEGATIVE rejected=13 command_list_preserved=1");
+            std::puts("RR_NGX_NEGATIVE rejected=15 command_list_preserved=1");
         }
         if (split && index == 0) {
             D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -288,16 +350,35 @@ int main(int argc, char** argv) try {
             std::puts("RR_NGX_SPLIT unfinished_rejected=1 paired_before_submit=1");
         }
         check(evaluate(list.Get(), feature, p, nullptr), "RR EvaluateFeature");
+        if (twoFeatures) {
+            // Preserve first feature output before a second live Vulkan backend
+            // consumes the same borrowed inputs and publishes to the same UAV.
+            // Both evaluations are delayed boundaries in one game command list.
+            auto* output = textures->output.Get();
+            if (enhanced) texture_copy_barrier(list.Get(), output, enhancedAccess(true), false, false);
+            else transition(list.Get(), output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            auto source = rr_bridge::D3D12Frames::texture(output);
+            auto destination = rr_bridge::D3D12Frames::placed(peerReadback.Get(), layout.outputOffset, layout.outputPitch,
+                rr_bridge::D3D12Frames::format(layout.outputFormat), layout.ow, layout.oh);
+            list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+            if (enhanced) texture_copy_barrier(list.Get(), output, enhancedAccess(true), false, true);
+            else transition(list.Get(), output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            check(evaluate(list.Get(), peerFeature, p, nullptr), "RR peer EvaluateFeature");
+        }
         // Both pointer payloads and parameter scalars change before submission.
         settings.worldToView[0] = 999; settings.viewToClip[5] = 999;
         d4r_ngx_set_float(p, "DLSS.Pre.Exposure", 999);
         d4r_ngx_set_d3d12_resource(p, "Color", nullptr);
+        if (dynamicExtents) {
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", 1);
+            d4r_ngx_set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", 1);
+        }
         auto output = textures->output;
         if (enhanced) texture_copy_barrier(list.Get(), output.Get(), enhancedAccess(true), false, false);
         else transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         auto source = rr_bridge::D3D12Frames::texture(output.Get());
         auto dest = rr_bridge::D3D12Frames::placed(readback.Get(), layout.outputOffset, layout.outputPitch,
-            DXGI_FORMAT_R16G16B16A16_FLOAT, layout.ow, layout.oh);
+            rr_bridge::D3D12Frames::format(layout.outputFormat), layout.ow, layout.oh);
         list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
         if (enhanced) {
             texture_copy_barrier(list.Get(), output.Get(), enhancedAccess(true), false, true);
@@ -309,6 +390,7 @@ int main(int argc, char** argv) try {
         if (stencil) stencilCopy(list.Get(), textures->inputs[2].Get(), false);
         if (index + 1 == layout.frames.size()) {
             check(release(feature), "RR Release before submission"); feature = nullptr;
+            if (peerFeature) { check(release(peerFeature), "RR peer Release before submission"); peerFeature = nullptr; }
             check(destroy(p), "RR Destroy parameters before submission"); p = nullptr;
             textures.reset(); output.Reset();
         }
@@ -321,6 +403,13 @@ int main(int argc, char** argv) try {
         D3D12_RANGE range{0, SIZE_T(layout.bytes)}; dx(readback->Map(0, &range, &mapped), "NGX RR readback map");
         try { layout.validate(mapped, index); } catch (...) { readback->Unmap(0, nullptr); throw; }
         readback->Unmap(0, nullptr);
+        if (twoFeatures) {
+            dx(peerReadback->Map(0, &range, &mapped), "NGX RR first feature readback map");
+            auto peerLayout = layout; peerLayout.output /= "peer";
+            try { peerLayout.validate(mapped, index); } catch (...) { peerReadback->Unmap(0, nullptr); throw; }
+            peerReadback->Unmap(0, nullptr);
+            std::printf("RR_NGX_PEER_FRAME index=%u exact=1 both_features_live=1\n", index);
+        }
         if (stencil) {
             D3D12_RANGE stencilRange{0, SIZE_T(stencilBytes)};
             dx(stencilReadback->Map(0, &stencilRange, &mapped), "RR stencil verification map");
@@ -331,6 +420,7 @@ int main(int argc, char** argv) try {
         }
         std::printf("RR_NGX_FRAME index=%u snapshot_mutated=1 exact=1 optional_mask=%u hardware_depth=%u depth_inverted=%u\n",
             index, optionalMask, settings.hardwareDepth, settings.depthInverted);
+        if (dynamicExtents) std::printf("RR_NGX_EXTENT index=%u render=%ux%u exact=1\n", index, layout.rw, layout.rh);
     }
     check(shutdown(), "RR Shutdown");
     if (contracts) std::puts("PASS RR_NGX_CONTRACTS capabilities=1 requirements=1 warp_rejected=1 invalid_inputs_rejected=1");
@@ -341,6 +431,11 @@ int main(int argc, char** argv) try {
     if (floatGuides) std::puts("PASS RR_NGX_FLOAT_GUIDES color_rgba32=1 motion_rg32=1 normals_rgba32=1 roughness_r16=1");
     if (switchGuides) std::puts("PASS RR_NGX_SWITCH_GUIDES alternate_each_frame=1 feature_recreated=0");
     if (autoExposure) std::puts("PASS RR_NGX_FLAGS hdr=1 render_motion=1 auto_exposure=1");
+    if (dynamicExtents) std::puts("PASS RR_NGX_DYNAMIC_EXTENTS feature_recreated=0 snapshot_geometry_owned=1");
+    if (twoFeatures) std::puts("PASS RR_NGX_TWO_FEATURES delayed_boundaries=2 separate_vulkan_devices=1 release_both_before_submit=1");
+    if (maxResources) std::puts("PASS RR_NGX_MAX_RESOURCES creation_size_retained=1 dynamic_input_subrects=1");
+    if (outputFloat32) std::puts("PASS RR_NGX_OUTPUT_FLOAT32 gpu_conversion=1 half_reference_widening_exact=1");
+    if (switchOutput) std::puts("PASS RR_NGX_SWITCH_OUTPUT alternating_half_float=1 feature_recreated=0");
     if (depthFormat != DXGI_FORMAT_UNKNOWN) std::printf("PASS RR_NGX_DEPTH format=%u stencil_preserved=%u\n", unsigned(depthFormat), stencil);
     std::puts("PASS RR_NGX_LIFECYCLE feature=13 snapshot_mutation=1 release_before_submit=1 parameter_destroy_before_submit=1");
     return 0;

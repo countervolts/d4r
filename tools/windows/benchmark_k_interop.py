@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import shutil
 
 
 def main():
@@ -24,9 +25,17 @@ def main():
                         help='diagnostic CPU stage logging; adds overhead to timings')
     parser.add_argument('--candidate-native', type=lambda s: Path(s).resolve(),
                         help='compare an experimental native directory instead of input batching')
+    parser.add_argument('--control-native', type=lambda s: Path(s).resolve(),
+                        help='use an explicit verified control kernel directory while retaining runtime dependencies')
+    parser.add_argument('--player-config', action='store_true', help='select batching/native paths through staged player INI')
+    parser.add_argument('--sequence', choices=('abba', 'controls', 'batches'), default='abba',
+                        help='paired comparison, or repeated identical settings to diagnose baseline determinism')
+    parser.add_argument('--reset-every-frame', action='store_true', help='diagnose history dependence; not representative temporal performance')
     parser.add_argument('--profile-kernels', action='store_true',
                         help='diagnostic deferred GPU events, allowing legacy-stream dependencies; timings are instrumented')
     args = parser.parse_args()
+    if args.player_config and (args.profile_stages or args.profile_kernels):
+        parser.error('player mode clears diagnostic profiling flags; use a separate instrumented run')
     if args.frames < 8 or args.frames > 120:
         parser.error('frames must be 8..120')
     if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*', args.resolution):
@@ -50,6 +59,21 @@ def main():
     native = runtime / 'native'
     if (native / 'gfx1101').is_dir():
         native = native / 'gfx1101'
+    if args.control_native:
+        native = args.control_native
+    report['playerConfig'] = args.player_config
+    report['sequence'] = args.sequence
+    report['resetEveryFrame'] = args.reset_every_frame
+    module = args.shim
+    if args.player_config:
+        runtime = args.output / 'player'
+        shutil.copytree(args.runtime, runtime)
+        module = runtime / 'd4r_nvngx.dll'
+        shutil.copy2(args.shim, module)
+        for source, relative in ((args.core, 'ngx/_nvngx.dll'), (args.dlss, 'dlss/nvngx_dlss.dll')):
+            destination = runtime / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
     nvapi = runtime / 'nvapi/nvapi64.dll'
     if not nvapi.is_file():
         nvapi = runtime / 'nvapi/gfx1101/nvapi64.dll'
@@ -82,7 +106,8 @@ def main():
                    D4R_ZLUDA_PROFILE_EVERY='1')
     try:
         reference = None
-        for index, batched in enumerate((False, True, True, False)):
+        variants = {'abba': (False, True, True, False), 'controls': (False,) * 4, 'batches': (True,) * 4}
+        for index, batched in enumerate(variants[args.sequence]):
             label = ('native-candidate' if args.candidate_native else 'batch') if batched else 'control'
             output = args.output / f'{index}-{label}'
             output.mkdir()
@@ -92,17 +117,32 @@ def main():
             else:
                 env.pop('D4R_BATCH_INPUT_COPIES', None)
             env['D4R_ZLUDA_NATIVE_DIR'] = str(args.candidate_native if batched and args.candidate_native else native)
-            command = [str(args.probe), '--module', str(args.shim), '--hip-root', str(runtime / 'hip'),
+            if args.player_config:
+                config = (Path(__file__).resolve().parents[2] / 'packaging/windows/d4r.ini').read_text()
+                config = re.sub(r'(?m)^BatchInputCopies\s*=\s*(?:true|false)\s*$',
+                                'BatchInputCopies = ' + str(batched and not args.candidate_native).lower(), config)
+                selected_native = args.candidate_native if batched and args.candidate_native else native
+                config = config.replace('NativeDir = auto', 'NativeDir = ' + str(selected_native))
+                (runtime / 'd4r.ini').write_text(config)
+            command = [str(args.probe), '--module', str(module), '--hip-root', str(runtime / 'hip'),
                        '--cuda-dll', str(runtime / 'zluda/nvcuda.dll'), '--ngx-core', str(args.core),
                        '--dlss-dll', str(args.dlss), '--nvapi-dll', str(nvapi),
                        '--ngx-abi', 'project', '--interop-mode', 'command-list', '--preset', '11',
                        '--ngx-output-resolution', args.resolution,
                        '--ngx-input-resolution', args.input_resolution, '--iterations', str(args.frames)]
+            if args.player_config:
+                command += ['--player-mode', '1']
+            if args.reset_every_frame:
+                command += ['--reset-every-frame', '1']
             with (output / 'stdout.log').open('wb') as out, (output / 'stderr.log').open('wb') as err:
                 result = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=180)
+            if args.player_config and (runtime / 'd4r_nvngx.log').exists():
+                shutil.copy2(runtime / 'd4r_nvngx.log', output / 'player.log')
             text = (output / 'stdout.log').read_text(errors='replace')
             if result.returncode or 'PASS D3D12_DLSS' not in text:
                 raise RuntimeError(f'run {index} failed ({result.returncode}); inspect {output}')
+            if args.reset_every_frame and 'D3D12_RESET every_frame=1' not in text:
+                raise RuntimeError('Requested reset diagnostic was not applied')
             iw, ih = map(int, args.input_resolution.split('x'))
             expected_size = f'D3D12_NGX_DIMENSIONS input={iw}x{ih} output={ow}x{oh}'
             if expected_size not in text or f'D4R_INTEROP async=0 batch_inputs={int(batched and not args.candidate_native)}' not in text:
@@ -118,6 +158,9 @@ def main():
             if reference is None:
                 reference = hashes
             elif hashes != reference:
+                report['mismatchRun'] = index
+                report['differentFrames'] = [name for name, digest in hashes.items() if reference.get(name) != digest]
+                report['mismatchedOutputHashes'] = hashes
                 raise RuntimeError(f'run {index}: output differs from control')
             report['runs'].append({'batch': batched and not bool(args.candidate_native),
                                    'candidate': batched, 'allFrameMs': times,
@@ -125,6 +168,8 @@ def main():
             print(f'run={index} variant={label} warmed_cpu_interop_ms={statistics.median(times[4:]):.3f}', flush=True)
         for mode in (False, True):
             values = [t for row in report['runs'] if row['candidate'] == mode for t in row['allFrameMs'][4:]]
+            if not values:
+                continue
             key = ('candidateMedianMs' if args.candidate_native else 'batchMedianMs') if mode else 'controlMedianMs'
             report[key] = statistics.median(values)
         report['passed'] = True

@@ -120,6 +120,7 @@ struct Args {
     std::string barrier_mode = "legacy";
     bool early_indirect = false;
     bool player_mode = false;
+    bool reset_each_frame = false;
     std::string ngx_core, dlss_dll;
     std::string nvapi_dll;
     std::string ngx_abi = "driver";
@@ -131,6 +132,7 @@ struct Args {
     std::string ngx_mode = "init";
     unsigned preset = 11;
     unsigned ngx_create_flags = 0;
+    unsigned ngx_quality = 2;
     unsigned output_width = 512, output_height = 288;
     unsigned input_width = 0, input_height = 0;
     std::string fixture_dir;
@@ -162,6 +164,7 @@ struct Args {
             }
             else if (key == "--early-indirect") early_indirect = value == "1";
             else if (key == "--player-mode") player_mode = value == "1";
+            else if (key == "--reset-every-frame") reset_each_frame = value == "1";
             else if (key == "--ngx-core") ngx_core = value;
             else if (key == "--dlss-dll") dlss_dll = value;
             else if (key == "--nvapi-dll") nvapi_dll = value;
@@ -189,6 +192,12 @@ struct Args {
                 ngx_create_flags = static_cast<unsigned>(std::stoul(value, &end));
                 if (end != value.size() || (ngx_create_flags != 0 && ngx_create_flags != 11))
                     throw std::runtime_error("ngx-create-flags must be 0 or 11 (HDR, low-resolution MV, inverted depth)");
+            }
+            else if (key == "--ngx-quality") {
+                size_t end = 0;
+                const auto parsed = std::stoul(value, &end);
+                if (end != value.size() || parsed > 5) throw std::runtime_error("ngx-quality must be 0..5");
+                ngx_quality = static_cast<unsigned>(parsed);
             }
             else if (key == "--ngx-output-resolution") {
                 const auto separator = value.find('x');

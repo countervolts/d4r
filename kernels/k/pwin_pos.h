@@ -121,6 +121,13 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
             }
     }
 
+#ifndef POS_VSHARE
+    // Without the shared V^T slots every wave computed V of ALL 64 tokens from hb in every head, i.e. it read the rows of
+    // the other waves. The residual stage below overwrites this wave's own hb rows with the MLP input; without a
+    // block barrier a fast wave does that while a slower one still reads those rows for a later head (a rare,
+    // timing-dependent wrong result seen on gfx1101: enc0 outputs differing between identical launches).
+    block_sync();
+#endif
     STAMP(3);
     // ---- residual, MLP init acc = x1 + b2, MLP input m = x1 * g2 (-> hb)
 #pragma unroll

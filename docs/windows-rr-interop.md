@@ -1,5 +1,95 @@
 # Native RR D3D12/Vulkan bridge gate
 
+## Current output coverage: RGBA16F and RGBA32F
+
+Native RR now accepts `DXGI_FORMAT_R32G32B32A32_FLOAT` output as well as the
+existing RGBA16F output. Model inference remains unchanged. A same-size nearest
+Vulkan image blit widens the model's half output on the GPU, then copies the
+float32 image through the shared packet into the borrowed D3D12 output texture.
+The backend checks source/destination blit support and allocates a private
+device-local conversion image only when needed. Packet output space reserves
+the largest supported texel size. No CPU tensor conversion enters production.
+
+Output format may change between frames without feature/model recreation or
+history reset. The conversion image is retained, with explicit transfer
+read/write barriers. Output dimensions remain fixed. Other encodings, external
+exposure conversion and game/reference-quality validation remain open.
+
+Synthetic D: eight frames across dynamic dimensions, two live features,
+creation-sized input resources, optional guides and enhanced/inherited states
+pass all 16 evaluations. Every RGBA32F component matches the independently
+widened standalone half reference exactly. Synthetic E: six inverted D32S8
+frames alternate half/float32 output without losing temporal consistency or
+changing stencil. Packaged v8 loader/INI with two live E features passes all 12
+evaluations. Final handles/parameters are released before queued submission.
+This establishes output conversion and engine consistency, not NVIDIA reference
+quality, game RR or a performance improvement.
+
+Evidence: `build/rr-ngx-output32-d-v1/summary.json`,
+`build/rr-ngx-output-switch-e-v1/summary.json`, and
+`build/rr-ngx-local-v8-output-switch-e-v1/summary.json`. Prior baseline binaries
+remain in `build/rr-output32-baseline-v1/`; older ZIPs remain unchanged.
+
+## Current native RR coverage: dynamic render sizes and two live features
+
+Native NGX feature 13 accepts per-frame render dimensions from 64 pixels through
+the feature's creation dimensions. Output size remains fixed. Each queued frame
+owns its render dimensions alongside the existing resource/scalar/matrix
+snapshot. Dimension changes rebuild size-dependent views, descriptors and
+temporal history only after prior GPU work retires. Vulkan model pipelines,
+uploaded weights, the creation-sized shared packet and timeline fence survive.
+History resets implicitly on a size change, even without a caller Reset flag.
+Unchanged dimensions preserve history. Invalid dimensions fail before recording
+or submission; failed reconfiguration poisons the backend rather than allowing
+partially rebuilt history to run.
+
+`prepare_rr_dynamic_fixture.py` generates independent standalone segment
+references and combines them into an NGX sequence with no explicit reset at size
+changes. The sequence is 96x96 twice, 64x64 twice, 96x96 twice, and 72x80 twice,
+with fixed 192x192 output and alternating absent/present optional guides.
+The 48x48 first fixture failed at the engine's existing 64-pixel minimum before
+NGX testing; it remains preserved. Corrected D/E fixtures each pass eight exact
+frames. D passes without SR dependencies; E passes player INI selection.
+
+`test_rr_ngx.py --dynamic-extents` checks every size/output and the exact resize
+diagnostic sequence. `--two-features` evaluates two live RR features with separate
+Vulkan devices on each game command list. It reads back both outputs separately
+and releases both handles/parameters before final submission. Packaged v7 E
+passes all 16 evaluations with enhanced/inherited access, optional guides and
+owned geometry. `--max-resources` retains creation-sized D3D12 input textures
+while the render rectangles change; that path also passes 16 exact evaluations.
+This tests multiple live handles and ordered delayed submission, not parallel
+GPU inference, threaded submission or asynchronous throughput.
+
+Six static D frames still pass inverted D32S8 depth, unchanged stencil,
+RGBA32/RG32/scalar-R16 guide switching and AutoExposure. All comparisons are
+against the same standalone engine, not NVIDIA quality-reference frames or game
+RR. No performance gain is claimed for resize support or model reuse.
+
+Evidence: `build/rr-ngx-dynamic-d-v2/summary.json`,
+`build/rr-ngx-dynamic-e-v2/summary.json`,
+`build/rr-ngx-dynamic-two-features-d-v1/summary.json`,
+`build/rr-ngx-local-v7-dynamic-two-e-v1/summary.json`,
+`build/rr-ngx-local-v7-max-dynamic-two-e-v1/summary.json`, and
+`build/rr-ngx-local-v7-static-regression-v2/summary.json`.
+The first E wrapper run completed all exact GPU outputs but failed its diagnostic
+check because player mode redirects stderr to d4r_nvngx.log. The verifier now
+reads that log in player mode; the corrected run passes. Earlier artifacts and
+baseline shim/probe copies remain intact under build/rr-dynamic-baseline-v1/.
+The first v7 static regression invoked the target DLL directly beside its
+player INI while requesting an environment-only/no-SR test. Player configuration
+correctly overrode those environment settings and rejected missing local SR
+dependencies before GPU evaluation. The corrected packaged-loader/player-INI
+fixture supplies pinned dependencies and passes all six frames; no policy block
+or bypass occurred.
+
+Other existing native coverage includes optional guides, float/UNORM inputs,
+typed/typeless D32/D32S8 depth, preserved stencil and creation-flag validation.
+Guide encodings, external exposure conversion, output-format conversion, output
+size changes, broader concurrency, game/reference-quality validation and FSR
+execution remain incomplete. Older sections below describe earlier milestones;
+the newest checklist entries supersede those earlier limitations.
+
 ## Runtime extraction in progress (2026-10-16)
 
 The packet layout now has a geometry-only constructor with no fixture I/O.

@@ -1,0 +1,11 @@
+diff --git a/util/util_small_vector.h b/util/util_small_vector.h
+index 78881c4..a20efbf 100644
+--- a/util/util_small_vector.h
++++ b/util/util_small_vector.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <new>
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>

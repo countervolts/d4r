@@ -4,12 +4,22 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 // Native Windows uses the installed driver's normal D3D12 path. Do not import
 // Proton's amdxc64 shim or Linux PCI/sysfs discovery into this process.
 inline bool d4r_fsr_rr_driver_extension(ID3D12Device* device, std::string& detail)
 {
+    // Experimental: the denoiser only consults amdxc64.dll when it is already loaded in the process. With
+    // D4R_FSR_AMDXC_SHIM=path, preload d4r's own shim (tools/windows/amdxc64_shim) for a vkd3d-proton device.
+    // AMD's real amdxc64.dll is never loaded by this helper.
+    if (const char* shim = std::getenv("D4R_FSR_AMDXC_SHIM")) {
+        if (!LoadLibraryA(shim)) {
+            detail = "D4R_FSR_AMDXC_SHIM could not be loaded";
+            return false;
+        }
+    }
     LUID luid{};
     device->GetAdapterLuid(&luid);
     IDXGIFactory4* factory = nullptr;

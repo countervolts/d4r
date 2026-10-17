@@ -46,6 +46,16 @@ int wmain(int argc, wchar_t** argv) {
     expect(s.preset == 12 && has_note(notes, "not validated"), "Model = 12 selects NGX preset 12 with limitation note");
     s = settings("[Interop]\nAsyncInterop = yes\n[Debug]\nValidateOutput = on\nLog = verbose\n", notes);
     expect(s.asyncInterop && s.validateOutput && s.verbose && notes.empty(), "boolean spellings and Log = verbose");
+    s = settings("[Interop]\nBatchInputCopies = yes\n", notes);
+    expect(s.batchInputCopies && notes.empty(), "input batching selected through player INI");
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(std::getenv("D4R_BATCH_INPUT_COPIES") != nullptr, "player environment enables input batching");
+    s = settings("[Interop]\nBatchInputCopies = invalid\n", notes);
+    expect(!s.batchInputCopies && has_note(notes, "BatchInputCopies must be true or false"), "invalid batching falls back to unbatched with a note");
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(std::getenv("D4R_BATCH_INPUT_COPIES") == nullptr, "player environment clears earlier input batching");
+    s = settings("", notes);
+    expect(!s.batchInputCopies && notes.empty(), "older INIs retain unbatched behavior");
     s = settings("[Debug]\nValidateOutput = maybe\nLog = loud\n", notes);
     expect(!s.validateOutput && !s.verbose && has_note(notes, "must be true or false, not 'maybe'") &&
         has_note(notes, "must be normal or verbose"), "invalid values fall back with plain notes");
@@ -77,11 +87,30 @@ int wmain(int argc, wchar_t** argv) {
     expect(std::string(std::getenv("D4R_RR_BACKEND")) == "native" &&
         std::filesystem::path(_wgetenv(L"D4R_RR_MODEL_DIR")) == player::rr_model_directory(dir, s), "native RR environment selected without a launcher");
     s = settings("[RayReconstruction]\nBackend = fsr\n", notes);
-    expect(s.rrBackend == "fsr" && has_note(notes, "FSR RR is unavailable"), "unavailable FSR selection remains explicit");
+    expect(s.rrBackend == "fsr" && has_note(notes, "FSR RR is experimental"), "FSR selection is reported as experimental");
+    s = settings("[RayReconstruction]\nBackend = fsr\nFsrDenoiser = amd\\denoiser.dll\n", notes);
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(std::string(std::getenv("D4R_RR_BACKEND")) == "fsr" &&
+        std::filesystem::path(_wgetenv(L"D4R_FSR_RR_DLL")) == std::filesystem::absolute(dir / L"amd" / L"denoiser.dll").lexically_normal() &&
+        std::filesystem::path(_wgetenv(L"D4R_FSR_VKD3D_CORE")) == dir / L"fsr" / L"d4r_vkd3d_core.dll" &&
+        std::filesystem::path(_wgetenv(L"D4R_FSR_AMDXC_SHIM")) == dir / L"fsr" / L"amdxc64.dll" &&
+        std::filesystem::path(_wgetenv(L"D4R_FSR_CACHE_DIR")) == dir / L"cache" / L"vkd3d" && !std::getenv("D4R_RR_MODEL_DIR"),
+        "FSR environment selected from d4r.ini without a launcher");
+    s = settings("[RayReconstruction]\nBackend = fsr\nFsrStabilityBias = 0\nFsrDetail = 0.25\n", notes);
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(notes.empty() || has_note(notes, "experimental"), "FSR tuning keys are recognized");
+    expect(std::string(std::getenv("D4R_FSR_RR_STABILITY_BIAS")) == "0" && std::string(std::getenv("D4R_FSR_RR_DETAIL")) == "0.25",
+        "FSR tuning reaches the environment");
+    s = settings("[RayReconstruction]\nBackend = fsr\nFsrStabilityBias = auto\nFsrDetail = 2\n", notes);
+    s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
+    expect(has_note(notes, "FsrDetail must be a number from 0 to 1") && !std::getenv("D4R_FSR_RR_STABILITY_BIAS") && !std::getenv("D4R_FSR_RR_DETAIL"),
+        "auto bias leaves AMD's default and an out-of-range detail is rejected");
     s = settings("[RayReconstruction]\nBackend = typo\n", notes);
     expect(s.rrBackend == "off" && has_note(notes, "Backend must be"), "invalid RR backend stays off");
     s = settings("", notes); s.cacheDir = (dir / L"cache").wstring(); player::apply(dir, s);
-    expect(!std::getenv("D4R_RR_BACKEND") && !std::getenv("D4R_RR_MODEL_DIR"), "default RR off clears stale selection");
+    expect(!std::getenv("D4R_RR_BACKEND") && !std::getenv("D4R_RR_MODEL_DIR") && !std::getenv("D4R_FSR_RR_DLL") &&
+        !std::getenv("D4R_FSR_VKD3D_CORE") && !std::getenv("D4R_FSR_AMDXC_SHIM") && !std::getenv("D4R_FSR_CACHE_DIR") &&
+        !std::getenv("D4R_FSR_RR_STABILITY_BIAS") && !std::getenv("D4R_FSR_RR_DETAIL"), "default RR off clears stale selection");
 
     std::filesystem::create_directories(dir / L"nvapi");
     { std::ofstream(dir / L"nvapi" / L"nvapi64.dll", std::ios::binary) << "generic nvapi fixture"; }

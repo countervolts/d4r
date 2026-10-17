@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 import subprocess
+import struct
 
 
 def main():
@@ -19,6 +20,11 @@ def main():
     parser.add_argument('--float-guides', action='store_true', help='exercise equivalent float32 color/motion/normals and scalar roughness')
     parser.add_argument('--switch-guides', action='store_true', help='alternate canonical and float guide formats without recreating feature')
     parser.add_argument('--auto-exposure', action='store_true', help='also set the public NGX AutoExposure creation flag')
+    parser.add_argument('--dynamic-extents', action='store_true', help='read per-frame bounded render dimensions from dynamic-extents.txt')
+    parser.add_argument('--two-features', action='store_true', help='evaluate two live independent RR features on each game command list')
+    parser.add_argument('--max-resources', action='store_true', help='retain creation-sized textures while dynamic input rectangles change')
+    parser.add_argument('--output-float32', action='store_true', help='validate GPU half-to-float32 output conversion against widened standalone output')
+    parser.add_argument('--switch-output', action='store_true', help='alternate half/float32 output formats without recreating feature')
     parser.add_argument('--depth-format', choices=('r32', 'r32-typeless', 'd32', 'd32s8', 'd32s8-typeless'), default='r32', help='exercise native depth-plane copy format')
     parser.add_argument('--player-config', action='store_true', help='stage a private player folder and select RR only through d4r.ini')
     parser.add_argument('--use-existing-ini', action='store_true', help='preserve the selected runtime INI when staging player validation')
@@ -35,6 +41,12 @@ def main():
         parser.error('--without-sr requires --contracts and a configured native RR backend')
     if args.switch_guides and not args.float_guides:
         parser.error('--switch-guides requires --float-guides')
+    if args.dynamic_extents and (args.float_guides or args.switch_guides or args.depth_format != 'r32'):
+        parser.error('--dynamic-extents currently uses canonical guides and R32 depth')
+    if args.max_resources and not args.dynamic_extents:
+        parser.error('--max-resources requires --dynamic-extents')
+    if args.switch_output and (not args.output_float32 or args.max_resources):
+        parser.error('--switch-output requires --output-float32 and cannot retain max resources')
     build = Path(__file__).resolve().parents[2] / 'build'
     if not args.output.is_relative_to(build.resolve()):
         parser.error('output must stay under ignored build/')
@@ -92,6 +104,16 @@ def main():
         mode += '-switch-guides'
     if args.auto_exposure:
         mode += '-auto-exposure'
+    if args.dynamic_extents:
+        mode += '-dynamic-extents'
+    if args.two_features:
+        mode += '-two-features'
+    if args.max_resources:
+        mode += '-max-resources'
+    if args.output_float32:
+        mode += '-output-float32'
+    if args.switch_output:
+        mode += '-switch-output'
     if args.depth_format != 'r32':
         mode += '-depth-' + args.depth_format
     if mode:
@@ -128,6 +150,32 @@ def main():
             raise RuntimeError('NGX RR temporal guide-format switching checks incomplete')
         if args.auto_exposure and 'PASS RR_NGX_FLAGS' not in text:
             raise RuntimeError('NGX RR creation flag checks incomplete')
+        if args.dynamic_extents:
+            extents = [tuple(map(int, line.split())) for line in (args.inputs / 'dynamic-extents.txt').read_text().splitlines()]
+            if 'PASS RR_NGX_DYNAMIC_EXTENTS' not in text:
+                raise RuntimeError('NGX RR dynamic extent checks incomplete')
+            for index, (width, height) in enumerate(extents):
+                if f'RR_NGX_EXTENT index={index} render={width}x{height} exact=1' not in text:
+                    raise RuntimeError('Incomplete NGX RR dynamic extent output')
+            creation = tuple(map(int, (args.inputs / 'frames.txt').read_text().splitlines()[0].split()[1:3]))
+            previous, expected_resizes = creation, []
+            for size in extents:
+                if size != previous:
+                    expected_resizes.extend([f'D4R_RR_RESIZE render={size[0]}x{size[1]} history_reset=1 model_reused=1 packet_reused=1'] * (2 if args.two_features else 1))
+                previous = size
+            diagnostics = args.output / ('player/d4r_nvngx.log' if args.player_config else 'stderr.log')
+            actual_resizes = [line for line in diagnostics.read_text().splitlines() if line.startswith('D4R_RR_RESIZE ')]
+            if actual_resizes != expected_resizes:
+                raise RuntimeError('NGX RR resize operations differ from requested sequence')
+            if args.contracts and 'RR_NGX_EXTENT_BOUNDS' not in text:
+                raise RuntimeError('NGX RR extent bounds checks missing')
+            report['dynamicExtents'] = extents
+            report.update(geometryChanges=len(expected_resizes), modelReusedAcrossResize=True,
+                          packetReusedAcrossResize=True, historyResetOnResize=True)
+        if args.max_resources:
+            if 'PASS RR_NGX_MAX_RESOURCES' not in text:
+                raise RuntimeError('NGX RR creation-sized dynamic input checks missing')
+            report['creationSizedInputResourcesRetained'] = True
         depth_values = {'r32-typeless': 39, 'd32': 40, 'd32s8': 20, 'd32s8-typeless': 19}
         if args.depth_format != 'r32':
             marker = f'PASS RR_NGX_DEPTH format={depth_values[args.depth_format]} stencil_preserved={int(args.depth_format.startswith("d32s8"))}'
@@ -140,9 +188,35 @@ def main():
         outputs = sorted(path.name for path in (args.output / 'frames').glob('*-out.bin'))
         if outputs != sorted(expected):
             raise RuntimeError('Incomplete NGX RR output set')
+        def reference_bytes(name):
+            data = (args.reference / name).read_bytes()
+            if args.output_float32 and (not args.switch_output or expected.index(name) % 2):
+                return b''.join(struct.pack('<f', value[0]) for value in struct.iter_unpack('<e', data))
+            return data
         for name in expected:
-            if (args.output / 'frames' / name).read_bytes() != (args.reference / name).read_bytes():
+            if (args.output / 'frames' / name).read_bytes() != reference_bytes(name):
                 raise RuntimeError('NGX RR reference mismatch: ' + name)
+        if args.two_features:
+            if 'PASS RR_NGX_TWO_FEATURES' not in text:
+                raise RuntimeError('NGX RR two-feature lifecycle checks incomplete')
+            peer_outputs = sorted(path.name for path in (args.output / 'frames/peer').glob('*-out.bin'))
+            if peer_outputs != sorted(expected):
+                raise RuntimeError('Incomplete first-feature output set')
+            for index, name in enumerate(expected):
+                if (args.output / 'frames/peer' / name).read_bytes() != reference_bytes(name):
+                    raise RuntimeError('NGX RR first-feature reference mismatch: ' + name)
+                if f'RR_NGX_PEER_FRAME index={index} exact=1 both_features_live=1' not in text:
+                    raise RuntimeError('NGX RR first-feature validation incomplete')
+            report.update(liveFeatures=2, bothFeaturesStandaloneExact=True, separateVulkanDevices=True,
+                          twoDelayedBoundariesPerCommandList=True, bothReleasedBeforeFinalSubmit=True)
+        if args.output_float32:
+            if 'PASS RR_NGX_OUTPUT_FLOAT32' not in text:
+                raise RuntimeError('NGX RR float32 output checks missing')
+            report.update(outputFormat='RGBA32F', gpuOutputConversion=True, widenedHalfReferenceExact=True)
+        if args.switch_output:
+            if 'PASS RR_NGX_SWITCH_OUTPUT' not in text:
+                raise RuntimeError('NGX RR temporal output format switching checks missing')
+            report.update(outputFormat='alternating RGBA16F/RGBA32F', outputFormatSwitchWithoutFeatureRecreation=True)
         optional_names = ('hitdistance', 'disocclusion', 'sss', 'particles')
         optional_frames = {name: sum((args.inputs / (frame.removesuffix('-out.bin') + '-' + name + '.bin')).is_file()
                                      for frame in expected) for name in optional_names}

@@ -19,13 +19,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 namespace d4r {
 class HipNetwork {
 public:
-    // tokensFd, outputFd: opaque file descriptors of the two shared Vulkan allocations (ownership passes to HIP);
+    // tokensFd, outputFd: opaque file descriptors (Linux) or Win32 NT handles (Windows; the caller keeps ownership) of the two shared Vulkan allocations (ownership passes to HIP);
     // allocationBytes: the size of each allocation; the buffers start at offset 0. width/height are preset
     // dependent, as above.
-    HipNetwork(const std::string& modelDirectory, uint32_t width, uint32_t height, int tokensFd, int outputFd,
+    HipNetwork(const std::string& modelDirectory, uint32_t width, uint32_t height, intptr_t tokensFd, intptr_t outputFd,
                uint64_t tokensAllocationBytes, uint64_t outputAllocationBytes);
     ~HipNetwork();
     HipNetwork(const HipNetwork&) = delete;
@@ -34,6 +35,12 @@ public:
     bool done();        // true once the queued layers have finished
     void wait();        // blocks until they have
     float lastMilliseconds(); // GPU time of the last finished launch
+    // Diagnostic: relaunches the network `rounds` x 8 times on the unchanged input tokens (the graphs cycle with
+    // period 8) and returns an FNV-1a hash of the output buffer after each launch, rounds-major.
+    std::vector<uint64_t> debugRepeatHashes(uint32_t rounds);
+    // Diagnostic: median GPU microseconds of every launch node of graph `phase` run individually (not graph-fused),
+    // over `trials` runs. Node order is network order, a layer's post kernels following its main kernel.
+    std::vector<float> debugNodeMicros(uint32_t phase, uint32_t trials);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

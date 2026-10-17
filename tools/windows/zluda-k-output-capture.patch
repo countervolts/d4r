@@ -1,0 +1,23 @@
+# Base Windows capture-helper SHA256: 517e0b158fad0070c556d84ce62749159a4b1f1a7b4bee93632f62cc23b3ec0e
+--- a/zluda/src/impl/d4r_replay.rs
++++ b/zluda/src/impl/d4r_replay.rs
+@@ -15,6 +15,10 @@
+         "dltss_pwin_dec1_layer" | "dltss_pwin_dec0_layer" => Some(176),
+         "rrlite_enc1_4x4" | "rrlite_enc2_4x4" | "rrlite_dec2_4x4" | "rrlite_dec1_4x4" => Some(56),
+         "rrlite_enc3_tube_4x4" => Some(88),
++        // Audited SR 310.9.1 output variant: the reconstruction LUT pointer is
++        // at byte 280 of this exact 328-byte PTX argument block. Other texture
++        // kernels remain outside this capture hook's whitelist.
++        "hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel" => Some(328),
+         _ => None,
+     }
+ }
+@@ -131,6 +135,8 @@
+         assert_eq!(super::parameter_size("rrlite_enc3_tube_4x4"), Some(88));
+         assert_eq!(super::parameter_size("dltss_pwin_enc0_layer_prep"), None);
+         assert_eq!(super::parameter_size("rrlite_enc3_tube_4x4_prep"), None);
++        assert_eq!(super::parameter_size("hiluma_engine_output_depthreg_mvhi_ldr_max_v2_rel"), Some(328));
++        assert_eq!(super::parameter_size("hiluma_engine_output_depthreg_mvhi_hdr_max_v2_rel"), None);
+         assert_eq!(super::parameter_size("dltss_pwin_unknown_layer"), None);
+     }
+ }

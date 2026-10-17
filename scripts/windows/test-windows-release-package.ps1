@@ -54,7 +54,8 @@ $release=Join-Path $OutputDirectory 'release'
 Invoke-Package $prefix $release
 foreach ($path in @('dxgi.dll','OptiScaler.ini','d4r/_nvngx.dll','d4r/d4r.ini','d4r/dll-pins.txt','d4r/package.json',
                     'd4r/hip/bin/amdhip64_7.dll','d4r/zluda/nvcuda.dll','d4r/licenses/d4r.txt','d4r/ngx/PUT _nvngx.dll HERE.txt',
-                    'd4r/gpu-targets.json','d4r/d4r_gpu_inventory.exe','d4r/d4r-check.ps1','WINDOWS_README.txt')) {
+                    'd4r/gpu-targets.json','d4r/d4r_gpu_inventory.exe','d4r/d4r-check.ps1','WINDOWS_README.txt',
+                    'install.bat','install-dependencies.py','d4r/model-tools/python/python.exe','d4r/model-tools/rr-tools.json')) {
     if (!(Test-Path -LiteralPath (Join-Path $release $path))) { throw "Release lacks $path" }
 }
 if ((Get-Content -LiteralPath (Join-Path $release 'd4r/_nvngx.dll') -Raw).Trim() -ne 'loader fixture') { throw 'd4r/_nvngx.dll is not the loader.' }
@@ -91,6 +92,47 @@ try { & (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePref
 if (!$rejected) { throw 'An unknown architecture was not rejected.' }
 $results+=@{case='architecture-subset'; passed=$true; shipped=$kept}
 
+# 1c. The optional FSR payload (vkd3d-proton core + amdxc64 shim) ships under d4r/fsr with its licences and source
+#     offer; AMD's denoiser never ships; a payload that claims to bundle it, or a changed file, is rejected.
+function New-FsrPayload([string]$Root,[bool]$ClaimsAmd) {
+    $files=[ordered]@{'fsr/d4r_vkd3d_core.dll'='core fixture'; 'fsr/amdxc64.dll'='shim fixture'; 'SOURCE.txt'='source offer';
+                      'licenses/vkd3d-proton-LGPL-2.1.txt'='lgpl'; 'licenses/dxil-spirv-MIT.txt'='mit'}
+    $hashes=[ordered]@{}
+    foreach ($entry in $files.GetEnumerator()) {
+        $path=Join-Path $Root $entry.Key; New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
+        Set-Content -LiteralPath $path $entry.Value -Encoding ASCII
+        $hashes[$entry.Key]=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    @{schema=1; kind='d4r-fsr-payload'; amdDenoiserBundled=$ClaimsAmd; files=$hashes} | ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath (Join-Path $Root 'fsr-payload.json') -Encoding UTF8
+}
+$goodPrefix=Join-Path $OutputDirectory 'inputs/good/game'
+$payload=Join-Path $OutputDirectory 'fsr-payload'; New-FsrPayload $payload $false
+$fsrRelease=Join-Path $OutputDirectory 'release-fsr'
+& (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $goodPrefix -LoaderDll $loader -PackageRoot $fsrRelease -FsrPayload $payload | Out-Null
+foreach ($path in @('d4r/fsr/d4r_vkd3d_core.dll','d4r/fsr/amdxc64.dll','d4r/fsr/SOURCE.txt','d4r/licenses/vkd3d-proton-LGPL-2.1.txt',
+                    'd4r/licenses/dxil-spirv-MIT.txt','d4r/fsr/patches/0001-dxil-spirv-include-exception-for-libcxx.patch')) {
+    if (!(Test-Path -LiteralPath (Join-Path $fsrRelease $path))) { throw "FSR release lacks $path" }
+}
+if (Get-ChildItem -LiteralPath $fsrRelease -Recurse -Filter 'amd_fidelityfx_denoiser_dx12.dll') { throw "AMD's denoiser must never ship." }
+$fsrManifest=Get-Content -LiteralPath (Join-Path $fsrRelease 'd4r/package.json') -Raw | ConvertFrom-Json
+foreach ($file in $fsrManifest.files) {
+    if ((Get-FileHash -LiteralPath (Join-Path $fsrRelease $file.path) -Algorithm SHA256).Hash -ne $file.sha256) { throw "FSR manifest hash wrong: $($file.path)" }
+}
+$fsrShipped=@(Get-ChildItem -LiteralPath $fsrRelease -Recurse -File | ForEach-Object { $_.FullName.Substring($fsrRelease.Length+1).Replace('\','/') } | Where-Object { $_ -ne 'd4r/package.json' })
+if (Compare-Object $fsrShipped @($fsrManifest.files.path)) { throw 'FSR release manifest and shipped files differ.' }
+if (Test-Path -LiteralPath (Join-Path $release 'd4r/fsr')) { throw 'The default release must not carry the FSR payload.' }
+$claims=Join-Path $OutputDirectory 'fsr-payload-claims-amd'; New-FsrPayload $claims $true
+$rejected=$false
+try { & (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $goodPrefix -LoaderDll $loader -PackageRoot (Join-Path $OutputDirectory 'release-fsr-claims') -FsrPayload $claims | Out-Null } catch { $rejected=$_.Exception.Message -match 'Unsupported FSR payload' }
+if (!$rejected) { throw 'A payload claiming to bundle AMD software was not rejected.' }
+$tampered=Join-Path $OutputDirectory 'fsr-payload-tampered'; New-FsrPayload $tampered $false
+Set-Content -LiteralPath (Join-Path $tampered 'fsr/amdxc64.dll') 'changed after hashing' -Encoding ASCII
+$rejected=$false
+try { & (Join-Path $PSScriptRoot 'package-windows-release.ps1') -GamePackagePrefix $goodPrefix -LoaderDll $loader -PackageRoot (Join-Path $OutputDirectory 'release-fsr-tampered') -FsrPayload $tampered | Out-Null } catch { $rejected=$_.Exception.Message -match 'FSR payload file changed' }
+if (!$rejected) { throw 'A changed FSR payload file was not rejected.' }
+$results+=@{case='fsr-payload'; passed=$true; files=$fsrShipped.Count}
+
 # 2. A code object for another GPU in a target's input is rejected.
 $prefix=Join-Path $OutputDirectory 'inputs/mixed/game'
 New-Inputs $prefix { param($root,$arch) if ($arch -eq 'gfx1101') { Write-CodeObject (Join-Path $root 'd4r/native/kernel3.hsaco') 65 } }
@@ -125,7 +167,7 @@ $metadata=Get-Content -LiteralPath (Join-Path $developmentRoot 'package/d4r/pack
 if(!$metadata.localDevelopment){throw 'Local ZIP lacks development marker.'}
 $archive=[IO.Compression.ZipFile]::OpenRead($zip)
 try{
-    foreach($required in @('install.bat','install-dlss.ps1','d4r/d4r.ini')){
+    foreach($required in @('install.bat','install-dlss.ps1','install-dependencies.py','d4r/d4r.ini','d4r/model-tools/python/python.exe')){
         if(!$archive.GetEntry($required)){throw "Local ZIP lacks $required"}
     }
 }finally{$archive.Dispose()}

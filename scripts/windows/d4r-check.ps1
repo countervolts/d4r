@@ -198,8 +198,8 @@ $iniPath = Join-Path $d4r 'd4r.ini'
 $model = 'K'
 if (Test-Path -LiteralPath $iniPath) {
     $section = ''; $iniProblems = 0
-    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'paths.nativedir' = 1; 'kernels.nativefp8' = 1; 'rayreconstruction.backend' = 1; 'rayreconstruction.modeldir' = 1 }
-    $boolean = @('dlss.showwatermark', 'interop.asyncinterop', 'debug.validateoutput', 'kernels.nativefp8')
+    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'interop.batchinputcopies' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'paths.nativedir' = 1; 'kernels.nativefp8' = 1; 'rayreconstruction.backend' = 1; 'rayreconstruction.modeldir' = 1 }
+    $boolean = @('dlss.showwatermark', 'interop.asyncinterop', 'interop.batchinputcopies', 'debug.validateoutput', 'kernels.nativefp8')
     foreach ($raw in (Read-TextFile $iniPath).TrimStart([char]0xFEFF) -split "`n") {
         $line = $raw.Trim()
         if (!$line -or $line.StartsWith(';') -or $line.StartsWith('#')) { continue }

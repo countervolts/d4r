@@ -1,0 +1,12 @@
+diff --git a/scratch_pool.hpp b/scratch_pool.hpp
+index 24fe09be..72866f24 100644
+--- a/scratch_pool.hpp
++++ b/scratch_pool.hpp
+@@ -25,6 +25,7 @@
+ #ifndef DXIL_SPV_SCRATCH_POOL_H_
+ #define DXIL_SPV_SCRATCH_POOL_H_
+ 
++#include <exception>
+ #include "thread_local_allocator.hpp"
+ 
+ namespace dxil_spv

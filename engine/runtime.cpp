@@ -569,7 +569,12 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     if ((input.flags & FrameFlagDisplayMotion) && !e.model.hasDisplayMotion)
         throw std::runtime_error("display-resolution motion needs a model compiled by the current compile_k.py");
     if (!(output.out2rnd[0] > 0 && output.out2rnd[0] <= 1 && output.out2rnd[1] > 0 && output.out2rnd[1] <= 1) ||
-        output.near2rnd[0] != output.out2rnd[0] || output.near2rnd[1] != output.out2rnd[1] ||
+        // Display-resolution motion bypasses the depth-neighbour lookup. NGX
+        // uses (1,1) for its unused nearest scale in that variant; standard
+        // frame construction uses the render ratio. Both are valid there.
+        (!(input.flags & FrameFlagDisplayMotion) &&
+            (output.near2rnd[0] != output.out2rnd[0] || output.near2rnd[1] != output.out2rnd[1])) ||
+        !(output.near2rnd[0] > 0 && output.near2rnd[0] <= 1 && output.near2rnd[1] > 0 && output.near2rnd[1] <= 1) ||
         !std::isfinite(output.sharp) ||
         !(std::isfinite(input.expo) && input.expo > 0 && std::isfinite(input.expoIn) && input.expoIn > 0 &&
           std::isfinite(output.expo) && output.expo > 0 && std::isfinite(input.expoRatio) && input.expoRatio > 0 &&

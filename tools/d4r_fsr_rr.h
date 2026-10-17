@@ -154,7 +154,7 @@ struct FsrRrRuntime
         uint64_t count = 0;
         ffxQueryDescGetVersions desc = {};
         desc.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-        desc.createDescType = FFX_API_EFFECT_ID_DENOISER;
+        desc.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER;
         desc.device = device;
         desc.outputCount = &count;
         queryResult = query(nullptr, &desc.header);

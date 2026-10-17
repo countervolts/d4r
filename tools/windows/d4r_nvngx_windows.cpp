@@ -5,6 +5,9 @@
 #if defined(D4R_NATIVE_RR_BACKEND)
 #include "rr_native_backend.h"
 #endif
+#if defined(D4R_FSR_RR_BACKEND)
+#include "fsr_rr_backend.h"
+#endif
 #include <dxgi.h>
 #include <unordered_map>
 #include <functional>
@@ -29,7 +32,7 @@ void initialize(ID3D12Device* device, unsigned long long app, const wchar_t* dat
     auto candidate = std::make_shared<d4r::win::RuntimeInitialization>(device, app, data, sdk, common, project);
     bool native = false;
 #if defined(D4R_NATIVE_RR_BACKEND)
-    const char* backend = std::getenv("D4R_RR_BACKEND"); native = backend && std::string(backend) == "native";
+    const char* backend = std::getenv("D4R_RR_BACKEND"); native = backend && (std::string(backend) == "native" || std::string(backend) == "fsr");
 #endif
     // Default SR startup remains eager. Native RR owns its Vulkan execution
     // independently; SR initializes only when its capabilities/feature are used.
@@ -40,20 +43,133 @@ struct Handle { unsigned Id; };
 unsigned nextId = 1;
 std::unordered_map<Handle*, std::shared_ptr<d4r::win::Feature>> features;
 #if defined(D4R_NATIVE_RR_BACKEND)
+bool rr_is_fsr() { const char* backend = std::getenv("D4R_RR_BACKEND"); return backend && std::string(backend) == "fsr"; }
+// One Ray Reconstruction feature served by the configured backend: native DLSS RR (D/E models) or FSR RR.
 struct RrFeature {
     d4r::win::rr::Creation creation;
-    d4r::win::rr::Backend backend;
+    std::unique_ptr<d4r::win::rr::Backend> native;
+#if defined(D4R_FSR_RR_BACKEND)
+    std::unique_ptr<d4r::win::rr::FsrBackend> fsr;
+    // The Super Sampling stage after FSR's denoiser: an internal feature 1 at the game's render and output sizes,
+    // configured like any SR feature ([DLSS] Model applies). Absent only when SR cannot start and output == render.
+    std::shared_ptr<d4r::win::Feature> sr;
+    void* srParams = nullptr;
+    ~RrFeature() { if (srParams) d4r_ngx_parameters_destroy(srParams); }
+    void start_super_sampling() {
+        try {
+            ensure_sr_runtime();
+            void* creationParams = d4r_ngx_parameters_create();
+            struct Guard { void* p; ~Guard() { d4r_ngx_parameters_destroy(p); } } guard{creationParams};
+            d4r_ngx_set_uint(creationParams, "Width", creation.width); d4r_ngx_set_uint(creationParams, "Height", creation.height);
+            d4r_ngx_set_uint(creationParams, "OutWidth", creation.outWidth); d4r_ngx_set_uint(creationParams, "OutHeight", creation.outHeight);
+            d4r_ngx_set_int(creationParams, "PerfQualityValue", creation.quality);
+            d4r_ngx_set_int(creationParams, "DLSS.Feature.Create.Flags", int(creation.flags));
+            d4r_ngx_set_int(creationParams, "DLSS.Enable.Output.Subrects", int(creation.outputSubrects));
+            d4r::win::player::apply_preset(creationParams);
+            sr = std::make_shared<d4r::win::Feature>(runtime, creationParams);
+            srParams = d4r_ngx_parameters_create();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "D4R_FSR_RR_SR_UNAVAILABLE %s\n", error.what());
+            sr.reset();
+            if (creation.outWidth != creation.width || creation.outHeight != creation.height)
+                throw std::runtime_error(std::string("FSR RR needs the Super Sampling stage to upscale, which is unavailable: ") + error.what());
+            return;  // output == render: the denoised colour goes straight to the output
+        }
+        fsr->set_super_sampling([this](ID3D12CommandQueue* queue, ID3D12Resource* denoised,
+                const d4r::win::rr::Snapshot& frame, const std::array<d4r::win::ResourceAccess, d4r::win::rr::Snapshot::Count>& access) {
+            using d4r::win::rr::Snapshot;
+            void* sp = srParams;
+            d4r_ngx_set_d3d12_resource(sp, "Color", denoised);
+            d4r_ngx_set_d3d12_resource(sp, "Depth", frame.resources[Snapshot::Depth].Get());
+            d4r_ngx_set_d3d12_resource(sp, "MotionVectors", frame.resources[Snapshot::Motion].Get());
+            d4r_ngx_set_d3d12_resource(sp, "Output", frame.resources[Snapshot::Output].Get());
+            d4r_ngx_set_d3d12_resource(sp, "ExposureTexture", frame.resources[Snapshot::Exposure].Get());
+            const auto& settings = frame.settings;
+            d4r_ngx_set_float(sp, "Jitter.Offset.X", settings.jitter[0]); d4r_ngx_set_float(sp, "Jitter.Offset.Y", settings.jitter[1]);
+            d4r_ngx_set_float(sp, "MV.Scale.X", settings.motionScale[0]); d4r_ngx_set_float(sp, "MV.Scale.Y", settings.motionScale[1]);
+            d4r_ngx_set_float(sp, "Sharpness", 0.0f);
+            d4r_ngx_set_float(sp, "DLSS.Pre.Exposure", settings.preExposure); d4r_ngx_set_float(sp, "DLSS.Exposure.Scale", frame.exposureScale);
+            d4r_ngx_set_float(sp, "FrameTimeDeltaInMsec", settings.frameTimeMs);
+            d4r_ngx_set_int(sp, "Reset", settings.reset ? 1 : 0);
+            d4r_ngx_set_uint(sp, "DLSS.Render.Subrect.Dimensions.Width", frame.renderWidth);
+            d4r_ngx_set_uint(sp, "DLSS.Render.Subrect.Dimensions.Height", frame.renderHeight);
+            d4r_ngx_set_uint(sp, "DLSS.Input.Color.Subrect.Base.X", 0); d4r_ngx_set_uint(sp, "DLSS.Input.Color.Subrect.Base.Y", 0);
+            d4r_ngx_set_uint(sp, "DLSS.Input.Depth.Subrect.Base.X", frame.origins[Snapshot::Depth][0]);
+            d4r_ngx_set_uint(sp, "DLSS.Input.Depth.Subrect.Base.Y", frame.origins[Snapshot::Depth][1]);
+            d4r_ngx_set_uint(sp, "DLSS.Input.MV.Subrect.Base.X", frame.origins[Snapshot::Motion][0]);
+            d4r_ngx_set_uint(sp, "DLSS.Input.MV.Subrect.Base.Y", frame.origins[Snapshot::Motion][1]);
+            d4r_ngx_set_uint(sp, "DLSS.Output.Subrect.Base.X", frame.origins[Snapshot::Output][0]);
+            d4r_ngx_set_uint(sp, "DLSS.Output.Subrect.Base.Y", frame.origins[Snapshot::Output][1]);
+            // resource states, as the shim's own feature-1 evaluation passes them
+            struct Plane { const char* state; d4r::win::ResourceAccess access; };
+            d4r::win::ResourceAccess denoisedAccess(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const Plane planes[] = {{"D4R.Color.State", denoisedAccess}, {"D4R.Depth.State", access[Snapshot::Depth]},
+                {"D4R.Motion.State", access[Snapshot::Motion]}, {"D4R.Output.State", access[Snapshot::Output]},
+                {"D4R.Exposure.State", access[Snapshot::Exposure]}};
+            for (const auto& plane : planes) {
+                const std::string prefix(plane.state);
+                d4r_ngx_set_uint(sp, plane.state, unsigned(plane.access.legacy));
+                d4r_ngx_set_uint(sp, (prefix + ".Enhanced").c_str(), plane.access.enhanced);
+                d4r_ngx_set_uint(sp, (prefix + ".Layout").c_str(), unsigned(plane.access.layout));
+                d4r_ngx_set_uint(sp, (prefix + ".Access").c_str(), unsigned(plane.access.access));
+            }
+            sr->evaluate_boundary(queue, sp);
+        }, sr->render_limits());
+    }
+#endif
     RrFeature(ID3D12Device* device, void* parameters, const std::string& directory)
-        : creation(parameters), backend(device, creation, directory) {}
+        : creation(parameters) {
+#if defined(D4R_FSR_RR_BACKEND)
+        if (rr_is_fsr()) {
+            fsr = std::make_unique<d4r::win::rr::FsrBackend>(device, creation, d4r::win::rr::FsrConfig::from_environment());
+            start_super_sampling();
+            return;
+        }
+#endif
+        native = std::make_unique<d4r::win::rr::Backend>(device, creation, directory);
+    }
+    void validate_frame(const d4r::win::rr::Snapshot& frame) {
+#if defined(D4R_FSR_RR_BACKEND)
+        if (fsr) { fsr->validate_frame(frame); return; }
+#endif
+        native->validate_frame(frame);
+    }
+    void evaluate(ID3D12CommandQueue* queue, const d4r::win::rr::Snapshot& frame,
+        const std::array<d4r::win::ResourceAccess, d4r::win::rr::Snapshot::Count>& access) {
+#if defined(D4R_FSR_RR_BACKEND)
+        if (fsr) { fsr->evaluate(queue, frame, access); return; }
+#endif
+        native->evaluate(queue, frame, access);
+    }
+    void drain() {
+#if defined(D4R_FSR_RR_BACKEND)
+        if (fsr) { fsr->drain(); if (sr) sr->drain(); return; }
+#endif
+        native->drain();
+    }
 };
 std::unordered_map<Handle*, std::shared_ptr<RrFeature>> rrFeatures;
 std::string rr_directory() {
     const char* backend = std::getenv("D4R_RR_BACKEND");
+    if (backend && std::string(backend) == "fsr") return {}; // FSR RR has no DLSS model directory
     if (!backend || std::string(backend) != "native")
-        throw std::runtime_error("Native RR requires D4R_RR_BACKEND=native");
+        throw std::runtime_error("Native RR requires D4R_RR_BACKEND=native (or fsr)");
     return d4r::win::env_path("D4R_RR_MODEL_DIR");
 }
+// FSR readiness is a cheap file check: building the backend loads vkd3d-proton and compiles AMD's shaders.
+bool fsr_ready() {
+#if defined(D4R_FSR_RR_BACKEND)
+    const auto config = d4r::win::rr::FsrConfig::from_environment();
+    auto present = [](const std::wstring& path) { return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    const bool ready = present(config.vkd3dCore) && present(config.denoiserDll) && present(config.amdxcShim);
+    if (!ready) std::fprintf(stderr, "D4R_RR_UNAVAILABLE FSR RR needs D4R_FSR_VKD3D_CORE, D4R_FSR_RR_DLL and D4R_FSR_AMDXC_SHIM to exist\n");
+    return ready;
+#else
+    return false;
+#endif
+}
 bool rr_ready(ID3D12Device* device) {
+    if (rr_is_fsr()) return fsr_ready();
     try {
         const auto directory = rr_directory();
         void* p = d4r_ngx_parameters_create();
@@ -270,7 +386,7 @@ API unsigned d4r_D3D12_EvaluateAtBoundary(ID3D12CommandQueue* queue, Handle* han
       auto it = rrFeatures.find(handle); if (it != rrFeatures.end()) rr = it->second; }
     if (rr) return call([&] {
         RrSnapshot snapshot(rr->creation, p, nullptr); snapshot.resolve();
-        rr->backend.evaluate(queue, snapshot.frame, snapshot.access); return 1u;
+        rr->evaluate(queue, snapshot.frame, snapshot.access); return 1u;
     });
 #endif
     std::shared_ptr<d4r::win::Feature> feature;
@@ -288,9 +404,9 @@ API unsigned NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, co
         auto snapshot = std::make_shared<RrSnapshot>(rr->creation, p, list);
         // Reject unsupported contracts before splitting the logical command
         // list. Submission still rechecks resources and resolved access.
-        rr->backend.validate_frame(snapshot->frame);
+        rr->validate_frame(snapshot->frame);
         d4r::win::commands::record_boundary(list, [rr, snapshot](ID3D12CommandQueue* queue) {
-            snapshot->resolve(); rr->backend.evaluate(queue, snapshot->frame, snapshot->access);
+            snapshot->resolve(); rr->evaluate(queue, snapshot->frame, snapshot->access);
         });
         return 1u;
     });
@@ -361,7 +477,7 @@ API unsigned NVSDK_NGX_D3D12_ReleaseFeature(Handle* handle) {
     { std::lock_guard<std::mutex> lock(apiMutex);
       auto it = rrFeatures.find(handle);
       if (it != rrFeatures.end()) { rr = std::move(it->second); rrFeatures.erase(it); delete handle; } }
-    if (rr) return call([&] { rr->backend.drain(); rr.reset(); return 1u; });
+    if (rr) return call([&] { rr->drain(); rr.reset(); return 1u; });
 #endif
     std::shared_ptr<d4r::win::Feature> feature;
     { std::lock_guard<std::mutex> lock(apiMutex);
@@ -376,7 +492,7 @@ API unsigned NVSDK_NGX_D3D12_Shutdown() {
     return call([&] {
         if (runtime && std::getenv("D4R_ASYNC_INTEROP")) runtime->drain_async_queue();
 #if defined(D4R_NATIVE_RR_BACKEND)
-        for (auto& pair : rrFeatures) pair.second->backend.drain();
+        for (auto& pair : rrFeatures) pair.second->drain();
         for (auto& pair : rrFeatures) delete pair.first;
         rrFeatures.clear();
 #endif
