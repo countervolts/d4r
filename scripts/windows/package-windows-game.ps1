@@ -44,6 +44,7 @@ function Stage([string]$source, [string]$relative) {
 Stage (Join-Path $OptiScalerRoot 'OptiScaler.dll') 'OptiScaler.dll'
 Stage (Join-Path $DiagnosticRoot 'bin/d4r_nvngx.dll') 'd4r/_nvngx.dll'
 Stage (Join-Path $DiagnosticRoot "bin/pixel_convert_${GpuArch}.hsaco") "d4r/pixel_convert_${GpuArch}.hsaco"
+Assert-D4RNvapiTarget (Join-Path $DiagnosticRoot 'nvapi-compat/nvapi64.dll') $GpuArch
 Stage (Join-Path $DiagnosticRoot 'nvapi-compat/nvapi64.dll') 'd4r/nvapi/nvapi64.dll'
 Stage (Join-Path $DiagnosticRoot 'nvapi-compat/nvapi64.dll') 'd4r/zluda/nvapi64.dll'
 Stage (Join-Path $DiagnosticRoot 'bin/d4r_debug_launcher.exe') 'd4r/d4r_debug_launcher.exe'

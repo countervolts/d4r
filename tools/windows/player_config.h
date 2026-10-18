@@ -272,11 +272,39 @@ inline void verify_native_fp8_bundle(const std::filesystem::path& dir, const Set
         contents.find("tokenLanes=true\n") == std::string::npos)
         throw std::runtime_error("[Kernels] NativeFp8=true needs matching gfx12 token-lane M kernels; rebuild the package with -TokenLanes and restart.");
 }
-inline std::filesystem::path compat_nvapi_path(const std::filesystem::path& dir) {
-    const auto colocated = dir / L"zluda" / L"nvapi64.dll";
-    if (std::filesystem::is_regular_file(colocated)) return colocated;
-    const auto arch = dir / L"nvapi" / diag::wide(diag::HipApi::target_arch()) / L"nvapi64.dll";
-    return std::filesystem::is_regular_file(arch) ? arch : dir / L"nvapi" / L"nvapi64.dll";
+// The compatibility NVAPI is built for one GPU target, so it is never shared between targets. A release carries
+// one per target in nvapi\<arch>\; that copy is the only acceptable one for <arch>. A single-target layout (quick
+// test, game package) has just nvapi\nvapi64.dll or the copy beside nvcuda.dll, and the shim then checks the
+// target the file names. In a multi-target folder a missing copy is an error: falling back to a shared DLL is
+// how a gfx1101 NVAPI once served a gfx1151 GPU ("No selected gfx1101 device").
+struct NvapiChoice { std::filesystem::path path; std::string error; };
+inline NvapiChoice select_compat_nvapi(const std::filesystem::path& dir, const std::string& arch) {
+    const auto file = [&](const std::string& target) { return dir / L"nvapi" / diag::wide(target) / L"nvapi64.dll"; };
+    if (std::filesystem::is_regular_file(file(arch))) return {file(arch), {}};
+    std::string others;
+    for (const auto& target : diag::gpu_targets)
+        if (std::filesystem::is_regular_file(file(target.architecture)))
+            others += (others.empty() ? "" : ", ") + std::string(target.architecture);
+    if (!others.empty())
+        return {{}, "this release has no NVAPI build for " + arch + " (d4r\\nvapi\\" + arch + "\\nvapi64.dll is missing; it has " +
+            others + "); extract the d4r ZIP again"};
+    for (const auto& single : {dir / L"nvapi" / L"nvapi64.dll", dir / L"zluda" / L"nvapi64.dll"})
+        if (std::filesystem::is_regular_file(single)) return {single, {}};
+    return {{}, "nvapi64.dll is missing (expected d4r\\nvapi\\" + arch + "\\nvapi64.dll); extract the d4r ZIP again"};
+}
+inline std::filesystem::path compat_nvapi_path(const std::filesystem::path& dir, const std::string& arch = diag::HipApi::target_arch()) {
+    const auto choice = select_compat_nvapi(dir, arch);
+    if (!choice.error.empty()) throw std::runtime_error(choice.error);
+    return choice.path;
+}
+// A shared nvapi64.dll beside nvcuda.dll (d4r 0.1.5 shipped the gfx1101 build there for every GPU) is on PATH and
+// could be loaded by name ahead of the right file; it is ignored here, so say so.
+inline void note_stale_shared_nvapi(const std::filesystem::path& dir, std::vector<std::string>& notes) {
+    bool perTarget = false;
+    for (const auto& target : diag::gpu_targets)
+        perTarget = perTarget || std::filesystem::is_regular_file(dir / L"nvapi" / diag::wide(target.architecture) / L"nvapi64.dll");
+    if (perTarget && std::filesystem::is_regular_file(dir / L"zluda" / L"nvapi64.dll"))
+        notes.push_back("d4r\\zluda\\nvapi64.dll is left over from an older d4r release (one GPU's build shared by all); it is ignored. Delete it");
 }
 inline std::filesystem::path raw_nvapi_backend_path(const std::filesystem::path& dir) {
     return dir / L"nvapi" / L"backend" / L"nvapi64.dll";
@@ -325,7 +353,10 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
     const auto p = [&](const std::wstring& relative) { return std::optional<std::wstring>((dir / relative).wstring()); };
     const std::optional<std::wstring> on = std::wstring(L"1"), off = std::wstring(L"0"), unset;
     const wchar_t* path = _wgetenv(L"PATH");
-    const auto compatNvapi = compat_nvapi_path(dir);
+    const std::string arch = diag::HipApi::target_arch();
+    // Startup has already verified the file (verify_nvapi); a missing one leaves D4R_NVAPI_DLL unset so a stale
+    // value from an earlier run cannot point at a DLL for another GPU.
+    const auto nvapi = select_compat_nvapi(dir, arch);
     // Same codegen and paths as windows-game.ps1; only diagnostics differ.
     const std::pair<const wchar_t*, std::optional<std::wstring>> values[] = {
         {L"D4R_RR_BACKEND", settings.rrBackend == "off" ? unset : std::optional<std::wstring>(diag::wide(settings.rrBackend))},
@@ -339,7 +370,8 @@ inline void apply(const std::filesystem::path& dir, const Settings& settings) {
         {L"D4R_FSR_CACHE_DIR", settings.rrBackend == "fsr" ? std::optional<std::wstring>((cache / L"vkd3d").wstring()) : unset},
         {L"D4R_HIP_ROOT", p(L"hip")}, {L"HIP_PATH", p(L"hip")},
         {L"D4R_NVCUDA_DLL", p(L"zluda\\nvcuda.dll")}, {L"ZLUDA_CUDA_LIB", p(L"zluda\\nvcuda.dll")},
-        {L"D4R_NVAPI_DLL", std::optional<std::wstring>(compatNvapi.wstring())},
+        {L"D4R_GPU_ARCH", std::optional<std::wstring>(diag::wide(arch))},
+        {L"D4R_NVAPI_DLL", nvapi.error.empty() ? std::optional<std::wstring>(nvapi.path.wstring()) : unset},
         {L"D4R_NVAPI_BACKEND", std::optional<std::wstring>(raw_nvapi_backend_path(dir).wstring())},
         {L"D4R_NGX_CORE", p(L"ngx\\_nvngx.dll")}, {L"D4R_DLSS_DLL", p(L"dlss\\nvngx_dlss.dll")},
         {L"D4R_NGX_DATA_DIR", std::optional<std::wstring>(ngxData.wstring())},
@@ -392,6 +424,8 @@ inline void ensure_environment() {
             reject_translation_layer();
             if (settings.nativeFp8) verify_native_fp8_bundle(dir, &settings);
             verify_code_objects(dir, &settings);
+            compat_nvapi_path(dir); // Throws with the fix spelled out when this GPU has no NVAPI build.
+            note_stale_shared_nvapi(dir, current.notes);
             apply(dir, settings);
             current.active = true; current.preset = settings.preset;
             const char* model = settings.preset == 5 ? "E" : settings.preset == 12 ? "L" : settings.preset == 13 ? "M" : "K";

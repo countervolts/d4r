@@ -1,6 +1,6 @@
 #pragma once
 #include "diagnostic.h"
-#include "gpu_target.h"
+#include "gpu_selection.h"
 #include <hip/hip_runtime_api.h>
 #include <cstdlib>
 #include <string>
@@ -43,14 +43,16 @@ struct HipApi {
         if (verbose || result != hipSuccess) std::printf("HIP %s -> %d (%s)\n", call, static_cast<int>(result), hipGetErrorName(result));
         if (result != hipSuccess) throw std::runtime_error(std::string(call) + ": " + hipGetErrorString(result));
     }
-    // The package's backend sets D4R_GPU_ARCH to the GPU type of the game's adapter before it loads this DLL, so one
-    // build serves every supported type (a compile-time-only target locked RDNA3 / gfx1201 cards out: "No selected
-    // gfx1200 device"). Unknown or missing values fall back to the build's own target.
+    // The architecture this process runs for: D4R_GPU_ARCH when it names a supported target, otherwise the build's
+    // own D4R_TARGET_ARCH. The loader and the shim publish the adapter's real architecture there before the
+    // NVAPI/NGX components start (publish_selected_gpu in gpu_environment.h), so every component agrees. A value that
+    // is set but unsupported is reported and ignored; select_architecture still refuses any device that is not of
+    // the architecture in use.
     static const char* target_arch() {
         static const std::string arch = [] {
-            const char* e = std::getenv("D4R_GPU_ARCH");
-            const std::string v = e ? gpu_architecture(e) : std::string(); // "gfx1101:xnack-" -> "gfx1101"
-            return supported_gpu_target(v) ? v : std::string(D4R_TARGET_ARCH);
+            const auto resolved = resolve_target_arch(std::getenv("D4R_GPU_ARCH"), D4R_TARGET_ARCH);
+            if (!resolved.warning.empty()) std::fprintf(stderr, "d4r: %s\n", resolved.warning.c_str());
+            return resolved.architecture;
         }();
         return arch.c_str();
     }
@@ -58,6 +60,14 @@ struct HipApi {
         if (requested >= 0) return requested;
         const char* e = std::getenv("D4R_HIP_DEVICE");
         return e && *e ? std::atoi(e) : -1;
+    }
+    // The adapter the loader or shim selected (D4R_GPU_LUID), for components that start before any D3D12 device is
+    // at hand. Absent means "any device of the target architecture"; a malformed value is an error, never ignored.
+    static bool configured_luid(AdapterLuid& luid) {
+        const char* text = std::getenv("D4R_GPU_LUID");
+        if (!text || !*text) return false;
+        if (!parse_luid(text, luid)) throw std::runtime_error(std::string("D4R_GPU_LUID='") + text + "' is not HHHHHHHH:LLLLLLLL");
+        return true;
     }
     int select_architecture(int requested, hipDeviceProp_t& selected, const void* required_luid = nullptr,
         bool allow_no_match = false) const {
@@ -71,24 +81,28 @@ struct HipApi {
         std::printf("HIP runtime=%d driver_api=%d headers=%d.%d.%d sizeof(properties)=%zu\n",
             version, driver, HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH, sizeof(hipDeviceProp_t));
         check(hipGetDeviceCount(&count), "hipGetDeviceCount");
-        int found = -1;
+        std::vector<GpuCandidate> devices;
         requested = requested_device(requested);
+        AdapterLuid wanted{};
+        const AdapterLuid* luid = nullptr;
+        if (required_luid) { std::memcpy(wanted.data(), required_luid, wanted.size()); luid = &wanted; }
+        else if (configured_luid(wanted)) luid = &wanted;
+        std::vector<hipDeviceProp_t> properties;
         for (int i = 0; i < count; ++i) {
             hipDeviceProp_t props{};
             check(hipGetDeviceProperties(&props, i), "hipGetDevicePropertiesR0600");
             std::printf("GPU ordinal=%d name=%s gcnArchName=%s wave=%d vram=%zu pci=%04x:%02x:%02x\n",
                 i, props.name, props.gcnArchName, props.warpSize, props.totalGlobalMem,
                 props.pciDomainID, props.pciBusID, props.pciDeviceID);
-            const std::string arch = props.gcnArchName;
-            if (gpu_architecture(arch) == target_arch() && (requested < 0 || requested == i) && found < 0 &&
-                (!required_luid || std::memcmp(props.luid, required_luid, sizeof(props.luid)) == 0)) {
-                found = i;
-                selected = props;
-            }
+            GpuCandidate candidate{props.name, gpu_architecture(props.gcnArchName), {}};
+            std::memcpy(candidate.luid.data(), props.luid, candidate.luid.size());
+            devices.push_back(candidate);
+            properties.push_back(props);
         }
+        const int found = find_gpu_device(devices, target_arch(), requested, luid);
         if (found < 0 && allow_no_match) return -1; // Capability enumeration can include Intel/WARP adapters.
-        if (found < 0) throw std::runtime_error(std::string("No selected ") + target_arch() +
-            " device for this adapter; use the package matching the actual HIP architecture (see GPU log)");
+        if (found < 0) throw std::runtime_error(no_device_message(devices, target_arch(), luid));
+        selected = properties[found];
         require_gpu_target(selected.gcnArchName, target_arch());
         check(hipSetDevice(found), "hipSetDevice");
         std::printf("SELECTED HIP ordinal=%d architecture=%s validation=%s\n", found, target_arch(),

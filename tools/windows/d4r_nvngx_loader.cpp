@@ -6,6 +6,7 @@
 // Keeping every file in one folder preserves NGX's search for
 // nvngx_dlss.dll beside the calling module.
 #include "d3d12_external.h"
+#include "gpu_environment.h"
 #include "ngx_public_abi.h"
 #include <dxgi.h>
 #include <fstream>
@@ -54,22 +55,25 @@ HMODULE select(const LUID* luid) {
         d4r::diag::HipApi hip((dir / L"hip").string());
         if (hip.hipInit(0) != hipSuccess) throw std::runtime_error("the AMD HIP runtime found no usable GPU; update the AMD graphics driver");
         int count = 0; (void)hip.hipGetDeviceCount(&count);
-        std::string found, detected;
+        std::vector<d4r::diag::GpuCandidate> devices;
         for (int i = 0; i < count; ++i) {
             hipDeviceProp_t props{};
             if (hip.hipGetDeviceProperties(&props, i) != hipSuccess) continue;
-            const auto arch = d4r::diag::gpu_architecture(props.gcnArchName);
-            detected += (detected.empty() ? "" : ", ") + arch + " (" + props.name + ")";
-            if (luid && std::memcmp(props.luid, luid, sizeof(*luid))) continue;
-            if (!luid && !std::filesystem::exists(dir / (L"_nvngx_" + d4r::diag::wide(arch) + L".dll"))) continue;
-            if (!found.empty() && found != arch) throw std::runtime_error("several GPUs with different architectures; start the game once DLSS selects one");
-            found = arch;
+            d4r::diag::GpuCandidate device{props.name, d4r::diag::gpu_architecture(props.gcnArchName), {}};
+            std::memcpy(device.luid.data(), props.luid, device.luid.size());
+            devices.push_back(device);
         }
-        if (found.empty()) throw std::runtime_error("no supported AMD GPU for this game's adapter. Detected: " +
-            (detected.empty() ? std::string("none") : detected) + ". This release supports: " + supported_list(dir) + ".");
+        d4r::diag::AdapterLuid wanted{};
+        if (luid) std::memcpy(wanted.data(), luid, wanted.size());
+        const auto choice = d4r::diag::choose_loader_architecture(devices, luid ? &wanted : nullptr,
+            [&](const std::string& arch) { return std::filesystem::exists(dir / (L"_nvngx_" + d4r::diag::wide(arch) + L".dll")); },
+            supported_list(dir));
+        if (!choice.error.empty()) throw std::runtime_error(choice.error);
+        const auto& found = choice.architecture;
         const auto path = dir / (L"_nvngx_" + d4r::diag::wide(found) + L".dll");
-        if (!std::filesystem::exists(path))
-            throw std::runtime_error("this release has no build for your GPU (" + found + "). It supports: " + supported_list(dir) + ".");
+        // The shim, NVAPI and the NGX core start from the environment: state the adapter's real architecture (and,
+        // once the game's adapter is known, its LUID) before the first of them loads, replacing any stale value.
+        d4r::diag::publish_selected_gpu(found, luid ? &wanted : nullptr);
         shim = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (!shim) {
             selectionFailed = true; // A broken install will not fix itself during this session.

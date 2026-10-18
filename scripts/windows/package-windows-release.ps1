@@ -64,7 +64,10 @@ foreach ($gpu in $selected) {
         # One GPU-query tool serves every target: it reports each device's real architecture.
         if ($relative -eq 'd4r/d4r_gpu_inventory.exe') { if (!$inventoryStaged) { Stage $path 'd4r/d4r_gpu_inventory.exe'; $inventoryStaged=$true } }
         elseif ($relative -eq 'd4r/_nvngx.dll') { Stage $path "d4r/_nvngx_$arch.dll" }
-        elseif ($relative -eq 'd4r/nvapi/nvapi64.dll') { Stage $path "d4r/nvapi/$arch/nvapi64.dll" }
+        elseif ($relative -eq 'd4r/nvapi/nvapi64.dll') { Assert-D4RNvapiTarget $path $arch; Stage $path "d4r/nvapi/$arch/nvapi64.dll" }
+        # The copy beside nvcuda.dll is one GPU's build: it is never shared. Each target's own build ships in
+        # d4r/nvapi/<arch>/ (above); the old shared copy made every GPU load the first target's NVAPI.
+        elseif ($relative -eq 'd4r/zluda/nvapi64.dll') { }
         elseif ($relative -like 'd4r/pixel_convert_*.hsaco') { Stage $path $relative }
         elseif ($relative.StartsWith('d4r/native/')) { Stage $path ("d4r/native/$arch/" + $relative.Substring('d4r/native/'.Length)) }
         elseif ($relative -eq 'd4r/nvapi/backend/nvapi64.dll' -or $relative -eq 'OptiScaler.dll' -or $relative.StartsWith('licenses/') -or
@@ -76,6 +79,7 @@ foreach ($gpu in $selected) {
         # Installer-only files (launcher, PowerShell installer, docs) are not part of a drag-in install.
     }
     if ($objects -ne 17) { throw "Expected 17 code objects for $arch" }
+    if (!(Test-Path -LiteralPath (Join-Path $PackageRoot "d4r/nvapi/$arch/nvapi64.dll") -PathType Leaf)) { throw "No d4r/nvapi/nvapi64.dll in the $arch input; the release needs one NVAPI build per target." }
     $commonStaged=$true
     $targets[$arch]=@{binarySourceCommit=$metadata.d4rCommit; hardwareValidation=$metadata.hardwareValidation;
         nativeFp8M=[bool]$metadata.nativeFp8M; tokenLanesM=[bool]$metadata.tokenLanesM}

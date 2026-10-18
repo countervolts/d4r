@@ -16,17 +16,24 @@ function Write-CodeObject([string]$Path,[int]$Machine) {
     New-Item -ItemType Directory -Force (Split-Path $Path) | Out-Null
     [IO.File]::WriteAllBytes($Path,$header)
 }
+# Stand-in compatibility NVAPI: names its build target the way the real DLL does (nvapi_trace.cpp).
+function Write-Nvapi([string]$Path,[string]$Target) {
+    New-Item -ItemType Directory -Force (Split-Path $Path) | Out-Null
+    [IO.File]::WriteAllBytes($Path,[Text.Encoding]::ASCII.GetBytes("MZ nvapi fixture D4R_NVAPI_TARGET=$Target")+[byte]0)
+}
 function New-Inputs([string]$Prefix,[scriptblock]$Mutate) {
     foreach ($target in $targets) {
         $arch=$target.architecture; $root="$Prefix-$arch"
-        $text=@{'OptiScaler.dll'='optiscaler'; 'd4r/_nvngx.dll'="shim $arch"; 'd4r/nvapi/nvapi64.dll'="nvapi $arch";
-            'd4r/nvapi/backend/nvapi64.dll'='raw backend nvapi'; 'd4r/hip/bin/amdhip64_7.dll'='hip'; 'd4r/zluda/nvcuda.dll'='zluda'; 'd4r/zluda/nvapi64.dll'='compat nvapi'; 'licenses/d4r.txt'='license';
+        $text=@{'OptiScaler.dll'='optiscaler'; 'd4r/_nvngx.dll'="shim $arch";             'd4r/nvapi/backend/nvapi64.dll'='raw backend nvapi'; 'd4r/hip/bin/amdhip64_7.dll'='hip'; 'd4r/zluda/nvcuda.dll'='zluda'; 'licenses/d4r.txt'='license';
             'd4r/d4r_gpu_inventory.exe'='inventory'; 'd4r/d4r_debug_launcher.exe'='launcher'; 'windows-game.ps1'='installer';
             'd4r/native/d4r-kernels.txt'='manifest'}
         foreach ($entry in $text.GetEnumerator()) {
             $path=Join-Path $root $entry.Key; New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
             Set-Content -LiteralPath $path $entry.Value -Encoding ASCII
         }
+        # As the game package stages it: the target's own build, in both places.
+        Write-Nvapi (Join-Path $root 'd4r/nvapi/nvapi64.dll') $arch
+        Write-Nvapi (Join-Path $root 'd4r/zluda/nvapi64.dll') $arch
         $objects=@("d4r/pixel_convert_$arch.hsaco")+@(1..16 | ForEach-Object { "d4r/native/kernel$_.hsaco" })
         foreach ($object in $objects) { Write-CodeObject (Join-Path $root $object) $target.elfMachine }
         if ($Mutate) { & $Mutate $root $arch }
@@ -62,16 +69,23 @@ if ((Get-Content -LiteralPath (Join-Path $release 'd4r/_nvngx.dll') -Raw).Trim()
 foreach ($target in $targets) {
     $arch=$target.architecture
     if ((Get-Content -LiteralPath (Join-Path $release "d4r/_nvngx_$arch.dll") -Raw).Trim() -ne "shim $arch") { throw "Wrong shim for $arch" }
-    if ((Get-Content -LiteralPath (Join-Path $release "d4r/nvapi/$arch/nvapi64.dll") -Raw).Trim() -ne "nvapi $arch") { throw "Wrong NVAPI for $arch" }
+    Assert-D4RNvapiTarget (Join-Path $release "d4r/nvapi/$arch/nvapi64.dll") $arch
+    foreach ($other in $targets) {
+        if ($other.architecture -ne $arch) {
+            $mismatch=$false
+            try { Assert-D4RNvapiTarget (Join-Path $release "d4r/nvapi/$arch/nvapi64.dll") $other.architecture } catch { $mismatch=$_.Exception.Message -match "built for $arch" }
+            if (!$mismatch) { throw "NVAPI for $arch passed as $($other.architecture)" }
+        }
+    }
     Assert-D4RCodeObjectTarget (Join-Path $release "d4r/pixel_convert_$arch.hsaco") $arch
     $native=@(Get-ChildItem -LiteralPath (Join-Path $release "d4r/native/$arch") -Filter '*.hsaco')
     if ($native.Count -ne 16 -or !(Test-Path -LiteralPath (Join-Path $release "d4r/native/$arch/d4r-kernels.txt"))) { throw "Native folder for $arch is incomplete" }
     foreach ($object in $native) { Assert-D4RCodeObjectTarget $object.FullName $arch }
 }
 if ((Get-Content -LiteralPath (Join-Path $release 'd4r/nvapi/backend/nvapi64.dll') -Raw).Trim() -ne 'raw backend nvapi') { throw 'The raw ZLUDA NVAPI backend was not staged separately.' }
-if ((Get-Content -LiteralPath (Join-Path $release 'd4r/zluda/nvapi64.dll') -Raw).Trim() -ne 'compat nvapi') { throw 'The compatibility NVAPI is not colocated with nvcuda.dll.' }
+if (Test-Path -LiteralPath (Join-Path $release 'd4r/zluda/nvapi64.dll')) { throw 'A shared NVAPI beside nvcuda.dll would be loaded for every GPU; it must not ship.' }
 if (@(Get-ChildItem -LiteralPath $release -Recurse -Filter 'd4r_gpu_inventory.exe').Count -ne 1) { throw 'The GPU query tool must ship exactly once.' }
-foreach ($excluded in @('d4r/d4r_debug_launcher.exe','windows-game.ps1','d4r/native/kernel1.hsaco','d4r/nvapi/nvapi64.dll')) {
+foreach ($excluded in @('d4r/d4r_debug_launcher.exe','windows-game.ps1','d4r/native/kernel1.hsaco','d4r/nvapi/nvapi64.dll','d4r/zluda/nvapi64.dll')) {
     if (Test-Path -LiteralPath (Join-Path $release $excluded)) { throw "Installer-only or untargeted file shipped: $excluded" }
 }
 $manifest=Get-Content -LiteralPath (Join-Path $release 'd4r/package.json') -Raw | ConvertFrom-Json
@@ -140,6 +154,29 @@ $rejected=$false
 try { Invoke-Package $prefix (Join-Path $OutputDirectory 'release-mixed') } catch { $rejected=$_.Exception.Message -match 'does not target gfx1101' }
 if (!$rejected) { throw 'A gfx1100 code object in the gfx1101 input was not rejected.' }
 $results+=@{case='mixed-target-rejected'; passed=$true}
+
+# 2b. NVAPI selection inputs: an NVAPI built for another GPU, one without a target marker (built before the
+#     marker existed) and a missing one are rejected; the d4r 0.1.5 input shape (the gfx1101 copy shared beside
+#     nvcuda.dll in every input) packages without that copy, and every target still gets its own build.
+$cases=[ordered]@{
+    'wrong-target'=@{mutate={ param($root,$arch) if ($arch -eq 'gfx1151') { Write-Nvapi (Join-Path $root 'd4r/nvapi/nvapi64.dll') 'gfx1101' } }; expect='built for gfx1101, not gfx1151'}
+    'no-marker'=@{mutate={ param($root,$arch) if ($arch -eq 'gfx1102') { Set-Content -LiteralPath (Join-Path $root 'd4r/nvapi/nvapi64.dll') 'legacy nvapi' -Encoding ASCII } }; expect='does not name exactly one GPU target'}
+    'missing'=@{mutate={ param($root,$arch) if ($arch -eq 'gfx1200') { Remove-Item -LiteralPath (Join-Path $root 'd4r/nvapi/nvapi64.dll') } }; expect='No d4r/nvapi/nvapi64.dll in the gfx1200 input'}
+}
+foreach ($case in $cases.GetEnumerator()) {
+    $prefix=Join-Path $OutputDirectory "inputs/nvapi-$($case.Key)/game"
+    New-Inputs $prefix $case.Value.mutate
+    $rejected=$false
+    try { Invoke-Package $prefix (Join-Path $OutputDirectory "release-nvapi-$($case.Key)") } catch { $rejected=$_.Exception.Message -like "*$($case.Value.expect)*" }
+    if (!$rejected) { throw "NVAPI case '$($case.Key)' was not rejected with '$($case.Value.expect)'." }
+}
+$prefix=Join-Path $OutputDirectory 'inputs/shared-nvapi/game'
+New-Inputs $prefix { param($root,$arch) Write-Nvapi (Join-Path $root 'd4r/zluda/nvapi64.dll') 'gfx1101' }
+$sharedRelease=Join-Path $OutputDirectory 'release-shared-nvapi'
+Invoke-Package $prefix $sharedRelease
+if (Test-Path -LiteralPath (Join-Path $sharedRelease 'd4r/zluda/nvapi64.dll')) { throw 'The shared gfx1101 NVAPI shipped.' }
+foreach ($target in $targets) { Assert-D4RNvapiTarget (Join-Path $sharedRelease "d4r/nvapi/$($target.architecture)/nvapi64.dll") $target.architecture }
+$results+=@{case='nvapi-per-target'; passed=$true; targets=$targets.Count}
 
 # 3. Shared runtime files must be identical across targets.
 $prefix=Join-Path $OutputDirectory 'inputs/runtime/game'

@@ -46,10 +46,21 @@ function Build([string]$Name,[string[]]$Arguments) {
 $results=@()
 
 # 1. d4r.ini validation and DLL pin decisions (the shim's own header).
+# The compatibility NVAPI is compiled once per registered target, exactly as the release builds it, so the
+# probe can check the target each binary names.
+$builtNvapi=Join-Path $OutputDirectory 'built-nvapi'
+$noTarget=@($common | Where-Object { $_ -notlike '-DD4R_TARGET_ARCH=*' })
+foreach ($target in $targets) {
+    $arch=$target.architecture
+    $dll=Join-Path $builtNvapi "$arch/nvapi64.dll"
+    New-Item -ItemType Directory -Force (Split-Path $dll) | Out-Null
+    Build "nvapi-$arch" ($noTarget+@("-DD4R_TARGET_ARCH=`"$arch`"",'-DD4R_NVAPI_COMPAT','-shared',(Join-Path $repo 'tools/windows/nvapi_trace.cpp'),'-o',$dll,'-lversion','-ldbghelp'))
+}
 $probe=Join-Path $OutputDirectory 'player_config_probe.exe'
 Build 'player-config' ($common+@('-municode',(Join-Path $repo 'tools/windows/player_config_probe.cpp'),'-o',$probe,'-lversion','-ldbghelp','-lbcrypt'))
-if (Invoke-Native (Join-Path $OutputDirectory 'player-config.log') $probe @((Join-Path $OutputDirectory 'pins-fixture'))) { throw "player_config_probe failed; see $(Join-Path $OutputDirectory 'player-config.log')" }
+if (Invoke-Native (Join-Path $OutputDirectory 'player-config.log') $probe @((Join-Path $OutputDirectory 'pins-fixture'),$builtNvapi)) { throw "player_config_probe failed; see $(Join-Path $OutputDirectory 'player-config.log')" }
 $results+=@{case='d4r-ini-and-dll-pins'; passed=$true}
+$results+=@{case='architecture-selection-all-targets'; passed=$true; targets=$targets.Count; nvapiBuilds=$targets.Count}
 
 # 2. Loader: GPU-free marker, LUID-based target selection, forwarding, and a
 #    clear failure when the folder has no build for the detected GPU.

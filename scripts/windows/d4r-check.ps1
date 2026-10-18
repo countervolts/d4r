@@ -46,7 +46,7 @@ if (!$manifest) { Bad 'd4r\package.json is missing or damaged (extract the d4r Z
 
 # --- files --------------------------------------------------------------------------------------
 $required = @('dxgi.dll', 'OptiScaler.ini', 'd4r\_nvngx.dll', 'd4r\d4r.ini', 'd4r\dll-pins.txt',
-    'd4r\hip\bin\amdhip64_7.dll', 'd4r\zluda\nvcuda.dll', 'd4r\zluda\nvapi64.dll', 'd4r\nvapi\backend\nvapi64.dll')
+    'd4r\hip\bin\amdhip64_7.dll', 'd4r\zluda\nvcuda.dll', 'd4r\nvapi\backend\nvapi64.dll')
 foreach ($file in $required) {
     if (Test-Path -LiteralPath (Join-Path $game $file) -PathType Leaf) { Ok $file }
     else { Bad "$file (extract the d4r ZIP again over the game folder)" }
@@ -156,6 +156,10 @@ else {
             if ($missing.Count) { Bad "GPU $($device.name) ($a): this release has no complete build for it (missing: $($missing -join ', '))" }
             else {
                 Ok "GPU $($device.name) ($a): build present, $native native kernels"
+                # Each nvapi64.dll names the GPU target it was built for; a copy for another GPU is refused at startup.
+                $nvapiText = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes((Join-Path $d4r "nvapi\$a\nvapi64.dll")))
+                $nvapiNames = @([regex]::Matches($nvapiText, 'D4R_NVAPI_TARGET=(gfx[0-9a-f]+)\0') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+                if ($nvapiNames.Count -ne 1 -or $nvapiNames[0] -ne $a) { Bad "d4r\nvapi\$a\nvapi64.dll is built for '$($nvapiNames -join ', ')' instead of $a (files from different GPUs are mixed; extract the d4r ZIP again)" }
                 if (!$arch) { $arch = $a }
             }
             if ($a -eq 'gfx1101') { Note 'RX 7700 XT has passed native Windows synthetic checks and limited game-frame tests; broad game validation remains incomplete' }
@@ -163,6 +167,9 @@ else {
         }
     }
     if (@($inventory.devices | Where-Object { $_.wavefrontSize -eq 32 }).Count -gt 1) { Note 'several GPUs found; d4r uses the one the game renders on' }
+}
+if (Test-Path -LiteralPath (Join-Path $d4r 'zluda\nvapi64.dll')) {
+    Note 'd4r\zluda\nvapi64.dll is left over from an older d4r release (one GPU''s build shared by all). d4r ignores it, but delete it'
 }
 if ($arch -and $registry.Count) {
     $info = @($registry | Where-Object { $_.architecture -eq $arch }) | Select-Object -First 1
@@ -198,7 +205,7 @@ $iniPath = Join-Path $d4r 'd4r.ini'
 $model = 'K'
 if (Test-Path -LiteralPath $iniPath) {
     $section = ''; $iniProblems = 0
-    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'interop.batchinputcopies' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'paths.nativedir' = 1; 'kernels.nativefp8' = 1; 'rayreconstruction.backend' = 1; 'rayreconstruction.modeldir' = 1 }
+    $known = @{ 'dlss.model' = 1; 'dlss.showwatermark' = 1; 'interop.asyncinterop' = 1; 'interop.batchinputcopies' = 1; 'debug.validateoutput' = 1; 'debug.log' = 1; 'paths.cachedir' = 1; 'paths.nativedir' = 1; 'kernels.nativefp8' = 1; 'rayreconstruction.backend' = 1; 'rayreconstruction.modeldir' = 1; 'rayreconstruction.fsrdenoiser' = 1; 'rayreconstruction.fsrstabilitybias' = 1; 'rayreconstruction.fsrdetail' = 1 }
     $boolean = @('dlss.showwatermark', 'interop.asyncinterop', 'interop.batchinputcopies', 'debug.validateoutput', 'kernels.nativefp8')
     foreach ($raw in (Read-TextFile $iniPath).TrimStart([char]0xFEFF) -split "`n") {
         $line = $raw.Trim()

@@ -1,4 +1,5 @@
 #include "diagnostic.h"
+#include "gpu_target.h"
 #if defined(D4R_NVAPI_COMPAT)
 #include "hip_api.h"
 #include <memory>
@@ -82,6 +83,14 @@ int __cdecl logical_info(void* logical, LogicalGpuData* info)
 }
 }
 #endif
+
+// The GPU target this DLL was built for. The marker string is also searched for by the packaging scripts, so a
+// release cannot ship (and a shim cannot load) an NVAPI built for another GPU.
+static const char target_marker[] = "D4R_NVAPI_TARGET=" D4R_TARGET_ARCH;
+extern "C" __declspec(dllexport) const char* __cdecl d4r_NvapiTargetArchitecture()
+{
+    return target_marker + sizeof("D4R_NVAPI_TARGET=") - 1;
+}
 
 // Trace build forwards responses unchanged. The compatibility build adds the
 // public topology APIs above; other queries still go to upstream ZLUDA NVAPI.

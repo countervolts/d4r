@@ -36,3 +36,12 @@ function Assert-D4RCodeObjectTarget([string]$Path, [string]$Target) {
     $expected=$info.elfMachine
     if ($header[48] -ne $expected) { throw "Code object does not target ${Target}: $Path (ELF machine=$($header[48]))" }
 }
+# The compatibility NVAPI names the GPU target it was built for (nvapi_trace.cpp); a copy for another GPU, or one
+# built before the marker existed, must never be packaged: it would refuse the GPU it is installed for.
+function Assert-D4RNvapiTarget([string]$Path, [string]$Target) {
+    [void](Get-D4RGpuTargetInfo $Target)
+    $text=[Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
+    $found=@([regex]::Matches($text,'D4R_NVAPI_TARGET=(gfx[0-9a-f]+)\0') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    if ($found.Count -ne 1) { throw "NVAPI does not name exactly one GPU target (rebuild d4r_nvapi_compat): $Path" }
+    if ($found[0] -ne $Target) { throw "NVAPI is built for $($found[0]), not ${Target}: $Path" }
+}

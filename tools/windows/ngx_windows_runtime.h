@@ -1,5 +1,6 @@
 #pragma once
 #include "d3d12_external.h"
+#include "gpu_environment.h"
 #include "d3d12_boundary_timing.h"
 #include "pixel_conversion.h"
 #include "cuda_image_api.h"
@@ -22,6 +23,19 @@ inline std::string env_path(const char* name) {
     if (!value || !*value) throw std::runtime_error(std::string("Set the absolute path in ") + name);
     if (!std::filesystem::path(diag::wide(value)).is_absolute()) throw std::runtime_error(std::string(name) + " must be absolute");
     return value;
+}
+// The NVAPI compatibility DLL names the GPU target it was built for. A file for another GPU (a mixed install, or
+// a shared copy from an older release) is refused here with the fix spelled out; older builds without the export
+// are accepted and still validate the device themselves.
+inline void require_nvapi_target(const diag::Library& nvapi, const std::string& path) {
+    using Target = const char*(__cdecl*)();
+    Target target = nullptr;
+    try { target = nvapi.symbol<Target>("d4r_NvapiTargetArchitecture"); }
+    catch (const std::exception&) { std::printf("D4R_NVAPI target=unknown (no d4r_NvapiTargetArchitecture export) path=%s\n", path.c_str()); return; }
+    const std::string built = target ? target() : "";
+    const std::string wanted = diag::HipApi::target_arch();
+    std::printf("D4R_NVAPI target=%s wanted=%s path=%s\n", built.c_str(), wanted.c_str(), path.c_str());
+    if (const auto error = diag::nvapi_target_error(built, wanted, path); !error.empty()) throw std::runtime_error(error);
 }
 inline void ngx_check(unsigned result, const char* operation) {
     if (result != 1 || !std::getenv("D4R_QUIET_API")) std::printf("D4R_NGX %s result=0x%08x\n", operation, result);
@@ -105,6 +119,9 @@ struct Runtime {
             hip.select_architecture(-1, props, &luid);
             hip.verbose = cuda.verbose = !std::getenv("D4R_QUIET_API");
             if (std::memcmp(&luid, props.luid, sizeof(luid))) throw std::runtime_error("D3D12/HIP LUID mismatch");
+            // NVAPI and the NGX core start from the environment: tell them which adapter and architecture this is.
+            diag::AdapterLuid selectedLuid{}; std::memcpy(selectedLuid.data(), props.luid, selectedLuid.size());
+            diag::publish_selected_gpu(diag::HipApi::target_arch(), &selectedLuid);
             cuda.check(cuda.cuInit(0), "cuInit(Windows runtime)");
             int count = 0; cuda.check(cuda.cuDeviceGetCount(&count), "cuDeviceGetCount");
             for (int i = 0; i < count; ++i) {
@@ -124,6 +141,7 @@ struct Runtime {
             // NGX's loader can probe CUDA during DLL initialization: establish
             // the correct primary context before loading either NVIDIA DLL.
             nvapi = std::make_unique<diag::Library>(diag::wide(env_path("D4R_NVAPI_DLL")));
+            require_nvapi_target(*nvapi, env_path("D4R_NVAPI_DLL"));
             dlss = std::make_unique<diag::Library>(diag::wide(env_path("D4R_DLSS_DLL")));
             core = std::make_unique<diag::Library>(diag::wide(env_path("D4R_NGX_CORE")));
             allocate = core->symbol<Allocate>("NVSDK_NGX_CUDA_AllocateParameters");

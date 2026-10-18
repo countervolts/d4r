@@ -33,7 +33,7 @@ foreach ($gpu in Get-D4RGpuTargets) {
         $relative=$file.path.Replace('\','/')
         if ((Get-FileHash -LiteralPath (Join-Path $source $file.path) -Algorithm SHA256).Hash -ne $file.sha256) { throw "Input file changed: $source/$relative" }
         if ($relative.EndsWith('.hsaco')) { Assert-D4RCodeObjectTarget (Join-Path $source $file.path) $arch }
-        if ($relative -eq 'gpu-target.json' -or $relative -eq 'd4r/_nvngx.dll' -or $relative -eq 'd4r/d4r_gpu_inventory.exe' -or $relative -eq 'd4r/d4r_debug_launcher.exe' -or $relative -eq 'd4r/nvapi/nvapi64.dll' -or
+        if ($relative -eq 'gpu-target.json' -or $relative -eq 'd4r/_nvngx.dll' -or $relative -eq 'd4r/d4r_gpu_inventory.exe' -or $relative -eq 'd4r/d4r_debug_launcher.exe' -or $relative -eq 'd4r/nvapi/nvapi64.dll' -or $relative -eq 'd4r/zluda/nvapi64.dll' -or
             $relative.StartsWith('d4r/native/') -or $relative -like 'd4r/pixel_convert_*.hsaco') {
             $entry=Stage (Join-Path $source $file.path) "files/targets/$arch/$relative"
             $targetFiles+=@{path=$relative; sha256=$entry.sha256; version=$entry.version}

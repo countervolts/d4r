@@ -21,10 +21,194 @@ std::string error_of(const std::function<void()>& fn) {
     try { fn(); } catch (const std::exception& error) { return error.what(); }
     return {};
 }
+
+using d4r::diag::AdapterLuid;
+using d4r::diag::GpuCandidate;
+AdapterLuid luid_of(unsigned low, unsigned high = 0) {
+    AdapterLuid luid{};
+    for (int i = 0; i < 4; ++i) { luid[i] = static_cast<unsigned char>(low >> (8 * i)); luid[4 + i] = static_cast<unsigned char>(high >> (8 * i)); }
+    return luid;
+}
+void write_file(const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+
+// Architecture selection rules that decide which NVAPI, shim and kernels a GPU gets. Pure logic, so every
+// registered target is covered here without the hardware; `builtNvapi` (optional) holds real nvapi64.dll
+// builds, one per target, to check the compiled-in target marker the same way the shim and packager do.
+void architecture_selection(const std::filesystem::path& root, const std::filesystem::path& builtNvapi) {
+    namespace diag = d4r::diag;
+    std::filesystem::remove_all(root);
+    std::vector<std::string> archs;
+    for (const auto& target : diag::gpu_targets) archs.push_back(target.architecture);
+    expect(archs.size() == 11, "the registry lists the 11 Windows GPU targets");
+
+    // D4R_GPU_ARCH: valid, suffixed, missing, empty and unsupported values.
+    for (const auto& arch : archs) {
+        auto r = diag::resolve_target_arch(arch.c_str(), "gfx1101");
+        expect(r.architecture == arch && r.source == "D4R_GPU_ARCH" && r.warning.empty(), "D4R_GPU_ARCH=" + arch + " selects " + arch);
+        r = diag::resolve_target_arch((arch + ":xnack-").c_str(), "gfx1201");
+        expect(r.architecture == arch, "feature-suffixed D4R_GPU_ARCH is normalized for " + arch);
+        r = diag::resolve_target_arch(nullptr, arch.c_str());
+        expect(r.architecture == arch && r.source == "build" && r.warning.empty(), "missing D4R_GPU_ARCH uses the build target " + arch);
+        r = diag::resolve_target_arch("", arch.c_str());
+        expect(r.architecture == arch && r.warning.empty(), "empty D4R_GPU_ARCH uses the build target " + arch);
+    }
+    for (const char* bad : {"gfx1030", "gfx9999", "GFX1101", "1101", "gfx1101 ", "rdna3"}) {
+        const auto r = diag::resolve_target_arch(bad, "gfx1151");
+        expect(r.architecture == "gfx1151" && r.source == "build" && contains(r.warning, std::string("'") + bad + "' is not a supported target"),
+            std::string("unsupported D4R_GPU_ARCH='") + bad + "' is reported and the build target is kept");
+    }
+
+    // LUID text used to hand the game's adapter to NVAPI.
+    for (const auto luid : {luid_of(0), luid_of(0x1a2b3c4d, 0), luid_of(0xdeadbeef, 0x7), luid_of(0xffffffff, 0xffffffff)}) {
+        AdapterLuid parsed{};
+        expect(diag::parse_luid(diag::format_luid(luid).c_str(), parsed) && parsed == luid, "LUID round trip " + diag::format_luid(luid));
+    }
+    AdapterLuid scratch{};
+    for (const char* bad : {"", "1234", "0000000000000000", "0000000:0000000a", "0000000g:00000001", "00000000:0000000100", "0x000000:00000001", "00000000:+0000001"})
+        expect(!diag::parse_luid(bad, scratch), std::string("malformed LUID '") + bad + "' is rejected");
+
+    // Release layout: nvapi\<arch>\nvapi64.dll for all targets plus the 0.1.5-style shared copy beside nvcuda.
+    const auto release = root / L"release";
+    for (const auto& arch : archs) write_file(release / L"nvapi" / diag::wide(arch) / L"nvapi64.dll", "nvapi " + arch);
+    write_file(release / L"zluda" / L"nvapi64.dll", "nvapi gfx1101 (shared)");
+    write_file(release / L"nvapi" / L"backend" / L"nvapi64.dll", "raw backend");
+    for (const auto& arch : archs) {
+        const auto choice = player::select_compat_nvapi(release, arch);
+        expect(choice.error.empty() && choice.path == release / L"nvapi" / diag::wide(arch) / L"nvapi64.dll" && player::read_text(choice.path) == "nvapi " + arch,
+            "NVAPI for " + arch + " is its own nvapi\\" + arch + " build, not the shared gfx1101 copy");
+    }
+    std::vector<std::string> notes;
+    player::note_stale_shared_nvapi(release, notes);
+    expect(has_note(notes, "left over from an older d4r release"), "a leftover shared NVAPI is called out");
+
+    // A missing per-target build is an error that names the fix; no other file may stand in for it.
+    for (const auto& arch : archs) {
+        const auto folder = root / (L"missing-" + diag::wide(arch));
+        std::filesystem::remove_all(folder);
+        std::filesystem::copy(release, folder, std::filesystem::copy_options::recursive);
+        std::filesystem::remove(folder / L"nvapi" / diag::wide(arch) / L"nvapi64.dll");
+        const auto choice = player::select_compat_nvapi(folder, arch);
+        expect(choice.path.empty() && contains(choice.error, "no NVAPI build for " + arch) && contains(choice.error, "nvapi\\" + arch + "\\nvapi64.dll"),
+            "missing nvapi\\" + arch + " fails with a clear message instead of using another DLL");
+        expect(!error_of([&] { player::compat_nvapi_path(folder, arch); }).empty(), "compat_nvapi_path(" + arch + ") throws when its build is missing");
+        std::filesystem::remove_all(folder);
+    }
+
+    // Single-target layouts (quick test, game package, development folders).
+    const auto single = root / L"single";
+    expect(contains(player::select_compat_nvapi(single, "gfx1151").error, "nvapi64.dll is missing"), "an empty folder has no NVAPI");
+    write_file(single / L"zluda" / L"nvapi64.dll", "single zluda");
+    expect(player::select_compat_nvapi(single, "gfx1151").path == single / L"zluda" / L"nvapi64.dll", "a single-target package may keep NVAPI beside nvcuda");
+    write_file(single / L"nvapi" / L"nvapi64.dll", "single nvapi");
+    expect(player::select_compat_nvapi(single, "gfx1151").path == single / L"nvapi" / L"nvapi64.dll", "nvapi\\nvapi64.dll outranks the copy beside nvcuda");
+    notes.clear(); player::note_stale_shared_nvapi(single, notes);
+    expect(notes.empty(), "single-target layouts are not flagged as stale");
+
+    // The environment the shim hands to ZLUDA, NVAPI and NGX.
+    {   // target_arch() is fixed per process; the per-target matrix above covers the other architectures.
+        const auto folder = root / L"apply";
+        for (const auto& other : archs) write_file(folder / L"nvapi" / diag::wide(other) / L"nvapi64.dll", "nvapi " + other);
+        auto s = settings("", notes); s.cacheDir = (folder / L"cache").wstring();
+        player::apply(folder, s);
+        const auto current = std::string(diag::HipApi::target_arch());
+        expect(_wgetenv(L"D4R_GPU_ARCH") && std::wstring(_wgetenv(L"D4R_GPU_ARCH")) == diag::wide(current), "player environment publishes D4R_GPU_ARCH=" + current);
+        expect(std::filesystem::path(_wgetenv(L"D4R_NVAPI_DLL")) == folder / L"nvapi" / diag::wide(current) / L"nvapi64.dll",
+            "player environment points D4R_NVAPI_DLL at the build for " + current);
+        std::filesystem::remove(folder / L"nvapi" / diag::wide(current) / L"nvapi64.dll");
+        player::apply(folder, s);
+        expect(!std::getenv("D4R_NVAPI_DLL"), "a missing build clears D4R_NVAPI_DLL instead of keeping a stale path");
+    }
+
+    // Several GPUs: iGPU + two dGPUs of one architecture + every registered target on one machine.
+    const std::vector<GpuCandidate> machine{{"AMD Radeon 780M", "gfx1103", luid_of(10)}, {"AMD Radeon RX 7700 XT", "gfx1101", luid_of(11)},
+        {"AMD Radeon RX 7700 XT #2", "gfx1101", luid_of(12)}, {"Radeon 8060S", "gfx1151", luid_of(13)}};
+    expect(diag::find_gpu_device(machine, "gfx1101") == 1, "without a LUID the first device of the architecture is used");
+    const auto second = luid_of(12), igpu = luid_of(10), unknown = luid_of(99);
+    expect(diag::find_gpu_device(machine, "gfx1101", -1, &second) == 2, "the LUID picks the second of two same-architecture GPUs");
+    expect(diag::find_gpu_device(machine, "gfx1103", -1, &igpu) == 0, "the iGPU is found by LUID");
+    expect(diag::find_gpu_device(machine, "gfx1101", -1, &igpu) == -1, "a LUID of another architecture does not match");
+    expect(diag::find_gpu_device(machine, "gfx1101", 2) == 2 && diag::find_gpu_device(machine, "gfx1101", 3) == -1, "an explicit ordinal must also be of the target architecture");
+    expect(diag::find_gpu_device(machine, "gfx1151", -1, &unknown) == -1, "an unknown adapter LUID matches nothing");
+    std::vector<GpuCandidate> everything;
+    for (size_t i = 0; i < archs.size(); ++i) everything.push_back({"GPU " + archs[i], archs[i], luid_of(100 + unsigned(i))});
+    for (size_t i = 0; i < archs.size(); ++i) {
+        const auto luid = luid_of(100 + unsigned(i));
+        bool exact = diag::find_gpu_device(everything, archs[i], -1, &luid) == int(i) && diag::find_gpu_device(everything, archs[i]) == int(i);
+        for (size_t j = 0; j < archs.size(); ++j) exact = exact && (j == i || diag::find_gpu_device(everything, archs[j], -1, &luid) == -1);
+        expect(exact, "among all 11 architectures " + archs[i] + " resolves only to its own adapter");
+    }
+
+    // Diagnostics for genuinely unsupported or mismatched GPUs (no crash, an actionable message).
+    auto message = diag::no_device_message(machine, "gfx1101", &unknown);
+    expect(contains(message, "No HIP device has the game's adapter LUID") && contains(message, "gfx1151 (Radeon 8060S)"), "unknown adapter: " + message);
+    const auto strix = luid_of(13);
+    message = diag::no_device_message(machine, "gfx1101", &strix);
+    expect(contains(message, "The GPU is gfx1151") && contains(message, "built for gfx1101") && contains(message, "extract the d4r ZIP again"),
+        "a gfx1101 file on a gfx1151 adapter is named as a mixed install: " + message);
+    const std::vector<GpuCandidate> rdna2{{"AMD Radeon RX 6800", "gfx1030", luid_of(5)}};
+    const auto six = luid_of(5);
+    message = diag::no_device_message(rdna2, "gfx1101", &six);
+    expect(contains(message, "gfx1030") && contains(message, "does not support") && contains(message, "gfx1154"), "unsupported RDNA2 GPU: " + message);
+    message = diag::no_device_message(rdna2, "gfx1201");
+    expect(contains(message, "none supported by d4r"), "no supported device at all: " + message);
+    expect(contains(diag::no_device_message({}, "gfx1100"), "reports no GPU"), "an empty HIP device list asks for a driver update");
+
+    // Loader: pick the shim for the game's adapter, never a different GPU's.
+    const auto has_all = [](const std::string& arch) { return diag::supported_gpu_target(arch); }; // A full release: one shim per target.
+    for (size_t i = 0; i < archs.size(); ++i) {
+        const auto luid = luid_of(100 + unsigned(i));
+        const auto choice = diag::choose_loader_architecture(everything, &luid, has_all, "all");
+        expect(choice.architecture == archs[i] && choice.error.empty(), "loader picks _nvngx_" + archs[i] + ".dll for that adapter");
+    }
+    auto choice = diag::choose_loader_architecture(machine, &igpu, has_all, "all");
+    expect(choice.architecture == "gfx1103", "loader follows the iGPU when the game renders on it");
+    choice = diag::choose_loader_architecture(machine, &second, has_all, "all");
+    expect(choice.architecture == "gfx1101", "loader follows the game's dGPU among several GPUs");
+    choice = diag::choose_loader_architecture(machine, nullptr, has_all, "all");
+    expect(choice.architecture.empty() && contains(choice.error, "several GPUs with different architectures"), "before an adapter is known, several architectures wait for Init");
+    choice = diag::choose_loader_architecture(machine, nullptr, [](const std::string& a) { return a == "gfx1151"; }, "gfx1151");
+    expect(choice.architecture == "gfx1151", "before an adapter is known, the only architecture with a build is used");
+    choice = diag::choose_loader_architecture(machine, &strix, [](const std::string& a) { return a == "gfx1101"; }, "gfx1101");
+    expect(choice.architecture.empty() && contains(choice.error, "no build for your GPU (gfx1151)") && contains(choice.error, "supports: gfx1101"), "loader: " + choice.error);
+    choice = diag::choose_loader_architecture(rdna2, &six, has_all, "all");
+    expect(choice.architecture.empty() && contains(choice.error, "gfx1030") && contains(choice.error, "not supported by d4r"), "loader: " + choice.error);
+    choice = diag::choose_loader_architecture(rdna2, nullptr, has_all, "all");
+    expect(choice.architecture.empty() && contains(choice.error, "no supported AMD GPU") && contains(choice.error, "gfx1030"), "loader: " + choice.error);
+    expect(diag::nvapi_target_error("gfx1151", "gfx1151", "p").empty() && contains(diag::nvapi_target_error("gfx1101", "gfx1151", "p"), "built for gfx1101 but the selected GPU is gfx1151"),
+        "an NVAPI built for another target is refused");
+
+    // Real nvapi64.dll builds, one per target: the file in nvapi\<arch> names <arch> and only <arch>.
+    if (builtNvapi.empty()) { std::printf("skip real NVAPI builds (no directory given)\n"); return; }
+    for (const auto& arch : archs) {
+        const auto layout = root / L"built";
+        const auto source = builtNvapi / diag::wide(arch) / L"nvapi64.dll";
+        std::filesystem::create_directories(layout / L"nvapi" / diag::wide(arch));
+        std::filesystem::copy_file(source, layout / L"nvapi" / diag::wide(arch) / L"nvapi64.dll", std::filesystem::copy_options::overwrite_existing);
+    }
+    for (const auto& arch : archs) {
+        const auto choice = player::select_compat_nvapi(root / L"built", arch);
+        expect(choice.error.empty(), "built layout has nvapi\\" + arch);
+        if (!choice.error.empty()) continue;
+        const HMODULE module = LoadLibraryExW(choice.path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        auto target = module ? reinterpret_cast<const char*(__cdecl*)()>(reinterpret_cast<void*>(GetProcAddress(module, "d4r_NvapiTargetArchitecture"))) : nullptr;
+        const std::string built = target ? target() : "";
+        expect(built == arch, "nvapi\\" + arch + "\\nvapi64.dll names " + arch + " (reports '" + built + "')");
+        const auto bytes = player::read_text(choice.path);
+        std::string others;
+        for (const auto& other : archs) if (other != arch && contains(bytes, "D4R_NVAPI_TARGET=" + other)) others += other + " ";
+        expect(contains(bytes, "D4R_NVAPI_TARGET=" + arch + '\0') && others.empty(), "nvapi\\" + arch + " carries only its own marker for the packager (" + others + ")");
+        expect(diag::nvapi_target_error(built, arch, "p").empty(), "the shim accepts nvapi\\" + arch + " for " + arch);
+        if (module) FreeLibrary(module);
+    }
+}
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 2) { std::printf("usage: player_config_probe FIXTURE_DIR\n"); return 2; }
+    if (argc != 2 && argc != 3) { std::printf("usage: player_config_probe FIXTURE_DIR [BUILT_NVAPI_DIR]\n"); return 2; }
     const std::filesystem::path dir(argv[1]);
     std::vector<std::string> notes;
 
@@ -122,9 +306,13 @@ int wmain(int argc, wchar_t** argv) {
     std::filesystem::create_directories(dir / L"zluda");
     const auto colocatedNvapi = dir / L"zluda" / L"nvapi64.dll";
     { std::ofstream(colocatedNvapi, std::ios::binary) << "colocated compatibility NVAPI fixture"; }
-    expect(player::compat_nvapi_path(dir) == colocatedNvapi, "player mode reuses NVAPI colocated with nvcuda");
+    expect(player::compat_nvapi_path(dir) == archNvapi, "a shared NVAPI beside nvcuda never outranks the architecture-specific one");
     std::filesystem::remove(colocatedNvapi);
     std::filesystem::remove(archNvapi);
+    std::filesystem::remove(dir / L"nvapi" / L"nvapi64.dll");
+    architecture_selection(dir / L"architecture-fixture", argc > 2 ? std::filesystem::path(argv[2]) : std::filesystem::path());
+    std::filesystem::create_directories(dir / L"nvapi");
+    { std::ofstream(dir / L"nvapi" / L"nvapi64.dll", std::ios::binary) << "generic nvapi fixture"; }
     expect(player::raw_nvapi_backend_path(dir) == dir / L"nvapi" / L"backend" / L"nvapi64.dll",
         "raw ZLUDA NVAPI backend has a separate explicit path");
     const auto archNative = dir / L"native" / d4r::diag::wide(d4r::diag::HipApi::target_arch());

@@ -91,6 +91,13 @@ $other=@(Get-ChildItem -LiteralPath (Join-Path $game 'd4r/native/gfx1100') -Filt
 Copy-Item -LiteralPath $other -Destination (Join-Path $game 'd4r/native/gfx1101/kernel3.hsaco') -Force
 Expect 'code-object-for-another-gpu' (Run-Check $game $inv) 1 @('MISSING\s+kernel3\.hsaco is not built for gfx1101','differs from the release')
 
+$game=New-Install 'gpu-wrong-nvapi'
+Copy-Item -LiteralPath (Join-Path $game 'd4r/nvapi/gfx1100/nvapi64.dll') -Destination (Join-Path $game 'd4r/nvapi/gfx1151/nvapi64.dll') -Force
+Expect 'nvapi-for-another-gpu' (Run-Check $game (Write-Inventory 'd' 'gfx1151' 'Radeon 8060S')) 1 @('MISSING\s+d4r\\nvapi\\gfx1151\\nvapi64\.dll is built for ''gfx1100'' instead of gfx1151')
+$game=New-Install 'stale-shared-nvapi'
+Copy-Item -LiteralPath (Join-Path $game 'd4r/nvapi/gfx1101/nvapi64.dll') -Destination (New-Item -ItemType Directory -Force (Join-Path $game 'd4r/zluda')).FullName -Force
+Expect 'stale-shared-nvapi-noted' (Run-Check $game (Write-Inventory 'e' 'gfx1151' 'Radeon 8060S')) 0 @('note\s+d4r\\zluda\\nvapi64\.dll is left over from an older d4r release','ok\s+GPU Radeon 8060S \(gfx1151\): build present')
+
 # 6. What the last game start said, and the bug-report ZIP.
 $game=New-Install 'log-failure'
 Set-Content -LiteralPath (Join-Path $game 'd4r/d4r_nvngx.log') "d4r: DLSS disabled: Wrong nvngx_dlss.dll: you have version 1.2.3.4" -Encoding ASCII
