@@ -2046,6 +2046,22 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         result = g.worker.call([&] { return g.ngx.init(id, g.dataPath.c_str(), &g.featureInfo, apiVersion); });
         logf("NVSDK_NGX_CUDA_Init(app=%llu, sdk=0x%x) -> 0x%08x", id, version, result);
     }
+    const bool hasProject = project != nullptr && !project->id.empty();
+    if (result != NGX_SUCCESS && !hasProject && g.ngx.initProjectId != nullptr)
+    {
+        // NGX 617.14 rejects application-ID initialization on this path (Cyberpunk 2077:
+        // 0xBAD0000C, or SR unavailable with 0xBAD00004). Streamline's RR plugin reads
+        // capabilities right after that first Init, so a failure there hides RR for the
+        // session even though the game's later project-ID Init works. Retry with d4r's
+        // own project identity (the diagnostics' default) so the first Init succeeds.
+        logf("D4R_NGX_IDENTITY_FALLBACK application=%llu: 0x%08x", id, result);
+        result = g.worker.call([&] {
+            return g.ngx.initProjectId("24480451-f00d-face-1304-0308dabad187", 0, "1.0", g.dataPath.c_str(),
+                                       apiVersion, &g.featureInfo);
+        });
+        logf("NVSDK_NGX_CUDA_Init_ProjectID(d4r fallback project=24480451-f00d-face-1304-0308dabad187, engine=0 1.0, sdk=0x%x) -> 0x%08x",
+             version, result);
+    }
     using LoadErrorFn = const char*(WINAPI*)();
     const auto loadError = reinterpret_cast<LoadErrorFn>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rLoadError")));
     if (loadError != nullptr && loadError()[0] != '\0')
