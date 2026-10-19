@@ -32,6 +32,8 @@ from test_m import pack_layer, defines
 EXACT = os.environ.get('M_EXACT') == '1'
 FAST = [] if EXACT or '-DM_RELAXED' in os.environ.get('M_DEFS', '').split() else ['-DM_RELAXED']
 FAST_WPW = [] if EXACT or os.environ.get('M_WPW') or 'WPW=' in os.environ.get('M_DEFS', '') else ['-DWPW=2']
+# preset L's expansion stage (dec0l) two windows per wave as well; its input stage (enc0l) is slower that way
+L_WPW = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_DEC0L', '') else ['-DWPW=2']
 SHADERS = {'enc1': 'm_enc1', 'enc2': 'm_enc2', 'enc3_tube': 'm_tube', 'dec2': 'm_dec2', 'dec1': 'm_dec1'}
 
 
@@ -159,7 +161,7 @@ def compile_l(a, one, R):
     for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW)
     for planes, suffix in ((0, ''), (1, '_planes')):
         glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST)
-        glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST)
+        glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST + L_WPW)
     # the reconstruction one render texel wider per tier than M's (4x4 taps): 11 (reconstruction/render >= 3),
     # 16 (the whole post_3_2 range), 12 (the compact tier: render/reconstruction <= 0.45, jitter within half a texel)
     for out, tile in (('post_l', 11), ('post_l_q', 16), ('post_l_c', 12)):

@@ -64,8 +64,8 @@
 #ifndef WPW
 #define WPW 1
 #endif
-#if WPW > 1 && KIND >= 3
-#error layer_m.comp: L's input and expansion stages stage their pixels per thread (WPW = 1)
+#if WPW > 2 && KIND >= 3
+#error layer_m.comp: L's input and expansion stages handle their 64 pixels one per invocation (WPW <= 2)
 #endif
 layout(local_size_x = 128 / WPW) in;
 // o: 0 g1, 1 bo, 2 g2, 3 b2 (f16); per head h at 4 + 4h: q, v (FP8), bias (f16), wo (FP8);
@@ -496,8 +496,7 @@ void main()
 #endif
 #if KIND == 3
     // ------------------------------------------------------------ L's input: features, embedding -> x0
-    FORW {
-        WINV
+    {
         const float e1 = ep.expo == 0.0 ? 1.0 : ep.expo, e2 = ep.expoPrev == 0.0 ? 1.0 : ep.expoPrev;
         const uint li = gl_LocalInvocationID.x;
         if (li < 64u)
@@ -510,7 +509,10 @@ void main()
             const uint at = (((py >> 2) * 2u + (px >> 2)) * 16u + (py & 3u) * 4u + (px & 3u)) * FS;
             for (uint k = 0u; k < 32u; ++k) FEW[at + k] = fe[k];
         }
-        SYNC
+    }
+    SYNC
+    FORW {
+        WINV
         // the embedding has the shape of an MLP chunk: 32 features -> 32 hidden (ReLU, FP8) -> C
         B8 f0, f1;
         coopMatLoad(f0, FEW, mt * 16u * FS, FS, CM);
@@ -532,8 +534,8 @@ void main()
         for (int i = 0; i < 8; ++i) X0S[xb + 16u * (N) + uint(i)] = float16_t(x_[i]); }
         EACH_T(EMB_N)
 #undef EMB_N
-        SYNC
     }
+    SYNC
 #endif
     // ------------------------------------------------------------ norm 1: sum of squares, residual and h1
     FORW {
@@ -768,7 +770,9 @@ void main()
         const uint hb = (mt * 16u + row) * HS + ch8;
         for (uint nt = 0u; nt < NT; ++nt)
             for (int i = 0; i < 8; ++i) HO[hb + 16u * nt + uint(i)] = float16_t(res[nt][i]);
-        SYNC
+    }
+    SYNC
+    {
         const uint li = gl_LocalInvocationID.x;
         const uint px = li & 7u, py = li >> 3;
         const ivec2 at = ivec2(X0 + int(px), Y0 + int(py));
