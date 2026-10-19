@@ -485,7 +485,7 @@ wait / delay markers. What was tried on top of level 3, none of it a gain:
 - the clamps removed: -30 us (2.2 ps per instruction and wave), but not usable: without the clamp the hardware
   conversion returns NaN above 464 where the clamp gives 448 (`satprobe.comp`);
 - f32 copies of the biases: 176 fewer conversions and 78 more loads per wave, slightly slower (587-595 us): a load
-  costs about three arithmetic instructions;
+  costs about three arithmetic instructions (on the later shaders they are faster, see 2026-10-20 below);
 - the softmax cubic computed, not read from its table: the same time;
 - no barriers: the same time;
 - one wave per window walking the four token slices, every weight, key and value tile read once
@@ -642,3 +642,26 @@ Against the default build, presented image, RGB, peak 1, 1280x720 -> 1440p. For 
 - `D4R_RR2_POOLED=rgb10_a2` (since 2026-10-13): the pooled histories as UNORM 10:10:10:2 images, 31 MB less at 1440p.
   Identical at 1280x720 -> 1440p and on reset frames; 43.7 - 47.2 dB on the history frames at 1114x626 -> 1080p and
   28.8 dB with random motion. Frame 3.526 -> 3.484 ms, 3.456 with `D4R_RR2_UNGUARDED=1` as well.
+
+### Byte-identical speed-ups (2026-10-20)
+
+RX 9070 XT, RADV 26.2.2 with the ACO `v_mad_u32_u16` patch, 1280x720 -> 2560x1440 game-like input, median of 6
+interleaved runs. Every image of every frame is byte-identical to the previous model on the replay, odd-size, 540p,
+stress and game-like inputs, at levels 0 and 3 and in the `D4R_RR2_UNGUARDED=1 D4R_RR2_POOLED=rgb10_a2` build.
+
+| Change | Stages (us) | Frame (ms) |
+|---|---|---|
+| `rr_exact.glsl` Q8PAIRS, `rr2_w.comp`: the pair widened into a variable, so binary16 pairs also reach the hardware saturation | dec0_0 372 -> 334, enc0 717 -> 695 | 3.549 -> 3.487 |
+| `rr2_m.comp` KIND 2: x computed once per lane, FP8 decodes and binary16 multiply-adds in pairs | dec1_0 223 -> 203, dec2_0 118 -> 108, dec3_0 62 -> 55, dec4_0 43 -> 39 | 3.487 -> 3.442 |
+| `rr2_m.comp` merge: a wave's channel tiles side by side, sharing each step's loads | enc1 236 -> 228, enc2 123 -> 112, enc3 68 -> 61, enc4 44 -> 40 | 3.442 -> 3.413 |
+| `rr2_m.comp` residual step: FP8 decodes and conversions in pairs | dec0_1 436 -> 430 | 3.413 -> 3.401 |
+| `rr2_pack.py` float32 copies of the biases (tables as column-major tiles), read by both block shaders | dec0_1 430 -> 412, dec1_1 184 -> 171, enc1 227 -> 218, dec1_0 202 -> 194 | 3.401 -> 3.329 |
+
+The opt-in build: 3.455 -> 3.215 ms, and 3.188 with encoder 0's gather as a pass of its own, which
+`D4R_RR2_UNGUARDED=1` now selects (`compile_rr2.py`; encoder 0 650 -> 623 us, the same images; in the guarded build
+the two are equally fast).
+
+Tried, no gain: the translated code's texel fetch without its branch (enc0 within noise); the next MLP branch's
+weights or biases prefetched (into L2, or into registers one branch ahead); two MLP branches per loop iteration; V^T
+kept in registers in `rr2_w.comp`; weight loads through buffer device addresses. Not done: decoder 0's second kernel
+on one wave, whose tail would need r and the MLP sum in 8 KiB of shared memory per wave.
