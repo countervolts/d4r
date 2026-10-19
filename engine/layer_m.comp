@@ -366,7 +366,6 @@ float16_t gelu1(float16_t x)
     precise f16vec2 C_ = f16vec2(EV(T, 4), EV(T, 5)), D_ = f16vec2(EV(T, 6), EV(T, 7)); \
     P0_[T] = (A_ * A_) + (B_ * B_); P1_[T] = (C_ * C_) + (D_ * D_); }
 
-shared f16vec4 VSH[4 * 2 * 16 * VWD / 4];   // per wave and head: the V tiles, transposed through shared memory
 #define MERGE (KIND == 1 || KIND == 3)
 #define EXPAND (KIND == 2 || KIND == 4)
 #if MERGE
@@ -385,6 +384,34 @@ shared float16_t X0S[64 * XS];              // the embedding's output x0, the bl
 const uint HS = 40u;
 shared float16_t HO[64 * HS];               // the block's f16 output, window-major, for the per-pixel head
 #endif
+// VSH: per wave and head the V tiles, transposed through shared memory (4 KiB, 512 bytes a tile). It is only accessed
+// as matrices, and only during the attention, so it takes the place of a buffer that is dead then: the merge rows
+// (written after the attention), the expansion (read before it) or, for KIND 4, the head's input (written after it).
+// Shared memory caps how many waves this GPU runs, and ACO gives a shader the registers that number of waves leaves.
+#if MERGE
+#define VSH NB
+#define VSH_UNIT 1u
+#if 32 * (4 * C + 8) < 4096
+#error layer_m.comp: the V tiles no longer fit in NB
+#endif
+#elif KIND == 2
+#define VSH NEX
+#define VSH_UNIT 1u
+#if 16 * (4 * C + 8) < 4096
+#error layer_m.comp: the V tiles no longer fit in NEX
+#endif
+#elif KIND == 4
+#define VSH HO
+#define VSH_UNIT 2u
+#if 64 * 40 * 2 < 4096
+#error layer_m.comp: the V tiles no longer fit in HO
+#endif
+#else
+shared floate4m3_t VSH[4 * 2 * 16 * VWD * 2];
+#define VSH_UNIT 1u
+#endif
+#define VSH_AT(t) ((t) * (512u / VSH_UNIT))      // tile t, in the buffer's elements
+#define VSH_STRIDE (VWD * 2u / VSH_UNIT)          // a row of VWD binary16
 #define SYNC memoryBarrierShared(); barrier();
 #if KIND == 4
 // NVIDIA's f32 activations of the head (rrlite_dec0_4x4's output code): a sigmoid rounded to binary16, and a
@@ -552,6 +579,9 @@ void main()
     H1N(N, rn) }
     EACH_T(NM1)
     }
+#if KIND == 2
+    SYNC   // every wave has read the block's input from NEX: the V tiles take its place
+#endif
     // ------------------------------------------------------------ attention, one head at a time
     for (uint hd = 0u; hd < uint(NH); ++hd)
     {
@@ -603,8 +633,8 @@ void main()
         // V of every window goes to its shared buffer now, so it does not occupy registers during the scores
         FORW {
             const uint mt = mt0 + w;
-            coopMatStore(v[w][0], VSH, (mt * 2u + 0u) * 64u, VWD / 4u, RM);
-            coopMatStore(v[w][1], VSH, (mt * 2u + 1u) * 64u, VWD / 4u, RM);
+            coopMatStore(v[w][0], VSH, VSH_AT(mt * 2u + 0u), VSH_STRIDE, RM);
+            coopMatStore(v[w][1], VSH, VSH_AT(mt * 2u + 1u), VSH_STRIDE, RM);
         }
         }
         // scores: q8(Q) against itself, rows are the queries and columns the keys, plus the relative position bias
@@ -634,8 +664,8 @@ void main()
         // V through this wave's shared buffer, then O^T = V^T x P^T: rows are the head channels, columns the tokens
         ACC o[2];
         A16 vt0, vt1;
-        coopMatLoad(vt0, VSH, (mt * 2u + 0u) * 64u, VWD / 4u, RM);
-        coopMatLoad(vt1, VSH, (mt * 2u + 1u) * 64u, VWD / 4u, RM);
+        coopMatLoad(vt0, VSH, VSH_AT(mt * 2u + 0u), VSH_STRIDE, RM);
+        coopMatLoad(vt1, VSH, VSH_AT(mt * 2u + 1u), VSH_STRIDE, RM);
 #if TEXL
         // P V is the block's one product of two f16 operands, and its f32 sum over the 16 keys is not exact: ZLUDA's
         // lowering of m16n8k16 puts key pair (j & 1) * 4 + 2 h + (j >> 1) in K dword j of half h (swin_tok.h
@@ -732,6 +762,7 @@ void main()
     }
 #if KIND == 4
     // ------------------------------------------------------------ L's expansion head: per-pixel reconstruction inputs
+    SYNC   // every wave is done with the V tiles in HO
     FORW {
         WINV
         const uint hb = (mt * 16u + row) * HS + ch8;
@@ -773,6 +804,7 @@ void main()
 #endif
     // ------------------------------------------------------------ patch merge: 2x2 tokens (4C) -> XC, half resolution
 #if MERGE
+    SYNC   // every wave is done with the V tiles in NB
     FORW {
         WINV
         // the 16 merged rows are gathered from the four waves: the row is the merged token of the lane's pixel
