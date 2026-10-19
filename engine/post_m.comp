@@ -154,6 +154,42 @@ void main()
     // three render texel rows and its own-cell residual rounding exactly as in the 16x16 shader
     const int y0 = 2 * gid.y;
     const bool inside0 = gid.x < p.hiSize.x && y0 < p.hiSize.y;
+    const vec2 pos0 = fma(vec2(gid.x, y0) + 0.5, p.hi2rnd, p.rndOffs), pos1 = fma(vec2(gid.x, y0 + 1) + 0.5, p.hi2rnd, p.rndOffs);
+    // The Gaussians of both rows at once: they have the same column (dx) and texels and differ only in dy, so one set
+    // of tile reads serves both, and each row's operations are the ones it had on its own, lane by lane (dy, the
+    // exponents and the third accumulator are binary16 pairs, element 0 the even row).
+    f16vec4 a0[2] = {f16vec4(0.0), f16vec4(0.0)}, a1[2] = {f16vec4(0.0), f16vec4(0.0)};
+    f16vec2 a2 = f16vec2(0.0);
+    float W[2] = {0.0, 0.0};
+    if (inside0)
+    {
+        // NVIDIA's kernel handles rows in pairs and gives the odd row the even row's three texel rows
+        const ivec2 base = ivec2(floor(pos0 - 0.5));
+        const f16vec2 d0 = f16vec2((vec2(base) + 0.5) - pos0);
+        // Native paired rows round the odd row's own-cell residual first, then adjust it in f16.
+        // Casting the even-cell residual once changes Gaussian weights at half-rounding boundaries.
+        const int ownBaseY = int(floor(pos1.y - 0.5));
+        const float16_t d1y = ownBaseY != base.y ? float16_t((float(ownBaseY) + 0.5) - pos1.y) - float16_t(1.0)
+                                                 : float16_t((float(base.y) + 0.5) - pos1.y);
+        const f16vec2 dy0 = f16vec2(d0.y, d1y);
+        for (int i = TAP_LO; i <= TAP_HI; ++i)
+        {
+            const float16_t dx = d0.x + float16_t(i), sq = dx * dx;
+            for (int j = TAP_LO; j <= TAP_HI; ++j)
+            {
+                const int k = (base.y - origin.y + j) * TILE_W + (base.x - origin.x + i);
+                const f16vec4 t0 = tile0[k], t1 = tile1[k], t2 = tile2[k];
+                const f16vec2 dy = dy0 + float16_t(j);
+                precise f16vec2 e = (f16vec2(sq * t2.y) + (dy * dy) * t2.z) + (dx * dy) * t2.w;
+                const float w0 = exp2(float(e.x)), w1 = exp2(float(e.y));
+                const float16_t wh0 = float16_t(w0), wh1 = float16_t(w1);
+                W[0] += w0; W[1] += w1;
+                a0[0] = fma(f16vec4(wh0), t0, a0[0]); a1[0] = fma(f16vec4(wh0), t1, a1[0]);
+                a0[1] = fma(f16vec4(wh1), t0, a0[1]); a1[1] = fma(f16vec4(wh1), t1, a1[1]);
+                a2 = fma(f16vec2(wh0, wh1), f16vec2(t2.x), a2);
+            }
+        }
+    }
     vec3 outA0 = vec3(0.0), outA1 = vec3(0.0);
     for (int r = 0; r < 2; ++r)
     {
@@ -163,39 +199,10 @@ void main()
         if (inside)
         {
             const vec2 centre = vec2(pix) + 0.5;
-            const vec2 pos = fma(centre, p.hi2rnd, p.rndOffs);
-            // NVIDIA's kernel handles rows in pairs and gives the odd row the even row's three texel rows
-            const float evenY = fma(float(pix.y & ~1) + 0.5, p.hi2rnd.y, p.rndOffs.y);
-            const ivec2 near = ivec2(floor(pos)), base = ivec2(floor(pos.x - 0.5), floor(evenY - 0.5));
-            f16vec2 d0 = f16vec2((vec2(base) + 0.5) - pos);
-            if ((pix.y & 1) != 0)
-            {
-                // Native paired rows round the odd row's own-cell residual first, then adjust it in f16.
-                // Casting the even-cell residual once changes Gaussian weights at half-rounding boundaries.
-                const int ownBaseY = int(floor(pos.y - 0.5));
-                if (ownBaseY != base.y)
-                    d0.y = float16_t((float(ownBaseY) + 0.5) - pos.y) - float16_t(1.0);
-            }
-            f16vec4 a0 = f16vec4(0.0), a1 = f16vec4(0.0);
-            float16_t a2 = float16_t(0.0);
-            float W = 0.0;
-            for (int i = TAP_LO; i <= TAP_HI; ++i)
-            {
-                const float16_t dx = d0.x + float16_t(i), sq = dx * dx;
-                for (int j = TAP_LO; j <= TAP_HI; ++j)
-                {
-                    const int k = (base.y - origin.y + j) * TILE_W + (base.x - origin.x + i);
-                    const f16vec4 t2 = tile2[k];
-                    const float16_t dy = d0.y + float16_t(j);
-                    precise float16_t e = (sq * t2.y + (dy * dy) * t2.z) + (dx * dy) * t2.w;
-                    const float w = exp2(float(e));
-                    const float16_t wh = float16_t(w);
-                    W += w;
-                    a0 = fma(f16vec4(wh), tile0[k], a0); a1 = fma(f16vec4(wh), tile1[k], a1); a2 = fma(wh, t2.x, a2);
-                }
-            }
-            const float inv = 1.0 / W;
-            const vec3 cur = inv * vec3(a0.rgb), m = inv * vec3(a0.w, a1.x, a1.y), g = inv * vec3(a1.z, a1.w, a2);
+            const vec2 pos = r == 0 ? pos0 : pos1;
+            const ivec2 near = ivec2(floor(pos));
+            const float inv = 1.0 / W[r];
+            const vec3 cur = inv * vec3(a0[r].rgb), m = inv * vec3(a0[r].w, a1[r].x, a1[r].y), g = inv * vec3(a1[r].z, a1[r].w, a2[r]);
             // the two most likely motion candidates
             const vec2 mvPos = any(notEqual(textureSize(mvCTex, 0), p.rndSize))
                 ? clamp(pos, vec2(0.5), vec2(p.rndSize) - 0.5) : pos;
@@ -246,7 +253,7 @@ void main()
             const vec3 hist = e1 * (expand(fma(vec3(b1), h1, b2 * h2)) * (1.0 / e2));
 #endif
             const vec3 lin = expand(cur);
-            const float g0 = clamp(p.gain * W * g.x, 0.0, 1.0);
+            const float g0 = clamp(p.gain * W[r] * g.x, 0.0, 1.0);
             const float ga = fma(g0, 1.0 - g.y, g.y), gb = fma(g0, 1.0 - g.z, g.z);
             outA = fma(lin - hist, vec3(ga), hist);
             if (isinf(outA.x + outA.y + outA.z) || isnan(outA.x + outA.y + outA.z)) outA = lin;
