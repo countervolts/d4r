@@ -23,6 +23,11 @@ void check(VkResult r, const char* operation) {
     if (r != VK_SUCCESS) throw std::runtime_error(std::string(operation) + ": VkResult " + std::to_string(r));
 }
 #define CK(call) check((call), #call)
+// a D4R_RR_TEST_* switch: set to anything but "" or "0"
+bool testFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") != 0;
+}
 std::vector<char> read(const std::string& file) {
     std::ifstream stream(file, std::ios::binary | std::ios::ate);
     if (!stream) throw std::runtime_error("cannot read " + file);
@@ -143,7 +148,7 @@ int main(int argc, char** argv) try {
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
     // D4R_RR_TEST_ROBUST2=1: robustBufferAccess2 / robustImageAccess2 as vkd3d-proton enables them (out-of-bounds
     // reads return zero)
-    const bool robust2 = std::getenv("D4R_RR_TEST_ROBUST2") != nullptr;
+    const bool robust2 = testFlag("D4R_RR_TEST_ROBUST2");
     if (robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     else { rb2.robustBufferAccess2 = rb2.robustImageAccess2 = rb2.nullDescriptor = VK_FALSE; }
     // Omit unsupported extension feature structures as well as their extension names. gfx11 RR uses f16 matrices.
@@ -155,11 +160,11 @@ int main(int argc, char** argv) try {
     }
     di.enabledExtensionCount = static_cast<uint32_t>(extensions.size()); di.ppEnabledExtensionNames = extensions.data();
     // D4R_RR_TEST_NO_ROBUST=1: no robust buffer or image access (out-of-bounds reads are undefined)
-    if (std::getenv("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
+    if (testFlag("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
     // D4R_RR_TEST_NO_COOPMAT=1: a device like vkd3d-proton's, without the cooperative-matrix and float8 features
-    if (std::getenv("D4R_RR_TEST_NO_COOPMAT")) { di.enabledExtensionCount = 0; v13.pNext = nullptr; }
+    if (testFlag("D4R_RR_TEST_NO_COOPMAT")) { di.enabledExtensionCount = 0; v13.pNext = nullptr; }
     // D4R_RR_TEST_NO_INT64_ATOMICS=1: no 64-bit buffer atomics (preset F's exposure then takes its two passes)
-    if (std::getenv("D4R_RR_TEST_NO_INT64_ATOMICS")) v12.shaderBufferInt64Atomics = v12.shaderSharedInt64Atomics = VK_FALSE;
+    if (testFlag("D4R_RR_TEST_NO_INT64_ATOMICS")) v12.shaderBufferInt64Atomics = v12.shaderSharedInt64Atomics = VK_FALSE;
     CK(vkCreateDevice(c.physical, &di, nullptr, &c.device));
     vkGetDeviceQueue(c.device, family, 0, &c.queue);
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pi.queueFamilyIndex = family;
