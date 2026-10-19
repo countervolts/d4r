@@ -22,7 +22,7 @@ bool gameMotionFormat(VkFormat format) {
 }
 bool gameDepthFormat(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) return depthAspect(format);
-    return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16_UNORM;
+    return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16_UNORM;
 }
 bool gameOutputFormat(VkFormat format) { return gameColorFormat(format); }
 
