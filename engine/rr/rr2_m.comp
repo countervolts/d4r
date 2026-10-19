@@ -535,9 +535,10 @@ void main()
         barrier();   // every wave is done with XT (the merge rows reuse it)
 #endif
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
-            [[unroll]] for (int i = 0; i < 8; ++i) {
-                RESID(y, ML[m][i], s2, rv[m][i])
-                Tb[m][i] = Q8R(y);
+            [[unroll]] for (int i = 0; i < 8; i += 2) {   // (each element as alone; the conversion two at a time)
+                RESID(y0, ML[m][i], s2, rv[m][i])
+                RESID(y1, ML[m][i + 1], s2, rv[m][i + 1])
+                Q8R2(Tb[m], i, y0, y1)
             }
             const uint w0 = pack4(Tb[m][0], Tb[m][1], Tb[m][2], Tb[m][3]), w1 = pack4(Tb[m][4], Tb[m][5], Tb[m][6], Tb[m][7]);
             const uint at = 4u * (m & 1u) + 2u * hl;
