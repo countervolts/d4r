@@ -91,14 +91,19 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #ifdef RR_NATIVE
 #define RVT float
 #define E4V(w, b) float(uintBitsToFloate4m3EXT(uint8_t(((w) >> (8u * (b))) & 0xffu)))
+// the FP8 bytes b and b + 1 (b even) of w, decoded together
+#define E4V2(w, b) vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t((w) >> (8u * (b))), uint8_t((w) >> (8u * (b) + 8u)))))
 #define RESID(d, a, s, c) const float d = fma(float(a), float(s), float(c));
 #define Q8R(x) q8s(x)
+#define Q8R2(dst, i, x0, x1) { const vec2 v_ = vec2((x0), (x1)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(v_)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
 #define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2(float((h)[i_]), float((h)[i_ + 1])); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 #else
 #define RVT float16_t
 #define E4V(w, b) e4((w), (b))
+#define E4V2(w, b) e4pair((w), (b) >> 1u)
 #define RESID(d, a, s, c) MADD(d, float16_t(a), s, c)
 #define Q8R(x) q8h(x)
+#define Q8R2(dst, i, x0, x1) { const vec2 v_ = vec2((x0), (x1)); fe4m3vec2 t_; saturatedConvertEXT(t_, v_); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
 #define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
 #endif
 // once (swin_m.comp explains RR_MIX, the one-rounding variant that is not bit-exact by construction)
@@ -445,15 +450,18 @@ void main()
         const uint xa = (16u * wv + col) * (C / 4u) + 4u * m + 2u * hl;
         const uvec2 xw = uvec2(XT[xa], XT[xa + 1u]);
 #endif
-        [[unroll]] for (int i = 0; i < 8; ++i) {
+        // two elements at a time: the FP8 decodes and the conversions into FP8 work on pairs
+        [[unroll]] for (int i = 0; i < 8; i += 2) {
 #if KIND == 2
-            const float16_t xb = xr[m][i];
+            const float16_t xb0 = xr[m][i], xb1 = xr[m][i + 1];
 #else
-            const RVT xb = E4V(xw[i >> 2], uint(i) & 3u);
+            const RVT xb0 = E4V2(xw[i >> 2], uint(i) & 3u).x, xb1 = E4V2(xw[i >> 2], uint(i) & 3u).y;
 #endif
-            RESID(r, AT[m][i], s1, xb)
-            rv[m][i] = r;
-            Nb[m][i] = Q8R(r);
+            RESID(r0, AT[m][i], s1, xb0)
+            RESID(r1, AT[m][i + 1], s1, xb1)
+            rv[m][i] = r0;
+            rv[m][i + 1] = r1;
+            Q8R2(Nb[m], i, r0, r1)
         }
     }
     RAC ML[MT];
