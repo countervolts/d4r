@@ -171,7 +171,8 @@ int main(int argc, char** argv) try {
     std::string key;
     uint32_t rw, rh, ow, oh;
     frames >> key >> rw >> rh >> ow >> oh;
-    d4r::RModel model(c.physical, c.device, modelDir, VK_NULL_HANDLE, v12.shaderBufferInt64Atomics == VK_TRUE);
+    d4r::RModel model(c.physical, c.device, modelDir, VK_NULL_HANDLE, v12.shaderBufferInt64Atomics == VK_TRUE,
+                      robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && rb2.robustImageAccess2 == VK_TRUE);
     d4r::REngine engine(model, rw, rh, ow, oh);
     const char* names[] = {"color", "motion", "depth", "normals", "roughness", "diffuse", "specular"};
     const VkFormat formats[] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT,

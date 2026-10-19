@@ -274,9 +274,10 @@ struct RFrameSettings {
 class RModel {
 public:
     // int64Atomics: the device has shaderBufferInt64Atomics enabled; preset F then measures the exposure in one pass
-    // (engine/rr/exposure_f.comp PASS 2) instead of two
+    // (engine/rr/exposure_f.comp PASS 2) instead of two. robustImages: the device has robustImageAccess2 enabled; the
+    // translated stages then leave the zero of an image load outside the image to the device (engine/rr/ptx2rr.py fetch0)
     RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
-           bool int64Atomics = false);
+           bool int64Atomics = false, bool robustImages = false);
     ~RModel();
     RModel(const RModel&) = delete;
     RModel& operator=(const RModel&) = delete;

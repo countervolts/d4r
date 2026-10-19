@@ -47,7 +47,8 @@ struct R2Model {
     Pipeline exposureOne;         // both exposure passes in one (exposure_f2.spv, 64-bit atomics); else null
     bool particles = false;       // the model has R2DownP
     bool gather = false;          // the model has R2Gather
-    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache, bool int64Atomics) {
+    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache, bool int64Atomics,
+              const VkSpecializationInfo* specialization) {
         const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         auto split = [](const std::string& list) {
             std::vector<std::string> items;
@@ -96,7 +97,7 @@ struct R2Model {
             types.insert(types.end(), st.textures.size(), t);
             types.insert(types.end(), st.surfaces.size(), s);
             types.insert(types.end(), st.buffers.size(), b);
-            st.pipeline.create(d.handle, directory + "/" + shader, types, subgroup, cache);
+            st.pipeline.create(d.handle, directory + "/" + shader, types, subgroup, cache, 0, specialization);
             { const auto bytes = read(directory + "/" + argsFile); st.args.assign(bytes.begin(), bytes.end()); }
             blob(st.weights, st.pending, weightFile == "-" ? std::vector<char>(16) : read(directory + "/" + weightFile));
         }

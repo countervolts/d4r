@@ -78,8 +78,17 @@ float lg2_ftz(float x) { return log2(abs(x) < 1.17549435e-38 ? 0.0 : x); }
 // PTX .relu: negative results become +0, NaN stays NaN
 f16vec2 relu2(f16vec2 v) { return f16vec2(v.x < 0.0hf ? 0.0hf : v.x, v.y < 0.0hf ? 0.0hf : v.y); }
 float16_t relu1(float16_t v) { return v < 0.0hf ? 0.0hf : v; }
-// (one unsigned comparison per axis: a negative coordinate is above every size)
-vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return any(greaterThanEqual(uvec2(c), uvec2(n))) ? vec4(0.0) : texelFetch(t, c, 0); }
+// An integer fetch outside the image returns zero (one unsigned comparison per axis: a negative coordinate is above
+// every size). With robustImageAccess2 the image load returns zero there itself, except for a w component the format
+// lacks, which it returns as one: the runtime sets RR_ROBUST_IMAGES when the device has it enabled (vkd3d-proton
+// always does), and only a fetch whose w is used still needs the image's size.
+layout(constant_id = 0) const bool RR_ROBUST_IMAGES = false;
+vec4 fetch0(sampler2D t, ivec2 c)
+{
+    const bool out_ = any(greaterThanEqual(uvec2(c), uvec2(textureSize(t, 0))));
+    if (RR_ROBUST_IMAGES) { const vec4 v = texelFetch(t, c, 0); return vec4(v.xyz, out_ ? 0.0 : v.w); }
+    return out_ ? vec4(0.0) : texelFetch(t, c, 0);
+}
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
 float round_half_away(float x) { float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
 uint PARAM32(uint o) { return param.w[o >> 2]; }
