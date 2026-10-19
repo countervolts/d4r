@@ -1,5 +1,6 @@
 #include "game_rr.h"
 #include "game_internal.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -15,6 +16,12 @@ struct GameDenoiser::Impl {
     game_detail::CanonicalInputs fallback;                 // colour, motion, depth
     std::array<game_detail::Plane, 8> guides;              // the guides and optional inputs, when one cannot be sampled directly
     bool started = false;
+    // Per-input ring-buffer detection: tracks distinct views for each of the 11 inputs
+    // (color, motion, depth, 8 guides). When an input exceeds the threshold, it is
+    // copied to a canonical plane so the engine sees a stable set of views.
+    static constexpr int NUM_INPUTS = 11;
+    std::array<std::vector<VkImageView>, NUM_INPUTS> seenViews;
+    std::array<bool, NUM_INPUTS> needsCopy = {};
     // debugging: D4R_ENGINE_RR_DUMP=DIR copies every engine image after each frame into a host-visible buffer and
     // writes it at the next frame's recording (by then the game has waited for the frame), as DIR/F-NAME.bin
     VkPhysicalDevice physical;
@@ -95,10 +102,28 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
         throw std::runtime_error("unsupported game texture format");
     // The stages sample every input at its texel coordinates from the origin, so only views at origin zero are
     // borrowed; anything else is copied first. Every input must be in GENERAL when borrowed (one layout for all).
-    auto direct = [](const GameImage& image) {
-        return image.view != VK_NULL_HANDLE && !image.x && !image.y && image.layout == VK_IMAGE_LAYOUT_GENERAL;
+    // Per-input ring-buffer detection: track distinct views and flag inputs that rotate.
+    // The engine caches descriptor sets per unique combination of input views (limit 16).
+    // If K inputs each rotate through N views, there are up to N^K combinations.
+    // Copying any rotating input to a canonical plane removes it from the combination.
+    const VkImageView inputViews[11] = {
+        frame.color.view, frame.motion.view, frame.depth.view,
+        frame.normals.view, frame.roughness.view, frame.diffuseAlbedo.view,
+        frame.specularAlbedo.view, frame.specularHitDistance.view,
+        frame.disocclusionMask.view, frame.subsurfaceGuide.view, frame.colorBeforeParticles.view
     };
-    const bool directColor = direct(frame.color), directMotion = direct(frame.motion), directDepth = direct(frame.depth);
+    for (int i = 0; i < 11; ++i) {
+        if (inputViews[i] == VK_NULL_HANDLE) continue;
+        auto& seen = g.seenViews[i];
+        if (std::find(seen.begin(), seen.end(), inputViews[i]) == seen.end()) {
+            seen.push_back(inputViews[i]);
+            if (seen.size() > 4) g.needsCopy[i] = true;
+        }
+    }
+    auto direct = [&](const GameImage& image, int idx) {
+        return !g.needsCopy[idx] && image.view != VK_NULL_HANDLE && !image.x && !image.y && image.layout == VK_IMAGE_LAYOUT_GENERAL;
+    };
+    const bool directColor = direct(frame.color, 0), directMotion = direct(frame.motion, 1), directDepth = direct(frame.depth, 2);
     // the four guides, then the two optional inputs (kept in their own one-channel formats when copied)
     const GameImage* guides[8] = {&frame.normals, &frame.roughness, &frame.diffuseAlbedo, &frame.specularAlbedo,
                                   &frame.specularHitDistance, &frame.disocclusionMask, &frame.subsurfaceGuide,
@@ -114,7 +139,7 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
     }
     g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, w, h, directColor, directMotion, directDepth);
     for (int i = 0; i < 8; ++i) {
-        if (!present(i) || direct(*guides[i])) continue;
+        if (!present(i) || direct(*guides[i], 3 + i)) continue;
         if (!g.guides[i].image) {
             g.fallback.ensure(cb, g.guides[i], guideFormats[i], w, h);
         }
@@ -132,7 +157,7 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
                                   &images.specularHitDistance, &images.disocclusionMask, &images.subsurfaceGuide,
                                   &images.colorBeforeParticles};
     for (int i = 0; i < 8; ++i)
-        if (present(i)) *guideViews[i] = direct(*guides[i]) ? guides[i]->view : g.guides[i].view;
+        if (present(i)) *guideViews[i] = direct(*guides[i], 3 + i) ? guides[i]->view : g.guides[i].view;
     const bool directOutput = frame.output.view != VK_NULL_HANDLE && frame.output.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
         frame.output.layout == VK_IMAGE_LAYOUT_GENERAL && !frame.output.x && !frame.output.y &&
         frame.output.image != frame.color.image && frame.output.image != frame.motion.image && frame.output.image != frame.depth.image;
