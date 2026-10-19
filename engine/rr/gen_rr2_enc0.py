@@ -181,8 +181,8 @@ def main():
     m = next(i for i, l in enumerate(g) if l.startswith('void main()'))
     # --one-wave (D4R_RR_RELAXED=3): the block as rr2_w.comp, in NVIDIA's own 32-thread group, the tail on the same wave
     one_wave = '--one-wave' in sys.argv
-    if one_wave and (dec or G != 1):
-        raise SystemExit('--one-wave is for encoder 0 with one window per workgroup')
+    if one_wave and G != 1:
+        raise SystemExit('--one-wave is for one window per workgroup')
     head = '\n'.join(g[:m])
     if not one_wave:
         head = head.replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
@@ -267,6 +267,7 @@ def main():
     store.append('    }')
     load = ['        {   // the guide head as the last product\'s D fragments (rows g, g + 8; columns 2t, 2t + 1)',
             '            const uint l_ = gl_SubgroupInvocationID, g_ = l_ >> 2u, t_ = l_ & 3u;']
+    load_row = {}   # load line -> its row offset (the token row is that + g)
     f16vars = set()
     for l in body[:nd]:
         if re.match(r'\s*(precise )?float16_t ', l):
@@ -275,9 +276,11 @@ def main():
         for q, r in enumerate(mm_[2]):
             row = f'({16 * i + 8 * q}u + g_)'
             load.append(f'            {var(r)} = HDV({row}, {8 * j}u + 2u * t_) | (HDV({row}, {8 * j + 1}u + 2u * t_) << 16u);')
+            load_row[load[-1]] = 16 * i + 8 * q
     for name, (ro, co, hf) in rmap.items():
         v = f'RSV({ro}u + g_, {co + hf}u + 2u * t_)'
         load.append(f'            {name} = ' + (f'uint16BitsToFloat16(uint16_t({v}));' if name in f16vars else f'{v};'))
+        load_row[load[-1]] = ro
     load.append('        }')
     # the native block's source, without its #version line (this shader has its own)
     block = (Path(__file__).resolve().parent / ('rr2_w.comp' if one_wave else 'rr2_m.comp')).read_text().split('\n', 1)[1]
@@ -300,8 +303,8 @@ def main():
     # then the second's); the compiler drops what a copy's stores do not need. Every stored value comes from the
     # same instructions on the same values as on one wave, so the outputs are the same.
     TW = int(sys.argv[sys.argv.index('--tail-waves') + 1]) if '--tail-waves' in sys.argv else 1
-    if TW > 1 and not (dec and G == 1):
-        raise SystemExit('--tail-waves is for dec0_1 with one window per workgroup')
+    if TW > 1 and not (dec and G == 1 and not one_wave):
+        raise SystemExit('--tail-waves is for dec0_1 with one window per workgroup, on the four-wave block')
     wx = (lambda t: t) if one_wave or TW > 1 else (lambda t: t.replace('gl_WorkGroupID.x', f'({G}u * gl_WorkGroupID.x + gl_SubgroupID)'))
     STORE = re.compile(r'^\s*(?!if\b|for\b|while\b|switch\b|return\b)[A-Za-z_]\w*\(')
     stores = [i for i, l in enumerate(tail) if STORE.match(l)]
@@ -314,8 +317,18 @@ def main():
                     for w in range(TW)) if TW > 1 else None
     valid = (f'gl_SubgroupID < {TW}u && gl_WorkGroupID.x < rr2_gx' if TW > 1 else
              f'gl_SubgroupID < {G}u && {G}u * gl_WorkGroupID.x + gl_SubgroupID < rr2_gx')
+    # --dec0_1 --one-wave (D4R_RR_RELAXED=3): the block is rr2_w.comp's KIND 5 on the tail's own wave, which hands r and
+    # the MLP sum over half the window's tokens at a time (rr2_handoff): the tail reads the rows of the first half,
+    # then those of the second, then runs as before with every store
+    if dec and one_wave:
+        head_lines, body_lines = load[:2], load[2:-1]
+        first = [l for l in body_lines if load_row[l] < 32]
+        second = [l for l in body_lines if load_row[l] >= 32]
+        tails = ('    rr2_handoff(0u);\n    if (rr2_valid) {\n' + '\n'.join(head_lines + first) + '\n        }\n    }\n'
+                 '    rr2_handoff(1u);\n    if (rr2_valid) {\n' + '\n'.join(head_lines + second) + '\n        }\n' +
+                 '\n'.join(keep) + '\n' + '\n'.join(tail) + '\n    }\n')
     text = (head + f'\n#extension GL_GOOGLE_include_directive : require\n#define RR2_EMBED 1\n#define RR2_GROUP {G}\n' +
-            ('#define RR2_XF_SHARED 1\n' if one_wave else '') + block + '\n' +
+            ('#define RR2_XF_SHARED 1\n' if one_wave and not dec else '') + block + '\n' +
             ('uint HDV(uint row, uint col) { return uint(float16BitsToUint16(rr2_msh(row, col))); }\n'
              'uint RSV(uint row, uint col) { return uint(float16BitsToUint16(rr2_rsh(row, col))); }\n\n' if dec else
              'uint HDV(uint row, uint col) { return col < 4u ? uint(float16BitsToUint16(HD[gl_SubgroupID * 256u + row * 4u + col])) : 0u; }\n\n') +
@@ -327,7 +340,7 @@ def main():
             ('' if dec else '\n'.join(store)) +
             # (the block runs unconditionally, also for a window past the level's last one: it writes nothing there, and
             # inside a branch the driver compiles it much slower)
-            ('\n    barrier();\n    rr2_block();\n    barrier();\n' if G == 1 else
+            ('\n    barrier();\n    rr2_block();\n' + ('' if dec and one_wave else '    barrier();\n') if G == 1 else
              f'\n    barrier();\n    for (uint w_ = 0u; w_ < {G}u; ++w_) {{\n        rr2_win = w_;\n'
              '        rr2_block();\n        barrier();\n    }\n') +
             (tails + '}\n' if tails else
