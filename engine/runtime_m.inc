@@ -540,7 +540,12 @@ std::vector<MEngine::DebugResource> MEngine::debugResources() const {
                                  {"mix", VK_NULL_HANDLE, e.mix.handle, VkDeviceSize(w) * h * 4, w, h},
                                  {"cov", VK_NULL_HANDLE, e.cov.handle, VkDeviceSize(w) * h * 8, w, h},
                                  {"mvA", VK_NULL_HANDLE, e.mvA[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
-                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h}};
+                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
+                                 // the reconstruction's outputs: the history, its half-resolution mean and the packed
+                                 // image the downsample reads
+                                 {"hist", VK_NULL_HANDLE, e.hist[1 - e.current].handle, VkDeviceSize(e.hw) * e.hh * 8, e.hw, e.hh},
+                                 {"half", VK_NULL_HANDLE, e.half[1 - e.current].handle, VkDeviceSize(e.hw / 2) * (e.hh / 2) * 16, e.hw / 2, e.hh / 2},
+                                 {"packed", e.packed.handle, VK_NULL_HANDLE, e.packed.size, 0, 0}};
     if (e.model.presetL) r.push_back({"skip", e.skipL.handle, VK_NULL_HANDLE, e.skipL.size, 0, 0});
     return r;
 }
