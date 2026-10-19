@@ -74,9 +74,11 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 // as ZLUDA (the captures) does. The activation table is built to match (enc1_ref.act).
 #ifdef RR_FUSE
 #define MADD(d, a, b, c) precise float16_t d = fma((a), (b), (c));
+#define MADD2(d, a, b, c) precise f16vec2 d = fma((a), f16vec2(b), (c));
 #define MADD4(d, a, b, c) precise f16vec4 d = fma((a), (b), (c));
 #else
 #define MADD(d, a, b, c) precise float16_t d##_p = (a) * (b); precise float16_t d = (c) + d##_p;
+#define MADD2(d, a, b, c) precise f16vec2 d##_p = (a) * f16vec2(b); precise f16vec2 d = (c) + d##_p;
 #define MADD4(d, a, b, c) precise f16vec4 d##_p = (a) * (b); precise f16vec4 d = d##_p + (c);
 #endif
 // RR_NATIVE (D4R_RR_RELAXED=3): the residual steps and the MLP activation in f32, straight into FP8 - no binary16 in
@@ -151,6 +153,8 @@ shared uint KVS[2 * 512];        // the current head's QK ([token slot][32]), th
 #endif
 #define LOW KVS
 shared uint EX[16 * C];          // their expansion: [low token][sub-position][C FP8 channels in slot order]
+// q8h of x, two elements per conversion instruction (each still clamped, as q8h does)
+#define Q8X(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 v_ = vec2((src)[i_], (src)[i_ + 1]); fe4m3vec2 t_; saturatedConvertEXT(t_, v_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 #endif
 #if KIND == 4
 #ifdef RR2_XF_ARENA
@@ -188,6 +192,8 @@ uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
     return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
 }
 float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
+// bytes 2h and 2h + 1 of w as binary16 (FP8 values are binary16 numbers: the same as two e4)
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u * h)), uint8_t(w >> (16u * h + 8u))))); }
 uvec2 mergeXY(uint r) { return r < 8u ? uvec2(r >> 1u, r & 1u) : uvec2((r - 8u) >> 1u, 2u + (r & 1u)); }
 // four binary16 values of a guide image at token (x, y) of a level w wide
 f16vec4 guideAt(uint off, int x, int y, int w)
@@ -315,36 +321,29 @@ void main()
             coopMatStore(q, EX, 4u * m, C, CMJ);
         }
         barrier();
-        if (tid < 64u) {
-            const uint k = inter(tid);
-            const int kx = x0 + int(k & 7u), ky = y0 + int(k >> 3u);
-            const uint tb = (skOff + uint(mirror(ky, ey) * ex + mirror(kx, ex)) * 32u) / 4u;
-            const uint r = uint(((ky >> 1) - Y0) * 4 + ((kx >> 1) - X0)), s = uint(2 * (ky & 1) + (kx & 1));
-            [[unroll]] for (uint wd = 0u; wd < C / 4; ++wd) {
-                const uint sk = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
-                const uint e = EX[r * C + s * (C / 4u) + wd];
-                floate4m3_t c[4];
-                [[unroll]] for (uint b = 0u; b < 4u; ++b) {
-                    MADD(x, e4(sk, b), s3, e4(e, b))
-                    c[b] = q8h(x);
-                }
-                XT[tid * (C / 4u) + wd] = pack4(c[0], c[1], c[2], c[3]);
-            }
-        }
-        {   // the same x for the residual step: the bytes of the words 4 m + 2 hl and 4 m + 2 hl + 1 of this lane's token
+        {   // x for this lane's token (slot 16 wv + col) at the channel slots 16 m + 8 hl + i, the bytes of the words
+            // 4 m + 2 hl and 4 m + 2 hl + 1: kept for the residual step (xr) and, as FP8, the token's row of XT
+            // (computed once here; it was also computed per token on two of the waves for XT)
             const int kx = x0 + int(t & 7u), ky = y0 + int(t >> 3u);
             const uint tb = (skOff + uint(mirror(ky, ey) * ex + mirror(kx, ex)) * 32u) / 4u;
             const uint r = uint(((ky >> 1) - Y0) * 4 + ((kx >> 1) - X0)), s = uint(2 * (ky & 1) + (kx & 1));
-            [[unroll]] for (uint m = 0u; m < MT; ++m)
+            [[unroll]] for (uint m = 0u; m < MT; ++m) {
                 [[unroll]] for (uint h2 = 0u; h2 < 2u; ++h2) {
                     const uint wd = 4u * m + 2u * hl + h2;
                     const uint sk = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
                     const uint e = EX[r * C + s * (C / 4u) + wd];
-                    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
-                        MADD(x, e4(sk, b), s3, e4(e, b))
-                        xr[m][4u * h2 + b] = x;
+                    [[unroll]] for (uint b = 0u; b < 4u; b += 2u) {
+                        MADD2(x, e4pair(sk, b >> 1u), s3, e4pair(e, b >> 1u))
+                        xr[m][4u * h2 + b] = x.x;
+                        xr[m][4u * h2 + b + 1u] = x.y;
                     }
                 }
+                floate4m3_t c[8];
+                Q8X(c, xr[m])
+                const uint xa = (16u * wv + col) * (C / 4u) + 4u * m + 2u * hl;
+                XT[xa] = pack4(c[0], c[1], c[2], c[3]);
+                XT[xa + 1u] = pack4(c[4], c[5], c[6], c[7]);
+            }
         }
         barrier();
     }
