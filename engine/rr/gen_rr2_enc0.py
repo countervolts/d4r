@@ -289,7 +289,7 @@ def main():
         restore = ['            ' + (f'{v} = uint16BitsToFloat16(uint16_t(arena.w[rr2_rec + 1024u + {len(saved)}u * l_ + {n}u]));' if v in f16vars
                                      else f'{v} = arena.w[rr2_rec + 1024u + {len(saved)}u * l_ + {n}u];') for n, v in enumerate(saved)]
         load[2:2] = restore
-        Path(out).write_text(
+        text = (
             head + '\n#extension GL_GOOGLE_include_directive : require\n#define RR2_EMBED 1\n#define RR2_GROUP 1\n#define RR2_XF_ARENA 1\n' +
             block + '\nuint HDV(uint row, uint col) { return col < 4u ? uint(float16BitsToUint16(HD[gl_SubgroupID * 256u + row * 4u + col])) : 0u; }\n\n'
             'void main()\n{\n' + '\n'.join(body[:nd]) + '\n' + where +
@@ -297,6 +297,13 @@ def main():
             '    rr2_xf = rr2_rec;\n    rr2_block();\n    barrier();\n    if (rr2_valid) {\n' +
             '    // the gather\'s index arithmetic the tail reads\n' + '\n'.join(recomputed) + '\n' +
             '\n'.join(load + keep) + '\n' + '\n'.join(tail) + '\n    }\n}\n')
+        # The block's windows in the reverse of the gather's dispatch order: the records the gather wrote last are
+        # the ones still in the GPU's last-level cache when the block starts (the records are larger than it), and
+        # reading them first keeps the rest from being evicted before it is read. Each window's work is the same;
+        # only the order of the workgroups changes (encoder 0 594 -> 578 us at 1280x720 -> 1440p, RX 9070 XT).
+        text = text.replace('gl_WorkGroupID.x', '(gl_NumWorkGroups.x - 1u - gl_WorkGroupID.x)').replace(
+            'gl_WorkGroupID.y', '(gl_NumWorkGroups.y - 1u - gl_WorkGroupID.y)')
+        Path(out).write_text(text)
         return
     # --tail-waves N (dec0_1, one window per workgroup): the translated tail on N of the block's waves instead of one.
     # Each wave runs its own copy of the tail with only the N-th part of its stores (in order: the first pixel's,
