@@ -24,8 +24,9 @@ RT void output_color_pack(f4 color, float exposure, uint32_t* a, uint32_t* b)
         const float q = div_a(ln, 9.0f) + asf(0xBC4FAE29u);
         weight = rcp_a(y) * q;
     }
-    *a = pack16(ashu((h1)(y * weight)), ashu((h1)((exposure * co) * weight)));
-    *b = pack16(ashu((h1)((exposure * cg) * weight)), ashu((h1)color[3]));
+    // f2h_rn: rounded to f32 and then to f16, as ZLUDA's compile does (no v_fma_mixlo of the product)
+    *a = pack16(ashu(f2h_rn(y * weight)), ashu(f2h_rn((exposure * co) * weight)));
+    *b = pack16(ashu(f2h_rn((exposure * cg) * weight)), ashu(f2h_rn(color[3])));
 }
 
 RT int output_tile_coord(int relative, int lo, int hi)

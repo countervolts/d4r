@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <time.h>
 #include "d4r_native_selection.h"
+#include "d4r_gpu_identity.h"
+#include "d4r_build.h"
 #include "d4r_motion_dilation.h"
 #include "d4r_native_motion.h"
 #include "d4r_wire_history.h"
@@ -430,46 +432,54 @@ static void native_cleanup(void)
         remove_directory(native_served);
 }
 
-/* The gfx target ("gfx1101") of the GPU DLSS runs on, "" when unknown: D4R_GPU_ARCH if set, else the KFD
-   topology's GPU with the most SIMDs. With an integrated and a discrete GPU (Ryzen 7000/9000 desktops) the
-   first KFD GPU node can be the integrated one, whose kernels would not match the discrete GPU. */
+/* Use the rendering adapter's PCI address, never the first/largest KFD GPU. Without an authenticated
+   address a single GPU is unambiguous; multiple GPUs use translated kernels instead of a guessed target. */
 static void gpu_architecture(char* out, size_t size)
 {
     out[0] = '\0';
-    const char* forced = getenv("D4R_GPU_ARCH");
-    if (forced != NULL && strncmp(forced, "gfx", 3) == 0)
+    char pci[64] = {}, only[32] = {};
+    GetEnvironmentVariableA("D4R_RENDER_PCI", pci, sizeof(pci));
+    int gpus = 0, matches = 0;
+    DIR* nodes = opendir("/sys/class/kfd/kfd/topology/nodes");
+    if (nodes == NULL) return;
+    for (struct dirent* node; (node = readdir(nodes)) != NULL;)
     {
-        snprintf(out, size, "%s", forced);
-        return;
-    }
-    unsigned long best_simds = 0;
-    int gpus = 0;
-    for (int node = 0; node < 16; ++node)
-    {
-        char path[128];
-        snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/properties", node);
+        if (node->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%s/properties", node->d_name);
         FILE* properties = fopen(path, "r");
         if (properties == NULL)
             continue;
         char line[256];
-        unsigned long simds = 0, target = 0;
+        unsigned long simds = 0, target = 0, domain = ~0ul, location = ~0ul;
         while (fgets(line, sizeof(line), properties) != NULL)
         {
             sscanf(line, "simd_count %lu", &simds);
             sscanf(line, "gfx_target_version %lu", &target);
+            sscanf(line, "domain %lu", &domain);
+            sscanf(line, "location_id %lu", &location);
         }
         fclose(properties);
         if (simds == 0 || target == 0)
             continue;
         ++gpus;
-        if (simds > best_simds)
+        snprintf(only, sizeof(only), "gfx%lu%lu%lx", target / 10000, (target / 100) % 100, target % 100);
+        if (d4r_pci_matches_kfd(pci, domain, location))
         {
-            best_simds = simds;
-            snprintf(out, size, "gfx%lu%lu%lx", target / 10000, (target / 100) % 100, target % 100);
+            ++matches;
+            snprintf(out, size, "%s", only);
         }
     }
-    if (gpus > 1)
-        tracef("native kernels: %d GPUs; using the one with the most SIMDs (%s); D4R_GPU_ARCH overrides", gpus, out);
+    closedir(nodes);
+    if (!pci[0] && gpus == 1) snprintf(out, size, "%s", only);
+    else if (matches != 1) out[0] = '\0';
+    const char* forced = getenv("D4R_GPU_ARCH");
+    if (forced != NULL && strcmp(forced, out) != 0)
+    {
+        tracef("D4R_GPU_ARCH=%s does not match the rendering GPU (%s); native kernels disabled", forced, out);
+        out[0] = '\0';
+    }
+    tracef("GPU target: render PCI=%s KFD GPUs=%d matches=%d architecture=%s", pci, gpus, matches, out);
 }
 
 static void prepare_native_kernels(const char* cache_home)
@@ -480,6 +490,11 @@ static void prepare_native_kernels(const char* cache_home)
     /* a release directory holds one manifest and set of code objects per GPU target */
     char architecture[32], source[1024], path[1200];
     gpu_architecture(architecture, sizeof(architecture));
+    if (!architecture[0])
+    {
+        unsetenv("D4R_ZLUDA_NATIVE_DIR");
+        return;
+    }
     FILE* manifest = NULL;
     /* RDNA4 with native FP8 WMMA (D4R_ZLUDA_WMMA_FP8_NATIVE=1, d4r.ini NativeFp8): the <target>-fp8 variant,
        whose kernels match ZLUDA's FP8 lowering; no other GPU has such a directory */
@@ -1385,8 +1400,12 @@ static void tracef(const char* format, ...)
     vsnprintf(line, sizeof(line), format, args);
     va_end(args);
 
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const double seconds = (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+    const unsigned long thread = GetCurrentThreadId();
     pthread_mutex_lock(&trace_lock);
-    fprintf(stderr, "[d4r nvcuda] %s\n", line);
+    fprintf(stderr, "[d4r nvcuda] [%.6f tid=%lu] %s\n", seconds, thread, line);
     fflush(stderr);
 
     char path[MAX_PATH] = {0};
@@ -1396,8 +1415,13 @@ static void tracef(const char* format, ...)
         FILE* output = fopen(path, "a");
         if (output != NULL)
         {
-            fprintf(output, "%s\n", line);
+            fprintf(output, "[%.6f tid=%lu] %s\n", seconds, thread, line);
             fclose(output);
+        }
+        else
+        {
+            static int warned;
+            if (!warned++) fprintf(stderr, "[d4r nvcuda] cannot open D4R_CUDA_TRACE=%s: %s\n", path, strerror(errno));
         }
     }
     pthread_mutex_unlock(&trace_lock);
@@ -1473,7 +1497,8 @@ typedef CUresult(__attribute__((sysv_abi)) *CUGETERRORSTRING_FN)(CUresult, const
 typedef CUresult(__attribute__((sysv_abi)) *CUGETPROCADDRESS_FN)(const char*, void**, int, uint64_t, int*);
 
 static pthread_once_t context_once = PTHREAD_ONCE_INIT;
-static CUresult context_setup_result = CUDA_ERROR_NOT_INITIALIZED;
+static CUresult context_bootstrap_result = CUDA_ERROR_NOT_INITIALIZED;
+static _Thread_local CUresult context_setup_result = CUDA_ERROR_NOT_INITIALIZED;
 static CUcontext cuda_context;
 
 static unsigned int get_process_u32(const char* name, unsigned int fallback)
@@ -1485,6 +1510,36 @@ static unsigned int get_process_u32(const char* name, unsigned int fallback)
     char* end = NULL;
     unsigned long parsed = strtoul(value, &end, 0);
     return end != value && *end == '\0' ? (unsigned int)parsed : fallback;
+}
+
+/* This calls ZLUDA directly: bridge wrappers would recurse through context bootstrap. */
+static CUresult selected_cuda_device(CUdevice* selected)
+{
+    CUDEVICEGETCOUNT_FN count_fn = (CUDEVICEGETCOUNT_FN)find_zluda_symbol("cuDeviceGetCount");
+    CUDEVICEGET_FN get_fn = (CUDEVICEGET_FN)find_zluda_symbol("cuDeviceGet");
+    typedef CUresult(__attribute__((sysv_abi)) * PCI_FN)(char*, int, CUdevice);
+    PCI_FN pci_fn = (PCI_FN)find_zluda_symbol("cuDeviceGetPCIBusId");
+    int count = 0;
+    if (!count_fn || !get_fn || count_fn(&count) != CUDA_SUCCESS || count < 1)
+        return CUDA_ERROR_NOT_INITIALIZED;
+    char expected[64] = {};
+    GetEnvironmentVariableA("D4R_RENDER_PCI", expected, sizeof(expected));
+    if (!expected[0] && count == 1) return get_fn(selected, 0);
+    if (!expected[0] || !pci_fn) return CUDA_ERROR_NOT_SUPPORTED;
+    int matches = 0;
+    for (int ordinal = 0; ordinal < count; ++ordinal)
+    {
+        CUdevice device;
+        char actual[64] = {};
+        if (get_fn(&device, ordinal) == CUDA_SUCCESS && pci_fn(actual, sizeof(actual), device) == CUDA_SUCCESS)
+        {
+            tracef("compute adapter ordinal=%d device=%d PCI=%s render=%s", ordinal, device, actual, expected);
+            if (d4r_same_pci(expected, actual)) { *selected = device; ++matches; }
+        }
+    }
+    if (matches != 1)
+        tracef("CUDA adapter mapping refused: render PCI=%s matches=%d; no GPU will be guessed", expected, matches);
+    return matches == 1 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 
 static void create_default_zluda_context(void)
@@ -1499,30 +1554,30 @@ static void create_default_zluda_context(void)
         return;
     }
 
-    context_setup_result = init(0);
-    if (context_setup_result != CUDA_SUCCESS)
+    context_bootstrap_result = init(0);
+    if (context_bootstrap_result != CUDA_SUCCESS)
     {
-        tracef("cuInit returned %d", context_setup_result);
+        tracef("cuInit returned %d", context_bootstrap_result);
         return;
     }
 
     int device_count = 0;
-    context_setup_result = get_device_count(&device_count);
-    if (context_setup_result != CUDA_SUCCESS || device_count < 1)
+    context_bootstrap_result = get_device_count(&device_count);
+    if (context_bootstrap_result != CUDA_SUCCESS || device_count < 1)
     {
-        tracef("cuDeviceGetCount returned %d, count %d", context_setup_result, device_count);
-        if (context_setup_result == CUDA_SUCCESS)
-            context_setup_result = CUDA_ERROR_NOT_INITIALIZED;
+        tracef("cuDeviceGetCount returned %d, count %d", context_bootstrap_result, device_count);
+        if (context_bootstrap_result == CUDA_SUCCESS)
+            context_bootstrap_result = CUDA_ERROR_NOT_INITIALIZED;
         return;
     }
 
     CUdevice device = 0;
-    context_setup_result = get_device(&device, 0);
-    if (context_setup_result == CUDA_SUCCESS)
-        context_setup_result = create_context(&cuda_context, 0, device);
-    if (context_setup_result != CUDA_SUCCESS)
+    context_bootstrap_result = selected_cuda_device(&device);
+    if (context_bootstrap_result == CUDA_SUCCESS)
+        context_bootstrap_result = create_context(&cuda_context, 0, device);
+    if (context_bootstrap_result != CUDA_SUCCESS)
     {
-        tracef("context creation returned %d", context_setup_result);
+        tracef("context creation returned %d", context_bootstrap_result);
         return;
     }
 
@@ -1531,7 +1586,21 @@ static void create_default_zluda_context(void)
 
 static void ensure_context(void)
 {
+    typedef CUresult(__attribute__((sysv_abi)) * CURRENT_FN)(CUcontext*);
+    CURRENT_FN current = (CURRENT_FN)find_zluda_symbol("cuCtxGetCurrent");
+    CUcontext active = NULL;
+    if (current && current(&active) == CUDA_SUCCESS && active != NULL)
+    {
+        context_setup_result = CUDA_SUCCESS;
+        return; /* NGX already selected a context; do not replace it with a second context. */
+    }
     pthread_once(&context_once, create_default_zluda_context);
+    context_setup_result = context_bootstrap_result;
+    if (context_setup_result == CUDA_SUCCESS && cuda_context != NULL)
+    {
+        CUCTX_CURRENT_FN set = (CUCTX_CURRENT_FN)find_zluda_symbol("cuCtxSetCurrent");
+        if (set) context_setup_result = set(cuda_context);
+    }
 }
 
 /* D4R_NGX_STREAM_PRIORITY=high|normal (default off): the null-stream work of NGX, the shim and this bridge
@@ -2567,6 +2636,7 @@ static int before_teardown(void)
 
 CUresult WINAPI cuInit(unsigned int flags)
 {
+    tracef("bridge build %s; CUDA_BEGIN api=cuInit flags=%u", D4R_RUNTIME_BUILD_ID, flags);
     CUINIT_FN function = (CUINIT_FN)find_zluda_symbol("cuInit");
     CUresult result = function != NULL ? function(flags) : CUDA_ERROR_NOT_INITIALIZED;
     tracef("cuInit flags=%u result=%d", flags, result);
@@ -2618,6 +2688,14 @@ CUresult WINAPI cuCtxGetDevice(CUdevice* device)
 
 CUresult WINAPI cuCtxCreate_v2(CUcontext* context, unsigned int flags, CUdevice device)
 {
+    CUdevice selected = -1;
+    CUresult mapping = selected_cuda_device(&selected);
+    if (mapping != CUDA_SUCCESS || selected != device)
+    {
+        if (context) *context = NULL;
+        tracef("CUDA context refused: device=%d mapped render device=%d status=%d", device, selected, mapping);
+        return mapping == CUDA_SUCCESS ? CUDA_ERROR_NOT_SUPPORTED : mapping;
+    }
     CUCTXCREATE_FN function = (CUCTXCREATE_FN)find_zluda_symbol("cuCtxCreate_v2");
     CUresult result = function != NULL ? function(context, flags, device) : CUDA_ERROR_NOT_INITIALIZED;
     tracef("cuCtxCreate_v2 flags=0x%x device=%d result=%d context=%p", flags, device,
@@ -2659,6 +2737,7 @@ static int elide_ngx_sync(void)
 
 CUresult WINAPI d4rCtxSynchronize(void)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=d4rCtxSynchronize");
     if (before_teardown())
         return CUDA_SUCCESS;
     CUCTX_SYNCHRONIZE_FN function = (CUCTX_SYNCHRONIZE_FN)find_zluda_symbol("cuCtxSynchronize");
@@ -2671,6 +2750,7 @@ CUresult WINAPI d4rCtxSynchronize(void)
 
 CUresult WINAPI cuCtxSynchronize(void)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuCtxSynchronize");
     if (before_teardown())
         return CUDA_SUCCESS;
     if (elide_ngx_sync())
@@ -2695,6 +2775,15 @@ CUresult WINAPI cuDeviceGetLuid(char* luid, unsigned int* device_node_mask, CUde
     if ((result == CUDA_SUCCESS || result == CUDA_ERROR_NOT_SUPPORTED) &&
         luid != NULL && device_node_mask != NULL)
     {
+        CUdevice selected = -1;
+        CUresult mapping = selected_cuda_device(&selected);
+        if (mapping != CUDA_SUCCESS || selected != device)
+        {
+            if (luid) memset(luid, 0, 8);
+            if (device_node_mask) *device_node_mask = 0;
+            tracef("cuDeviceGetLuid device=%d is not the mapped render adapter (selected=%d status=%d)", device, selected, mapping);
+            return mapping == CUDA_SUCCESS ? CUDA_SUCCESS : mapping;
+        }
         unsigned int low = get_process_u32("D4R_CUDA_LUID_LOW", 0xffffffffu);
         unsigned int high = get_process_u32("D4R_CUDA_LUID_HIGH", 0xffffffffu);
         unsigned int node_mask = get_process_u32("D4R_CUDA_NODE_MASK", 0xffffffffu);
@@ -2791,6 +2880,7 @@ static const void* replacement_image(const void* image, const char* api)
 
 CUresult WINAPI cuModuleLoadData(CUmodule* module, const void* image)
 {
+    tracef("CUDA_BEGIN api=cuModuleLoadData image=%p", image);
     CUMODULELOADDATA_FN function = (CUMODULELOADDATA_FN)find_zluda_symbol("cuModuleLoadData");
     verify_native_kernels(image);
     capture_ptx_if_present(image, "cuModuleLoadData");
@@ -2804,6 +2894,7 @@ CUresult WINAPI cuModuleLoadData(CUmodule* module, const void* image)
 CUresult WINAPI cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int option_count,
                                    int* options, void** option_values)
 {
+    tracef("CUDA_BEGIN api=cuModuleLoadDataEx image=%p options=%u", image, option_count);
     CUMODULELOADDATAEX_FN function = (CUMODULELOADDATAEX_FN)find_zluda_symbol("cuModuleLoadDataEx");
     verify_native_kernels(image);
     capture_ptx_if_present(image, "cuModuleLoadDataEx");
@@ -2817,6 +2908,7 @@ CUresult WINAPI cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned
 
 CUresult WINAPI cuModuleLoad(CUmodule* module, const char* filename)
 {
+    tracef("CUDA_BEGIN api=cuModuleLoad file=%s", filename != NULL ? filename : "<null>");
     CUMODULELOAD_FN function = (CUMODULELOAD_FN)find_zluda_symbol("cuModuleLoad");
     CUresult result = function != NULL ? function(module, filename) : missing("cuModuleLoad");
     tracef("cuModuleLoad file=%s result=%d module=%p", filename != NULL ? filename : "<null>",
@@ -2837,6 +2929,7 @@ CUresult WINAPI cuModuleUnload(CUmodule module)
 
 CUresult WINAPI cuModuleGetFunction(CUfunction* function_out, CUmodule module, const char* name)
 {
+    tracef("CUDA_BEGIN api=cuModuleGetFunction module=%p name=%s", module, name ? name : "<null>");
     CUMODULEGETFUNCTION_FN function = (CUMODULEGETFUNCTION_FN)find_zluda_symbol("cuModuleGetFunction");
     CUresult result = function != NULL ? function(function_out, module, name) : missing("cuModuleGetFunction");
     if (result == CUDA_SUCCESS && function_out != NULL)
@@ -2882,6 +2975,7 @@ CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, 
                                unsigned int block_z, unsigned int shared_bytes, CUstream stream,
                                void** kernel_params, void** extra)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuLaunchKernel function=%p", function_handle);
     static CULAUNCHKERNEL_FN function;
     if (function == NULL)
         function = (CULAUNCHKERNEL_FN)find_zluda_symbol("cuLaunchKernel");
@@ -2964,6 +3058,7 @@ CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, 
 
 CUresult WINAPI cuMemAlloc(CUdeviceptr* pointer, size_t bytes)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuMemAlloc bytes=%zu", bytes);
     CUMEMALLOC_FN function = (CUMEMALLOC_FN)find_zluda_symbol("cuMemAlloc_v2");
     CUresult result = function != NULL ? function(pointer, bytes) : missing("cuMemAlloc_v2");
     if (result == CUDA_SUCCESS && pointer != NULL)
@@ -3022,6 +3117,8 @@ CUresult WINAPI cuMemcpy2D(const void* copy)
 
 CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, size_t bytes, CUstream stream)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuMemcpyHtoDAsync bytes=%zu dst=0x%llx stream=%p", bytes,
+                              (unsigned long long)destination, stream);
     CUMEMCPYHTODASYNC_FN function = (CUMEMCPYHTODASYNC_FN)find_zluda_symbol("cuMemcpyHtoDAsync_v2");
     if (microcuda_k_write) microcuda_k_write(destination, bytes);
     stream = d4r_ngx_stream(stream);
@@ -3033,6 +3130,7 @@ CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, s
 
 CUresult WINAPI cuMemcpyDtoH(void* destination, CUdeviceptr source, size_t bytes)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuMemcpyDtoH bytes=%zu src=0x%llx", bytes, (unsigned long long)source);
     CUMEMCPYDTOH_FN function = (CUMEMCPYDTOH_FN)find_zluda_symbol("cuMemcpyDtoH_v2");
     CUresult result = function != NULL ? function(destination, source, bytes) : missing("cuMemcpyDtoH_v2");
     TRACE_CALL(result, "cuMemcpyDtoH->v2 dst=%p src=0x%llx bytes=%zu result=%d",
@@ -3378,6 +3476,7 @@ static int d4r_forward_is_teardown(const char* target)
 #define D4R_FORWARD(name, target, count, params, args) \
     CUresult WINAPI name params \
     { \
+        if (trace_verbose()) tracef("CUDA_BEGIN api=" #name); \
         if (d4r_forward_is_teardown(#target) && before_teardown()) \
             return CUDA_SUCCESS; \
         typedef CUresult(__attribute__((sysv_abi)) * function_type) params; \
@@ -3394,6 +3493,7 @@ D4R_FORWARD(cuEventRecord, cuEventRecord, 2, (D4rArg a0, D4rArg a1), (a0, (D4rAr
 D4R_FORWARD(cuEventRecordWithFlags, cuEventRecordWithFlags, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, (D4rArg)d4r_ngx_stream((CUstream)a1), a2))
 CUresult WINAPI cuEventSynchronize(D4rArg a0)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=cuEventSynchronize event=%p", (void*)a0);
     if (before_teardown())
         return CUDA_SUCCESS;
     typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
@@ -3411,6 +3511,7 @@ CUresult WINAPI cuEventSynchronize(D4rArg a0)
    game's split command list only after this event has actually completed. */
 CUresult WINAPI d4rEventSynchronize(D4rArg a0)
 {
+    if (trace_verbose()) tracef("CUDA_BEGIN api=d4rEventSynchronize event=%p", (void*)a0);
     if (before_teardown())
         return CUDA_SUCCESS;
     typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);

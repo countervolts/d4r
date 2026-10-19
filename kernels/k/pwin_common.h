@@ -61,6 +61,17 @@ __device__ __forceinline__ uint32_t lane_id()
 #undef PWIN_NATIVE_F16ACC
 #undef PWIN_F16ACC_NATIVE
 #endif
+// RDNA2: the weight images use plain global loads. The raw-buffer path below builds its resource with gfx11's
+// dword3 (0x31004000: unified format 4, 8_SSCALED), which gfx11 ignores for untyped loads; gfx10 descriptors want
+// a 32-bit format there (AMD's own libraries use 0x31014000 on gfx103x), and no gfx10 encoding has been validated
+// on RDNA2 hardware, so RDNA2 takes no descriptor at all. Keyed on D4R_WMMA_SOFT (always set on gfx10) so that the
+// RDNA3 validation build of the RDNA2 kernels runs the same loads.
+#ifdef D4R_WMMA_SOFT
+#ifndef PWIN_NO_BUFFER_IMG
+#define PWIN_NO_BUFFER_IMG
+#endif
+#undef PWIN_GELU_LUT_BUFFER
+#endif
 typedef wm_op op_t; // WMMA operand: u8v (gfx11) or u4v (gfx12)
 
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)

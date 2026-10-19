@@ -76,8 +76,14 @@ export D4R_DLSS_PTX_DIR="$BUILD/ptx"
 python3 "$ROOT/kernels/tools/extract_dlss_ptx.py" "$D4R_BUNDLE_DLSS" "$D4R_DLSS_PTX_DIR" > "$BUILD/logs/extract.log"
 build_textures() {
     local arch="$1" folder fp8 accuracy out
-    # RDNA2 has no texture tails (they need WMMA); package_release.sh builds its K layers
-    [[ "$arch" == gfx103* ]] && return 0
+    # RDNA2: only K's natively translated hiluma output/input kernels (no WMMA), fast set only (the accuracy
+    # set keeps ZLUDA's compile of them); package_release.sh builds the K layers and copies these
+    if [[ "$arch" == gfx103* ]]; then
+        D4R_PREFER_ACCURACY=0 D4R_GPU_ARCH="$arch" D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" \
+            "$ROOT/kernels/build.sh" tex "$D4R_BUNDLE_TEX/$arch" > "$BUILD/logs/tex-$arch-0.log" 2>&1
+        echo "Texture kernels rebuilt: $arch (native hiluma output/input only)"
+        return 0
+    fi
     folders=("$arch")
     [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
     for folder in "${folders[@]}"; do

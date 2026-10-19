@@ -206,6 +206,12 @@ def main(argv):
         env["D4R_SHIM_MARKER_POLL_US"] = value
 
     value = flag("Engine", "Enabled")
+    if value is None:
+        models = Path(os.environ.get("D4R_RUNTIME_DIR", path.parent)) / "engine"
+        value = any((models / model).is_dir() for model in
+                    ("k", "k-ldr", "m", "m-ldr", "l", "l-ldr", "rr-d", "rr-e", "rr-f",
+                     "rr-d-gfx11", "rr-e-gfx11"))
+        env["D4R_ENGINE_K"] = "0"
     env["D4R_ENGINE"] = "1" if value else "0"
     if path_value("Engine", "ModelDir"):
         env["D4R_ENGINE_MODEL_DIR"] = path_value("Engine", "ModelDir")

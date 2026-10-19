@@ -77,6 +77,16 @@ RT uint32_t f2u_rz(float x)
 }
 
 // ---------------------------------------------------------------- f16 (denormals kept)
+// cvt.rn.f16.f32: the f32 value rounded to f16. The empty asm keeps LLVM from folding the conversion into the
+// f32 operation that produced the value (fptrunc(fma(fpext ...)) -> v_fma_mixlo/mixhi_f16), which rounds the exact
+// result to f16 once instead of to f32 and then to f16: on an RX 7700 XT that differed from the two-step result for
+// 1 in ~29,000 random f16 operand triples, and in the hiluma output kernel it left single 1-ulp seeds that the
+// temporal history then spread (ZLUDA keeps both roundings).
+RT h1 f2h_rn(float x)
+{
+    __asm__ volatile("" : "+v"(x));
+    return (h1)x;
+}
 RT h1 hfma(h1 a, h1 b, h1 c) { return __builtin_fmaf16(a, b, c); }
 RT h2 h2fma(h2 a, h2 b, h2 c) { return __builtin_elementwise_fma(a, b, c); }
 RT h1 hmaxn(h1 a, h1 b) { return __builtin_fmaximum_numf16(a, b); }

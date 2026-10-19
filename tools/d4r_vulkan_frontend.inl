@@ -620,6 +620,13 @@ static NgxResult native_vk_init(unsigned long long id, const wchar_t* path, VkIn
         VkPhysicalDeviceIDProperties identity = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &identity};
         properties2(physical, &properties);
+        VkPhysicalDevicePCIBusInfoPropertiesEXT bus = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+        properties.pNext = &bus;
+        properties2(physical, &properties);
+        char pci[32] = {};
+        if (bus.pciDomain || bus.pciBus || bus.pciDevice || bus.pciFunction)
+            std::snprintf(pci, sizeof(pci), "%04x:%02x:%02x.%x", bus.pciDomain, bus.pciBus, bus.pciDevice, bus.pciFunction);
+        SetEnvironmentVariableA("D4R_RENDER_PCI", pci[0] ? pci : nullptr);
         if (identity.deviceLUIDValid)
         {
             uint32_t low, high;

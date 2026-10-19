@@ -61,8 +61,27 @@ export PATH="$KIT/bin:$PATH"   # the bundled glslangValidator
 glslangValidator --version > /dev/null 2>&1 || fail "glslangValidator ($KIT/bin) does not run on this system"
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/d4r-models.XXXXXX")"
-trap 'rm -rf -- "$WORK"' EXIT
+LOG_ROOT="${D4R_MODEL_LOG_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/d4r/model-builds}"
+mkdir -p -- "$LOG_ROOT"
+BUILD_LOGS="$(mktemp -d "$LOG_ROOT/build.XXXXXX")"
+WORK="$BUILD_LOGS/work"; mkdir -p "$WORK"
+MODEL_TOOLS="$KIT/model_tools.py"
+[[ -f "$MODEL_TOOLS" ]] || fail "missing $MODEL_TOOLS; update the model builder tools"
+cleanup() {
+  local status=$?
+  if (( status == 0 )); then
+    while IFS= read -r -d '' log; do
+      relative="${log#"$WORK/"}"
+      mkdir -p -- "$BUILD_LOGS/$(dirname -- "$relative")"
+      cp -- "$log" "$BUILD_LOGS/$relative"
+    done < <(find "$WORK" -name '*.log' -type f -print0)
+    rm -rf -- "$WORK"
+  else
+    printf 'build-engine-models: failed build and captures preserved at %s\n' "$WORK" >&2
+  fi
+  printf 'Model build diagnostics: %s\n' "$BUILD_LOGS"
+}
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -72,6 +91,7 @@ place() {   # place NAME DIR FILE...
   shift 2
   mkdir -p "$RUNTIME/engine" "$WORK/place/$name"
   for f in "$@"; do cp -- "$src/$f" "$WORK/place/$name/"; done
+  python3 "$MODEL_TOOLS" manifest "$WORK/place/$name"
   rm -rf -- "$dst.new"; mv -- "$WORK/place/$name" "$dst.new"
   rm -rf -- "$dst.old"; [[ ! -e "$dst" ]] || mv -- "$dst" "$dst.old"
   mv -- "$dst.new" "$dst"; rm -rf -- "$dst.old"
@@ -83,18 +103,24 @@ model_files() {   # rr.txt and the files it names, for model directory $1
 }
 run() {   # run LOG COMMAND...: the command's output in WORK/LOG, shown when it fails
   local log="$WORK/$1"; shift
-  "$@" > "$log" 2>&1 || { tail -n 20 "$log" >&2; fail "failed: $(basename -- "$2") (log above)"; }
+  python3 "$MODEL_TOOLS" run --log "$log" --timeout "${D4R_MODEL_TIMEOUT:-900}" -- "$@" ||
+    fail "failed: $1 (see $log)"
 }
 
 if (( DO_RR )); then
   DLL="$RUNTIME/nvngx_dlssd.dll"
   [[ -f "$DLL" && "$(sha "$DLL")" == "$DLSSD_SHA256" ]] || fail "Ray Reconstruction models need nvngx_dlssd.dll 310.9.1 in $RUNTIME (run install.sh)"
   echo 'Building the Ray Reconstruction models (presets D, E and F) from nvngx_dlssd.dll...'
+  # Build both portable arithmetic variants; runtime selects by device capabilities. Do not let the build
+  # host (or an inherited developer switch) silently determine what another game/GPU receives from the cache.
   for p in D E; do
-    l=$(tr DE de <<< "$p")
-    bash "$KIT/engine/rr/build_native_model.sh" --dll "$DLL" "$p" "$WORK/rr-$l" > "$WORK/rr-$l.log" 2>&1 ||
-      { tail -n 20 "$WORK/rr-$l.log" >&2; fail "preset $p model failed"; }
-    place "rr-$l" "$WORK/rr-$l" $(model_files "$WORK/rr-$l") exposure_rr0.spv exposure_rr1.spv
+    for arithmetic in fp8 gfx11; do
+      l=$(tr DE de <<< "$p"); name="rr-$l"; gfx11=0
+      if [[ "$arithmetic" == gfx11 ]]; then name+="-gfx11"; gfx11=1; fi
+      run "$name.log" env D4R_RR_GFX11="$gfx11" bash "$KIT/engine/rr/build_native_model.sh" \
+        --dll "$DLL" "$p" "$WORK/$name"
+      place "$name" "$WORK/$name" $(model_files "$WORK/$name") exposure_rr0.spv exposure_rr1.spv
+    done
   done
   run ptx-f.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$WORK/ptx-f"
   run rr-f.log python3 "$KIT/engine/compile_rr2.py" --dll "$DLL" "$WORK/rr-f" --ptx-dir "$WORK/ptx-f"
@@ -125,16 +151,17 @@ if (( DO_SR )); then
     local w="$WORK/$1"
     mkdir -p "$w/replay"
     printf '  rendering one frame with model %s through d4r (GE-Proton %s)...\n' "$1" "$(basename "$PROTON")"
-    (cd "$APP" && env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" STEAM_COMPAT_DATA_PATH="$WORK/prefix" \
+    (cd "$APP" && python3 "$MODEL_TOOLS" run --log "$w/run.log" --timeout "${D4R_MODEL_TIMEOUT:-900}" -- \
+      env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" STEAM_COMPAT_DATA_PATH="$WORK/prefix" \
       PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='d3d12=n,b;d3d12core=n,b;d4r12core=n,b' \
       D4R_ENGINE=0 D4R_DLSS_PRESET="$2" D4R_HARNESS_CREATE_FLAGS=0x4B D4R_SHIM_LOG="$(winpath "$w/shim.log")" \
+      D4R_CUDA_TRACE="$(winpath "$w/cuda.log")" D4R_CUDA_VERBOSE=1 \
       D4R_CUDA_REPLAY_DUMP_DIR="$w/replay" D4R_CUDA_REPLAY_DUMP_LIMIT=60 \
       "$PROTON/proton" run "$APP/d3d12_dlss_harness.exe" "$(winpath "$RUNTIME/nvngx.dll")" "$(winpath "$w/out.raw")" \
-      1 640 360 1280 720) > "$w/run.log" 2>&1 || true
-    if ! ls "$w/replay" | grep -q "$3"; then
-      tail -n 15 "$w/run.log" >&2
+      1 640 360 1280 720) || fail "model $1: capture process failed; diagnostics in $w"
+    if ! python3 "$MODEL_TOOLS" capture "$w" "$1"; then
       [[ ! -f "$w/shim.log" ]] || tail -n 15 "$w/shim.log" >&2
-      fail "model $1: the test frame did not run through DLSS (logs above)"
+      fail "model $1: incomplete or invalid test frame (diagnostics in $w)"
     fi
   }
   echo 'Building the Super Resolution models (K, M and L) from what NGX uploads...'

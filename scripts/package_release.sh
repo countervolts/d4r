@@ -16,7 +16,8 @@
 #   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
 #                                                                           default ~/.cache/d4r-rocm-runtime
 #   D4R_MAX_GLIBC     highest GLIBC ABI the Linux libraries may require     default 2.41
-#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1030-gfx1036 (K only), gfx1100-gfx1103, gfx1200, gfx1201
+#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1030-gfx1036 (K and its hiluma kernels only),
+#                    gfx1100-gfx1103, gfx1200, gfx1201
 #                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
 #   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: system SPDX or common-licenses copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
@@ -216,15 +217,30 @@ ensure_rr_textures() {
   fi
 }
 build_target() {
-  local folder="$1" arch fp8 tex_dir accurate accurate_tex f
+  local folder="$1" arch fp8 tex_dir tmp_tex accurate accurate_tex f
   arch="${folder%-fp8}"
   fp8=0
   [[ "$folder" == *-fp8 ]] && fp8=1
-  # RDNA2 (gfx103x): only DLSS 4's layers (preset K) have native kernels there, built with software matrix
-  # products (kernels/common/wmma_layout.h); M, L, the texture tails and Ray Reconstruction stay translated by ZLUDA
+  # RDNA2 (gfx103x): DLSS 4's layers (preset K), built with software matrix products
+  # (kernels/common/wmma_layout.h), and K's hiluma output/input kernels translated from the PTX
+  # (kernels/native, no WMMA; wave32, byte-identical to ZLUDA's compile). M, L, the texture tails and Ray
+  # Reconstruction call WMMA and stay translated by ZLUDA. The accuracy set keeps ZLUDA's compile of hiluma.
   if [[ "$arch" == gfx103* ]]; then
     D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
     D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/accuracy/$folder" >/dev/null
+    if [[ "$VARIANT" != clean ]]; then
+      tex_dir="$D4R_BUNDLE_TEX/$folder" tmp_tex=""
+      if [[ ! -d "$tex_dir" ]]; then
+        tex_dir="$(mktemp -d)" tmp_tex="$tex_dir"
+        D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" \
+          "$ROOT/kernels/build.sh" tex "$tex_dir" >/dev/null
+      fi
+      # only the kernels validated for RDNA2, whatever else an older bundle folder holds
+      for f in "$tex_dir"/hiluma_engine_output_*_hdr_max_v2_rel.hsaco "$tex_dir"/hiluma_engine_input_*_v2_rel.hsaco; do
+        [[ -f "$f" ]] && cp "$f" "$STAGE/d4r/kernels/$folder/"
+      done
+      [[ -z "$tmp_tex" ]] || rm -rf "$tmp_tex"
+    fi
     rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt "$STAGE/d4r/kernels/accuracy/$folder"/*.resolution.txt
     python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"
     python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/accuracy/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"

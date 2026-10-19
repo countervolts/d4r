@@ -127,14 +127,29 @@ static bool check(HRESULT hr, const char* what)
 
 static void submit_and_wait()
 {
-    g_list->Close();
+    if (!check(g_list->Close(), "Close command list")) std::_Exit(1);
     ID3D12CommandList* lists[] = {g_list};
     g_queue->ExecuteCommandLists(1, lists);
-    g_queue->Signal(g_fence, ++g_fenceValue);
+    if (!check(g_queue->Signal(g_fence, ++g_fenceValue), "Signal fence")) std::_Exit(1);
     if (g_fence->GetCompletedValue() < g_fenceValue)
     {
-        g_fence->SetEventOnCompletion(g_fenceValue, g_event);
-        WaitForSingleObject(g_event, INFINITE);
+        if (!check(g_fence->SetEventOnCompletion(g_fenceValue, g_event), "SetEventOnCompletion")) std::_Exit(1);
+        DWORD timeout = 60000;
+        if (const char* value = std::getenv("D4R_HARNESS_GPU_TIMEOUT_MS"))
+        {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && parsed >= 1 && parsed <= 600000) timeout = parsed;
+        }
+        const DWORD waited = WaitForSingleObject(g_event, timeout);
+        if (waited != WAIT_OBJECT_0)
+        {
+            std::fprintf(stderr, "GPU fence wait failed: wait=0x%lx timeout=%lu ms fence=%llu completed=%llu device=0x%08lx\n",
+                         waited, timeout, g_fenceValue, g_fence->GetCompletedValue(), g_device->GetDeviceRemovedReason());
+            std::fflush(stderr);
+            // The capture is an isolated diagnostic process. Do not enter teardown with outstanding GPU work.
+            std::_Exit(waited == WAIT_TIMEOUT ? 124 : 1);
+        }
     }
     g_allocator->Reset();
     g_list->Reset(g_allocator, nullptr);
@@ -1043,6 +1058,9 @@ static float halton(uint32_t index, uint32_t base)
 
 int main(int argc, char** argv)
 {
+    // The installer redirects output to a file. Keep the last stage visible even if HIP/Wine stalls or crashes.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     trace_stage("entered main");
     if (argc < 3)
     {

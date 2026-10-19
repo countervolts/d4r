@@ -167,14 +167,17 @@ if [[ ! -f "$BUILDER" ]]; then
   [[ "$DO_ENGINE" != 1 ]] || fail "missing $BUILDER (this release has no engine-model builder)"
   done_msg; exit 0
 fi
-models=(rr-d rr-e rr-f k k-ldr m m-ldr l l-ldr)
+models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 k k-ldr m m-ldr l l-ldr)
 # One build serves every game with the same DLLs and builder: the key covers both and the accuracy choice.
 key() {   # key EXACT(0|1)
   { echo "exact=$1"
+    # Model compilers accept per-layer K_DEFS_*, M_* arithmetic/tile options, and D4R_RR_* choices.
+    # A cache hit must not silently replace a model built with different compiler options.
+    env | LC_ALL=C sort | sed -n -e '/^K_/p' -e '/^M_/p' -e '/^D4R_RR_/p'
     sha256sum -- "$RUNTIME/nvngx_dlss.dll" "$RUNTIME/nvngx_dlssd.dll" 2>/dev/null | cut -d' ' -f1
     (cd "$RUNTIME/tools" && find . -type f ! -name '*.pyc' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum); } | sha256sum | cut -c1-16
 }
-have() { local m; for m in "${models[@]}"; do [[ -f "$1/$m/model.json" || -f "$1/$m/rr.txt" ]] || return 1; done; }
+have() { python3 "$RUNTIME/tools/models/model_tools.py" validate "$1" 2>/dev/null; }
 STAMP="$RUNTIME/engine/.d4r-models"
 if [[ "$EXACT" == ask ]]; then
   EXACT=0

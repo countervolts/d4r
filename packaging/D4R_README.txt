@@ -70,6 +70,10 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @installer    compatibility tools (or set D4R_PROTON=/path/to/GE-Proton11-3). It takes a minute or two once;
 @installer    the models are kept in ~/.cache/d4r/engine-models for the next game. bash install.sh --help lists
 @installer    options for scripted installs.
+@installer    RR D/E also have separate gfx11 models; devices without compatible matrix support retain CUDA
+@installer    translation. Builds report progress and time out after 900 seconds per command (override with
+@installer    D4R_MODEL_TIMEOUT). Failed captures and logs are retained under ~/.cache/d4r/model-builds;
+@installer    D4R_MODEL_LOG_DIR changes that location. Model checksums are verified before cache reuse.
 @installer 3. In Steam, open the game's Properties:
 @clean 3. In Steam, open the game's Properties:
 @full 2. In Steam, open the game's Properties:

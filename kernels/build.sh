@@ -5,8 +5,10 @@
 # usage: kernels/build.sh [all|k|l|m|tex|rr|rrswin] [OUT_DIR] (default: all, kernels/out/native)
 #
 #   D4R_ROCM_DIR    ROCm installation with clang and the HIP device libraries (default /opt/rocm)
-#   D4R_GPU_ARCH    target GPU (default gfx1101): an RDNA3 (gfx110x) or RDNA4 (gfx120x) target; the kernels
-#                   need wave32 WMMA, and kernels/common/wmma_layout.h picks the register layout per target
+#   D4R_GPU_ARCH    target GPU (default gfx1101): an RDNA3 (gfx110x) or RDNA4 (gfx120x) target, where
+#                   kernels/common/wmma_layout.h picks the WMMA register layout per target, or an RDNA2 (gfx103x)
+#                   target: there only K's layers (software matrix products) and the texture kernels that
+#                   need no WMMA (tex: K's natively translated hiluma output and input kernels) are built
 #   D4R_NATIVE_FP8  1 (RDNA4 only): the variant for ZLUDA's native FP8 WMMA (d4r.ini [Kernels] NativeFp8):
 #                   M's layers on FP8 WMMA with NVIDIA's e4m3 activations, texture tails matching ZLUDA's
 #                   D4R_ZLUDA_WMMA_FP8_NATIVE lowering. K is the same in both variants.
@@ -45,6 +47,12 @@ CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "clang++ not found in $ROCM/lib/llvm/bin (set D4R_ROCM_DIR)" >&2; exit 2; }
 mkdir -p "$OUT"
 case "$WHAT" in all|k|l|m|tex|rr|rrswin) ;; *) echo "unknown kernel family: $WHAT" >&2; exit 2 ;; esac
+# RDNA2 has no WMMA instruction: M/L's Swin layers, their texture tails and Ray Reconstruction call it directly
+RDNA2=0
+if [[ "$ARCH" == gfx103* ]]; then
+    RDNA2=1
+    case "$WHAT" in m|l|rr|rrswin) echo "$WHAT kernels need WMMA, which RDNA2 ($ARCH) does not have" >&2; exit 2 ;; esac
+fi
 # Never certify a directory containing older fast binaries as an accuracy set.
 if [[ "$ACCURACY" == 1 ]] && compgen -G "$OUT/*.hsaco" >/dev/null &&
     { [[ ! -f "$OUT/d4r-accuracy.txt" ]] || [[ "$(cat "$OUT/d4r-accuracy.txt")" != 1 ]]; }; then
@@ -82,14 +90,15 @@ if [[ "$WHAT" == all || "$WHAT" == k ]]; then
     echo "== DLSS 4 (preset K) transformer layers"
     for src in "$HERE"/k/dltss_pwin_*.hip; do build_hip "$src"; done
 fi
-if [[ "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ]]; then
+if [[ "$RDNA2" == 0 && ( "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ) ]]; then
     echo "== DLSS 4.5 (presets L/M) shared Swin layers"
     for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$([[ "$FP8" == 1 ]] && echo -DD4R_FP8_WMMA)"; done
 fi
 if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     echo "== texture kernels (NVIDIA PTX with native parts)"
     : "${D4R_DLSS_DLL:?set D4R_DLSS_DLL to nvngx_dlss.dll (310.7)}"
-    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a ZLUDA build with patches/zluda}"
+    # RDNA2 builds only the PTX-to-HIP translations below, which ZLUDA does not compile
+    [[ "$RDNA2" == 1 ]] || : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a ZLUDA build with patches/zluda}"
     PTX_DIR="${D4R_DLSS_PTX_DIR:-$HERE/extracted/ptx}"
     if [[ -z "${D4R_DLSS_PTX_DIR:-}" ]]; then
         python3 "$HERE/tools/extract_dlss_ptx.py" "$D4R_DLSS_DLL" "$PTX_DIR"
@@ -152,7 +161,10 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             for range in hdr ldr; do native_ins+=("hiluma_engine_input_${depth}_${mv}_${range}_v2_rel"); done
         done
     done
-    for spec in "${specs[@]}"; do
+    # RDNA2: none of the ZLUDA-compiled texture builds above (their tails call WMMA, and the sust_only builds
+    # are not validated there); only the natively translated hiluma kernels below
+    [[ "$RDNA2" == 1 ]] && specs=()
+    for spec in "${specs[@]+"${specs[@]}"}"; do
         IFS=: read -r kernel src mode <<< "$spec"
         [[ "$ACCURACY" == 0 && " ${native_outs[*]} " == *" $kernel "* ]] && continue
         # accuracy sets are wave32, except M's post and downsample kernels on RDNA4: their wave64 builds keep the
@@ -180,8 +192,13 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/output_translated.hip"
             python3 "$NAT/rewrite_output.py" "$NT/output_translated.hip" > "$NT/$native_out.hip"
             depth_tile=(); [[ "$native_out" == *_mvhi_* ]] && depth_tile=(-DD4R_K_NO_DEPTH_TILE)
-            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" "$OUT/$native_out.hsaco" \
-                -DD4R_NATIVE_F2I "${depth_tile[@]}" -DD4R_AS1_STORES
+            # RDNA3/4: wave64 (FP32 dual issue; 0.49 -> 0.44 ms on an RX 7700 XT, same bytes). RDNA2 issues wave64
+            # in two passes, so it gets wave32 (no stack frame, 96 VGPRs), and WGP mode: a 256-thread workgroup
+            # then takes 2 of each SIMD's 10 wave slots instead of 4, so 10 waves fit per SIMD instead of 8
+            # (measured with RDNA2's occupancy on the RX 7700 XT: 0.596 -> 0.568 ms, same bytes).
+            wave=(); [[ "$RDNA2" == 1 ]] && wave=(WAVE=32 CUMODE=0)
+            env "${wave[@]}" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
+                "$OUT/$native_out.hsaco" -DD4R_NATIVE_F2I "${depth_tile[@]}" -DD4R_AS1_STORES
         done
         for native_in in "${native_ins[@]}"; do
             ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
@@ -192,7 +209,7 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
         done
     fi
 fi
-if [[ "$WHAT" == rr || ( "$WHAT" == all && -n "${D4R_DLSSD_DLL:-}" ) ]]; then
+if [[ "$WHAT" == rr || ( "$WHAT" == all && "$RDNA2" == 0 && -n "${D4R_DLSSD_DLL:-}" ) ]]; then
     echo "== Ray Reconstruction texture kernels"
     : "${D4R_DLSSD_DLL:?set D4R_DLSSD_DLL to the CUDA-capable nvngx_dlssd.dll}"
     : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a patched ZLUDA build}"

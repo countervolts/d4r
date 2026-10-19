@@ -60,6 +60,20 @@ class ShimConfigTests(unittest.TestCase):
             result = subprocess.run(cmd, env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
 
+    def test_auto_engine_detects_models_without_overriding_environment(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            ini = root / 'd4r.ini'
+            ini.write_text('[Engine]\nEnabled = auto\n')
+            (root / 'engine/rr-d-gfx11').mkdir(parents=True)
+            env = {k: v for k, v in os.environ.items() if not k.startswith('D4R_')}
+            cmd = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
+            output = subprocess.check_output(cmd, env=env, text=True)
+            self.assertIn('export D4R_ENGINE=1\n', output)
+            self.assertIn('export D4R_ENGINE_K=0\n', output)
+            output = subprocess.check_output(cmd, env=dict(env, D4R_ENGINE='0'), text=True)
+            self.assertNotIn('export D4R_ENGINE=', output)
+
     def test_launcher_marker_poll_defaults_overrides_and_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'

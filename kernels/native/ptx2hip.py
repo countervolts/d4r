@@ -593,10 +593,10 @@ class Translator:
         if dt == 'f16' and stp == 'f32':
             if 'rn' not in mods:
                 raise Err(op)
-            A(a[0], f'(h1){V(a[1], "f32")}', 'f16'); return
+            A(a[0], f'f2h_rn({V(a[1], "f32")})', 'f16'); return
         if dt == 'f16x2' and stp == 'f32':
             # d = {cvt(a) in the high half, cvt(b) in the low half}
-            A(a[0], f'pack16(ashu((h1){V(a[2], "f32")}), ashu((h1){V(a[1], "f32")}))', 'u32'); return
+            A(a[0], f'pack16(ashu(f2h_rn({V(a[2], "f32")})), ashu(f2h_rn({V(a[1], "f32")})))', 'u32'); return
         if dt == 'f16' and stp == 'f16':
             x = V(a[1], 'f16')
             if 'rni' in mods:

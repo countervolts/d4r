@@ -101,6 +101,8 @@
 #include "d4r_fsr_rr.h"
 #include "d4r_fsr_rr_identity.h"
 #include "d4r_fsr4_identity.h"
+#include "d4r_engine_compat.h"
+#include "d4r_build.h"
 #include "d4r_fsr_rr_passes.h"
 #include "../engine/game.h"
 #include "../engine/game_m.h"
@@ -752,7 +754,7 @@ static void load_portable_config()
         bool on = false;
         if (enabled.empty() || enabled == "auto")
         {
-            for (const wchar_t* model : {L"k", L"k-ldr", L"m", L"m-ldr", L"l", L"l-ldr", L"rr-d", L"rr-e", L"rr-f"})
+            for (const wchar_t* model : {L"k", L"k-ldr", L"m", L"m-ldr", L"l", L"l-ldr", L"rr-d", L"rr-e", L"rr-f", L"rr-d-gfx11", L"rr-e-gfx11"})
             {
                 const DWORD attributes = GetFileAttributesW((dir + L"\\engine\\" + model).c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -956,12 +958,16 @@ public:
         return jobs_.size();
     }
 
-    template <typename Function> auto call(Function function) -> decltype(function())
+    template <typename Function> auto call(Function function, const char* label = nullptr) -> decltype(function())
     {
         using Result = decltype(function());
         auto task = std::make_shared<std::packaged_task<Result()>>(std::move(function));
         auto future = task->get_future();
         post([task] { (*task)(); });
+        const auto started = std::chrono::steady_clock::now();
+        while (label && future.wait_for(std::chrono::seconds(15)) == std::future_status::timeout)
+            logf("worker wait: %s still pending after %.0f s (resources retained)", label,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         return future.get();
     }
 
@@ -1974,6 +1980,7 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     ensure_portable_config();
     if (g_portable.active && !g.core)
     {
+        logf("d4r runtime build %s", D4R_RUNTIME_BUILD_ID);
         logf("portable install in %ls (settings from d4r.ini, Linux path %s)", g_portable.dir.c_str(),
              g_portable.unixDir.c_str());
         for (const std::string& note : g_portable.notes)
@@ -1993,6 +2000,11 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         LUID luid;
         device->GetAdapterLuid(&luid);
         set_cuda_adapter_luid(luid);
+        std::string adapterDetail, adapterPci;
+        d4r_true_identity(device, adapterDetail, &adapterPci);
+        SetEnvironmentVariableA("D4R_RENDER_PCI", adapterPci.empty() ? nullptr : adapterPci.c_str());
+        logf("CUDA adapter mapping: %s; PCI match %s", adapterDetail.c_str(),
+             adapterPci.empty() ? "unavailable (multiple compute devices will be refused)" : adapterPci.c_str());
         // OptiScaler's FSR 4 option needs the real AMD identity for OptiScaler and AMD's modules (d4r_fsr4_identity.h)
         if (env_string("D4R_FSR4_IDENTITY") != "0")
         {
@@ -2003,6 +2015,8 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     }
 
     g.paths.clear();
+    logf("engine selection: D4R_ENGINE=%s D4R_ENGINE_K=%s network=%s (environment overrides d4r.ini)",
+         env_string("D4R_ENGINE").c_str(), env_string("D4R_ENGINE_K").c_str(), env_string("D4R_ENGINE_NETWORK").c_str());
     wchar_t featureDirectory[MAX_PATH] = {};
     DWORD length = GetEnvironmentVariableW(L"D4R_NGX_FEATURE_DIR", featureDirectory, MAX_PATH);
     if (length > 0 && length < MAX_PATH)
@@ -3404,6 +3418,7 @@ struct VulkanInterop
     // shaderBufferInt64Atomics is enabled on vkd3d-proton's device (it enables it when the GPU has it): Ray
     // Reconstruction preset F then measures the exposure in one pass, as NGX does, instead of two
     bool int64Atomics = false;
+    bool matrixF16 = false;
     // The engine runs on the game's own Vulkan device (native Vulkan NGX frontend): no vkd3d interop objects.
     bool native = false;
     PFN_vkGetPhysicalDeviceFormatProperties formatProperties = nullptr;
@@ -8952,6 +8967,9 @@ static int start_engine_model_rr(const Feature& feature);
 // Vulkan-only K features retain just their creation settings until a frame actually needs CUDA.
 static NgxResult create_cuda_feature(Feature& feature)
 {
+    const auto createStarted = std::chrono::steady_clock::now();
+    logf("CUDA_CREATE_BEGIN preset=%u render=%ux%u output=%ux%u flags=0x%x", feature.preset,
+         feature.width, feature.height, feature.outWidth, feature.outHeight, feature.flags);
     static const char* const kSuperSamplingPresets[] = {
         "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
         "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.UltraPerformance",
@@ -8963,6 +8981,7 @@ static NgxResult create_cuda_feature(Feature& feature)
     const bool rayReconstruction = feature.rayReconstruction;
     const char* const* presetNames = rayReconstruction ? kRayReconstructionPresets : kSuperSamplingPresets;
     const NgxResult result = g.worker.call([&]() -> NgxResult {
+        logf("CUDA_CREATE_WORKER_BEGIN preset=%u", feature.preset);
         NgxResult allocation = g.ngx.allocateParameters(&feature.cudaParams);
         if (allocation != NGX_SUCCESS)
             return allocation;
@@ -9002,8 +9021,10 @@ static NgxResult create_cuda_feature(Feature& feature)
             feature.scratch = 0;
         // The core owns the denoiser: it loads nvngx_dlssd.dll, knows its kernel map, and
         // dispatches feature 13 to it. Only the feature id differs from Super Sampling.
+        logf("CUDA_CREATE_NGX_BEGIN preset=%u scratch=0x%llx", feature.preset, feature.scratch);
         const NgxResult created = g.ngx.createFeature(
             rayReconstruction ? NGX_FEATURE_RAY_RECONSTRUCTION : NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+        logf("CUDA_CREATE_NGX_END preset=%u result=0x%08x", feature.preset, created);
         if (created != NGX_SUCCESS)
         {
             if (feature.cudaHandle != nullptr) g.ngx.releaseFeature(feature.cudaHandle);
@@ -9062,9 +9083,11 @@ static NgxResult create_cuda_feature(Feature& feature)
             }
         }
         return created;
-    });
+    }, "CUDA feature creation");
     logf("NVSDK_NGX_CUDA_CreateFeature(feature=%u) -> 0x%08x",
          rayReconstruction ? NGX_FEATURE_RAY_RECONSTRUCTION : NGX_FEATURE_SUPER_SAMPLING, result);
+    logf("CUDA_CREATE_END preset=%u result=0x%08x elapsed_ms=%.1f", feature.preset, result,
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStarted).count());
     if (result == NGX_SUCCESS) feature.cudaCreationDeferred = false;
     return result;
 }
@@ -9339,6 +9362,33 @@ static void init_engine_vulkan()
             for (uint32_t index = 0; index < count; ++index)
                 g_vk.float8 |= std::strcmp(extensions[index].extensionName, "VK_EXT_shader_float8") == 0;
     }
+    auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(instanceProc(instance, "vkGetPhysicalDeviceFeatures2"));
+    auto matrices = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+        instanceProc(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+    bool fp8 = false;
+    if (features2 && matrices)
+    {
+        VkPhysicalDeviceShaderFloat8FeaturesEXT f8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        cm.pNext = g_vk.float8 ? &f8 : nullptr;
+        VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &cm};
+        features2(g_vk.physical, &features);
+        uint32_t n = 0;
+        if (cm.cooperativeMatrix && matrices(g_vk.physical, &n, nullptr) == VK_SUCCESS)
+        {
+            std::vector<VkCooperativeMatrixPropertiesKHR> properties(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            if (matrices(g_vk.physical, &n, properties.data()) == VK_SUCCESS)
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    g_vk.matrixF16 |= d4r_matrix_tuple(properties[i], VK_COMPONENT_TYPE_FLOAT16_KHR);
+                    fp8 |= d4r_matrix_tuple(properties[i], VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
+                }
+        }
+        fp8 = fp8 && f8.shaderFloat8 && f8.shaderFloat8CooperativeMatrix;
+    }
+    g_vk.float8 = g_vk.float8 && fp8;
+    logf("engine backend: f16 matrix tuple %s; FP8 matrix tuple %s", g_vk.matrixF16 ? "supported" : "unsupported",
+         g_vk.float8 ? "supported" : "unsupported");
     logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)" : "unavailable: "
          "M and L run on the CUDA backend");
     // the features vkd3d-proton created its device with
@@ -10328,6 +10378,8 @@ static std::string rr_model_directory(int slot)
         char folder[MAX_PATH * 3] = {};
         WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + folders[slot]).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
+        if (slot < 2 && !g_vk.float8)
+            directory += "-gfx11";
     }
     return directory[0] == '/' ? "Z:" + directory : directory;
 }
@@ -10346,6 +10398,10 @@ static void init_engine_backend_rr(int slot)
     const auto start = std::chrono::steady_clock::now();
     try
     {
+        std::string metadata;
+        if (!read_whole_file(widen(path + "\\rr.txt"), metadata) ||
+            !d4r_rr_model_compatible(metadata, g_vk.matrixF16, g_vk.float8))
+            throw std::runtime_error("model arithmetic is unsupported by this GPU (no pipelines created)");
         auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, g_vk.int64Atomics);
         if (model->preset() != g_rrPreset[slot])
             throw std::runtime_error("the directory holds a model of another preset");

@@ -73,7 +73,7 @@ inline bool d4r_read_hex_file(const char* path, uint32_t& value)
 
 // The real PCI identity of the GPU behind a vkd3d-proton device: Vulkan's PCI bus address, then that
 // device's sysfs vendor/device files.
-inline D4rPciIdentity d4r_true_identity(ID3D12Device* device, std::string& detail)
+inline D4rPciIdentity d4r_true_identity(ID3D12Device* device, std::string& detail, std::string* address = nullptr)
 {
     D4rPciIdentity identity;
     ID3D12DXVKInteropDevice1* interop = nullptr;
@@ -126,6 +126,12 @@ inline D4rPciIdentity d4r_true_identity(ID3D12Device* device, std::string& detai
         return identity;
     }
     identity.known = true;
+    if (address != nullptr)
+    {
+        char pci[32];
+        std::snprintf(pci, sizeof(pci), "%04x:%02x:%02x.%x", bus.pciDomain, bus.pciBus, bus.pciDevice, bus.pciFunction);
+        *address = pci;
+    }
     char text[256];
     std::snprintf(text, sizeof(text), "PCI %04x:%02x:%02x.%x is %04x:%04x (Vulkan reports %04x:%04x, driver %s)",
                   bus.pciDomain, bus.pciBus, bus.pciDevice, bus.pciFunction, identity.vendor, identity.device,
