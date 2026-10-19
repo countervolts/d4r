@@ -94,7 +94,8 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
                bool robustImages)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
-    // the translated stages' specialization constant 0 (engine/rr/ptx2rr.py RR_ROBUST_IMAGES); shaders without it ignore it
+    // the translated stages' specialization constant 0 (engine/rr/ptx2rr.py RR_ROBUST_IMAGES), set for every stage of the
+    // model; shaders without it ignore it. Constant 0 is reserved for this: an RR shader must not declare it otherwise.
     const VkBool32 robust = VK_TRUE;
     const VkSpecializationMapEntry robustEntry{0, 0, sizeof(VkBool32)};
     const VkSpecializationInfo robustInfo{1, &robustEntry, sizeof(VkBool32), &robust};

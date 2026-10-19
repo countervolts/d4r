@@ -81,7 +81,8 @@ float16_t relu1(float16_t v) { return v < 0.0hf ? 0.0hf : v; }
 // An integer fetch outside the image returns zero (one unsigned comparison per axis: a negative coordinate is above
 // every size). With robustImageAccess2 the image load returns zero there itself, except for a w component the format
 // lacks, which it returns as one: the runtime sets RR_ROBUST_IMAGES when the device has it enabled (vkd3d-proton
-// always does), and only a fetch whose w is used still needs the image's size.
+// always does), and only a fetch whose w is used still needs the image's size. The runtime sets constant 0 on every
+// stage of a Ray Reconstruction model (engine/runtime_rr.inc), so no other RR shader may use that id.
 layout(constant_id = 0) const bool RR_ROBUST_IMAGES = false;
 vec4 fetch0(sampler2D t, ivec2 c)
 {
