@@ -84,6 +84,13 @@ SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WA
 # differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13)
 POOLED = os.environ.get('D4R_RR2_POOLED', 'rgba32f')
 SURFACES = {'dec0_1': {176: 'rgba8_snorm', 184: 'rgba8', 192: 'rgba8'}, 'post': {120: POOLED}, 'pooled': {8: POOLED}}
+# D4R_RR2_UNGUARDED=1 (opt-in, D4R_RR_RELAXED=3 only): the translated code (encoder 0's and decoder 0's per-pixel parts,
+# the output passes) without its exactness guards: no `precise` registers, no opaque zero OR-ed into binary16 stores and
+# conversions (ptx2rr.py --unguarded) and no NoContraction pass (spv_exact_convert.py) on those modules, so the driver may
+# contract, fold and fuse there as it does in the relaxed native stages (engine/rr/README.md)
+UNGUARDED = os.environ.get('D4R_RR2_UNGUARDED') == '1'
+if UNGUARDED and RELAXED < 3:
+    raise SystemExit('D4R_RR2_UNGUARDED=1 is for D4R_RR_RELAXED=3')
 
 
 def find_module(ptx_dir, kernel):
@@ -170,8 +177,8 @@ def main():
         cmd += [f'--surface={off}={fmt}' for off, fmt in SURFACES.get(stage, {}).items()]
         # the hybrid stages' and the output passes' modules go through spv_exact_convert.py, so their conversions need
         # only the lighter guard (ptx2rr.py --exact-convert)
-        exact = (bool(a.native) and stage in HYBRID) or not network
-        cmd += ['--exact-convert'] if exact else []
+        exact = ((bool(a.native) and stage in HYBRID) or not network) and not UNGUARDED
+        cmd += ['--exact-convert'] if exact else ['--unguarded'] if UNGUARDED else []
         subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
         info = json.loads(generated.with_suffix('.json').read_text())
         weights = '-'
@@ -195,8 +202,9 @@ def main():
                 subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
                                          f'-I{HERE / "rr"}', str(work / 'enc0_g.comp'), '-o', str(out / 'enc0g.spv')],
                                check=True, stdout=subprocess.DEVNULL)
-                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
-                               check=True, stdout=subprocess.DEVNULL)
+                if not UNGUARDED:
+                    subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
+                                   check=True, stdout=subprocess.DEVNULL)
                 record = int((work / 'enc0_g.record').read_text())
             if RELAXED >= 3 and stage in ONE_WAVE and (split or GROUP == 1):
                 how = how + ['--one-wave']
@@ -206,8 +214,9 @@ def main():
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
                                      f'-I{HERE / "rr"}', str(work / f'{stage}_m.comp'), '-o', str(out / f'{stage}.spv')],
                            check=True, stdout=subprocess.DEVNULL)
-            subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
-                           check=True, stdout=subprocess.DEVNULL)
+            if not UNGUARDED:
+                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
         else:
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', str(generated), '-o',
                                      str(out / f'{stage}.spv')], check=True, stdout=subprocess.DEVNULL)

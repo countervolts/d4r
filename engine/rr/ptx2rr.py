@@ -950,6 +950,9 @@ class RRT(base.T):
         w(f'shared uint mms[{384 * (self.bx * self.by * self.bz // 32)}];   // mma_e4m3_f16 scratch, per subgroup')
 
     def runtime(self):
+        if getattr(self, 'unguarded', False):   # --unguarded: no opaque zero
+            assert '#define SUST_Z (gl_NumWorkGroups.z - 1u)' in RR_RUNTIME
+            return RR_RUNTIME.replace('#define SUST_Z (gl_NumWorkGroups.z - 1u)', '#define SUST_Z 0u')
         return RR_RUNTIME
 
 
@@ -976,6 +979,9 @@ def main():
     ap.add_argument('--oob-report', action='store_true', help='debugging: count out-of-range buffer accesses')
     ap.add_argument('--exact-convert', action='store_true',
                     help='the module goes through spv_exact_convert.py: lighter guards on binary16 conversions (CVT_GUARD)')
+    ap.add_argument('--unguarded', action='store_true',
+                    help="none of the exactness guards: no 'precise' registers and no opaque zero OR-ed into binary16 "
+                         "stores and conversions, so the driver may contract, fold and fuse (compile_rr2.py D4R_RR2_UNGUARDED)")
     ns = ap.parse_args()
     block = tuple(int(x) for x in ns.block.split(',')) if ns.block else default_block(ns.kernel)
     formats = {int(k): v for k, v in (x.split('=') for x in ns.surface)}
@@ -991,8 +997,9 @@ def main():
         t.probes = probes
         t.probe_block = tuple(int(x) for x in ns.probe_block.split(','))
         t.oob = ns.oob_report
+        t.unguarded = ns.unguarded
         return t
-    t = base.build(make, False, False, False)
+    t = base.build(make, False, ns.unguarded, False)
     for off, fmt in formats.items():
         if off in t.surfaces:
             t.surfaces[off] = fmt
