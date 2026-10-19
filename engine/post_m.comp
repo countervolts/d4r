@@ -214,6 +214,9 @@ void main()
             // the fallback colour is only fetched where the history sample leaves the image or the history was reset:
             // the value is the same either way, so computing it in the branch saves the fetch on ordinary pixels
             const bool out1 = q1.x < 0.0 || q1.y < 0.0 || q1.x > size.x || q1.y > size.y || p.reset != 0u;
+            // the second candidate often has the first one's vector (where the motion is uniform): the same position,
+            // so the first one's sample or fallback (a NaN is never equal, and +0 and -0 give the same position)
+            const bool same = all(equal(second.xy, big.xy));
 #if PRESET_L
             // linear light: a sample's expansion (when the previous exposure is positive) or the colour texel
             const vec3 h1 = out1 ? texelFetch(colorTex, colourTexel(near), 0).rgb : historyLinear(q1, p.expoPrev == 0.0 ? 1.0 : p.expoPrev);
@@ -221,7 +224,9 @@ void main()
             if (b2 > 0.0)
             {
                 const vec2 q2 = centre + second.xy;
-                if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
+                if (same)
+                    h2 = h1;
+                else if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
                     h2 = out1 ? h1 : texelFetch(colorTex, colourTexel(near), 0).rgb;
                 else h2 = historyLinear(q2, p.expoPrev == 0.0 ? 1.0 : p.expoPrev);
             }
@@ -232,7 +237,9 @@ void main()
             if (b2 > 0.0)
             {
                 const vec2 q2 = centre + second.xy;
-                if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
+                if (same)
+                    h2 = h1;
+                else if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
                     h2 = out1 ? h1 : compress(e2 * texelFetch(colorTex, colourTexel(near), 0).rgb);
                 else h2 = history(q2);
             }
