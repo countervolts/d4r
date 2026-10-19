@@ -725,6 +725,20 @@ void main()
     EACH_T(N2)
     }
     // ------------------------------------------------------------ the MLP, 32 hidden channels at a time
+    // M_RESIDUAL_F32 (opt-in, part of M_RELAXED): the residual stays f32 across the MLP's chunks and is rounded to
+    // binary16 once after them, instead of after every chunk
+#ifdef M_RESIDUAL_F32
+#ifndef M_RELAXED
+#error layer_m.comp: M_RESIDUAL_F32 needs M_RELAXED
+#endif
+    ACC RF_[WPW][NT];
+#define RF_IN(N) RF_[w][N] = ACC(res[N]);
+    FORW { EACH_T(RF_IN) }
+#undef RF_IN
+#define K32R(N, a0, b0, a1, b1) { RF_[w][N] = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), RF_[w][N])); }
+#else
+#define K32R(N, a0, b0, a1, b1) K32H(res[N], a0, b0, a1, b1)
+#endif
     for (uint c = 0u; c < UC / 8u; ++c)
     {
         const uint ow1 = p.o[20u + 3u * c], ob1 = p.o[21u + 3u * c], ow2 = p.o[22u + 3u * c];
@@ -759,9 +773,15 @@ void main()
         A8 a0, a1; \
         LDA8(a0, ow2, 0u, UC, 16u * (N)); \
         LDA8(a1, ow2, 1u, UC, 16u * (N)); \
-        FORW { K32H(res[N], a0, G0_[w], a1, G1_[w]) } }
+        FORW { K32R(N, a0, G0_[w], a1, G1_[w]) } }
         EACH_T(MLP2_N)
     }
+#undef K32R
+#ifdef M_RESIDUAL_F32
+#define RF_OUT(N) res[N] = HAC(RF_[w][N]);
+    FORW { EACH_T(RF_OUT) }
+#undef RF_OUT
+#endif
 #if KIND == 4
     // ------------------------------------------------------------ L's expansion head: per-pixel reconstruction inputs
     SYNC   // every wave is done with the V tiles in HO
