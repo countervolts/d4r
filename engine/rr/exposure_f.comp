@@ -1,17 +1,23 @@
 #version 460
-// Ray Reconstruction preset F (rr2_*): the auto exposure of rr2_histogram_auto_exposure_basic_kernel, in two passes.
+// Ray Reconstruction preset F (rr2_*): the auto exposure of rr2_histogram_auto_exposure_basic_kernel.
 //
 // NVIDIA's kernel sums a clamped luma per 16x16 block (a pairwise tree over the block's threads), converts each block
 // sum to fixed point (x 2^32 / 10000, round to nearest) and adds them with a 64-bit atomic; the last block to finish
-// turns the total into the exposure. The integer total does not depend on the order of the blocks, so PASS 0 writes
-// every block's fixed-point sum and PASS 1 (one workgroup) adds them and does what the last block does:
+// turns the total into the exposure:
 //   exposure = 0.23547088 / max(mean luma, 0.005)               -> the 1x1 exposure image of this frame
 //   values   = { e, p, 1 / e, clamp(log2(e / p), -6, 6) / 6 }   -> the 16-byte buffer encoder 0 and the output passes read
 // with e the exposure truncated to binary16 and p the previous frame's (1 where either is zero).
+// PASS 2 is that kernel (64-bit atomics on a storage buffer: shaderBufferInt64Atomics). Without them the runtime runs
+// two passes: PASS 0 writes every block's fixed-point sum and PASS 1 (one workgroup) adds them and does what the last
+// block does. The total is an integer: it does not depend on the order of the blocks, so both give the same values.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_control_flow_attributes : require
 #ifndef PASS
 #define PASS 0
+#endif
+#if PASS == 2
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_memory_scope_semantics : require
 #endif
 layout(set = 0, binding = 0, std430) readonly buffer Params {
     ivec2 last;        // render size - 1
@@ -19,15 +25,15 @@ layout(set = 0, binding = 0, std430) readonly buffer Params {
     float invCount;    // 10000 / (2^32 * render pixels)
     uint reset;        // the kernel's argument 32: no log ratio when set
 } p;
-#if PASS == 0
+#if PASS != 1
 // One thread per column of the 16x16 block. NVIDIA's tree over the block's 256 threads (index 16 y + x: i += i + 128,
 // then 64, 32, ... 1) is, per column, ((r0 + r8) + (r4 + r12)) + ((r2 + r10) + (r6 + r14)) of the even rows plus the
 // same of the odd rows, and then the columns (c + c8, + 4, + 2, + 1).
 layout(local_size_x = 16) in;
 layout(set = 0, binding = 1) uniform sampler2D color;
-layout(set = 0, binding = 2, std430) writeonly buffer Sums { uint64_t s[]; } sums;
 shared float col[16];
-void main()
+// the block's fixed-point sum, in thread 0
+uint64_t blockSum()
 {
     const uint tx = gl_LocalInvocationID.x;
     const int x = int(gl_GlobalInvocationID.x), y0 = int(gl_WorkGroupID.y) * 16;
@@ -49,33 +55,37 @@ void main()
     precise float c = w1 + w0;
     col[tx] = c;
     barrier();
-    if (tx == 0u) {
-        precise float d[8];
-        [[unroll]] for (int k = 0; k < 8; ++k) d[k] = col[k + 8] + col[k];
-        precise float e0 = d[4] + d[0], e1 = d[5] + d[1], e2 = d[6] + d[2], e3 = d[7] + d[3];
-        precise float f0 = e2 + e0, f1 = e3 + e1;
-        precise float g = f1 + f0;
-        sums.s[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = uint64_t(roundEven(g * 429496.71875));
-    }
+    if (tx != 0u) return 0ul;
+    precise float d[8];
+    [[unroll]] for (int k = 0; k < 8; ++k) d[k] = col[k + 8] + col[k];
+    precise float e0 = d[4] + d[0], e1 = d[5] + d[1], e2 = d[6] + d[2], e3 = d[7] + d[3];
+    precise float f0 = e2 + e0, f1 = e3 + e1;
+    precise float g = f1 + f0;
+    return uint64_t(roundEven(g * 429496.71875));
+}
+#endif
+#if PASS == 0
+layout(set = 0, binding = 2, std430) writeonly buffer Sums { uint64_t s[]; } sums;
+void main()
+{
+    const uint64_t s = blockSum();
+    if (gl_LocalInvocationID.x == 0u) sums.s[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = s;
 }
 #else
+#if PASS == 1
 layout(local_size_x = 64) in;
 shared uint64_t part[64];
 layout(set = 0, binding = 1, std430) readonly buffer Sums { uint64_t s[]; } sums;
-layout(set = 0, binding = 2, std430) writeonly buffer Values { vec4 v; } values;
-layout(set = 0, binding = 3) uniform sampler2D previous;
-layout(set = 0, binding = 4, r16f) uniform writeonly image2D current;
-void main()
+#else
+// s[0]: the total, s[1]: the blocks done; the last block leaves both 0 for the next frame
+layout(set = 0, binding = 2, std430) buffer Sums { uint64_t s[]; } sums;
+#endif
+layout(set = 0, binding = PASS + 1, std430) writeonly buffer Values { vec4 v; } values;
+layout(set = 0, binding = PASS + 2) uniform sampler2D previous;
+layout(set = 0, binding = PASS + 3, r16f) uniform writeonly image2D current;
+// the last block's work, from the frame's total
+void finish(uint64_t total)
 {
-    // the block sums are integers: any order. 64 strided partial sums, then thread 0 finishes
-    const uint tid = gl_LocalInvocationID.x;
-    uint64_t mine = 0ul;
-    for (uint b = tid; b < p.blocks; b += 64u) mine += sums.s[b];
-    part[tid] = mine;
-    barrier();
-    if (tid != 0u) return;
-    uint64_t total = 0ul;
-    for (uint b = 0u; b < 64u; ++b) total += part[b];
     precise float mean = p.invCount * float(total);
     precise float e = 0.23547088 / max(mean, 0.005);
     imageStore(current, ivec2(0), vec4(e));
@@ -90,4 +100,33 @@ void main()
     if (p.reset == 0u) ratio = clamp(log2(max(cur, 1e-8) / max(prev, 1e-8)), -6.0, 6.0) * 0.16666667;
     values.v = vec4(cur, prev, 1.0 / cur, ratio);
 }
+#if PASS == 1
+void main()
+{
+    // the block sums are integers: any order. 64 strided partial sums, then thread 0 finishes
+    const uint tid = gl_LocalInvocationID.x;
+    uint64_t mine = 0ul;
+    for (uint b = tid; b < p.blocks; b += 64u) mine += sums.s[b];
+    part[tid] = mine;
+    barrier();
+    if (tid != 0u) return;
+    uint64_t total = 0ul;
+    for (uint b = 0u; b < 64u; ++b) total += part[b];
+    finish(total);
+}
+#else
+void main()
+{
+    const uint64_t s = blockSum();
+    if (gl_LocalInvocationID.x != 0u) return;
+    atomicAdd(sums.s[0], s, gl_ScopeDevice, 0, gl_SemanticsRelaxed);
+    // the release orders this block's add before its count, and the last block's acquire every block's add before
+    // its read of the total
+    if (atomicAdd(sums.s[1], 1ul, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease) != uint64_t(p.blocks - 1u))
+        return;
+    const uint64_t total = atomicExchange(sums.s[0], 0ul, gl_ScopeDevice, 0, gl_SemanticsRelaxed);
+    atomicExchange(sums.s[1], 0ul, gl_ScopeDevice, 0, gl_SemanticsRelaxed);
+    finish(total);
+}
+#endif
 #endif

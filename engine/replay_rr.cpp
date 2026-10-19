@@ -158,6 +158,8 @@ int main(int argc, char** argv) try {
     if (std::getenv("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
     // D4R_RR_TEST_NO_COOPMAT=1: a device like vkd3d-proton's, without the cooperative-matrix and float8 features
     if (std::getenv("D4R_RR_TEST_NO_COOPMAT")) { di.enabledExtensionCount = 0; v13.pNext = nullptr; }
+    // D4R_RR_TEST_NO_INT64_ATOMICS=1: no 64-bit buffer atomics (preset F's exposure then takes its two passes)
+    if (std::getenv("D4R_RR_TEST_NO_INT64_ATOMICS")) v12.shaderBufferInt64Atomics = v12.shaderSharedInt64Atomics = VK_FALSE;
     CK(vkCreateDevice(c.physical, &di, nullptr, &c.device));
     vkGetDeviceQueue(c.device, family, 0, &c.queue);
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pi.queueFamilyIndex = family;
@@ -169,7 +171,7 @@ int main(int argc, char** argv) try {
     std::string key;
     uint32_t rw, rh, ow, oh;
     frames >> key >> rw >> rh >> ow >> oh;
-    d4r::RModel model(c.physical, c.device, modelDir);
+    d4r::RModel model(c.physical, c.device, modelDir, VK_NULL_HANDLE, v12.shaderBufferInt64Atomics == VK_TRUE);
     d4r::REngine engine(model, rw, rh, ow, oh);
     const char* names[] = {"color", "motion", "depth", "normals", "roughness", "diffuse", "specular"};
     const VkFormat formats[] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT,

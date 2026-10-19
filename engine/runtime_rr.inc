@@ -90,7 +90,7 @@ struct RModel::Impl {
     bool uploaded = false;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
+RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool int64Atomics)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
     // rr.txt: "D4RR0001", "preset N", one "stage NAME SHADER.spv SUBGROUP WEIGHTS TEXTURES SURFACES" line per stage in
@@ -103,7 +103,7 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     if (line.rfind("D4RR0002", 0) == 0) {
         m.preset = 6;
         m.v2 = std::make_unique<R2Model>();
-        m.v2->load(m.device, directory, lines, cache);
+        m.v2->load(m.device, directory, lines, cache, int64Atomics);
         return;
     }
     if (line.rfind("D4RR0001", 0) != 0) throw std::runtime_error("not a Ray Reconstruction model (rr.txt D4RR0001)");
