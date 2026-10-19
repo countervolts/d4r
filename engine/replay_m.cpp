@@ -107,7 +107,7 @@ int main(int argc, char** argv) try {
     CK(vkCreateCommandPool(c.device, &pi, nullptr, &c.pool));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = c.pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
     VkCommandBuffer cb; CK(vkAllocateCommandBuffers(c.device, &cai, &cb));
-    VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qpi.queryType = VK_QUERY_TYPE_TIMESTAMP; qpi.queryCount = 7;
+    VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qpi.queryType = VK_QUERY_TYPE_TIMESTAMP; qpi.queryCount = 17;
     VkQueryPool qp; CK(vkCreateQueryPool(c.device, &qpi, nullptr, &qp));
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(c.physical, &props);
     auto submit = [&] {
@@ -151,7 +151,7 @@ int main(int argc, char** argv) try {
                 if (data.size() != sizes[k]) throw std::runtime_error("wrong input size");
                 frameInputs.push_back(std::move(data));
             }
-        std::vector<double> times, walls; std::vector<std::vector<double>> stage(6);
+        std::vector<double> times, walls; std::vector<std::vector<double>> stage(6), layer(10);
         const auto now = [] { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         // D4R_M_RESET_ALL=1: every frame is a reset frame, as the D3D12 harness passes them without its temporal option
         const bool resetAll = std::getenv("D4R_M_RESET_ALL") != nullptr;
@@ -169,7 +169,7 @@ int main(int argc, char** argv) try {
                 s.renderWidth = rw; s.renderHeight = rh;
                 const double t0 = now();
                 engine.setFrame({color.view, motion.view, depth.view}, s);
-                vkCmdResetQueryPool(cb, qp, 0, 7);
+                vkCmdResetQueryPool(cb, qp, 0, 17);
                 double networkUs = 0;
                 if (hip) {
 #ifdef D4R_ENGINE_HIP
@@ -186,12 +186,16 @@ int main(int argc, char** argv) try {
                 if (pass == 0) vkCmdCopyImageToBuffer(cb, engine.outputImage(), VK_IMAGE_LAYOUT_GENERAL, out.buffer, 1, &region);
                 submit();
                 if (pass) walls.push_back(now() - t0);
-                uint64_t t[7]; CK(vkGetQueryPoolResults(c.device, qp, 0, 7, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                uint64_t t[17] = {};
+                // D4R_ENGINE_M_LAYER_STAMPS=1: the ten network layers' stamps as well (queries 7 - 16)
+                static const bool layerStamps = std::getenv("D4R_ENGINE_M_LAYER_STAMPS") != nullptr && !hip;
+                CK(vkGetQueryPoolResults(c.device, qp, 0, layerStamps ? 17 : 7, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
                 const double tick = props.limits.timestampPeriod / 1000.0;
                 double d[6]; for (int k = 0; k < 6; ++k) d[k] = double(t[k + 1] - t[k]) * tick;
                 if (hip) d[2] = networkUs; // measured HIP network time; the complete span includes host handoffs
                 const double us = double(t[6] - t[0]) * tick;
                 if (pass) for (int k = 0; k < 6; ++k) stage[k].push_back(d[k]);
+                if (pass && layerStamps) for (int l = 0; l < 10; ++l) layer[l].push_back(double(t[7 + l] - (l ? t[6 + l] : t[2])) * tick);
                 if (pass == 0 && std::getenv("D4R_M_DUMP")) {
                     // development: every intermediate of this frame, to PREFIX-NAME-FRAME.bin
                     for (const auto& d : engine.debugResources()) {
@@ -216,6 +220,11 @@ int main(int argc, char** argv) try {
             std::sort(walls.begin(), walls.end()); std::printf("  wall clock, record to completion: median %.1f us, min %.1f us\n", walls[walls.size() / 2], walls[0]);
             const char* names[6] = {"exposure", "input", "network", "expansion", "reconstruction", "downsample"};
             for (int k = 0; k < 6; ++k) { std::sort(stage[k].begin(), stage[k].end()); std::printf("  %-14s median %.1f us\n", names[k], stage[k][stage[k].size() / 2]); }
+            if (!layer[0].empty()) {
+                std::printf("  layers (us):");
+                for (auto& v : layer) { std::sort(v.begin(), v.end()); std::printf(" %.1f", v[v.size() / 2]); }
+                std::printf("\n");
+            }
         }
         CK(vkDeviceWaitIdle(c.device));
     }

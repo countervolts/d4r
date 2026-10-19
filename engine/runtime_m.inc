@@ -512,9 +512,12 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     auto& e = *impl; auto& m = e.model;
     if (e.external) throw std::runtime_error("this engine's network is external: record the front and the back");
     recordFront(cb, stamps, first);
+    // timing only: D4R_ENGINE_M_LAYER_STAMPS=1 also stamps after every network layer, from query first + 7 on
+    static const bool layerStamps = std::getenv("D4R_ENGINE_M_LAYER_STAMPS") != nullptr;
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
         dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); emptyStage(cb);
+        if (stamps && layerStamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, first + 7 + l);
     }
     recordBack(cb, stamps, stamps ? first + 3 : 0);
 }
