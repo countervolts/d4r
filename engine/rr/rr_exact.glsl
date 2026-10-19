@@ -136,8 +136,10 @@ float16_t fma16q(float16_t a, float16_t b, float16_t c, inout bool mid)
 #endif
 }
 #ifndef RR_GFX11
-// The saturating FP8 conversion of a whole accumulator, two elements per conversion instruction
-#define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(vec2((src)[i_], (src)[i_ + 1]))); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+// The saturating FP8 conversion of a whole accumulator, two elements per conversion instruction. The pair is widened
+// into a variable first: written inline, binary16 sources (decoder 0's x) reached NIR with one element's infinity test
+// inverted, which the FINITE pattern does not match, and each element took a clamp, a compare and a select as well
+#define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 v_ = vec2((src)[i_], (src)[i_ + 1]); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(v_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 // q8(act(h)) from the packed table (enc1_pack.act_table; the weight buffer's W8U view at W_ACT)
 #define ACTQ(h) uintBitsToFloate4m3EXT(w8u.w[W_ACT + bh(h)])
 // the activation of a whole accumulator into FP8. RR_NATIVE (D4R_RR_RELAXED=3): in f32, two elements per

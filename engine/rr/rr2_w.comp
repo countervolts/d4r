@@ -43,6 +43,7 @@ layout(set = 0, binding = 0, std430) readonly buffer ParamBlock { uint p[]; } pa
 layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
 layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
 layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
+layout(set = 0, binding = 1, std430) readonly buffer W32F { float w[]; } w32f;   // the biases' float32 copies ("_f")
 layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -124,7 +125,7 @@ void main()
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
             [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], XF_SRC, XF_AT + wv * 256u + 4u * kt, 16u, CMJ);
             [[unroll]] for (uint m = 0u; m < MT; ++m)
-                [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = float(w16.w[W_EBU / 2u + 16u * m + 8u * hl + uint(i)]);
+                [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = w32f.w[W_EBU_F / 4u + 16u * m + 8u * hl + uint(i)];
         }
 #ifdef RR2_XF_SHARED
         barrier();   // XF is read: XT and KVS take its place
@@ -140,7 +141,7 @@ void main()
                 B8 Hb[2];
                 [[unroll]] for (uint c = 0u; c < 2u; ++c) {
                     ACC h;
-                    [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[(W_EBD0 + EBRANCH * br) / 2u + 16u * c + 8u * hl + uint(i)]);
+                    [[unroll]] for (int i = 0; i < 8; ++i) h[i] = w32f.w[(W_EBD0_F + EBRANCH * br) / 4u + 16u * c + 8u * hl + uint(i)];
                     [[unroll]] for (uint kt = 0u; kt < 4u; kt += 2u) K32(h, ewd[c][kt], fb[wv][kt], ewd[c][kt + 1u], fb[wv][kt + 1u])
                     ACT8(Hb[c], h)
                 }
@@ -167,7 +168,7 @@ void main()
         [[unroll]] for (uint kt = 0u; kt < CL / 16; ++kt) coopMatLoad(lb[kt], XT, 4u * kt, CL / 4u, CMJ);
         for (uint m = 0u; m < 4u * MT; ++m) {
             ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = w32f.w[W_BE_F / 4u + 16u * m + 8u * hl + uint(i)];
             [[unroll]] for (uint kt = 0u; kt < CL / 16; kt += 2u) {
                 A8 w0, w1;
                 LDA(w0, W_WE, CL, m, kt); LDA(w1, W_WE, CL, m, kt + 1u);
@@ -209,7 +210,7 @@ void main()
     ACC AT[4][MT];
     [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
         [[unroll]] for (uint m = 0u; m < MT; ++m)
-            [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = float(w16.w[W_BO / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = w32f.w[W_BO_F / 4u + 16u * m + 8u * hl + uint(i)];
     [[unroll]] for (uint hd = 0u; hd < NH; ++hd) {
         // V^T of every token tile first: stored, read back as the product's A operands, then QK takes its place
         A8 kt0[4], kt1[4], v0[2][2], v1[2][2], wo0[MT], wo1[MT];
@@ -273,9 +274,9 @@ void main()
                         coopMatLoad(cached, KVS, (wv - 2u) * 256u + kt * 8u, 16u, CMJ);
                         [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = cached[i];
                     } else {
-                        HAC c;
-                        coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
-                        ACC p_ = coopMatMulAdd(kt1[kt], allQ[wv][1], coopMatMulAdd(kt0[kt], allQ[wv][0], ACC(c)));
+                        ACC c;   // the bias tile's float32 copy, [key tile][query tile] column-major (rr2_pack.py)
+                        coopMatLoad(c, w32f.w, (W_BIAS0_F + HEAD * hd) / 4u + (kt * 4u + wv) * 256u, 16u, CMJ);
+                        ACC p_ = coopMatMulAdd(kt1[kt], allQ[wv][1], coopMatMulAdd(kt0[kt], allQ[wv][0], c));
                         [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(float16_t(p_[i]))]));
                         if (wv < 2u && kt >= 2u) {
                             HAC cached;
@@ -332,12 +333,12 @@ void main()
                 const float r = fma(AT[wv][m][i], f1, xb);
                 rv[wv][m][i] = r;
                 
-                ML[wv][m][i] = float(w16.w[W_BU / 2u + 16u * m + 8u * hl + uint(i)]);
+                ML[wv][m][i] = w32f.w[W_BU_F / 4u + 16u * m + 8u * hl + uint(i)];
             }
             Q8(Nb[wv][m], rv[wv][m])
         }
     [[unroll]] for (uint br = 0u; br < NB; ++br) {
-        const uint w1 = W_WD0 + BRANCH * br, b1 = W_BD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
+        const uint w1 = W_WD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
         A8 wd[2][MT], wu0[MT], wu1[MT];
         [[unroll]] for (uint c = 0u; c < 2u; ++c)
             [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wd[c][kt], w1, C, c, kt);
@@ -346,7 +347,7 @@ void main()
             B8 Hb[2];
             [[unroll]] for (uint c = 0u; c < 2u; ++c) {
                 ACC h;
-                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = w32f.w[(W_BD0_F + BRANCH * br) / 4u + 16u * c + 8u * hl + uint(i)];
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(h, wd[c][kt], Nb[wv][kt], wd[c][kt + 1u], Nb[wv][kt + 1u])
                 ACT8(Hb[c], h)
             }
@@ -370,7 +371,8 @@ void main()
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             floate4m3_t Tb[8];
             [[unroll]] for (int i = 0; i < 8; i += 2) {
-                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]))));
+                const vec2 y_ = vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]));
+                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(y_));
                 Tb[i] = q.x; Tb[i+1] = q.y;
             }
 #if KIND == 4
@@ -383,7 +385,7 @@ void main()
 #if KIND == 4
         {   // the guide head (rows 0-3 on lanes 0-15), for the translated tail
             ACC hv;
-            [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = float(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = w32f.w[W_BH_F / 4u + 8u * hl + uint(i)];
             [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(hv, wh[kt], Tm[kt], wh[kt + 1u], Tm[kt + 1u])
             if (hl == 0u) [[unroll]] for (uint c = 0u; c < 4u; ++c) HD[t * 4u + c] = float16_t(hv[c]);
         }
