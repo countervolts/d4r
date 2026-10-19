@@ -113,7 +113,8 @@ uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
 {
     return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
 }
-f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u*h)), uint8_t(w >> (16u*h+8u))))); }
+// (a half of unpack8(w): converted in place, see rr2_m.comp)
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(h == 0u ? unpack8(w).xy : unpack8(w).zw)); }
 float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
 
 #ifdef RR2_EMBED
@@ -355,7 +356,7 @@ void main()
                 const float xb = float(qx[wv][m][i]);
 #elif KIND == 5
                 const uint xw = XT[XTA((16u * wv + col) * (C / 4u) + 4u * m + 2u * hl + (uint(i) >> 2u))];
-                const float xb = float(uintBitsToFloate4m3EXT(uint8_t(xw >> (8u * (uint(i) & 3u)))));
+                const float xb = float(uintBitsToFloate4m3EXT(((uint(i) & 2u) == 0u ? unpack8(xw).xy : unpack8(xw).zw)[uint(i) & 1u]));
 #else
                 const float xb = float(xr[wv][m][i]);
 #endif
