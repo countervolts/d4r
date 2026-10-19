@@ -4,13 +4,14 @@
 #
 # usage: bash d4r/tools/build-engine-models.sh [--rr-only | --sr-only] [--exact] [D4R_FOLDER]
 #        bash d4r/tools/build-engine-models.sh --find-proton      prints the GE-Proton it would use (or nothing)
-#
+#        bash d4r/tools/build-engine-models.sh --list-sr-models   prints the Super Resolution models it builds here
 #   Ray Reconstruction  engine/rr-d, rr-e, rr-f   from d4r/nvngx_dlssd.dll 310.9.1 alone (about half a minute)
-#   Super Resolution    engine/k, k-ldr, m, m-ldr, l, l-ldr
+#   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr (on RDNA2 only e, f, k, k-ldr; D4R_ENGINE_ALL_MODELS=1
+#                       builds L and M there too, which takes most of an hour)
 #                       NVIDIA's DLSS keeps these weights packed in nvngx_dlss.dll; they are read where NGX unpacks
 #                       them: the bundled D3D12 test app renders one frame per model through this d4r folder under
-#                       GE-Proton, and the uploads are saved (a minute or two each; the first run also compiles
-#                       DLSS's kernels and creates a temporary Proton prefix)
+#                       GE-Proton, and the uploads are saved (the frames after the first render at the same time;
+#                       the first run also compiles DLSS's kernels and creates a temporary Proton prefix)
 # Needs python3 with numpy, and for Super Resolution a GE-Proton (D4R_PROTON=/path/to/GE-Proton11-3 to choose one).
 # The models are the fastest builds (this GPU's own arithmetic; engine/README.md). --exact builds NVIDIA's roundings
 # instead: bit-identical to the CUDA path, about 20% slower (K is the same either way).
@@ -18,14 +19,15 @@
 set -euo pipefail
 
 fail() { printf 'build-engine-models: %s\n' "$*" >&2; exit 1; }
-DO_RR=1 DO_SR=1 FIND_PROTON=0
+DO_RR=1 DO_SR=1 FIND_PROTON=0 LIST_SR=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rr-only) DO_SR=0; shift ;;
     --sr-only) DO_RR=0; shift ;;
     --exact) export D4R_RR_RELAXED=0 M_EXACT=1; shift ;;
     --find-proton) FIND_PROTON=1; shift ;;
-    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --list-sr-models) LIST_SR=1; shift ;;
+    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) break ;;
   esac
 done
@@ -46,6 +48,27 @@ find_proton() {
     done
   fi
 }
+gpu_arch() {   # the GPU the native kernels are chosen for: D4R_GPU_ARCH, else the KFD node with the most SIMDs
+  if [[ -n "${D4R_GPU_ARCH:-}" ]]; then printf '%s\n' "$D4R_GPU_ARCH"; return; fi
+  local f simds version best=0 found=''
+  for f in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+    [[ -r "$f" ]] || continue
+    simds=$(awk '$1 == "simd_count" { print $2 }' "$f")
+    version=$(awk '$1 == "gfx_target_version" { print $2 }' "$f")   # gfx1033 = 100303
+    if (( ${simds:-0} > best )); then best=$simds; found=$version; fi
+  done
+  [[ -z "$found" ]] || printf 'gfx%d%d%x\n' $((found / 10000)) $((found / 100 % 100)) $((found % 100))
+}
+sr_models() {
+  # RDNA2 has native kernels for K's layers only: L's and M's test frames would compile their transformer layers
+  # with emulated matrix products for most of an hour, so d4r's normal path keeps those two models there
+  if [[ "${D4R_ENGINE_ALL_MODELS:-0}" != 1 && "$(gpu_arch)" == gfx103* ]]; then
+    echo e f k k-ldr
+  else
+    echo e f k k-ldr l l-ldr m m-ldr
+  fi
+}
+if (( LIST_SR )); then sr_models; exit 0; fi
 if (( FIND_PROTON )); then find_proton; [[ -z "$PROTON" ]] || printf '%s\n' "$PROTON"; exit 0; fi
 TOOLS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 KIT="$TOOLS/models"
@@ -69,6 +92,7 @@ MODEL_TOOLS="$KIT/model_tools.py"
 [[ -f "$MODEL_TOOLS" ]] || fail "missing $MODEL_TOOLS; update the model builder tools"
 cleanup() {
   local status=$?
+  kill $(jobs -p) 2> /dev/null || true
   if (( status == 0 )); then
     while IFS= read -r -d '' log; do
       relative="${log#"$WORK/"}"
@@ -146,15 +170,16 @@ if (( DO_SR )); then
   else
     fail "d4r's d3d12.dll / d3d12core.dll not found next to $RUNTIME"
   fi
+  PTX="$WORK/ptx"
   winpath() { printf 'Z:%s' "$(printf '%s' "$1" | tr '/' '\\')"; }
-  dump() {   # dump NAME PRESET: the uploads of one frame of preset PRESET in WORK/NAME/replay
+  dump() {   # dump NAME PRESET PATTERN [FLAGS]: the uploads of one frame of preset PRESET in WORK/NAME/replay
     local w="$WORK/$1"
     mkdir -p "$w/replay"
     printf '  rendering one frame with model %s through d4r (GE-Proton %s)...\n' "$1" "$(basename "$PROTON")"
     (cd "$APP" && python3 "$MODEL_TOOLS" run --log "$w/run.log" --timeout "${D4R_MODEL_TIMEOUT:-900}" -- \
       env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" STEAM_COMPAT_DATA_PATH="$WORK/prefix" \
       PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='d3d12=n,b;d3d12core=n,b;d4r12core=n,b' \
-      D4R_ENGINE=0 D4R_DLSS_PRESET="$2" D4R_HARNESS_CREATE_FLAGS=0x4B D4R_SHIM_LOG="$(winpath "$w/shim.log")" \
+      D4R_ENGINE=0 D4R_DLSS_PRESET="$2" D4R_HARNESS_CREATE_FLAGS="${4:-0x4B}" D4R_SHIM_LOG="$(winpath "$w/shim.log")" \
       D4R_CUDA_TRACE="$(winpath "$w/cuda.log")" D4R_CUDA_VERBOSE=1 \
       D4R_CUDA_REPLAY_DUMP_DIR="$w/replay" D4R_CUDA_REPLAY_DUMP_LIMIT=60 \
       "$PROTON/proton" run "$APP/d3d12_dlss_harness.exe" "$(winpath "$RUNTIME/nvngx.dll")" "$(winpath "$w/out.raw")" \
@@ -164,9 +189,32 @@ if (( DO_SR )); then
       fail "model $1: incomplete or invalid test frame (diagnostics in $w)"
     fi
   }
-  echo 'Building the Super Resolution models (K, M and L) from what NGX uploads...'
   mkdir -p "$WORK/prefix"
-  dump k 11 dltss_pwin_dec0_layer
+  models=" $(sr_models) "
+  echo "Building the Super Resolution models ($(sr_models)) from what NGX uploads..."
+  [[ "$models" == *" m "* ]] || echo "  (L and M are left to d4r's normal path on this GPU ($(gpu_arch)); D4R_ENGINE_ALL_MODELS=1 builds them)"
+  run ptx.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$PTX"
+  # Each test frame compiles its DLSS kernels in one thread, so the frames render at the same time; the first
+  # renders alone because it creates the Proton prefix. A model is built as soon as its frame is done.
+  declare -A JOBS
+  start() { dump "$@" & JOBS[$1]=$!; }
+  finish() { wait "${JOBS[$1]}" || exit 1; }   # dump has said why
+  # presets E and F (DLSS 3's CNN): LDR with render-size motion (the model serves every flag set)
+  dump e 5 cuda_engine_input_kernel_rel 0xa
+  start f 6 cuda_engine_input_kernel_rel 0xa
+  start k 11 dltss_pwin_dec0_layer
+  if [[ "$models" == *" m "* ]]; then
+    start l 12 'rrlite_enc0_4x4_mvlo_hdr$'
+    start m 13 rrlite_enc0_4x4_mvlo_hdr_folded
+  fi
+  for c in "e E" "f F"; do
+    set -- $c
+    [[ $1 == e ]] || finish "$1"
+    run "$1.log" python3 "$KIT/engine/compile_sr_e.py" "$WORK/$1/replay" "$DLL" "$WORK/$1-out" --preset "$2" --ptx-dir "$PTX"
+    place "$1" "$WORK/$1-out" $(ls "$WORK/$1-out")
+    rm -rf -- "${WORK:?}/$1"
+  done
+  finish k
   run k-extract.log python3 "$KIT/engine/extract_k.py" "$WORK/k/replay" "$WORK/k/model"
   run k-lut.log python3 "$KIT/engine/prepare_k.py" "$WORK/k" "$WORK/k/case" --lut-only
   for v in k k-ldr; do
@@ -175,14 +223,14 @@ if (( DO_SR )); then
     place "$v" "$WORK/$v-out" $(ls "$WORK/$v-out")
   done
   rm -rf -- "$WORK/k"
-  for c in "m 13 rrlite_enc0_4x4_mvlo_hdr_folded" "l 12 rrlite_enc0_4x4_mvlo_hdr$"; do
-    set -- $c
-    dump "$1" "$2" "$3"
-    for v in "$1" "$1-ldr"; do
-      run "$v.log" python3 "$KIT/engine/compile_m.py" "$WORK/$1" "$WORK/$v-out" $([[ $v == *-ldr ]] && echo --ldr)
+  for m in l m; do
+    [[ "$models" == *" $m "* ]] || continue
+    finish "$m"
+    for v in "$m" "$m-ldr"; do
+      run "$v.log" python3 "$KIT/engine/compile_m.py" "$WORK/$m" "$WORK/$v-out" $([[ $v == *-ldr ]] && echo --ldr)
       place "$v" "$WORK/$v-out" $(ls "$WORK/$v-out")
     done
-    rm -rf -- "${WORK:?}/$1"
+    rm -rf -- "${WORK:?}/$m"
   done
 fi
 printf 'Engine models are in %s/engine.\n' "$RUNTIME"

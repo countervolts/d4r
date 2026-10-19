@@ -13,7 +13,7 @@ import re
 import sys
 
 REG_RE = re.compile(r'%([a-zA-Z]+)(\d+)$')
-GT = {'f': 'float', 'r': 'uint', 'rd': 'uint64_t', 'rs': 'uint', 'p': 'bool'}
+GT = {'f': 'float', 'r': 'uint', 'rd': 'uint64_t', 'rs': 'uint', 'p': 'bool', 'fd': 'double'}
 SREG = {'%tid.x': 'gl_LocalInvocationID.x', '%tid.y': 'gl_LocalInvocationID.y', '%tid.z': 'gl_LocalInvocationID.z',
         '%ctaid.x': 'gl_WorkGroupID.x', '%ctaid.y': 'gl_WorkGroupID.y', '%ctaid.z': 'gl_WorkGroupID.z',
         '%ntid.x': 'gl_WorkGroupSize.x', '%ntid.y': 'gl_WorkGroupSize.y',
@@ -406,8 +406,10 @@ class T:
             A(dst, V(src, 'u32'), 'u32'); return
         # ------------------------------------------------ f32
         if ft == 'f32' and base in ('add', 'sub', 'mul'):
+            if 'rz' in mods and base == 'add':
+                A(a[0], f'add_rz({V(a[1], "f32")}, {V(a[2], "f32")})', 'float'); return
             if 'rz' in mods:
-                A(a[0], f'round_half_away({V(a[1], "f32")})', 'float'); return     # the roundf idiom: + copysign(0.5), then trunc
+                raise Err(f'unsupported rounding: {base}.rz')
             A(a[0], f'{V(a[1], "f32")} {"+-*"[["add", "sub", "mul"].index(base)]} {V(a[2], "f32")}', 'float'); return
         if ft == 'f32' and base == 'fma':
             A(a[0], f'fma({V(a[1], "f32")}, {V(a[2], "f32")}, {V(a[3], "f32")})', 'float'); return
@@ -419,6 +421,8 @@ class T:
             A(a[0], f'abs({V(a[1], "f32")})', 'float'); return
         if ft == 'f32' and base in ('rcp', 'ex2', 'lg2', 'rsqrt', 'sqrt'):
             fn = {'rcp': 'rcp_a', 'ex2': 'exp2', 'lg2': 'log2', 'rsqrt': 'inversesqrt', 'sqrt': 'sqrt'}[base]
+            if base == 'lg2' and 'ftz' in mods:
+                fn = 'lg2_ftz'   # a denormal input is zero: -inf, where log2 returns about -127
             A(a[0], f'{fn}({V(a[1], "f32")})', 'float'); return
         if ft == 'f32' and base == 'div':
             A(a[0], f'{V(a[1], "f32")} * rcp_a({V(a[2], "f32")})', 'float'); return
@@ -428,6 +432,8 @@ class T:
             e = f'fma({x[0]}, {x[1]}, {x[2]})' if base == 'fma' else f'({x[0]} {"+-*"[["add", "sub", "mul"].index(base)]} {x[1]})'
             if 'sat' in mods:
                 e = f'min(max({e}, f16vec2(0.0hf)), f16vec2(1.0hf))'
+            if 'relu' in mods:   # negative results clamp to +0 (NaN stays NaN)
+                e = f'relu2({e})'
             A(a[0], e, 'f16x2'); return
         if ft == 'f16x2' and base == 'abs':
             A(a[0], f'abs({V(a[1], "f16x2")})', 'f16x2'); return
@@ -442,6 +448,8 @@ class T:
             e = f'fma({x[0]}, {x[1]}, {x[2]})' if base == 'fma' else f'({x[0]} {"+-*"[["add", "sub", "mul"].index(base)]} {x[1]})'
             if 'sat' in mods:
                 e = f'min(max({e}, 0.0hf), 1.0hf)'
+            if 'relu' in mods:
+                e = f'relu1({e})'
             A(a[0], e, 'f16'); return
         if base == 'set' and 'f16x2' in mods and 'u32' in mods:
             c = self.cmp(mods, True); x, y = V(a[1], 'f16x2'), V(a[2], 'f16x2')
@@ -901,6 +909,14 @@ uint HU2_(u16vec2 u) { return uint(u.x) | (uint(u.y) << 16); }
 uint H2U(f16vec2 h) { return HU2_(float16BitsToUint16(h)); }
 int s16(uint u) { return (int(u) << 16) >> 16; }
 float rcp_a(float x) { return 1.0 / x; }
+// add.rz.f32: the sum rounded toward zero (round to nearest, then one ulp back when that went away from zero; the
+// error term is exact, TwoSum)
+float add_rz(float a, float b) { precise float s = a + b; precise float bb = s - a; precise float e = (a - (s - bb)) + (b - bb);
+    return (e != 0.0 && ((e < 0.0) != (s < 0.0)) && s != 0.0) ? uintBitsToFloat(floatBitsToUint(s) - 1u) : s; }
+float lg2_ftz(float x) { return log2(abs(x) < 1.17549435e-38 ? 0.0 : x); }
+// PTX .relu: negative results become +0, NaN stays NaN
+f16vec2 relu2(f16vec2 v) { return f16vec2(v.x < 0.0hf ? 0.0hf : v.x, v.y < 0.0hf ? 0.0hf : v.y); }
+float16_t relu1(float16_t v) { return v < 0.0hf ? 0.0hf : v; }
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
 float round_half_away(float x) { float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
 uint PARAM32(uint o) { return param.w[o >> 2]; }

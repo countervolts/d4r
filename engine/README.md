@@ -1147,6 +1147,132 @@ Ultra Performance, the downsample weights and the network's summation order (M i
 backend in the harness as well: 1706x960 -> 2560x1440 and 640x360 -> 1920x1080, where it measured 36-41 dB with the
 native accuracy kernels' order; `compile_m.py` builds both presets' networks with `TEXL`). Details: `L_NOTES.md`.
 
+## Presets E and F: DLSS 3's CNN (runtime and shim path exist; experimental, the RDNA2 route)
+
+Presets E (5) and F (6) are NGX 310.7's CNN upscaler, in the `nvngx_dlss.dll` the installer already fetches. Its
+frame is an input kernel (`cuda_engine_input_kernel_rel_{ldr,hdr}_mvdiff_{mvhi,mvlo}`: the game's colour, depth and
+motion, the previous output and motion to 16 channels per token of 4x4 output pixels, the warped history and this
+frame's output-size motion), eleven `dltss_nchw8_*` network kernels (a U-Net over the token grid, the output padded
+to 128 / 4, five levels) and a reconstruction kernel (`..._aniso_gaussian_dfn_{fastpath_3x3_128, mid_3x3_128,
+3x3_256, fastpath_5x5_256, 5x5_256}`: the last decoder level, a 40-channel head per token and the anisotropic
+Gaussian reconstruction of the output and the next history). E and F share the kernels; they differ in weights and
+in two constants.
+
+- The network is d4r's own `sr/e_net.comp` (five modes: the first encoder, the 3x3 + pool encoders, 1x1 convs, the
+  upsampling 1x1, the decoders' double 1x1), packed binary16 like the RR CNN's packed flavor (`rr/cnn_pk.glsl`): a
+  lane owns a pixel, the weights are wave-uniform scalar loads feeding `v_pk_fma_f16`, the input of a workgroup is
+  staged in LDS. No cooperative matrices, so it is the engine's route on RDNA2. It writes NGX's tensor layouts
+  (`[C/8][H][W][8]`, the full-size skips as 2x2 phases, 8-bit activations as binary16 bits 14..7), which the
+  translated reconstruction kernel reads.
+- The input and reconstruction kernels are translated from the user's DLL (`rr/ptx2rr.py`) in every variant; the
+  runtime picks a variant for the ratio (5x5 above 2.5x, `fastpath_3x3` from 1.6x, `mid` when each render axis is
+  floor/ceil of two thirds of its output axis, the generic kernels otherwise) and rewrites every frame-dependent
+  field of their argument blocks (sizes, ratios,
+  jitter, reset, MV scale, the HDR and MVLowRes flags; harness captures at seven sizes and ratios, 2026-10-18).
+- `compile_sr_e.py REPLAY NVNGX_DLSS_DLL OUT --preset E|F` builds a model from one frame's replay dump (the weights are
+  packed in the DLL; NGX uploads them unpacked), `runtime_e.inc` is `EModel` / `EEngine`, `game_e.cpp` the game
+  adapter, `replay_e.cpp` the replay (`d4r-e`). The shim runs presets 5 and 6 with `engine\e` / `engine\f`
+  (`D4R_ENGINE_MODEL_E_DIR`, `_F_DIR`), LDR or HDR, either motion resolution, any render size (a new size rebuilds
+  the engine), the game's exposure texture or AutoExposure. `build-engine-models.sh` builds both.
+- Exposure (HDR; harness captures with per-frame pre-exposure, exposure scale and exposure texture schedules,
+  2026-10-19). Both translated kernels take this frame's exposure scale (twice), pre-exposure and 1 / pre-exposure
+  (input words 244-256, reconstruction 592-604). They sample the exposure as 1x1 textures: the input kernel's 344 and
+  360 and the reconstruction's 472 and 480 this frame's, the input kernel's 352 the previous frame's, which NGX's
+  `cuda_copy_exposure_kernel` copies into a half surface after each frame (the current one on a reset frame):
+  `sr/exposure_copy_e.comp`. With AutoExposure NGX runs K's measurement (`cuda_luma_convert_kernel`, three
+  `cuda_reduce_sum_kernel`, `cuda_auto_exposure_copy_kernel`: key 0.18 / 0.82 times exp(-mean log luma), the luma
+  scaled by 1 / pre-exposure, truncated to half) on every second frame from the first, on M's grid (half the output,
+  half the render size but at least 256 above 2x), and ignores the game's texture: `exposure_k.comp` MODE 3. The
+  engine used to leave all of this at the model dump's values (exposure 1, the current exposure as the previous one):
+  at 1280x720 -> 1920x1080 with pre-exposure 4/2/8 and scale 0.5/0.75/1.25 it measured 39/18/29 dB against NGX with
+  the game's texture, now 64/55/54 dB; with AutoExposure 65/54/54 dB, through the shim as through `d4r-e` (neutral
+  exposure: 64-66 dB, unchanged). Models built before this keep the old binding and refuse AutoExposure.
+- The reconstruction's jitter words 544-556 are the previous and this frame's jitter as (y, x). The runtime wrote
+  (-x, -y), which agrees only on the harness's first three jitters (0, -+0.25), so three-frame checks passed while
+  later frames of the jitter sequence measured 26-28 dB (every game's Halton jitter was affected). Twelve-frame
+  captures at 640x360 -> 1280x720 now measure 60-66 dB (HDR), 61-66 dB (LDR), and with AutoExposure at
+  960x540 -> 1920x1080 and pre-exposure 19-21 60-66 dB; on the Steam Deck through the shim 51-67 dB against ZLUDA.
+
+With the f32 reconstruction head, accuracy against NGX through ZLUDA (three temporal frames): 63-68 dB at 640x360 -> 1280x720
+(LDR and HDR, both motion resolutions, E and F), 1280x720 -> 1920x1080, 1001x563 -> 1501x845 (generic kernel),
+427x240 -> 1280x720 (5x5), 742x418 -> 1280x720; DLAA 57-73 dB. Network tensors 45-60 dB each (binary16 accumulation).
+The translation needed two `vulkan/ptx2glsl.py` fixes that apply to every translated kernel: `.relu` on f16 / f16x2
+`fma`, `add` and `mul` was ignored, and `add.rz` was always taken for the `roundf` idiom (CUDA's `log1pf` starts with
+an `add.rz`, which lost its second operand).
+
+Steam Deck (gfx1033, RADV, best of 12), 640x360 -> 1280x720: 4.3 ms (input 0.78, network 1.86, reconstruction 1.68);
+1280x720 -> 1920x1080: 10.1 ms. The network's ideal at the Deck's packed-f16 rate is 0.75 ms at 720p; the two
+translated kernels are the larger share (the reconstruction is 5400 VALU instructions as translated, its emulated
+mma about 0.3 ms of it), so native input and reconstruction kernels are the next step.
+
+RDNA2 tuning (2026-10-18): the SR decoders now reuse the input's padded LDS rows for their hidden layer,
+with a workgroup barrier before overwriting the input. This removes a second allocation and its bank conflicts.
+RR's packed CNN uses smaller tiles on the stages limited by LDS occupancy; its decoder filters cache each bilinear
+sample once per tile, retaining the original half-precision operation order. Rebuild the model directories with
+`compile_sr_e.py` / `compile_rr3.py` to use these shaders; the existing runtime selects the packed RR flavor on RDNA2.
+
+Steam Deck gfx1033, RADV, GPU fixed temporarily at its stock 1600 MHz, interleaved baseline/candidate runs,
+best of 12 submissions per frame (four temporal frames for RR, three for SR), 640x360 -> 1280x720:
+
+| Model | Before tuning, ms | After tuning, ms |
+|---|---:|---:|
+| SR E, complete frame | 3.13 | 3.09 |
+| SR E, network | 1.24 | 1.20 |
+| RR A, complete frame | 14.61 | 12.48 |
+| RR A, input + network | 12.98 | 10.85 |
+
+These are inference timings without output readback, with no other GPU workload; automatic clocks and games can
+run slower. The changes preserve the packed path's arithmetic: all outputs and histories match byte for byte at
+one submission per frame and in repeated runs. Additional checks cover RR's partially filled tiles (70x66 render),
+and SR's HDR, output-resolution motion, odd sizes (1001x563 -> 1501x845), 1080p output and 5x5 reconstruction.
+The packed convolutions still differ from NVIDIA's matrix accumulation as described above. The translated SR
+input/reconstruction passes still take most of the frame, so these results do not establish hardware-optimal
+performance. `tests/test_cnn_packed_gpu.py` checks decoder reuse and partial pixel sets against a CPU reference
+without proprietary weights (`D4R_RUN_GPU_TESTS=1 D4R_EVK=/path/to/evk python3 -m unittest tests.test_cnn_packed_gpu`).
+
+The reconstruction head now defaults to packed binary16 accumulation too (`D4R_MMA_PACKED` in
+`cnn_sr/mma_f16.glsl`, enabled only for the SR model builder). Each lane computes two columns together with
+`v_pk_fma_f16`, retaining the fragment layout and K order without expanding operands and accumulators to f32.
+The translated stages also use aligned 32-bit arena accesses for packed words. This removes pairs of scalar
+16-bit loads/stores; their binding and tensor layouts stay the same. Formatted image stores expand at the call
+site, retaining the concrete SPIR-V image format instead of passing it through an unformatted function parameter.
+All four input and five reconstruction variants pass `spirv-val`.
+
+On the same Deck at a fixed stock 1600 MHz, best of 12 submissions per frame, the complete E pass with the
+previous f32 head versus the new packed head (three-frame input sequence):
+
+| Render -> output | f32 head, ms | Packed head, ms |
+|---|---:|---:|
+| 640x360 -> 1280x720, LDR | 3.09 | 2.55 |
+| 640x360 -> 1280x720, HDR | 3.09 | 2.66 |
+| 1001x563 -> 1501x845, generic reconstruction | 6.28 | 5.30 |
+| 1280x720 -> 1920x1080 | 7.15 | 6.20 |
+| 427x240 -> 1280x720, 5x5 reconstruction | 5.10 | 4.02 |
+
+At 640x360 -> 1280x720 the reconstruction pass itself falls from about 1.35 to 0.80 ms. The packed head rounds
+after each half FMA, so its image is **not byte-identical** to the previous head. At one submission per frame,
+eight tested configurations (also HDR, both motion resolutions, balanced scaling and DLAA) give 64.9-92.6 dB
+RGB PSNR against the f32-head engine over three temporal frames, with finite outputs throughout. These comparisons
+measure the arithmetic change, not quality parity with NGX or a long gameplay sequence. `--head-accumulation f32`
+retains the previous head arithmetic, with the word-access optimization; the default is `f16` for both E and F.
+`tests/test_cnn_mma_gpu.py` checks both accumulation modes, fragment mapping and independent concurrent waves
+against CPU references. Rebuild model shaders to pick up the new default; old model directories continue to run.
+
+Rounded Quality dimensions also use the existing `mid_3x3_128` reconstruction kernel: each render axis must be
+floor or ceil of two thirds of its output axis. The kernel still samples with the actual ratios and jitter.
+This avoids the generic reconstruction fallback for 853x533 -> 1280x800 without changing the model arithmetic.
+On the Deck at stock 1600 MHz, three interleaved before/after runs (120 temporal frames each, 30 warm-up frames
+discarded, 270 measured samples per build) reduce median reconstruction from 2.44 to 1.23 ms and the complete
+upscaling pass from 4.46 to 3.26 ms. This change only needs a runtime rebuild; existing model shaders work.
+`tests/test_sr_reconstruction_gpu.py` compares automatic selection against forced generic reconstruction, including
+mixed per-axis rounding, partial tiles, HDR/LDR, both motion resolutions, jitter, history and reset. On the Deck,
+all 384 preset E test frames match bit for bit; an optional private preset F model enables the same checks for F.
+
+```sh
+python3 engine/compile_sr_e.py "$CAP/replay" nvngx_dlss.dll build/e-model --preset E
+build/native-engine/d4r-e build/e-model INPUT_DIR OUT_DIR    # D4R_ENGINE_E_PROFILE=1: microseconds per pass
+```
+
 ## Files
 
 | File | Role |
@@ -1168,6 +1294,7 @@ native accuracy kernels' order; `compile_m.py` builds both presets' networks wit
 | `l_model.py`, `test_l.py`, `L_NOTES.md` | Preset L: weights of the input and expansion stages, their tests against a capture, the algorithms |
 | `enc0_features.glsl` | Presets M and L: the input stage's 32 per-pixel feature slots |
 | `exposure_k.comp` | Automatic exposure: log-luma block sums, then the exposure state and the stages' exposure fields |
+| `sr/e_net.comp`, `compile_sr_e.py`, `runtime_e.inc`, `game_e.h`, `game_e.cpp`, `replay_e.cpp` | Presets E and F: the network shader, the model builder, the runtime, the game adapter and the replay (`d4r-e`) |
 | `test_frame.py`, `test_model.py` | Temporal result checks and model corruption tests |
 | `test_game.cpp` | Queued direct-texture, rectangle, layout, conversion and precision regression checks |
 | `test_k.py`, `test_in*.py`, `test_out*.py` | Isolated shader diagnosis and reference comparisons |

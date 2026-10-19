@@ -25,8 +25,11 @@ GameExe =
 ; K     | 4     | DLAA / Quality / Balanced       | Default; faster alternative to M/L
 ; M     | 4.5   | Performance                     | More demanding on RDNA3
 ; L     | 4.5   | Ultra Performance               | Especially 4K; experimental
-; E     | 3 CNN | Quality / Balanced / Performance | Legacy faster fallback
+; E     | 3 CNN | Quality / Balanced / Performance | Legacy faster fallback; the engine's choice on RDNA2
 ; F     | 3 CNN | DLAA / Ultra Performance        | Deprecated; prefer K or L
+;
+; On the engine ([Engine]) E and F run from engine\e and engine\f (build-engine-models.sh) without cooperative
+; matrices, so they are the models for RDNA2 GPUs (Steam Deck: about 5 ms at 640x360 -> 1280x720).
 ;
 ; Select the upscaling mode separately in game/OptiScaler. These are recommendations;
 ; other modes are allowed. L requires the L texture build.
@@ -134,12 +137,15 @@ EvalSync = false
 MarkerPollUs = auto
 
 [Engine]
-; Experimental. Runs DLSS 4 and 4.5 (models K, L and M) on d4r's own Vulkan inference engine instead of NVIDIA's
+; Experimental. Runs DLSS 4 and 4.5 (models K, L and M) and DLSS 3's CNN (models E and F) on d4r's own Vulkan
+; inference engine instead of NVIDIA's
 ; kernels through ZLUDA: the whole evaluation is recorded into the game's own command list, the game shows the
 ; result of the frame it just rendered, and FrameAge and the [Interop] hand-off settings do not apply.
 ; Needs VkD3DDir, a driver with VK_KHR_cooperative_matrix (Mesa RADV on RDNA3/RDNA4) and the model folders
-; (RuntimeDir/engine/k, k-ldr, m, m-ldr, l, l-ldr; scripts/install_d4r_runtime.sh). A game or setting the engine
-; does not cover uses the normal path, with the reason in d4r_nvngx.log: other models than K, L and M,
+; (RuntimeDir/engine/k, k-ldr, m, m-ldr, l, l-ldr; scripts/install_d4r_runtime.sh). E and F (engine/e, engine/f;
+; D4R_ENGINE_MODEL_E_DIR, D4R_ENGINE_MODEL_F_DIR) need no cooperative matrices: they run on RDNA2 (Steam Deck)
+; too, from any render size and HDR or LDR, with AutoExposure too (models built by this version). A game or setting the engine
+; does not cover uses the normal path, with the reason in d4r_nvngx.log: other models than E, F, K, L and M,
 ; display-resolution motion vectors with L or M, or a K model built before the current engine/compile_k.py for display-resolution
 ; motion, non-inverted depth or exposure supplied by the game. Details and measurements: engine/README.md.
 ; (D4R_ENGINE)

@@ -106,6 +106,7 @@
 #include "d4r_fsr_rr_passes.h"
 #include "../engine/game.h"
 #include "../engine/game_m.h"
+#include "../engine/game_e.h"
 #include "../engine/game_rr.h"
 #include "../engine/vk_dispatch.h"
 
@@ -2956,6 +2957,8 @@ struct Feature
     std::unique_ptr<d4r::GameUpscalerM> engineMDynamic; // Vulkan at changing sizes; original HIP resources stay alive
     unsigned int engineMLastWidth = 0, engineMLastHeight = 0;
     unsigned int engineMRenderWidth = 0, engineMRenderHeight = 0; // first evaluation's effective extent
+    std::unique_ptr<d4r::GameUpscalerE> engineE; // presets E/F (DLSS 3's CNN): fixed render size, rebuilt on a change
+    unsigned int engineERenderWidth = 0, engineERenderHeight = 0;
     std::unique_ptr<d4r::GameDenoiser> engineR; // Ray Reconstruction (engine/runtime_rr.inc)
     ProfileClock::time_point engineRProfileAt{};
     // Preset M and preset K with the network on the native HIP layers ([Engine] Network): the buffers shared
@@ -10353,6 +10356,192 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     return true;
 }
 
+// Presets E (5) and F (6), DLSS 3's CNN (engine/runtime_e.inc, built by engine/compile_sr_e.py from
+// nvngx_dlss.dll 310.7.0): engine\e and engine\f next to this DLL, or D4R_ENGINE_MODEL_E_DIR / _F_DIR. One model
+// serves LDR and HDR, both motion resolutions; its network runs without cooperative matrices (RDNA2 included).
+struct EngineBackendE
+{
+    std::once_flag once[2];
+    std::unique_ptr<d4r::EModel> models[2];
+};
+static EngineBackendE g_engineE;
+
+static void init_engine_backend_e(int slot)
+{
+    const char* const name = slot ? "F" : "E";
+    std::string directory = env_string(slot ? "D4R_ENGINE_MODEL_F_DIR" : "D4R_ENGINE_MODEL_E_DIR");
+    if (directory.empty())
+    {
+        char folder[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + (slot ? L"\\engine\\f" : L"\\engine\\e")).c_str(), -1, folder,
+                            sizeof(folder), nullptr, nullptr);
+        directory = folder;
+    }
+    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    {
+        logf("engine backend (%s): Vulkan interop is unavailable", name);
+        return;
+    }
+    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
+    const auto start = std::chrono::steady_clock::now();
+    try
+    {
+        g_engineE.models[slot] = std::make_unique<d4r::EModel>(g_vk.physical, g_vk.device, path);
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (%s): cannot load the model from %s: %s", name, path.c_str(), error.what());
+        return;
+    }
+    logf("engine backend (%s): model %s loaded in %.0f ms", name, path.c_str(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+static bool engine_evaluate_e(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                              ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
+                              ID3D12Resource* exposure, const FrameParams& p, uint32_t frame)
+{
+    const int slot = feature.preset == 6 ? 1 : 0;
+    const char* const name = slot ? "F" : "E";
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("engine backend (%s): %s; feature %u uses the CUDA backend from frame %u", name, reason, feature.handle.Id, frame);
+        return false;
+    };
+    std::call_once(g_engineE.once[slot], [slot] { init_engine_backend_e(slot); });
+    d4r::EModel* const model = g_engineE.models[slot].get();
+    if (model == nullptr)
+        return refuse(slot ? "no preset F model (engine\\f)" : "no preset E model (engine\\e)");
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
+    const bool hdr = (feature.flags & 0x1) != 0, lowRes = (feature.flags & 0x2) != 0;
+    // AutoExposure: NGX measures the exposure from the colour (HDR only; an LDR feature has no exposure at all)
+    const bool autoExposure = hdr && (feature.flags & 0x40) != 0;
+    if (autoExposure && !model->hasAutoExposure())
+        return refuse("auto exposure needs a model built by this d4r version (run d4r/tools/build-engine-models.sh)");
+    if (hdr && !(std::isfinite(p.preExposure) && p.preExposure > 0.0f))
+        return refuse("the pre-exposure is not a positive number");
+    if (hdr && !(std::isfinite(p.exposureScale) && p.exposureScale > 0.0f))
+        return refuse("the exposure scale is not a positive number");
+    if (color == output || depth == output || motion == output)
+        return refuse("input/output texture aliasing is not supported");
+    if (p.renderWidth > feature.outWidth || p.renderHeight > feature.outHeight)
+        return refuse("the render size exceeds the output size");
+    d4r::GameFrameE game;
+    using Source = EngineFrameSource;
+    const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
+    const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
+    const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
+    const uint32_t mw = lowRes ? p.renderWidth : feature.outWidth, mh = lowRes ? p.renderHeight : feature.outHeight;
+    // HDR: the game's exposure texture is NGX's exposure (its copy kernel moves texel 0 into the 1x1 the kernels read);
+    // with AutoExposure NGX measures instead and does not read it
+    const bool gameExposure = hdr && !autoExposure && exposure != nullptr;
+    Source sources[5] = {
+        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {motion, &game.motion, p.mvBaseX, p.mvBaseY, mw, mh, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState,
+         D3D12_RESOURCE_STATE_COPY_DEST},
+        {exposure, &game.exposure, 0, 0, 1, 1, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+    };
+    const size_t sourceCount = gameExposure ? 5 : 4;
+    for (size_t index = 0; index < sourceCount; ++index)
+    {
+        Source& source = sources[index];
+        UINT64 handle = 0, offset = 0;
+        D3D12_RESOURCE_DESC desc;
+        source.resource->GetDesc(&desc);
+        if (FAILED(g_vk.interop->GetVulkanResourceInfo1(source.resource, &handle, &offset, &source.image->format)) ||
+            handle == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            source.x + source.width > desc.Width || source.y + source.height > desc.Height)
+            return refuse("a texture is not a single-sample 2D image covering its rectangle");
+        source.image->image = reinterpret_cast<VkImage>(handle);
+        source.image->x = source.x;
+        source.image->y = source.y;
+        prepare_engine_view(feature, source.resource, desc, *source.image, source.image == &game.output,
+                            source.x == 0 && source.y == 0, source.copyState);
+        g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
+    }
+    if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R16_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT)))
+        return refuse("the exposure texture must be a float texture the engine samples directly");
+    if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
+        !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !d4r::gameOutputFormat(game.output.format))
+    {
+        logf("engine backend (%s): Vulkan formats colour %d, depth %d, motion %d, output %d", name, game.color.format,
+             game.depth.format, game.motion.format, game.output.format);
+        return refuse("a texture format is not implemented");
+    }
+    game.jitter[0] = p.jitterX;
+    game.jitter[1] = p.jitterY;
+    game.motionScale[0] = p.mvScaleX;
+    game.motionScale[1] = p.mvScaleY;
+    if (hdr)
+    {
+        game.preExposure = p.preExposure;
+        game.exposureScale = p.exposureScale;
+    }
+    const bool resized = feature.engineE != nullptr &&
+        (p.renderWidth != feature.engineERenderWidth || p.renderHeight != feature.engineERenderHeight);
+    game.reset = p.reset != 0 || feature.engineE == nullptr || resized;
+    try
+    {
+        if (feature.engineE == nullptr || resized)
+        {
+            feature.engineE.reset();
+            feature.engineE = std::make_unique<d4r::GameUpscalerE>(*model, g_vk.physical, g_vk.device, feature.outWidth,
+                                                                   feature.outHeight, p.renderWidth, p.renderHeight, hdr, lowRes,
+                                                                   autoExposure);
+            feature.engineERenderWidth = p.renderWidth;
+            feature.engineERenderHeight = p.renderHeight;
+            logf("engine backend (%s): feature %u runs preset %s in the game's command list (%ux%u -> %ux%u, %s, %s motion%s)",
+                 name, feature.handle.Id, name, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
+                 hdr ? "HDR" : "LDR", lowRes ? "render-size" : "output-size", autoExposure ? ", auto exposure" : "");
+        }
+    }
+    catch (const std::exception& error)
+    {
+        logf("engine backend (%s): %s", name, error.what());
+        return refuse("the engine could not be created");
+    }
+    if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
+        return refuse("the command list cannot retain the engine's resources");
+    for (size_t index = 0; index < sourceCount; ++index)
+        transition(list, sources[index].resource, sources[index].state, sources[index].copyState);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    bool recorded = SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list, &command));
+    const char* failure = recorded ? nullptr : "BeginVkCommandBufferInterop failed";
+    if (recorded)
+    {
+        try
+        {
+            feature.engineE->record(command, game);
+        }
+        catch (const std::exception& error)
+        {
+            logf("engine backend (%s): %s", name, error.what());
+            failure = "the frame could not be recorded";
+            recorded = false;
+        }
+        if (FAILED(g_vk.interop->EndVkCommandBufferInterop(list)) && recorded)
+        {
+            failure = "EndVkCommandBufferInterop failed";
+            recorded = false;
+        }
+    }
+    for (size_t index = 0; index < sourceCount; ++index)
+        transition(list, sources[index].resource, sources[index].copyState, sources[index].state);
+    if (!recorded)
+        return refuse(failure);
+    if (frame <= 3 || frame % 600 == 0)
+        logf("engine frame %u recorded, preset %s (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame, name, p.jitterX,
+             p.jitterY, game.reset, p.mvScaleX, p.mvScaleY);
+    return true;
+}
+
 // Ray Reconstruction models (engine/compile_rr.py; preset F: engine/compile_rr2.py): one per preset, engine\rr-d,
 // engine\rr-e and engine\rr-f next to this DLL, or D4R_ENGINE_MODEL_RR_D_DIR / _E_DIR / _F_DIR. Slots: 0 D, 1 E, 2 F.
 struct EngineBackendR
@@ -10729,6 +10918,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return engine_evaluate_rr(feature, list, color, depth, motion, output, parameters, p, frame);
     if (feature.preset == 13 || feature.preset == 12)
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
+    if (feature.preset == 5 || feature.preset == 6)
+        return engine_evaluate_e(feature, list, color, depth, motion, output, exposure, p, frame);
     if (feature.preset == 11 && env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip")
         return refuse("[Engine] Enabled = auto keeps K on the native kernels (faster than the Vulkan network)");
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
@@ -10742,7 +10933,7 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return refuse(ldr ? "no LDR model (engine\\k-ldr) for a game without the HDR flag" : "not available");
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
     if (feature.preset != 11)
-        return refuse("only presets K, L and M are implemented");
+        return refuse("only presets E, F, K, L and M are implemented");
     // MVLowRes (0x2) clear: vectors are at output resolution (engine revision D4RO0003).
     const bool displayMotion = (feature.flags & 0x2) == 0;
     if (displayMotion && !model->hasDisplayMotion())

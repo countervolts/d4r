@@ -26,6 +26,10 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.CmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(deviceProc(device, "vkCmdPipelineBarrier"))) != nullptr;
     ok &= (vkTable.CmdUpdateBuffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(deviceProc(device, "vkCmdUpdateBuffer"))) != nullptr;
     ok &= (vkTable.CmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(deviceProc(device, "vkCmdWriteTimestamp"))) != nullptr;
+    ok &= (vkTable.CmdResetQueryPool = reinterpret_cast<PFN_vkCmdResetQueryPool>(deviceProc(device, "vkCmdResetQueryPool"))) != nullptr;
+    ok &= (vkTable.CreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(deviceProc(device, "vkCreateQueryPool"))) != nullptr;
+    ok &= (vkTable.DestroyQueryPool = reinterpret_cast<PFN_vkDestroyQueryPool>(deviceProc(device, "vkDestroyQueryPool"))) != nullptr;
+    ok &= (vkTable.GetQueryPoolResults = reinterpret_cast<PFN_vkGetQueryPoolResults>(deviceProc(device, "vkGetQueryPoolResults"))) != nullptr;
     ok &= (vkTable.CreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(deviceProc(device, "vkCreateBuffer"))) != nullptr;
     ok &= (vkTable.CreateComputePipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(deviceProc(device, "vkCreateComputePipelines"))) != nullptr;
     ok &= (vkTable.CreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(deviceProc(device, "vkCreateDescriptorPool"))) != nullptr;
@@ -46,6 +50,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.DestroyShaderModule = reinterpret_cast<PFN_vkDestroyShaderModule>(deviceProc(device, "vkDestroyShaderModule"))) != nullptr;
     ok &= (vkTable.FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))) != nullptr;
     ok &= (vkTable.GetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(deviceProc(device, "vkGetBufferMemoryRequirements"))) != nullptr;
+    ok &= (vkTable.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(deviceProc(device, "vkGetBufferDeviceAddress"))) != nullptr;
     ok &= (vkTable.GetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(deviceProc(device, "vkGetImageMemoryRequirements"))) != nullptr;
     ok &= (vkTable.MapMemory = reinterpret_cast<PFN_vkMapMemory>(deviceProc(device, "vkMapMemory"))) != nullptr;
     ok &= (vkTable.UnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))) != nullptr;

@@ -5,6 +5,8 @@
 //          [0, 10000], 0.005).
 //   MODE 2 (Ray Reconstruction, the same cuda_dldn_engine_* kernels): MODE 1's measurement, written to two 1x1
 //          images instead of stage parameter blocks.
+//   MODE 3 (presets E and F, NGX's cuda_luma_convert / auto_exposure_copy kernels): MODE 0's measurement, written to
+//          the 1x1 image the input and reconstruction kernels sample as the exposure.
 // Both modes measure the same grid: the colour rectangle sampled at half the output size with an
 // endpoint-aligned nearest-texel lookup (the reference's cuda_luma_convert_kernel; the grid equals the
 // rectangle itself only when the render size is half the output size).
@@ -17,6 +19,7 @@
 #ifndef MODE
 #define MODE 0
 #endif
+#define LOG_MEAN (MODE == 0 || MODE == 3)   // key * exp(-mean of the log luma)
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
@@ -63,7 +66,7 @@ void main()
             const vec3 c = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
             // the reference accumulates the logarithm of the exposed luma (cuda_luma_convert_kernel). The
             // constant is applied to Y = fma(b, 0.25, fma(r, 0.25, g * 0.5)); MODE 1 keeps its own expression.
-#if MODE == 0
+#if LOG_MEAN
             precise const float luma = p.scale * fma(c.b, 0.25, fma(c.r, 0.25, 0.5 * c.g));
             // log(luma + 1e-6) as lg2(x) * ln2, and a non-finite or non-positive luma contributes nothing
             if (luma > 0.0 && !isinf(luma))
@@ -93,6 +96,8 @@ layout(set = 0, binding = 5) uniform sampler2D gameExposure;                    
 layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // enc0_m: expo, expoPrev at words 25, 26
 layout(set = 0, binding = 4, std430) buffer PostParams { float w[]; } post;     // post_m: words 14, 15
 layout(set = 0, binding = 5, std430) buffer DownParams { float w[]; } down;     // down_m: word 12
+#elif MODE == 3
+layout(set = 0, binding = 3, r16f) uniform writeonly image2D exposureOut;
 #else
 // MODE 2 (Ray Reconstruction): the denoiser's stages sample the exposure as two 1x1 textures, this frame's and
 // the previous frame's (zero on the first frame and after a reset)
@@ -124,7 +129,7 @@ void main()
     {
         float mean = 0.0;
         for (uint i = 0u; i < 64u; ++i) mean += part[i];
-#if MODE == 0
+#if LOG_MEAN
         // auto_exposure_copy_kernel: key * exp2(-log2e * sum), written to a half surface. The formatted
         // store truncates toward zero, as in MODE 1 (measured on the captured K exposure: the store lands
         // one binary16 code below the correctly rounded value).
@@ -136,7 +141,7 @@ void main()
         float measured = truncatedHalf(full);
 #endif
         if (!(measured > 0.0) || isinf(measured)) measured = 1.0;
-#if MODE == 0
+#if LOG_MEAN
         previous = (p.flags & 2u) != 0u ? measured : current;
 #else
         previous = (p.flags & 2u) != 0u ? 0.0 : current;       // 0: no earlier exposure (the stages read it as 1)
@@ -154,6 +159,8 @@ void main()
     inp.w[25] = current; inp.w[26] = previous;
     post.w[14] = current; post.w[15] = previous;
     down.w[12] = current;
+#elif MODE == 3
+    imageStore(exposureOut, ivec2(0), vec4(current));
 #else
     imageStore(exposureOut, ivec2(0), vec4(current));
     imageStore(previousOut, ivec2(0), vec4(previous));

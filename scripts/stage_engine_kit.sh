@@ -16,7 +16,7 @@ HARNESS="${D4R_HARNESS_EXE:-$ROOT/build/d3d12_dlss_harness.exe}"
 [[ -f "$HARNESS" ]] || { echo "missing $HARNESS (scripts/build_d3d12_dlss_harness.sh)" >&2; exit 2; }
 KIT="$D4R/tools/models"
 rm -rf "$KIT"
-mkdir -p "$KIT/bin" "$KIT/engine/rr" "$KIT/kernels/tools" "$KIT/kernels/rr" "$KIT/vulkan" "$D4R/licenses"
+mkdir -p "$KIT/bin" "$KIT/engine/rr" "$KIT/engine/sr" "$KIT/engine/cnn_sr" "$KIT/kernels/tools" "$KIT/kernels/rr" "$KIT/vulkan" "$D4R/licenses"
 copy() {   # copy SRC_DIR DST_DIR PATTERN...: never tests
   local src=$1 dst=$2 pat f
   shift 2
@@ -30,6 +30,8 @@ copy() {   # copy SRC_DIR DST_DIR PATTERN...: never tests
 }
 copy engine "$KIT/engine" '*.py' '*.comp' '*.glsl'
 copy engine/rr "$KIT/engine/rr" '*.py' '*.comp' '*.glsl' '*.txt' '*.npy' '*.sh'
+copy engine/cnn_sr "$KIT/engine/cnn_sr" '*.glsl'
+copy engine/sr "$KIT/engine/sr" '*.comp' '*.glsl'
 copy kernels/tools "$KIT/kernels/tools" '*.py'
 copy kernels/rr "$KIT/kernels/rr" '*.py'
 copy vulkan "$KIT/vulkan" '*.py'   # ptx2glsl.py: engine/rr/ptx2rr.py builds on it

@@ -135,7 +135,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     for action in ('manifest', 'validate'):
-        sub.add_parser(action).add_argument('directory', type=Path)
+        action_parser = sub.add_parser(action)
+        action_parser.add_argument('directory', type=Path)
+        if action == 'validate':
+            action_parser.add_argument('models', nargs='*', choices=MODELS)
     p = sub.add_parser('capture')
     p.add_argument('directory', type=Path)
     p.add_argument('name', choices=('k', 'm', 'l'))
@@ -152,7 +155,7 @@ def main():
         elif a.action == 'manifest':
             manifest(a.directory, write=True)
         else:
-            for name in MODELS:
+            for name in (a.models or MODELS):
                 manifest(a.directory / name)
     except (OSError, ValueError, KeyError, StopIteration) as error:
         print(f'model-tools: {error}', file=sys.stderr)
