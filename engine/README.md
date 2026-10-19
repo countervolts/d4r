@@ -1093,6 +1093,23 @@ on the Vulkan shaders unless `[Engine] Network = hip`:
 A model built with no options was compared shader by shader with the explicitly optioned build of each row, and the
 exact switches still reproduce the captures (`build/rr/f/nv/defaults.sh`).
 
+### Byte-identical speed-ups (2026-10-19)
+
+RX 9070 XT, RADV 26.2.2, `d4r-m` 1280x720 -> 2560x1440 with `D4R_ENGINE_M_LAYER_STAMPS=1`. Every output frame, and
+everything `D4R_M_DUMP` writes, is byte-identical to the previous build (M and L, HDR and LDR, the three
+reconstruction tile tiers and the stress inputs).
+
+| change | stage | before -> after (us) |
+|---|---|---|
+| `layer_m.comp`: hardware FP8 saturation where a value cannot be infinite, and the V tiles in a buffer that is dead during the attention (more waves per SIMD) | frame | M 1583 -> 1566, L 2349 -> 2293 |
+| `post_m.comp`: the second history candidate reuses the first one's sample when both have the same vector | reconstruction, uniform motion | 325 -> 288 |
+| `post_m.comp`: both rows of a pixel pair take their Gaussian taps in one pass | reconstruction | 287 -> 265 (L 355 -> 320) |
+| `down_m.comp`: the horizontal pass reads its texels into registers, no shared source tile | downsample | L 102 -> 91, M 117 -> 113 |
+| `layer_m.comp`, `compile_m.py`: L's expansion stage at two windows per wave (`M_DEFS_DEC0L=-DWPW=1` for one) | expansion | 383 -> 366 |
+
+The network layers are separated by an execution-only barrier (`emptyStage`). A memory barrier there gives the same
+output and costs about 60 us (M 1520 -> 1592), so it stays.
+
 ## Preset L (runtime and shim path exist; experimental)
 
 Preset L (render preset 12, NVIDIA's model for Ultra Performance) is M's pipeline with its own input, expansion and

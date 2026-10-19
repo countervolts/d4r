@@ -615,3 +615,17 @@ was measured and not built for D / E (`build/rr/f/nv/dstage.sh`, `dnl.sh`, level
   loads between a window's waves) decoder 0 takes the same time (803-818 us), encoder 1 the same, decoder 1 10% less.
   These windows also have 96 key tokens (3 KiB each for the tokens, the keys and the values at C = 32), which does
   not fit the 4 KiB a single wave can hold at full rate.
+
+### Byte-identical speed-ups (2026-10-19)
+
+RX 9070 XT, RADV 26.2.2, 1280x720 -> 2560x1440 with `D4R_ENGINE_RR_STAGE_STAMPS=1`. Every image of every frame is
+byte-identical to the previous model on the replay and stress inputs, at levels 0 to 3.
+
+- `ptx2rr.py`: OCML's tanh (decoder 0's second kernel) in f32 where f64 was not needed. Exp's error term becomes
+  Dekker's exact product error; the polynomial below 0.625 stays in f64, because the driver folds away the f32
+  rounding between its f64 steps. Identical to the previous function on all 2^32 inputs. dec0_1 475 -> 446 us, frame
+  3.568 -> 3.537 ms.
+- `exposure_f.comp` PASS 2: the exposure in one pass as NGX does it, each block adding its fixed-point sum to a 64-bit
+  total with an atomic add and the last block finishing. It needs `shaderBufferInt64Atomics`, which vkd3d-proton
+  enables; the shim reads the device's features through `GetDeviceFeatures`. Without it, or with a model that has no
+  `exposure_f2.spv`, the two passes run (`D4R_RR_TEST_NO_INT64_ATOMICS=1` forces them). Exposure 25.2 -> 14.9 us.
