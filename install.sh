@@ -167,17 +167,19 @@ if [[ ! -f "$BUILDER" ]]; then
   [[ "$DO_ENGINE" != 1 ]] || fail "missing $BUILDER (this release has no engine-model builder)"
   done_msg; exit 0
 fi
-models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 k k-ldr m m-ldr l l-ldr)
-# One build serves every game with the same DLLs and builder: the key covers both and the accuracy choice.
+# the Super Resolution models depend on the GPU (RDNA2 builds no L and M), so the builder lists them
+models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 $(bash "$BUILDER" --list-sr-models))
+# One build serves every game with the same DLLs, builder and model set: the key covers them and the accuracy choice.
 key() {   # key EXACT(0|1)
   { echo "exact=$1"
+    echo "models=${models[*]}"
     # Model compilers accept per-layer K_DEFS_*, M_* arithmetic/tile options, and D4R_RR_* choices.
     # A cache hit must not silently replace a model built with different compiler options.
     env | LC_ALL=C sort | sed -n -e '/^K_/p' -e '/^M_/p' -e '/^D4R_RR_/p'
     sha256sum -- "$RUNTIME/nvngx_dlss.dll" "$RUNTIME/nvngx_dlssd.dll" 2>/dev/null | cut -d' ' -f1
     (cd "$RUNTIME/tools" && find . -type f ! -name '*.pyc' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum); } | sha256sum | cut -c1-16
 }
-have() { python3 "$RUNTIME/tools/models/model_tools.py" validate "$1" 2>/dev/null; }
+have() { python3 "$RUNTIME/tools/models/model_tools.py" validate "$1" "${models[@]}" 2>/dev/null; }
 STAMP="$RUNTIME/engine/.d4r-models"
 if [[ "$EXACT" == ask ]]; then
   EXACT=0
@@ -193,9 +195,10 @@ if [[ "$DO_ENGINE" == ask ]]; then
   echo "Set up d4r's own DLSS engine (recommended)?"
   echo '  + Faster on RDNA4: DLSS 4 / 4.5 and Ray Reconstruction run on d4r'"'"'s Vulkan engine instead of NVIDIA'"'"'s kernels'
   echo '    through CUDA emulation (for example Ray Reconstruction at 720p -> 4K in about 3.6 ms per frame).'
+  echo '  + On RDNA2 (Steam Deck) it is the route for DLSS 3'"'"'s CNN presets E and F: those models run without cooperative matrices.'
   echo '  + Lower latency: the game shows the upscaled result of the frame it just rendered, not an older one.'
   echo '  + No minute-long freeze while DLSS'"'"'s CUDA kernels compile the first time a model is used.'
-  echo '  - Longer setup, once: building its models takes a minute or two (it renders a test frame per model'
+  echo '  - Longer setup, once: building its models takes a few minutes (it renders a test frame per model'
   echo '    through GE-Proton) and needs ~300 MB of temporary space. Later installs reuse the models.'
   echo '  - Slower for K and M on RDNA3; there d4r keeps those two models on its normal path.'
   echo '  Without it, d4r uses its normal path; anything the engine does not cover uses that path anyway.'

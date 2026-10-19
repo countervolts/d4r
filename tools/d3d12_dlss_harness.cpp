@@ -2030,12 +2030,25 @@ int main(int argc, char** argv)
         }
         else if (temporal)
             d4r_ngx_set_int(parameters, "Reset", forceReset || frame == 1 ? 1 : 0);
-        // D4R_HARNESS_PRE_EXPOSURE / D4R_HARNESS_EXPOSURE_SCALE: non-neutral values on every frame, as games
-        // with their own exposure pipeline pass them.
+        // D4R_HARNESS_PRE_EXPOSURE / D4R_HARNESS_EXPOSURE_SCALE: non-neutral values, as games with their own
+        // exposure pipeline pass them. A comma list gives one value per frame (the last repeats).
+        auto scheduled = [frame](const char* list) {
+            float value = 1.0f;
+            const char* cursor = list;
+            for (int index = 1; index <= frame; ++index)
+            {
+                char* end = nullptr;
+                value = std::strtof(cursor, &end);
+                if (*end != ',')
+                    break;
+                cursor = end + 1;
+            }
+            return value;
+        };
         if (const char* value = std::getenv("D4R_HARNESS_PRE_EXPOSURE"))
-            d4r_ngx_set_float(parameters, "DLSS.Pre.Exposure", static_cast<float>(std::atof(value)));
+            d4r_ngx_set_float(parameters, "DLSS.Pre.Exposure", scheduled(value));
         if (const char* value = std::getenv("D4R_HARNESS_EXPOSURE_SCALE"))
-            d4r_ngx_set_float(parameters, "DLSS.Exposure.Scale", static_cast<float>(std::atof(value)));
+            d4r_ngx_set_float(parameters, "DLSS.Exposure.Scale", scheduled(value));
         // D4R_HARNESS_NGX_FLOATS="Name=value,Name=value": float evaluation parameters set on every frame after the
         // defaults (e.g. MV.Scale.X=2,FrameTimeDeltaInMsec=8), to see how NGX passes them on.
         if (const char* list = std::getenv("D4R_HARNESS_NGX_FLOATS"))

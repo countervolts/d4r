@@ -70,6 +70,14 @@ uint HU2_(u16vec2 u) { return uint(u.x) | (uint(u.y) << 16); }
 uint H2U(f16vec2 h) { return HU2_(float16BitsToUint16(h)); }
 int s16(uint u) { return (int(u) << 16) >> 16; }
 float rcp_a(float x) { return 1.0 / x; }
+// add.rz.f32: the sum rounded toward zero (round to nearest, then one ulp back when that went away from zero; the
+// error term is exact, TwoSum)
+float add_rz(float a, float b) { precise float s = a + b; precise float bb = s - a; precise float e = (a - (s - bb)) + (b - bb);
+    return (e != 0.0 && ((e < 0.0) != (s < 0.0)) && s != 0.0) ? uintBitsToFloat(floatBitsToUint(s) - 1u) : s; }
+float lg2_ftz(float x) { return log2(abs(x) < 1.17549435e-38 ? 0.0 : x); }
+// PTX .relu: negative results become +0, NaN stays NaN
+f16vec2 relu2(f16vec2 v) { return f16vec2(v.x < 0.0hf ? 0.0hf : v.x, v.y < 0.0hf ? 0.0hf : v.y); }
+float16_t relu1(float16_t v) { return v < 0.0hf ? 0.0hf : v; }
 // (one unsigned comparison per axis: a negative coordinate is above every size)
 vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return any(greaterThanEqual(uvec2(c), uvec2(n))) ? vec4(0.0) : texelFetch(t, c, 0); }
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
@@ -105,17 +113,27 @@ uint GW16(uint a) { CHECKW(a); return uint(wbuf.wh[a >> 1]); }
 // a 32-bit access is 4-byte aligned (PTX ISA): one word of the same buffer's word view
 uint GW32(uint a) { CHECKW(a + 2u); return wbuf32.ww[a >> 2]; }
 uint GA16(uint a) { CHECKR(a); return uint(abuf.ah[a >> 1]); }
-uint GA32(uint a) { CHECKR(a + 2u); return uint(abuf.ah[a >> 1]) | (uint(abuf.ah[(a >> 1) + 1u]) << 16); }
+uint GA32(uint a) { CHECKR(a + 2u);
+#ifdef D4R_WORD_ARENA
+    return abuf32.aw[a >> 2];
+#else
+    return uint(abuf.ah[a >> 1]) | (uint(abuf.ah[(a >> 1) + 1u]) << 16);
+#endif
+}
 void SA16(uint a, uint v) { CHECKS(a); abuf.ah[a >> 1] = uint16_t(v & 0xffffu); }
-void SA32(uint a, uint v) { CHECKS(a + 2u); abuf.ah[a >> 1] = uint16_t(v & 0xffffu); abuf.ah[(a >> 1) + 1u] = uint16_t(v >> 16); }
+void SA32(uint a, uint v) { CHECKS(a + 2u);
+#ifdef D4R_WORD_ARENA
+    abuf32.aw[a >> 2] = v;
+#else
+    abuf.ah[a >> 1] = uint16_t(v & 0xffffu); abuf.ah[(a >> 1) + 1u] = uint16_t(v >> 16);
+#endif
+}
 
 // Surface stores with .zero out-of-bounds semantics.
-void sust_p4(writeonly image2D s, int x, int y, vec4 v)
-{
-    ivec2 n = imageSize(s);
-    if (uint(x) < uint(n.x) && uint(y) < uint(n.y)) imageStore(s, ivec2(x, y), v);
-}
-void sust_p1(writeonly image2D s, int x, int y, float v) { sust_p4(s, x, y, vec4(v, 0.0, 0.0, 0.0)); }
+// Expand stores at the call site: passing a formatted image to an unformatted image2D
+// parameter makes glslang emit mismatched SPIR-V image types.
+#define sust_p4(S, X, Y, V) { ivec2 sn_ = imageSize(S); ivec2 sc_ = ivec2(X, Y); if (uint(sc_.x) < uint(sn_.x) && uint(sc_.y) < uint(sn_.y)) imageStore(S, sc_, V); }
+#define sust_p1(S, X, Y, V) sust_p4(S, X, Y, vec4(V, 0.0, 0.0, 0.0))
 // Formatted stores to normalized surfaces, as the reference converts them (ZLUDA's surface_formatted_store_bits): NaN
 // to zero, clamp, round half away from zero in f32. The quotient is what the image store then converts back exactly.
 // UNORM 10:10:10:2 surfaces (the pooled histories) are RGBA32F images holding the quantised values, like ZLUDA's.
@@ -211,14 +229,8 @@ vec4 q_unorm1010102_hw(vec4 v)
 // was one binary16 ulp low in half its values, which the next frame's encoder 0 amplifies): OR-ing in a zero the
 // compiler cannot see (the dispatch's z count is 1) keeps the conversion's rounding.
 #define SUST_Z (gl_NumWorkGroups.z - 1u)
-void sust_b2(writeonly image2D s, int x, int y, uint a, uint b)
-{
-    sust_p4(s, x >> 2, y, vec4(float(H(a | SUST_Z)), float(H(b | SUST_Z)), 0.0, 0.0));
-}
-void sust_b4(writeonly image2D s, int x, int y, uint a, uint b, uint c, uint d)
-{
-    sust_p4(s, x >> 3, y, vec4(float(H(a | SUST_Z)), float(H(b | SUST_Z)), float(H(c | SUST_Z)), float(H(d | SUST_Z))));
-}
+#define sust_b2(S, X, Y, A, B) sust_p4(S, (X) >> 2, Y, vec4(float(H((A) | SUST_Z)), float(H((B) | SUST_Z)), 0.0, 0.0))
+#define sust_b4(S, X, Y, A, B, C, D) sust_p4(S, (X) >> 3, Y, vec4(float(H((A) | SUST_Z)), float(H((B) | SUST_Z)), float(H((C) | SUST_Z)), float(H((D) | SUST_Z))))
 
 // shfl.sync.up/down within a 32-lane warp (ZLUDA's SHFL_SYNC_IMPL). in_bounds is the predicate output.
 uint shfl_dir(uint v, uint delta, uint opts, bool down, out bool in_bounds)
@@ -529,6 +541,8 @@ class RRT(base.T):
     def __init__(self, ptx, kernel, block, weights_arg=40, buffers=()):
         self.weights_arg = weights_arg
         self.buffers = sorted(buffers)   # argument offsets of further buffers, each its own binding
+        self.written_buffers = set()
+        self.unified_arena = False
         self.snorm16 = set()             # texture arguments of --snorm16
         bx, by, bz = block
         if bx * by * bz % 32:
@@ -557,7 +571,7 @@ class RRT(base.T):
         # module globals with an initialiser (the output filter's bicubic phase table): constants, laid out one after
         # another in a blob that is the stage's weight buffer (binding 1); `mov.u64 %rd, NAME` is its offset there
         self.globals, self.globals_blob = {}, b''
-        for gm in re.finditer(r'\.global\s+\.align\s+\d+\s+\.b8\s+(\w+)\[(\d+)\]\s*=\s*\{([^}]*)\}', ptx):
+        for gm in re.finditer(r'\.(?:global|const)\s+\.align\s+\d+\s+\.b8\s+(\w+)\[(\d+)\]\s*=\s*\{([^}]*)\}', ptx):
             self.globals[gm.group(1)] = len(self.globals_blob)
             data = bytes(int(x) for x in gm.group(3).split(','))
             self.globals_blob += data + bytes(-len(data) % 16)
@@ -651,6 +665,8 @@ class RRT(base.T):
 
     def gorigin(self, reg):
         s = self.origin.get(reg, set())
+        if self.unified_arena and s and 'w' not in s:
+            return 'a'
         if len(s) != 1:
             raise base.Err(f'global pointer {reg} has origin {sorted(s)} (need exactly one of w/a)')
         return next(iter(s))
@@ -673,6 +689,16 @@ class RRT(base.T):
         return f'uint({self.val(reg, "u64")}) + {off}u' if off >= 0 else f'uint({self.val(reg, "u64")}) - {-off}u'
 
     def ld(self, o, a):
+        if 'const' in o:
+            m = re.fullmatch(r'\[\s*(\w+)\s*(?:\+\s*(\d+))?\s*\]', a[1].strip())
+            if not m or m.group(1) not in self.globals:
+                raise base.Err(f'unsupported constant address {a[1]}')
+            size, count = mem_shape(o)
+            at = self.globals[m.group(1)] + int(m.group(2) or 0)
+            dsts = braces(a[0]) if count > 1 else [a[0]]
+            for i, d in enumerate(dsts):
+                self.A(d, f'GW{size * 8}({at + i * size}u)', 'u16' if size == 2 else 'u32')
+            return
         if 'global' not in o:
             return super().ld(o, a)
         size, count = mem_shape(o)
@@ -683,12 +709,23 @@ class RRT(base.T):
             self.A(d, f'{fn}{size * 8}({self.gbyte(reg, off + i * size)})', 'u16' if size == 2 else 'u32')
 
     def st(self, o, a):
+        if 'shared' in o and o[-1] in ('u16', 'b16', 'f16') and not {'v2', 'v4'} & set(o):
+            reg, off = self.addr(a[0])
+            value = self.val(a[1], 'u16')
+            self.E('{ uint at_ = ' + self.val(reg, 'u32') + f' + {off}u;')
+            self.E('uint shift_ = (at_ & 2u) * 8u;')
+            self.E('atomicAnd(sh[at_ >> 2], ~(0xffffu << shift_));')
+            self.E(f'atomicOr(sh[at_ >> 2], (uint({value}) & 0xffffu) << shift_); }}')
+            return
         if 'global' not in o:
             return super().st(o, a)
         size, count = mem_shape(o)
         reg, off = self.gaddr(a[0])
         if self.gorigin(reg) == 'w':
             raise base.Err(f'store through the read-only weight pointer: {a}')
+        for origin in self.origin.get(reg, ()):
+            if origin.startswith('x'):
+                self.written_buffers.add(int(origin[1:]))
         fn = self.gfn(reg, True)
         vals = braces(a[1]) if count > 1 else [a[1]]
         for i, v in enumerate(vals):
@@ -826,6 +863,20 @@ class RRT(base.T):
             return
         if op.startswith('mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16'):
             return self.mma(a)
+        if op in ('mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16',
+                  'mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16'):
+            d, x, b, c = (braces(t) for t in a)
+            depth = 8 if '.m16n8k8.' in op else 16
+            if (len(d), len(x), len(b), len(c)) != (2, depth // 4, depth // 8, 2):
+                raise base.Err(f'invalid fragments for {op}')
+            operands = ', '.join(self.val(r, 'u32') for r in x + b + c)
+            self.E('{ uint md0_, md1_;')
+            self.E(f'mma_f16_m16n8k{depth}({operands}, md0_, md1_);')
+            self.A(d[0], 'md0_', 'u32')
+            self.A(d[1], 'md1_', 'u32')
+            return self.E('}')
+        if op.startswith('mma.sync.'):
+            raise base.Err(f'unsupported matrix operation {op}')
         if op == 'mma.pair.e4m3':
             d, h, x, b, c, e, f = (braces(t) for t in a)
             args = ', '.join(self.val(r, 'u32') for r in x + b + c + e + f)
@@ -904,6 +955,51 @@ class RRT(base.T):
             c = ('(isnan({0}) || isnan({1}))' if parts[1] == 'nan' else
                  '!(isnan({0}) || isnan({1}))' if parts[1] == 'num' else self.cmp(set(parts), True))
             return self.A(a[0], f'(({c.format(self.val(a[1], "f16"), self.val(a[2], "f16"))}) ? 1.0hf : 0.0hf)', 'f16')
+        if op == 'popc.b32':
+            return self.A(a[0], f'uint(bitCount({self.val(a[1], "u32")}))', 'u32')
+        if op in ('dp2a.lo.u32.u32', 'dp2a.hi.u32.u32'):
+            x, y, c = (self.val(t, 'u32') for t in a[1:])
+            shift = 0 if parts[1] == 'lo' else 16
+            return self.A(a[0], f'({c} + ({x} & 0xffffu) * (({y} >> {shift}u) & 0xffu) + '
+                          f'({x} >> 16u) * (({y} >> {shift + 8}u) & 0xffu))', 'u32')
+        if op.startswith('ldmatrix.sync.aligned.m8n8.'):
+            regs = braces(a[0])
+            count = 4 if 'x4' in parts else 2 if 'x2' in parts else 1
+            if len(regs) != count or parts[-1] != 'b16':
+                raise base.Err(f'unsupported matrix load {op}')
+            src, off = self.addr(a[1])
+            addr = f'({self.val(src, "u32")} + {off}u)'
+            self.E('{ uint lane_ = gl_SubgroupInvocationID;')
+            for i, dst in enumerate(regs):
+                if 'trans' in parts:
+                    self.E(f'uint lo_{i} = subgroupShuffle({addr}, {8*i}u + 2u * (lane_ & 3u)) + (lane_ >> 2u) * 2u;')
+                    self.E(f'uint hi_{i} = subgroupShuffle({addr}, {8*i + 1}u + 2u * (lane_ & 3u)) + (lane_ >> 2u) * 2u;')
+                    self.A(dst, f'(SH16(lo_{i}) | (SH16(hi_{i}) << 16u))', 'u32')
+                else:
+                    self.E(f'uint row_{i} = subgroupShuffle({addr}, (lane_ >> 2u) + {8*i}u);')
+                    self.A(dst, f'SH32(row_{i} + (lane_ & 3u) * 4u)', 'u32')
+            return self.E('}')
+        if op.startswith('cp.async'):
+            if op == 'cp.async.commit_group' or op.startswith('cp.async.wait_group'):
+                return  # Copies below execute synchronously in program order.
+            if not op.startswith(('cp.async.cg.shared.global', 'cp.async.ca.shared.global')):
+                raise base.Err(f'unsupported asynchronous copy {op}')
+            dst, doff = self.addr(a[0])
+            src, soff = self.gaddr(a[1])
+            size = int(a[2])
+            if size not in (4, 8, 16):
+                raise base.Err(f'unsupported asynchronous copy size {size}')
+            valid = self.val(a[3], 'u32') if len(a) > 3 else f'{size}u'
+            fn = self.gfn(src)
+            self.E('{ uint dst_ = ' + self.val(dst, 'u32') + f' + {doff}u;')
+            self.E(f'uint bytes_ = {valid};')
+            for i in range(size // 4):
+                self.E(f'uint word_{i} = 0u;')
+                self.E(f'if (bytes_ > {4*i}u) {{')
+                self.E(f'uint n_ = min(bytes_ - {4*i}u, 4u);')
+                self.E(f'word_{i} = {fn}32({self.gbyte(src, soff + 4*i)}) & (0xffffffffu >> ((4u - n_) * 8u)); }}')
+                self.E(f'sh[(dst_ + {4*i}u) >> 2] = word_{i};')
+            return self.E('}')
         return super().op(op, a)
 
     # ------------------------------------------------ stage contract
@@ -911,6 +1007,7 @@ class RRT(base.T):
         w('#version 460')
         w('#extension GL_EXT_shader_explicit_arithmetic_types : require')
         w('#extension GL_EXT_shader_16bit_storage : require')
+        w('#extension GL_EXT_control_flow_attributes : require')
         w('#extension GL_KHR_shader_subgroup_basic : require')
         w('#extension GL_KHR_shader_subgroup_shuffle : require')
         w('#extension GL_KHR_shader_subgroup_ballot : require')
@@ -926,6 +1023,9 @@ class RRT(base.T):
         w('layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { uint16_t wh[]; } wbuf;')
         w('layout(set = 0, binding = 1, std430) readonly buffer WeightBuf32 { uint ww[]; } wbuf32;')
         w('layout(set = 0, binding = 2, std430) buffer ArenaBuf { uint16_t ah[]; } abuf;')
+        w('#ifdef D4R_WORD_ARENA')
+        w('layout(set = 0, binding = 2, std430) buffer ArenaBuf32 { uint aw[]; } abuf32;')
+        w('#endif')
         n = 3
         for off in sorted(self.textures):
             w(f'layout(set = 0, binding = {n}) uniform sampler2D T{off};')
@@ -935,7 +1035,7 @@ class RRT(base.T):
             q = {'rgba8_snorm': 'q_snorm8', 'rgba8': 'q_unorm8', 'rgba32f': 'q_unorm1010102', 'rgb10_a2': 'q_unorm1010102_hw'}.get(self.surfaces[off], '')
             w(f'#define SUSTQ_{off}(v) {q}(v)')
             n += 1
-        for off in self.buffers:
+        for off in (() if self.unified_arena else self.buffers):
             w(f'layout(set = 0, binding = {n}, std430) buffer XBuf{off} {{ uint16_t h[]; }} xb{off};')
             w(f'uint GX{off}_16(uint a) {{ return uint(xb{off}.h[a >> 1]); }}')
             w(f'uint GX{off}_32(uint a) {{ return uint(xb{off}.h[a >> 1]) | (uint(xb{off}.h[(a >> 1) + 1u]) << 16); }}')
@@ -950,10 +1050,12 @@ class RRT(base.T):
         w(f'shared uint mms[{384 * (self.bx * self.by * self.bz // 32)}];   // mma_e4m3_f16 scratch, per subgroup')
 
     def runtime(self):
+        runtime = RR_RUNTIME
         if getattr(self, 'unguarded', False):   # --unguarded: no opaque zero
             assert '#define SUST_Z (gl_NumWorkGroups.z - 1u)' in RR_RUNTIME
-            return RR_RUNTIME.replace('#define SUST_Z (gl_NumWorkGroups.z - 1u)', '#define SUST_Z 0u')
-        return RR_RUNTIME
+            runtime = RR_RUNTIME.replace('#define SUST_Z (gl_NumWorkGroups.z - 1u)', '#define SUST_Z 0u')
+        return (runtime + (ROOT / 'engine' / 'round_half.glsl').read_text() +
+                (ROOT / 'engine' / 'cnn_sr' / 'mma_f16.glsl').read_text())
 
 
 def main():
@@ -972,6 +1074,8 @@ def main():
     ap.add_argument('--buffer', action='append', type=int, default=[], metavar='OFFSET',
                     help='a pointer argument that is neither the weights nor the arena: its own storage buffer, bound '
                          'after the surfaces in ascending argument offset (repeatable)')
+    ap.add_argument('--unified-arena', action='store_true',
+                    help='place all --buffer pointer arguments in binding 2; retain their write metadata')
     ap.add_argument('--probe', action='append', default=[], metavar='LINE:%REG,...',
                     help='debugging: store the registers after the statement at that module line executes (last '
                          'execution) for workgroup --probe-block, into a debug buffer bound after the surfaces')
@@ -993,6 +1097,7 @@ def main():
 
     def make():
         t = RRT(src, ns.kernel, block, ns.weights_arg, ns.buffer)
+        t.unified_arena = ns.unified_arena
         t.snorm16 = set(ns.snorm16)
         t.probes = probes
         t.probe_block = tuple(int(x) for x in ns.probe_block.split(','))
@@ -1009,7 +1114,9 @@ def main():
     # the binding order (stage contract): textures, then surfaces, in ascending argument offset
     Path(ns.out).with_suffix('.json').write_text(json.dumps(
         {'kernel': ns.kernel, 'block': block, 'textures': sorted(t.textures),
-         'surfaces': [[off, t.surfaces[off]] for off in sorted(t.surfaces)], 'buffers': t.buffers, 'shared': t.shared_bytes,
+         'surfaces': [[off, t.surfaces[off]] for off in sorted(t.surfaces)],
+         'buffers': [] if t.unified_arena else t.buffers, 'shared': t.shared_bytes,
+         'written_buffers': sorted(t.written_buffers),
          'probes': [[line, reg] for line in sorted(probes) for reg in probes[line]], 'oob': ns.oob_report}) + '\n')
     sys.stderr.write(f'block={block} textures={sorted(t.textures)} surfaces={t.surfaces} shared={t.shared_bytes}\n')
 

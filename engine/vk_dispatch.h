@@ -24,6 +24,10 @@ struct VkTable {
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
     PFN_vkCmdUpdateBuffer CmdUpdateBuffer = nullptr;
     PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
+    PFN_vkCmdResetQueryPool CmdResetQueryPool = nullptr;
+    PFN_vkCreateQueryPool CreateQueryPool = nullptr;
+    PFN_vkDestroyQueryPool DestroyQueryPool = nullptr;
+    PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
     PFN_vkCreateBuffer CreateBuffer = nullptr;
     PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
     PFN_vkCreateDescriptorPool CreateDescriptorPool = nullptr;
@@ -44,6 +48,7 @@ struct VkTable {
     PFN_vkDestroyShaderModule DestroyShaderModule = nullptr;
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
+    PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress = nullptr;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
     PFN_vkMapMemory MapMemory = nullptr;
     PFN_vkUnmapMemory UnmapMemory = nullptr;
@@ -72,6 +77,10 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkCmdPipelineBarrier ::d4r::vkTable.CmdPipelineBarrier
 #define vkCmdUpdateBuffer ::d4r::vkTable.CmdUpdateBuffer
 #define vkCmdWriteTimestamp ::d4r::vkTable.CmdWriteTimestamp
+#define vkCmdResetQueryPool ::d4r::vkTable.CmdResetQueryPool
+#define vkCreateQueryPool ::d4r::vkTable.CreateQueryPool
+#define vkDestroyQueryPool ::d4r::vkTable.DestroyQueryPool
+#define vkGetQueryPoolResults ::d4r::vkTable.GetQueryPoolResults
 #define vkCreateBuffer ::d4r::vkTable.CreateBuffer
 #define vkCreateComputePipelines ::d4r::vkTable.CreateComputePipelines
 #define vkCreateDescriptorPool ::d4r::vkTable.CreateDescriptorPool
@@ -92,6 +101,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkDestroyShaderModule ::d4r::vkTable.DestroyShaderModule
 #define vkFreeMemory ::d4r::vkTable.FreeMemory
 #define vkGetBufferMemoryRequirements ::d4r::vkTable.GetBufferMemoryRequirements
+#define vkGetBufferDeviceAddress ::d4r::vkTable.GetBufferDeviceAddress
 #define vkGetImageMemoryRequirements ::d4r::vkTable.GetImageMemoryRequirements
 #define vkMapMemory ::d4r::vkTable.MapMemory
 #define vkUnmapMemory ::d4r::vkTable.UnmapMemory

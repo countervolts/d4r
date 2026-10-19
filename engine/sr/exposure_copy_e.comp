@@ -1,0 +1,20 @@
+#version 460
+// d4r engine, presets E and F: NGX's cuda_copy_exposure_kernel. After each frame the frame's exposure (the game's
+// 1x1 texture or the AutoExposure measurement) goes into a 1x1 half surface, which the next frame's input kernel
+// samples as the previous exposure (its texture 352; on a reset frame NGX binds the current exposure there instead,
+// so the engine copies before the input kernel too). The formatted half store truncates toward zero, like the
+// auto-exposure copy (engine/exposure_k.comp).
+layout(local_size_x = 32) in;   // one full wave32 subgroup; invocation 0 stores
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, r16f) uniform writeonly image2D previous;
+float truncatedHalf(float v)
+{
+    uint bits = packHalf2x16(vec2(v, 0.0)) & 65535u;
+    if (unpackHalf2x16(bits).x > v) --bits;
+    return unpackHalf2x16(bits).x;
+}
+void main()
+{
+    if (gl_LocalInvocationID.x == 0u)
+        imageStore(previous, ivec2(0), vec4(truncatedHalf(texelFetch(source, ivec2(0), 0).r)));
+}

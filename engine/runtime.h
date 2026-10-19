@@ -310,4 +310,55 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
+// ---------------------------------------------------------------- Super Resolution presets E and F (the DLSS 3 CNN)
+// NGX 310.7's CNN upscaler: its input kernel and its reconstruction kernel translated from the user's DLL, the
+// network between them d4r's own packed-f16 shaders (engine/sr/e_net.comp), so it runs on any GPU with binary16
+// arithmetic, cooperative matrices not required (engine/runtime_e.inc, built by engine/compile_sr_e.py). Same
+// conventions as the classes above. The device needs shaderFloat16, storageBuffer16BitAccess, shaderInt16,
+// subgroupSizeControl and computeFullSubgroups with 32-wide subgroups.
+struct EFrameSettings {
+    float jitter[2] = {0, 0};       // render pixels, as the game passes them to NGX
+    float motionScale[2] = {1, 1};  // NGX's MV scale: motion texels times this are the motion's pixels
+    bool reset = false;
+    float preExposure = 1, exposureScale = 1;   // the game's (DLSS.Pre.Exposure, DLSS.Exposure.Scale)
+};
+class EModel {
+public:
+    EModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    ~EModel();
+    EModel(const EModel&) = delete;
+    EModel& operator=(const EModel&) = delete;
+    void recordUpload(VkCommandBuffer command);
+    bool uploadRecorded() const;
+    bool hasAutoExposure() const;   // the model directory holds the exposure shaders (exposure_e0/1.spv)
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+    friend class EEngine;
+};
+class EEngine {
+public:
+    // hdr: NGX's IsHDR (linear colour, the exposure textures); lowResMotion: MVLowRes (render-size motion vectors,
+    // in render pixels; otherwise output-size motion in output pixels). Render size at most the output size.
+    // autoExposure (HDR): NGX's AutoExposure, the exposure measured from the colour on every second frame instead of
+    // read from images.exposure (needs EModel::hasAutoExposure).
+    EEngine(EModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight,
+            bool hdr, bool lowResMotion, bool autoExposure = false);
+    ~EEngine();
+    EEngine(const EEngine&) = delete;
+    EEngine& operator=(const EEngine&) = delete;
+    void recordInitialize(VkCommandBuffer command);
+    // color (and depth with lowResMotion) at the render size, motion at the render or output size; images.exposure
+    // the game's 1x1 exposure (HDR without autoExposure; 1 when absent). A borrowed RGBA16F finalOutput (GENERAL) is written directly.
+    void setFrame(const FrameImages& images, const EFrameSettings& settings, FrameOutput finalOutput = {});
+    // With a timestamp query pool, four stamps are written from query `first`: start, after the input kernel, after
+    // the network and after the reconstruction.
+    void recordFrame(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
+    VkImage outputImage() const; // RGBA16F, GENERAL, when no finalOutput was bound
+    struct DebugBuffer { std::string name; VkBuffer buffer; VkDeviceSize offset, bytes; };
+    std::vector<DebugBuffer> debugBuffers() const; // the network's tensors in the arena (engine/replay_e.cpp)
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
 } // namespace d4r

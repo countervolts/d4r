@@ -80,7 +80,8 @@ class ModelBuildTests(unittest.TestCase):
 
     def test_dump_does_not_accept_a_failed_child_with_a_replay_marker(self):
         text = (ROOT / 'packaging/build_engine_models.sh').read_text()
-        function = text[text.index('  dump() {'):text.index("  echo 'Building the Super Resolution")]
+        start = text.index('  dump() {')
+        function = text[start:text.index('\n  }\n', start) + len('\n  }\n')]
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
             (root / 'proton').mkdir(); (root / 'app').mkdir()

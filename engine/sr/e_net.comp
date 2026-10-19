@@ -1,0 +1,408 @@
+#version 460
+// The network of DLSS Super Resolution presets E and F (nvngx_dlss.dll 310.7: the "dltss_nchw8_*" kernels between
+// NGX's input kernel and its reconstruction kernel) as d4r's own packed-f16 shaders, for any GPU with binary16
+// arithmetic and no cooperative matrices required (RADV on RDNA2 included).
+//
+// The network is a U-Net over the token grid (L0: the output size rounded up to 128, divided by 4; level l is L0 / 2^l):
+//   enc0  conv 3x3 16 -> 32, ReLU -> skip0 (8-bit, L0); 2x2 max-pool, conv 1x1 32 -> 64, ReLU -> skip1 (8-bit, L1);
+//         its 2x2 max-pool -> pool1 (8-bit, L2)
+//   enc1  conv 3x3 64 -> 128 (8-bit in) -> skip2 (L2), pool -> pool2 (L3)        enc2 128 -> 128 at L3, enc3 128 -> 256
+//   at L4 (both binary16): MODE_ENC3
+//   mid0  conv 1x1 256 -> 512, mid1 512 -> 256 at L5: MODE_CONV1
+//   up4   bilinear 2x of mid1 + skip4, conv 1x1 256 -> 256 (MODE_UP1); red4 conv 1x1 256 -> 128 (MODE_CONV1)
+//   dec3, dec2, dec1  bilinear 2x of the level below + the skip, conv 1x1 C -> M, ReLU, conv 1x1 M -> N, ReLU
+//   (MODE_DEC2); dec1's output and skip0 feed NGX's reconstruction kernel (translated, engine/compile_e.py), which
+//   runs the last decoder level and the head itself.
+// Every conv is followed by its bias and a ReLU. Tensors are NVIDIA's: [C/8][H][W][8] ("nchw8") for the pooled and
+// decoder outputs, and the full-size skips as the four 2x2 phases [y&1][x&1][C/8][H/2][W/2][8] ("sub"); 8-bit
+// activations are binary16 bits 14..7 (round half up, as cnn_common.glsl's enc8).
+//
+// Arithmetic: a lane owns a pixel, a wave 32 pixels (a 4 x 8 block in Morton order, so 2x2 pools are quads of
+// lanes) and 32 output channels; the weights are wave-uniform scalar loads feeding v_pk_fma_f16 (as
+// engine/rr/cnn_pk.glsl). Binary16 accumulation: not bit-exact to NGX's f16 mma (about 45-80 dB per tensor).
+//
+// Bindings: 0 the parameter block (below), 1 the weights (binary16, [tap][k][n] / [k][n], n fastest), 2 the arena
+// (the frame's tensors; every offset in bytes).
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(std430, binding = 0) readonly buffer Params { uint p[]; };
+layout(std430, binding = 1) readonly restrict buffer Weights { uint w[]; };      // binary16 pairs
+layout(std430, binding = 1) readonly restrict buffer Weights4 { uvec4 w4[]; };
+layout(std430, binding = 2) buffer Arena { uint a[]; };
+layout(std430, binding = 2) buffer Arena4 { uvec4 a4[]; };
+layout(std430, binding = 2) buffer Arena2 { uvec2 a2[]; };
+
+// the parameter block (words): 0 H, 1 W (this stage's level), 2 input, 3 skip (MODE_UP1 / MODE_DEC2) or second
+// output, 4 output, 5 third output, 6.. weights and biases (word offsets in binding 1): 6 w1, 7 b1, 8 w2, 9 b2
+#define PH p[0]
+#define PW p[1]
+
+#ifndef CIN
+#define CIN 32
+#endif
+#ifndef C
+#define C 32                    // the stage's (first) conv outputs
+#endif
+#ifndef C2
+#define C2 32                   // MODE_ENC0 / MODE_DEC2: the second conv's outputs
+#endif
+#define NQ 32                   // a wave's output channels
+#ifndef LOW8
+#define LOW8 0
+#endif
+#ifndef SKIP8
+#define SKIP8 0
+#endif
+#ifndef IN8
+#define IN8 0
+#endif
+#ifndef OUT8
+#define OUT8 0
+#endif
+#if defined(MODE_DEC2)
+#define WAVES ((C > C2 ? C : C2) / NQ)
+#elif defined(MODE_ENC0)
+#define WAVES 4                 // a 8 x 16 tile of L0; its pooled 4 x 8 block of L1 is the second conv's
+#else
+#define WAVES (C / NQ)
+#endif
+layout(local_size_x = 32 * WAVES) in;
+
+// gl_SubgroupID, not the invocation index / 32: the compiler then knows a wave's index (and every weight address
+// built from it) is uniform, and loads the weights with scalar loads
+uint wave() { return gl_SubgroupID; }
+uint lane() { return gl_LocalInvocationIndex & 31u; }
+// a lane's pixel in its wave's 4 x 8 block: x = b0 + 2 b2 + 4 b4, y = b1 + 2 b3
+uvec2 morton(uint l) { return uvec2((l & 1u) | ((l >> 1u) & 2u) | ((l >> 2u) & 4u), ((l >> 1u) & 1u) | ((l >> 2u) & 2u)); }
+
+f16vec2 h2(uint u) { return unpackFloat2x16(u); }
+uint u2(f16vec2 v) { return packFloat2x16(v); }
+// 8-bit activations <-> binary16
+f16vec4 dec8x4(uint u)
+{
+    const uint lo = ((u << 7u) & 0x7f80u) | ((u << 15u) & 0x7f800000u);
+    const uint hi = ((u >> 9u) & 0x7f80u) | ((u >> 1u) & 0x7f800000u);
+    return f16vec4(h2(lo), h2(hi));
+}
+uint enc8x4(f16vec2 x, f16vec2 y)
+{
+    const f16vec2 ex = h2(u2(x) & 0xfc00fc00u), ey = h2(u2(y) & 0xfc00fc00u);
+    const uint rx = u2(fma(ex, f16vec2(0.0625), x)), ry = u2(fma(ey, f16vec2(0.0625), y));
+    return ((rx >> 7u) & 0xffu) | ((rx >> 15u) & 0xff00u) | ((ry << 9u) & 0xff0000u) | ((ry << 1u) & 0xff000000u);
+}
+
+// eight channels (one nchw8 group g) of a pixel of a [CH/8][H][W][8] tensor at byte offset `at`
+void load8(uint at, uint g, uint h, uint wd, uint y, uint x, bool in8, out f16vec2 v[4])
+{
+    const uint e = (g * h + y) * wd + x;
+    if (in8) {
+        const uvec2 b = a2[at / 8u + e];
+        const f16vec4 lo = dec8x4(b.x), hi = dec8x4(b.y);
+        v[0] = lo.xy; v[1] = lo.zw; v[2] = hi.xy; v[3] = hi.zw;
+    } else {
+        const uvec4 b = a4[at / 16u + e];
+        v[0] = h2(b.x); v[1] = h2(b.y); v[2] = h2(b.z); v[3] = h2(b.w);
+    }
+}
+// the same from a 2x2-phase ("sub") tensor of a level of size h x wd
+void loadSub(uint at, uint g, uint ch, uint h, uint wd, uint y, uint x, bool in8, out f16vec2 v[4])
+{
+    const uint ph = (y & 1u) * 2u + (x & 1u);
+    load8(at + ph * (ch * (h / 2u) * (wd / 2u)) * (in8 ? 1u : 2u), g, h / 2u, wd / 2u, y >> 1u, x >> 1u, in8, v);
+}
+void store8(uint at, uint g, uint h, uint wd, uint y, uint x, bool out8, f16vec2 v[4])
+{
+    const uint e = (g * h + y) * wd + x;
+    if (out8) a2[at / 8u + e] = uvec2(enc8x4(v[0], v[1]), enc8x4(v[2], v[3]));
+    else a4[at / 16u + e] = uvec4(u2(v[0]), u2(v[1]), u2(v[2]), u2(v[3]));
+}
+void storeSub(uint at, uint g, uint ch, uint h, uint wd, uint y, uint x, bool out8, f16vec2 v[4])
+{
+    const uint ph = (y & 1u) * 2u + (x & 1u);
+    store8(at + ph * (ch * (h / 2u) * (wd / 2u)) * (out8 ? 1u : 2u), g, h / 2u, wd / 2u, y >> 1u, x >> 1u, out8, v);
+}
+
+#ifndef PS
+#define PS 1                    // pixel sets per lane: 2 reuses every scalar-loaded weight for two pixels
+#endif
+// acc[i][j] (pixel set i, output pair j of the wave's 32) += the eight channels v[i] (k = k0 .. k0 + 7) times the
+// weight rows k0 .. k0 + 7 of a [k][N] matrix at word offset wrow (N / 2 words per row), the wave's columns from
+// word column wcol
+void fma8(inout f16vec2 acc[PS][16], f16vec2 v[PS][4], uint wrow, uint rowWords, uint wcol)
+{
+    [[unroll]] for (uint kk = 0u; kk < 8u; ++kk) {
+        const uint r = wrow + kk * rowWords + wcol;
+        [[unroll]] for (uint j4 = 0u; j4 < 4u; ++j4) {
+            const uvec4 q = w4[r / 4u + j4];
+            [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+                const float16_t x = (kk & 1u) == 0u ? v[i][kk >> 1u].x : v[i][kk >> 1u].y;
+                acc[i][4u * j4] = fma(f16vec2(x), h2(q.x), acc[i][4u * j4]);
+                acc[i][4u * j4 + 1u] = fma(f16vec2(x), h2(q.y), acc[i][4u * j4 + 1u]);
+                acc[i][4u * j4 + 2u] = fma(f16vec2(x), h2(q.z), acc[i][4u * j4 + 2u]);
+                acc[i][4u * j4 + 3u] = fma(f16vec2(x), h2(q.w), acc[i][4u * j4 + 3u]);
+            }
+        }
+    }
+}
+void biasRelu(inout f16vec2 acc[PS][16], uint b, uint wcol)
+{
+    [[unroll]] for (uint j4 = 0u; j4 < 4u; ++j4) {
+        const uvec4 q = w4[(b + wcol) / 4u + j4];
+        [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+            acc[i][4u * j4] = max(acc[i][4u * j4] + h2(q.x), f16vec2(0.0));
+            acc[i][4u * j4 + 1u] = max(acc[i][4u * j4 + 1u] + h2(q.y), f16vec2(0.0));
+            acc[i][4u * j4 + 2u] = max(acc[i][4u * j4 + 2u] + h2(q.z), f16vec2(0.0));
+            acc[i][4u * j4 + 3u] = max(acc[i][4u * j4 + 3u] + h2(q.w), f16vec2(0.0));
+        }
+    }
+}
+void zero(out f16vec2 acc[PS][16]) { [[unroll]] for (uint i = 0u; i < uint(PS); ++i) [[unroll]] for (uint j = 0u; j < 16u; ++j) acc[i][j] = f16vec2(0.0); }
+// the 2x2 max over a lane quad (xor 1, 2: Morton order)
+void pool4(inout f16vec2 acc[16])
+{
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+        acc[j] = max(acc[j], h2(subgroupShuffleXor(u2(acc[j]), 1u)));
+        acc[j] = max(acc[j], h2(subgroupShuffleXor(u2(acc[j]), 2u)));
+    }
+}
+// the wave's 32 channels (groups gq .. gq + 3) of a pixel
+void storeAll(uint at, uint gq, uint h, uint wd, uint y, uint x, bool out8, bool sub, uint ch, f16vec2 acc[16])
+{
+    [[unroll]] for (uint g = 0u; g < 4u; ++g) {
+        f16vec2 v[4] = f16vec2[4](acc[4u * g], acc[4u * g + 1u], acc[4u * g + 2u], acc[4u * g + 3u]);
+        if (sub) storeSub(at, gq + g, ch, h, wd, y, x, out8, v); else store8(at, gq + g, h, wd, y, x, out8, v);
+    }
+}
+
+// the input of MODE_UP1 / MODE_DEC2 at (y, x), eight channels of group g: the level below (h/2 x wd/2) upsampled
+// 2x bilinearly (half-pixel centres, edges clamped: 0.75 / 0.25 per axis) plus the skip
+void upSkip(uint g, uint y, uint x, out f16vec2 v[4])
+{
+    const uint h = PH, wd = PW, lh = h / 2u, lw = wd / 2u;
+    const uint iy = y >> 1u, ix = x >> 1u;
+    const uint ny = uint(clamp(int(iy) + ((y & 1u) == 0u ? -1 : 1), 0, int(lh) - 1));
+    const uint nx = uint(clamp(int(ix) + ((x & 1u) == 0u ? -1 : 1), 0, int(lw) - 1));
+    f16vec2 a0[4], a1[4], b0[4], b1[4], s[4];
+    load8(p[2], g, lh, lw, iy, ix, LOW8 != 0, a0); load8(p[2], g, lh, lw, iy, nx, LOW8 != 0, a1);
+    load8(p[2], g, lh, lw, ny, ix, LOW8 != 0, b0); load8(p[2], g, lh, lw, ny, nx, LOW8 != 0, b1);
+    loadSub(p[3], g, uint(CIN), h, wd, y, x, SKIP8 != 0, s);
+    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+        const f16vec2 r0 = fma(f16vec2(0.25), a1[i], f16vec2(0.75) * a0[i]);
+        const f16vec2 r1 = fma(f16vec2(0.25), b1[i], f16vec2(0.75) * b0[i]);
+        v[i] = fma(f16vec2(0.25), r1, f16vec2(0.75) * r0) + s[i];
+    }
+}
+
+#if defined(MODE_ENC0)
+shared f16vec2 sh[32 * PS * 18]; // pooled pixels, padded to avoid LDS bank conflicts
+#endif
+// the convolution's input in LDS, loaded once by the workgroup (all its loads in flight, and its waves share it):
+// the tile of pixels (with the 3x3 conv's one-pixel halo) x CIN channels, binary16, rows of CINP halves (CIN / 2 + 2
+// words: 2 mod 4, so a 64-bit read's 16 lanes hit distinct bank pairs)
+#if defined(MODE_DEC2) && CIN != C
+#error "decoder LDS reuse requires CIN == C"
+#endif
+#define CINP (CIN + 4)
+#if defined(MODE_ENC0)
+#define TW 16                   // four waves of 4 PS x 8 pixels
+#define TH (8 * PS)
+#elif defined(MODE_ENC3)
+#define TW 8                    // every wave the same 4 PS x 8 pixels
+#define TH (4 * PS)
+#endif
+#ifdef TW
+#define TILEPX ((TH + 2) * (TW + 2))
+#else
+#define TILEPX (32 * PS)
+#endif
+#if TILEPX * CINP * 2 > 65536
+#error "CNN tile exceeds 64 KiB of shared memory; reduce PS"
+#endif
+shared f16vec4 tile[TILEPX * CINP / 4];
+void tileStore(uint px, uint g, f16vec2 v[4])
+{
+    const uint at = (px * uint(CINP) + g * 8u) / 4u;
+    tile[at] = f16vec4(v[0], v[1]); tile[at + 1u] = f16vec4(v[2], v[3]);
+}
+void tileLoad(uint px, uint g, out f16vec2 v[4])
+{
+    const uint at = (px * uint(CINP) + g * 8u) / 4u;
+    const f16vec4 a = tile[at], b = tile[at + 1u];
+    v[0] = a.xy; v[1] = a.zw; v[2] = b.xy; v[3] = b.zw;
+}
+#ifdef TW
+// the tile of the [CIN/8][H][W][8] input around the block at (y0, x0), zero outside
+void loadTile(uint at, uint h, uint wd, int y0, int x0, bool in8)
+{
+    for (uint i = gl_LocalInvocationIndex; i < uint(TILEPX * CIN / 8); i += gl_WorkGroupSize.x) {
+        const uint px = i / uint(CIN / 8), g = i % uint(CIN / 8);
+        const int y = y0 - 1 + int(px / uint(TW + 2)), x = x0 - 1 + int(px % uint(TW + 2));
+        f16vec2 v[4];
+        if (y >= 0 && y < int(h) && x >= 0 && x < int(wd)) load8(at, g, h, wd, uint(y), uint(x), in8, v);
+        else { v[0] = f16vec2(0.0); v[1] = f16vec2(0.0); v[2] = f16vec2(0.0); v[3] = f16vec2(0.0); }
+        tileStore(px, g, v);
+    }
+    barrier();
+}
+#endif
+
+#ifdef TW
+// the 3x3 conv (CIN -> C) of the tile's pixels (ly + 4 i, lx) (block coordinates), the wave's 32 outputs
+void conv3x3(inout f16vec2 acc[PS][16], uint ly, uint lx, uint w1, uint wcol)
+{
+    [[dont_unroll]] for (uint t = 0u; t < 9u; ++t) {
+        const uint px = (ly + t / 3u) * uint(TW + 2) + lx + t % 3u;
+        [[dont_unroll]] for (uint g = 0u; g < uint(CIN) / 8u; ++g) {
+            f16vec2 v[PS][4];
+            [[unroll]] for (uint i = 0u; i < uint(PS); ++i) tileLoad(px + 4u * i * uint(TW + 2), g, v[i]);
+            fma8(acc, v, w1 + (t * uint(CIN) + g * 8u) * uint(C / 2), uint(C / 2), wcol);
+        }
+    }
+}
+#endif
+// conv 1x1 over the tile's rows (32 PS pixels, set i the pixels 32 i + lane), K channels, the wave's 32 outputs
+void conv1x1(inout f16vec2 acc[PS][16], uint lane, uint k, uint wrow, uint n, uint wcol)
+{
+    [[dont_unroll]] for (uint g = 0u; g < k / 8u; ++g) {
+        f16vec2 v[PS][4];
+        [[unroll]] for (uint i = 0u; i < uint(PS); ++i) tileLoad(32u * i + lane, g, v[i]);
+        fma8(acc, v, wrow + g * 8u * (n / 2u), n / 2u, wcol);
+    }
+}
+
+void main()
+{
+    const uint wv = wave(), l = lane();
+    f16vec2 acc[PS][16];
+    zero(acc);
+    const uvec2 m = morton(l);
+#if defined(MODE_ENC0)
+    // a 8 PS x 16 tile of L0: wave wv its 4 PS x 8 part, pixel set i the 4 x 8 block i of that
+    const uint wx = (wv & 1u) * 8u, wy = (wv >> 1u) * 4u * uint(PS);
+    const uint H0 = PH, W0 = PW;
+    loadTile(p[2], H0, W0, int(gl_WorkGroupID.y * uint(TH)), int(gl_WorkGroupID.x * 16u), false);
+    conv3x3(acc, wy + m.y, wx + m.x, p[6], 0u);
+    biasRelu(acc, p[7], 0u);
+    [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+        const uint x = gl_WorkGroupID.x * 16u + wx + m.x, y = gl_WorkGroupID.y * uint(TH) + wy + 4u * i + m.y;
+        storeAll(p[3], 0u, H0, W0, y, x, true, true, 32u, acc[i]);             // skip0: 8-bit, phases
+        pool4(acc[i]);
+        // the pooled L1 pixel of every lane quad into the tile's 4 PS x 8 L1 block (4 x 8 Morton blocks again)
+        if ((l & 3u) == 0u) {
+            const uint lx = (wv & 1u) * 4u + (m.x >> 1u), ly = (wv >> 1u) * 2u * uint(PS) + 2u * i + (m.y >> 1u);
+            const uint b = ly >> 2u, yy = ly & 3u;
+            const uint q = b * 32u + ((lx & 1u) | ((yy & 1u) << 1u) | ((lx & 2u) << 1u) | ((yy & 2u) << 2u) | ((lx & 4u) << 2u));
+            [[unroll]] for (uint j = 0u; j < 16u; ++j) sh[q * 18u + j] = acc[i][j];
+        }
+    }
+    barrier();
+    // conv 1x1 32 -> 64 at L1: wave wv the outputs 32 (wv & 1) .. +31 of the L1 block wv >> 1 (PS of them)
+    if (wv < 2u * uint(PS)) {
+        const uint b = wv >> 1u, hf = wv & 1u;
+        const uint x1 = gl_WorkGroupID.x * 8u + m.x, y1 = gl_WorkGroupID.y * 4u * uint(PS) + 4u * b + m.y;
+        f16vec2 a1[1][16];
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) a1[0][j] = f16vec2(0.0);
+        [[unroll]] for (uint g = 0u; g < 4u; ++g) {
+            const uint at = (b * 32u + l) * 18u + 4u * g;
+            f16vec2 v[1][4] = f16vec2[1][4](f16vec2[4](sh[at], sh[at + 1u], sh[at + 2u], sh[at + 3u]));
+#if PS == 1
+            fma8(a1, v, p[8] + g * 8u * 32u, 32u, hf * 16u);
+#else
+            // fma8 takes PS pixel sets: the second conv runs one set per wave
+            [[unroll]] for (uint kk = 0u; kk < 8u; ++kk) {
+                const uint r = p[8] + g * 8u * 32u + kk * 32u + hf * 16u;
+                const float16_t xv = (kk & 1u) == 0u ? v[0][kk >> 1u].x : v[0][kk >> 1u].y;
+                [[unroll]] for (uint j4 = 0u; j4 < 4u; ++j4) {
+                    const uvec4 qv = w4[r / 4u + j4];
+                    a1[0][4u * j4] = fma(f16vec2(xv), h2(qv.x), a1[0][4u * j4]);
+                    a1[0][4u * j4 + 1u] = fma(f16vec2(xv), h2(qv.y), a1[0][4u * j4 + 1u]);
+                    a1[0][4u * j4 + 2u] = fma(f16vec2(xv), h2(qv.z), a1[0][4u * j4 + 2u]);
+                    a1[0][4u * j4 + 3u] = fma(f16vec2(xv), h2(qv.w), a1[0][4u * j4 + 3u]);
+                }
+            }
+#endif
+        }
+        {
+            [[unroll]] for (uint j4 = 0u; j4 < 4u; ++j4) {
+                const uvec4 qv = w4[(p[9] + hf * 16u) / 4u + j4];
+                a1[0][4u * j4] = max(a1[0][4u * j4] + h2(qv.x), f16vec2(0.0));
+                a1[0][4u * j4 + 1u] = max(a1[0][4u * j4 + 1u] + h2(qv.y), f16vec2(0.0));
+                a1[0][4u * j4 + 2u] = max(a1[0][4u * j4 + 2u] + h2(qv.z), f16vec2(0.0));
+                a1[0][4u * j4 + 3u] = max(a1[0][4u * j4 + 3u] + h2(qv.w), f16vec2(0.0));
+            }
+        }
+        storeAll(p[4], hf * 4u, H0 / 2u, W0 / 2u, y1, x1, true, true, 64u, a1[0]);     // skip1: 8-bit, phases
+        pool4(a1[0]);
+        if ((l & 3u) == 0u) storeAll(p[5], hf * 4u, H0 / 4u, W0 / 4u, y1 >> 1u, x1 >> 1u, true, false, 64u, a1[0]);   // pool1
+    }
+#elif defined(MODE_ENC3)
+    // a 4 PS x 8 block of the level, wave wv the outputs 32 wv .. +31; skip (binary16, phases) and its pool (nchw8)
+    loadTile(p[2], PH, PW, int(gl_WorkGroupID.y * uint(TH)), int(gl_WorkGroupID.x * 8u), IN8 != 0);
+    conv3x3(acc, m.y, m.x, p[6], wv * 16u);
+    biasRelu(acc, p[7], wv * 16u);
+    [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+        const uint x = gl_WorkGroupID.x * 8u + m.x, y = gl_WorkGroupID.y * uint(TH) + 4u * i + m.y;
+        const bool inside = x < PW && y < PH;
+        if (inside) storeAll(p[3], wv * 4u, PH, PW, y, x, false, true, uint(C), acc[i]);
+        pool4(acc[i]);
+        if (inside && (l & 3u) == 0u) storeAll(p[4], wv * 4u, PH / 2u, PW / 2u, y >> 1u, x >> 1u, false, false, uint(C), acc[i]);
+    }
+#else
+    // a row-major run of 32 PS pixels (set i: 32 i + lane): its input staged in LDS once for all the waves
+    for (uint e = gl_LocalInvocationIndex; e < uint(32 * PS * CIN / 8); e += gl_WorkGroupSize.x) {
+        const uint q = gl_WorkGroupID.x * 32u * uint(PS) + e / uint(CIN / 8), g = e % uint(CIN / 8), qy = q / PW, qx = q % PW;
+        f16vec2 v[4];
+        if (qy >= PH) { v[0] = f16vec2(0.0); v[1] = f16vec2(0.0); v[2] = f16vec2(0.0); v[3] = f16vec2(0.0); }
+#if defined(MODE_UP1) || defined(MODE_DEC2)
+        else upSkip(g, qy, qx, v);
+#else
+        else load8(p[2], g, PH, PW, qy, qx, false, v);
+#endif
+        tileStore(e / uint(CIN / 8), g, v);
+    }
+    barrier();
+#if defined(MODE_DEC2)
+    // conv 1 (C outputs over C / 32 waves) into LDS, then conv 2 (C2 outputs over C2 / 32 waves)
+    if (wv < uint(C) / 32u) {
+        conv1x1(acc, l, uint(CIN), p[6], uint(C), wv * 16u);
+        biasRelu(acc, p[7], wv * 16u);
+    }
+    // All waves finish reading the input before the hidden layer reuses its padded LDS rows.
+    barrier();
+    if (wv < uint(C) / 32u) {
+        [[unroll]] for (uint i = 0u; i < uint(PS); ++i)
+            [[unroll]] for (uint g = 0u; g < 4u; ++g) {
+                f16vec2 v[4] = f16vec2[4](acc[i][4u * g], acc[i][4u * g + 1u], acc[i][4u * g + 2u], acc[i][4u * g + 3u]);
+                tileStore(32u * i + l, wv * 4u + g, v);
+            }
+    }
+    barrier();
+    if (wv < uint(C2) / 32u) {
+        zero(acc);
+        [[dont_unroll]] for (uint g = 0u; g < uint(C) / 8u; ++g) {
+            f16vec2 v[PS][4];
+            [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+                tileLoad(32u * i + l, g, v[i]);
+            }
+            fma8(acc, v, p[8] + g * 8u * uint(C2 / 2), uint(C2 / 2), wv * 16u);
+        }
+        biasRelu(acc, p[9], wv * 16u);
+        [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+            const uint px = gl_WorkGroupID.x * 32u * uint(PS) + 32u * i + l, y = px / PW, x = px % PW;
+            if (y < PH) storeAll(p[4], wv * 4u, PH, PW, y, x, OUT8 != 0, false, uint(C2), acc[i]);
+        }
+    }
+#else
+    conv1x1(acc, l, uint(CIN), p[6], uint(C), wv * 16u);
+    biasRelu(acc, p[7], wv * 16u);
+    [[unroll]] for (uint i = 0u; i < uint(PS); ++i) {
+        const uint px = gl_WorkGroupID.x * 32u * uint(PS) + 32u * i + l, y = px / PW, x = px % PW;
+        if (y < PH) storeAll(p[4], wv * 4u, PH, PW, y, x, false, false, uint(C), acc[i]);
+    }
+#endif
+#endif
+}

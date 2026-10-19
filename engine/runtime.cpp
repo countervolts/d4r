@@ -36,9 +36,24 @@ struct Device {
     VkDevice handle;
     VkPhysicalDeviceMemoryProperties memory;
     VkPhysicalDeviceProperties properties;
+    bool coopmat = false;
     Device(VkPhysicalDevice physical, VkDevice device) : handle(device) {
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
         vkGetPhysicalDeviceProperties(physical, &properties);
+#ifndef D4R_ENGINE_VK_TABLE
+        uint32_t count = 0;
+        VKCHECK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr));
+        std::vector<VkExtensionProperties> extensions(count);
+        VKCHECK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data()));
+        coopmat = std::any_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
+        });
+        if (const char* force = std::getenv("D4R_RR_TEST_NO_COOPMAT"))
+            if (std::strcmp(force, "1") == 0) coopmat = false;
+#endif
+        // The shim borrows a device whose enabled feature chain is unavailable here.
+        // CNN stages use the extension-free flavor instead of assuming physical support
+        // means VK_KHR_cooperative_matrix was enabled by the application.
     }
     VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags) const {
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
@@ -804,4 +819,5 @@ VkDeviceSize Engine::networkHeadBytes(uint32_t outputWidth, uint32_t outputHeigh
 VkDeviceSize Engine::activationBytes() const { return impl->activations; }
 #include "runtime_m.inc"
 #include "runtime_rr.inc"
+#include "runtime_e.inc"
 } // namespace d4r
