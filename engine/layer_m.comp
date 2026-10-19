@@ -213,6 +213,15 @@ HAC bias16(uint off, uint stride) { HAC b; coopMatLoad(b, w16.w, off / 4u, strid
 // straight from f32 into FP8, two elements per saturating conversion; the activation in f32 as well
 #define SAT2_(dst, i, v) { fe4m3vec2 t_; saturatedConvertEXT(t_, (v)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
 #define MK8_F8(dst, a) { SAT2_(dst, 0, vec2((a)[0], (a)[1])) SAT2_(dst, 2, vec2((a)[2], (a)[3])) SAT2_(dst, 4, vec2((a)[4], (a)[5])) SAT2_(dst, 6, vec2((a)[6], (a)[7])) }
+// SATF2_: the same for a value that is never infinite, written as "an infinity becomes NaN, then saturate", which RADV
+// turns into the hardware conversion with FP16_OVFL instead of a NaN-preserving clamp per element and the conversion
+// (f2e4m3fn_satfn; the same result for every finite value and NaN, engine/rr/rr_exact.glsl FINITE). Used for the
+// attention's f32 sums of FP8 products (MK8_F8F) and the normalised tokens: the norm sums the squares of the very
+// values it scales, so an infinite channel makes the reciprocal 0 and the product NaN, never infinite. The binary16
+// accumulators (q, the MLP, the expansion, the residual) can overflow to infinity and keep SAT2_.
+vec2 finite2_(vec2 v) { return vec2(isinf(v.x) ? uintBitsToFloat(0x7fc00000u) : v.x, isinf(v.y) ? uintBitsToFloat(0x7fc00000u) : v.y); }
+#define SATF2_(dst, i, v) { fe4m3vec2 t_; saturatedConvertEXT(t_, finite2_(v)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
+#define MK8_F8F(dst, a) { SATF2_(dst, 0, vec2((a)[0], (a)[1])) SATF2_(dst, 2, vec2((a)[2], (a)[3])) SATF2_(dst, 4, vec2((a)[4], (a)[5])) SATF2_(dst, 6, vec2((a)[6], (a)[7])) }
 #define GELU2_(dst, i, h) { const vec2 x_ = vec2((h)[i], (h)[(i) + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); \
     const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.08108133), vec2(0.41216981)), vec2(0.5)); SAT2_(dst, i, x_ * g_) }
 #define GELU8(dst, h) { GELU2_(dst, 0, h) GELU2_(dst, 2, h) GELU2_(dst, 4, h) GELU2_(dst, 6, h) }
@@ -222,12 +231,13 @@ HAC bias16(uint off, uint stride) { HAC b; coopMatLoad(b, w16.w, off / 4u, strid
     const float16_t q4_ = CL8(Q16((a)[4])), q5_ = CL8(Q16((a)[5])), q6_ = CL8(Q16((a)[6])), q7_ = CL8(Q16((a)[7])); \
     (dst)[0] = floate4m3_t(q0_); (dst)[1] = floate4m3_t(q1_); (dst)[2] = floate4m3_t(q2_); (dst)[3] = floate4m3_t(q3_); \
     (dst)[4] = floate4m3_t(q4_); (dst)[5] = floate4m3_t(q5_); (dst)[6] = floate4m3_t(q6_); (dst)[7] = floate4m3_t(q7_); }
+#define MK8_F8F MK8_F8
 #endif
 // the normalised tokens into FP8 (inside NM1 / N2: x0..x7 the token, g0 / g1 the gains)
 #ifdef M_RELAXED
 #define H1N(N, r_) { const float f_ = float(r_); \
-        SAT2_(h1[N], 0, vec2(x0, x1) * (f_ * vec2(g0.xy))) SAT2_(h1[N], 2, vec2(x2, x3) * (f_ * vec2(g0.zw))) \
-        SAT2_(h1[N], 4, vec2(x4, x5) * (f_ * vec2(g1.xy))) SAT2_(h1[N], 6, vec2(x6, x7) * (f_ * vec2(g1.zw))) }
+        SATF2_(h1[N], 0, vec2(x0, x1) * (f_ * vec2(g0.xy))) SATF2_(h1[N], 2, vec2(x2, x3) * (f_ * vec2(g0.zw))) \
+        SATF2_(h1[N], 4, vec2(x4, x5) * (f_ * vec2(g1.xy))) SATF2_(h1[N], 6, vec2(x6, x7) * (f_ * vec2(g1.zw))) }
 #else
 #define H1N(N, r_) { \
         h1[N][0] = floate4m3_t(CL8(x0 * float16_t(r_ * g0.x))); h1[N][1] = floate4m3_t(CL8(x1 * float16_t(r_ * g0.y))); \
@@ -635,7 +645,7 @@ void main()
         o[0] = coopMatMulAdd(vt0, pb, ACC(0.0));
         o[1] = coopMatMulAdd(vt1, pb, ACC(0.0));
         R16(o[0]); R16(o[1]);
-        MK8_F8(OB_[w][0], o[0]); MK8_F8(OB_[w][1], o[1]);
+        MK8_F8F(OB_[w][0], o[0]); MK8_F8F(OB_[w][1], o[1]);
         }
         // the output projection of this head's 32 attention channels, straight into the residual stream
 #define WO_N(N) { \
