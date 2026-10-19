@@ -629,3 +629,16 @@ byte-identical to the previous model on the replay and stress inputs, at levels 
   total with an atomic add and the last block finishing. It needs `shaderBufferInt64Atomics`, which vkd3d-proton
   enables; the shim reads the device's features through `GetDeviceFeatures`. Without it, or with a model that has no
   `exposure_f2.spv`, the two passes run (`D4R_RR_TEST_NO_INT64_ATOMICS=1` forces them). Exposure 25.2 -> 14.9 us.
+
+### Opt-in builds for preset F (2026-10-19)
+
+Against the default build, presented image, RGB, peak 1, 1280x720 -> 1440p. For scale, the exact build
+(`D4R_RR_RELAXED=0`) is 43.0 - 44.4 dB from the default.
+
+- `D4R_RR2_UNGUARDED=1` (level 3 only): the translated code (encoder 0's and decoder 0's per-pixel parts, the output
+  passes) without its exactness guards: no `precise`, no opaque zero on binary16 stores, no `spv_exact_convert.py`.
+  56.0 dB on the reset frame, then 43.0 - 45.6 dB, as far from the exact build as the default is. Frame 3.526 -> 3.501
+  ms.
+- `D4R_RR2_POOLED=rgb10_a2` (since 2026-10-13): the pooled histories as UNORM 10:10:10:2 images, 31 MB less at 1440p.
+  Identical at 1280x720 -> 1440p and on reset frames; 43.7 - 47.2 dB on the history frames at 1114x626 -> 1080p and
+  28.8 dB with random motion. Frame 3.526 -> 3.484 ms, 3.456 with `D4R_RR2_UNGUARDED=1` as well.

@@ -80,8 +80,9 @@ GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
 # D4R_RR2_SPLIT=1 / 0 forces the gather pass / the single shader.
 SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WAVE else '1') != '0'
 # The pooled histories as RGBA32F holding q / 1023, as ZLUDA backs them (16 bytes a pixel). D4R_RR2_POOLED=rgb10_a2
-# makes them real UNORM 10:10:10:2 images (0.1 ms faster at 4K), but the hardware's bilinear filter then rounds
-# differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13)
+# makes them real UNORM 10:10:10:2 images (0.1 ms faster at 4K, 70 MB less), but the hardware's bilinear filter then
+# rounds differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13); on
+# random-motion noise also at 2x (29 dB on the history frames, engine/rr/README.md)
 POOLED = os.environ.get('D4R_RR2_POOLED', 'rgba32f')
 SURFACES = {'dec0_1': {176: 'rgba8_snorm', 184: 'rgba8', 192: 'rgba8'}, 'post': {120: POOLED}, 'pooled': {8: POOLED}}
 # D4R_RR2_UNGUARDED=1 (opt-in, D4R_RR_RELAXED=3 only): the translated code (encoder 0's and decoder 0's per-pixel parts,
