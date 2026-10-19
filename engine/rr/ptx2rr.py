@@ -8,6 +8,11 @@ implements the stage contract of engine/rr/README.md: binding 0 = parameter bloc
 binding 1 = weight buffer (argument 40), binding 2 = plane arena, then textures and
 surfaces in ascending argument offset. One PTX block is one workgroup of X*Y*Z invocations.
 
+Adjacent m16n8k32 mma statements that share their A fragment are translated as one paired product (pair_mma);
+D4R_PTX2RR_NO_PAIR=1 translates each on its own, for debugging the pairing. Only the translated network stages
+contain these (compile_rr.py from a capture); the native builds (build_native_model.sh, compile_rr2.py) replace those
+stages, so their shaders do not change with it.
+
 The generated shader is derived from the user's own DLL and is model data: write it to the
 model/build directory only; do not commit or redistribute it.
 """

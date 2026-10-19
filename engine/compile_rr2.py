@@ -70,7 +70,8 @@ NATIVE = ['enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4_0', 'dec4_1', 'dec3_0', 
 KERNEL['downp'] = 'rr2_downsample_kernel_static_hdr'
 BLOCK['downp'] = '16,16,1'
 BUFFERS['downp'] = [72, 168, 176]
-# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py)
+# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py);
+# D4R_RR2_TAIL_WAVES: dec0_1's tail on that many of the four-wave block's waves (the one-wave block ignores it)
 HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1', '--tail-waves', os.environ.get('D4R_RR2_TAIL_WAVES', '2')]}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
