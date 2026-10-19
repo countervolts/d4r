@@ -707,3 +707,51 @@ during the MLP, for fewer registers (same time); the image size read once per te
 fetch (within noise); a driver without the RDNA4 hazard waits for SGPRs read by the VALU saves 2 - 4 us per
 translated stage, so avoiding them is not worth much. Not done: the output filter's refinement loop runs until the
 slowest lane of a wave converges; regrouping pixels by iteration count would save an estimated 25 us.
+
+### Where the time of the top stages goes, and the encoder-0 order (2026-10-20, evening)
+
+Same setup (RX 9070 XT, RADV 26.2.2 with the round-5b GL2 change, 1280x720 -> 2560x1440 game-like input, opt-in
+build, `D4R_RR_TEST_ROBUST2=1`, median of 3 - 6 interleaved runs). Before writing more peepholes, each of the top
+stages was timed with stub variants of its shader: stores behind an opaque false, texel fetches or arena reads
+replaced by cheap arithmetic, every weight tile read from one hot 4 KiB (distinct loads, no CSE), the cubic table
+lookups replaced by the value, one head / no MLP branches, extra shared memory to cut the waves per SIMD, the
+shader returning at once. The variants' outputs are wrong, so only the stage's own time counts, and only for stages
+without data-dependent loops (the native blocks, the gather, the decoder tail; not post and down, whose refinement
+loops run longer or shorter with the data they get, see below).
+
+| Stage (us) | Without stores | Without arena / fetches | Weights hot | Without cubic lookups | Half the waves per SIMD | Everything but the arithmetic removed |
+|---|---|---|---|---|---|---|
+| dec0_1 369 | 366 | 337 (tokens) | 344 | 332 | 484 (4 waves) / 882 (2) | 308 |
+| dec0_0 317 | 315 | 308 | 308 | 285 | - | 282 |
+| enc0 block ~339 | ~317 | ~242 (the gather's record) | ~318 | ~308 | +118 (3 waves) | ~215 |
+| enc0 gather ~255 | ~208 | ~161 (fetches) | - | - | +334 (2 waves) | ~150 |
+
+So decoder 0's two kernels and encoder 0's block are bound by their own VALU and WMMA issue (83 - 89% of their time
+is left with every memory access removed; a WMMA 16x16x16 FP8 costs about 16 cycles of the SIMD on this GPU, a
+quarter of the block's instruction time), and lose about a third more with half the waves: more waves would help,
+but shared memory (4 KiB a wave, 32 KiB a SIMD) and 192 - 240 registers cap them at 6 - 8. The gather is VALU and
+SALU issue plus its fetches. The record encoder 0's block reads (73 MB a frame, written by the gather just before)
+is the one stage that reads from DRAM: the block's windows now run in the reverse of the gather's dispatch order
+(`gen_rr2_enc0.py --split block`), so that the records written last are read first while they are still in the
+64 MB last-level cache: encoder 0 597 -> 576 us, frame 2.985 -> 2.961 ms (6 interleaved runs). The levels' kernels are unchanged in what
+they compute; every image of every frame is byte-identical to the previous model on the 7 input sets, with and
+without `D4R_RR_TEST_ROBUST2=1`, for the opt-in, default and exact builds (presets D and E do not use this
+generator; their models are file-identical).
+
+The deep levels (3 - 5, 274 us in 7 dispatches) are not latency-bound in the way assumed: a dispatch of an empty
+shader costs 1 us, and a window's four waves run on one CU with nothing else to do, so level 5's 24 windows use 24
+of 64 CUs at full tilt (its time is the same at 540p, 720p and 1080p). The output filter (post, ~400 us) is where
+the data matters: its refinement loop runs until a wave's slowest lane converges, and a stub that changes the
+half-size history it reads next frame changes its time by up to 100 us, which looked like a store cost until the
+same stores to a buffer, copied to the image by a pass of their own, cost exactly as much once the history was
+right.
+
+Tried, no gain (all byte-identical where they ran): the cubic numerator computed in packed binary16 arithmetic
+instead of looked up (identical on all 65536 inputs; dec0_1 +7 us, dec0_0 +3, enc0 +9: the gathers hit the L0
+cache); the deep levels with their heads and MLP branches on 2 - 4 groups of waves, folded in order through shared
+memory (enc3 55 -> 77 / 103 us: one workgroup stays on one CU); 2 - 4 windows per workgroup for the same reason
+(enc5 29 -> 102 us); the half-size history stored to the arena by the filter and written to its image by a copy
+pass (+23 us for the pass, the filter unchanged); encoder 0's gather and block in 4 - 32 bands of rows with the
+block of a band next to the gather of the next (-15 us with 4 bands, worse beyond: each band's barrier drains the
+GPU); encoder 0 fused into one shader again (607 us against 575). Decoder 0's two kernels in reverse order gain
+nothing (their tokens are still cached).
