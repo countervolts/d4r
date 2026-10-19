@@ -57,6 +57,7 @@ layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
 layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
 layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
 layout(set = 0, binding = 1, std430) readonly buffer W8U { uint8_t w[]; } w8u;
+layout(set = 0, binding = 1, std430) readonly buffer W32F { float w[]; } w32f;
 layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -84,10 +85,6 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #endif
 // RR_NATIVE (D4R_RR_RELAXED=3): the residual steps and the MLP activation in f32, straight into FP8 - no binary16 in
 // between and no activation table. Not the reference's roundings (about 40 dB from it, like RR_RELAXED).
-// (The biases stay binary16: f32 copies were tried for RR_NATIVE and were slower - half the conversions, but one more
-// load per accumulator, and a load costs about three arithmetic instructions here.)
-#define BV(X, i) RV(w16.w[W_##X / 2u + (i)])
-#define BVS(X, stride, n, i) RV(w16.w[(W_##X + (stride) * (n)) / 2u + (i)])
 #ifdef RR_NATIVE
 #define RVT float
 #define E4V(w, b) float(uintBitsToFloate4m3EXT(uint8_t(((w) >> (8u * (b))) & 0xffu)))
@@ -107,6 +104,15 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
 #endif
 // once (swin_m.comp explains RR_MIX, the one-rounding variant that is not bit-exact by construction)
+// The biases: binary16 for RR_MIX's binary16 accumulators, otherwise their float32 copies (rr2_pack.py "_f", the same
+// values), with no conversion per element; a bias tile's copy is column-major, a lane's eight values in one place.
+#ifdef RR_MIX
+#define BV(X, i) RV(w16.w[W_##X / 2u + (i)])
+#define BVS(X, stride, n, i) RV(w16.w[(W_##X + (stride) * (n)) / 2u + (i)])
+#else
+#define BV(X, i) w32f.w[W_##X##_F / 4u + (i)]
+#define BVS(X, stride, n, i) w32f.w[(W_##X##_F + (stride) * (n)) / 4u + (i)]
+#endif
 #ifdef RR_MIX
 #define RAC HAC
 #define RV(x) (x)
@@ -394,8 +400,17 @@ void main()
                 coopMatLoad(k0, KVS, KVA(kt * 128u), 8u, RM);
                 coopMatLoad(k1, KVS, KVA(kt * 128u + 4u), 8u, RM);
                 HAC c;
+#ifdef RR_MIX
                 coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
                 K32H(c, k0, Qb[0], k1, Qb[1])
+#else
+                {   // the bias tile's float32 copy, [key tile][query tile] column-major (rr2_pack.py): K32H without its widening
+                    ACC b_;
+                    coopMatLoad(b_, w32f.w, (W_BIAS0_F + HEAD * hd) / 4u + (kt * 4u + wv) * 256u, 16u, CMJ);
+                    ACC p_ = coopMatMulAdd(k1, Qb[1], coopMatMulAdd(k0, Qb[0], b_));
+                    [[unroll]] for (int i_ = 0; i_ < 8; ++i_) c[i_] = float16_t(p_[i_]);
+                }
+#endif
                 [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(c[i])]));
             }
             // key slot 16kt + 8hl + i is NVIDIA's column 8j + 2tt + half with j = 4(kt >> 1) + (kt & 1) + 2((i >> 1) & 1),
