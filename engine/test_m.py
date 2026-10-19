@@ -90,7 +90,7 @@ def defines(name):
     # compile_m.py's arithmetic (ZLUDA's lowering); M_TEXL=0 gives the native accuracy kernels' for the network layers.
     # M_DEFS: extra defines for every layer_m.comp stage; M_DEFS_ENC1, M_DEFS_ENC3_TUBE, ...: for one layer
     texl = ['-DTEXL=1'] if kind >= 3 or os.environ.get('M_TEXL', '1') != '0' else []
-    # M_WPW=2: two 4x4-token windows per wave in the network layers (layer_m.comp WPW; not L's input / expansion)
+    # M_WPW=2: two 4x4-token windows per wave in the network layers (layer_m.comp WPW; L's input / expansion: M_DEFS_*)
     wpw = [f"-DWPW={os.environ['M_WPW']}"] if kind < 3 and os.environ.get('M_WPW') else []
     return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}'] + texl + wpw + os.environ.get('M_DEFS', '').split() + os.environ.get('M_DEFS_' + name.upper(), '').split()
 

@@ -3385,6 +3385,9 @@ struct VulkanInterop
     // VK_EXT_shader_float8 (vkd3d-proton enables it when the GPU has it): M's and L's engine layers are FP8
     // cooperative-matrix shaders, which RADV's compiler crashes on without it (RDNA3)
     bool float8 = false;
+    // shaderBufferInt64Atomics is enabled on vkd3d-proton's device (it enables it when the GPU has it): Ray
+    // Reconstruction preset F then measures the exposure in one pass, as NGX does, instead of two
+    bool int64Atomics = false;
     // The engine runs on the game's own Vulkan device (native Vulkan NGX frontend): no vkd3d interop objects.
     bool native = false;
     PFN_vkGetPhysicalDeviceFormatProperties formatProperties = nullptr;
@@ -9322,6 +9325,17 @@ static void init_engine_vulkan()
     }
     logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)" : "unavailable: "
          "M and L run on the CUDA backend");
+    // the features vkd3d-proton created its device with
+    const VkPhysicalDeviceFeatures2* features = nullptr;
+    if (SUCCEEDED(g_vk.interop->GetDeviceFeatures(&features)) && features != nullptr)
+        for (auto* next = static_cast<const VkBaseInStructure*>(features->pNext); next != nullptr; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                g_vk.int64Atomics = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(next)->shaderBufferInt64Atomics == VK_TRUE;
+            if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES)
+                g_vk.int64Atomics = reinterpret_cast<const VkPhysicalDeviceShaderAtomicInt64Features*>(next)->shaderBufferInt64Atomics == VK_TRUE;
+        }
+    logf("engine backend: 64-bit buffer atomics %s", g_vk.int64Atomics ? "enabled" : "not enabled: preset F's exposure in two passes");
 }
 
 static void init_engine_backend()
@@ -10316,7 +10330,7 @@ static void init_engine_backend_rr(int slot)
     const auto start = std::chrono::steady_clock::now();
     try
     {
-        auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path);
+        auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, g_vk.int64Atomics);
         if (model->preset() != g_rrPreset[slot])
             throw std::runtime_error("the directory holds a model of another preset");
         g_engineR.models[slot] = std::move(model);

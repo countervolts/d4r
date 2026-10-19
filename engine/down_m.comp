@@ -4,6 +4,7 @@
 // five-tap filter whose weights depend on the output pixel's parity, limits each pass to the range of its taps
 // (no ringing), and undoes the range compression and the exposure.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
 #include "output_store.glsl"
 // LDR (NGX's *_ldr_* kernel): the packed image is the display-referred colour itself.
@@ -13,8 +14,7 @@
 // D4RM0003: the runtime dispatches 8x64 output pixels per workgroup.
 #define BLOCK_X 8
 #define BLOCK_Y 64
-#define TILE_W (3 * BLOCK_X / 2 + 4)
-#define TILE_H (3 * BLOCK_Y / 2 + 4)
+#define TILE_H (3 * BLOCK_Y / 2 + 4)     // source rows of the block
 layout(local_size_x = BLOCK_X, local_size_y = BLOCK_Y) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
@@ -27,8 +27,19 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
 layout(set = 0, binding = 1) uniform sampler2D colorTex;        // render resolution; its alpha is passed through
 layout(set = 0, binding = 2, FINAL_OUTPUT_FORMAT) uniform writeonly image2D outImg;
 layout(set = 0, binding = 3, std430) readonly buffer Src { uint w[]; } src;
-shared f16vec4 tile[TILE_W * TILE_H];       // source texels around the block
 shared f16vec4 rows[TILE_H * BLOCK_X];      // after the horizontal pass
+// The horizontal pass reads the source texels straight into registers, without a shared tile: an invocation filters
+// SEG output columns of one source row from the 3 SEG / 2 + 4 texels around them.
+#define SEG 4
+#define SPAN (3 * SEG / 2 + 4)
+f16vec3 unpack(uint w)
+{
+#if LDR
+    return f16vec3(vec3(float(w & 2047u) * (1.0 / 2047.0), float((w >> 11) & 2047u) * (1.0 / 2047.0), float(w >> 22) * (1.0 / 1023.0)));
+#else
+    return f16vec3(vec3(float(w & 2047u) * 0.0011968734906986356, float((w >> 11) & 2047u) * 0.0011968734906986356, float(w >> 22) * 0.002394916955381632));
+#endif
+}
 // weights of taps -2 .. +2 for an even output coordinate; an odd one uses them mirrored
 // as binary16 bit patterns: NGX rounds its f32 constants to the nearest binary16 (cvt.rn), while glslang folds
 // float16_t(<literal>) toward zero (W0 became -0.041321 instead of -0.041351: 6% of the captured frame's outputs
@@ -49,25 +60,27 @@ void main()
 {
     const ivec2 lid = ivec2(gl_LocalInvocationID.xy), pix = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 base = ivec2(3 * BLOCK_X / 2, 3 * BLOCK_Y / 2) * ivec2(gl_WorkGroupID.xy) - 2;
-    for (int i = lid.y * BLOCK_X + lid.x; i < TILE_W * TILE_H; i += BLOCK_X * BLOCK_Y)
+    // the horizontal pass, SEG output columns x0 .. x0 + SEG - 1 of source row y per item
+    const int zero = int(gl_NumWorkGroups.z) - 1;
+    for (int item = lid.y * BLOCK_X + lid.x; item < TILE_H * (BLOCK_X / SEG); item += BLOCK_X * BLOCK_Y)
     {
-        const ivec2 at = clamp(base + ivec2(i % TILE_W, i / TILE_W), ivec2(0), p.srcSize - 1);
-        const uint w = src.w[at.y * p.srcSize.x + at.x];
-#if LDR
-        tile[i] = f16vec4(vec4(float(w & 2047u) * (1.0 / 2047.0), float((w >> 11) & 2047u) * (1.0 / 2047.0), float(w >> 22) * (1.0 / 1023.0), 0.0));
-#else
-        tile[i] = f16vec4(vec4(float(w & 2047u) * 0.0011968734906986356, float((w >> 11) & 2047u) * 0.0011968734906986356, float(w >> 22) * 0.002394916955381632, 0.0));
-#endif
+        const int y = item / (BLOCK_X / SEG), x0 = item % (BLOCK_X / SEG) * SEG;
+        const int row = clamp(base.y + y, 0, p.srcSize.y - 1) * p.srcSize.x;
+        f16vec3 t[SPAN];
+        [[unroll]] for (int k = 0; k < SPAN; ++k)
+            t[k] = unpack(src.w[row + clamp(base.x + 3 * x0 / 2 + k, 0, p.srcSize.x - 1)]);
+        [[unroll]] for (int q = 0; q < SEG; ++q)
+        {
+            // column x0 + q (as even as q) is centred on texel 3 (q / 2) + 2 (q & 1) + 2 of the item's. Its parity stays a
+            // run-time value: with constant weights the compiler shares products between neighbouring filters and
+            // splits their fused multiply-adds (30% of the outputs change)
+            const int o = 3 * (q >> 1) + 2 * (q & 1) + 2;
+            rows[y * BLOCK_X + x0 + q].rgb = filter5(t[o - 2], t[o - 1], t[o], t[o + 1], t[o + 2], ((q + zero) & 1) != 0);
+        }
     }
     memoryBarrierShared(); barrier();
     const ivec2 c = ivec2(floor((vec2(pix) + 0.5) * 1.5)) - base;
-    for (int y = lid.y; y < TILE_H; y += BLOCK_Y)
-    {
-        const int o = y * TILE_W + c.x;
-        rows[y * BLOCK_X + lid.x].rgb = filter5(tile[o - 2].rgb, tile[o - 1].rgb, tile[o].rgb, tile[o + 1].rgb, tile[o + 2].rgb, (pix.x & 1) != 0);
-    }
-    memoryBarrierShared(); barrier();
-    // After both shared barriers: borrowed images may extend beyond the feature's true output rectangle.
+    // After the shared barrier: borrowed images may extend beyond the feature's true output rectangle.
     // M accepts even output dimensions and srcSize = outputSize/2*3, so this bounds check is exact.
     if (3 * pix.x >= 2 * p.srcSize.x || 3 * pix.y >= 2 * p.srcSize.y) return;
     const int o = c.y * BLOCK_X + lid.x;

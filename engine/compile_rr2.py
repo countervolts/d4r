@@ -12,7 +12,7 @@ D4R_CUDA_REPLAY_DUMP_FILTER=rr2 D4R_CUDA_LAUNCH_STATS_FILTER=rr2 and preset hint
                        table of its PTX module; enc0-aux.bin is encoder 0's second table (argument 104)
   <stage>.args         the argument block of the capture's frame, pointers and handles cleared: the runtime keeps its
                        constants and fills what depends on the frame or the geometry (engine/runtime_rr2.inc)
-  exposure_f0.spv, exposure_f1.spv   engine/rr/exposure_f.comp
+  exposure_f0.spv, exposure_f1.spv   engine/rr/exposure_f.comp (exposure_f2.spv: both in one, 64-bit atomics)
   rr.txt               the manifest RModel reads ("D4RR0002")
 With --native, the stages engine/rr/rr2_m.comp implements (enc1 ... enc5, dec4 ... dec1, dec0's first kernel) are that
 shader with weights read from the DLL itself (engine/rr/rr2_pack.py) instead of the translation: bit-identical to
@@ -249,7 +249,7 @@ def main():
         if hybrid and split:   # the same block, bindings and regions; "rN": N words per window record, "s3": in three ranges
             lines.append(f'stage enc0g enc0g.spv 32 - {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"} r{record} s3')
         print(f'{stage}: {kernel}, {len(args)} argument bytes' + (' (native block)' if hybrid else ''))
-    for p in (0, 1):
+    for p in (0, 1, 2):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-DPASS={p}',
                         str(HERE / 'rr' / 'exposure_f.comp'), '-o', str(out / f'exposure_f{p}.spv')],
                        check=True, stdout=subprocess.DEVNULL)

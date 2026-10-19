@@ -121,31 +121,49 @@ void sust_p1(writeonly image2D s, int x, int y, float v) { sust_p4(s, x, y, vec4
 // UNORM 10:10:10:2 surfaces (the pooled histories) are RGBA32F images holding the quantised values, like ZLUDA's.
 // tanh.approx.f32 as the reference computes it: ROCm's OCML tanh (device-libs ocml/src/tanhF.cl) with LLVM's AMDGPU
 // lowering of exp (lowerFEXP, fast-FMA path): the same fused operations, hardware exp2, ldexp and reciprocal.
-// (a fused f32 a * b + c through f64: the product is exact there and the sum is rounded to 53 bits before the f32
-// rounding. The driver's own f32 fma is a product and a sum whenever its product also exists on its own, as in
-// exp's ph / fma(x, c, -ph) pair.)
-float fmad(float a, float b, float c) { precise double s = double(a) * double(b) + double(c); return float(s); }
+// Up to 2026-10-19 every fused operation went through f64 (the product exact there, the sum rounded to 53 bits, then
+// to f32), which this GPU runs at a small fraction of the f32 rate. They are the driver's f32 fma now, with two
+// exceptions that keep every result bit for bit what it was, on all 2^32 arguments (RX 9070 XT, RADV; NaN payloads
+// included):
+// - the polynomial stays in f64: the driver drops the f32 rounding between nested f64 operations (it folds
+//   f2f64(f2f32(x)) to x; the conversions are not NoContraction), so its four nested steps always ran in f64 with one
+//   rounding at the end. In f32 (true fma), 24,836 arguments round one f32 step differently, 2 of them in binary16.
+// - exp's error term fma(w, c, -ph) next to ph = w * c: the driver makes that the product it already has and a sum,
+//   exactly 0, even with every operand precise or opaque. It is Dekker's exact product error: w split into two halves
+//   of 12 bits (w * 4097 = w * (2^12 + 1)), log2(e) into 1.4423828125 + 0.0003122091293334961 (11 and 12 bits), so
+//   every partial product is exact and so is each sum.
+// A NaN argument keeps its payload, quieted and positive, as the f64 conversion left it.
 float tanh_ocml(float x)
 {
     const float y = abs(x);
     precise float z;
     if (y < 0.625) {
         precise float y2 = y * y;
-        precise float p = fmad(y2, fmad(y2, fmad(y2, fmad(y2, -0.005700020585209131, 0.02063407190144062), -0.053737930953502655), 0.13331416249275208), -0.3333328068256378);
+        precise double y2d = double(y2);
+        precise double pd = (((y2d * -0.005700020585209131 + 0.02063407190144062) * y2d - 0.053737930953502655) * y2d +
+                             0.13331416249275208) * y2d - 0.3333328068256378;
+        precise float p = float(pd);
         precise float yp = y * p;
-        z = fmad(y2, yp, y);
+        z = fma(y2, yp, y);
     } else {
         const float w = 2.0 * y;
         precise float ph = w * 1.4426950216293335;
-        precise float f0 = fmad(w, 1.4426950216293335, -ph);
-        precise float pl = fmad(w, 1.925962855864327e-08, f0);
+        precise float wt = w * 4097.0;
+        precise float wh = wt - (wt - w);
+        precise float wl = w - wh;
+        precise float f1 = wh * 1.4423828125 - ph;
+        precise float f2 = f1 + wh * 0.0003122091293334961;
+        precise float f3 = f2 + wl * 1.4423828125;
+        precise float f0 = f3 + wl * 0.0003122091293334961;
+        precise float pl = fma(w, 1.925962855864327e-08, f0);
         const float e = roundEven(ph);
         precise float d = ph - e;
         precise float a = d + pl;
         float t = ldexp(exp2(a), int(e));
         if (w > 88.72283172607422) t = uintBitsToFloat(0x7f800000u);
         precise float s1 = t + 1.0;
-        z = fmad(-2.0, rcp_a(s1), 1.0);
+        z = fma(-2.0, rcp_a(s1), 1.0);
+        if (isnan(z)) z = uintBitsToFloat(floatBitsToUint(y) | 0x00400000u);
     }
     return x < 0.0 || floatBitsToUint(x) == 0x80000000u ? -z : z;
 }

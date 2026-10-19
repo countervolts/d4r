@@ -512,9 +512,12 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     auto& e = *impl; auto& m = e.model;
     if (e.external) throw std::runtime_error("this engine's network is external: record the front and the back");
     recordFront(cb, stamps, first);
+    // timing only: D4R_ENGINE_M_LAYER_STAMPS=1 also stamps after every network layer, from query first + 7 on
+    static const bool layerStamps = std::getenv("D4R_ENGINE_M_LAYER_STAMPS") != nullptr;
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
         dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); emptyStage(cb);
+        if (stamps && layerStamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, first + 7 + l);
     }
     recordBack(cb, stamps, stamps ? first + 3 : 0);
 }
@@ -525,11 +528,24 @@ std::vector<MEngine::DebugResource> MEngine::debugResources() const {
     std::vector<DebugResource> r{{"enc0-params", e.enc0P.handle, VK_NULL_HANDLE, e.enc0P.size, 0, 0},
                                  {"tokens", e.tokens.handle, VK_NULL_HANDLE, e.tokens.size, 0, 0},
                                  {"head", e.dec1Out.handle, VK_NULL_HANDLE, e.dec1Out.size, 0, 0},
+                                 // the network's own activations, layer by layer
+                                 {"skip1", e.skip1.handle, VK_NULL_HANDLE, e.skip1.size, 0, 0},
+                                 {"merged1", e.merged1.handle, VK_NULL_HANDLE, e.merged1.size, 0, 0},
+                                 {"skip2", e.skip2.handle, VK_NULL_HANDLE, e.skip2.size, 0, 0},
+                                 {"merged2", e.merged2.handle, VK_NULL_HANDLE, e.merged2.size, 0, 0},
+                                 {"tubeA", e.tubeA.handle, VK_NULL_HANDLE, e.tubeA.size, 0, 0},
+                                 {"tubeB", e.tubeB.handle, VK_NULL_HANDLE, e.tubeB.size, 0, 0},
+                                 {"dec2", e.dec2Out.handle, VK_NULL_HANDLE, e.dec2Out.size, 0, 0},
                                  {"gates", VK_NULL_HANDLE, e.gates.handle, VkDeviceSize(w) * h * 4, w, h},
                                  {"mix", VK_NULL_HANDLE, e.mix.handle, VkDeviceSize(w) * h * 4, w, h},
                                  {"cov", VK_NULL_HANDLE, e.cov.handle, VkDeviceSize(w) * h * 8, w, h},
                                  {"mvA", VK_NULL_HANDLE, e.mvA[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
-                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h}};
+                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
+                                 // the reconstruction's outputs: the history, its half-resolution mean and the packed
+                                 // image the downsample reads
+                                 {"hist", VK_NULL_HANDLE, e.hist[1 - e.current].handle, VkDeviceSize(e.hw) * e.hh * 8, e.hw, e.hh},
+                                 {"half", VK_NULL_HANDLE, e.half[1 - e.current].handle, VkDeviceSize(e.hw / 2) * (e.hh / 2) * 16, e.hw / 2, e.hh / 2},
+                                 {"packed", e.packed.handle, VK_NULL_HANDLE, e.packed.size, 0, 0}};
     if (e.model.presetL) r.push_back({"skip", e.skipL.handle, VK_NULL_HANDLE, e.skipL.size, 0, 0});
     return r;
 }

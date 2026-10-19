@@ -273,7 +273,10 @@ struct RFrameSettings {
 };
 class RModel {
 public:
-    RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    // int64Atomics: the device has shaderBufferInt64Atomics enabled; preset F then measures the exposure in one pass
+    // (engine/rr/exposure_f.comp PASS 2) instead of two
+    RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+           bool int64Atomics = false);
     ~RModel();
     RModel(const RModel&) = delete;
     RModel& operator=(const RModel&) = delete;

@@ -44,9 +44,10 @@ struct R2Model {
     Buffer aux;                   // encoder 0's second table (argument 104)
     std::vector<char> auxPending;
     std::array<Pipeline, 2> exposure;
+    Pipeline exposureOne;         // both exposure passes in one (exposure_f2.spv, 64-bit atomics); else null
     bool particles = false;       // the model has R2DownP
     bool gather = false;          // the model has R2Gather
-    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache) {
+    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache, bool int64Atomics) {
         const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         auto split = [](const std::string& list) {
             std::vector<std::string> items;
@@ -108,6 +109,8 @@ struct R2Model {
         blob(aux, auxPending, read(directory + "/enc0-aux.bin"));
         exposure[0].create(d.handle, directory + "/exposure_f0.spv", {b, t, b}, 64, cache);
         exposure[1].create(d.handle, directory + "/exposure_f1.spv", {b, b, b, t, s}, 64, cache);
+        if (int64Atomics && exists(directory + "/exposure_f2.spv"))
+            exposureOne.create(d.handle, directory + "/exposure_f2.spv", {b, t, b, b, t, s}, 64, cache);
     }
     void recordUpload(VkCommandBuffer cb) {   // the weights into the command buffer (recordContents)
         for (auto& st : stages) recordContents(cb, st.weights, st.pending);
@@ -172,7 +175,7 @@ struct R2Engine {
         std::vector<VkDescriptorSet> down;
         std::vector<std::array<VkDescriptorSet, 2>> downP;
         VkDescriptorSet pooled = VK_NULL_HANDLE, exposure0 = VK_NULL_HANDLE;
-        std::array<VkDescriptorSet, 2> exposure1{};
+        std::array<VkDescriptorSet, 2> exposure1{}, exposureOne{};
     };
     std::vector<Bindings> bindings;
     const Bindings* bound = nullptr;
@@ -337,7 +340,7 @@ struct R2Engine {
         exposure.blocksX = (rw + 15) / 16; exposure.blocks = exposure.blocksX * ((rh + 15) / 16);
         exposure.last[0] = static_cast<int32_t>(rw - 1); exposure.last[1] = static_cast<int32_t>(rh - 1);
         exposure.invCount = static_cast<float>(10000.0 / (4294967296.0 * rw * rh));
-        sums.create(d, exposure.blocks * 8, storage);
+        sums.create(d, std::max(exposure.blocks, 2u) * 8, storage);   // the one-pass exposure: the total and the count
         const size_t tiles = src.size();
         auto place = [&](size_t bytes) { const VkDeviceSize at = paramBytes; paramBytes += (bytes + 255) & ~VkDeviceSize(255); return at; };
         for (unsigned i = 0; i < R2Network; ++i) { blocks[i] = model.stages[i].args; paramAt[i] = place(blocks[i].size()); }
@@ -593,17 +596,29 @@ struct R2Engine {
                     b.downP.push_back({stageSet(b, R2DownP, downPAt[i], 0, output), stageSet(b, R2DownP, downPAt[i], 1, output)});
             }
             b.pooled = stageSet(b, R2Pooled, pooledAt, 0, output);
-            b.exposure0 = descriptorSet(d.handle, b.pool, model.exposure[0].descriptors);
-            bindRange(d.handle, b.exposure0, 0, paramAll, expAt);
-            bindImage(d.handle, b.exposure0, 1, images.color, nearest, images.layout);
-            bindBuffer(d.handle, b.exposure0, 2, sums);
-            for (uint32_t par = 0; par < 2; ++par) {
-                VkDescriptorSet set = b.exposure1[par] = descriptorSet(d.handle, b.pool, model.exposure[1].descriptors);
-                bindRange(d.handle, set, 0, paramAll, expAt);
-                bindBuffer(d.handle, set, 1, sums);
-                bindBuffer(d.handle, set, 2, values);
-                bindImage(d.handle, set, 3, e[par ^ 1].view, nearest);
-                bindImage(d.handle, set, 4, e[par].view);
+            if (model.exposureOne.handle)
+                for (uint32_t par = 0; par < 2; ++par) {
+                    VkDescriptorSet set = b.exposureOne[par] = descriptorSet(d.handle, b.pool, model.exposureOne.descriptors);
+                    bindRange(d.handle, set, 0, paramAll, expAt);
+                    bindImage(d.handle, set, 1, images.color, nearest, images.layout);
+                    bindBuffer(d.handle, set, 2, sums);
+                    bindBuffer(d.handle, set, 3, values);
+                    bindImage(d.handle, set, 4, e[par ^ 1].view, nearest);
+                    bindImage(d.handle, set, 5, e[par].view);
+                }
+            else {
+                b.exposure0 = descriptorSet(d.handle, b.pool, model.exposure[0].descriptors);
+                bindRange(d.handle, b.exposure0, 0, paramAll, expAt);
+                bindImage(d.handle, b.exposure0, 1, images.color, nearest, images.layout);
+                bindBuffer(d.handle, b.exposure0, 2, sums);
+                for (uint32_t par = 0; par < 2; ++par) {
+                    VkDescriptorSet set = b.exposure1[par] = descriptorSet(d.handle, b.pool, model.exposure[1].descriptors);
+                    bindRange(d.handle, set, 0, paramAll, expAt);
+                    bindBuffer(d.handle, set, 1, sums);
+                    bindBuffer(d.handle, set, 2, values);
+                    bindImage(d.handle, set, 3, e[par ^ 1].view, nearest);
+                    bindImage(d.handle, set, 4, e[par].view);
+                }
             }
             bindings.push_back(std::move(b));
             found = bindings.end() - 1;
@@ -675,9 +690,15 @@ struct R2Engine {
             vkCmdUpdateBuffer(cb, paramAll.handle, at, std::min<VkDeviceSize>(65536, paramBytes - at), all.data() + at);
         memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        dispatch(cb, model.exposure[0], b.exposure0, exposure.blocksX, exposure.blocks / exposure.blocksX);
-        step();
-        dispatch(cb, model.exposure[1], b.exposure1[cur], 1, 1);
+        // the exposure: one pass with 64-bit atomics (the last block finishes, as NGX's kernel), or the block sums and
+        // one workgroup that adds them
+        if (model.exposureOne.handle)
+            dispatch(cb, model.exposureOne, b.exposureOne[cur], exposure.blocksX, exposure.blocks / exposure.blocksX);
+        else {
+            dispatch(cb, model.exposure[0], b.exposure0, exposure.blocksX, exposure.blocks / exposure.blocksX);
+            step();
+            dispatch(cb, model.exposure[1], b.exposure1[cur], 1, 1);
+        }
         step();
         stamp(1);
         for (unsigned stage = 0; stage < R2Network; ++stage) {
