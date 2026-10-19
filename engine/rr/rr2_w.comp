@@ -370,7 +370,8 @@ void main()
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             floate4m3_t Tb[8];
             [[unroll]] for (int i = 0; i < 8; i += 2) {
-                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]))));
+                const vec2 y_ = vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]));
+                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(y_));
                 Tb[i] = q.x; Tb[i+1] = q.y;
             }
 #if KIND == 4
