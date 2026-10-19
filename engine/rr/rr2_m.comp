@@ -32,6 +32,7 @@ layout(local_size_x = 128) in;
 #include "rr_exact.glsl"
 
 #define MT (C / 16)
+#define MW ((CM / 16 + 3) / 4)   // the merge's channel tiles per wave (at most)
 
 #ifdef RR2_EMBED
 #define PRM(i) param.w[i]
@@ -577,19 +578,29 @@ void main()
         const uvec2 mxy = mergeXY(col);
         const int X = x0 / 2 + int(mxy.x), Y = y0 / 2 + int(mxy.y);
         const uint o = (mrgOff + uint(Y * hx + X) * 32u) >> 2u;
-        for (uint m = wv; m < CM / 16u; m += 4u) {
-            RAC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = BV(BM, 16u * m + 8u * hl + uint(i));
-            for (uint ks = 0u; ks < C / 8u; ++ks) {
-                B8 g0, g1; A8 w0, w1;
-                coopMatLoad(g0, XT, 8u * ks, C, CMJ);
-                coopMatLoad(g1, XT, 8u * ks + 4u, C, CMJ);
+        // the wave's tiles side by side, so their chains (C / 8 dependent steps each) overlap; a wave with fewer
+        // tiles than MW repeats its last one and drops the copy
+        RAC a[MW];
+        [[unroll]] for (uint j = 0u; j < MW; ++j) {
+            const uint m = min(wv + 4u * j, CM / 16u - 1u);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[j][i] = BV(BM, 16u * m + 8u * hl + uint(i));
+        }
+        [[unroll]] for (uint ks = 0u; ks < C / 8u; ++ks) {
+            B8 g0, g1;
+            coopMatLoad(g0, XT, 8u * ks, C, CMJ);
+            coopMatLoad(g1, XT, 8u * ks + 4u, C, CMJ);
+            [[unroll]] for (uint j = 0u; j < MW; ++j) {
+                const uint m = min(wv + 4u * j, CM / 16u - 1u);
+                A8 w0, w1;
                 LDA(w0, W_WM, 4u * C, m, 2u * ks); LDA(w1, W_WM, 4u * C, m, 2u * ks + 1u);
-                K32(a, w0, g0, w1, g1)
+                K32(a[j], w0, g0, w1, g1)
             }
+        }
+        [[unroll]] for (uint j = 0u; j < MW; ++j) {
+            const uint m = wv + 4u * j;
             B8 q;
-            Q8(q, a)
-            if (X >= 0 && Y >= 0 && X < hx && Y < hy) {
+            Q8(q, a[j])
+            if (m < CM / 16u && X >= 0 && Y >= 0 && X < hx && Y < hy) {
                 const uint at = o + (m >> 1u) * (lplane >> 2u) + 4u * (m & 1u) + 2u * hl;
                 arena.w[at] = pack4(q[0], q[1], q[2], q[3]);
                 arena.w[at + 1u] = pack4(q[4], q[5], q[6], q[7]);
