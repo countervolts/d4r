@@ -34,6 +34,11 @@ FAST = [] if EXACT or '-DM_RELAXED' in os.environ.get('M_DEFS', '').split() else
 FAST_WPW = [] if EXACT or os.environ.get('M_WPW') or 'WPW=' in os.environ.get('M_DEFS', '') else ['-DWPW=2']
 # preset L's expansion stage (dec0l) two windows per wave as well; its input stage (enc0l) is slower that way
 L_WPW = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_DEC0L', '') else ['-DWPW=2']
+# M_RESIDUAL_F32=1 (opt-in, not with M_EXACT=1): every layer_m.comp stage keeps the residual stream f32 across the MLP's
+# 32-channel chunks, one binary16 rounding after them instead of one per chunk (engine/README.md)
+RESF32 = ['-DM_RESIDUAL_F32'] if os.environ.get('M_RESIDUAL_F32') == '1' else []
+if RESF32 and EXACT:
+    raise SystemExit('M_RESIDUAL_F32=1 is part of the relaxed arithmetic: not with M_EXACT=1')
 SHADERS = {'enc1': 'm_enc1', 'enc2': 'm_enc2', 'enc3_tube': 'm_tube', 'dec2': 'm_dec2', 'dec1': 'm_dec1'}
 
 
@@ -107,7 +112,7 @@ def main():
     # the network in the arithmetic of ZLUDA's lowering of NVIDIA's PTX (TEXL): byte-identical to the CUDA backend
     # with NVIDIA's translated kernels in the harness (2026-10-11), where the native accuracy kernels' K32_MIX order
     # drifted to 36-41 dB through the FP8 tube
-    for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW)
+    for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW + RESF32)
     for s in ('enc0_m', 'dec0_m', 'post_m', 'down_m'): glsl(s + '.comp', s + '.spv', ['-DLDR=1'] if a.ldr and s != 'dec0_m' else [])
     glsl('down_m.comp', 'down_m_rgb10.spv', ['-DOUTPUT_RGB10=1'] + (['-DLDR=1'] if a.ldr else []))
     glsl('post_m.comp', 'post_m_q.spv', ['-DTILE_W=15', '-DTILE_H=15'] + (['-DLDR=1'] if a.ldr else []))
@@ -158,10 +163,10 @@ def compile_l(a, one, R):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *flags, str(HERE / src), '-o', str(a.output / out)], check=True, stdout=subprocess.DEVNULL)
     ldr = ['-DLDR=1'] if a.ldr else []
     # the network in the arithmetic of ZLUDA's lowering of NVIDIA's PTX (TEXL), as for preset M (L_NOTES.md)
-    for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW)
+    for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW + RESF32)
     for planes, suffix in ((0, ''), (1, '_planes')):
-        glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST)
-        glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST + L_WPW)
+        glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST + RESF32)
+        glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST + L_WPW + RESF32)
     # the reconstruction one render texel wider per tier than M's (4x4 taps): 11 (reconstruction/render >= 3),
     # 16 (the whole post_3_2 range), 12 (the compact tier: render/reconstruction <= 0.45, jitter within half a texel)
     for out, tile in (('post_l', 11), ('post_l_q', 16), ('post_l_c', 12)):

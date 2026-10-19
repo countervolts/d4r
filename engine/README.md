@@ -1110,6 +1110,15 @@ reconstruction tile tiers and the stress inputs).
 The network layers are separated by an execution-only barrier (`emptyStage`). A memory barrier there gives the same
 output and costs about 60 us (M 1520 -> 1592), so it stays.
 
+### `M_RESIDUAL_F32` (opt-in, 2026-10-19)
+
+`M_RESIDUAL_F32=1 python3 engine/compile_m.py ...` keeps the residual stream in f32 across the MLP's 32-channel chunks
+and rounds it to binary16 once after them, instead of after every chunk. It needs the relaxed build (not
+`M_EXACT=1`) and is off by default. 1280x720 -> 1440p: M 1521 -> 1410 us, L 2195 -> 2077. Against the default build,
+final RGB, peak 1: 43 - 46 dB (L 45 - 49) on smooth frames, 17 - 18 dB on noise. The exact build is as far from the
+default, so this moves no further from NVIDIA's arithmetic than `M_RELAXED` already does. Not checked against an
+NVIDIA card.
+
 ## Preset L (runtime and shim path exist; experimental)
 
 Preset L (render preset 12, NVIDIA's model for Ultra Performance) is M's pipeline with its own input, expansion and
