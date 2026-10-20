@@ -38,6 +38,11 @@ struct R2Stage {
     uint32_t group = 1;    // "xN": a workgroup holds N windows along x (the stages generated around translated code)
     uint32_t record = 0;   // R2Gather, "rN": 32-bit words per window in the arena
     bool ranges = false;   // R2Gather, "s3": the records' rows lie in three ranges (six words end enc0's block; else one address)
+    // "phases": the stage split over several workgroups per window (engine/rr/rr2_m.comp RR2_PHASE 1 - 4): one head per
+    // workgroup, the heads' sum and r, one MLP branch per workgroup, the rest; a window's values pass through a record
+    // of recordWords 32-bit words in the arena. Null pipelines: the model has none (or not all four files)
+    std::array<Pipeline, 4> phases;
+    uint32_t heads = 0, branches = 0, recordWords = 0;
 };
 struct R2Model {
     std::array<R2Stage, R2Stages> stages;
@@ -67,6 +72,22 @@ struct R2Model {
         while (std::getline(lines, line)) {
             std::istringstream f(line);
             std::string key; f >> key;
+            if (key == "phases") {   // "phases STAGE P1 P2 P3 P4 HEADS BRANCHES WORDS" (after the stage's own line)
+                std::string name, files[4];
+                uint32_t heads = 0, branches = 0, words = 0;
+                f >> name >> files[0] >> files[1] >> files[2] >> files[3] >> heads >> branches >> words;
+                unsigned stage = 0;
+                while (stage < R2Network && name != R2Names[stage]) ++stage;
+                if (stage >= R2Network || !seen[stage] || !heads || !branches || !words)
+                    throw std::runtime_error("rr.txt: invalid phases line: " + line);
+                bool all = true;
+                for (const auto& file : files) all = all && exists(directory + "/" + file);
+                if (!all) continue;   // a model packaged without them runs the stage's own shader
+                auto& st = stages[stage];
+                for (int k = 0; k < 4; ++k) st.phases[k].create(d.handle, directory + "/" + files[k], {b, b, b}, 32, cache, 0, specialization);
+                st.heads = heads; st.branches = branches; st.recordWords = words;
+                continue;
+            }
             if (key != "stage") continue;
             // "stage NAME SHADER.spv SUBGROUP WEIGHTS|- ARGS TEXTURES SURFACES BUFFERS POINTERS": the lists are
             // comma-separated argument offsets ("-": none), surfaces OFFSET:FORMAT, pointers OFFSET:UNITS; an optional "xN"
@@ -137,6 +158,13 @@ struct R2Engine {
     uint32_t tileGroup = 1;
     // the gather pass's records (R2Gather): byte address of range 0, its rows of windows, range 1, its rows, range 2
     std::array<uint32_t, 5> gatherWords{};
+    // the network stages that run in phases (R2Stage::phases) at this render size: those with at most D4R_RR2_SPLIT_WINDOWS
+    // windows (default 48, a little under the compute units of the GPUs that run preset F: with fewer windows than
+    // compute units a window has one to itself and its heads and MLP branches wait on one another; with more, the
+    // extra workgroups only add work. RX 9070, 1280x720: enc5's 18 - 24 windows run in phases, level 4's 66 - 77 do
+    // not). Their records start at recordsAt
+    std::array<bool, R2Network> split{};
+    uint64_t recordsAt = 0;
     struct Rect { uint32_t x0, y0, x1, y1; };
     std::vector<Rect> src, dst;               // per tile: intermediate rectangle (with overlap), output rectangle
     std::vector<VkDeviceSize> downPAt;
@@ -333,7 +361,25 @@ struct R2Engine {
         gatherWords = {static_cast<uint32_t>(ranges[0].first), ranges[0].second, static_cast<uint32_t>(ranges[1].first),
                        ranges[1].second, static_cast<uint32_t>(tail)};
         const uint64_t gatherTail = placed >= rows ? 0 : (rows - placed) * rowBytes;
-        const uint64_t arenaTotal = std::max({tileEnd, model.gather ? tail + gatherTail : 0});
+        // the phases' records: past the network's regions, where only the tile slots (live in the output stage) and the
+        // gather records' last rows (live in encoder 0) lie
+        const char* splitEnv = std::getenv("D4R_RR2_SPLIT_WINDOWS");
+        const uint32_t splitWindows = splitEnv ? static_cast<uint32_t>(std::strtoul(splitEnv, nullptr, 10)) : 48u;
+        uint64_t recordBytes = 0;
+        recordsAt = (arenaBytes + 255) & ~uint64_t(255);
+        for (unsigned stage = 0; stage < R2Network; ++stage) {
+            const auto& st = model.stages[stage];
+            if (!st.phases[0].handle) continue;
+            const int l = R2Level[stage];
+            uint32_t windows = 0;
+            for (uint32_t f = 0; f < 2; ++f) {
+                const uint32_t shift = r2Shift(stage, f), sx = shift & 0xffffu, sy = shift >> 16;
+                windows = std::max(windows, ((lw(l) + sx + 7) / 8) * ((lh(l) + sy + 7) / 8));
+            }
+            split[stage] = windows <= splitWindows;
+            if (split[stage]) recordBytes = std::max(recordBytes, uint64_t(windows) * st.recordWords * 4);
+        }
+        const uint64_t arenaTotal = std::max({tileEnd, model.gather ? tail + gatherTail : 0, recordsAt + recordBytes});
         if (arenaTotal > 0xffffffffull) throw std::runtime_error("Ray Reconstruction: the render size is too large for the arena");
         arena.create(d, arenaTotal, storage, debug);
         values.create(d, 16, storage, debug);
@@ -344,7 +390,11 @@ struct R2Engine {
         sums.create(d, std::max(exposure.blocks, 2u) * 8, storage);   // the one-pass exposure: the total and the count
         const size_t tiles = src.size();
         auto place = [&](size_t bytes) { const VkDeviceSize at = paramBytes; paramBytes += (bytes + 255) & ~VkDeviceSize(255); return at; };
-        for (unsigned i = 0; i < R2Network; ++i) { blocks[i] = model.stages[i].args; paramAt[i] = place(blocks[i].size()); }
+        for (unsigned i = 0; i < R2Network; ++i) {
+            blocks[i] = model.stages[i].args;
+            if (split[i]) blocks[i].resize(std::max<size_t>(blocks[i].size(), 108));   // argument 104: the phases' records
+            paramAt[i] = place(blocks[i].size());
+        }
         postBlocks.assign(tiles, model.stages[R2Post].args); downBlocks.assign(tiles, model.stages[R2Down].args);
         if (model.particles) downPBlocks.assign(tiles, model.stages[R2DownP].args);
         for (size_t i = 0; i < tiles; ++i) {
@@ -376,6 +426,7 @@ struct R2Engine {
         for (unsigned stage = 0; stage < R2Network; ++stage) {
             auto& p = blocks[stage];
             const int l = R2Level[stage];
+            if (split[stage]) put32(p, 104, static_cast<uint32_t>(recordsAt));
             put32(p, 0, lw(l)); put32(p, 4, lh(l));
             putF(p, 84, 1.0f / static_cast<float>(lw(l))); putF(p, 88, 1.0f / static_cast<float>(lh(l)));
             for (const auto& [offset, units] : model.stages[stage].pointers)
@@ -710,8 +761,18 @@ struct R2Engine {
                 dispatch(cb, model.stages[R2Gather].pipeline, b.gather[cur], gx, (lh(l) + sy + 7) / 8);
                 step();
             }
-            dispatch(cb, model.stages[stage].pipeline, b.network[stage][cur], (gx + model.stages[stage].group - 1) / model.stages[stage].group, (lh(l) + sy + 7) / 8);
-            step();
+            const auto& st = model.stages[stage];
+            const uint32_t gy = (lh(l) + sy + 7) / 8;
+            if (split[stage]) {   // the phases: heads, their sum and r, MLP branches, the rest
+                const uint32_t parts[4] = {st.heads, 1, st.branches, 1};
+                for (int k = 0; k < 4; ++k) {
+                    dispatch(cb, st.phases[k], b.network[stage][cur], gx * parts[k], gy);
+                    step();
+                }
+            } else {
+                dispatch(cb, st.pipeline, b.network[stage][cur], (gx + st.group - 1) / st.group, gy);
+                step();
+            }
             stageStamp();
         }
         stamp(2);

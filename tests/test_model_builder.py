@@ -78,6 +78,21 @@ class ModelBuildTests(unittest.TestCase):
             pixels.tofile(directory / 'out.raw')
             with self.assertRaises(ValueError): model_tools.capture(directory, 'k')
 
+    def test_model_files_lists_every_file_rr_txt_names(self):
+        text = (ROOT / 'packaging/build_engine_models.sh').read_text()
+        start = text.index('model_files() {')
+        function = text[start:text.index('\n}\n', start) + len('\n}\n')]
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / 'rr.txt').write_text(
+                'D4RR0002\npreset 6\nstage enc5 enc5_m.spv 32 weights-enc5m.bin enc5.args - - - 8:1216\n'
+                'phases enc5 enc5_p1.spv enc5_p2.spv enc5_p3.spv enc5_p4.spv 8 20 27136\n'
+                'stage post post.spv 64 weights-post.bin post.args 24,32 96:rgba16f - -\n')
+            result = subprocess.run(['bash', '-c', function + 'model_files "$1"\n', '_', t], capture_output=True, text=True,
+                                    timeout=10, check=True)
+        self.assertEqual(result.stdout.split(), ['rr.txt', 'enc5.args', 'enc5_m.spv', 'enc5_p1.spv', 'enc5_p2.spv',
+                                                 'enc5_p3.spv', 'enc5_p4.spv', 'post.args', 'post.spv', 'weights-enc5m.bin',
+                                                 'weights-post.bin'])
+
     def test_dump_does_not_accept_a_failed_child_with_a_replay_marker(self):
         text = (ROOT / 'packaging/build_engine_models.sh').read_text()
         start = text.index('  dump() {')

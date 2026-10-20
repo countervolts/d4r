@@ -123,7 +123,8 @@ place() {   # place NAME DIR FILE...
 }
 model_files() {   # rr.txt and the files it names, for model directory $1
   echo rr.txt
-  awk '$1 == "stage" { print $3; if ($5 != "-") print $5; if ($6 ~ /\.args$/) print $6 } $1 == "template" { print $3 }' "$1/rr.txt" | sort -u
+  awk '$1 == "stage" { print $3; if ($5 != "-") print $5; if ($6 ~ /\.args$/) print $6 } $1 == "template" { print $3 }
+       $1 == "phases" { print $3; print $4; print $5; print $6 }' "$1/rr.txt" | sort -u
 }
 run() {   # run LOG COMMAND...: the command's output in WORK/LOG, shown when it fails
   local log="$WORK/$1"; shift
