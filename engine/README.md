@@ -1122,7 +1122,7 @@ the explicitly optioned build of each row, and the exact switches still reproduc
 
 ### Byte-identical speed-ups (2026-10-19)
 
-RX 9070 XT, RADV 26.2.2, `d4r-m` 1280x720 -> 2560x1440 with `D4R_ENGINE_M_LAYER_STAMPS=1`. Every output frame, and
+RX 9070, RADV 26.2.2, `d4r-m` 1280x720 -> 2560x1440 with `D4R_ENGINE_M_LAYER_STAMPS=1`. Every output frame, and
 everything `D4R_M_DUMP` writes, is byte-identical to the previous build (M and L, HDR and LDR, the three
 reconstruction tile tiers and the stress inputs).
 

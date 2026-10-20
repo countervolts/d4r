@@ -300,7 +300,7 @@ def main():
         # The block's windows in the reverse of the gather's dispatch order: the records the gather wrote last are
         # the ones still in the GPU's last-level cache when the block starts (the records are larger than it), and
         # reading them first keeps the rest from being evicted before it is read. Each window's work is the same;
-        # only the order of the workgroups changes (encoder 0 594 -> 578 us at 1280x720 -> 1440p, RX 9070 XT).
+        # only the order of the workgroups changes (encoder 0 594 -> 578 us at 1280x720 -> 1440p, RX 9070).
         text = text.replace('gl_WorkGroupID.x', '(gl_NumWorkGroups.x - 1u - gl_WorkGroupID.x)').replace(
             'gl_WorkGroupID.y', '(gl_NumWorkGroups.y - 1u - gl_WorkGroupID.y)')
         Path(out).write_text(text)

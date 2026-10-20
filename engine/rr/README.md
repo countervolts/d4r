@@ -530,7 +530,7 @@ only; the other stages still use `rr2_m.comp`.
 well 4.98 / 5.59. Decoder 0's second kernel is not converted: it hands r and the MLP sum (8 KiB of binary16) to its
 translated tail through shared memory, which a single wave cannot hold without losing the 4 KiB rate.
 
-Shared memory, later (2026-10-18, RX 9070 XT, RADV, 1280x720 -> 2560x1440, `d4r-rr` with `D4R_RR_TIME_REPEAT=40`
+Shared memory, later (2026-10-18, RX 9070, RADV, 1280x720 -> 2560x1440, `d4r-rr` with `D4R_RR_TIME_REPEAT=40`
 and `D4R_ENGINE_RR_STAGE_STAMPS=1`, five interleaved runs; every image of six temporal frames byte-identical to the
 previous model, also at 1114x626 -> 1080p, 853x480 -> 1440p and with `D4R_RR_TEST_ROBUST2=1`). ACO sizes a shader's
 registers to the waves its shared memory leaves room for (enc1 needed 97 vector registers before scheduling and got
@@ -570,7 +570,7 @@ registers to the waves its shared memory leaves room for (enc1 needed 97 vector 
 - **Hardware saturation for the FP8 conversions of f32 values** (`rr_exact.glsl` `FINITE`). RADV lowers a saturating
   conversion (`saturatedConvertEXT`) as a NaN-preserving clamp per element (`v_minimummaximum_f32`) and then the
   conversion, because the hardware's FP16_OVFL saturation turns infinities into NaN instead of +-448 (ACO's comment;
-  confirmed on all 2^32 f32 inputs, RX 9070 XT: FP16_OVFL is identical to the clamp for every finite value and NaN,
+  confirmed on all 2^32 f32 inputs, RX 9070: FP16_OVFL is identical to the clamp for every finite value and NaN,
   only +-Inf differ). The values converted here never are infinite: sums of FP8 products (each at most 448^2) and
   binary16 biases stay far below 3.4e38. Written as "an infinity becomes NaN, then saturate", the conversion is the
   pattern `nir_opt_algebraic` turns into `f2e4m3fn_satfn` (vkd3d-proton's; Mesa >= 25.2, `has_f2e4m3fn_satfn`):
@@ -618,7 +618,7 @@ was measured and not built for D / E (`build/rr/f/nv/dstage.sh`, `dnl.sh`, level
 
 ### Byte-identical speed-ups (2026-10-19)
 
-RX 9070 XT, RADV 26.2.2, 1280x720 -> 2560x1440 with `D4R_ENGINE_RR_STAGE_STAMPS=1`. Every image of every frame is
+RX 9070, RADV 26.2.2, 1280x720 -> 2560x1440 with `D4R_ENGINE_RR_STAGE_STAMPS=1`. Every image of every frame is
 byte-identical to the previous model on the replay and stress inputs, at levels 0 to 3.
 
 - `ptx2rr.py`: OCML's tanh (decoder 0's second kernel) in f32 where f64 was not needed. Exp's error term becomes
@@ -647,7 +647,7 @@ Against the previous default build, presented image, RGB, peak 1, 1280x720 -> 14
 
 ### Byte-identical speed-ups (2026-10-20)
 
-RX 9070 XT, RADV 26.2.2 with the ACO `v_mad_u32_u16` patch, 1280x720 -> 2560x1440 game-like input, median of 6
+RX 9070, RADV 26.2.2 with the ACO `v_mad_u32_u16` patch, 1280x720 -> 2560x1440 game-like input, median of 6
 interleaved runs. Every image of every frame is byte-identical to the previous model on the replay, odd-size, 540p,
 stress and game-like inputs, at levels 0 and 3 and in the `D4R_RR2_UNGUARDED=1 D4R_RR2_POOLED=rgb10_a2` build.
 
@@ -675,7 +675,7 @@ Same setup as above (and the RADV buffer-offset pass), opt-in build (`D4R_RR2_UN
 `D4R_RR_TEST_ROBUST2=1`. Every image of every frame is byte-identical to the previous model on the replay, odd-size,
 540p, stress and game-like inputs, with and without `D4R_RR_TEST_ROBUST2=1`: preset F at levels 0 and 3 and in the
 opt-in build, presets D and E at levels 0 and 3 (they share the translated code), and the RDNA3 builds of D and E
-(`D4R_RR_GFX11=1`, run on the RX 9070 XT).
+(`D4R_RR_GFX11=1`, run on the RX 9070).
 
 | Change | Stages (us) | Frame (ms) |
 |---|---|---|
@@ -712,7 +712,7 @@ slowest lane of a wave converges; regrouping pixels by iteration count would sav
 
 ### Where the time of the top stages goes, and the encoder-0 order (2026-10-20, evening)
 
-Same setup (RX 9070 XT, RADV 26.2.2 with the round-5b GL2 change, 1280x720 -> 2560x1440 game-like input, opt-in
+Same setup (RX 9070, RADV 26.2.2 with the round-5b GL2 change, 1280x720 -> 2560x1440 game-like input, opt-in
 build, `D4R_RR_TEST_ROBUST2=1`, median of 3 - 6 interleaved runs). Before writing more peepholes, each of the top
 stages was timed with stub variants of its shader: stores behind an opaque false, texel fetches or arena reads
 replaced by cheap arithmetic, every weight tile read from one hot 4 KiB (distinct loads, no CSE), the cubic table
@@ -760,7 +760,7 @@ nothing (their tokens are still cached).
 
 ### The deep stages, and windows split over several workgroups (2026-10-20, night)
 
-The card measured since 2026-10-18 is an RX 9070 (56 compute units; the sections above call it a 9070 XT). Same setup
+The card measured since 2026-10-18 is an RX 9070 (56 compute units). Same setup
 as above, opt-in build. Each window of levels 3 - 5 was timed with the shader clock (start and end per workgroup):
 
 - Between two stages the GPU idles 0.6 - 0.7 us; the barrier is not what costs time. Level 4 and 5 stages start all
