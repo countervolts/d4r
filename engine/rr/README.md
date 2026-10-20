@@ -755,3 +755,46 @@ pass (+23 us for the pass, the filter unchanged); encoder 0's gather and block i
 block of a band next to the gather of the next (-15 us with 4 bands, worse beyond: each band's barrier drains the
 GPU); encoder 0 fused into one shader again (607 us against 575). Decoder 0's two kernels in reverse order gain
 nothing (their tokens are still cached).
+
+### The deep stages, and windows split over several workgroups (2026-10-20, night)
+
+The card measured since 2026-10-18 is an RX 9070 (56 compute units; the sections above call it a 9070 XT). Same setup
+as above, opt-in build. Each window of levels 3 - 5 was timed with the shader clock (start and end per workgroup):
+
+- Between two stages the GPU idles 0.6 - 0.7 us; the barrier is not what costs time. Level 4 and 5 stages start all
+  their windows within 0.4 us, and every window takes 28 - 35 us, so such a stage lasts one window. Inside one (enc5):
+  input 0.8 us, attention 12.8 (eight heads), MLP 16.9 (20 branches); each head's and each branch's loop iteration
+  waits for its weight tiles, with two waves per SIMD and nothing else to hide that.
+- Level 3 has more windows than fit at once (252 for 224 places in enc3 and dec3_1, 240 for 168 in dec3_0), so each
+  of its stages ends with a second, mostly empty round.
+
+One dispatch for levels 3 - 5 with per-window completion counters (a window starts as soon as the windows it reads
+are done) would recover at most 33 us of their 281 (the measured window times replayed with every dependency and
+unlimited compute units), nearly all of it in the level-3 decoders, and it would also need its own arena regions
+(enc4 writes its merge into encoder 3's input region). Not built.
+
+What is built: a stage with fewer windows than the GPU has compute units runs in four dispatches, so that a window's
+heads and MLP branches run on as many workgroups (`rr2_m.comp` `RR2_PHASE`): 1 one head per workgroup, 2 the heads'
+out-projections in head order and r, 3 one MLP branch per workgroup, 4 the up-projections in branch order and the
+rest of the stage. The values handed over are what the whole shader already keeps (Ob, Nb and Hb as FP8 tiles, r as
+it is), through a record per window placed in the arena past the network's regions, so every window computes exactly
+the same values. Phases 2 and 4 load the next head's or branch's tiles while the current one's products run.
+`compile_rr2.py` builds the phases for enc3, enc4, enc5, dec4_1 and dec3_1 (a `phases` line in `rr.txt`;
+`D4R_RR2_PHASES=0` builds none); the runtime uses them for a stage with at most 48 windows (`D4R_RR2_SPLIT_WINDOWS`,
+0 for never). Older runtimes ignore the lines.
+
+| Render size | Stages in phases | Stage times (us) | Frame (ms) |
+|---|---|---|---|
+| 1280x720 | enc5 | enc5 29 -> 19 | 2.954 -> 2.947 |
+| 960x540 | enc4, enc5, dec4_1 | enc5 29 -> 17, enc4 31 -> 28, dec4_1 29 -> 23 | 1.721 -> 1.705 |
+| 1920x1080 | enc5 | enc5 28 -> 23 | within noise |
+
+Every image of every frame is byte-identical to the previous build on the 7 input sets and at 1280x720 -> 3840x2160,
+opt-in, default and exact builds, with and without `D4R_RR_TEST_ROBUST2=1`, and with every stage in phases
+(`D4R_RR2_SPLIT_WINDOWS=100000`); the single-stage shaders are unchanged files. Branch 1's Hb handed to branch 0 changes
+53 of 90 images.
+
+Tried, no gain: phases at 1280x720 for the stages with 66 - 77 windows (enc4 33 -> 38 us, dec4_1 29 -> 32, level 3
+much slower: the extra workgroups only add work there); the next branch's tiles loaded early in the single shader,
+with r kept in the arena meanwhile (enc5 29 -> 24, every other deep stage 2 - 9 us slower); WGP mode, which RADV
+uses only for shaders without shared memory, forced on every stage in a scratch driver (frame 2.955 -> 3.256 ms).
