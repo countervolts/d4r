@@ -1968,6 +1968,8 @@ static void set_cuda_adapter_luid(const LUID& luid)
     logf("CUDA device LUID set to the D3D12 adapter LUID %s:%s", high, low);
 }
 
+static void start_engine_preload();
+
 static NgxResult initialize(unsigned long long applicationId, const wchar_t* dataPath, ID3D12Device* device,
                             const NgxFeatureCommonInfo* featureInfo, unsigned int sdkVersion,
                             const ProjectIdentity* project = nullptr)
@@ -2103,6 +2105,8 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     }
     else
         logf("Ray Reconstruction: disabled by D4R_RR_ENABLE=0");
+    if (result == NGX_SUCCESS && device != nullptr)
+        start_engine_preload();
     return result;
 }
 
@@ -10607,6 +10611,37 @@ static void init_engine_backend_rr(int slot)
          path.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 }
 
+// Starts loading a Ray Reconstruction model (once per slot) on a thread of its own, or in place with
+// D4R_ENGINE_RR_SYNC=1. The thread keeps the game's device, and with it the VkDevice, alive until the model is loaded.
+static void begin_engine_model_rr(int slot)
+{
+    std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
+    std::call_once(g_engineR.once[slot], [slot] {
+        g_engineR.state[slot] = 1;
+        // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
+        if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
+            init_engine_backend_rr(slot);
+        else
+        {
+            ID3D12Device* const device = g.device;
+            if (device != nullptr)
+                device->AddRef();
+            std::thread([slot, device] {
+                init_engine_backend_rr(slot);
+                if (device != nullptr)
+                    device->Release();
+            }).detach();
+        }
+    });
+}
+
+// The slot of the Ray Reconstruction model that serves a preset hint
+static int rr_engine_slot(uint32_t preset)
+{
+    static const bool haveF = GetFileAttributesA((rr_model_directory(2) + "\\rr.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return preset == 5 ? 1 : (haveF && preset != 4) ? 2 : 0;
+}
+
 // Starts loading the Ray Reconstruction model `feature` runs on (once per preset) and returns its slot. Called at
 // CreateFeature too, so the model is usually ready by the first frame.
 static int start_engine_model_rr(const Feature& feature)
@@ -10618,18 +10653,55 @@ static int start_engine_model_rr(const Feature& feature)
     // 6, Cyberpunk 2077's 0x80000002 (harness runs with D4R_RR_PRESET, 2026-10-13). The shim cannot see which DLL
     // version the CUDA backend loaded, so that mapping applies when the user built a preset F model (engine\rr-f),
     // which only a 310.9 DLL yields.
-    static const bool haveF = GetFileAttributesA((rr_model_directory(2) + "\\rr.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const int slot = feature.preset == 5 ? 1 : (haveF && feature.preset != 4) ? 2 : 0;
-    std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
-    std::call_once(g_engineR.once[slot], [slot] {
-        g_engineR.state[slot] = 1;
-        // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
-        if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
-            init_engine_backend_rr(slot);
-        else
-            std::thread([slot] { init_engine_backend_rr(slot); }).detach();
-    });
+    const int slot = rr_engine_slot(feature.preset);
+    begin_engine_model_rr(slot);
     return slot;
+}
+
+// At NGX init, starts loading the engine models this configuration will use: Ray Reconstruction's (the model a feature
+// without a preset hint runs, normally preset F) and Super Sampling's when [DLSS] Model forces K, L or M (its HDR
+// model; LDR models still load at first use). On a cold shader cache their pipelines take seconds to compile (preset F
+// 3.7 s in Witcher 3 after a driver update), and games create their features well after they initialise NGX (64 s
+// there), so the compile no longer holds up the first frame. Only the models (pipelines and weights) load early;
+// every feature still creates its own resources at its first frame. D4R_ENGINE_PRELOAD=0 turns this off.
+static void start_engine_preload()
+{
+    static std::once_flag once;
+    if (env_uint("D4R_ENGINE_PRELOAD", 1) == 0 || !engine_requested() || g.device == nullptr)
+        return;
+    std::call_once(once, [] {
+        // the game's thread, inside its NGX init: the vkd3d-proton interop and the engine's Vulkan entry points
+        std::call_once(g_vk.once, init_vram_interop);
+        if (g_vk.interop == nullptr || g_vk.lifetime == nullptr)
+            return;
+        std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
+        if (g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+            return;
+        const bool rr = rr_enabled() && rr_backend() == RrBackend::Dlss;
+        const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
+        const uint32_t sr = forced.enabled ? forced.value : 0;
+        const bool srM = (sr == 12 || sr == 13) && g_vk.float8;
+        const bool srK = sr == 11 && !(env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip");
+        if (!rr && !srM && !srK)
+            return;
+        logf("engine backend: loading the models this configuration uses at NGX init:%s%s%s", rr ? " Ray Reconstruction" : "",
+             rr && (srM || srK) ? "," : "", srM ? (sr == 12 ? " Super Sampling preset L" : " Super Sampling preset M")
+                                         : srK ? " Super Sampling preset K" : "");
+        if (rr)
+            begin_engine_model_rr(rr_engine_slot(0));
+        if (srM || srK)
+        {
+            ID3D12Device* const device = g.device;
+            device->AddRef();
+            std::thread([device, srK, presetL = sr == 12] {
+                if (srK)
+                    std::call_once(g_engine.once, init_engine_backend);
+                else
+                    std::call_once(g_engineM.once[presetL][0], [presetL] { init_engine_backend_m_variant(presetL, false); });
+                device->Release();
+            }).detach();
+        }
+    });
 }
 
 // Ray Reconstruction on the engine: d4r's stages in the game's command list, with the denoiser's guides sampled
