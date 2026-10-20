@@ -656,6 +656,7 @@ void main()
             coopMatStore(v[w][0], VSH, VSH_AT(mt * 2u + 0u), VSH_STRIDE, RM);
             coopMatStore(v[w][1], VSH, VSH_AT(mt * 2u + 1u), VSH_STRIDE, RM);
         }
+        subgroupMemoryBarrierShared();   // the wave's lanes read one another's V through VSH below
         }
         // scores: q8(Q) against itself, rows are the queries and columns the keys, plus the relative position bias
         // (read column-major, so the accumulator holds S^T: this lane holds the keys 8h..8h+7 of one query)
@@ -704,6 +705,7 @@ void main()
         LDA8(a1, ow, 1u, UC, 16u * (N)); \
         FORW { K32H(res[N], a0, OB_[w][0], a1, OB_[w][1]) } }
         EACH_T(WO_N)
+        subgroupMemoryBarrierShared();   // this head's VSH reads before the next head's stores
     }
     // ------------------------------------------------------------ norm 2
     // the native element (T, 8h+i) holds the natural channel tok_xnat(T, 8h+i) = 16T + 4h + (i&3) + 8*((i>>2)&1),
