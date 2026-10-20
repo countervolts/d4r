@@ -798,3 +798,15 @@ Tried, no gain: phases at 1280x720 for the stages with 66 - 77 windows (enc4 33 
 much slower: the extra workgroups only add work there); the next branch's tiles loaded early in the single shader,
 with r kept in the arena meanwhile (enc5 29 -> 24, every other deep stage 2 - 9 us slower); WGP mode, which RADV
 uses only for shaders without shared memory, forced on every stage in a scratch driver (frame 2.955 -> 3.256 ms).
+
+### What the output filter's refinement steps cost (2026-10-20, night)
+
+The output filter alone (`D4R_ENGINE_RR_SKIP=down,pooled`) takes 384 us at 1280x720 -> 1440p and 844 us at 4K. Its
+translated code has no loop besides NGX's progress-counter wait (skipped here): what was called its refinement loop
+is a cascade of up to four steps per row of a pixel pair, each five bilinear history samples, written out twice.
+Counting active lanes on the game-like input, step 1 runs in 86% of the waves with 64% of their lanes, step 2 97% /
+59%, step 3 93% / 56%, step 4 30% / 15%; on the stress input every step runs with about 95% of the lanes. Without
+steps 2 - 4 (wrong images) the filter takes 336 / 742 us, so their idle lanes cost at most about 20 / 45 us: that is
+all that regrouping pixels by step count could recover, and the rest is per-pixel arithmetic that a native rewrite
+would have to repeat to stay exact (1564 VALU and 44 samples per 64-wide wave, of which the steps are 40 samples).
+Not rewritten.
