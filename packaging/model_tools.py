@@ -41,32 +41,40 @@ def capture(directory, name):
     pixels = np.fromfile(output, dtype=np.float16).reshape(-1, 4)
     if not np.isfinite(pixels).all() or not np.any(pixels[:, :3]):
         raise ValueError('capture produced a nonfinite or empty frame')
-    if name == 'k':
+    if name in ('e', 'f'):
+        launches = sorted((directory / 'replay').glob('replay-*'))
+        first = next((i for i, p in enumerate(launches)
+                      if p.name.split('-', 2)[-1].startswith('cuda_engine_input_kernel_rel_')), None)
+        if first is None:
+            raise ValueError('missing captured CNN input layer')
+        frame = launches[first + 1:]
+        end = next((i for i, p in enumerate(frame)
+                    if p.name.split('-', 2)[-1].startswith('cuda_engine_input_kernel_rel_')), len(frame))
+        network = [p for p in frame[:end] if p.name.split('-', 2)[-1].startswith('dltss_nchw8_')]
+        if len(network) != 12 or 'aniso_gaussian_dfn' not in network[-1].name:
+            raise ValueError('missing captured CNN network or reconstruction layer')
+        selected = [launches[first], *network]
+    elif name == 'k':
         kernels = ['dltss_pwin_' + s + '_layer' for s in
                    ('enc0', 'enc1', 'enc2', 'enc3', 'enc4', 'dec5', 'dec4', 'dec3', 'dec2', 'dec1', 'dec0')]
-    elif name in ('m', 'l'):
+    else:
         kernels = ['rrlite_' + s + '_4x4' for s in ('enc1', 'enc2', 'enc3_tube', 'dec2', 'dec1')]
         kernels += ['rrlite_enc0_4x4_mvlo_hdr' + ('_folded' if name == 'm' else ''),
                     'rrlite_dec0_4x4' + ('_folded' if name == 'm' else '')]
-    launches = []
-    if name in ('e', 'f'):
-        replay = sorted((directory / 'replay').glob('replay-*'))
-        first = next((i for i, p in enumerate(replay) if p.name.split('-', 2)[2].startswith('cuda_engine_input_kernel_rel_')), None)
-        if first is None:
-            raise ValueError('missing captured CNN input')
-        network = [p for p in replay[first + 1:] if p.name.split('-', 2)[2].startswith('dltss_nchw8_')][:12]
-        if len(network) != 12 or 'aniso_gaussian' not in network[-1].name:
-            raise ValueError('missing captured CNN layers or reconstruction')
-        launches = [replay[first], *network]
-    else:
+    if name not in ('e', 'f'):
+        selected = []
         for kernel in kernels:
             matches = sorted((directory / 'replay').glob('replay-*-' + kernel))
-            count = 6 if kernel == 'rrlite_enc3_tube_4x4' else 1
-            if len(matches) < count:
+            if not matches:
                 raise ValueError(f'missing captured layer {kernel}')
-            launches.extend(matches[:count])
-    for launch in launches:
-        kernel = launch.name.split('-', 2)[2]
+            if kernel == 'rrlite_enc3_tube_4x4':
+                if len(matches) != 6:
+                    raise ValueError('capture requires all six Swin tube layers')
+                selected.extend(matches)
+            else:
+                selected.append(matches[0])
+    for launch in selected:
+        kernel = launch.name.split('-', 2)[-1]
         rows = [line.split() for line in (launch / 'manifest.txt').read_text().splitlines()]
         if ['kernel', kernel] not in rows:
             raise ValueError(f'{kernel}: incorrect capture metadata')
