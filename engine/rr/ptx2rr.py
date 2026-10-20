@@ -8,6 +8,11 @@ implements the stage contract of engine/rr/README.md: binding 0 = parameter bloc
 binding 1 = weight buffer (argument 40), binding 2 = plane arena, then textures and
 surfaces in ascending argument offset. One PTX block is one workgroup of X*Y*Z invocations.
 
+Adjacent m16n8k32 mma statements that share their A fragment are translated as one paired product (pair_mma);
+D4R_PTX2RR_NO_PAIR=1 translates each on its own, for debugging the pairing. Only the translated network stages
+contain these (compile_rr.py from a capture); the native builds (build_native_model.sh, compile_rr2.py) replace those
+stages, so their shaders do not change with it.
+
 The generated shader is derived from the user's own DLL and is model data: write it to the
 model/build directory only; do not commit or redistribute it.
 """
@@ -78,8 +83,18 @@ float lg2_ftz(float x) { return log2(abs(x) < 1.17549435e-38 ? 0.0 : x); }
 // PTX .relu: negative results become +0, NaN stays NaN
 f16vec2 relu2(f16vec2 v) { return f16vec2(v.x < 0.0hf ? 0.0hf : v.x, v.y < 0.0hf ? 0.0hf : v.y); }
 float16_t relu1(float16_t v) { return v < 0.0hf ? 0.0hf : v; }
-// (one unsigned comparison per axis: a negative coordinate is above every size)
-vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return any(greaterThanEqual(uvec2(c), uvec2(n))) ? vec4(0.0) : texelFetch(t, c, 0); }
+// An integer fetch outside the image returns zero (one unsigned comparison per axis: a negative coordinate is above
+// every size). With robustImageAccess2 the image load returns zero there itself, except for a w component the format
+// lacks, which it returns as one: the runtime sets RR_ROBUST_IMAGES when the device has it enabled (vkd3d-proton
+// always does), and only a fetch whose w is used still needs the image's size. The runtime sets constant 0 on every
+// stage of a Ray Reconstruction model (engine/runtime_rr.inc), so no other RR shader may use that id.
+layout(constant_id = 0) const bool RR_ROBUST_IMAGES = false;
+vec4 fetch0(sampler2D t, ivec2 c)
+{
+    const bool out_ = any(greaterThanEqual(uvec2(c), uvec2(textureSize(t, 0))));
+    if (RR_ROBUST_IMAGES) { const vec4 v = texelFetch(t, c, 0); return vec4(v.xyz, out_ ? 0.0 : v.w); }
+    return out_ ? vec4(0.0) : texelFetch(t, c, 0);
+}
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
 float round_half_away(float x) { float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
 uint PARAM32(uint o) { return param.w[o >> 2]; }
@@ -581,6 +596,48 @@ class RRT(base.T):
         if not os.environ.get('D4R_PTX2RR_NO_PAIR'):
             self.pair_mma()
         self.origins()
+        self.low32 = self.low32_regs()
+
+    def low32_regs(self):
+        """The %rd registers whose value only matters modulo 2^32: every use is the address of a global load or store
+        (the translation takes its low 32 bits, gbyte), a truncation to 32 bits, or an operand of an add, subtract,
+        low multiply, move or left shift whose result is such a register too. A wide multiply or a 64-bit left shift
+        into one is translated in 32 bits (op): the same low 32 bits, without the 64-bit arithmetic the driver keeps."""
+        uses = {}   # register -> [(kind, destination)]: 'ok' a truncating use, 'dep' fine if the destination is low32
+        regs = set()
+        dep_ops = ('add.s64', 'add.u64', 'sub.s64', 'sub.u64', 'mul.lo.s64', 'mul.lo.u64', 'mov.b64', 'mov.u64',
+                   'mov.s64', 'cvta.to.global.u64', 'cvta.global.u64')
+        for kind, text in self.toks:
+            if kind != 'stmt' or text.startswith('.'):
+                continue
+            text = re.sub(r'^@!?%p\d+\s+', '', text)
+            parts = text.split(None, 1)
+            if len(parts) < 2:
+                continue
+            op, a = parts[0], base.split_operands(parts[1])
+            found = [(i, r) for i, t in enumerate(a) for r in re.findall(r'%rd\d+', t)]
+            regs.update(r for _, r in found)
+            o = op.split('.')
+            for i, r in found:
+                if i == 0 and not a[0].startswith('['):
+                    continue   # a definition
+                if o[0] in ('ld', 'st') and 'global' in o and a[1 if o[0] == 'ld' else 0].strip().startswith('[') \
+                        and i == (1 if o[0] == 'ld' else 0):
+                    uses.setdefault(r, []).append(('ok', None))
+                elif op in ('cvt.u32.u64', 'cvt.s32.s64'):
+                    uses.setdefault(r, []).append(('ok', None))
+                elif op in dep_ops or (op == 'shl.b64' and i == 1):
+                    uses.setdefault(r, []).append(('dep', a[0].strip()))
+                else:
+                    uses.setdefault(r, []).append(('bad', None))
+        low = set(regs)
+        changed = True
+        while changed:
+            changed = False
+            for r in list(low):
+                if any(k == 'bad' or (k == 'dep' and d not in low) for k, d in uses.get(r, [])):
+                    low.discard(r); changed = True
+        return low
 
     def stmt(self, s):
         line = self.stmt_lines[self.stmt_index] if self.stmt_index < len(self.stmt_lines) else None
@@ -900,6 +957,16 @@ class RRT(base.T):
             return self.E(f'{sfn}32({self.gbyte(reg, off)}, {fn}32({self.gbyte(reg, off)}) + {self.val(a[1], "u32")});')
         if op == 'membar.gl':
             return
+        # a wide multiply or a 64-bit left shift whose result only matters modulo 2^32 (low32_regs), in 32 bits
+        if op in ('mul.wide.u32', 'mul.wide.s32') and a[0].strip() in self.low32:
+            return self.A(a[0], f'uint64_t({self.val(a[1], "u32")} * {self.val(a[2], "u32")})', 'u64')
+        if op == 'shl.b64' and a[0].strip() in self.low32:
+            n = self.val(a[2], 'u32')
+            return self.A(a[0], f'uint64_t(({n} & 63u) >= 32u ? 0u : uint({self.val(a[1], "u64")}) << ({n} & 63u))', 'u64')
+        # ... and the sums and products of such registers (in 32 bits too, so that the products above stay in 32 bits)
+        if op in ('add.s64', 'add.u64', 'sub.s64', 'sub.u64', 'mul.lo.s64', 'mul.lo.u64') and a[0].strip() in self.low32:
+            x, y = (f'uint({self.val(t, "u64")})' for t in a[1:3])
+            return self.A(a[0], f'uint64_t({x} {"+" if parts[0] == "add" else "-" if parts[0] == "sub" else "*"} {y})', 'u64')
         if op == 'activemask.b32':
             # the warp's lanes: this half of a 64-wide wave
             return self.A(a[0], '((gl_SubgroupInvocationID & 32u) != 0u ? subgroupBallot(true).y : subgroupBallot(true).x)', 'u32')

@@ -175,7 +175,8 @@ struct Pipeline {
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
     }
     void create(VkDevice dev, const std::string& file, const std::vector<VkDescriptorType>& types,
-                uint32_t subgroup, VkPipelineCache cache, VkPipelineCreateFlags flags = 0) {
+                uint32_t subgroup, VkPipelineCache cache, VkPipelineCreateFlags flags = 0,
+                const VkSpecializationInfo* specialization = nullptr) {
         device = dev;
         std::vector<VkDescriptorSetLayoutBinding> bindings;
         for (uint32_t i = 0; i < types.size(); ++i)
@@ -199,7 +200,7 @@ struct Pipeline {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.layout = layout; ci.flags = flags;
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &required,
-                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", nullptr};
+                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", specialization};
         VkResult result = vkCreateComputePipelines(dev, cache, 1, &ci, nullptr, &handle);
         vkDestroyShaderModule(dev, shader, nullptr);
         check(result, "vkCreateComputePipelines");

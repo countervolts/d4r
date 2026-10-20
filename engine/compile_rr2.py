@@ -70,7 +70,8 @@ NATIVE = ['enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4_0', 'dec4_1', 'dec3_0', 
 KERNEL['downp'] = 'rr2_downsample_kernel_static_hdr'
 BLOCK['downp'] = '16,16,1'
 BUFFERS['downp'] = [72, 168, 176]
-# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py)
+# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py);
+# D4R_RR2_TAIL_WAVES: dec0_1's tail on that many of the four-wave block's waves (the one-wave block ignores it)
 HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1', '--tail-waves', os.environ.get('D4R_RR2_TAIL_WAVES', '2')]}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
@@ -87,6 +88,12 @@ SURFACES = {'dec0_1': {176: 'rgba8_snorm', 184: 'rgba8', 192: 'rgba8'}, 'post': 
 UNGUARDED = os.environ.get('D4R_RR2_UNGUARDED') == '1'
 if UNGUARDED and RELAXED < 3:
     raise SystemExit('D4R_RR2_UNGUARDED=1 is for D4R_RR_RELAXED=3')
+# decoder 0's second kernel on one wave (rr2_w.comp KIND 5, the translated tail on the same wave), which the
+# D4R_RR2_UNGUARDED=1 build uses: dec0_1 393 -> 374 us at 1280x720 -> 1440p, the same images. In the guarded build its
+# tail's channel kc[2] comes out as a NaN of the other sign on the stress inputs (a product of two NaNs, whose sign
+# follows the compiler's operand order), so that build keeps the four-wave block. D4R_RR2_ONE_WAVE_DEC0_1=1 / 0 forces it.
+if os.environ.get('D4R_RR2_ONE_WAVE_DEC0_1', '1' if UNGUARDED else '0') != '0' and RELAXED >= 3:
+    ONE_WAVE.add('dec0_1')
 # encoder 0's gather as a pass of its own, which pays with the four-wave block (one shader would run the gather on one
 # wave of the four). With the one-wave block (level 3) the gather runs in the block's own shader and hands its
 # features over in shared memory instead (rr2_w.comp RR2_XF_SHARED): no record in the arena, one dispatch less. Without
@@ -209,10 +216,13 @@ def main():
                     subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
                                    check=True, stdout=subprocess.DEVNULL)
                 record = int((work / 'enc0_g.record').read_text())
+            hybrid_args = HYBRID[stage]
             if RELAXED >= 3 and stage in ONE_WAVE and (split or GROUP == 1):
                 how = how + ['--one-wave']
+                if stage == 'dec0_1':   # the tail runs on the block's one wave
+                    hybrid_args = ['--dec0_1', '--tail-waves', '1']
             subprocess.run([sys.executable, str(HERE / 'rr' / 'gen_rr2_enc0.py'), str(find_module(a.ptx_dir, kernel)),
-                            str(generated), str(work / f'{stage}_m.comp'), *HYBRID[stage], *how],
+                            str(generated), str(work / f'{stage}_m.comp'), *hybrid_args, *how],
                            check=True, stdout=subprocess.DEVNULL)
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
                                      f'-I{HERE / "rr"}', str(work / f'{stage}_m.comp'), '-o', str(out / f'{stage}.spv')],

@@ -88,8 +88,8 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #ifdef RR_NATIVE
 #define RVT float
 #define E4V(w, b) float(uintBitsToFloate4m3EXT(uint8_t(((w) >> (8u * (b))) & 0xffu)))
-// the FP8 bytes b and b + 1 (b even) of w, decoded together
-#define E4V2(w, b) vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t((w) >> (8u * (b))), uint8_t((w) >> (8u * (b) + 8u)))))
+// the FP8 bytes b and b + 1 (b even) of w, decoded together (a half of unpack8(w), which the compiler converts in place)
+#define E4V2(w, b) vec2(uintBitsToFloate4m3EXT((b) == 0u ? unpack8(w).xy : unpack8(w).zw))
 #define RESID(d, a, s, c) const float d = fma(float(a), float(s), float(c));
 #define Q8R(x) q8s(x)
 #define Q8R2(dst, i, x0, x1) { const vec2 v_ = vec2((x0), (x1)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(v_)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
@@ -204,8 +204,10 @@ uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
     return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
 }
 float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
-// bytes 2h and 2h + 1 of w as binary16 (FP8 values are binary16 numbers: the same as two e4)
-f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u * h)), uint8_t(w >> (16u * h + 8u))))); }
+// bytes 2h and 2h + 1 of w as binary16 (FP8 values are binary16 numbers: the same as two e4). A half of unpack8(w): the
+// compiler converts it in place (the low half, or the high one through the operand select), where a vector built from
+// two extracted bytes was first assembled with two byte permutes
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(h == 0u ? unpack8(w).xy : unpack8(w).zw)); }
 uvec2 mergeXY(uint r) { return r < 8u ? uvec2(r >> 1u, r & 1u) : uvec2((r - 8u) >> 1u, 2u + (r & 1u)); }
 // four binary16 values of a guide image at token (x, y) of a level w wide
 f16vec4 guideAt(uint off, int x, int y, int w)
@@ -533,9 +535,10 @@ void main()
         barrier();   // every wave is done with XT (the merge rows reuse it)
 #endif
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
-            [[unroll]] for (int i = 0; i < 8; ++i) {
-                RESID(y, ML[m][i], s2, rv[m][i])
-                Tb[m][i] = Q8R(y);
+            [[unroll]] for (int i = 0; i < 8; i += 2) {   // (each element as alone; the conversion two at a time)
+                RESID(y0, ML[m][i], s2, rv[m][i])
+                RESID(y1, ML[m][i + 1], s2, rv[m][i + 1])
+                Q8R2(Tb[m], i, y0, y1)
             }
             const uint w0 = pack4(Tb[m][0], Tb[m][1], Tb[m][2], Tb[m][3]), w1 = pack4(Tb[m][4], Tb[m][5], Tb[m][6], Tb[m][7]);
             const uint at = 4u * (m & 1u) + 2u * hl;

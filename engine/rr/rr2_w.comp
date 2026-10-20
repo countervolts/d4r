@@ -10,6 +10,9 @@
 // HD), included with RR2_EMBED by the shader engine/rr/gen_rr2_enc0.py --one-wave generates: with RR2_XF_SHARED the
 // gather runs in the same shader and leaves the features in XF (the default), with RR2_XF_ARENA they come from the
 // gather pass's record in the arena (--split block).
+// KIND 5 is decoder 0's second kernel the same way (gen_rr2_enc0.py --dec0_1 --one-wave): its tokens from the arena,
+// the block, and r and the MLP sum handed to the translated tail on the same wave through shared memory, half the
+// window's tokens at a time (rr2_handoff), so that the shader still declares 4 KiB.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -25,8 +28,11 @@ layout(local_size_x = 32) in;
 #endif
 #include "rr2_stage.h"
 #include "rr_exact.glsl"
-#if !(KIND == 2 || KIND == 4) || CM != 0 || GUIDE != 0 || C != 32
-#error rr2_w.comp: a 32-channel decoder's first kernel, or encoder 0's block
+#if !(KIND == 2 || KIND == 4 || KIND == 5) || CM != 0 || GUIDE != 0 || C != 32
+#error rr2_w.comp: a 32-channel decoder's first kernel, encoder 0's block or decoder 0's second kernel
+#endif
+#if KIND == 5 && !defined(RR2_EMBED)
+#error rr2_w.comp: decoder 0's second kernel hands r and the MLP sum to the translated tail (gen_rr2_enc0.py --dec0_1)
 #endif
 #if KIND == 4 && !(defined(RR2_EMBED) && (defined(RR2_XF_ARENA) || defined(RR2_XF_SHARED)))
 #error rr2_w.comp: encoder 0's block reads the gather's features (gen_rr2_enc0.py --one-wave)
@@ -66,6 +72,12 @@ shared uint XF[64 * 16];
 #define KVS XF
 #define XT XF
 #define XTA(o) (512u + (o))
+#elif KIND == 5
+// KVS words 0 - 511, XT words 512 - 1023; after the block the 4 KiB hold r and the MLP sum for half the tokens
+shared uint SM[1024];
+#define KVS SM
+#define XT SM
+#define XTA(o) (512u + (o))
 #else
 shared uint XT[16 * C];
 shared uint KVS[512];          // the expansion (input phase), then per head V^T, then QK
@@ -93,11 +105,16 @@ shared float16_t HD[64 * 4];     // the guide head per token (raster order), for
 const uint EBRANCH = W_EWD1 - W_EWD0;
 #endif
 
+#if KIND == 5
+uint rr2_r16[4][MT][4], rr2_m16[4][MT][4];   // r and the MLP sum as binary16 pairs per token slice and channel tile (rr2_handoff)
+#endif
+
 uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
 {
     return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
 }
-f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u*h)), uint8_t(w >> (16u*h+8u))))); }
+// (a half of unpack8(w): converted in place, see rr2_m.comp)
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(h == 0u ? unpack8(w).xy : unpack8(w).zw)); }
 float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
 
 #ifdef RR2_EMBED
@@ -154,6 +171,16 @@ void main()
                 coopMatStore(qx[wv][m], XT, XTA(wv * 4u * C + 4u * m), C / 4u, CMJ);
             }
     }
+#elif KIND == 5
+    // ---------------------------------------------------------------- the block's input: the window's 64 tokens from the
+    // arena, two per lane ([token slot][C FP8 channels in slot order], as rr2_m.comp's XT)
+    for (uint tk = lane; tk < 64u; tk += 32u) {
+        const uint k = inter(tk);
+        const int xx = mirror(x0 + int(k & 7u), ex), yy = mirror(y0 + int(k >> 3u), ey);
+        const uint tb = (inOff + uint(yy * ex + xx) * 32u) / 4u;
+        [[unroll]] for (uint wd = 0u; wd < C / 4u; ++wd) XT[XTA(tk * (C / 4u) + wd)] = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
+    }
+    barrier();
 #else
     // ---------------------------------------------------------------- the block's input: expansion plus skip
     float16_t xr[4][MT][8];   // this lane's part of x for each token slice: [slice][channel tile][element]
@@ -327,6 +354,9 @@ void main()
             [[unroll]] for (int i = 0; i < 8; ++i) {
 #if KIND == 4
                 const float xb = float(qx[wv][m][i]);
+#elif KIND == 5
+                const uint xw = XT[XTA((16u * wv + col) * (C / 4u) + 4u * m + 2u * hl + (uint(i) >> 2u))];
+                const float xb = float(uintBitsToFloate4m3EXT(((uint(i) & 2u) == 0u ? unpack8(xw).xy : unpack8(xw).zw)[uint(i) & 1u]));
 #else
                 const float xb = float(xr[wv][m][i]);
 #endif
@@ -336,6 +366,11 @@ void main()
                 ML[wv][m][i] = w32f.w[W_BU_F / 4u + 16u * m + 8u * hl + uint(i)];
             }
             Q8(Nb[wv][m], rv[wv][m])
+#if KIND == 5
+            // the tail takes r as binary16: converted here, so that the f32 values are not live across the MLP
+            [[unroll]] for (int i = 0; i < 8; i += 2)
+                rr2_r16[wv][m][i >> 1] = packFloat2x16(f16vec2(float16_t(rv[wv][m][i]), float16_t(rv[wv][m][i + 1])));
+#endif
         }
     [[unroll]] for (uint br = 0u; br < NB; ++br) {
         const uint w1 = W_WD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
@@ -355,6 +390,14 @@ void main()
         }
     }
 
+#if KIND == 5
+    // ---------------------------------------------------------------- r and the MLP sum for the translated tail, which
+    // forms y = r + MLP * s2 itself (rr2_handoff)
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+        [[unroll]] for (uint m = 0u; m < MT; ++m)
+            [[unroll]] for (int i = 0; i < 8; i += 2)
+                rr2_m16[wv][m][i >> 1] = packFloat2x16(f16vec2(float16_t(ML[wv][m][i]), float16_t(ML[wv][m][i + 1])));
+#else
     // ---------------------------------------------------------------- y = r + MLP * s2: the stage's tokens
 #if KIND == 4
     A8 wh[MT];
@@ -391,4 +434,31 @@ void main()
         }
 #endif
     }
+#endif
 }
+#if KIND == 5
+// r and the MLP sum of the window's tokens 32 phase ... 32 phase + 31 for the translated tail, as binary16 pairs of
+// natural channels 2k, 2k + 1 per token (r at word 0, the MLP sum at word 512): the layout rr2_m.comp KIND 5 hands all
+// 64 tokens over in, 8 KiB, which one wave cannot hold at the full rate (above). The tail takes the rows of each half
+// in turn (gen_rr2_enc0.py).
+void rr2_handoff(uint phase)
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint hl = lane >> 4u, col = lane & 15u;
+    barrier();   // the block, or the tail's reads of the previous half, are done with SM
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+        const uint t = inter(16u * wv + col);
+        if ((t >> 5u) == phase)
+            [[unroll]] for (uint m = 0u; m < MT; ++m)
+                [[unroll]] for (int i = 0; i < 8; i += 2) {
+                    const uint w = ((t & 31u) * 32u + inter(16u * m + 8u * hl + uint(i))) >> 1u;
+                    SM[w] = rr2_r16[wv][m][i >> 1];
+                    SM[512u + w] = rr2_m16[wv][m][i >> 1];
+                }
+    }
+    barrier();
+}
+// r and the MLP sum of token row, natural channel col (row in the half rr2_handoff wrote last)
+float16_t rr2_rsh(uint row, uint col) { return unpackFloat2x16(SM[(row & 31u) * 16u + (col >> 1u)])[col & 1u]; }
+float16_t rr2_msh(uint row, uint col) { return unpackFloat2x16(SM[512u + (row & 31u) * 16u + (col >> 1u)])[col & 1u]; }
+#endif

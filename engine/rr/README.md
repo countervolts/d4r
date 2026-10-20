@@ -664,4 +664,94 @@ the two are equally fast).
 Tried, no gain: the translated code's texel fetch without its branch (enc0 within noise); the next MLP branch's
 weights or biases prefetched (into L2, or into registers one branch ahead); two MLP branches per loop iteration; V^T
 kept in registers in `rr2_w.comp`; weight loads through buffer device addresses. Not done: decoder 0's second kernel
-on one wave, whose tail would need r and the MLP sum in 8 KiB of shared memory per wave.
+on one wave, whose tail would need r and the MLP sum in 8 KiB of shared memory per wave (done later the same day,
+below, by handing them over in two halves).
+
+### Byte-identical speed-ups (2026-10-20, later)
+
+Same setup as above (and the RADV buffer-offset pass), opt-in build (`D4R_RR2_UNGUARDED=1 D4R_RR2_POOLED=rgb10_a2`),
+`D4R_RR_TEST_ROBUST2=1`. Every image of every frame is byte-identical to the previous model on the replay, odd-size,
+540p, stress and game-like inputs, with and without `D4R_RR_TEST_ROBUST2=1`: preset F at levels 0 and 3 and in the
+opt-in build, presets D and E at levels 0 and 3 (they share the translated code), and the RDNA3 builds of D and E
+(`D4R_RR_GFX11=1`, run on the RX 9070 XT).
+
+| Change | Stages (us) | Frame (ms) |
+|---|---|---|
+| `ptx2rr.py` fetch0: with `robustImageAccess2` the translated stages' texel fetches skip their bounds test | enc0 616 -> 600, output passes 607 -> 590 | 3.111 -> 3.082 |
+| `rr2_w.comp` KIND 5: decoder 0's second kernel on one wave (opt-in build only, see below) | dec0_1 393 -> 374 | 3.081 -> 3.062 |
+| `rr2_m.comp`, `rr2_w.comp`: FP8 pairs decoded as halves of `unpack8`, without byte permutes | dec0_0 324 -> 316, dec1_0 183 -> 181 | 3.057 -> 3.041 |
+| `rr2_m.comp`: the stage's output tokens converted two at a time | dec1_1 160 -> 156, enc1 213 -> 211 | 3.049 -> 3.029 |
+| `ptx2rr.py`: 64-bit address arithmetic in 32 bits where only the low 32 bits are used | output passes 592 -> 575 | 3.035 -> 3.014 |
+
+The steps above were measured one after another before the RDNA2 preset E / F change was merged. All of it, against
+models built from the branch these changes sit on, 6 interleaved runs: opt-in build 3.128 -> 3.024 ms, default build
+3.256 -> 3.147, exact build 4.080 -> 4.004 (4 runs); presets D / E at level 3 3.383 -> 3.320 / 3.390 -> 3.287.
+
+- The fetch: the reference reads an integer texel outside the image as zero. With `robustImageAccess2` the image load
+  already returns zero there, except for a w component the format lacks, which comes back as one. The runtime sets
+  specialization constant 0 (`RR_ROBUST_IMAGES`) when the device has the feature enabled: the shim reads it from
+  vkd3d-proton's device features (vkd3d-proton requires robustness2; the shim logs `robustImageAccess2 enabled`),
+  `d4r-rr` with `D4R_RR_TEST_ROBUST2=1`. Otherwise, and with models built before this change, nothing changes.
+- Decoder 0's second kernel on one wave hands r and the MLP sum to the translated tail through 4 KiB of shared
+  memory, half the window's tokens at a time. Only the opt-in build uses it: in the guarded build the tail's `kc[2]`
+  comes out as a NaN of the other sign on the stress inputs, because the sign of a product of two NaNs follows the
+  operand order the compiler picks (`ACO_DEBUG=nosched` alone flips it there). `D4R_RR2_ONE_WAVE_DEC0_1=1` / `0`
+  forces either.
+- Presets D and E at level 3 show the same on the stress inputs: with `ACO_DEBUG=nosched` alone 102 and 100 of 186
+  images change at 720p, and every value that differs is a NaN on both sides, with the other sign. Comparisons that
+  change the compiler or driver therefore hash those images with every NaN replaced by one canonical NaN (0 of 186
+  then differ); the comparisons above are identical without it.
+
+Tried, no gain: the output passes as wave32 (post 112 us slower); r of half the token slices kept in shared memory
+during the MLP, for fewer registers (same time); the image size read once per texture in the gather instead of per
+fetch (within noise); a driver without the RDNA4 hazard waits for SGPRs read by the VALU saves 2 - 4 us per
+translated stage, so avoiding them is not worth much. Not done: the output filter's refinement loop runs until the
+slowest lane of a wave converges; regrouping pixels by iteration count would save an estimated 25 us.
+
+### Where the time of the top stages goes, and the encoder-0 order (2026-10-20, evening)
+
+Same setup (RX 9070 XT, RADV 26.2.2 with the round-5b GL2 change, 1280x720 -> 2560x1440 game-like input, opt-in
+build, `D4R_RR_TEST_ROBUST2=1`, median of 3 - 6 interleaved runs). Before writing more peepholes, each of the top
+stages was timed with stub variants of its shader: stores behind an opaque false, texel fetches or arena reads
+replaced by cheap arithmetic, every weight tile read from one hot 4 KiB (distinct loads, no CSE), the cubic table
+lookups replaced by the value, one head / no MLP branches, extra shared memory to cut the waves per SIMD, the
+shader returning at once. The variants' outputs are wrong, so only the stage's own time counts, and only for stages
+without data-dependent loops (the native blocks, the gather, the decoder tail; not post and down, whose refinement
+loops run longer or shorter with the data they get, see below).
+
+| Stage (us) | Without stores | Without arena / fetches | Weights hot | Without cubic lookups | Half the waves per SIMD | Everything but the arithmetic removed |
+|---|---|---|---|---|---|---|
+| dec0_1 369 | 366 | 337 (tokens) | 344 | 332 | 484 (4 waves) / 882 (2) | 308 |
+| dec0_0 317 | 315 | 308 | 308 | 285 | - | 282 |
+| enc0 block ~339 | ~317 | ~242 (the gather's record) | ~318 | ~308 | +118 (3 waves) | ~215 |
+| enc0 gather ~255 | ~208 | ~161 (fetches) | - | - | +334 (2 waves) | ~150 |
+
+So decoder 0's two kernels and encoder 0's block are bound by their own VALU and WMMA issue (83 - 89% of their time
+is left with every memory access removed; a WMMA 16x16x16 FP8 costs about 16 cycles of the SIMD on this GPU, a
+quarter of the block's instruction time), and lose about a third more with half the waves: more waves would help,
+but shared memory (4 KiB a wave, 32 KiB a SIMD) and 192 - 240 registers cap them at 6 - 8. The gather is VALU and
+SALU issue plus its fetches. The record encoder 0's block reads (73 MB a frame, written by the gather just before)
+is the one stage that reads from DRAM: the block's windows now run in the reverse of the gather's dispatch order
+(`gen_rr2_enc0.py --split block`), so that the records written last are read first while they are still in the
+64 MB last-level cache: encoder 0 597 -> 576 us, frame 2.985 -> 2.961 ms (6 interleaved runs). The levels' kernels are unchanged in what
+they compute; every image of every frame is byte-identical to the previous model on the 7 input sets, with and
+without `D4R_RR_TEST_ROBUST2=1`, for the opt-in, default and exact builds (presets D and E do not use this
+generator; their models are file-identical).
+
+The deep levels (3 - 5, 274 us in 7 dispatches) are not latency-bound in the way assumed: a dispatch of an empty
+shader costs 1 us, and a window's four waves run on one CU with nothing else to do, so level 5's 24 windows use 24
+of 64 CUs at full tilt (its time is the same at 540p, 720p and 1080p). The output filter (post, ~400 us) is where
+the data matters: its refinement loop runs until a wave's slowest lane converges, and a stub that changes the
+half-size history it reads next frame changes its time by up to 100 us, which looked like a store cost until the
+same stores to a buffer, copied to the image by a pass of their own, cost exactly as much once the history was
+right.
+
+Tried, no gain (all byte-identical where they ran): the cubic numerator computed in packed binary16 arithmetic
+instead of looked up (identical on all 65536 inputs; dec0_1 +7 us, dec0_0 +3, enc0 +9: the gathers hit the L0
+cache); the deep levels with their heads and MLP branches on 2 - 4 groups of waves, folded in order through shared
+memory (enc3 55 -> 77 / 103 us: one workgroup stays on one CU); 2 - 4 windows per workgroup for the same reason
+(enc5 29 -> 102 us); the half-size history stored to the arena by the filter and written to its image by a copy
+pass (+23 us for the pass, the filter unchanged); encoder 0's gather and block in 4 - 32 bands of rows with the
+block of a band next to the gather of the next (-15 us with 4 bands, worse beyond: each band's barrier drains the
+GPU); encoder 0 fused into one shader again (607 us against 575). Decoder 0's two kernels in reverse order gain
+nothing (their tokens are still cached).

@@ -90,9 +90,16 @@ struct RModel::Impl {
     bool uploaded = false;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool int64Atomics)
+RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool int64Atomics,
+               bool robustImages)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
+    // the translated stages' specialization constant 0 (engine/rr/ptx2rr.py RR_ROBUST_IMAGES), set for every stage of the
+    // model; shaders without it ignore it. Constant 0 is reserved for this: an RR shader must not declare it otherwise.
+    const VkBool32 robust = VK_TRUE;
+    const VkSpecializationMapEntry robustEntry{0, 0, sizeof(VkBool32)};
+    const VkSpecializationInfo robustInfo{1, &robustEntry, sizeof(VkBool32), &robust};
+    const VkSpecializationInfo* specialization = robustImages ? &robustInfo : nullptr;
     // rr.txt: "D4RR0001", "preset N", one "stage NAME SHADER.spv SUBGROUP WEIGHTS TEXTURES SURFACES" line per stage in
     // RNames order (TEXTURES: comma-separated argument offsets or "-"; SURFACES: OFFSET:FORMAT,... or "-") and
     // "template enc0|hkpn FILE" (the argument blocks whose constants the runtime keeps)
@@ -103,7 +110,7 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     if (line.rfind("D4RR0002", 0) == 0) {
         m.preset = 6;
         m.v2 = std::make_unique<R2Model>();
-        m.v2->load(m.device, directory, lines, cache, int64Atomics);
+        m.v2->load(m.device, directory, lines, cache, int64Atomics, specialization);
         return;
     }
     if (line.rfind("D4RR0001", 0) != 0) throw std::runtime_error("not a Ray Reconstruction model (rr.txt D4RR0001)");
@@ -143,7 +150,7 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
             std::vector<VkDescriptorType> types{b, b, b};
             types.insert(types.end(), m.textures[stage].size(), t);
             types.insert(types.end(), m.surfaces[stage].size(), s);
-            m.stages[stage].create(device, directory + "/" + shader, types, subgroup, cache, flags);
+            m.stages[stage].create(device, directory + "/" + shader, types, subgroup, cache, flags, specialization);
             auto blob = read(directory + "/" + weightFile);
             const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             m.weights[stage].create(m.device, blob.size(), usage);

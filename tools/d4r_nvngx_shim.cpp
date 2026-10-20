@@ -3421,6 +3421,9 @@ struct VulkanInterop
     // shaderBufferInt64Atomics is enabled on vkd3d-proton's device (it enables it when the GPU has it): Ray
     // Reconstruction preset F then measures the exposure in one pass, as NGX does, instead of two
     bool int64Atomics = false;
+    // robustImageAccess2 is enabled on vkd3d-proton's device (it requires it): the Ray Reconstruction stages translated
+    // from NVIDIA's kernels then leave the zero of an image load outside the image to the device
+    bool robustImages = false;
     bool matrixF16 = false;
     // The engine runs on the game's own Vulkan device (native Vulkan NGX frontend): no vkd3d interop objects.
     bool native = false;
@@ -9403,8 +9406,11 @@ static void init_engine_vulkan()
                 g_vk.int64Atomics = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(next)->shaderBufferInt64Atomics == VK_TRUE;
             if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES)
                 g_vk.int64Atomics = reinterpret_cast<const VkPhysicalDeviceShaderAtomicInt64Features*>(next)->shaderBufferInt64Atomics == VK_TRUE;
+            if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT)
+                g_vk.robustImages = reinterpret_cast<const VkPhysicalDeviceRobustness2FeaturesEXT*>(next)->robustImageAccess2 == VK_TRUE;
         }
     logf("engine backend: 64-bit buffer atomics %s", g_vk.int64Atomics ? "enabled" : "not enabled: preset F's exposure in two passes");
+    logf("engine backend: robustImageAccess2 %s", g_vk.robustImages ? "enabled" : "not enabled");
 }
 
 static void init_engine_backend()
@@ -10591,7 +10597,8 @@ static void init_engine_backend_rr(int slot)
         if (!read_whole_file(widen(path + "\\rr.txt"), metadata) ||
             !d4r_rr_model_compatible(metadata, g_vk.matrixF16, g_vk.float8))
             throw std::runtime_error("model arithmetic is unsupported by this GPU (no pipelines created)");
-        auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, g_vk.int64Atomics);
+        auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, g_vk.int64Atomics,
+                                                   g_vk.robustImages);
         if (model->preset() != g_rrPreset[slot])
             throw std::runtime_error("the directory holds a model of another preset");
         g_engineR.models[slot] = std::move(model);
