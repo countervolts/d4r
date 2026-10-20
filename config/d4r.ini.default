@@ -29,7 +29,8 @@ GameExe =
 ; F     | 3 CNN | DLAA / Ultra Performance        | Deprecated; prefer K or L
 ;
 ; On the engine ([Engine]) E and F run from engine\e and engine\f (build-engine-models.sh) without cooperative
-; matrices, so they are the models for RDNA2 GPUs (Steam Deck: about 5 ms at 640x360 -> 1280x720).
+; matrices, so they are the models for RDNA2 GPUs (Steam Deck: about 5 ms at 640x360 -> 1280x720). K runs there
+; too (engine\k: its network on v_dot2, about 9.7 ms at 640x360 -> 1280x720, faster than K's native kernels).
 ;
 ; Select the upscaling mode separately in game/OptiScaler. These are recommendations;
 ; other modes are allowed. L requires the L texture build.
@@ -145,7 +146,7 @@ MarkerPollUs = auto
 ; result of the frame it just rendered, and FrameAge and the [Interop] hand-off settings do not apply.
 ; Needs VkD3DDir, a driver with VK_KHR_cooperative_matrix (Mesa RADV on RDNA3/RDNA4) and the model folders
 ; (RuntimeDir/engine/k, k-ldr, m, m-ldr, l, l-ldr; scripts/install_d4r_runtime.sh). E and F (engine/e, engine/f;
-; D4R_ENGINE_MODEL_E_DIR, D4R_ENGINE_MODEL_F_DIR) need no cooperative matrices: they run on RDNA2 (Steam Deck)
+; D4R_ENGINE_MODEL_E_DIR, D4R_ENGINE_MODEL_F_DIR) and K (its layer_dot2 network) need no cooperative matrices: they run on RDNA2 (Steam Deck)
 ; too, from any render size and HDR or LDR, with AutoExposure too (models built by this version). A game or setting the engine
 ; does not cover uses the normal path, with the reason in d4r_nvngx.log: other models than E, F, K, L and M,
 ; display-resolution motion vectors with L or M, or a K model built before the current engine/compile_k.py for display-resolution

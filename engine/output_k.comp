@@ -279,9 +279,11 @@ void main()
     const int a0 = int(floor(float(cA))) - 1;
     // Every product and sum of the filter is rounded to half precision, as in the reference: with single precision
     // the result differs visibly more (49 dB against 116 dB on the luma history of the test frames).
-    f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0);
-    const float16_t line0 = cB + (float16_t(a0) - cA) * slope;
-    float16_t line = line0;
+    // Where every exponent is below -12 the result is the tap with the largest exponent instead. The loop tracks
+    // that tap as it goes: a second pass over the taps, run only where the sum of weights allowed it, ran for most
+    // waves on a Steam Deck (one such pixel suffices) and cost 0.2 ms of 4.3 at 1080p.
+    f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0), eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
+    float16_t line = cB + (float16_t(a0) - cA) * slope;
     for (int r = 0; r < 4; ++r)
     {
         const int bs = int(roundEven(float(line))) - 1;
@@ -293,38 +295,17 @@ void main()
         for (int j = 0; j < 3; ++j)
         {
             // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
-            const f16vec4 w = exp2(fma(db * db, f16vec4(e1), lin));
-            sumY = fma(w, f16vec4(tileC[ti + j * stepB].x), sumY); sumW += w;
+            const f16vec4 E = fma(db * db, f16vec4(e1), lin);
+            const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + j * stepB].x);
+            sumY = fma(w, Y, sumY); sumW += w;
+            const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
+            eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
             db += float16_t(1.0); lin += cross;
         }
         line += slope;
     }
     vec4 F = vec4(sumY) / vec4(sumW);
-    // Where every exponent is below -12 the result is the tap with the largest exponent instead. That needs all
-    // twelve weights below 2^-12, so the sum of weights rules it out for almost every pixel.
-    if (any(lessThan(sumW, f16vec4(12.5 / 4096.0))))
-    {
-        f16vec4 eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
-        line = line0;
-        for (int r = 0; r < 4; ++r)
-        {
-            const int bs = int(roundEven(float(line))) - 1;
-            const f16vec4 dA = float16_t(a0 + r) - subA;
-            f16vec4 db = float16_t(bs) - subB;
-            const f16vec4 cross = dA * e2;
-            f16vec4 lin = fma(db, cross, (dA * dA) * e0);
-            const int ti = (a0 + r) * stepA + bs * stepB;
-            for (int j = 0; j < 3; ++j)
-            {
-                const f16vec4 E = fma(db * db, f16vec4(e1), lin);
-                const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
-                eMax = mix(eMax, E, gt); yMax = mix(yMax, f16vec4(tileC[ti + j * stepB].x), gt);
-                db += float16_t(1.0); lin += cross;
-            }
-            line += slope;
-        }
-        F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
-    }
+    F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
     // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads
     // it as an f16 value widened to f32 (dlss-0046 converts every lane with cvt.rn.f16.f32 before the
     // `fma bl, F - Hq, Hq` that forms N), and the normalisation and the low-exponent fallback also produce

@@ -16,7 +16,7 @@ host staging and command-buffer event synchronization; it does not use vkd3d-pro
 | CUDA bridge `nvcuda.dll` | `tools/wine_nvcuda_bridge.c` | A Wine builtin whose Windows exports forward to ZLUDA's Linux `libcuda.so`, plus d4r helpers (Vulkan memory import, asynchronous 2D copies, GPU-side waits, output redirect, linear textures) |
 | ZLUDA | `patches/zluda` | CUDA driver API on HIP; compiles NVIDIA's PTX to AMDGPU code; serves native kernels in place of PTX kernels |
 | Native kernels | `kernels/` | RDNA3 implementations of the DLSS network layers and parts of texture kernels |
-| vkd3d-proton patch | `patches/vkd3d-proton` | Splits a D3D12 command list around DLSS and retains external resources through command allocator completion |
+| vkd3d-proton patch | `patches/vkd3d-proton` | Splits a D3D12 command list around DLSS, retains external resources through command allocator completion, and enables VK_EXT_pipeline_robustness so the engine's pipelines can opt out of buffer robustness |
 | NVAPI identity | `tools/d4r_nvapi_identity.c` | Reports an Ada (sm_89) GPU so NGX selects the network weights matching the PTX ZLUDA compiles |
 
 ## One frame

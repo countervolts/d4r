@@ -51,6 +51,7 @@ struct Context {
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory{};
     uint32_t timestampBits = 64;
+    bool matrices = false;      // VK_KHR_cooperative_matrix is enabled (K takes layer.comp, else layer_dot2.comp)
     ~Context() {
         if (device) vkDeviceWaitIdle(device);
         if (cache) vkDestroyPipelineCache(device, cache, nullptr);
@@ -77,7 +78,9 @@ struct Context {
         uint32_t extensionCount = 0; CK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr));
         std::vector<VkExtensionProperties> extensions(extensionCount);
         CK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, extensions.data()));
-        if (std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); }))
+        // K runs without cooperative matrices (KNetwork::Dot2: RDNA2); M needs them
+        matrices = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); });
+        if (!matrices && fp8)
             throw std::runtime_error("VK_KHR_cooperative_matrix required");
         if (fp8 && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME); }))
             throw std::runtime_error("VK_EXT_shader_float8 required for M");
@@ -85,25 +88,27 @@ struct Context {
             throw std::runtime_error("VK_KHR_external_memory_fd required for the native HIP network");
         VkPhysicalDeviceShaderFloat8FeaturesEXT float8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR matrix{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr};
-        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &matrix};
+        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, matrices ? &matrix : nullptr};
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
         VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
         vkGetPhysicalDeviceFeatures2(physical, &features);
         if (fp8 && (!float8.shaderFloat8 || !float8.shaderFloat8CooperativeMatrix))
             throw std::runtime_error("GPU lacks FP8 cooperative matrices");
-        if (!matrix.cooperativeMatrix || !features.features.shaderInt16 || !features.features.shaderStorageImageExtendedFormats || !f11.storageBuffer16BitAccess || !f12.shaderFloat16 || !f13.subgroupSizeControl || !f13.computeFullSubgroups)
+        if ((matrices && !matrix.cooperativeMatrix) || !features.features.shaderInt16 || !features.features.shaderStorageImageExtendedFormats || !f11.storageBuffer16BitAccess || !f12.shaderFloat16 || !f13.subgroupSizeControl || !f13.computeFullSubgroups)
             throw std::runtime_error("GPU lacks f16 storage/arithmetic, cooperative matrix or subgroup control");
-        auto matrixProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-        if (!matrixProperties) throw std::runtime_error("cooperative matrix query unavailable");
-        uint32_t matrixCount = 0; CK(matrixProperties(physical, &matrixCount, nullptr));
-        std::vector<VkCooperativeMatrixPropertiesKHR> matrices(matrixCount, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-        CK(matrixProperties(physical, &matrixCount, matrices.data()));
-        if (std::none_of(matrices.begin(), matrices.end(), [](const auto& p) {
-            return p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.scope == VK_SCOPE_SUBGROUP_KHR &&
-                   p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                   p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR;
-        })) throw std::runtime_error("16x16x16 f16 -> f32 cooperative matrices required");
+        if (matrices) {
+            auto matrixProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+            if (!matrixProperties) throw std::runtime_error("cooperative matrix query unavailable");
+            uint32_t matrixCount = 0; CK(matrixProperties(physical, &matrixCount, nullptr));
+            std::vector<VkCooperativeMatrixPropertiesKHR> tuples(matrixCount, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            CK(matrixProperties(physical, &matrixCount, tuples.data()));
+            if (std::none_of(tuples.begin(), tuples.end(), [](const auto& p) {
+                return p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.scope == VK_SCOPE_SUBGROUP_KHR &&
+                       p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR;
+            })) throw std::runtime_error("16x16x16 f16 -> f32 cooperative matrices required");
+        }
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         vkGetPhysicalDeviceProperties2(physical, &p2);
@@ -114,7 +119,7 @@ struct Context {
         features.features.shaderStorageImageExtendedFormats = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12}; f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13}; f12.shaderFloat16 = VK_TRUE;
-        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &matrix}; f13.subgroupSizeControl = f13.computeFullSubgroups = VK_TRUE;
+        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, matrices ? &matrix : nullptr}; f13.subgroupSizeControl = f13.computeFullSubgroups = VK_TRUE;
         matrix = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr}; matrix.cooperativeMatrix = VK_TRUE;
         if (fp8) {
             float8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
@@ -128,8 +133,9 @@ struct Context {
         timestampBits = families[family].timestampValidBits;
         float priority = 1;
         VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueFamilyIndex = family; qi.queueCount = 1; qi.pQueuePriorities = &priority;
-        const char* enabled[3] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
-        uint32_t enabledCount = 1;
+        const char* enabled[3] = {};
+        uint32_t enabledCount = 0;
+        if (matrices) enabled[enabledCount++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
         if (fp8) enabled[enabledCount++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
         if (externalMemory) enabled[enabledCount++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features};
@@ -344,7 +350,8 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         }
     }
     const auto start = std::chrono::steady_clock::now();
-    d4r::Model model(context.physical,context.device,modelDir,context.cache);
+    d4r::Model model(context.physical,context.device,modelDir,context.cache,context.matrices ? d4r::KNetwork::Auto : d4r::KNetwork::Dot2);
+    if (model.dot2Network()) std::cerr << "network: layer_dot2 (no cooperative matrices)\n";
     d4r::ExternalNetwork external{};
 #ifdef D4R_ENGINE_HIP
     std::unique_ptr<d4r::HipNetwork> network;

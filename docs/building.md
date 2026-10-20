@@ -6,7 +6,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 | Component | Tested version |
 |---|---|
 | ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0014` in order |
-| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` through `0003` in order |
+| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` through `0005` in order |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
 | DLSS | `nvngx_dlss.dll` 310.7.0 |
@@ -61,7 +61,7 @@ When linking on a system with ROCm libraries outside the default search path, in
 scripts/build_vkd3d_proton_d4r.sh ~/.cache/d4r-vkd3d-d4r
 ```
 
-Patches `0001` and `0002` provide same-frame command-list splitting and resource-lifetime tracking; both are required by the shim, which rejects feature creation without the lifetime interface, even when CPU staging or previous-frame output is selected. Patch `0003` adds experimental exportable linear textures, enabled only by `VKD3D_D4R_LINEAR_TEXTURES=1`. Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output and update `d3d12.dll` and `d3d12core.dll` together.
+Patches `0001` and `0002` provide same-frame command-list splitting and resource-lifetime tracking; both are required by the shim, which rejects feature creation without the lifetime interface, even when CPU staging or previous-frame output is selected. Patch `0003` adds experimental exportable linear textures, enabled only by `VKD3D_D4R_LINEAR_TEXTURES=1`; patch `0004` (`VKD3D_D4R_LINEAR_RGBA8=WxH`) extends that to the RGBA8 output the shim writes in place (`D4R_SHIM_INPLACE=1`). Patch `0005` enables `VK_EXT_pipeline_robustness`, so the engine's pipelines opt out of buffer robustness (`D4R_ENGINE_BUFFER_ROBUSTNESS=1` keeps it). Point `D4R_VKD3D_DIR` (or `VkD3DDir` in d4r.ini) at the output and update `d3d12.dll` and `d3d12core.dll` together.
 
 Game-local `d3d12.dll` and `d3d12core.dll` override the prefix's copies. Update both if the game already contains an older d4r runtime; changing only `D4R_VKD3D_DIR` does not replace those local overrides.
 
@@ -180,7 +180,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
 | `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0014` applied |
-| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001`–`0003` applied |
+| `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001`–`0005` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
 | `D4R_ROCM_LINK_STUBS` | optional directory for additional ROCm link libraries |

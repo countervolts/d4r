@@ -48,6 +48,7 @@ shader uses wave64 and computes reconstruction and temporal accumulation in one 
 Requirements: C++17, Vulkan headers/loader, Python with NumPy, and `glslangValidator`. The GPU/driver must support
 Vulkan 1.3, `VK_KHR_cooperative_matrix` with 16x16x16 f16 operands/f32 accumulation, wave32/wave64 subgroup control,
 f16 storage/arithmetic, shader int16, and extended storage-image formats. The executable checks these capabilities.
+K also runs without cooperative matrices (RDNA2): see [Preset K without cooperative matrices](#preset-k-without-cooperative-matrices-rdna2).
 
 A model directory holds values read from NVIDIA's DLSS (`weights.bin`, `offsets.bin`, `lut.bin`, `hipnet.bin`,
 `model.json`) next to d4r's compiled shaders. Build it from your own `nvngx_dlss.dll` and keep it on your machine:
@@ -135,6 +136,17 @@ reproduces that cycle (observed over 64 evaluations); `d4r-k` replays use the ca
 frames, the fixed one. On a captured sequence the fixed shift costs 4-8 dB against NGX's. The helper supports output dimensions at least
 256x256 and render dimensions no larger than output. Device image/buffer limits can impose a lower maximum than
 the helper's 8192-pixel dimension limit. Only standard HDR output with zero output origin is supported.
+
+The decoders skip the windows that only cover that padding (`kLayerGroups` in `runtime.cpp`). A window reads only
+its own tokens (a decoder also the 4x4 low-resolution tokens under it and its encoder's skip tokens), so the
+windows a frame's results depend on follow backwards from what the later stages read: the reconstruction reads the
+head of the output's tokens, the next frame's input stage the token feature at most one token further (bilinear,
+on-screen history only). The encoders all run: the deep layers' few windows mirror at the grid's edge and read
+every token above them. 1280x720 has 180 of 256 token rows; dec0 then runs 24 of 33 window rows, dec1 13 of 17,
+dec2 7 of 9, dec3 4 of 5. Every output is unchanged (final image, both histories, and the token feature and head
+where anything reads them; the head and feature rows past 187 keep older values). Steam Deck, 640x360 -> 1280x720:
+9.66 -> 8.84 ms per frame; RX 9070 XT, cooperative matrices: 713 -> 682 us. `D4R_ENGINE_K_TRIM=0` runs every
+window. `test_frame.py` compares the token feature on the rows and columns the next frame can read.
 
 The eleven layers can also run on the native HIP kernels (`kernels/k`, the accuracy HSACOs) with the stages
 around them still on Vulkan, through two storage buffers shared by file descriptor. `compile_k.py --hip
@@ -1313,6 +1325,121 @@ python3 engine/compile_sr_e.py "$CAP/replay" nvngx_dlss.dll build/e-model --pres
 build/native-engine/d4r-e build/e-model INPUT_DIR OUT_DIR    # D4R_ENGINE_E_PROFILE=1: microseconds per pass
 ```
 
+## Preset K without cooperative matrices (RDNA2)
+
+RDNA2 (the Steam Deck's VanGogh, gfx103x) has no matrix instructions and RADV does not expose
+`VK_KHR_cooperative_matrix` there, so `layer.comp` cannot run. `layer_dot2.comp` is the same Swin block (same
+bindings, parameter block, build-time shape and roundings to binary16) on `v_dot2_f32_f16`: binary16 pairs, f32
+accumulation, at the full packed rate of the GPU. Only the order of the f32 sums differs from `layer.comp`.
+
+- GLSL reaches the instruction through `SPV_VALVE_mixed_float_dot_product` (`spirv_instruction`, `OpFDot2MixAcc32VALVE`);
+  RADV lowers it to `v_dot2_f32_f16`, whose weight operand can be a scalar register.
+- One wave32 per attention head (twice the heads, at most eight, in the deep layers C >= 96, which have too few
+  windows to fill the GPU otherwise). A lane owns two tokens of the 8x8 window (lane and lane + 32), so every
+  wave spans the window and each weight word feeds two products. The products with weights take the weights from
+  scalar memory (the waves split the output channels); the activations are rows in shared memory.
+- The weights are the model's own matrices with each pair of K rows interleaved (one 32-bit word holds W[2i][n]
+  and W[2i+1][n]). The runtime does that when it loads `weights.bin`; every tensor keeps its offset, so a model
+  directory serves both networks. `compile_k.py` writes the shaders as `<layer>_dot2.spv` next to `<layer>.spv`.
+- Attention runs in registers: a lane holds its tokens' queries, keys and transposed values; the other tokens'
+  keys and values come from the lanes holding them as DPP8 broadcasts fused into `v_dot2c`
+  (`swizzleInvocationsMaskedAMD`, eight lanes at a time), and the registers rotate by eight lanes per step. Softmax
+  is single-pass without the maximum (as the reference): the f32 sums are scaled by 1 / sum at the end instead of
+  rounding each probability to binary16 first. That measured the same or 0.1-0.2 dB closer to NGX per layer
+  than the exact two-pass order, and is faster.
+- Patch merge and expand (the 16 low-resolution tokens of a window): a lane owns two output columns; weights
+  are loaded 16 K pairs ahead. In the merge a lane computes `MMT` merged tokens (each weight pair feeds 2 `MMT`
+  products); `compile_k.py` takes the largest of 2, 4, 8, 16 that keeps 60% of the lanes busy (enc0/enc1 8,
+  enc2 16, enc3 4, enc4 8).
+- Shared memory sets how many windows a CU holds. In the C = 64 layers (one wave per head, `AO_ROWS`) the heads'
+  attention outputs go into the token rows once every wave has read them, and the MLP takes one hidden chunk of
+  32 at a time: 14 KB instead of 19 KB, four windows per CU instead of three.
+
+Selection: `d4r::KNetwork` on `Model` (`Auto`: the matrices when the device exposes the extension, else
+`layer_dot2`; `D4R_ENGINE_K_NETWORK=dot2|matrix` overrides, which also runs `layer_dot2` on RDNA3/4 for testing).
+`d4r-k` no longer requires cooperative matrices for K. The shim picks `layer_dot2` when the GPU has no f16 matrix
+tuple and, there, keeps K on the engine under `[Engine] Enabled = auto` (on RDNA2 the native K layers emulate WMMA).
+A K model built before this has no `_dot2` shaders: the shim then logs that it must be rebuilt and uses the CUDA
+backend. On RDNA2 the input stage and the reconstruction run as wave32 (`D4R_ENGINE_K_STAGE_WAVE=32|64` forces
+either, the outputs are identical).
+
+Accuracy (`test_k.py --dot2`, each layer on NGX's captured inputs of a 1920x1080 frame, against NGX's outputs):
+the same PSNR as `layer.comp` to 0.1 dB on every tensor, 64-80 dB, on the RX 9070 XT and on the Steam Deck. End to
+end against the cooperative-matrix network (six temporal frames, 640x360 -> 1280x720): 61-66 dB on the final
+image, 65-77 dB on the network head, which is about as far as the matrix network is from NGX.
+
+Steam Deck (gfx1033, RADV 26.2.4, GPU fixed at 1600 MHz), ordinary frames, `d4r-k`, 25 frames per submission:
+
+| Render -> output | Frame | Input | Network | Reconstruction | Frame before 2026-10-20 |
+|---|---:|---:|---:|---:|---:|
+| 640x360 -> 1280x720 | 8.31 ms | 0.49 | 6.1 | 1.73 | 9.66 ms |
+| 640x400 -> 1280x800 | 8.76 ms | 0.51 | 6.4 | 1.91 | 9.87 ms |
+| 854x480 -> 1280x720 | 8.50 ms | 0.64 | 6.1 | 1.78 | 9.83 ms |
+| 1280x720 -> 1920x1080 | 15.47 ms | 1.30 | 10.3 | 3.96 | 16.64 ms |
+
+2026-10-20: the decoders' padded windows (see the token grid above: 9.66 -> 8.84 ms at 720p), `AO_ROWS`
+(enc1 1007 -> 895, dec1 979 -> 884, enc2 437 -> 392, dec2 322 -> 284 us) and `MMT` (enc2 392 -> 369, enc3
+352 -> 340, enc4 278 -> 270 us). The network's output is bit-identical to the previous `layer_dot2` on the Deck
+and on the RX 9070 XT (same order of every sum). Then the reconstruction: `output_k.comp` takes the low-exponent
+fallback (the largest-weight sample where every weight underflows) in the filter loop itself instead of a second
+pass, which most waves ran (RX 9070 XT 102.9 -> 94.4 us, same output bits), and runs as wave32 on RDNA2 (before
+the change wave64 was faster). Together on the Deck: 1080p 4314 -> 3963 us, 720p 1898 -> 1729 us. The
+reconstruction is VALU-bound; removing
+parts of it costs (1080p): filter 1.40 ms, history colour 0.82, fallback 0.57, re-exposure 0.16, the rest under 0.1.
+
+The eleven layers at 1920x1080 output (the capture) took 20.4 ms in the first version and 10.9 ms now; the ideal at
+the Deck's v_dot2 rate (1.64 TMAC/s, measured 1.51 in a pure loop) is 6.9 ms. The full-resolution layers run at
+65-75% of it (the rest is VALU work around the products: conversions, biases, GELU, softmax), the deep layers
+lower (few windows, half the waves idle during attention).
+
+Where the time goes (2026-10-20, Steam Deck; per-section shader clocks, ablations and the ACO listing):
+- Occupancy dominates. enc1 with one, two and three windows per CU: 3866, 2137, 1630 us (1080p capture); enc0
+  with three instead of four: +14%. 256 VGPRs (attention holds queries, keys, values, outputs and the residual
+  accumulators) cap every layer at four waves per SIMD.
+- In enc1 the products are 24.6k of 34.7k issued instructions per wave (other VALU 3.0k, SALU 5.0k: mostly
+  copies between the scalar weight loads' registers). Without weight-cache misses (all weights read from one
+  small region) enc1 is 8.5% faster.
+- Not useful: weights through the vector path as DPP8 broadcasts, prefetched an iteration ahead (`v_dot2c` with
+  DPP8 runs at 91% of peak in isolation, scalar weights at 96%; the layers were 3% slower to 5% faster); 16
+  waves per window in dec5 (2.3x slower, probably because a workgroup stays on one CU); four waves per window in enc2/dec2
+  (unchanged); skip-connection loads ahead of the expand; 4x8 register blocks in the expand (under 1%). VGPR
+  bank conflicts are not the limit (the pure loop has the same 25% of same-bank operand pairs and reaches 96%).
+- The deep layers (enc4, dec4, dec5: 4-6 windows at 720p, one per CU) spend their time inside single windows: in
+  enc4 the MLP runs at about 75% of a CU, attention at 55% (half the waves wait), the merge at 26%. Splitting a
+  window into two workgroups by token half (both compute every token's norm, keys and values, each the rest for
+  its 32 tokens; same sums) was slower in every layer but dec5 at 720p (190 -> 155 us; enc4 270 -> 300, dec4
+  246 -> 268, 1080p all slower): the repeated keys and values cost more than the idle waves. At most ~0.2 ms (1080p)
+  to 0.6 ms (720p) is left there in total.
+- int8 (`v_dot4_i32_i8`, twice the v_dot2 rate) for the MLPs of the four full-resolution layers, activations
+  quantized per token in the epilogue: 1080p 15.51 -> 15.21 ms, final image 53-59 dB from the binary16 network.
+  Not kept: the gain is small next to the quality loss (the conversions and scales eat most of the doubled rate).
+
+Buffer robustness: vkd3d-proton enables `robustBufferAccess2` (`VK_EXT_robustness2`) on the device, and RADV then
+loads storage buffers through the vector path instead of scalar loads, which makes this network about 1.6x slower
+(the products take their weights from scalar registers). `patches/vkd3d-proton/0005-enable-pipeline-robustness.patch`
+lets vkd3d-proton enable `VK_EXT_pipeline_robustness`, and the shim then creates the engine's pipelines with storage
+and uniform buffer robustness disabled (`d4r::setBufferRobustnessDisabled`; `D4R_ENGINE_BUFFER_ROBUSTNESS=1` keeps
+it; the engine's shaders stay inside their buffers). Harness, 960x540 -> 1920x1080 (GPU fixed at 1600 MHz):
+engine GPU time 22.5 -> 16.6 ms, frame 24.9 -> 19.0 ms (18.5 with the reconstruction change above), output
+byte-identical. About 1.1 ms of the rest is the harness resetting the history every frame. Without the patched
+vkd3d-proton (stock Proton) the shim logs `buffer robustness on` and runs at the old speed.
+
+Through the shim (the D3D12 harness under GE-Proton, `install.sh` run on the Deck, `d4r.ini` defaults, preset K,
+640x360 -> 1280x720, HDR, 120-300 frames): `engine backend: ... (network: v_dot2, no cooperative matrices)`, GPU time
+of the evaluation 14.8 ms against 17.1 ms for the CUDA path (ZLUDA with the gfx1033 native K layers). The harness
+renders one frame every ~240 ms, so both start each evaluation on a cold GPU (the same engine frame takes 9.7 ms
+back to back in `d4r-k`). Final image against the CUDA path on 12 frames: 48.0-56.0 dB, the same as the
+cooperative-matrix engine on an RX 9070 XT (48.0-55.8 dB) on the same frames; the two engines differ by 57-60 dB,
+the Deck's engine from the RX 9070 XT's `layer_dot2` by 58-60 dB and the two GPUs' CUDA paths by 58 dB. The
+differences are isolated pixels where K's reconstruction takes a discrete decision.
+
+What the compiler needed: the wave index from `gl_SubgroupID` (with `gl_LocalInvocationID.x >> 5` ACO cannot prove
+the weight addresses uniform and loads every weight through the vector path: 14.8 -> 12.8 ms); copy loops that
+issue all loads first (one memory latency instead of one per element: 1.9 ms of the frame); ACO fuses DPP8 into
+`v_dot2c` only for up to three uses of a broadcast value and implements `row_share` on gfx10 as `v_permlane16`
+(a full instruction); RADV caps shared-memory loads at 64 bits. One miscompile: an array copy `tb = tn` followed by
+a store to `tn` read the new values; the shader copies element by element.
+
 ## Files
 
 | File | Role |
@@ -1325,6 +1452,7 @@ build/native-engine/d4r-e build/e-model INPUT_DIR OUT_DIR    # D4R_ENGINE_E_PROF
 | `capture.py`, `prepare_k.py` | Capture decoding and complete-frame reference case preparation |
 | `prepare_frames.py` | Ordinary raw HDR frame preparation without NGX parameter blocks |
 | `input_k.comp`, `layer.comp`, `output_k.comp` | Own input, fused network, and reconstruction shaders |
+| `layer_dot2.comp` | Preset K's network without cooperative matrices (RDNA2), `<layer>_dot2.spv` |
 | `m_model.py`, `layer_m.comp`, `test_m.py` | Preset M: logical weights and numpy model, layer shader, tiled FP8 packer and per-layer test |
 | `hip_net.h`, `hip_net.cpp` | Shared M/K native HIP network loading and immutable graph execution, for native Linux programs |
 | `enc0_m.comp`, `dec0_m.comp`, `post_m.comp`, `down_m.comp` | Preset M: input, expansion, reconstruction and downsample stages |

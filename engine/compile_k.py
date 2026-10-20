@@ -188,6 +188,25 @@ def main():
     for name, e in index.items():
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, os.environ.get('K_DEFS_' + name.upper(), '').split()),   # per layer, e.g. K_DEFS_DEC0=-DTPW=2
                         str(HERE / 'layer.comp'), '-o', str(a.output / (name + '.spv'))], check=True)
+        # the same layer without cooperative matrices (RDNA2: v_dot2_f32_f16); the runtime interleaves the weights.
+        # The deep layers (C >= 96) have few windows: up to eight waves per window instead of one per head
+        # (Steam Deck, 1920x1080 output: enc3 485 -> 435, enc4 306 -> 259, dec5 182 -> 94, dec4 257 -> 215,
+        # dec3 436 -> 383 us). K_DOT2_DEFS / K_DOT2_DEFS_<LAYER> add or override defines.
+        if e.get('fold_gains', True):
+            nw = [f"-DNW={min(2 * e['H'], 8)}"] if e['C'] >= 96 else []
+            # patch merge: the most merged tokens per lane (reuse of each weight load) that keeps 60% of the lanes busy
+            # (Steam Deck, 640x360 -> 1280x720: enc2 392 -> 369, enc3 352 -> 340, enc4 278 -> 270 us)
+            if e['kind'] in ('enc', 'enc0'):
+                waves, pairs = (min(2 * e['H'], 8) if e['C'] >= 96 else e['H']), e['X'] // 2
+                def busy(mmt):
+                    step = 32 * waves * mmt // 16
+                    return pairs / (-(-pairs // step) * step)
+                nw.append(f"-DMMT={max(m for m in (2, 4, 8, 16) if waves * m % 16 == 0 and busy(m) >= 0.6)}")
+            extra = os.environ.get('K_DOT2_DEFS', '').split() + os.environ.get('K_DOT2_DEFS_' + name.upper(), '').split()
+            given = {d.split('=')[0] for d in extra}
+            nw = [d for d in nw if d.split('=')[0] not in given]
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, nw + extra),
+                            str(HERE / 'layer_dot2.comp'), '-o', str(a.output / (name + '_dot2.spv'))], check=True)
     for name in ('input_k', 'output_k'):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(['-DLDR=1'] if a.ldr else []),
                         str(HERE / (name + '.comp')), '-o', str(a.output / (name + '.spv'))], check=True)

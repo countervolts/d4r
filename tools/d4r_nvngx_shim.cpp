@@ -1124,10 +1124,11 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
                format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32_TYPELESS ||
                format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
                format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R8G8B8A8_UNORM;
-    case Plane::Exposure:
+    case Plane::Exposure: // R8G8B8A8_UNORM: Ghost of Tsushima (read normalized, as a sampled texture)
         return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS ||
                format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_TYPELESS ||
-               format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+               format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+               format == DXGI_FORMAT_R8G8B8A8_UNORM;
     }
     return false;
 }
@@ -1305,6 +1306,9 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
                 single[x] = half_to_float(value);
                 break;
             }
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+                single[x] = static_cast<float>(source[x * 4]) / 255.0f;
+                break;
             default:
                 std::memcpy(single + x, source + x * (format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : 4), 4);
                 break;
@@ -3115,7 +3119,8 @@ static bool ensure_staging(Staging& staging, ID3D12Resource* resource, D3D12_HEA
 static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
                        D3D12_RESOURCE_STATES after)
 {
-    if (before == after)
+    // A null pResource invalidates the whole command list in vkd3d-proton ("A resource pointer is NULL.")
+    if (resource == nullptr || before == after)
         return;
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3862,6 +3867,15 @@ static void init_vram_interop()
     bool exportable = false;
     for (const char* name : extensions)
         exportable |= std::strcmp(name, "VK_KHR_external_memory_win32") == 0;
+    // d4r's vkd3d-proton enables VK_EXT_pipeline_robustness (patches/vkd3d-proton/0005): the engine's pipelines then
+    // opt out of robustBufferAccess2, which keeps RADV from scalar storage-buffer loads (K's network: about 1.6x).
+    bool pipelineRobustness = false;
+    for (const char* name : extensions)
+        pipelineRobustness |= std::strcmp(name, "VK_EXT_pipeline_robustness") == 0;
+    if (pipelineRobustness && env_uint("D4R_ENGINE_BUFFER_ROBUSTNESS", 0) == 0)
+        d4r::setBufferRobustnessDisabled(true);
+    logf("engine backend: buffer robustness %s", pipelineRobustness && env_uint("D4R_ENGINE_BUFFER_ROBUSTNESS", 0) == 0 ?
+         "off for the engine's pipelines (VK_EXT_pipeline_robustness)" : "on (the device's default)");
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
     if (vulkan == nullptr)
         vulkan = LoadLibraryA("vulkan-1.dll");
@@ -4258,6 +4272,7 @@ static bool vram_exposure_blit_supported(VkFormat format)
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
         return vram_blit_supported(format, VK_FORMAT_R32_SFLOAT);
     default:
         return false;
@@ -9463,7 +9478,9 @@ static void init_engine_backend()
     const auto start = std::chrono::steady_clock::now();
     try
     {
-        g_engine.model = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path);
+        // without the f16 matrix tuple (RDNA2) the network runs layer_dot2.comp's shaders
+        g_engine.model = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE,
+                                                      g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2);
         g_engine.directory = path;
     }
     catch (const std::exception& error)
@@ -9472,8 +9489,9 @@ static void init_engine_backend()
              "create it)", path.c_str(), error.what());
         return;
     }
-    logf("engine backend: model %s loaded and pipelines compiled in %.0f ms", path.c_str(),
-         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    logf("engine backend: model %s loaded and pipelines compiled in %.0f ms (network: %s)", path.c_str(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+         g_engine.model->dot2Network() ? "v_dot2, no cooperative matrices" : "cooperative matrices");
 }
 
 static void init_engine_backend_ldr()
@@ -9490,7 +9508,8 @@ static void init_engine_backend_ldr()
     const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
     try
     {
-        g_engine.modelLdr = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path);
+        g_engine.modelLdr = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE,
+                                                         g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2);
         g_engine.directoryLdr = path;
         logf("engine backend: LDR model %s loaded", path.c_str());
     }
@@ -10503,8 +10522,9 @@ static bool engine_evaluate_e(Feature& feature, ID3D12GraphicsCommandList* list,
     if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R16_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
-                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT)))
-        return refuse("the exposure texture must be a float texture the engine samples directly");
+                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R8G8B8A8_UNORM)))
+        return refuse("the exposure texture must be a float or unorm texture the engine samples directly");
     if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
         game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
@@ -11028,7 +11048,9 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
     if (feature.preset == 5 || feature.preset == 6)
         return engine_evaluate_e(feature, list, color, depth, motion, output, exposure, p, frame);
-    if (feature.preset == 11 && env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip")
+    // Without the f16 matrix tuple (RDNA2) the native K layers emulate WMMA and the engine's v_dot2 network is the
+    // faster one, so auto keeps K on the engine there
+    if (feature.preset == 11 && env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip" && g_vk.matrixF16)
         return refuse("[Engine] Enabled = auto keeps K on the native kernels (faster than the Vulkan network)");
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
     const bool ldr = (feature.flags & 0x1) == 0;
@@ -11105,8 +11127,9 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
     if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R16_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
-                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT)))
-        return refuse("the exposure texture must be a float texture the engine samples directly");
+                                                                  game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R8G8B8A8_UNORM)))
+        return refuse("the exposure texture must be a float or unorm texture the engine samples directly");
     if (game.depth.format == VK_FORMAT_D32_SFLOAT || game.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
         game.depth.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
@@ -11232,8 +11255,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         profile_timestamp(feature, list, frame, 0);
         profile_timestamp(feature, list, frame, 1);
     }
-    for (const Source& source : sources)
-        transition(list, source.resource, source.state, source.copyState);
+    for (size_t index = 0; index < sourceCount; ++index) // sources[4] (exposure) is null under AutoExposure
+        transition(list, sources[index].resource, sources[index].state, sources[index].copyState);
     VkCommandBuffer command = VK_NULL_HANDLE;
     bool recorded = SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list, &command));
     const char* failure = recorded ? nullptr : "BeginVkCommandBufferInterop failed";
@@ -11255,8 +11278,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
             recorded = false;
         }
     }
-    for (const Source& source : sources)
-        transition(list, source.resource, source.copyState, source.state);
+    for (size_t index = 0; index < sourceCount; ++index) // sources[4] (exposure) is null under AutoExposure
+        transition(list, sources[index].resource, sources[index].copyState, sources[index].state);
     if (!recorded)
         return refuse(failure);
     if (profile)
@@ -11395,11 +11418,16 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
     motion->GetDesc(&motionDesc);
     output->GetDesc(&outputDesc);
     if (frame == 1)
+    {
+        D3D12_RESOURCE_DESC exposureDesc = {};
+        if (exposure != nullptr)
+            exposure->GetDesc(&exposureDesc);
         logf("evaluate: color %llux%u fmt=%d, depth %llux%u fmt=%d, mv %llux%u fmt=%d, output %llux%u fmt=%d, "
-             "exposure=%p",
+             "exposure=%p %llux%u fmt=%d",
              colorDesc.Width, colorDesc.Height, colorDesc.Format, depthDesc.Width, depthDesc.Height, depthDesc.Format,
              motionDesc.Width, motionDesc.Height, motionDesc.Format, outputDesc.Width, outputDesc.Height,
-             outputDesc.Format, exposure);
+             outputDesc.Format, exposure, exposureDesc.Width, exposureDesc.Height, exposureDesc.Format);
+    }
     if (env_uint("D4R_SHIM_TRACE_MOTION", 0) != 0)
     {
         static const GUID tag = {0xbaecd840,0x42b4,0x4b60,{0x8b,0x44,0x81,0x9a,0x7f,0xa1,0x51,0xa4}};

@@ -18,6 +18,7 @@ static_assert(offsetof(OutputParams, expo) == 148);
 static_assert(sizeof(LayerShape) == 16);
 static_assert(sizeof(Shape) == 184);
 namespace {
+bool noBufferRobustness = false;
 void check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + ": VkResult " + std::to_string(result));
 }
@@ -197,7 +198,9 @@ struct Pipeline {
         VKCHECK(vkCreateShaderModule(dev, &si, nullptr, &shader));
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         required.requiredSubgroupSize = subgroup;
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        VkPipelineRobustnessCreateInfoEXT robustness{VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
+        robustness.storageBuffers = robustness.uniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, noBufferRobustness ? &robustness : nullptr};
         ci.layout = layout; ci.flags = flags;
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &required,
                     VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", specialization};
@@ -235,6 +238,52 @@ void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set,
     vkCmdDispatch(cb, x, y, 1);
 }
 constexpr const char* Names[KLayers] = {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"};
+// The windows of each layer (x, y group counts) that the frame's results depend on. A window reads only its own
+// tokens (mirrored at the grid's edges; a decoder also the 4x4 low-resolution tokens below it and the skip tokens
+// of its encoder), so windows whose tokens nothing reads later can be left out without changing any result. The
+// token grid is padded (a multiple of 32, at least 256: 1280x720 has 180 of 256 rows), and nothing reads the
+// decoders' padded tokens: the reconstruction reads the head of the output's own tokens, the next frame's input
+// stage the token feature at most one token past them (bilinear, only for on-screen history). The encoders all
+// run: the deep layers' few windows mirror at the grid's edge, so they read every token above them.
+// D4R_ENGINE_K_TRIM=0 runs every window (the padded tokens then match NGX's).
+std::array<std::array<uint32_t, 2>, KLayers> kLayerGroups(const Shape& shape, bool trim) {
+    std::array<std::array<uint32_t, 2>, KLayers> groups{};
+    auto mirror = [](int v, int n) { v = std::abs(v); return std::min(v, 2 * n - 2 - v); };
+    auto tdiv2 = [](int v) { return v < 0 ? -(-v / 2) : v / 2; };
+    for (unsigned a = 0; a < 2; ++a) {
+        auto size = [&](unsigned i) { return a ? shape.layers[i].h : shape.layers[i].w; };
+        auto shift = [&](unsigned i) { return a ? shape.layers[i].sy : shape.layers[i].sx; };
+        auto full = [&](unsigned i) { return uint32_t(size(i) + shift(i) + 7) / 8; };
+        for (unsigned i = 0; i < KLayers; ++i) groups[i][a] = full(i);
+        if (!trim) continue;
+        // the windows that write tokens [0, n) of layer i
+        auto windows = [&](unsigned i, int n) { return std::clamp(uint32_t(n + shift(i) + 7) / 8, 1u, full(i)); };
+        // one past the last token those windows read at the layer's resolution, or at half of it (low-resolution)
+        auto reads = [&](unsigned i, bool half) {
+            int last = 0;
+            for (int w = 0; w < int(groups[i][a]); ++w)
+                for (int t = 0; t < (half ? 4 : 8); ++t) {
+                    const int origin = 8 * w - shift(i);
+                    last = std::max(last, half ? mirror(tdiv2(origin) + t, size(i) / 2) : mirror(origin + t, size(i)));
+                }
+            return last + 1;
+        };
+        const int out = int(a ? shape.outputHeight : shape.outputWidth);
+        int need = std::min(size(10), (out + 3) / 4 + 2), skip[5] = {};
+        for (unsigned i = 10; i >= 6; --i) {
+            groups[i][a] = windows(i, need);
+            skip[10 - i] = reads(i, false);
+            need = reads(i, true);
+        }
+        groups[5][a] = windows(5, need);
+        int merged = reads(5, false);
+        for (int i = 4; i >= 0; --i) {
+            groups[i][a] = windows(unsigned(i), std::max(skip[i], 2 * merged));
+            merged = reads(unsigned(i), false);
+        }
+    }
+    return groups;
+}
 constexpr uint32_t Channels[KLayers] = {32, 64, 64, 96, 128, 160, 128, 96, 64, 64, 32};
 constexpr uint32_t Heads[KLayers] = {2, 2, 2, 4, 4, 8, 4, 4, 2, 2, 2};
 constexpr uint32_t Merged[5] = {64, 64, 96, 128, 160};
@@ -245,6 +294,7 @@ static_assert(sizeof(ExposureParams) == 56);
 bool exists(const std::string& file) { return bool(std::ifstream(file, std::ios::binary)); }
 static_assert(sizeof(LayerParams) == 448);
 } // namespace
+void setBufferRobustnessDisabled(bool disabled) { noBufferRobustness = disabled; }
 
 Shape makeKShape(uint32_t width, uint32_t height) {
     if (width < 256 || height < 256 || width > 8192 || height > 8192)
@@ -315,12 +365,22 @@ struct Model::Impl {
     Pipeline input, output, outputRgb10;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
-         hasGameExposure = false, hasRatioTables = false;
+         hasGameExposure = false, hasRatioTables = false, dot2 = false;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
+Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
+    if (const char* force = std::getenv("D4R_ENGINE_K_NETWORK")) {
+        if (!std::strcmp(force, "dot2")) network = KNetwork::Dot2;
+        else if (!std::strcmp(force, "matrix")) network = KNetwork::Matrix;
+    }
+#ifdef D4R_ENGINE_VK_TABLE
+    if (network == KNetwork::Auto) network = KNetwork::Matrix;
+#else
+    if (network == KNetwork::Auto) network = m.device.coopmat ? KNetwork::Matrix : KNetwork::Dot2;
+#endif
+    m.dot2 = network == KNetwork::Dot2;
     if (exists(directory + "/direct_origins.bin")) {
         auto marker = read(directory + "/direct_origins.bin");
         // Shader revision: 1 has the corrected motion origins; 2 also reads the frame flags (regular depth);
@@ -343,6 +403,9 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
         throw std::runtime_error("invalid K model sizes");
     m.hasRatioTables = lut.size() != KTableBytes;
     std::memcpy(m.offsets.data(), offsets.data() + 16, sizeof(m.offsets));
+    // layer_dot2.comp reads every matrix W[K][N] with each pair of rows interleaved, so one 32-bit word holds
+    // W[2i][n] and W[2i+1][n] (test_k.py dot2_weights): done here, on the validated spans, in place
+    std::vector<char> pairs;
     for (unsigned i = 0; i < KLayers; ++i) {
         const auto& layer = m.offsets[i]; uint32_t c = Channels[i];
         auto span = [&](unsigned slot, uint64_t elements) {
@@ -350,18 +413,28 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
             if (offset % 16 || (uint64_t(offset) + elements) * 2 > weights.size())
                 throw std::runtime_error(std::string("invalid tensor span in ") + Names[i]);
         };
+        auto matrix = [&](unsigned slot, uint32_t k, uint32_t n) {
+            span(slot, uint64_t(k) * n);
+            if (!m.dot2) return;
+            uint16_t* w = reinterpret_cast<uint16_t*>(weights.data()) + layer[slot];
+            pairs.resize(size_t(k) * n * 2);
+            uint16_t* t = reinterpret_cast<uint16_t*>(pairs.data());
+            for (uint32_t r = 0; r < k; ++r)
+                for (uint32_t col = 0; col < n; ++col) t[(r / 2 * n + col) * 2 + r % 2] = w[r * n + col];
+            std::memcpy(w, t, pairs.size());
+        };
         for (unsigned j = 0; j < 4; ++j) span(j, 16 * c);
         for (unsigned h = 0; h < Heads[i]; ++h) {
-            for (unsigned j = 0; j < 3; ++j) span(4 + 5 * h + j, c * 32);
-            span(7 + 5 * h, 4096); span(8 + 5 * h, 32 * c);
+            for (unsigned j = 0; j < 3; ++j) matrix(4 + 5 * h + j, c, 32);
+            span(7 + 5 * h, 4096); matrix(8 + 5 * h, 32, c);
         }
         for (unsigned ch = 0; ch < c / 8; ++ch) {
-            span(44 + 3 * ch, c * 32); span(45 + 3 * ch, 512); span(46 + 3 * ch, 32 * c);
+            matrix(44 + 3 * ch, c, 32); span(45 + 3 * ch, 512); matrix(46 + 3 * ch, 32, c);
         }
-        if (i < 5) { span(104, 4 * c * Merged[i]); span(105, 16 * Merged[i]); }
-        if (i >= 6) { span(104, Channels[i - 1] * 4 * c); span(105, 16 * 4 * c); }
-        if (i == 0) { span(106, 16 * c); span(107, 16 * c); }
-        if (i == 10) { span(106, c * 48); span(107, 16 * 48); }
+        if (i < 5) { matrix(104, 4 * c, Merged[i]); span(105, 16 * Merged[i]); }
+        if (i >= 6) { matrix(104, Channels[i - 1], 4 * c); span(105, 16 * 4 * c); }
+        if (i == 0) { matrix(106, 16, c); span(107, 16 * c); }
+        if (i == 10) { matrix(106, c, 48); span(107, 16 * 48); }
     }
     if (weights.size() > m.device.properties.limits.maxStorageBufferRange)
         throw std::runtime_error("model weights exceed the device's storage buffer range");
@@ -369,14 +442,27 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     m.lut.create(m.device, lut.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     m.weightBytes = std::move(weights); m.lutBytes = std::move(lut);
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    for (unsigned i = 0; i < KLayers; ++i) m.network[i].create(device, directory + "/" + Names[i] + ".spv", {b,b,b,b,b,b}, 32, cache);
-    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, 64, cache);
-    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, 64, cache);
+    for (unsigned i = 0; i < KLayers; ++i) {
+        const std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : ".spv");
+        if (m.dot2 && !exists(spv))
+            throw std::runtime_error("the model has no network shaders for GPUs without cooperative matrices (" + spv +
+                                     "): rebuild it with the current compile_k.py");
+        m.network[i].create(device, spv, {b,b,b,b,b,b}, 32, cache);
+    }
+    // The stages around the network run as wave64 (D4R_ENGINE_K_STAGE_WAVE=32|64 forces one size; the outputs are
+    // identical). Without cooperative matrices (RDNA2, which issues wave64 in two passes) the input stage and the
+    // reconstruction run as wave32: Steam Deck, 640x360 -> 1280x720, input 615 -> 494 us, reconstruction
+    // 1805 -> 1729 us (with the single-pass fallback of output_k.comp; before it wave64 was faster, 1898 vs 2021 us).
+    const char* waveEnv = std::getenv("D4R_ENGINE_K_STAGE_WAVE");
+    const uint32_t wave = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : 64;
+    const uint32_t stageWave = waveEnv ? wave : m.dot2 ? 32 : 64;
+    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, stageWave, cache);
+    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache);
     if (exists(directory + "/output_k_rgb10.spv"))
-        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, 64, cache);
+        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
-        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, 64, cache);
-        m.exposure[1].create(device, directory + "/exposure_k1.spv", {b,b,b,b,b,t}, 64, cache);
+        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache);
+        m.exposure[1].create(device, directory + "/exposure_k1.spv", {b,b,b,b,b,t}, wave, cache);
         m.hasExposure = true;
     }
 }
@@ -387,6 +473,7 @@ bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
+bool Model::dot2Network() const { return impl->dot2; }
 Model::~Model() = default;
 bool Model::uploadRecorded() const { return impl->uploaded; }
 void Model::recordUpload(VkCommandBuffer cb) {
@@ -419,6 +506,7 @@ struct Engine::Impl {
     unsigned previous = 0;
     bool initialized = false, frameSet = false, reset = false, windowsChanged = false, rgb10Output = false;
     bool external = false;   // the caller owns the token and head buffers; the layers run outside
+    bool trim = true;        // only the windows the results depend on (kLayerGroups)
     bool frontDone = false;  // recordFront has run and recordBack is due
     // Recorded into each frame's command buffer, so a frame still queued on the GPU keeps its own values.
     InputParams input{}; OutputParams output{};
@@ -451,6 +539,7 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         uint32_t(base.w) > shape.outputWidth || uint32_t(base.h) > shape.outputHeight)
         throw std::runtime_error("K token grid must be a multiple of 32, at least 256x256, and cover the output");
     e.external = external != nullptr;
+    if (const char* trim = std::getenv("D4R_ENGINE_K_TRIM")) e.trim = std::strcmp(trim, "0") != 0;
     if (e.external && (!external->tokens || !external->head)) throw std::runtime_error("external network without its buffers");
     for (unsigned i = 0; i < KLayers; ++i) {
         auto layer = shape.layers[i]; unsigned scale = i <= 5 ? i : 10 - i;
@@ -730,11 +819,11 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     auto base = e.shape.layers[0];
     dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8);
     mark(3);
+    const auto groups = kLayerGroups(e.shape, e.trim);
     for (unsigned i = 0; i < KLayers; ++i) {
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        auto ls = e.shape.layers[i];
-        dispatch(cb, e.model.network[i], e.layerSets[i], (ls.w + ls.sx + 7) / 8, (ls.h + ls.sy + 7) / 8);
+        dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
         mark(4 + i);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);

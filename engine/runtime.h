@@ -8,6 +8,11 @@
 #include <string>
 
 namespace d4r {
+// Pipelines created after this call opt out of storage and uniform buffer robustness (VK_EXT_pipeline_robustness);
+// the device must enable pipelineRobustness. For a host device with robustBufferAccess2 (vkd3d-proton): RADV then
+// cannot use scalar loads for storage buffers, which costs preset K's v_dot2 network about 1.6x on a Steam Deck.
+// The engine's shaders stay in bounds without it.
+void setBufferRobustnessDisabled(bool disabled);
 constexpr unsigned KLayers = 11;
 // These are the shader ABI, not NGX/CUDA parameter blocks. Sizes are checked in runtime.cpp.
 struct InputParams {
@@ -101,13 +106,19 @@ FrameParams makeKFrameParams(const Shape& shape, const FrameSettings& settings);
 // leaves the three outer layers on each side at (4,4).
 std::array<LayerShape, KLayers> makeKWindows(const Shape& shape, uint32_t frameIndex);
 
+// The network's shaders: cooperative matrices (layer.comp, VK_KHR_cooperative_matrix with 16x16x16 f16 inputs / f32
+// accumulation) or v_dot2_f32_f16 without them (layer_dot2.comp, the model's <layer>_dot2.spv: RDNA2). Auto takes
+// the matrices when the device exposes the extension (D4R_ENGINE_K_NETWORK=dot2|matrix overrides); a build with the
+// Vulkan table (the shim) cannot see the device's extensions, so there Auto means Matrix and the caller decides.
+enum class KNetwork { Auto, Matrix, Dot2 };
 // Device must enable shaderInt16, shaderStorageImageExtendedFormats,
 // storageBuffer16BitAccess, shaderFloat16, subgroupSizeControl,
-// computeFullSubgroups and VK_KHR_cooperative_matrix (16x16x16 f16 inputs / f32 accumulation).
+// computeFullSubgroups and, for KNetwork::Matrix, VK_KHR_cooperative_matrix.
 // Caller serializes recording and waits for the GPU before destruction. Frames execute in recording order.
 class Model {
 public:
-    Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+          KNetwork network = KNetwork::Auto);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -121,6 +132,7 @@ public:
     bool hasGameExposure() const; // packaged shaders read FrameImages::exposure (exposure flag 4)
     bool hasRatioTables() const; // lut.bin holds all sixteen reconstruction tables, not only one ratio's
     bool hasRgb10Output() const; // a packaged RGB10A2 final-store variant is available
+    bool dot2Network() const; // the network runs layer_dot2.comp (no cooperative matrices)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
