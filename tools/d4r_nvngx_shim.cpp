@@ -768,8 +768,9 @@ static void load_portable_config()
         else
             on = ini_flag(ini, "engine", "Enabled", 0) != 0;
         portable_set("D4R_ENGINE", on ? "1" : "0");
-        // auto leaves K on the native kernels: K's Vulkan network is slower (2026-10-17, 7700 XT, 1706x960 -> 1440p:
-        // 3.59 ms vs 2.35 ms dlss_gpu). Enabled = true, or Network = hip with a model that has the HIP layers, keeps it.
+        // auto leaves K on the native kernels on RDNA3: K's Vulkan network is slower there (2026-10-17, 7700 XT,
+        // 1706x960 -> 1440p: 3.59 ms vs 2.35 ms dlss_gpu). RDNA4 keeps K on the engine (engine_k_refused).
+        // Enabled = true, or Network = hip with a model that has the HIP layers, keeps it on every GPU.
         if (enabled.empty() || enabled == "auto")
             portable_set("D4R_ENGINE_K", "0");
     }
@@ -9389,6 +9390,16 @@ static bool engine_requested()
     return requested;
 }
 
+// [Engine] Enabled = auto (D4R_ENGINE_K=0) keeps K on the native kernels only on RDNA3: there they beat the Vulkan
+// network, on RDNA2 (no f16 matrix tuple) they emulate WMMA and on RDNA4 (FP8 matrix tuple) the engine is faster
+// (2026-10-21, RX 9070 XT, preset K HDR: 1920x1080 -> 3840x2160 2.93 ms vs 9.19 ms, 960x540 -> 1920x1080 0.95 ms
+// vs 4.35 ms on the game queue). Needs init_engine_vulkan.
+static bool engine_k_refused()
+{
+    return env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip" && g_vk.matrixF16 &&
+           !g_vk.float8;
+}
+
 static void init_engine_vulkan()
 {
     VkInstance instance = VK_NULL_HANDLE;
@@ -10737,7 +10748,7 @@ static void start_engine_preload()
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
         const bool srM = (sr == 12 || sr == 13) && g_vk.float8;
-        const bool srK = sr == 11 && !(env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip");
+        const bool srK = sr == 11 && !engine_k_refused();
         if (!rr && !srM && !srK)
             return;
         logf("engine backend: loading the models this configuration uses at NGX init:%s%s%s", rr ? " Ray Reconstruction" : "",
@@ -11048,10 +11059,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
     if (feature.preset == 5 || feature.preset == 6)
         return engine_evaluate_e(feature, list, color, depth, motion, output, exposure, p, frame);
-    // Without the f16 matrix tuple (RDNA2) the native K layers emulate WMMA and the engine's v_dot2 network is the
-    // faster one, so auto keeps K on the engine there
-    if (feature.preset == 11 && env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip" && g_vk.matrixF16)
-        return refuse("[Engine] Enabled = auto keeps K on the native kernels (faster than the Vulkan network)");
+    if (feature.preset == 11 && engine_k_refused())
+        return refuse("[Engine] Enabled = auto keeps K on the native kernels on RDNA3 (faster than the Vulkan network)");
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
     const bool ldr = (feature.flags & 0x1) == 0;
     if (ldr)

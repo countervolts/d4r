@@ -1358,7 +1358,10 @@ accumulation, at the full packed rate of the GPU. Only the order of the f32 sums
 Selection: `d4r::KNetwork` on `Model` (`Auto`: the matrices when the device exposes the extension, else
 `layer_dot2`; `D4R_ENGINE_K_NETWORK=dot2|matrix` overrides, which also runs `layer_dot2` on RDNA3/4 for testing).
 `d4r-k` no longer requires cooperative matrices for K. The shim picks `layer_dot2` when the GPU has no f16 matrix
-tuple and, there, keeps K on the engine under `[Engine] Enabled = auto` (on RDNA2 the native K layers emulate WMMA).
+tuple. `[Engine] Enabled = auto` keeps K on the engine on RDNA2 (the native K layers emulate WMMA) and on RDNA4 (FP8
+matrix tuple: RX 9070 XT, preset K HDR through the D3D12 harness, game-queue GPU time 1920x1080 -> 3840x2160 2.93 ms
+against 9.19 ms for the CUDA path, 960x540 -> 1920x1080 0.95 ms against 4.35 ms, final image 49-52 dB apart), and
+leaves it on the native kernels on RDNA3, where they are faster.
 A K model built before this has no `_dot2` shaders: the shim then logs that it must be rebuilt and uses the CUDA
 backend. On RDNA2 the input stage and the reconstruction run as wave32 (`D4R_ENGINE_K_STAGE_WAVE=32|64` forces
 either, the outputs are identical).
