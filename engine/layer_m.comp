@@ -368,21 +368,35 @@ float16_t gelu1(float16_t x)
 
 #define MERGE (KIND == 1 || KIND == 3)
 #define EXPAND (KIND == 2 || KIND == 4)
-#if MERGE
+// Preset L's input stage (KIND 3) keeps its FP8 buffers inside its binary16 one (UB8: offset and stride of an FP8
+// matrix there, in binary16 units; FP8 bytes go in and out as halves of a binary16 word): the features follow x0, and
+// the merge rows (and the V tiles) take x0's place once norm 1 has read it. 12 KiB of shared memory become 7.5, which
+// lets the stage run two windows per wave (compile_m.py) at eight waves per SIMD; the values are the same.
+#if KIND == 3
+const uint FS = 40u, XS = 40u;              // row strides of the feature and x0 images (32 + slack)
+const uint FEW_AT = 64u * XS;               // the features, in binary16 units
+shared float16_t X0S[64 * XS + 64 * FS / 2];   // x0, the embedding's output (the block's input), then the features
+#define NB X0S                              // 16 merged rows, preceded by 16 rows of slack for the gather (FP8)
+#if 32 * (4 * C + 8) > 2 * 64 * 40
+#error layer_m.comp: the merge rows no longer fit in X0S
+#endif
+#elif MERGE
 shared floate4m3_t NB[32 * S4];             // 16 merged rows, preceded by 16 rows of slack for the gather
 #endif
 #if EXPAND
 shared floate4m3_t NLI[16 * SLO];           // the block's 16 low-resolution tokens
 shared floate4m3_t NEX[16 * S4];            // their expanded 4C columns
 #endif
-#if KIND == 3
-const uint FS = 40u, XS = 40u;              // row strides of the feature and x0 images (32 + slack)
-shared floate4m3_t FEW[64 * FS];            // the block's 64 pixels' feature slots, window-major (wave, token)
-shared float16_t X0S[64 * XS];              // the embedding's output x0, the block's input
-#endif
 #if KIND == 4
 const uint HS = 40u;
 shared float16_t HO[64 * HS];               // the block's f16 output, window-major, for the per-pixel head
+#endif
+#if KIND == 3
+#define UB8(o) ((o) / 2u)                   // an FP8 offset or stride in the binary16 array
+// two FP8 bytes into the binary16 word at (even) byte offset b
+#define B8PUT2(A, b, v0, v1) (A)[(b) >> 1u] = uint16BitsToFloat16(uint16_t(uint(floate4m3BitsToUintEXT(v0)) | (uint(floate4m3BitsToUintEXT(v1)) << 8u)))
+#else
+#define UB8(o) (o)
 #endif
 // VSH: per wave and head the V tiles, transposed through shared memory (4 KiB, 512 bytes a tile). It is only accessed
 // as matrices, and only during the attention, so it takes the place of a buffer that is dead then: the merge rows
@@ -390,7 +404,11 @@ shared float16_t HO[64 * HS];               // the block's f16 output, window-ma
 // Shared memory caps how many waves this GPU runs, and ACO gives a shader the registers that number of waves leaves.
 #if MERGE
 #define VSH NB
+#if KIND == 3
+#define VSH_UNIT 2u
+#else
 #define VSH_UNIT 1u
+#endif
 #if 32 * (4 * C + 8) < 4096
 #error layer_m.comp: the V tiles no longer fit in NB
 #endif
@@ -507,7 +525,7 @@ void main()
             gatherFeatures(li, ivec2(X0, Y0), e1, e2, li < 32u, fe);
             const uint px = li & 7u, py = li >> 3;
             const uint at = (((py >> 2) * 2u + (px >> 2)) * 16u + (py & 3u) * 4u + (px & 3u)) * FS;
-            for (uint k = 0u; k < 32u; ++k) FEW[at + k] = fe[k];
+            for (uint k = 0u; k < 32u; k += 2u) B8PUT2(X0S, 2u * FEW_AT + at + k, fe[k], fe[k + 1u]);
         }
     }
     SYNC
@@ -515,8 +533,8 @@ void main()
         WINV
         // the embedding has the shape of an MLP chunk: 32 features -> 32 hidden (ReLU, FP8) -> C
         B8 f0, f1;
-        coopMatLoad(f0, FEW, mt * 16u * FS, FS, CM);
-        coopMatLoad(f1, FEW, mt * 16u * FS + 16u, FS, CM);
+        coopMatLoad(f0, X0S, FEW_AT + UB8(mt * 16u * FS), UB8(FS), CM);
+        coopMatLoad(f1, X0S, FEW_AT + UB8(mt * 16u * FS + 16u), UB8(FS), CM);
         HAC z0 = bias16(p.o[61], 32u), z1 = bias16(p.o[61] + 16u, 32u);
         { A8 a0, a1; LDA8(a0, p.o[60], 0u, 32u, 0u); LDA8(a1, p.o[60], 1u, 32u, 0u); K32H(z0, a0, f0, a1, f1) }
         { A8 a0, a1; LDA8(a0, p.o[60], 0u, 32u, 16u); LDA8(a1, p.o[60], 1u, 32u, 16u); K32H(z1, a0, f0, a1, f1) }
@@ -581,8 +599,8 @@ void main()
     H1N(N, rn) }
     EACH_T(NM1)
     }
-#if KIND == 2
-    SYNC   // every wave has read the block's input from NEX: the V tiles take its place
+#if KIND == 2 || KIND == 3
+    SYNC   // every wave has read the block's input (NEX, X0S): the V tiles take its place
 #endif
     // ------------------------------------------------------------ attention, one head at a time
     for (uint hd = 0u; hd < uint(NH); ++hd)
@@ -833,7 +851,7 @@ void main()
         WINV
         // the 16 merged rows are gathered from the four waves: the row is the merged token of the lane's pixel
         const uint mrow = (byr >> 1) * 4u + (bxr >> 1), qq = (byr & 1u) * 2u + (bxr & 1u);
-#define MG_W(N) { A8 y; MK8_F8(y, res[N]); coopMatStore(y, NB, 16u * S4 + mrow * S4 + qq * UC + 16u * (N) - row * S4, S4, RM); }
+#define MG_W(N) { A8 y; MK8_F8(y, res[N]); coopMatStore(y, NB, UB8(16u * S4 + mrow * S4 + qq * UC + 16u * (N) - row * S4), UB8(S4), RM); }
         EACH_T(MG_W)
     }
     SYNC
@@ -857,8 +875,8 @@ void main()
                 HAC y = bias16(p.o[69] + 16u * u, UXC);
                 for (uint kt = 0u; kt < 4u * UC / 16u; kt += 2u)
                 {
-                    B8 b0, b1; coopMatLoad(b0, NB, 16u * S4 + kt * 16u, S4, CM);
-                    coopMatLoad(b1, NB, 16u * S4 + (kt + 1u) * 16u, S4, CM);
+                    B8 b0, b1; coopMatLoad(b0, NB, UB8(16u * S4 + kt * 16u), UB8(S4), CM);
+                    coopMatLoad(b1, NB, UB8(16u * S4 + (kt + 1u) * 16u), UB8(S4), CM);
                     A8 a0, a1; LDA8(a0, p.o[68], kt, UXC, 16u * u);
                     LDA8(a1, p.o[68], kt + 1u, UXC, 16u * u);
                     K32H(y, a0, b0, a1, b1)

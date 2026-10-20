@@ -32,8 +32,10 @@ from test_m import pack_layer, defines
 EXACT = os.environ.get('M_EXACT') == '1'
 FAST = [] if EXACT or '-DM_RELAXED' in os.environ.get('M_DEFS', '').split() else ['-DM_RELAXED']
 FAST_WPW = [] if EXACT or os.environ.get('M_WPW') or 'WPW=' in os.environ.get('M_DEFS', '') else ['-DWPW=2']
-# preset L's expansion stage (dec0l) two windows per wave as well; its input stage (enc0l) is slower that way
+# preset L's expansion stage (dec0l) two windows per wave as well, and its input stage (enc0l) since that keeps its FP8
+# buffers in its binary16 one (7.5 KiB of shared memory, layer_m.comp): 445 -> 415 us at 1280x720, the same values
 L_WPW = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_DEC0L', '') else ['-DWPW=2']
+L_WPW_ENC0 = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_ENC0L', '') else ['-DWPW=2']
 # M_RESIDUAL_F32=1 (opt-in, not with M_EXACT=1): every layer_m.comp stage keeps the residual stream f32 across the MLP's
 # 32-channel chunks, one binary16 rounding after them instead of one per chunk (engine/README.md)
 RESF32 = ['-DM_RESIDUAL_F32'] if os.environ.get('M_RESIDUAL_F32') == '1' else []
@@ -165,7 +167,7 @@ def compile_l(a, one, R):
     # the network in the arithmetic of ZLUDA's lowering of NVIDIA's PTX (TEXL), as for preset M (L_NOTES.md)
     for name, out in SHADERS.items(): glsl('layer_m.comp', out + '.spv', defines(name) + ['-DTEXL=1'] + FAST + FAST_WPW + RESF32)
     for planes, suffix in ((0, ''), (1, '_planes')):
-        glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST + RESF32)
+        glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST + L_WPW_ENC0 + RESF32)
         glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST + L_WPW + RESF32)
     # the reconstruction one render texel wider per tier than M's (4x4 taps): 11 (reconstruction/render >= 3),
     # 16 (the whole post_3_2 range), 12 (the compact tier: render/reconstruction <= 0.45, jitter within half a texel)
