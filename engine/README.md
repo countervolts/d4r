@@ -1147,6 +1147,31 @@ Ultra Performance, the downsample weights and the network's summation order (M i
 backend in the harness as well: 1706x960 -> 2560x1440 and 640x360 -> 1920x1080, where it measured 36-41 dB with the
 native accuracy kernels' order; `compile_m.py` builds both presets' networks with `TEXL`). Details: `L_NOTES.md`.
 
+### The input stage in less shared memory (2026-10-20, night)
+
+RX 9070 (56 compute units), `d4r-m` 1280x720 -> 2560x1440, median of interleaved runs. `layer_m.comp` KIND 3 keeps
+the features and the merge rows inside x0's binary16 array (FP8 matrices at half the offsets and strides, feature
+bytes stored in pairs; the merge rows and V tiles take x0's place after a barrier behind norm 1): 12 KiB of shared
+memory become 7.5. That makes two windows per wave pay for the input stage, which `compile_m.py` now builds that way
+(`M_DEFS_ENC0L=-DWPW=1` for one; at 12 KiB it ran five waves per SIMD and was slower, now eight).
+
+| Build | Input stage (us) | Frame (us) |
+|---|---|---|
+| L, `M_RESIDUAL_F32=1` | 446 -> 414 | 2033 -> 1995 |
+| L | 447 -> 414 | 2157 -> 2115 |
+| L, stress input | 446 -> 419 | 2104 -> 2078 |
+
+Every output frame and everything `D4R_M_DUMP` writes is byte-identical to the previous build (L and L-LDR, with and
+without `M_RESIDUAL_F32`, `M_EXACT=1`; replay, odd-size and stress inputs); preset M's shaders are unchanged files.
+Feature bytes stored in the wrong order change every frame.
+
+Tried, no gain: the expansion stage's FP8 buffers inside its head buffer (9 -> 5 KiB, 7 -> 12 waves per SIMD:
+expansion 355 -> 358 us; one window per wave there, 381). Both stages are bound by their own VALU issue (input stage
+2961 instructions per wave, 1977 VALU of which 548 conversions; expansion 3383 and 2471), not by latency, so more
+waves do not help them. The network layers' next MLP chunk loaded during the current one, by hand (what a compiler
+hoisting loads across the loop's back-edge would do): the next chunk's biases and first tiles, every layer slower
+(network 803 -> 833 us); all its tiles and biases, at the same registers and waves, enc1 and dec1 181 -> 204 us.
+
 ## Presets E and F: DLSS 3's CNN (runtime and shim path exist; experimental, the RDNA2 route)
 
 Presets E (5) and F (6) are NGX 310.7's CNN upscaler, in the `nvngx_dlss.dll` the installer already fetches. Its
