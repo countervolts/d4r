@@ -353,10 +353,10 @@ how the passes were arranged:
   eight slots, 58 MB at 4K) and a group's post passes run without barriers between them, as do its down passes
   together with the next group's post passes on the other half of the slots - what NGX does with two slots and its
   progress counters. `D4R_ENGINE_RR_SKIP=serial` restores the old order.
-- **Pooled histories as real 10:10:10:2 images: withdrawn.** 4 bytes a pixel instead of RGBA32F's 16 saved
-  0.1 ms and was identical at 3x and 2x scaling, but the hardware's bilinear filter rounds a UNORM image differently
-  from a float one: at 1.5x (capFQ) temporal frames came out at 44 - 51 dB. The default is RGBA32F again;
-  `D4R_RR2_POOLED=rgb10_a2` builds the other form.
+- **Pooled histories as real 10:10:10:2 images** (the default since 2026-10-20). 4 bytes a pixel instead of
+  RGBA32F's 16 saved 0.1 ms and was identical at 3x and 2x scaling, but the hardware's bilinear filter rounds a
+  UNORM image differently from a float one: at 1.5x (capFQ) temporal frames came out at 44 - 51 dB (28.8 dB on
+  random-motion noise's history frames, below). `D4R_RR2_POOLED=rgba32f` builds the reference form.
 
 Tried without gain: 32-bit arena accesses for the translated code's paired 16-bit ones (0.01 ms), dropping the
 subgroup shuffles or the depth search (they cost nothing measurable). What is left is NVIDIA's arithmetic: gather
@@ -407,9 +407,9 @@ byte-identical to the previous build, same speed:
   weights go into the command buffer with `vkCmdUpdateBuffer` instead of through a host-visible staging copy that
   stayed allocated.
 
-Through the shim (direct output) the harness process peaks 159 MiB lower (1100 -> 941 MiB). Not exact, so not
-done: the pooled histories as RGB10A2 (`D4R_RR2_POOLED=rgb10_a2`, -70 MB, see above); they hold q / 1023, which
-neither binary16 nor UNORM16 represents exactly. `D4R_ENGINE_RR_ARENA`
+Through the shim (direct output) the harness process peaks 159 MiB lower (1100 -> 941 MiB). Not exact: the pooled
+histories as RGB10A2 (`D4R_RR2_POOLED=rgb10_a2`, -70 MB, now the default, see above) hold q / 1023, which neither
+binary16 nor UNORM16 represents exactly. `D4R_ENGINE_RR_ARENA`
 keeps the old separate layout, so that arena dumps show the network's regions as NGX leaves them.
 
 ## Against a real NVIDIA card: `D4R_RR_FUSE` (2026-10-13)
@@ -630,18 +630,20 @@ byte-identical to the previous model on the replay and stress inputs, at levels 
   enables; the shim reads the device's features through `GetDeviceFeatures`. Without it, or with a model that has no
   `exposure_f2.spv`, the two passes run (`D4R_RR_TEST_NO_INT64_ATOMICS=1` forces them). Exposure 25.2 -> 14.9 us.
 
-### Opt-in builds for preset F (2026-10-19)
+### Opt-in builds that became defaults (2026-10-20)
 
-Against the default build, presented image, RGB, peak 1, 1280x720 -> 1440p. For scale, the exact build
-(`D4R_RR_RELAXED=0`) is 43.0 - 44.4 dB from the default.
+Against the previous default build, presented image, RGB, peak 1, 1280x720 -> 1440p. For scale, the exact build
+(`D4R_RR_RELAXED=0 D4R_RR2_POOLED=rgba32f`) is 43.0 - 44.4 dB from that build.
 
-- `D4R_RR2_UNGUARDED=1` (level 3 only): the translated code (encoder 0's and decoder 0's per-pixel parts, the output
-  passes) without its exactness guards: no `precise`, no opaque zero on binary16 stores, no `spv_exact_convert.py`.
-  56.0 dB on the reset frame, then 43.0 - 45.6 dB, as far from the exact build as the default is. Frame 3.526 -> 3.501
-  ms.
-- `D4R_RR2_POOLED=rgb10_a2` (since 2026-10-13): the pooled histories as UNORM 10:10:10:2 images, 31 MB less at 1440p.
+- Unguarded translated code (the default at level 3 since 2026-10-20; `D4R_RR2_UNGUARDED=0` keeps the guards):
+  encoder 0's and decoder 0's per-pixel parts and the output
+  passes without their exactness guards: no `precise`, no opaque zero on binary16 stores, no `spv_exact_convert.py`.
+  56.0 dB on the reset frame, then 43.0 - 45.6 dB, as far from the exact build as the previous default was. Frame
+  3.526 -> 3.501 ms.
+- `D4R_RR2_POOLED=rgb10_a2` (since 2026-10-13, the default since 2026-10-20; `rgba32f` builds the reference form):
+  the pooled histories as UNORM 10:10:10:2 images, 31 MB less at 1440p.
   Identical at 1280x720 -> 1440p and on reset frames; 43.7 - 47.2 dB on the history frames at 1114x626 -> 1080p and
-  28.8 dB with random motion. Frame 3.526 -> 3.484 ms, 3.456 with `D4R_RR2_UNGUARDED=1` as well.
+  28.8 dB with random motion. Frame 3.526 -> 3.484 ms, 3.456 with the unguarded code as well.
 
 ### Byte-identical speed-ups (2026-10-20)
 
@@ -657,8 +659,8 @@ stress and game-like inputs, at levels 0 and 3 and in the `D4R_RR2_UNGUARDED=1 D
 | `rr2_m.comp` residual step: FP8 decodes and conversions in pairs | dec0_1 436 -> 430 | 3.413 -> 3.401 |
 | `rr2_pack.py` float32 copies of the biases (tables as column-major tiles), read by both block shaders | dec0_1 430 -> 412, dec1_1 184 -> 171, enc1 227 -> 218, dec1_0 202 -> 194 | 3.401 -> 3.329 |
 
-The opt-in build: 3.455 -> 3.215 ms, and 3.188 with encoder 0's gather as a pass of its own, which
-`D4R_RR2_UNGUARDED=1` now selects (`compile_rr2.py`; encoder 0 650 -> 623 us, the same images; in the guarded build
+The build that is now the default: 3.455 -> 3.215 ms, and 3.188 with encoder 0's gather as a pass of its own, which
+the unguarded default selects (`compile_rr2.py`; encoder 0 650 -> 623 us, the same images; in the guarded build
 the two are equally fast).
 
 Tried, no gain: the translated code's texel fetch without its branch (enc0 within noise); the next MLP branch's

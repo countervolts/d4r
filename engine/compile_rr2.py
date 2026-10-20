@@ -79,17 +79,18 @@ BUFFERS['downp'] = [72, 168, 176]
 HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1', '--tail-waves', os.environ.get('D4R_RR2_TAIL_WAVES', '2')]}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
-# The pooled histories as RGBA32F holding q / 1023, as ZLUDA backs them (16 bytes a pixel). D4R_RR2_POOLED=rgb10_a2
-# makes them real UNORM 10:10:10:2 images (0.1 ms faster at 4K, 70 MB less), but the hardware's bilinear filter then
-# rounds differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13); on
-# random-motion noise also at 2x (29 dB on the history frames, engine/rr/README.md)
-POOLED = os.environ.get('D4R_RR2_POOLED', 'rgba32f')
+# The pooled histories as real UNORM 10:10:10:2 images (4 bytes a pixel; 0.1 ms faster at 4K, 70 MB less). The hardware's
+# bilinear filter then rounds differently from the RGBA32F form ZLUDA backs them with (16 bytes a pixel):
+# identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13); on random-motion noise
+# also at 2x (29 dB on the history frames, engine/rr/README.md). D4R_RR2_POOLED=rgba32f builds that reference form.
+POOLED = os.environ.get('D4R_RR2_POOLED', 'rgb10_a2')
 SURFACES = {'dec0_1': {176: 'rgba8_snorm', 184: 'rgba8', 192: 'rgba8'}, 'post': {120: POOLED}, 'pooled': {8: POOLED}}
-# D4R_RR2_UNGUARDED=1 (opt-in, D4R_RR_RELAXED=3 only): the translated code (encoder 0's and decoder 0's per-pixel parts,
-# the output passes) without its exactness guards: no `precise` registers, no opaque zero OR-ed into binary16 stores and
-# conversions (ptx2rr.py --unguarded) and no NoContraction pass (spv_exact_convert.py) on those modules, so the driver may
-# contract, fold and fuse there as it does in the relaxed native stages (engine/rr/README.md)
-UNGUARDED = os.environ.get('D4R_RR2_UNGUARDED') == '1'
+# D4R_RR2_UNGUARDED (on by default, D4R_RR_RELAXED=3 only; D4R_RR2_UNGUARDED=0 keeps the guards): the translated code
+# (encoder 0's and decoder 0's per-pixel parts, the output passes) without its exactness guards: no `precise` registers, no
+# opaque zero OR-ed into binary16 stores and conversions (ptx2rr.py --unguarded) and no NoContraction pass
+# (spv_exact_convert.py) on those modules, so the driver may contract, fold and fuse there as it does in the relaxed
+# native stages (engine/rr/README.md)
+UNGUARDED = os.environ.get('D4R_RR2_UNGUARDED', '1' if RELAXED >= 3 else '0') == '1'
 if UNGUARDED and RELAXED < 3:
     raise SystemExit('D4R_RR2_UNGUARDED=1 is for D4R_RR_RELAXED=3')
 # decoder 0's second kernel on one wave (rr2_w.comp KIND 5, the translated tail on the same wave), which the

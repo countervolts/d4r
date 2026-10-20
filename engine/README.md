@@ -1100,12 +1100,13 @@ on the Vulkan shaders unless `[Engine] Network = hip`:
 | model | default build | the exact build (NVIDIA's roundings, bit-identical to the CUDA path) |
 |---|---|---|
 | K (`compile_k.py`) | two tiles per wave in the 32-channel layers (same output) | `K_TPW=1` for the previous layout |
-| M, L (`compile_m.py`) | `M_RELAXED`, two windows per wave | `M_EXACT=1` |
+| M, L (`compile_m.py`) | `M_RELAXED`, two windows per wave, `M_RESIDUAL_F32` | `M_EXACT=1` (implies `M_RESIDUAL_F32=0`) |
 | RR D, E (`rr/build_native_model.sh`) | `D4R_RR_RELAXED=3` | `D4R_RR_RELAXED=0` |
-| RR F (`compile_rr2.py`) | `D4R_RR_RELAXED=3` | `D4R_RR_RELAXED=0` |
+| RR F (`compile_rr2.py`) | `D4R_RR_RELAXED=3`, `D4R_RR2_UNGUARDED=1`, `D4R_RR2_POOLED=rgb10_a2` | `D4R_RR_RELAXED=0 D4R_RR2_POOLED=rgba32f` |
 
-A model built with no options was compared shader by shader with the explicitly optioned build of each row, and the
-exact switches still reproduce the captures (`build/rr/f/nv/defaults.sh`).
+When these defaults were introduced (2026-10-14), a model built with no options was compared shader by shader with
+the explicitly optioned build of each row, and the exact switches still reproduce the captures
+(`build/rr/f/nv/defaults.sh`).
 
 ### Byte-identical speed-ups (2026-10-19)
 
@@ -1124,14 +1125,14 @@ reconstruction tile tiers and the stress inputs).
 The network layers are separated by an execution-only barrier (`emptyStage`). A memory barrier there gives the same
 output and costs about 60 us (M 1520 -> 1592), so it stays.
 
-### `M_RESIDUAL_F32` (opt-in, 2026-10-19)
+### `M_RESIDUAL_F32` (default since 2026-10-20)
 
-`M_RESIDUAL_F32=1 python3 engine/compile_m.py ...` keeps the residual stream in f32 across the MLP's 32-channel chunks
-and rounds it to binary16 once after them, instead of after every chunk. It needs the relaxed build (not
-`M_EXACT=1`) and is off by default. 1280x720 -> 1440p: M 1521 -> 1410 us, L 2195 -> 2077. Against the default build,
-final RGB, peak 1: 43 - 46 dB (L 45 - 49) on smooth frames, 17 - 18 dB on noise. The exact build is as far from the
-default, so this moves no further from NVIDIA's arithmetic than `M_RELAXED` already does. Not checked against an
-NVIDIA card.
+Every relaxed build keeps the residual stream in f32 across the MLP's 32-channel chunks
+and rounds it to binary16 once after them, instead of after every chunk; `M_RESIDUAL_F32=0` builds the previous
+form. It needs the relaxed build (`M_EXACT=1` implies `M_RESIDUAL_F32=0`). 1280x720 -> 1440p: M 1521 -> 1410 us,
+L 2195 -> 2077. Against the previous relaxed build, final RGB, peak 1: 43 - 46 dB (L 45 - 49) on smooth frames,
+17 - 18 dB on noise. The exact build is as far from the previous relaxed build, so this moves no further from
+NVIDIA's arithmetic than `M_RELAXED` already does. Not checked against an NVIDIA card.
 
 ## Preset L (runtime and shim path exist; experimental)
 

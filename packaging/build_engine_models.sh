@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rr-only) DO_SR=0; shift ;;
     --sr-only) DO_RR=0; shift ;;
-    --exact) export D4R_RR_RELAXED=0 M_EXACT=1; shift ;;
+    --exact) export D4R_RR_RELAXED=0 D4R_RR2_POOLED=rgba32f M_EXACT=1; shift ;;
     --find-proton) FIND_PROTON=1; shift ;;
     --list-sr-models) LIST_SR=1; shift ;;
     -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;

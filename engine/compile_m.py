@@ -36,11 +36,12 @@ FAST_WPW = [] if EXACT or os.environ.get('M_WPW') or 'WPW=' in os.environ.get('M
 # buffers in its binary16 one (7.5 KiB of shared memory, layer_m.comp): 445 -> 415 us at 1280x720, the same values
 L_WPW = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_DEC0L', '') else ['-DWPW=2']
 L_WPW_ENC0 = [] if EXACT or 'WPW=' in os.environ.get('M_DEFS', '') + os.environ.get('M_DEFS_ENC0L', '') else ['-DWPW=2']
-# M_RESIDUAL_F32=1 (opt-in, not with M_EXACT=1): every layer_m.comp stage keeps the residual stream f32 across the MLP's
-# 32-channel chunks, one binary16 rounding after them instead of one per chunk (engine/README.md)
-RESF32 = ['-DM_RESIDUAL_F32'] if os.environ.get('M_RESIDUAL_F32') == '1' else []
+# M_RESIDUAL_F32 (on by default in the relaxed build; M_RESIDUAL_F32=0 turns it off, and M_EXACT=1 implies 0): every
+# layer_m.comp stage keeps the residual stream f32 across the MLP's 32-channel chunks, one binary16 rounding after them
+# instead of one per chunk (engine/README.md)
+RESF32 = ['-DM_RESIDUAL_F32'] if os.environ.get('M_RESIDUAL_F32', '0' if EXACT else '1') == '1' else []
 if RESF32 and EXACT:
-    raise SystemExit('M_RESIDUAL_F32=1 is part of the relaxed arithmetic: not with M_EXACT=1')
+    raise SystemExit('M_RESIDUAL_F32 is part of the relaxed arithmetic: not with M_EXACT=1')
 SHADERS = {'enc1': 'm_enc1', 'enc2': 'm_enc2', 'enc3_tube': 'm_tube', 'dec2': 'm_dec2', 'dec1': 'm_dec1'}
 
 
