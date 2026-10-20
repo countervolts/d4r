@@ -66,6 +66,10 @@ BUFFERS = {'enc0': [104, 256], 'post': [16, 256, 264], 'down': [72, 168, 176]}
 # NVIDIA; the reference this engine is checked against (ZLUDA) backs them with RGBA32F, and so does the engine.
 NATIVE = ['enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4_0', 'dec4_1', 'dec3_0', 'dec3_1', 'dec2_0', 'dec2_1', 'dec1_0',
           'dec1_1', 'dec0_0']
+# The deep stages that can also run split over several workgroups per window (rr2_m.comp RR2_PHASE 1 - 4, KIND 0 and 3):
+# <stage>_p1.spv ... _p4.spv and a "phases" line in rr.txt; the runtime uses them for a stage with fewer windows than
+# the GPU has compute units (enc5 at 1280x720) and the single shader otherwise. D4R_RR2_PHASES=0 builds none.
+PHASED = [] if os.environ.get('D4R_RR2_PHASES') == '0' else ['enc3', 'enc4', 'enc5', 'dec4_1', 'dec3_1']
 # --particles: the downsample kernel with the particle layer
 KERNEL['downp'] = 'rr2_downsample_kernel_static_hdr'
 BLOCK['downp'] = '16,16,1'
@@ -162,12 +166,16 @@ def main():
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
             defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
-            subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
-                                     f'-I{HERE / "rr"}', str(HERE / 'rr' / ('rr2_w.comp' if RELAXED >= 3 and stage in ONE_WAVE else 'rr2_m.comp')), '-o', str(out / f'{stage}_m.spv')],
-                           check=True, stdout=subprocess.DEVNULL)
-            if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
-                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}_m.spv')],
+            phased = stage in PHASED and not (RELAXED >= 3 and stage in ONE_WAVE)
+            for phase in [0] + ([1, 2, 3, 4] if phased else []):
+                spv = out / (f'{stage}_m.spv' if phase == 0 else f'{stage}_p{phase}.spv')
+                subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs] +
+                               ([f'-DRR2_PHASE={phase}'] if phase else []) + [f'-I{work}', f'-I{HERE / "rr"}',
+                               str(HERE / 'rr' / ('rr2_w.comp' if RELAXED >= 3 and stage in ONE_WAVE else 'rr2_m.comp')), '-o', str(spv)],
                                check=True, stdout=subprocess.DEVNULL)
+                if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
+                    subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(spv)],
+                                   check=True, stdout=subprocess.DEVNULL)
             if launch is None:
                 (out / f'{stage}.args').write_bytes(blocks[stage])
                 ptrs = [ARENA[stage]]
@@ -177,7 +185,12 @@ def main():
                 unit = launch.allocs[arena][1] / 3152
                 ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers if p.alloc == arena and p.offset != 24]
             lines.append(f'stage {stage} {stage}_m.spv 32 {weights} {stage}.args - - - {",".join(ptrs)}')
-            print(f'{stage}: native (engine/rr/rr2_m.comp)')
+            if phased:   # "phases STAGE P1 P2 P3 P4 HEADS BRANCHES WORDS": the shaders, the grid's parts and a window's record
+                shape = dict(l.split()[1:3] for l in (work / 'rr2_stage.h').read_text().splitlines() if l.startswith('#define ') and len(l.split()) >= 3)
+                c, nh, nb = (int(shape[k].rstrip('u')) for k in ('C', 'NH', 'NB'))
+                words = nh * 512 + (c // 16) * 256 + (c // 16) * 1024 + nb * 512   # rr2_m.comp SC_WIN
+                lines.append(f'phases {stage} ' + ' '.join(f'{stage}_p{k}.spv' for k in (1, 2, 3, 4)) + f' {nh} {nb} {words}')
+            print(f'{stage}: native (engine/rr/rr2_m.comp)' + (', also in four phases' if phased else ''))
             continue
         generated = out / f'{stage}.generated.comp'
         cmd = [sys.executable, str(HERE / 'rr' / 'ptx2rr.py'), str(find_module(a.ptx_dir, kernel)), kernel, str(generated),

@@ -15,6 +15,10 @@
 // [channel tile][token] accumulators: one workgroup per 8x8-token window, four waves, wave w owning the token slots
 // 16w ... 16w + 15; token and channel slot j holds the natural index inter(j) (NVIDIA's k order, which is also the
 // arena's byte order within a 32-channel plane).
+// RR2_PHASE 1 - 4 (KIND 0 and 3) splits a window over several workgroups, for stages with fewer windows than the GPU
+// has compute units: 1 one head per workgroup, 2 the heads' out-projections and r, 3 one MLP branch per workgroup,
+// 4 the MLP's up-projections and everything after; the values handed over (Ob, Nb, Hb as FP8 tiles, r) go through a
+// record per window in the arena, so every window computes exactly what the whole shader (RR2_PHASE 0) computes.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -126,6 +130,29 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #endif
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
 #define BRANCHB BRANCH
+#ifndef RR2_PHASE
+#define RR2_PHASE 0
+#endif
+#if RR2_PHASE != 0
+#if KIND != 0 && KIND != 3
+#error rr2_m.comp: RR2_PHASE is for KIND 0 and 3
+#endif
+// phases 1 and 3: workgroup x = part * windows + window (part: the head, the MLP branch)
+#if RR2_PHASE == 1 || RR2_PHASE == 3
+#define RR2_PARTS (RR2_PHASE == 1 ? uint(NH) : uint(NB))
+#define RR2_GXW (gl_NumWorkGroups.x / RR2_PARTS)
+#define RR2_PART (gl_WorkGroupID.x / RR2_GXW)
+#undef RR2_WGX
+#define RR2_WGX (gl_WorkGroupID.x % RR2_GXW)
+#else
+#define RR2_GXW gl_NumWorkGroups.x
+#endif
+// the window's record (32-bit words): Ob of every head, Nb, r, Hb of every branch (FP8 tiles of 64 words, r per lane);
+// argument 104 holds the records' byte address in the arena (the runtime's, engine/runtime_rr2.inc)
+const uint SC_OB = 0u, SC_NB = SC_OB + NH * 512u, SC_RV = SC_NB + MT * 256u, SC_HB = SC_RV + MT * 1024u, SC_WIN = SC_HB + NB * 512u;
+uint scBase() { return (PRM(26) >> 2u) + (gl_WorkGroupID.y * RR2_GXW + RR2_WGX) * SC_WIN; }
+uint scRv(uint m, int i) { return scBase() + SC_RV + ((m * 8u + uint(i)) * 4u + gl_SubgroupID) * 32u + gl_SubgroupInvocationID; }
+#endif
 
 #if KIND == 1
 // enc1's merge input is in registers (gb) before XT or KVS is first written, so the three share 8 KiB instead of 16
@@ -238,7 +265,8 @@ void main()
     const bool inside = tx >= 0 && ty >= 0 && tx < ex && ty < ey;
 
     // ---------------------------------------------------------------- the block's input x: one token per thread
-#if KIND == 0 || KIND == 3 || KIND == 5
+#if RR2_PHASE >= 3   // (phases 3 and 4 start from the record)
+#elif KIND == 0 || KIND == 3 || KIND == 5
     if (tid < 64u) {
         const uint k = inter(tid);
         const int xx = mirror(x0 + int(k & 7u), ex), yy = mirror(y0 + int(k >> 3u), ey);
@@ -364,10 +392,37 @@ void main()
 #endif
 
     // ---------------------------------------------------------------- attention: the heads' out-projections sum up
+#if RR2_PHASE == 0 || RR2_PHASE == 2
     RAC AT[MT];
     [[unroll]] for (uint m = 0u; m < MT; ++m)
         [[unroll]] for (int i = 0; i < 8; ++i) AT[m][i] = BV(BO, 16u * m + 8u * hl + uint(i));
+#endif
+#if RR2_PHASE == 2
+    {   // the heads' out-projections in head order; the next head's tiles load while this head's products run (a
+        // window has a compute unit to itself here: nothing else would hide their latency). The last iteration loads
+        // its own tiles again: with a branch around the loads, the compiler waits for them before the back-edge
+        A8 wn[2 * MT];
+        B8 on[2];
+        [[unroll]] for (uint m = 0u; m < MT; ++m) { LDA(wn[2u * m], W_WO0, 32u, m, 0u); LDA(wn[2u * m + 1u], W_WO0, 32u, m, 1u); }
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(on[c], arena.w, scBase() + SC_OB + wv * 128u + c * 64u, 4u, CMJ);
+        [[dont_unroll]] for (uint hd = 0u; hd < NH; ++hd) {
+            A8 wc[2 * MT];
+            [[unroll]] for (uint k = 0u; k < 2u * MT; ++k) wc[k] = wn[k];
+            B8 Ob[2];
+            Ob[0] = on[0]; Ob[1] = on[1];
+            const uint hn = min(hd + 1u, uint(NH) - 1u);
+            [[unroll]] for (uint m = 0u; m < MT; ++m) { LDA(wn[2u * m], W_WO0 + HEAD * hn, 32u, m, 0u); LDA(wn[2u * m + 1u], W_WO0 + HEAD * hn, 32u, m, 1u); }
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(on[c], arena.w, scBase() + SC_OB + (hn * 4u + wv) * 128u + c * 64u, 4u, CMJ);
+            [[unroll]] for (uint m = 0u; m < MT; ++m) K32(AT[m], wc[2u * m], Ob[0], wc[2u * m + 1u], Ob[1])
+        }
+    }
+#elif RR2_PHASE <= 1
+#if RR2_PHASE == 1
+    {
+        const uint hd = RR2_PART;
+#else
     [[dont_unroll]] for (uint hd = 0u; hd < NH; ++hd) {
+#endif
         barrier();   // every wave is done with the previous head's QK / V
         for (uint j = 0u; j < 2u; ++j) {   // 8 jobs (token tile n, channel tile c)
             const uint job = wv + 4u * j, n = job >> 1u, c = job & 1u;
@@ -452,16 +507,28 @@ void main()
             }
             Q8(Ob[c], o)
         }
+#if RR2_PHASE == 1
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatStore(Ob[c], arena.w, scBase() + SC_OB + (hd * 4u + wv) * 128u + c * 64u, 4u, CMJ);
+#else
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             A8 a0, a1;
             LDA(a0, W_WO0 + HEAD * hd, 32u, m, 0u); LDA(a1, W_WO0 + HEAD * hd, 32u, m, 1u);
             K32(AT[m], a0, Ob[0], a1, Ob[1])
         }
+#endif
     }
+#endif
+#if RR2_PHASE == 1
+    return;
+#else
 
     // ---------------------------------------------------------------- r = x + attention * s1; the MLP's input q8(r)
     RVT rv[MT][8];
     B8 Nb[MT];
+#if RR2_PHASE == 3
+    [[unroll]] for (uint m = 0u; m < MT; ++m) coopMatLoad(Nb[m], arena.w, scBase() + SC_NB + (m * 4u + wv) * 64u, 4u, CMJ);
+#elif RR2_PHASE == 4   // (r is read after the MLP)
+#else
     [[unroll]] for (uint m = 0u; m < MT; ++m) {
 #if KIND != 2
         const uint xa = (16u * wv + col) * (C / 4u) + 4u * m + 2u * hl;
@@ -481,10 +548,53 @@ void main()
             Q8R2(Nb[m], i, r0, r1)
         }
     }
+#endif
+#if RR2_PHASE == 2
+    [[unroll]] for (uint m = 0u; m < MT; ++m) {
+        coopMatStore(Nb[m], arena.w, scBase() + SC_NB + (m * 4u + wv) * 64u, 4u, CMJ);
+#ifdef RR_NATIVE
+        [[unroll]] for (int i = 0; i < 8; ++i) arena.w[scRv(m, i)] = floatBitsToUint(rv[m][i]);
+#else
+        [[unroll]] for (int i = 0; i < 8; ++i) arena.w[scRv(m, i)] = uint(float16BitsToUint16(rv[m][i]));
+#endif
+    }
+    return;
+#else
+#if RR2_PHASE != 3
     RAC ML[MT];
     [[unroll]] for (uint m = 0u; m < MT; ++m)
         [[unroll]] for (int i = 0; i < 8; ++i) ML[m][i] = BV(BU, 16u * m + 8u * hl + uint(i));
+#endif
+#if RR2_PHASE == 4
+    {   // the branches' up-projections in branch order, the next branch's tiles loading meanwhile (as in phase 2)
+        A8 wn[2 * MT];
+        B8 hn[2];
+        [[unroll]] for (uint m = 0u; m < MT; ++m) { LDA(wn[2u * m], W_WU0, 32u, m, 0u); LDA(wn[2u * m + 1u], W_WU0, 32u, m, 1u); }
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(hn[c], arena.w, scBase() + SC_HB + wv * 128u + c * 64u, 4u, CMJ);
+        [[dont_unroll]] for (uint br = 0u; br < NB; ++br) {
+            A8 wc[2 * MT];
+            [[unroll]] for (uint k = 0u; k < 2u * MT; ++k) wc[k] = wn[k];
+            B8 Hb[2];
+            Hb[0] = hn[0]; Hb[1] = hn[1];
+            const uint bn = min(br + 1u, uint(NB) - 1u), w2n = W_WU0 + BRANCH * bn;
+            [[unroll]] for (uint m = 0u; m < MT; ++m) { LDA(wn[2u * m], w2n, 32u, m, 0u); LDA(wn[2u * m + 1u], w2n, 32u, m, 1u); }
+            [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(hn[c], arena.w, scBase() + SC_HB + (bn * 4u + wv) * 128u + c * 64u, 4u, CMJ);
+            [[unroll]] for (uint m = 0u; m < MT; ++m) K32(ML[m], wc[2u * m], Hb[0], wc[2u * m + 1u], Hb[1])
+        }
+    }
+    [[unroll]] for (uint m = 0u; m < MT; ++m)
+#ifdef RR_NATIVE
+        [[unroll]] for (int i = 0; i < 8; ++i) rv[m][i] = uintBitsToFloat(arena.w[scRv(m, i)]);
+#else
+        [[unroll]] for (int i = 0; i < 8; ++i) rv[m][i] = uint16BitsToFloat16(uint16_t(arena.w[scRv(m, i)]));
+#endif
+#else
+#if RR2_PHASE == 3
+    {
+        const uint br = RR2_PART;
+#else
     [[dont_unroll]] for (uint br = 0u; br < NB; ++br) {
+#endif
         const uint w1 = W_WD0 + BRANCH * br, b1 = W_BD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
         B8 Hb[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
@@ -497,12 +607,20 @@ void main()
             }
             ACT8(Hb[c], h)
         }
+#if RR2_PHASE == 3
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatStore(Hb[c], arena.w, scBase() + SC_HB + (br * 4u + wv) * 128u + c * 64u, 4u, CMJ);
+#else
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             A8 a0, a1;
             LDA(a0, w2, 32u, m, 0u); LDA(a1, w2, 32u, m, 1u);
             K32(ML[m], a0, Hb[0], a1, Hb[1])
         }
+#endif
     }
+#endif
+#if RR2_PHASE == 3
+    return;
+#else
 
 #if KIND == 5
     // dec0's second kernel: the translated tail forms y = r + MLP * s2 itself and computes the outputs from it
@@ -654,4 +772,7 @@ void main()
 #endif
     }
 #endif
+#endif   // RR2_PHASE != 3
+#endif   // RR2_PHASE != 2
+#endif   // RR2_PHASE != 1
 }
