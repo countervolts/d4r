@@ -308,6 +308,20 @@ The shim loads each model on first use from a folder next to it, or from a varia
 | L, HDR flag set | `engine\l` | `D4R_ENGINE_MODEL_L_DIR` | `compile_m.py` on a capture of preset L |
 | L, no HDR flag | `engine\l-ldr` | `D4R_ENGINE_MODEL_L_LDR_DIR` | `compile_m.py --ldr` on a capture of preset L |
 
+The models the configuration will use are loaded at NGX init instead, each on a thread of its own (2026-10-20):
+Ray Reconstruction's (the model a feature without a preset hint runs, preset F when `engine\rr-f` exists) when
+`[RayReconstruction] Backend = dlss`, and the HDR model of the preset `[DLSS] Model` forces (K when `[Engine]` runs K,
+L or M). On a cold shader cache (after a driver or model update) their pipelines take seconds to compile, and games
+create their features long after they initialise NGX, so the first frame no longer waits for them. Only the models
+load early (pipelines and weights: 8 MB for preset F, 2 MB for L); a feature still creates its own resources at its
+first frame. `D4R_ENGINE_PRELOAD=0` loads on first use as before.
+
+| D3D12 test app through the shim (`rr_backend_check.exe`, proton, 1280x720 -> 1440p) | Before | After |
+|---|---|---|
+| Ray Reconstruction preset F, cold cache, 8 s from NGX init to the feature: first frame | 3.05 s | 9.6 ms |
+| Super Sampling preset L, the same | 0.89 s | 7.5 ms |
+| Preset F / preset L, warm cache: first frame | 7.6 / 8.1 ms | 7.3 / 4.9 ms |
+
 `scripts/install_d4r_runtime.sh` stages them from `D4R_ENGINE_MODEL`, `D4R_ENGINE_MODEL_LDR`, `D4R_ENGINE_MODEL_M`,
 `D4R_ENGINE_MODEL_M_LDR`, `D4R_ENGINE_MODEL_L` and `D4R_ENGINE_MODEL_L_LDR`, copying each folder whole (with `hipnet.bin` and `hip/` from `--hip`). A model whose
 `hipnet.bin` belongs to the other preset keeps the Vulkan network. The Vulkan network is the default since 2026-10-14;
