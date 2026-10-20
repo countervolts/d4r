@@ -204,7 +204,20 @@ If something goes wrong
 - Ray Reconstruction needs the CUDA-capable 3.10.7 nvngx_dlssd.dll beside the shim, the matching
   patched d3d12.dll/d3d12core.dll, and the ICU launch overrides from the Ray Reconstruction section
   above. Enable [Kernels] NativeFp8; the scalar FP8 RR path is not validated.
-- Not supported: DLSS Frame Generation and DirectX 11.
+- Optional frame generation: with the game closed, run
+    python3 d4r/d4r-features.py . --fg xefg --input dlssg
+  from its main executable folder. Use --input fsrfg for native FSR 3.1 FG or
+  --input upscaler for games without native FG. --fg fsrfg selects FSR FG output.
+  Restart, enable the native FG input in-game, and activate FG in OptiScaler.
+  XeFG needs borderless mode and SDR/HDR10 (not scRGB). Verify with FG debug view.
+- Optional Reflex-to-AL2/XeLL/LFX: python3 d4r/d4r-features.py . --latency auto
+  Then enable Reflex in-game. The provider selects an available method; AL2 on
+  Proton also requires host/vkd3d support. This does not change FrameAge.
+  The router preserves NGX's real NVAPI topology queries. Both features are
+  experimental and off by default. Each setup change creates an exact INI backup.
+  Disable: python3 d4r/d4r-features.py . --fg off --latency proton
+- Not supported: NVIDIA's DLSS Frame Generation network and DirectX 11.
+  OptiScaler can instead convert DLSSG inputs into XeFG or FSR FG as above.
 - Development builds expose an experimental native Vulkan NGX path using CPU staging.
   Youngblood is the first intended game test; gameplay remains unverified. See the
   project documentation (docs/vulkan.md) for its separate Vulkan setup and limits.

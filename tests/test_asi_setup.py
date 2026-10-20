@@ -91,7 +91,8 @@ int wmain(int argc, wchar_t** argv) {
             game = Path(tmp) / 'Game with spaces'
             original = (b'; keep this comment\r\n[Plugins]\r\nPath=custom plugins\r\n'
                         b'LoadAsiPlugins=true\r\nLoadReShade=true\r\n'
-                        b'[FrameGen]\r\nFGOutput=fsr31\r\n[Menu]\r\nShortcutKey=45\r\n')
+                        b'[FrameGen]\r\nFGOutput=fsr31\r\n[NvApi]\r\nOverrideNvapiDll=true\r\n'
+                        b'[Menu]\r\nShortcutKey=45\r\n')
             plugin = self.fixture(game, original)
             result = self.setup(game, plugin)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -100,6 +101,7 @@ int wmain(int argc, wchar_t** argv) {
             self.assertEqual(configured.count(b'\n'), configured.count(b'\r\n'))
             self.assertIn(b'LoadReShade=true\r\n', configured)
             self.assertIn(b'[FrameGen]\r\nFGOutput=fsr31\r\n', configured)
+            self.assertIn(b'OverrideNvapiDll=true\r\n', configured)
             self.assertIn(b'; keep this comment\r\n', configured)
             ini = configparser.ConfigParser()
             ini.read_string(configured.decode())

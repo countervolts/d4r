@@ -110,10 +110,10 @@ static std::string configure(std::string source, const fs::path& plugin)
         pos = end;
     }
     struct Setting { std::string section, key, value; };
-    const std::array<Setting, 11> settings = {{{"Upscalers", "Dx12Upscaler", "dlss"}, {"DLSS", "Enabled", "true"},
+    const std::array<Setting, 10> settings = {{{"Upscalers", "Dx12Upscaler", "dlss"}, {"DLSS", "Enabled", "true"},
         {"Inputs", "EnableDlssInputs", "true"}, {"Hooks", "HookOriginalNvngxOnly", "true"},
         {"Hooks", "UseNtdllHooks", "false"},
-        {"NvApi", "OverrideNvapiDll", "false"}, {"Spoofing", "Dxgi", "true"},
+        {"Spoofing", "Dxgi", "true"},
         {"FSR", "FsrAgilitySDKUpgrade", "false"},
         {"Plugins", "LoadAsiPlugins", "true"}, {"Plugins", "Path", utf8(plugin.parent_path().wstring())},
         {"Libraries", "NvngxPath", utf8(plugin.wstring())}}};

@@ -26,6 +26,17 @@ namespace d4r_fsr4_identity
 {
 inline D4rPciIdentity g_real;
 inline LUID g_luid = {};
+// FSR Ray Regeneration's Proton provider needs the normal identity throughout discovery,
+// including nested OptiScaler/driver-extension calls. Keep its scope local to the calling
+// thread so the independent FSR upscaler still receives the real GPU identity.
+inline thread_local unsigned g_originalIdentityDepth = 0;
+struct OriginalIdentityScope
+{
+    OriginalIdentityScope() { ++g_originalIdentityDepth; }
+    ~OriginalIdentityScope() { --g_originalIdentityDepth; }
+    OriginalIdentityScope(const OriginalIdentityScope&) = delete;
+    OriginalIdentityScope& operator=(const OriginalIdentityScope&) = delete;
+};
 using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
 using GetDesc1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
 using GetDesc2Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter2*, DXGI_ADAPTER_DESC2*);
@@ -73,7 +84,7 @@ inline bool caller_sees_real(void* address)
 
 template <typename Desc> inline void correct(void* caller, Desc* out)
 {
-    if (out->AdapterLuid.LowPart == g_luid.LowPart && out->AdapterLuid.HighPart == g_luid.HighPart &&
+    if (g_originalIdentityDepth == 0 && out->AdapterLuid.LowPart == g_luid.LowPart && out->AdapterLuid.HighPart == g_luid.HighPart &&
         caller_sees_real(caller))
     {
         out->VendorId = g_real.vendor;

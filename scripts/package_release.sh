@@ -113,6 +113,14 @@ for ffx in amd_fidelityfx_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
   cp "$OPTI/$ffx" "$STAGE/$ffx"
 done
 cp "$OPTI/Licenses/FidelityFX_v2_LICENSE.md" "$STAGE/d4r/licenses/FidelityFX-LICENSE.txt"
+# Optional FG/latency implementations from the same OptiScaler release. Keep
+# them private until d4r-features.py sets explicit per-library overrides.
+for feature in fakenvapi.dll libxell.dll libxess_fg.dll amd_fidelityfx_framegeneration_dx12.dll; do
+  [[ -f "$OPTI/$feature" ]] || { echo "the OptiScaler release has no $feature (FG/latency support)" >&2; exit 2; }
+  cp "$OPTI/$feature" "$STAGE/d4r/$feature"
+done
+cp "$OPTI/Licenses/XeSS_LICENSE.txt" "$STAGE/d4r/licenses/XeSS-LICENSE.txt"
+[[ ! -f "$OPTI/fakenvapi.ini" ]] || cp "$OPTI/fakenvapi.ini" "$STAGE/d4r/fakenvapi.ini"
 else
   cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
   # Same NGX exports and implementation, delivered through the ASI loader.
@@ -137,6 +145,8 @@ cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
   "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
+cp "$ROOT/packaging/d4r-features.py" "$STAGE/d4r/d4r-features.py"
+cp "$ROOT/build/d4r_nvapi64.dll" "$STAGE/d4r/d4r_nvapi64.dll"
 # AMD FSR Ray Regeneration 1.2 for [RayReconstruction] Backend = fsr: AMD's unmodified denoiser DLL (MIT)
 if [[ -n "${D4R_BUNDLE_FSR_RR_DLL:-}" ]]; then
   cp "$D4R_BUNDLE_FSR_RR_DLL" "$STAGE/d4r/amd_fidelityfx_denoiser_dx12.dll"
@@ -261,6 +271,8 @@ build_target() {
         [[ -f "$f" ]] || continue
         [[ -e "$STAGE/d4r/kernels/$folder/$(basename "$f")" ]] || cp "$f" "$STAGE/d4r/kernels/$folder/"
       done
+      # the RGBA8 store capability of the native LDR output kernels (kernels/build.sh), keyed by their code bytes
+      [[ -f "$tex_dir/d4r-rgba8.txt" ]] && cp "$tex_dir/d4r-rgba8.txt" "$STAGE/d4r/kernels/$folder/"
     fi
   fi
   [[ "$VARIANT" == clean ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0

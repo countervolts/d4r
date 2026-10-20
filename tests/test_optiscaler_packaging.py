@@ -131,6 +131,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                            input='int fixture(void) { return 0; }\n', text=True, check=True)
             fixture(repo / 'build/d4r_nvngx.dll')
             fixture(repo / 'build/d4r-setup.exe')
+            fixture(repo / 'build/d4r_nvapi64.dll')
             fixture(repo / 'build/wine-nvcuda/x86_64-unix/nvcuda.dll.so', elf.read_bytes())
             fixture(inputs / 'zluda/libnvcuda.so', elf.read_bytes())
             fixture(inputs / 'rocm/lib/libamdhip64.so.7', elf.read_bytes())
@@ -138,7 +139,9 @@ class OptiScalerConfigTests(unittest.TestCase):
             for name in ('d3d12.dll', 'd3d12core.dll'):
                 fixture(inputs / 'vkd3d' / name, b'MZ fixture d3d12core.dll\0 then d3d12core.dll\0' if name == 'd3d12.dll' else b'fixture')
             fixture(inputs / 'opti/OptiScaler.dll')
-            for name in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'Licenses/FidelityFX_v2_LICENSE.md'):
+            for name in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'Licenses/FidelityFX_v2_LICENSE.md',
+                         'fakenvapi.dll', 'libxell.dll', 'libxess_fg.dll',
+                         'amd_fidelityfx_framegeneration_dx12.dll', 'Licenses/XeSS_LICENSE.txt'):
                 fixture(inputs / 'opti' / name)
             fixture(inputs / 'opti/OptiScaler.ini', upstream_ini().replace('\n', '\r\n').encode())
             dlss = fixture(inputs / 'nvngx_dlss.dll')
@@ -193,6 +196,14 @@ class OptiScalerConfigTests(unittest.TestCase):
                         if mode == 'proxy':
                             data = archive.read('OptiScaler.ini')
                             self.assert_routing(data)
+                            cfg = configparser.ConfigParser()
+                            cfg.read_string(data.decode())
+                            self.assertEqual(cfg['FrameGen']['Enabled'], 'false')
+                            self.assertEqual(cfg['NvApi']['OverrideNvapiDll'], 'false')
+                            for dependency in ('fakenvapi.dll', 'libxell.dll', 'libxess_fg.dll',
+                                               'amd_fidelityfx_framegeneration_dx12.dll', 'd4r_nvapi64.dll',
+                                               'd4r-features.py', 'licenses/XeSS-LICENSE.txt'):
+                                self.assertIn('d4r/' + dependency, archive.namelist())
                             configs.append(data)
                             self.assertEqual(data, (repo / 'dist' / name / 'OptiScaler.ini').read_bytes())
                             # OptiScaler's FSR 3.X/4 upscaler: AMD's loader and upscaler beside it
@@ -206,7 +217,8 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertIn('d4r/d4r-setup.exe', archive.namelist())
                             self.assertEqual('d4r/install.sh' in archive.namelist(), bundled == 'installer')
                             if bundled != 'installer':
-                                self.assertFalse(any(n.endswith('.py') for n in archive.namelist()))
+                                self.assertFalse(any(n.endswith('.py') and n != 'd4r/d4r-features.py'
+                                                     for n in archive.namelist()))
                             self.assertIn(b'ASI add-on', archive.read('d4r/README.txt'))
                             self.assertEqual({n.split('/')[0] for n in archive.namelist()}, {'d4r.asi', 'd4r'})
                             self.assertIn('d4r/d3d12.dll', archive.namelist())
@@ -225,7 +237,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertEqual(archive.read(kit + 'bin/glslangValidator'), validator.read_bytes())
                             self.assertEqual(archive.read('d4r/licenses/glslang-LICENSE.txt'), license_path.read_bytes())
                             self.assertIn(kit + 'bin/d3d12_dlss_harness.exe', archive.namelist())
-                            self.assertFalse(any(n.endswith('.py') and not n.startswith(kit)
+                            self.assertFalse(any(n.endswith('.py') and n != 'd4r/d4r-features.py' and not n.startswith(kit)
                                                  for n in archive.namelist()))
                             self.assertNotIn(kit + 'engine/weights.bin', archive.namelist())
                             self.assertNotIn(kit + 'engine/test_unrelated.py', archive.namelist())
@@ -245,6 +257,29 @@ class OptiScalerConfigTests(unittest.TestCase):
 
 
 class InstallCheckTests(unittest.TestCase):
+    def test_selected_features_check_dependencies_and_router_recursion_guard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            game = Path(temporary)
+            (game / 'd4r').mkdir()
+            ini = ('[Libraries]\nNvngxPath=d4r\\nvngx.dll\nNvapiPath=d4r\\d4r_nvapi64.dll\n'
+                   '[FrameGen]\nEnabled=true\nFGInput=dlssg\nFGOutput=xefg\n'
+                   '[NvApi]\nOverrideNvapiDll=true\n[Hooks]\nUseNtdllHooks=false\n')
+            (game / 'OptiScaler.ini').write_text(ini)
+            def check():
+                return subprocess.run(['sh', str(ROOT / 'packaging/d4r-check.sh'), temporary],
+                                      capture_output=True, text=True).stdout
+            output = check()
+            self.assertIn('MISSING  libxess_fg.dll', output)
+            self.assertIn('MISSING  fakenvapi.dll', output)
+            for name in ('libxess_fg.dll', 'libxell.dll', 'fakenvapi.dll', 'd4r_nvapi64.dll'):
+                (game / 'd4r' / name).touch()
+            output = check()
+            self.assertIn('ok       libxess_fg.dll (optional feature)', output)
+            self.assertIn('ok       fakenvapi.dll (latency provider)', output)
+            self.assertNotIn('requires Hooks.UseNtdllHooks=false', output)
+            (game / 'OptiScaler.ini').write_text(ini.replace('UseNtdllHooks=false', 'UseNtdllHooks=true'))
+            self.assertIn('requires Hooks.UseNtdllHooks=false', check())
+
     def test_routing_separate_from_file_presence(self):
         with tempfile.TemporaryDirectory() as temporary:
             game = Path(temporary) / 'game with spaces'

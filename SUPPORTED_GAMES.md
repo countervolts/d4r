@@ -24,7 +24,7 @@ General notes:
 
 - Select DLSS in the game's graphics settings where it is offered. OptiScaler can also feed DLSS from a game's FSR or XeSS inputs, but those are a fallback for games that hide DLSS and can ghost or show a black screen.
 - Experimental Ray Reconstruction requires a CUDA-capable 3.10.7 denoiser, matching lifetime-aware d3d12.dll/d3d12core.dll, and native FP8 WMMA for the validated gfx1201 path. Cyberpunk 2077 is verified below; RR in Alan Wake 2 and Control remains unverified, so keep it off for their documented setups.
-- Saving settings from the OptiScaler overlay ("Save INI") rewrites `OptiScaler.ini` and resets d4r's values to `auto`, including frame generation (`[FrameGen] Enabled=false`, `FGInput=nofg`, `FGOutput=nofg`) and `[Inputs] EnableDlssInputs=true`. Restore them afterwards, or keep a copy of the original file.
+- Saving settings from the OptiScaler overlay ("Save INI") can rewrite d4r's routing values to `auto`. Keep a copy of the INI and check `[Inputs] EnableDlssInputs=true` and the explicit NGX path afterwards. The default FG settings are `Enabled=false`, `FGInput=nofg`, `FGOutput=nofg`; if you enabled the [optional FG/latency setup](docs/frame-generation.md), rerun its command to restore your selected features instead.
 
 Game-specific setup:
 

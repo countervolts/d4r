@@ -133,6 +133,45 @@ if [ -f "$D4R/nvngx_dlss.dll" ] && command -v strings >/dev/null 2>&1; then
   esac
 fi
 
+# Optional features are only requirements when selected. Their absence must not
+# make an ordinary SR/RR installation fail this checker.
+fg_enabled=$(ini_value framegen enabled 2>/dev/null | tr '[:upper:]' '[:lower:]')
+fg_output=$(ini_value framegen fgoutput 2>/dev/null | tr '[:upper:]' '[:lower:]')
+fg_input=$(ini_value framegen fginput 2>/dev/null | tr '[:upper:]' '[:lower:]')
+feature_file() {
+  feature_path=$(ini_value libraries "$1" 2>/dev/null) || feature_path=auto
+  case "$feature_path" in auto|'') feature_path="$D4R/$2" ;;
+    *) feature_path=$(wine_file "$feature_path") || feature_path= ;; esac
+  [ ! -d "$feature_path" ] || feature_path="$feature_path/$2"
+  [ -f "$feature_path" ] && ok "$2 (optional feature)" || bad "$2 (selected optional feature; check its library override)"
+}
+if [ "$fg_enabled" = true ]; then
+  case "$fg_input" in ''|auto|nofg) misconfigured 'FG is enabled but no FGInput is selected' ;; esac
+  case "$fg_output" in
+    xefg) feature_file xefgpath libxess_fg.dll; feature_file xellpath libxell.dll
+          note 'XeFG requires borderless SDR/HDR10, Reflex markers and FG activation after restart' ;;
+    fsrfg) feature_file ffxdx12fgpath amd_fidelityfx_framegeneration_dx12.dll ;;
+    ''|auto|nofg) misconfigured 'FG is enabled but no FGOutput is selected' ;;
+    *) note "custom FG output: $fg_output (not checked)" ;;
+  esac
+fi
+nvapi_path=$(ini_value libraries nvapipath 2>/dev/null | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+nvapi_override=$(ini_value nvapi overridenvapidll 2>/dev/null | tr '[:upper:]' '[:lower:]')
+if [ "$nvapi_override" = true ]; then
+  case "$nvapi_path" in
+    */d4r_nvapi64.dll)
+      feature_file nvapipath d4r_nvapi64.dll
+      router_path=$(ini_value libraries nvapipath 2>/dev/null)
+      router_path=$(wine_file "$router_path") || router_path=
+      [ -f "$(dirname "$router_path")/fakenvapi.dll" ] && ok 'fakenvapi.dll (latency provider)' || bad 'fakenvapi.dll beside d4r_nvapi64.dll'
+      ntdll_hooks=$(ini_value hooks usentdllhooks 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      [ "$ntdll_hooks" = false ] || misconfigured 'd4r latency router requires Hooks.UseNtdllHooks=false'
+      note 'Latency routing configured; confirm the active AL2/XeLL/LFX method in OptiScaler at runtime'
+      ;;
+    *) note 'custom NVAPI override; d4r topology compatibility is not checked' ;;
+  esac
+fi
+
 found=
 for dir in "$ROCM/lib" /opt/rocm/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
   [ -e "$dir/libamdhip64.so.7" ] && { found="$dir"; break; }

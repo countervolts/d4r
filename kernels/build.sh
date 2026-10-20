@@ -151,22 +151,33 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     # (kernels/native): these builds replace the sust_only build of the same name. Every flag variant whose
     # code the translators prove compatible is covered (they refuse anything else): input = all 8
     # depth x motion x range variants; output = the 4 HDR "max" variants (the LDR max kernels are a different
-    # kernel structure and keep the sust_only build). D4R_K_NO_DEPTH_TILE (skip the depth tile fill) is proven
+    # kernel structure: on RDNA3 they get their own translation below). D4R_K_NO_DEPTH_TILE (skip the depth tile fill) is proven
     # for mvhi only: mvlo kernels read the depth tile, so they keep the fill (measured: byte-exact only then).
     # The accuracy set keeps ZLUDA's compile (denormals preserved).
-    native_outs=() native_ins=()
+    native_outs=() native_ins=() native_ldr_outs=()
     for depth in depthinv depthreg; do
         for mv in mvhi mvlo; do
             native_outs+=("hiluma_engine_output_${depth}_${mv}_hdr_max_v2_rel")
             for range in hdr ldr; do native_ins+=("hiluma_engine_input_${depth}_${mv}_${range}_v2_rel"); done
         done
     done
+    # RDNA3: K's 4 LDR "max" outputs (SDR games, e.g. Ghost of Tsushima), translated as in
+    # scripts/build_k_ldr_output.sh with 96 VGPRs instead of ZLUDA's wave64 compile (141 VGPRs, 5 waves per SIMD):
+    # 0.986 -> 0.759 ms at 1712x960 -> 2560x1440 on an RX 7700 XT. Every harness frame byte-identical to ZLUDA's
+    # compile for all 4 variants (Quality, Performance and DLAA for depthinv/mvlo). Also writes the d4r-rgba8.txt
+    # sidecar that lets D4R_SHIM_OUTPUT_RGBA8 store RGBA8 texels directly. RDNA4 is not validated.
+    if [[ "$ARCH" == gfx11* ]]; then
+        for depth in depthinv depthreg; do
+            for mv in mvhi mvlo; do native_ldr_outs+=("hiluma_engine_output_${depth}_${mv}_ldr_max_v2_rel"); done
+        done
+    fi
     # RDNA2: none of the ZLUDA-compiled texture builds above (their tails call WMMA, and the sust_only builds
     # are not validated there); only the natively translated hiluma kernels below
     [[ "$RDNA2" == 1 ]] && specs=()
     for spec in "${specs[@]+"${specs[@]}"}"; do
         IFS=: read -r kernel src mode <<< "$spec"
-        [[ "$ACCURACY" == 0 && " ${native_outs[*]} " == *" $kernel "* ]] && continue
+        [[ "$ACCURACY" == 0 && " ${native_outs[*]} ${native_ldr_outs[*]+"${native_ldr_outs[*]}"} " == *" $kernel "* ]] &&
+            continue
         # accuracy sets are wave32, except M's post and downsample kernels on RDNA4: their wave64 builds keep the
         # denormal handling and gave the same image on an RX 9070 XT (post 0.79 -> 0.67 ms, downsample 0.43 -> 0.39 ms)
         w64=0
@@ -199,6 +210,32 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             wave=(); [[ "$RDNA2" == 1 ]] && wave=(WAVE=32 CUMODE=0)
             env "${wave[@]}" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
                 "$OUT/$native_out.hsaco" -DD4R_NATIVE_F2I "${depth_tile[@]}" -DD4R_AS1_STORES
+        done
+        for native_out in "${native_ldr_outs[@]+"${native_ldr_outs[@]}"}"; do
+            [[ "$native_out" =~ ^hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_ldr_max_v2_rel$ ]] ||
+                { echo "not an LDR max output kernel: $native_out" >&2; exit 2; }
+            ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
+            # LDR has another CFG/parameter layout than HDR: no tile rewrite. The 96-VGPR cap keeps the DLAA path's
+            # spills in its own blocks and runs Quality..UltraPerf at 8 waves per SIMD (0.825 -> 0.776 ms).
+            # Plain f16 conversions, not f2h_rn: ZLUDA's compile of these LDR kernels folds the f32 product into the
+            # f16 rounding too, so only the folded form reproduces it (f2h_rn: 33 of 60 harness frames differ).
+            python3 "$NAT/ptx2hip.py" --as1 "$ptx" "$native_out" | sed 's/f2h_rn(/(h1)(/g' > "$NT/$native_out.hip"
+            sed -i "s/__attribute__((amdgpu_flat_work_group_size(1, 256))) void $native_out(/__attribute__((amdgpu_flat_work_group_size(1, 256), amdgpu_num_vgpr(96))) void $native_out(/" "$NT/$native_out.hip"
+            grep -q "amdgpu_num_vgpr(96)" "$NT/$native_out.hip" || { echo "VGPR cap not applied: $native_out" >&2; exit 2; }
+            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
+                "$OUT/$native_out.hsaco" -DD4R_NATIVE_F2I -DD4R_AS1_STORES
+            python3 - "$OUT" "$native_out" <<'PY'
+from pathlib import Path
+import sys
+out, name = Path(sys.argv[1]), sys.argv[2]
+value = 14695981039346656037
+for byte in (out / (name + '.hsaco')).read_bytes():
+    value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+path = out / 'd4r-rgba8.txt'
+rows = path.read_text().splitlines() if path.exists() else ['# RGBA8 store capability: NAME FNV1a64 of code object']
+rows = [row for row in rows if not row.startswith(name + ' ')]
+path.write_text('\n'.join(rows + [f'{name} {value:016x}']) + '\n')
+PY
         done
         for native_in in "${native_ins[@]}"; do
             ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }

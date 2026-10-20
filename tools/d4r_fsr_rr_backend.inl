@@ -159,6 +159,7 @@ static void fsr_rr_message(uint32_t type, const wchar_t* message)
 // device is known then), with g.mutex held. Cheap: no shader is built until a feature creates its context.
 static void fsr_rr_prepare_runtime()
 {
+    d4r_fsr4_identity::OriginalIdentityScope originalIdentity;
     if (g_fsr.attempted)
         return;
     g_fsr.attempted = true;
@@ -345,6 +346,7 @@ static void fsr_rr_release(Feature& feature)
 // After the GPU has finished every command list that recorded this feature.
 static void fsr_rr_destroy(Feature& feature)
 {
+    d4r_fsr4_identity::OriginalIdentityScope originalIdentity;
     FsrRrFeature* fsr = feature.fsr;
     if (fsr == nullptr)
         return;
@@ -643,6 +645,7 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
                                  ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
                                  ID3D12Resource* exposure, void* parameters, const FrameParams& p, uint32_t frame)
 {
+    d4r_fsr4_identity::OriginalIdentityScope originalIdentity;
     FsrRrFeature& fsr = *feature.fsr;
     const bool profile = profile_enabled();
     ProfileClock::time_point cpuStamp[5];

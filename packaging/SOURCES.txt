@@ -6,6 +6,8 @@ d4r @VERSION@: where every file in this release comes from
 Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
   d4r/nvngx.dll          NGX shim            tools/d4r_nvngx_shim.cpp in the d4r repository
   d4r/nvcuda.dll         Wine CUDA bridge    tools/wine_nvcuda_bridge.c
+  d4r/d4r_nvapi64.dll    optional latency NVAPI router, tools/d4r_nvapi_router.cpp
+  d4r/d4r-features.py    per-game opt-in setup and exact INI backups
   d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
                          (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
   d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
@@ -18,6 +20,16 @@ Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
 @installer                        License: d4r/licenses/glslang-LICENSE.txt
 
 Third-party software, unmodified or patched by d4r:
+  d4r/fakenvapi.dll      from the supplied OptiScaler release (GPL-3.0),
+                         https://github.com/optiscaler/fakenvapi
+  d4r/libxell.dll, d4r/libxess_fg.dll
+                         Intel XeLL/XeFG from the same OptiScaler release,
+                         https://github.com/intel/xess; d4r/licenses/XeSS-LICENSE.txt
+  d4r/amd_fidelityfx_framegeneration_dx12.dll
+                         AMD FSR FG from the same OptiScaler release (MIT),
+                         d4r/licenses/FidelityFX-LICENSE.txt
+  (These optional third-party files ship in proxy packages. ASI add-ons use
+   the existing OptiScaler installation's matching dependencies.)
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
                          commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0014 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).

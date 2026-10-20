@@ -10,7 +10,8 @@ Libraries.NvngxPath=d4r\nvngx.dll
 # The game's DLSS calls reach OptiScaler; d4r's own load of NVIDIA's NGX core is left alone
 Inputs.EnableDlssInputs=true
 Hooks.HookOriginalNvngxOnly=true
-# Proton's NVAPI (with PROTON_FORCE_NVAPI=1) serves the game; no fakenvapi
+# Proton's NVAPI serves the game by default. d4r-features.py opts into the
+# latency-only router without replacing NGX's GPU/topology interfaces.
 NvApi.OverrideNvapiDll=false
 # The game sees an NVIDIA GPU through DXGI, so it offers DLSS
 Spoofing.Dxgi=true

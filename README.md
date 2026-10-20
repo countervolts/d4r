@@ -37,6 +37,9 @@ Open OptiScaler's menu (Insert):
 
 Both are on by default; `[OptiScaler] FollowPresets` and `Fsr4` in `d4r.ini` turn them off.
 
+Experimental [XeFG/FSR frame generation and XeLL/Anti-Lag latency conversion](docs/frame-generation.md)
+are available through an opt-in per-game setup command, with INI backups. Fresh installs keep them off.
+
 ## Known issues
 
 - In some games using some models native upscaling can show visible artifacting. For fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` ([native kernel numerics](docs/native-kernels.md#numerics)).

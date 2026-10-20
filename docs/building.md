@@ -192,6 +192,14 @@ Run `bash scripts/build_release_glibc241.sh` inside the container. The script ch
 ## Checks
 
 - `python3 -m unittest discover -s tests -v` includes OptiScaler INI generation, full/clean package staging and NGX-routing checker regressions. Package tests use fixture binaries and GPU-build stand-ins; real DLL loading still needs the OptiScaler/Proton harness.
+
+Full proxy packages also require `fakenvapi.dll`, `libxell.dll`, `libxess_fg.dll`,
+`amd_fidelityfx_framegeneration_dx12.dll` and `Licenses/XeSS_LICENSE.txt` from the
+same OptiScaler release. These are staged in `d4r/`; the NVAPI router is built
+alongside the shim. ASI packages retain the existing OptiScaler dependencies.
+See [opt-in FG and latency setup](frame-generation.md) for configuration and rollback.
+For the offscreen OptiScaler SR harness, `D4R_OPTISCALER_FEATURE_RUNTIME=/path/to/d4r`
+enables the latency router against the supplied real dependencies while leaving FG off.
 - `scripts/check_environment.sh` lists the tools, GPU and Proton builds it finds.
 - The D3D12 harness (`scripts/run_d3d12_dlss_harness_proton.sh`) drives DLSS outside a game.
   - `D4R_HARNESS_MOTION_SCENE=1 D4R_HARNESS_SAVE_FRAMES=1` saves a temporal sequence for byte comparisons. Compare the regular output path against `D4R_SHIM_OUTPUT_PACKED=1` and/or `D4R_SHIM_INPLACE=1 VKD3D_D4R_LINEAR_TEXTURES=1`, with VRAM interop, split frames and direct output enabled; `D4R_HARNESS_OUTPUT_RGB10A2=1` selects packed output.

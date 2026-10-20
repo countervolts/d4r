@@ -11,7 +11,7 @@ import sys
 import time
 
 MANIFEST = 'files.sha256.json'
-MODELS = ('rr-d', 'rr-e', 'rr-f', 'rr-d-gfx11', 'rr-e-gfx11', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
+MODELS = ('rr-d', 'rr-e', 'rr-f', 'rr-d-gfx11', 'rr-e-gfx11', 'e', 'f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
 
 
 def digest(path):
@@ -23,7 +23,7 @@ def manifest(directory, write=False):
     directory = Path(directory)
     files = {str(p.relative_to(directory)): digest(p) for p in sorted(directory.rglob('*'))
              if p.is_file() and p.name != MANIFEST}
-    if not files or not any(n in files for n in ('model.json', 'rr.txt')):
+    if not files or not any(n in files for n in ('model.json', 'rr.txt', 'e.txt')):
         raise ValueError(f'{directory}: missing model metadata')
     if write:
         (directory / MANIFEST).write_text(json.dumps(files, indent=2, sort_keys=True) + '\n')
@@ -44,15 +44,29 @@ def capture(directory, name):
     if name == 'k':
         kernels = ['dltss_pwin_' + s + '_layer' for s in
                    ('enc0', 'enc1', 'enc2', 'enc3', 'enc4', 'dec5', 'dec4', 'dec3', 'dec2', 'dec1', 'dec0')]
-    else:
-        kernels = ['rrlite_' + s + '_4x4' for s in ('enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4', 'dec3', 'dec2', 'dec1')]
+    elif name in ('m', 'l'):
+        kernels = ['rrlite_' + s + '_4x4' for s in ('enc1', 'enc2', 'enc3_tube', 'dec2', 'dec1')]
         kernels += ['rrlite_enc0_4x4_mvlo_hdr' + ('_folded' if name == 'm' else ''),
                     'rrlite_dec0_4x4' + ('_folded' if name == 'm' else '')]
-    for kernel in kernels:
-        matches = sorted((directory / 'replay').glob('replay-*-' + kernel))
-        if not matches:
-            raise ValueError(f'missing captured layer {kernel}')
-        launch = matches[0]
+    launches = []
+    if name in ('e', 'f'):
+        replay = sorted((directory / 'replay').glob('replay-*'))
+        first = next((i for i, p in enumerate(replay) if p.name.split('-', 2)[2].startswith('cuda_engine_input_kernel_rel_')), None)
+        if first is None:
+            raise ValueError('missing captured CNN input')
+        network = [p for p in replay[first + 1:] if p.name.split('-', 2)[2].startswith('dltss_nchw8_')][:12]
+        if len(network) != 12 or 'aniso_gaussian' not in network[-1].name:
+            raise ValueError('missing captured CNN layers or reconstruction')
+        launches = [replay[first], *network]
+    else:
+        for kernel in kernels:
+            matches = sorted((directory / 'replay').glob('replay-*-' + kernel))
+            count = 6 if kernel == 'rrlite_enc3_tube_4x4' else 1
+            if len(matches) < count:
+                raise ValueError(f'missing captured layer {kernel}')
+            launches.extend(matches[:count])
+    for launch in launches:
+        kernel = launch.name.split('-', 2)[2]
         rows = [line.split() for line in (launch / 'manifest.txt').read_text().splitlines()]
         if ['kernel', kernel] not in rows:
             raise ValueError(f'{kernel}: incorrect capture metadata')
@@ -141,7 +155,7 @@ def main():
             action_parser.add_argument('models', nargs='*', choices=MODELS)
     p = sub.add_parser('capture')
     p.add_argument('directory', type=Path)
-    p.add_argument('name', choices=('k', 'm', 'l'))
+    p.add_argument('name', choices=('e', 'f', 'k', 'm', 'l'))
     p = sub.add_parser('run')
     p.add_argument('--log', required=True)
     p.add_argument('--timeout', type=float, default=900)

@@ -11,6 +11,7 @@ BUILD_ID="$(bash "$ROOT/scripts/runtime_build_id.sh")"
 VULKAN_INCLUDE="${VULKAN_INCLUDE:-/usr/include}"
 
 mkdir -p "$ROOT/build"
+bash "$ROOT/scripts/build_d4r_nvapi_router.sh"
 # Native configuration helper, launched automatically by InitializeASI.
 "$MINGW_CXX" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
   "$ROOT/tools/d4r_asi_setup.cpp" -o "$ROOT/build/d4r-setup.exe"

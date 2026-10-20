@@ -1,6 +1,16 @@
 d4r ASI add-on for Linux / Proton
 ================================
 
+Optional FG/latency: d4r/d4r-features.py configures OptiScaler with an exact INI
+backup. Pass the game folder and --runtime /path/to/plugins/d4r. Copy the matching
+OptiScaler release's fakenvapi.dll, libxell.dll, libxess_fg.dll and (for FSR FG)
+amd_fidelityfx_framegeneration_dx12.dll into that d4r folder, retaining licenses.
+Example: python3 plugins/d4r/d4r-features.py . --runtime plugins/d4r --fg xefg --input dlssg
+Restart, enable native DLSS FG in-game and activate FG in OptiScaler. For a game
+without native FG use --input upscaler. Latency-only: --fg off --latency auto,
+then enable Reflex in-game. AL2 requires host/vkd3d support; XeLL/LFX are fallbacks.
+Disable: --fg off --latency proton. Setup preserves these choices.
+
 1. Drop d4r.asi and the d4r folder into OptiScaler's existing plugins folder.
    For example: <game>/plugins/d4r.asi and <game>/plugins/d4r/.
    Custom plugin folders work too: keep the ASI and its companion folder together.

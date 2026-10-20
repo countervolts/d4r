@@ -31,12 +31,15 @@
 //   D4R_SHIM_INPUT_STATE / D4R_SHIM_DEPTH_STATE / D4R_SHIM_OUTPUT_STATE
 //                       D3D12 resource states the inputs/output are in when
 //                       EvaluateFeature is called (defaults 0x40, 0x40, 0x8)
-//   D4R_SHIM_GPU_INPUT_WAIT=1 experimental NGX null-stream input wait (default 0; split VRAM only)
-//   D4R_SHIM_OUTPUT_RGBA8=1 validated native K output stores RGBA8 directly (default 0)
-//   D4R_SHIM_NATIVE_COMPLETION=1 native null-stream callback signals/wakes split completion (default 0)
-//   D4R_SHIM_FUSE_RGBA8_INPUT=1 combine RGBA8 color conversion and linear-buffer copy (default 0)
-//   D4R_SHIM_GPU_COMPLETION=1 (needs GPU_INPUT_WAIT) the game's queue polls DLSS's completion word on the GPU
-//                       instead of a CPU-signalled split (bounded poll; default 0)
+//   GPU hand-off settings, all default 1 (=0 turns one off; each falls back by itself, and logs why, where its
+//   prerequisites are missing). Ghost of Tsushima 1440p Quality K: game-queue DLSS span 3.05 -> 2.79 ms with
+//   them, 2.43 ms together with the native LDR output kernels (kernels/build.sh); output frames unchanged.
+//   D4R_SHIM_GPU_INPUT_WAIT NGX null-stream input wait (split VRAM, same-frame Super Sampling only)
+//   D4R_SHIM_OUTPUT_RGBA8 validated native K output stores RGBA8 directly (needs the d4r-rgba8.txt sidecar)
+//   D4R_SHIM_NATIVE_COMPLETION native null-stream callback signals/wakes split completion
+//   D4R_SHIM_FUSE_RGBA8_INPUT combine RGBA8 color conversion and linear-buffer copy
+//   D4R_SHIM_GPU_COMPLETION (needs GPU_INPUT_WAIT) the game's queue polls DLSS's completion word on the GPU
+//                       instead of a CPU-signalled split (bounded poll)
 //   D4R_PROFILE_GPU_EVENTS / _TIMESTAMPS / _LOG / _CPU_TIME=0 drop one part of D4R_PROFILE (bisection)
 //   D4R_NGX_STREAM_PRIORITY=high|normal (bridge) run NGX on one priority HIP stream (default off; no gain measured)
 //   D4R_SHIM_MARKER_POLL_US=N fixed CPU marker pacing; unset: adaptive (0 yields)
@@ -2064,7 +2067,29 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         logf("NVSDK_NGX_CUDA_Init(app=%llu, sdk=0x%x) -> 0x%08x", id, version, result);
     }
     const bool hasProject = project != nullptr && !project->id.empty();
-    if (result != NGX_SUCCESS && !hasProject && g.ngx.initProjectId != nullptr)
+    bool unavailableAfterInit = false;
+    if (result == NGX_SUCCESS && !hasProject && g.ngx.initProjectId != nullptr)
+    {
+        // Init may succeed while NGX rejects the application identity at feature
+        // initialization. Streamline caches this first answer, before a later
+        // project-ID Init. Match the Windows runtime's capability check too.
+        unavailableAfterInit = g.worker.call([&] {
+            void* caps = nullptr;
+            if (g.ngx.getCapabilityParameters(&caps) != NGX_SUCCESS || caps == nullptr)
+                return false;
+            int available = -1, initResult = NGX_SUCCESS, needsDriver = -1;
+            const bool known = d4r_ngx_get_int(caps, "SuperSampling.Available", &available) == NGX_SUCCESS &&
+                               d4r_ngx_get_int(caps, "SuperSampling.FeatureInitResult", &initResult) == NGX_SUCCESS &&
+                               d4r_ngx_get_int(caps, "SuperSampling.NeedsUpdatedDriver", &needsDriver) == NGX_SUCCESS;
+            g.ngx.destroyParameters(caps);
+            const bool retry = known && needsDriver == 0 && (available == 0 || initResult != NGX_SUCCESS);
+            if (retry)
+                logf("application-ID capabilities unavailable: available=%d init=0x%08x needsDriver=%d",
+                     available, static_cast<unsigned int>(initResult), needsDriver);
+            return retry;
+        });
+    }
+    if ((result != NGX_SUCCESS || unavailableAfterInit) && !hasProject && g.ngx.initProjectId != nullptr)
     {
         // NGX 617.14 rejects application-ID initialization on this path (Cyberpunk 2077:
         // 0xBAD0000C, or SR unavailable with 0xBAD00004). Streamline's RR plugin reads
@@ -2072,6 +2097,10 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         // session even though the game's later project-ID Init works. Retry with d4r's
         // own project identity (the diagnostics' default) so the first Init succeeds.
         logf("D4R_NGX_IDENTITY_FALLBACK application=%llu: 0x%08x", id, result);
+        // A successful Init owns a session even when its SR feature is unavailable.
+        // Release it before retrying, so the fallback gets a fresh identity.
+        if (unavailableAfterInit)
+            g.worker.call([&] { return g.ngx.shutdown(); });
         result = g.worker.call([&] {
             return g.ngx.initProjectId("24480451-f00d-face-1304-0308dabad187", 0, "1.0", g.dataPath.c_str(),
                                        apiVersion, &g.featureInfo);
@@ -3892,13 +3921,13 @@ static void init_vram_interop()
         FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R3), reinterpret_cast<void**>(&g_vk.linear))))
         g_vk.linear = nullptr;
     g_vk.ready = ok;
-    if (ok && (env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) != 0 ||
+    if (ok && (env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 1) != 0 ||
                env_uint("D4R_SHIM_FUSE_R11_OUTPUT", 0) != 0 || env_uint("D4R_SHIM_FUSE_R11_INPUT", 0) != 0))
     {
         g_fusedColorReady = g_fusedColorStage.init(g_vk.device, deviceProc);
         if (!g_fusedColorReady) g_fusedColorStage.destroy();
     }
-    if (ok && env_uint("D4R_SHIM_GPU_COMPLETION", 0) != 0)
+    if (ok && env_uint("D4R_SHIM_GPU_COMPLETION", 1) != 0)
     {
         g_waitReady = g_waitStage.init(g_vk.device, deviceProc) && g_waitStage.wait_ready();
         if (!g_waitReady) g_waitStage.destroy();
@@ -4312,7 +4341,7 @@ static VkBufferImageCopy full_region(const VramCopy& copy)
 static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* source, const VramCopy& copy, uint32_t frame=0)
 {
     const auto desc=source->GetDesc();
-    const bool rgba8=desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM && env_uint("D4R_SHIM_FUSE_RGBA8_INPUT",0)!=0;
+    const bool rgba8=desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM && env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 1)!=0;
     const unsigned requested=env_uint("D4R_SHIM_FUSE_R11_INPUT",0);
     const bool r11=desc.Format==DXGI_FORMAT_R11G11B10_FLOAT &&
         (requested==1 || (requested==2 && (frame/300)%4>=2));
@@ -9717,7 +9746,7 @@ static bool create_engine_shared_buffer(VramBuffer& target, size_t bytes, bool h
 
 static bool initialize_ngx_gpu_wait(Feature& feature)
 {
-    if (env_uint("D4R_SHIM_GPU_INPUT_WAIT", 0) == 0)
+    if (env_uint("D4R_SHIM_GPU_INPUT_WAIT", 1) == 0)
         return false;
     // Age-zero output only; keep queue depth and the existing split-frame contract unchanged.
     if (!feature.split || feature.rayReconstruction || g_vk.fill == nullptr ||
@@ -9731,10 +9760,10 @@ static bool initialize_ngx_gpu_wait(Feature& feature)
     static std::once_flag watchdog;
     std::call_once(watchdog, [] { std::thread(ngx_input_watchdog).detach(); });
     feature.ngxGpuWait.store(true);
-    // D4R_SHIM_GPU_COMPLETION=1 (default 0): the game's queue waits for DLSS on the GPU, polling the frame's word
+    // D4R_SHIM_GPU_COMPLETION (default 1): the game's queue waits for DLSS on the GPU, polling the frame's word
     // in the same coherent buffer, instead of a split list released by a CPU timeline signal (one host round trip,
     // ~0.1 ms, per frame). The pool is never freed: game command lists still reference the set after retirement.
-    if (env_uint("D4R_SHIM_GPU_COMPLETION", 0) != 0)
+    if (env_uint("D4R_SHIM_GPU_COMPLETION", 1) != 0)
     {
         if (feature.completionSet.set == VK_NULL_HANDLE && g_waitReady && g.cu.ngxWriteValue32 != nullptr)
             feature.gpuCompletion = g_waitStage.wait_set(feature.completionSet, feature.ngxInputSync.buffer, 256);
@@ -11566,7 +11595,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
             logf("linear inputs: NGX samples the interop buffers directly");
         const bool gpuWait = p.vram && initialize_ngx_gpu_wait(*feature);
         if (feature->split && !feature->rayReconstruction && !feature->engineNetTimeline &&
-            env_uint("D4R_SHIM_NATIVE_COMPLETION", 0) != 0 && g.cu.timelineCreate != nullptr &&
+            env_uint("D4R_SHIM_NATIVE_COMPLETION", 1) != 0 && g.cu.timelineCreate != nullptr &&
             g.cu.timelinePrepare != nullptr && g.cu.timelineCancel != nullptr && g.cu.timelineQueue != nullptr &&
             g.cu.timelineSignal != nullptr && g.cu.timelineDestroy != nullptr && g.cu.timelineWait != nullptr)
         {
@@ -11616,7 +11645,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
                          feature->packedReady.load();
         p.packedRgba8 = feature->split && feature->outputDirectAllowed && feature->preset == 11 &&
                        outputDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && vramOutput.width % 2 == 0 &&
-                       env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_RGBA8", 0) != 0 &&
+                       env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_RGBA8", 1) != 0 &&
                        feature->rgba8Ready.load();
         p.packedOutput |= p.packedRgba8;
         static bool packedLogged = false;

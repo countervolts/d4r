@@ -122,8 +122,10 @@ VramInterop = true
 InputSync = true
 ; Faster hand-offs between the game and DLSS (same frame, same result). Need FrameAge = 0 and VRAM
 ; interop, and a runtime built from this checkout (scripts/install_d4r_runtime.sh).
-; Input readiness uses adaptive CPU polling by default. D4R_SHIM_GPU_INPUT_WAIT=1 enables experimental
-; null-stream GPU waits for same-frame Super Sampling; diagnostics and host input reads retain CPU waits.
+; Same-frame Super Sampling waits for its inputs and signals its completion on the GPU (no CPU round trip), and
+; model K's output kernel stores RGBA8 directly. To turn one off, add it to [Env] as 0: D4R_SHIM_GPU_INPUT_WAIT,
+; D4R_SHIM_GPU_COMPLETION, D4R_SHIM_NATIVE_COMPLETION, D4R_SHIM_OUTPUT_RGBA8, D4R_SHIM_FUSE_RGBA8_INPUT.
+; Without the GPU input wait, input readiness uses adaptive CPU polling (MarkerPollUs).
 ;   LinearInputs: DLSS reads the game's inputs in place once the input marker is ready
 ;   DirectOutput: the result is written straight into the game-side buffer (preset K, and only while
 ;     NGX runs the native output kernel; drops NVIDIA's "DLSS SDK" watermark)

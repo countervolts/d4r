@@ -78,6 +78,63 @@ class ModelBuildTests(unittest.TestCase):
             pixels.tofile(directory / 'out.raw')
             with self.assertRaises(ValueError): model_tools.capture(directory, 'k')
 
+    def test_cnn_capture_and_manifest_accept_e_f_and_reject_missing_layers(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as t:
+            directory = Path(t)
+            np.ones((720, 1280, 4), dtype=np.float16).tofile(directory / 'out.raw')
+            replay = directory / 'replay'
+            replay.mkdir()
+            kernels = ['cuda_engine_input_kernel_rel_ldr_mvdiff_mvlo']
+            kernels += ['dltss_nchw8_layer_' + str(i) for i in range(11)]
+            kernels += ['dltss_nchw8_aniso_gaussian_final']
+            for i, kernel in enumerate(kernels):
+                launch = replay / f'replay-{i:06d}-{kernel}'
+                launch.mkdir()
+                (launch / 'manifest.txt').write_text(f'kernel {kernel}\nargs 8\nalloc 0 0x1000 4\npointer 0 0 0\n')
+                (launch / 'args.bin').write_bytes(bytes(8))
+                (launch / 'alloc-0.bin').write_bytes(bytes(4))
+            for model in ('e', 'f'):
+                model_tools.capture(directory, model)
+            (launch / 'alloc-0.bin').write_bytes(b'')
+            with self.assertRaises(ValueError): model_tools.capture(directory, 'e')
+            (launch / 'alloc-0.bin').write_bytes(bytes(4))
+            (replay / 'replay-000005-dltss_nchw8_layer_4').rename(directory / 'removed')
+            with self.assertRaises(ValueError): model_tools.capture(directory, 'f')
+            model = directory / 'model'
+            model.mkdir()
+            (model / 'e.txt').write_text('CNN manifest')
+            model_tools.manifest(model, write=True)
+            model_tools.manifest(model)
+            self.assertIn('e', model_tools.MODELS)
+            self.assertIn('f', model_tools.MODELS)
+
+    def test_l_m_capture_requires_all_six_tube_launches(self):
+        import numpy as np
+        for model in ('l', 'm'):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as t:
+                directory = Path(t)
+                np.ones((720, 1280, 4), dtype=np.float16).tofile(directory / 'out.raw')
+                replay = directory / 'replay'
+                replay.mkdir()
+                folded = '_folded' if model == 'm' else ''
+                kernels = ['rrlite_enc0_4x4_mvlo_hdr' + folded, 'rrlite_enc1_4x4', 'rrlite_enc2_4x4']
+                kernels += ['rrlite_enc3_tube_4x4'] * 6
+                kernels += ['rrlite_dec2_4x4', 'rrlite_dec1_4x4', 'rrlite_dec0_4x4' + folded]
+                for i, kernel in enumerate(kernels):
+                    launch = replay / f'replay-{i:06d}-{kernel}'
+                    launch.mkdir()
+                    (launch / 'manifest.txt').write_text(f'kernel {kernel}\nargs 8\nalloc 0 0x1000 4\npointer 0 0 0\n')
+                    (launch / 'args.bin').write_bytes(bytes(8))
+                    (launch / 'alloc-0.bin').write_bytes(bytes(4))
+                model_tools.capture(directory, model)
+                tube = replay / 'replay-000008-rrlite_enc3_tube_4x4'
+                (tube / 'args.bin').write_bytes(b'')
+                with self.assertRaises(ValueError): model_tools.capture(directory, model)
+                (tube / 'args.bin').write_bytes(bytes(8))
+                tube.rename(directory / 'removed')
+                with self.assertRaises(ValueError): model_tools.capture(directory, model)
+
     def test_model_files_lists_every_file_rr_txt_names(self):
         text = (ROOT / 'packaging/build_engine_models.sh').read_text()
         start = text.index('model_files() {')
