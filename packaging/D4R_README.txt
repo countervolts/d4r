@@ -124,7 +124,7 @@ Settings
   true / false force it on / off. It needs Mesa RADV with VK_KHR_cooperative_matrix (on RDNA2, which
   lacks it, K, M, E and F run on the engine without it) and the models in d4r/engine: k (K), k-ldr (K in games without HDR), m and m-ldr (M), l and l-ldr (L),
   rr-d, rr-e and rr-f (Ray Reconstruction). Games and settings it does not cover (other models,
-  display-resolution motion vectors with L or M) keep using the normal path,
+  display-resolution motion vectors with L) keep using the normal path,
   and d4r/d4r_nvngx.log says which one ran and why. Tested in a few games so far.
 @installer   install.sh builds the models from your NVIDIA DLLs (d4r/tools/build-engine-models.sh). They hold
 @installer   values read from NVIDIA's DLSS: they stay on your machine and must not be shared.

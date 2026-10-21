@@ -10234,8 +10234,11 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         return refuse(presetL ? "no LDR model (engine\\l-ldr) for a game without the HDR flag"
                               : "no LDR model (engine\\m-ldr) for a game without the HDR flag");
     }
-    if ((feature.flags & 0x2) == 0)
-        return refuse("needs render-resolution motion vectors");
+    // MVLowRes clear: display-resolution vectors (one per output pixel, in output pixels), NGX's *_mvhi_* kernels
+    const bool displayMotion = (feature.flags & 0x2) == 0;
+    if (displayMotion && (presetL || !model->hasDisplayMotion()))
+        return refuse(presetL ? "needs render-resolution motion vectors"
+                              : "display-resolution motion vectors need an M model rebuilt by the current compile_m.py");
     if (!model->hasDynamicResolution() && feature.engineM != nullptr &&
         (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
         return refuse("dynamic render sizes need a model rebuilt by the current compile_m.py");
@@ -10251,7 +10254,8 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     Source sources[4] = {
         {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
         {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE},
-        {motion, &game.motion, p.mvBaseX, p.mvBaseY, p.renderWidth, p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
+        {motion, &game.motion, p.mvBaseX, p.mvBaseY, displayMotion ? feature.outWidth : p.renderWidth,
+         displayMotion ? feature.outHeight : p.renderHeight, inputState, D3D12_RESOURCE_STATE_COPY_SOURCE},
         {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState,
          D3D12_RESOURCE_STATE_COPY_DEST},
     };
@@ -10284,6 +10288,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     game.jitter[1] = p.jitterY;
     game.motionToRender[0] = p.mvScaleX;
     game.motionToRender[1] = p.mvScaleY;
+    game.displayMotion = displayMotion;
     if ((feature.flags & 0x4) != 0 && p.mvScaleX != 0.0f && p.mvScaleY != 0.0f)
     {
         game.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;

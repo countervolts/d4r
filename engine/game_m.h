@@ -7,7 +7,9 @@ namespace d4r {
 struct GameFrameM {
     GameImage color, depth, motion, output;     // as for GameUpscaler; compatible views at origin zero may be borrowed
     float jitter[2] = {0, 0};
-    float motionToRender[2] = {1, 1};           // (motion texel + motionOffset) * this = render pixels
+    float motionToRender[2] = {1, 1};           // (motion texel + motionOffset) * this = render pixels (output
+                                                // pixels with displayMotion)
+    bool displayMotion = false;                 // output-sized motion (MVLowRes clear); needs MModel::hasDisplayMotion
     float motionOffset[2] = {0, 0};             // jittered motion vectors: jitter - previous jitter, motion texel units
     bool reset = false;
     bool depthInverted = true;

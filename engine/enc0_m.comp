@@ -47,7 +47,13 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     uint depthFlag, reset, frame;
     float expo, expoPrev;
     float halfInvX, halfInvY, renderInvX, renderInvY; // host-rounded CUDA texture coordinates
+    // display-resolution motion (MVLowRes clear: NGX's rrlite_enc0_4x4_mvhi_*): a pixel's one vector is the motion
+    // texel at floor((pixel + 0.5 - jitter) * mvPix), clamped to [0, mvMax]; it serves all three candidates
+    uint displayMv;
+    ivec2 mvMax;
+    vec2 mvPix;             // output / render
 } p;
+#define ENC0_DISPLAY_MV 1
 layout(set = 0, binding = 1) uniform sampler2D colorTex;
 layout(set = 0, binding = 2) uniform sampler2D motionTex;
 layout(set = 0, binding = 3) uniform sampler2D depthTex;

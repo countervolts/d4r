@@ -17,9 +17,13 @@ struct MEnc0Params {
     uint32_t depthFlag, reset, frame;
     float expo, expoPrev;
     float halfInv[2], renderInv[2]; // CUDA texture coordinates use host-rounded reciprocals
+    uint32_t displayMv; int32_t mvMax[2]; float mvPix[2]; // display-resolution motion (enc0_m.comp, D4RM0005)
 };
 struct MDec0Params { int32_t size[2], tokW; uint32_t reset; float rndOffs[2], rnd2hi[2], hiSize[2], histOffs[2], sigma, rho, renderInv[2]; };
-struct MPostParams { int32_t colOrigin[2], hiSize[2], rndSize[2]; float hi2rnd[2], rndOffs[2], invRnd[2], gain; uint32_t reset; float expo, expoPrev; };
+struct MPostParams {
+    int32_t colOrigin[2], hiSize[2], rndSize[2]; float hi2rnd[2], rndOffs[2], invRnd[2], gain; uint32_t reset; float expo, expoPrev;
+    int32_t mvSize[2]; float mvScale[2], mvOffs[2]; // display-resolution motion (post_m.comp, D4RM0005): zero size otherwise
+};
 struct MDownParams { int32_t srcSize[2], outOrigin[2], colOrigin[2], colSize[2]; float out2rnd[2], rndOffs[2], expo; };
 struct MLayerParams { int32_t w, h, sx, sy; uint32_t o[72]; };
 // The grid NGX measures the exposure on (cuda_dldn_engine_luma_convert_kernel's launch, presets M and L alike,
@@ -27,9 +31,11 @@ struct MLayerParams { int32_t w, h, sx, sy; uint32_t o[72]; };
 // (Ultra Performance), then half the render size but at least 256 (640x360 -> 1920x1080: 320x256, 854x480 ->
 // 2560x1440: 427x256, 1280x720 -> 3840x2160: 640x360).
 uint32_t exposureGrid(uint32_t render, uint32_t output) { return output / 2 <= render ? output / 2 : std::max(render / 2, 256u); }
-static_assert(sizeof(MEnc0Params) == 124 && offsetof(MEnc0Params, expo) == 100 && offsetof(MEnc0Params, halfInv) == 108, "enc0_m.comp and exposure_k.comp (words 25, 26)");
+static_assert(sizeof(MEnc0Params) == 144 && offsetof(MEnc0Params, expo) == 100 && offsetof(MEnc0Params, halfInv) == 108 &&
+              offsetof(MEnc0Params, mvMax) == 128, "enc0_m.comp and exposure_k.comp (words 25, 26)");
 static_assert(sizeof(MDec0Params) == 64, "dec0_m.comp");
-static_assert(sizeof(MPostParams) == 64 && offsetof(MPostParams, expo) == 56, "post_m.comp and exposure_k.comp (words 14, 15)");
+static_assert(sizeof(MPostParams) == 88 && offsetof(MPostParams, expo) == 56 && offsetof(MPostParams, mvSize) == 64,
+              "post_m.comp and exposure_k.comp (words 14, 15)");
 static_assert(sizeof(MDownParams) == 52 && offsetof(MDownParams, expo) == 48, "down_m.comp and exposure_k.comp (word 12)");
 static_assert(sizeof(MLayerParams) == 304, "layer_m.comp");
 struct Tex {
@@ -164,6 +170,7 @@ struct MModel::Impl {
     // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
     // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
     bool presetL = false, dynamicResolution = false;
+    bool displayMotion = false;     // D4RM0005: enc0_m and post_m read display-resolution motion (post_m binding 12)
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t dither16 = 0;
     float lConst[5]{};
@@ -180,7 +187,9 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
-    m.dynamicResolution = head.size() >= 8 && (!std::memcmp(head.data(), "D4RM0004", 8) || !std::memcmp(head.data(), "D4RL0002", 8));
+    m.displayMotion = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0005", 8);
+    m.dynamicResolution = head.size() >= 8 && (m.displayMotion || !std::memcmp(head.data(), "D4RM0004", 8) ||
+                                               !std::memcmp(head.data(), "D4RL0002", 8));
     const size_t expect = m.presetL ? 40 + (MLayers + 2) * 74 * 4 : 16 + 5 * 4 + MLayers * 74 * 4;
     if (head.size() != expect || (!m.presetL && !m.dynamicResolution && std::memcmp(head.data(), "D4RM0003", 8))) throw std::runtime_error("incompatible M/L model metadata");
     uint32_t n8 = 0, n16 = 0;
@@ -235,6 +244,7 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const uint32_t forced = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : waveEnv && !std::strcmp(waveEnv, "64") ? 64 : 0;
     const uint32_t wave = forced ? forced : 64, postWave = forced ? forced : m.dot2 ? 32 : 64;
     auto postTypes = std::vector<VkDescriptorType>{b,t,t,t,t,t,t,t,t,s,s,b};
+    if (m.displayMotion) postTypes.push_back(t);    // the game's motion texture
     m.post.create(device, directory + "/" + po + ".spv", postTypes, postWave, cache);
     m.postQuality.create(device, directory + "/" + po + "_q.spv", postTypes, postWave, cache);
     if (exists(directory + "/" + po + "_c.spv"))
@@ -252,6 +262,7 @@ bool MModel::uploadRecorded() const { return impl->uploaded; }
 bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
 bool MModel::hasDynamicResolution() const { return impl->dynamicResolution; }
+bool MModel::hasDisplayMotion() const { return impl->displayMotion; }
 bool MModel::isPresetL() const { return impl->presetL; }
 bool MModel::dot2Network() const { return impl->dot2; }
 void MModel::recordUpload(VkCommandBuffer cb) {
@@ -448,6 +459,8 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
         throw std::runtime_error("render size exceeds the engine's capacity or is below 64");
     if (!e.model.dynamicResolution && (rw != e.maxRw || rh != e.maxRh))
         throw std::runtime_error("recompile the M/L model for dynamic render sizes");
+    if (s.displayMotion && !e.model.displayMotion)
+        throw std::runtime_error("display-resolution motion needs an M model rebuilt by the current compile_m.py (D4RM0005)");
     if (e.external && (rw != e.maxRw || rh != e.maxRh))
         throw std::runtime_error("external M/L network requires its constructor render size");
     const bool reset = s.reset || e.frame == 0 || rw != e.rw || rh != e.rh;
@@ -458,14 +471,20 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
         20ull * rw <= 9ull * e.hw && 20ull * rh <= 9ull * e.hh;
     const bool L = e.model.presetL;
     const float fx = float(e.hw) / float(e.rw), fy = float(e.hh) / float(e.rh);
+    // motion units -> reconstruction pixels: render-resolution vectors scale by reconstruction / render, display-resolution
+    // ones (in output pixels) by reconstruction / output
+    const float mx = s.displayMotion ? float(e.hw) / float(e.ow) : fx, my = s.displayMotion ? float(e.hh) / float(e.oh) : fy;
     e.enc0 = {{int32_t(e.rw), int32_t(e.rh)}, {2, 2}, {int32_t(e.gw / 2), int32_t(e.gh / 2)}, {s.jitter[0], s.jitter[1]}, {e.prevJitter[0], e.prevJitter[1]},
-              {s.motionScale[0] * fx, s.motionScale[1] * fy}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
+              {s.motionScale[0] * mx, s.motionScale[1] * my}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
               L ? e.model.lConst[0] : 9.045065879821777f, L ? e.model.lConst[1] : 0.22356846928596497f,
-              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
+              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.maxRw), 1.f / float(e.maxRh)},
+              s.displayMotion ? 1u : 0u, {int32_t(e.ow) - 1, int32_t(e.oh) - 1}, {float(e.ow) / float(e.rw), float(e.oh) / float(e.rh)}};
     e.dec0 = {{int32_t(e.rw), int32_t(e.rh)}, int32_t(e.gw / 2), reset ? 1u : 0u, {s.jitter[0], s.jitter[1]}, {fx, fy}, {float(e.hw), float(e.hh)},
               {e.prevJitter[0], e.prevJitter[1]}, L ? e.model.lConst[2] : 8.f, L ? e.model.lConst[3] : 0.07863261550664902f, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
     e.post = {{0, 0}, {int32_t(e.hw), int32_t(e.hh)}, {int32_t(e.rw), int32_t(e.rh)}, {1.f / fx, 1.f / fy}, {s.jitter[0], s.jitter[1]},
-              {1.f / float(e.maxRw), 1.f / float(e.maxRh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
+              {1.f / float(e.maxRw), 1.f / float(e.maxRh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f,
+              {s.displayMotion ? int32_t(e.ow) : 0, s.displayMotion ? int32_t(e.oh) : 0}, {e.enc0.mvScale[0], e.enc0.mvScale[1]},
+              {s.motionOffset[0], s.motionOffset[1]}};
     e.down = {{int32_t(e.hw), int32_t(e.hh)}, {0, 0}, {0, 0}, {int32_t(e.rw), int32_t(e.rh)}, {float(e.rw) / float(e.ow), float(e.rh) / float(e.oh)}, {s.jitter[0], s.jitter[1]}, 1.f};
     const uint32_t sw = exposureGrid(e.rw, e.ow), sh = exposureGrid(e.rh, e.oh);
     const uint32_t bx = (sw + 31) / 32, by = (sh + 31) / 32;
@@ -538,6 +557,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 bindImage(dev, post, 6, e.mvA[i].view, e.nearest); bindImage(dev, post, 7, e.mvB.view, e.nearest);
                 bindImage(dev, post, 8, e.mvC.view, e.linear); bindImage(dev, post, 9, e.hist[i].view);
                 bindImage(dev, post, 10, e.half[i].view); bindBuffer(dev, post, 11, e.packed);
+                if (m.displayMotion) bindImage(dev, post, 12, images.motion, e.nearest, images.motionLayout);
             }
             e.bindings.push_back(b);
         } catch (...) {

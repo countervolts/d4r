@@ -12,6 +12,7 @@ enc0/dec0 matrices plain and NGX-ordered as their own stages read them), weights
 table), offsets.bin and the compiled shaders. The weights are values read from NVIDIA's DLSS and are not redistributable
 with d4r; the shaders are d4r's own.
 """
+# D4RM0005 adds display-resolution motion to M (enc0_m.comp displayMv, post_m.comp binding 12; NGX's *_mvhi_* kernels).
 # D4RM0004 / D4RL0002 add active-rectangle sampling for dynamic input sizes.
 # D4RM0003 coupled the blocked FP8 operands, RGBA32F half-history backing and 8x64 downsample dispatch;
 # the previous package's shader workgroup dimensions are not interchangeable with this runtime.
@@ -107,7 +108,7 @@ def main():
         layers.append((add8(b8), add16(b16), o))
     blob8, blob16 = np.concatenate(w8), np.concatenate(w16)
     blob8.tofile(a.output / 'weights8.bin'); blob16.tofile(a.output / 'weights16.bin')
-    head = struct.pack('<8sII', b'D4RM0004', blob8.size, blob16.size) + struct.pack('<5I', *enc0, *dec0)
+    head = struct.pack('<8sII', b'D4RM0005', blob8.size, blob16.size) + struct.pack('<5I', *enc0, *dec0)
     for o8, o16, o in layers: head += struct.pack('<2I72I', o8, o16, *o)
     (a.output / 'offsets.bin').write_bytes(head)
     def glsl(src, out, flags=()):
@@ -136,7 +137,7 @@ def main():
     elif marker.exists(): marker.unlink()
     for p in '01': glsl('exposure_k.comp', f'exposure_m{p}.spv', ['-DMODE=1', '-DPASS=' + p])
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv')) + sorted(a.output.glob('hip/*.hsaco'))
-    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RM0004', 'preset': 'M', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
+    (a.output / 'model.json').write_text(json.dumps({'format': 'D4RM0005', 'preset': 'M', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))
     print(f'Compiled native preset M model in {a.output} ({blob8.size} FP8 bytes, {blob16.size} bytes of f16 data)')
 
 

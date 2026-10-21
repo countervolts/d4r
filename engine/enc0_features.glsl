@@ -1,9 +1,13 @@
 // d4r engine, presets M and L: the input stage's per-pixel features, shared by enc0_m.comp (M) and layer_m.comp
 // KIND 3 (L, whose input stage gathers the same 32 feature slots). The including shader declares the parameter
 // block (EP) and the bindings colorTex, motionTex, depthTex, prevMvTex, halfTex, featTex, mvAOut, mvBOut, mvCOut and
-// noise. EP names the parameter block (default p).
+// noise. EP names the parameter block (default p). ENC0_DISPLAY_MV: the block has displayMv, mvMax and mvPix
+// (enc0_m.comp), and display-resolution motion is taken when displayMv is set.
 #ifndef EP
 #define EP p
+#endif
+#ifndef ENC0_DISPLAY_MV
+#define ENC0_DISPLAY_MV 0
 #endif
 // F8T: the type of an FP8 feature slot; F8OF(h): a binary16 value on the FP8 grid as one. Without FP8 support (the
 // v_dot2 stages, fp8_soft.glsl) the slots are binary16 values on the FP8 grid.
@@ -53,23 +57,39 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     const ivec2 raw = block + ivec2(px, py), a = abs(raw);
     const ivec2 m = ivec2(a.x < EP.size.x ? a.x : 2 * EP.size.x - a.x - 2, a.y < EP.size.y ? a.y : 2 * EP.size.y - a.y - 2);
     const bool outside = raw.x < 0 || raw.y < 0 || a.x >= EP.size.x || a.y >= EP.size.y;
-    // the neighbours with the smallest and the largest depth
-    ivec2 lo = m, hi = m;
-    float dlo = texelFetch(depthTex, texel(m), 0).r, dhi = dlo;
-    const ivec2 offs[8] = ivec2[8](ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));
-    for (int k = 0; k < 8; ++k)
+    const vec2 centre = vec2(m) + 0.5, f = centre - EP.jitter, inv = 1.0 / vec2(EP.size);
+    vec2 mvA, mvB, mvC;
+#if ENC0_DISPLAY_MV
+    const bool displayMv = EP.displayMv != 0u;
+    if (displayMv)
     {
-        const float d = texelFetch(depthTex, texel(m + offs[k]), 0).r;
-        if (d < dlo) { dlo = d; lo = m + offs[k]; }
-        if (d > dhi) { dhi = d; hi = m + offs[k]; }
+        // one vector per pixel, no depth: the display-resolution texel the pixel's unjittered centre falls in
+        const ivec2 t = ivec2(floor(f * EP.mvPix));
+        mvA = EP.mvScale * (EP.mvOffs + texelFetch(motionTex, ivec2(t.x > 0 ? min(t.x, EP.mvMax.x) : 0, t.y > 0 ? min(t.y, EP.mvMax.y) : 0), 0).xy);
+        mvB = mvA; mvC = mvA;
     }
-    const vec2 mvA = motion(EP.depthFlag != 0u ? lo : hi), mvB = motion(EP.depthFlag != 0u ? hi : lo), mvC = motion(m);
+    else
+#else
+    const bool displayMv = false;
+#endif
+    {
+        // the neighbours with the smallest and the largest depth
+        ivec2 lo = m, hi = m;
+        float dlo = texelFetch(depthTex, texel(m), 0).r, dhi = dlo;
+        const ivec2 offs[8] = ivec2[8](ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));
+        for (int k = 0; k < 8; ++k)
+        {
+            const float d = texelFetch(depthTex, texel(m + offs[k]), 0).r;
+            if (d < dlo) { dlo = d; lo = m + offs[k]; }
+            if (d > dhi) { dhi = d; hi = m + offs[k]; }
+        }
+        mvA = motion(EP.depthFlag != 0u ? lo : hi); mvB = motion(EP.depthFlag != 0u ? hi : lo); mvC = motion(m);
+    }
     if (!outside)
     {
         imageStore(mvAOut, m, vec4(mvA, 0.0, 0.0)); imageStore(mvBOut, m, vec4(mvB, 0.0, 0.0)); imageStore(mvCOut, m, vec4(mvC, 0.0, 0.0));
     }
     const vec3 own = texelFetch(colorTex, texel(m), 0).rgb;
-    const vec2 centre = vec2(m) + 0.5, f = centre - EP.jitter, inv = 1.0 / vec2(EP.size);
     // how much the motion changed since the previous frame
     vec2 prevPixel = clamp(((f + EP.prevJitter) + mvA * EP.hi2rnd) * vec2(EP.renderInvX, EP.renderInvY), vec2(0.0), vec2(EP.size) * vec2(EP.renderInvX, EP.renderInvY));
     if (any(notEqual(textureSize(prevMvTex, 0), EP.size)))
@@ -81,7 +101,15 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     const float change = EP.changeGain * (log2(d2 > 0.0 ? sqrt(d2) + 1.0 : 1.0) * 0.6931472);
     // the previous result along the candidates
     precise vec2 q[4];
-    q[0] = mvA + f * EP.rnd2hi; q[1] = mvC + f * EP.rnd2hi; q[2] = mvB + f * EP.rnd2hi;
+    if (displayMv)
+    {
+        // the display-resolution kernel fuses the product into the one vector (rrlite_enc0_4x4_mvhi_*)
+        q[0] = fma(f, EP.rnd2hi, mvA); q[1] = q[0]; q[2] = q[0];
+    }
+    else
+    {
+        q[0] = mvA + f * EP.rnd2hi; q[1] = mvC + f * EP.rnd2hi; q[2] = mvB + f * EP.rnd2hi;
+    }
     // The captured PTX fuses the first pixel's fourth coordinate, but reuses a rounded
     // centre*scale product for the second pixel. A single FMA for both changes FP8 dither.
     q[3] = fusedFourth ? fma(centre, EP.rnd2hi, mvC) : centre * EP.rnd2hi + mvC;

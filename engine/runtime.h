@@ -202,6 +202,9 @@ struct MFrameSettings {
     float jitter[2] = {0, 0};     // render-pixel offsets in [-0.5, 0.5], as NGX's reconstruction tiles require
     float motionScale[2] = {1, 1};  // (motion texel + offset) * scale = render pixels
     float motionOffset[2] = {0, 0}; // jittered motion vectors: jitter - previous jitter, in motion texel units
+    // Motion vectors at output resolution (one texel per output pixel; motionScale then gives output pixels); needs
+    // MModel::hasDisplayMotion
+    bool displayMotion = false;
     bool reset = false;
     bool depthInverted = true;
     uint32_t renderWidth = 0, renderHeight = 0; // zero uses the constructor size; otherwise within its capacity
@@ -220,6 +223,7 @@ public:
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
     bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
+    bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
     bool dot2Network() const;  // the v_dot2 stages (no cooperative matrices, no FP8)
 private:

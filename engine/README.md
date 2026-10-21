@@ -365,7 +365,8 @@ the result of the frame it just rendered. The shim log says `engine backend: fea
 command list`.
 
 The shim hands a feature to the CUDA backend, with a log line giving the reason, when: the preset is not K, L or M;
-the feature is preset L or M with display-resolution motion vectors (MVLowRes clear), which they do not implement yet; the
+the feature is preset L with display-resolution motion vectors (MVLowRes clear), which it does not implement yet, or M with
+them and a package that predates `D4RM0005`; the
 motion vectors are display-resolution and the K package predates `D4RO0003` (K with a current package takes them, and
 jittered vectors are handled by adding the jitter change, as NGX does); the depth is regular (not inverted) and the K
 package predates `D4RO0002`; HDR K runs without AutoExposure and either has no float exposure texture the engine can
@@ -388,7 +389,8 @@ Limits of this first integration, all untested in a real game:
   phases and makes its own output differ by about 33 dB. The harness's panning scene (`D4R_HARNESS_QUALITY_PAN=1,0`,
   content moving one output pixel per frame) keeps frame 1 exact and then drifts to about 70-73 dB, with the same
   figures for render-resolution motion on the same scene, so that residual is the moving-content history drift and
-  not the display-resolution path. M still uses CUDA for it.
+  not the display-resolution path. M takes display-resolution motion with a `D4RM0005` package (below); L still uses
+  CUDA for it.
 - With MVJittered set (create flags 0x4f render-resolution or 0x4d display-resolution) the harness's jitter scene
   (`D4R_HARNESS_JITTER_SCENE=1`) is 109.8 dB on frame 1 and then drifts to about 69-72 dB; the same scene with
   MVJittered clear shows the same drift, so that is the scene's own content/rounding limit, not the offset. The
@@ -1458,6 +1460,33 @@ issue all loads first (one memory latency instead of one per element: 1.9 ms of 
 `v_dot2c` only for up to three uses of a broadcast value and implements `row_share` on gfx10 as `v_permlane16`
 (a full instruction); RADV caps shared-memory loads at 64 bits. One miscompile: an array copy `tb = tn` followed by
 a store to `tn` read the new values; the shader copies element by element.
+
+## Preset M with display-resolution motion vectors (D4RM0005)
+
+Games that clear MVLowRes (Subnautica 2: flags 0x49) give one vector per output pixel, in output pixels; NGX then runs
+`rrlite_enc0_4x4_mvhi_*_folded` and `rrlite_post_3_*_mvhi_*_folded` instead of the `mvlo` kernels (expansion,
+network and downsample are shared). The two differ from `mvlo` only in where the motion comes from:
+
+- Input stage (`enc0_m.comp` `displayMv`): no depth is read. A render pixel's vector is the motion texel at
+  `floor((pixel + 0.5 - jitter) * output / render)`, clamped to the output rectangle, scaled by MV.Scale *
+  reconstruction / output (1.5 at 640x360 -> 1280x720 against 3 for render-resolution vectors); it is all three
+  candidates (also on the three surfaces dec0 and the next frame read), and the candidates' history positions are
+  `fma(pixel + 0.5 - jitter, rnd2hi, mv)` (fused; `mvlo` rounds the product first). The fourth candidate keeps
+  `mvlo`'s fused/unfused split between a lane's two pixels.
+- Reconstruction (`post_m.comp` binding 12, `mvSize > 0`): the game's motion texture is read per reconstruction
+  pixel at `int((x + 0.5) / reconstruction size * output size)`, in f32 (not the binary16 surfaces), and
+  `q = fma(scale, texel + offset, x + 0.5)` serves both candidates; the candidate weights are chosen as before.
+- `compile_m.py` writes `D4RM0005`; the runtime binds the motion texture for such models only (`MModel::
+  hasDisplayMotion`), and the shim keeps older M packages and L on the CUDA backend for these games. The adapter's
+  motion fallback is output-sized, as K's.
+
+Validation: harness 640x360 -> 1280x720, flags 0x49, `D4R_HARNESS_MV_HIRES=1 D4R_HARNESS_MOTION_SCENE=1`, ten
+frames: an `M_EXACT=1` package on the RX 9070 XT is byte-identical to the CUDA backend running NVIDIA's translated
+kernels (`[Kernels] NativeKernels = off`) on every frame; the Steam Deck's v_dot2 stages 35.6 dB from it (35.5 dB
+for render-resolution vectors). Render-resolution output is unchanged (`test_frame_m.py` on the capture: every stage
+identical, and the harness output byte-identical to the previous build). In that motion scene the render-resolution
+harness run is 36.8 dB from the same CUDA reference with the previous build as well, so that gap predates this.
+Subnautica 2 on the Deck (640x400 -> 1280x800, Performance) runs preset M on the engine with it.
 
 ## Preset M without cooperative matrices or FP8 (RDNA2)
 

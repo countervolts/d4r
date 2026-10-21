@@ -11,7 +11,7 @@ struct GameUpscalerM::Impl {
     bool started = false;
     Impl(MModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetwork* external)
         : model(m), engine(m, rw, rh, ow, oh, external), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
-          fallback(p, d, rw, rh, rw, rh) {}
+          fallback(p, d, rw, rh, ow, oh) {}   // the motion fallback holds display-resolution vectors too
     void inputs(VkCommandBuffer cb, const GameFrameM& frame);
     void result(VkCommandBuffer cb, const GameFrameM& frame);
 };
@@ -41,13 +41,14 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
         g.engine.recordInitialize(cb);
         g.started = true;
     }
-    g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, w, h, directColor, directMotion, directDepth);
+    const uint32_t mw = frame.displayMotion ? g.outputWidth : w, mh = frame.displayMotion ? g.outputHeight : h;
+    g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, mw, mh, directColor, directMotion, directDepth);
     MFrameSettings s;
     s.renderWidth = w; s.renderHeight = h;
     s.jitter[0] = frame.jitter[0]; s.jitter[1] = frame.jitter[1];
     s.motionScale[0] = frame.motionToRender[0]; s.motionScale[1] = frame.motionToRender[1];
     s.motionOffset[0] = frame.motionOffset[0]; s.motionOffset[1] = frame.motionOffset[1];
-    s.reset = frame.reset; s.depthInverted = frame.depthInverted;
+    s.reset = frame.reset; s.depthInverted = frame.depthInverted; s.displayMotion = frame.displayMotion;
     FrameImages images{};
     images.color = directColor ? frame.color.view : g.fallback.color.view;
     images.motion = directMotion ? frame.motion.view : g.fallback.motion.view;
