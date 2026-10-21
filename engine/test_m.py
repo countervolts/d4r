@@ -101,13 +101,16 @@ def defines(name):
 # layer_m_dot2.comp MLP_PAIR_SCALE: one int8 scale for a pair of MLP chunks, whose w2 blocks then share their column
 # scales (widen)
 DOT2_PAIR = int(os.environ.get('M_DOT2_PAIR', '1'))   # compile_m.py's D4RM0006 packages: 1
+# layer_m_dot2.comp EXPAND_INT8 (D4RM0007): the decoders' expansion on int8 (widen packs its matrix so)
+DOT2_EXPAND_INT8 = int(os.environ.get('M_DOT2_EXPAND_INT8', '1'))
 
 
 def dot2_defines(name):
     """layer_m_dot2.comp's build of a network layer: KIND 2 expands from XC channels, 0 not (an encoder's patch merge
     is merge_m_dot2.comp's, dot2_merge_defines)"""
     C, heads, NPM, CIN = mm.LAYERS[name]
-    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={2 if CIN else 0}', f'-DXC={CIN or 16}', f'-DMLP_PAIR_SCALE={DOT2_PAIR}']
+    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={2 if CIN else 0}', f'-DXC={CIN or 16}', f'-DMLP_PAIR_SCALE={DOT2_PAIR}',
+            f'-DEXPAND_INT8={DOT2_EXPAND_INT8}']
 
 
 def dot2_merge_defines(name):
@@ -121,19 +124,21 @@ def widen(b8, o, name):
     """a layer's FP8 bytes (pack_layer) as the dot2 stages read them (engine/runtime_m.inc widenM): every blocked matrix
     W[K][N] at byte offset off as [K/2][N] binary16 pairs (W[2i][n], W[2i+1][n]) at dword off / 2; the MLP's as int8
     [K/4][N] words (W[4i + j][n] in byte j), each column scaled by its largest magnitude / 127, then N f32 scales, and
-    the output projection's (all heads as one [32 NH][C] matrix) and the patch merge's too"""
+    the output projection's (all heads as one [32 NH][C] matrix), the patch merge's and (DOT2_EXPAND_INT8) the
+    decoders' expansion's too"""
     C, heads, NPM, CIN = mm.LAYERS[name]
     h16 = me.E4M3.astype(F16).view(np.uint16).astype(np.uint32)
     out = np.zeros(b8.size // 2 + 64, np.uint32)
     blocked = lambda off, K, N: b8[off + 256 * ((np.arange(K)[:, None] // 16) * (N // 16) + np.arange(N)[None, :] // 16)
                                      + (np.arange(N)[None, :] % 16) * 16 + np.arange(K)[:, None] % 16]
-    mats = [(o[68], CIN, 4 * C)] if CIN else []
+    mats = [(o[68], CIN, 4 * C)] if CIN and not DOT2_EXPAND_INT8 else []
     for off, K, N in mats:
         vals = h16[blocked(off, K, N)]
         out[off // 2:off // 2 + K * N // 2] = (vals[0::2] | (vals[1::2] << 16)).ravel()
     i8 = [m for h in range(heads) for m in ((o[4 + 4 * h], C, 32), (o[5 + 4 * h], C, 32))]
     i8 += [m for c in range(C // 8) for m in ((o[20 + 3 * c], C, 32), (o[22 + 3 * c], 32, C))]
     i8 += [(o[68], 4 * C, NPM)] if NPM else []
+    i8 += [(o[68], CIN, 4 * C)] if CIN and DOT2_EXPAND_INT8 else []
     assert all(o[7 + 4 * h] == o[7] + h * 32 * C for h in range(heads)), 'the output projections are not consecutive'
     i8.append((o[7], 32 * heads, C))     # the heads' output projections as one [NA][C] matrix
     groups = [[m] for m in i8]

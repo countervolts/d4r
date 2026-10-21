@@ -2,8 +2,8 @@
 // d4r engine, preset M: one Swin block over 4x4-token windows for GPUs without cooperative matrices or FP8 (RDNA2).
 // The mathematics, parameters, bindings 0 and 2-5 and the build-time shape (C, NH, KIND 0 or 2, XC) are layer_m.comp's
 // relaxed build (M_RELAXED, M_RESIDUAL_F32); the products run on v_dot2_f32_f16 (binary16 pairs, f32 accumulation),
-// the MLP's, Q's, V's and the attention output projection's on v_dot4_i32_i8 (int8 with per-token and per-column
-// scales; the values are quantised straight from f32, without the FP8 rounding the relaxed build does first). The
+// the MLP's, Q's, V's, the attention output projection's and (EXPAND_INT8) the decoders' expansion on v_dot4_i32_i8
+// (int8 with per-token and per-column scales; the values are quantised straight from f32, without the FP8 rounding the relaxed build does first). The
 // encoders are built with KIND 0: their patch merge is merge_m_dot2.comp, dispatched after the block. FP8 values are
 // exact in binary16, so the v_dot2 products are exact and only the f32 summation order and the binary16 roundings
 // inside the 32-deep steps (which layer_m.comp's relaxed build keeps) differ. FP8 conversions are packed binary16 and
@@ -36,6 +36,11 @@
 // pair's w2 blocks with joint column scales, widenM); 0: a scale per chunk, the epilogue per chunk
 #ifndef MLP_PAIR_SCALE
 #define MLP_PAIR_SCALE 1
+#endif
+// EXPAND_INT8 1 (KIND 2, D4RM0007): the expansion on v_dot4_i32_i8 as well: the low-resolution tokens as int8 with one
+// scale each, the matrix as int8 [XC/4][4C] words and 4C column scales (widenM); 0: binary16 pairs on v_dot2
+#ifndef EXPAND_INT8
+#define EXPAND_INT8 0
 #endif
 layout(local_size_x = 32 * NW) in;
 // o: 0 g1, 1 bo, 2 g2, 3 b2 (f16); per head h at 4 + 4h: q, v (FP8), bias (f16), wo (FP8);
@@ -182,8 +187,7 @@ void normInt8(uint gain, out float scale[2])
         const uint r = XA + (lane + 32u * t) * RS + wave * (CW / 4u);
         [[unroll]] for (uint d = 0u; d < CW / 4u; ++d)
         {
-            const ivec4 q = ivec4(round(vec4(hv[t][4u * d], hv[t][4u * d + 1u], hv[t][4u * d + 2u], hv[t][4u * d + 3u]) * inv));
-            L[r + d] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+            L[r + d] = q8x4(vec4(hv[t][4u * d], hv[t][4u * d + 1u], hv[t][4u * d + 2u], hv[t][4u * d + 3u]), inv);
         }
     }
 }
@@ -206,6 +210,23 @@ void main()
             L[RH + r * LRS + 2u * d] = v.x; L[RH + r * LRS + 2u * d + 1u] = v.y;
         }
         barrier();
+#if EXPAND_INT8
+        // eight lanes of one wave per low-resolution token: its largest magnitude, then its int8 words in place of the
+        // binary16 pairs (each lane has read its pairs before any of the eight writes), its int8 step after the rows
+        const uint LTS = RH + 16u * LRS, PL = XH / 8u;
+        for (uint i = gi; i < 128u; i += NT)
+        {
+            const uint r = i >> 3, g = i & 7u;
+            vec2 v[PL];
+            float mx = 0.0;
+            [[unroll]] for (uint d = 0u; d < PL; ++d) { v[d] = vec2(unpackFloat2x16(L[RH + r * LRS + g * PL + d])); mx = max(mx, max(abs(v[d].x), abs(v[d].y))); }
+            mx = max(mx, subgroupShuffleXor(mx, 1u)); mx = max(mx, subgroupShuffleXor(mx, 2u)); mx = max(mx, subgroupShuffleXor(mx, 4u));
+            const float inv = mx > 0.0 ? 127.0 / mx : 0.0;
+            if (g == 0u) L[LTS + r] = floatBitsToUint(mx * (1.0 / 127.0));
+            [[unroll]] for (uint d = 0u; d < PL; d += 2u) L[RH + r * LRS + g * (PL / 2u) + d / 2u] = q8x4(vec4(v[d], v[d + 1u]), inv);
+        }
+        barrier();
+#endif
         // a lane computes four consecutive columns (sub-position q, channels c..c+3) of ER low-resolution tokens (all 16,
         // or half of them when the workgroup has more lanes than column quads)
         const uint ER = NT > UC ? 8u : 16u;
@@ -217,6 +238,34 @@ void main()
             float e[ER][4];
             [[unroll]] for (uint r = 0u; r < ER; ++r) { e[r][0] = lo(b01.x); e[r][1] = hi(b01.x); e[r][2] = lo(b01.y); e[r][3] = hi(b01.y); }
             const uint wbase = p.o[68] / 2u + col;
+#if EXPAND_INT8
+            {
+                int ie[ER][4];
+                [[unroll]] for (uint r = 0u; r < ER; ++r) [[unroll]] for (uint n = 0u; n < 4u; ++n) ie[r][n] = 0;
+                [[dont_unroll]] for (uint kq = 0u; kq < uint(XC) / 4u; kq += 4u)
+                {
+                    uvec4 w[4];
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    {
+                        const uint at = wbase + (kq + j) * 4u * UC;
+                        w[j] = uvec4(wb.w[at], wb.w[at + 1u], wb.w[at + 2u], wb.w[at + 3u]);
+                    }
+                    [[unroll]] for (uint r = 0u; r < ER; ++r)
+                    {
+                        const uvec4 a = lds4(RH + (r0 + r) * LRS + kq);
+                        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                            [[unroll]] for (uint n = 0u; n < 4u; ++n) ie[r][n] += dotPacked4x8EXT(int(a[j]), int(w[j][n]));
+                    }
+                }
+                const uint sat = wbase + (uint(XC) / 4u) * 4u * UC;
+                const vec4 sw = uintBitsToFloat(uvec4(wb.w[sat], wb.w[sat + 1u], wb.w[sat + 2u], wb.w[sat + 3u]));
+                [[unroll]] for (uint r = 0u; r < ER; ++r)
+                {
+                    const float ts = uintBitsToFloat(L[LTS + r0 + r]);
+                    [[unroll]] for (uint n = 0u; n < 4u; ++n) e[r][n] += float(ie[r][n]) * (ts * sw[n]);
+                }
+            }
+#else
             [[dont_unroll]] for (uint kp = 0u; kp < XH; kp += 4u)
             {
                 uvec4 w[4];
@@ -232,6 +281,7 @@ void main()
                         [[unroll]] for (uint n = 0u; n < 4u; ++n) e[r][n] = d2(a[j], w[j][n], e[r][n]);
                 }
             }
+#endif
             // q8 of the binary16 sums; sub-position q of low-resolution token r is block token (2 rx + (q & 1), 2 ry + (q >> 1))
             [[unroll]] for (uint r = 0u; r < ER; ++r)
             {
@@ -393,8 +443,7 @@ void main()
             const float inv = m > 0.0 ? 127.0 / m : 0.0;
             [[unroll]] for (uint n = 0u; n < 32u; n += 4u)
             {
-                const ivec4 q = ivec4(round(vec4(o[t][n], o[t][n + 1u], o[t][n + 2u], o[t][n + 3u]) * inv));
-                L[XA + (lane + 32u * (tb + t)) * RS + 8u * h + n / 4u] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+                L[XA + (lane + 32u * (tb + t)) * RS + 8u * h + n / 4u] = q8x4(vec4(o[t][n], o[t][n + 1u], o[t][n + 2u], o[t][n + 3u]), inv);
             }
         }
     }
@@ -510,8 +559,7 @@ void main()
                 const float inv = chunkInv[t][k];
                 [[unroll]] for (uint n = 0u; n < HW; n += 4u)
                 {
-                    const ivec4 q = ivec4(round(vec4(hh[t][k * HW + n], hh[t][k * HW + n + 1u], hh[t][k * HW + n + 2u], hh[t][k * HW + n + 3u]) * inv));
-                    L[RH + (lane + 32u * t) * HQS + 8u * k + (col + n) / 4u] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+                    L[RH + (lane + 32u * t) * HQS + 8u * k + (col + n) / 4u] = q8x4(vec4(hh[t][k * HW + n], hh[t][k * HW + n + 1u], hh[t][k * HW + n + 2u], hh[t][k * HW + n + 3u]), inv);
                 }
             }
         }

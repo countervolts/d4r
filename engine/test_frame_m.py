@@ -32,6 +32,16 @@ DOT2 = os.environ.get('DOT2') == '1'
 BLOCKS = 2 if DOT2 else 1      # the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks
 
 
+def int8_plain(w):
+    """a plain FP8 matrix [K][N] as [K/4][N] int8 words and N f32 column scales (runtime_m.inc widenM's int8 with the
+    plain layout): the int8 expansion stage's (dec0_m.comp INT8, D4RM0007)"""
+    W = me.E4M3.astype(np.float64)[w]
+    scale = np.abs(W).max(0) / 127.0
+    scale[scale == 0] = 1.0
+    q = np.clip(np.round(W / scale), -127, 127).astype(np.int8).view(np.uint8).astype(np.uint32)
+    return np.concatenate([(q[0::4] | (q[1::4] << 8) | (q[2::4] << 16) | (q[3::4] << 24)).ravel(), scale.astype(np.float32).view(np.uint32)])
+
+
 def widen_plain(w):
     """a plain FP8 matrix [K][N] as [K/2][N] binary16 pairs (engine/runtime_m.inc widenM): the dot2 stages' layout"""
     h = me.E4M3.astype(np.float16).view(np.uint16).astype(np.uint32)[w]
@@ -133,14 +143,14 @@ for f in range(frames):
     wb = L.blob(L.u8(0))
     cols = (np.arange(4)[:, None] * 32 + np.arange(20)[None, :]).ravel()
     d0w = wb[sm.woff_table(0, 512, 1024, 64, 128)][:, cols]
-    (np.concatenate([widen_plain(d0w).ravel(), np.zeros(16, np.uint32)]) if DOT2 else np.concatenate([d0w.ravel(), np.zeros(64, np.uint8)])).tofile(f'{D}/d0.w8')
+    (np.concatenate([int8_plain(d0w), np.zeros(1280, np.uint32)]) if DOT2 else np.concatenate([d0w.ravel(), np.zeros(64, np.uint8)])).tofile(f'{D}/d0.w8')
     np.concatenate([np.tile(wb[8192:8192 + 256].view(np.float16)[cols][None, :], (16, 1)).ravel(), np.zeros(32, np.float16)]).tofile(f'{D}/d0.w16')
     open(f'{D}/d0.params', 'wb').write(struct.pack('<2iiI2f2f2f2f2f2f', rw, rh, tw, L.P[120], *L.f2(72), *L.f2(88), float(L.i2(96)[0]), float(L.i2(96)[1]), *L.f2(80), *L.f2(160), *L.f2(104)))
     open(f'{D}/d0.manifest', 'w').write('\n'.join([
         f'param {D}/d0.params', f'grid {(gw // 8 + 1) // 2} {(gh // 8 + 1) // 2}' if DOT2 else f'grid {gw // 8} {gh // 8}', f'tex 1 {D}/mvA {rw} {rh} 2 16 nearest', f'tex 2 {pfeat} {rw} {rh} 4 9 linear',
         f'surf 3 {rw} {rh} 4 9 - {D}/feat', f'surf 4 {rw} {rh} 4 8 - {D}/gates', f'surf 5 {rw} {rh} 4 8 - {D}/mix', f'surf 6 {rw} {rh} 4 16 - {D}/cov',
         f'lut {own[Ps[-1].out]}', f'lut {D}/d0.w8', f'lut {D}/d0.w16']) + '\n')
-    run([kvk, shader('dec0_m', ['-DDOT2=1'] if DOT2 else []), f'{D}/d0.manifest', '1', '32'])
+    run([kvk, shader('dec0_m', ['-DDOT2=1', '-DINT8=1'] if DOT2 else []), f'{D}/d0.manifest', '1', '32'])
     for off, name, dt in ((128, 'feat', np.int8), (136, 'gates', np.uint8), (144, 'mix', np.uint8)):
         a = np.fromfile(L.res[off], dt).astype(np.int32); b = np.fromfile(f'{D}/{name}', dt).astype(np.int32)
         print(f'frame {f}: dec0 {name:5s} identical {100 * (a == b).mean():5.1f}%, within one step {100 * (np.abs(a - b) <= 1).mean():5.1f}%, mean |diff| {np.abs(a - b).mean():.3f} steps', flush=True)

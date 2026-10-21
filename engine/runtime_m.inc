@@ -74,8 +74,10 @@ struct Tex {
 // (test_m.widen does the same).
 // qvInt8 (D4RM0006): the heads' q and v matrices are int8 as well (layer_m_dot2.comp gemmHeadI8) and the MLP's w2
 // blocks share their column scales in pairs (MLP_PAIR_SCALE); older packages' shaders read q and v as binary16 pairs
+// stageInt8 (D4RM0007): the expansion stage's matrix (dec0_m.comp INT8, plain [K/4][N] words) and the decoders'
+// expansion matrices (layer_m_dot2.comp EXPAND_INT8) are int8 as well
 std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::array<uint32_t, 74>, MLayers>& layers,
-                         const uint32_t enc0[3], const uint32_t dec0[2], bool qvInt8) {
+                         const uint32_t enc0[3], const uint32_t dec0[2], bool qvInt8, bool stageInt8) {
     const bool pairScale = qvInt8;
     uint16_t half[256];
     for (unsigned c = 0; c < 256; ++c) {
@@ -104,8 +106,10 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
     };
     // int8 matrices: [K/4][N] words and N column scales at dword off / 2; with off2 the matrix at off2 shares the
     // column scales (the largest magnitude of both)
-    auto int8 = [&](size_t off, unsigned K, unsigned N, size_t off2 = SIZE_MAX) {
-        auto at = [&](size_t o, unsigned k, unsigned n) { return o + 256 * ((k / 16) * (N / 16) + n / 16) + (n % 16) * 16 + k % 16; };
+    auto int8 = [&](size_t off, unsigned K, unsigned N, size_t off2 = SIZE_MAX, bool plainLayout = false) {
+        auto at = [&](size_t o, unsigned k, unsigned n) {
+            return plainLayout ? o + size_t(k) * N + n : o + 256 * ((k / 16) * (N / 16) + n / 16) + (n % 16) * 16 + k % 16;
+        };
         for (unsigned n = 0; n < N; ++n) {
             double largest = 0;
             for (unsigned k = 0; k < K; ++k) largest = std::max(largest, std::abs(value(byte(at(off, k, n)))));
@@ -151,9 +155,11 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
             else int8(base + o[22 + 3 * c], 32, C);
         }
         if (MMerged[i]) int8(base + o[68], 4 * C, MMerged[i]);
-        if (MExpanded[i]) blocked(base + o[68], MExpanded[i], 4 * C);
+        if (MExpanded[i] && stageInt8) int8(base + o[68], MExpanded[i], 4 * C);
+        else if (MExpanded[i]) blocked(base + o[68], MExpanded[i], 4 * C);
     }
-    plain(enc0[0], 128, 64); plain(dec0[0], 64, 80);
+    plain(enc0[0], 128, 64);
+    if (stageInt8) int8(dec0[0], 64, 80, SIZE_MAX, true); else plain(dec0[0], 64, 80);
     return out;
 }
 void bindRange(VkDevice device, VkDescriptorSet set, uint32_t binding, const Buffer& buffer, VkDeviceSize offset) {
@@ -188,6 +194,7 @@ struct MModel::Impl {
     bool presetL = false, dynamicResolution = false;
     bool displayMotion = false;     // D4RM0005: enc0_m and post_m read display-resolution motion (post_m binding 12)
     bool qvInt8 = false;            // D4RM0006: layer_m_dot2's q and v matrices are int8 (widenM)
+    bool stageInt8 = false;         // D4RM0007: the expansion stage's and the decoders' expansion matrices are int8
     bool halfRgb10 = false;         // the half-resolution history is RGB10A2 (post_m_dot2.spv), else RGBA32F
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t dither16 = 0;
@@ -206,7 +213,9 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
     // D4RM0006: D4RM0005 plus the dot2 layers' int8 Q and V
-    m.qvInt8 = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0006", 8);
+    // D4RM0007: D4RM0006 plus the int8 expansion stage and decoder expansions
+    m.stageInt8 = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0007", 8);
+    m.qvInt8 = m.stageInt8 || (head.size() >= 8 && !std::memcmp(head.data(), "D4RM0006", 8));
     m.displayMotion = m.qvInt8 || (head.size() >= 8 && !std::memcmp(head.data(), "D4RM0005", 8));
     m.dynamicResolution = head.size() >= 8 && (m.displayMotion || !std::memcmp(head.data(), "D4RM0004", 8) ||
                                                !std::memcmp(head.data(), "D4RL0002", 8));
@@ -238,7 +247,7 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m.w16.create(m.device, b16.size(), usage);
     m.bytes16 = b16;
-    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8); m.w16x.create(m.device, m.bytes8.size(), usage); }
+    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8, m.stageInt8); m.w16x.create(m.device, m.bytes8.size(), usage); }
     else { m.w8.create(m.device, b8.size(), usage); m.bytes8 = b8; }
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const std::string variant = m.dot2 ? "_dot2" : "";

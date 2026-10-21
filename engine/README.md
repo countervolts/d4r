@@ -1625,6 +1625,23 @@ four-dword-aligned shared-memory reads in the input stage (unchanged). Also not 
   v_dot2 rate), the gather the rest; of the reconstruction's 1250 us the history fetches are about 350 us and the
   Gaussian loop 60 us, over a floor of about 680 us.
 
+`D4RM0007` (2026-10-21): the expansion stage's product on `v_dot4` (`dec0_m.comp` `INT8`: every token's 64 channels
+as int8 with one scale, the matrix as int8 with column scales, f32 sums without the binary16 roundings) and the
+decoders' expansions as well (`layer_m_dot2.comp` `EXPAND_INT8`); every int8 quantisation as `q8x4` (`fp8_soft.glsl`:
+v * inv + 1536 rounded to binary16 in one `v_fma_mix`, whose low byte is the rounded int8, instead of multiply, round,
+convert and byte packing); the input stage skips the slot pairs that are always zero (6 of a pixel's 16, the same
+output) and samples the previous result once per distinct candidate vector (`ENC0_DEDUP`, the same output). Steam
+Deck, three interleaved `d4r-m` runs: 640x360 -> 1280x720 12.43 -> 11.79 ms (input 917 -> 763 us, network 9.25 ->
+8.86 ms, expansion 547 -> 444 us), 640x400 -> 1280x800 13.41 -> 12.70 ms, 1280x720 -> 1920x1080 42.75 -> 40.34 ms.
+Against the relaxed matrix network on the RX 9070 XT (six frames, pooled RGB): 35.77 / 36.10 / 42.67 dB at
+720p / 800p / 1080p (before 35.56 / 36.15 / 42.43), the 60-frame exposure ramp 23.88 dB (23.89). Not useful: the
+input stage's product on int8 (115 us, but 1.4 dB further on the 720p frames: its dithered FP8 features lose their fine
+steps near zero, with one scale per token or per pixel alike); software pipelining or unrolling its weight loads
+(ACO sinks the prefetch to its use; unchanged or slower); the 1920x1080 history as RGB10A2 (+17 us: the
+reconstruction is not bandwidth-bound; its history fetches about 220 us, the stores 160 us, the Gaussians' `exp2` 8 us).
+What remains in the layers (ablations): GELU about 260 us, the attention core 440 us; an MLP scale and epilogue per
+four chunks instead of two would save at most 125 us.
+
 ## Files
 
 | File | Role |

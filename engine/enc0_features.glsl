@@ -6,6 +6,11 @@
 #ifndef EP
 #define EP p
 #endif
+// ENC0_DEDUP: a candidate along the same vector as an earlier one (uniform motion, display-resolution motion) takes
+// that one's sample of the previous result instead of fetching and converting it again (the same value)
+#ifndef ENC0_DEDUP
+#define ENC0_DEDUP 0
+#endif
 #ifndef ENC0_DISPLAY_MV
 #define ENC0_DISPLAY_MV 0
 #endif
@@ -116,6 +121,11 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     vec3 h[4];
     for (int k = 0; k < 4; ++k)
     {
+#if ENC0_DEDUP
+        // the same position as an earlier candidate (a NaN is never equal, and +0 and -0 sample the same texels)
+        if (k > 0 && all(equal(q[k], q[0]))) { h[k] = h[0]; continue; }
+        if (k > 1 && all(equal(q[k], q[1]))) { h[k] = h[1]; continue; }
+#endif
         precise vec3 s = own;
         if (!(q[k].x < 0.0 || q[k].y < 0.0 || q[k].x > EP.hiSize.x || q[k].y > EP.hiSize.y || EP.reset != 0u))
 #if LDR

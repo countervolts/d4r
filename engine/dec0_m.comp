@@ -7,8 +7,15 @@
 // same binary16 rounding after every 32 products, FP8 in integer arithmetic (fp8_soft.glsl); binding 8 holds the
 // matrix widened to binary16 pairs [32][80] by the runtime. A workgroup is four of the blocks (2x2), so the product
 // runs with a token per lane and wave-uniform weights.
+// INT8 (with DOT2, D4RM0007): the product on v_dot4_i32_i8 instead: every token's 64 channels as int8 with one scale
+// (its largest magnitude / 127), binding 8 the matrix as int8 [16][80] words and 80 column scales (runtime_m.inc
+// widenM), the sums in f32 without the binary16 roundings. Steam Deck 720p 547 -> 450 us, the final image within the
+// run-to-run spread of the binary16 product.
 #ifndef DOT2
 #define DOT2 0
+#endif
+#ifndef INT8
+#define INT8 0
 #endif
 #if DOT2
 #extension GL_KHR_shader_subgroup_basic : require
@@ -16,6 +23,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_spirv_intrinsics : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_integer_dot_product : require
 #include "fp8_soft.glsl"
 #else
 #extension GL_KHR_cooperative_matrix : require
@@ -58,6 +67,9 @@ spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabiliti
 float dot2acc(f16vec2 a, f16vec2 b, float c);
 float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
 shared uint TK[64 * 36];                    // the 64 tokens (four blocks of 16) as binary16 pairs, rows of 32 + 4 dwords
+#if INT8
+shared float TS[64];                        // INT8: the rows are 16 int8 words; the tokens' int8 steps
+#endif
 shared f16vec4 EO[64 * 88 / 4];
 float16_t q8(float16_t v) { return e4m3Round(float(v)); }
 #else
@@ -104,11 +116,27 @@ void main()
     if (all(lessThan(2 * t0, p.size)))
     {
         const uint src = uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u)) * 64u + hf * 32u;
+#if INT8
+        // the token's largest magnitude over both halves (lanes row and row + 16), then its int8 words
+        vec4 v[8];
+        float mx = 0.0;
+        [[unroll]] for (uint d = 0u; d < 8u; ++d)
+        {
+            const uvec2 h = e4m3Unpack4(tok.a[src / 4u + d]);
+            v[d] = vec4(vec2(unpackFloat2x16(h.x)), vec2(unpackFloat2x16(h.y)));
+            mx = max(mx, max(max(abs(v[d].x), abs(v[d].y)), max(abs(v[d].z), abs(v[d].w))));
+        }
+        mx = max(mx, subgroupShuffleXor(mx, 16u));
+        const float inv = mx > 0.0 ? 127.0 / mx : 0.0;
+        if (hf == 0u) TS[first + row] = mx * (1.0 / 127.0);
+        [[unroll]] for (uint d = 0u; d < 8u; ++d) TK[(first + row) * 36u + hf * 8u + d] = q8x4(v[d], inv);
+#else
         for (uint d = 0u; d < 8u; ++d)
         {
             const uvec2 v = e4m3Unpack4(tok.a[src / 4u + d]);
             TK[(first + row) * 36u + hf * 16u + 2u * d] = v.x; TK[(first + row) * 36u + hf * 16u + 2u * d + 1u] = v.y;
         }
+#endif
     }
     memoryBarrierShared(); barrier();
     // a lane computes columns 20 w .. 20 w + 19 of tokens lane and lane + 32 (wave-uniform weights): the bias, then 32
@@ -121,6 +149,29 @@ void main()
             const vec2 b = vec2(unpackFloat2x16(w16.w[(c0 + n) / 2u]));
             [[unroll]] for (uint t = 0u; t < 2u; ++t) { a[t][n] = b.x; a[t][n + 1u] = b.y; }
         }
+#if INT8
+        {
+            int ia[2][20];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; ++n) ia[t][n] = 0;
+            [[unroll]] for (uint kq = 0u; kq < 16u; kq += 4u)
+            {
+                const uint r0 = lane * 36u + kq, r1 = (lane + 32u) * 36u + kq;
+                const uvec4 f0 = uvec4(TK[r0], TK[r0 + 1u], TK[r0 + 2u], TK[r0 + 3u]);
+                const uvec4 f1 = uvec4(TK[r1], TK[r1 + 1u], TK[r1 + 2u], TK[r1 + 3u]);
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) [[unroll]] for (uint n = 0u; n < 20u; ++n)
+                {
+                    const int w = int(w8.w[(kq + j) * 80u + c0 + n]);
+                    ia[0][n] += dotPacked4x8EXT(int(f0[j]), w); ia[1][n] += dotPacked4x8EXT(int(f1[j]), w);
+                }
+            }
+            const float ts0 = TS[lane], ts1 = TS[lane + 32u];
+            [[unroll]] for (uint n = 0u; n < 20u; ++n)
+            {
+                const float sw = uintBitsToFloat(w8.w[16u * 80u + c0 + n]);
+                a[0][n] += float(ia[0][n]) * (ts0 * sw); a[1][n] += float(ia[1][n]) * (ts1 * sw);
+            }
+        }
+#else
         for (uint k0 = 0u; k0 < 32u; k0 += 16u)
         {
             float s[2][20];
@@ -138,6 +189,7 @@ void main()
             }
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; ++n) a[t][n] = roundHalfSat(s[t][n] + a[t][n]);
         }
+#endif
         [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; n += 4u)
             EO[((lane + 32u * t) * 88u + c0 + n) / 4u] = f16vec4(a[t][n], a[t][n + 1u], a[t][n + 2u], a[t][n + 3u]);
     }

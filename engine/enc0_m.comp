@@ -8,6 +8,9 @@
 // same binary16 rounding after every 32 products, FP8 in binary16 and integer arithmetic (fp8_soft.glsl); binding 10
 // holds the matrix widened to binary16 pairs [64][64] by the runtime. A workgroup is four of the blocks (2x2), so the
 // product runs with a token per lane and wave-uniform weights (one block: per-lane weights, 3.4x the product's time).
+// It skips the slot pairs that are always zero (6 of a pixel's 16, enc0_features.glsl: their products add +0, the
+// output is the same) and reuses the previous result's sample of candidates along the same vector (ENC0_DEDUP):
+// Steam Deck 720p 917 -> 763 us.
 #ifndef DOT2
 #define DOT2 0
 #endif
@@ -18,6 +21,7 @@
 #extension GL_EXT_spirv_intrinsics : require
 #extension GL_GOOGLE_include_directive : require
 #include "fp8_soft.glsl"
+#define ENC0_DEDUP 1
 #define F8T float16_t
 #define F8OF(h) e4m3Round(float(h))
 #else
@@ -120,11 +124,14 @@ void main()
     {
         float s[2][16];
         [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n) s[t][n] = 0.0;
-        [[unroll]] for (uint kp = k0; kp < k0 + 16u; kp += 4u)
+        [[unroll]] for (uint kr = 0u; kr < 16u; kr += 4u)
         {
+            const uint kp = k0 + kr;
             const uvec4 f0 = fe4(lane * 68u + kp), f1 = fe4((lane + 32u) * 68u + kp);
             [[unroll]] for (uint j = 0u; j < 4u; ++j) [[unroll]] for (uint n = 0u; n < 16u; ++n)
             {
+                // a pixel's slot pairs 5, 7, ..., 15 are always zero
+                if (kr + j >= 5u && ((kr + j) & 1u) != 0u) continue;
                 const uint w = w8.w[(kp + j) * 64u + c0 + n];
                 s[0][n] = d2(f0[j], w, s[0][n]); s[1][n] = d2(f1[j], w, s[1][n]);
             }
