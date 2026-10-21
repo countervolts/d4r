@@ -25,10 +25,11 @@ class ModelBuildTests(unittest.TestCase):
             (root / 'tools').mkdir()
             (root / 'tools/compiler.py').write_text('compiler fixture')
             for name in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'): (root / name).write_bytes(b'DLL fixture')
-            env = {k: v for k, v in os.environ.items() if not k.startswith(('D4R_RR_', 'K_', 'M_'))}
+            env = {k: v for k, v in os.environ.items() if not k.startswith(('D4R_RR_', 'D4R_RR2_', 'D4R_PTX2RR_', 'K_', 'M_'))}
             command = ['bash', '-c', 'RUNTIME=$1\n' + key + '\nkey 0', '_', t]
             baseline = subprocess.check_output(command, env=env)
-            for name in ('K_DEFS_ENC0', 'M_EXACT', 'D4R_RR_MIX'):
+            for name in ('K_DEFS_ENC0', 'M_EXACT', 'D4R_RR_MIX', 'D4R_RR2_UNGUARDED', 'D4R_RR2_POOLED',
+                         'D4R_PTX2RR_NO_PAIR'):
                 self.assertNotEqual(baseline, subprocess.check_output(command, env=dict(env, **{name: '1'})))
 
     def test_child_exit_status_and_timeout_are_preserved(self):
