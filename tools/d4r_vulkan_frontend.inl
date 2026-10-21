@@ -1150,6 +1150,15 @@ D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd, const
     native_vk_engine_reap();
     if (NgxResult engineResult; owner.frames.empty() && native_vk_engine(owner, cmd, p, engineResult))
         return engineResult;
+    if (owner.feature->cudaCreationDeferred)
+    {
+        // the engine did not take this frame: the staging path needs NGX's CUDA feature, created here as at
+        // CreateFeature before (before anything is recorded, so the GPU never waits on the compile)
+        logf("engine backend: creating CUDA fallback for feature %u at frame %u", owner.feature->handle.Id,
+             owner.feature->frame + 1);
+        if (const NgxResult created = create_cuda_feature(*owner.feature); created != NGX_SUCCESS) return created;
+        logf("engine backend: CUDA fallback initialized; the staging path starts without history");
+    }
     for (auto* frame : owner.frames)
         if (frame->done && frame->result != NGX_SUCCESS) return frame->result;
     native_vk_reap(g_nativeVkRetired);
