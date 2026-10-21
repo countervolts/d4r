@@ -64,6 +64,10 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define Q8(dst, src) Q8PAIRS(dst, src)
 #define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
+// The block is one wave: its lanes hand values to one another through shared memory (stores by some lanes, loads by
+// others). The memory model needs a subgroup barrier between them; RADV keeps a wave's shared-memory accesses in order
+// and emits nothing for it (aco_insert_waitcnt.cpp setup_barrier), other compilers may reorder without it.
+#define WAVE_SYNC subgroupMemoryBarrierShared();
 
 #if KIND == 4 && defined(RR2_XF_SHARED)
 // the gather's features (XF, [token slot][64 FP8 feature slots], 4 KiB) are all in registers before the block first
@@ -170,6 +174,7 @@ void main()
                 Q8(qx[wv][m], X[wv][m])
                 coopMatStore(qx[wv][m], XT, XTA(wv * 4u * C + 4u * m), C / 4u, CMJ);
             }
+        WAVE_SYNC
     }
 #elif KIND == 5
     // ---------------------------------------------------------------- the block's input: the window's 64 tokens from the
@@ -191,6 +196,7 @@ void main()
             const int X = mirror(X0 + int(r & 3u), hx), Y = mirror(Y0 + int(r >> 2u), hy);
             XT[i] = arena.w[(inOff + (wd >> 3u) * lplane + uint(Y * hx + X) * 32u) / 4u + (wd & 7u)];
         }
+        WAVE_SYNC
         B8 lb[CL / 16];
         [[unroll]] for (uint kt = 0u; kt < CL / 16; ++kt) coopMatLoad(lb[kt], XT, 4u * kt, CL / 4u, CMJ);
         for (uint m = 0u; m < 4u * MT; ++m) {
@@ -205,6 +211,7 @@ void main()
             Q8(q, a)
             coopMatStore(q, KVS, EX_AT + 4u * m, C, CMJ);
         }
+        WAVE_SYNC
         // the same x for the residual step, in this lane's own layout (token slot 16 wv + col, channel slots
         // 16 m + 8 hl + i = bytes of the words 4 m + 2 hl and 4 m + 2 hl + 1)
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
@@ -230,6 +237,7 @@ void main()
                 coopMatStore(q, XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
             }
         }
+        WAVE_SYNC
     }
 #endif
 
@@ -239,6 +247,7 @@ void main()
         [[unroll]] for (uint m = 0u; m < MT; ++m)
             [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = w32f.w[W_BO_F / 4u + 16u * m + 8u * hl + uint(i)];
     [[unroll]] for (uint hd = 0u; hd < NH; ++hd) {
+        WAVE_SYNC
         // V^T of every token tile first: stored, read back as the product's A operands, then QK takes its place
         A8 kt0[4], kt1[4], v0[2][2], v1[2][2], wo0[MT], wo1[MT];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
@@ -257,11 +266,13 @@ void main()
                 coopMatStore(va, KVS, c * 256u + 4u * n, 16u, RM);
             }
         }
+        WAVE_SYNC
         [[unroll]] for (uint c = 0u; c < 2u; ++c)
             [[unroll]] for (uint ks = 0u; ks < 2u; ++ks) {
                 coopMatLoad(v0[c][ks], KVS, c * 256u + 8u * ks, 16u, RM);
                 coopMatLoad(v1[c][ks], KVS, c * 256u + 8u * ks + 4u, 16u, RM);
             }
+        WAVE_SYNC
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
             A8 wk[MT];
             [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wk[kt], W_WQK0 + HEAD * hd, C, c, kt);
@@ -278,6 +289,7 @@ void main()
                 coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
             }
         }
+        WAVE_SYNC
         [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
             coopMatLoad(kt0[kt], KVS, kt * 128u, 8u, RM);
             coopMatLoad(kt1[kt], KVS, kt * 128u + 4u, 8u, RM);
@@ -289,8 +301,9 @@ void main()
         B8 allQ[4][2];
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
             [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(allQ[wv][c], KVS, wv * 128u + 4u * c, 8u, CMJ);
+        WAVE_SYNC
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
-            if (wv == 2u) memoryBarrierShared();
+            if (wv == 2u) { memoryBarrierShared(); WAVE_SYNC }
             B8 Pb[4];
             {
                 float16_t e[4][8];
