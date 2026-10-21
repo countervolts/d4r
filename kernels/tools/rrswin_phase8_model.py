@@ -18,7 +18,7 @@ import pathlib
 import struct
 import sys
 
-sys.path.insert(0, "/home/wouter/git/d4r/kernels/rr")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "rr"))
 import rr_layer_spec as R  # noqa: E402
 
 BASE = 46000000

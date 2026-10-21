@@ -152,10 +152,10 @@ Weight-image byte ranges are the body's own verified table (`rrswin_enc0.hip`'s
 
 | gate | requirement | result |
 |---|---|---|
-| translated reference set | 22 oracle stages `p1..p22` captured (`/home/wouter/rr/gate-enc0/oracle-p<stage>/dumps`), 6 launches each | **captured** |
+| translated reference set | 22 oracle stages `p1..p22` captured (`rr/gate-enc0/oracle-p<stage>/dumps`, relative to the capture working directory), 6 launches each | **captured** |
 | harness determinism | `compare_launch_dump.py` oracle-p1 vs oracle-p3: 108 args, 6 differ — only arg048, first differing byte exactly at 46,000,000 (the debug payload); all surfaces/textures/weights byte-identical | **proven** |
 | performance anchor (translated) | `D4R_HARNESS_FRAME_WAIT_MS=0` (continuous, matching the 16.2 ms config), 30 frames, frames 13–30: **enc0 = 3.879 ms/frame**, total 16.79 — the documented 3.79 ms baseline reproduced within ~2 % | **measured** |
-| full-frame reference | `control-80`: 80-frame run of the installed runtime with `D4R_HARNESS_SAVE_FRAMES`, 80 saved frames (`/home/wouter/rr/gate-enc0/control-80/out.raw.frameN`) | **captured** |
+| full-frame reference | `control-80`: 80-frame run of the installed runtime with `D4R_HARNESS_SAVE_FRAMES`, 80 saved frames (`rr/gate-enc0/control-80/out.raw.frameN`) | **captured** |
 | primitives | `rrswin_enc0_engine_test.cpp` steps vs independent host models | pending |
 | per-phase oracle | engine `D4R_RRSWIN_DEBUG_STAGE=<n>` vs the translated stage, payload-window compare | pending |
 | layer surfaces | `compare_launch_dump.py` translated vs engine enc0 output surfaces | pending |
