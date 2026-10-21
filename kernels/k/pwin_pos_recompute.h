@@ -3,6 +3,20 @@
 #pragma once
 #include "pwin_layer.h"
 
+// POS_DIRECT_NORM (no-embedding MT=1 layer, enc1): waves 0 and 1 load one token per lane straight from global
+// memory and write its normalized row, instead of four waves staging the raw rows in LDS and both half-waves of
+// each re-reading and summing every row. The same sums, roundings and gamma products; act/hb alias, and the raw
+// input is never needed in LDS (the residual reloads it from global memory).
+template <class L, int MT>
+constexpr bool pos_direct_norm()
+{
+#ifdef POS_DIRECT_NORM
+    return L::CIN == 0 && MT == 1;
+#else
+    return false;
+#endif
+}
+
 template <class L, int MT>
 __device__ void pos_recompute_core(const PwinParams& p, const u8v* __restrict__ img, const u4v* __restrict__ bias,
                          half_t (*act)[LDSR(L::C)], half_t (*hb)[LDSR(L::C)])
@@ -14,9 +28,9 @@ __device__ void pos_recompute_core(const PwinParams& p, const u8v* __restrict__ 
     const uint8_t* w = p.w;
     PROF_INIT;
 
-    // ---- L2 norm of every tile of this wave -> hb
+    // ---- L2 norm of every tile of this wave -> hb (done by pos_recompute_encoder for pos_direct_norm)
 #pragma unroll
-    for (int mi = 0; mi < MT; ++mi)
+    for (int mi = 0; mi < (pos_direct_norm<L, MT>() ? 0 : MT); ++mi)
     {
         const half_t* arow = act[16 * (wv * MT + mi) + m];
         half_t* hrow = hb[16 * (wv * MT + mi) + m];
@@ -290,40 +304,100 @@ __device__ void pos_recompute_encoder(const PwinParams& p0, const u8v* __restric
     const int wv = __builtin_amdgcn_readfirstlane(threadIdx.z), bx = blockIdx.x, by = blockIdx.y;
     PROF_INIT;
     STAMP(20);
-#pragma unroll
-    for (int mi = 0; mi < MT; ++mi)
+    if constexpr (pos_direct_norm<L, MT>())
     {
-        const int tok = 16 * (wv * MT + mi) + m, ty = tok >> 3, tx = tok & 7;
-        const int X = mirror(8 * bx - p.sx + tx, p.W), Y = mirror(8 * by - p.sy + ty, p.H);
-        if constexpr (L::CIN != 0)
+        // wave-uniform producer branch, no barrier inside it: pos_recompute_core's first block_sync orders these
+        // hb rows before every wave's attention
+        if (wv < 2)
         {
-            const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * L::CIN;
-            op_t xe[L::KE];
+            const int tok = 32 * wv + (int)l;
+            const int X = mirror(8 * bx - p.sx + (tok & 7), p.W), Y = mirror(8 * by - p.sy + (tok >> 3), p.H);
+            const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * C;
+            u8v xr[L::KT];
 #pragma unroll
-            for (int ks = 0; ks < L::KE; ++ks)
-                xe[ks] = op_gload(xin + 16 * ks);
+            for (int kt = 0; kt < L::KT; ++kt)
+                xr[kt] = gload_row16(xin + 16 * kt);
+            float ss = 0.0f;
 #pragma unroll
-            for (int nt = 0; nt < C / 16; ++nt)
+            for (int kt = 0; kt < L::KT; ++kt)
             {
-                f8v d = acc_vec<L>(img, p0.w, 32 * nt, L::V_EMB + nt);
+                const u8v xv = xr[kt];
 #pragma unroll
-                for (int ks = 0; ks < L::KE; ++ks)
-                    d = mma16(op_imgt(img, L::T_EMB + ks * (C / 16) + nt), xe[ks], d);
-                half_t xo[8];
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_SS)
+                for (int j = 0; j < 8; ++j)
+                {
+                    const uint32_t xj = xv[j];
+                    const hv2 v = __builtin_bit_cast(hv2, xj), q = v * v;
+                    ss += (float)q[0];
+                    ss += (float)q[1];
+                }
+#else
+                for (int c = 0; c < 16; ++c)
+                {
+                    const half_t v = op_get(xv, c);
+                    ss += (float)(half_t)(v * v);
+                }
+#endif
+            }
+            const half_t r16 = half_rsqrt((half_t)ss);
 #pragma unroll
-                for (int i = 0; i < 8; ++i)
-                    xo[i] = hmax((half_t)d[i], (half_t)0.0f);
-                op_store(&act[tok][16 * nt], operand_from_dt(xo));
+            for (int kt = 0; kt < L::KT; ++kt)
+            {
+                const u8v xv = xr[kt];
+                const u8v gv = lds_row16((const half_t*)(p.w + L::G1) + 16 * kt);
+                u8v hv;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
+                {
+                    const uint32_t xj = xv[j], gj = gv[j];
+                    hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                }
+#else
+                    hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
+                                  op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+#endif
+                store_row16(&hb[tok][16 * kt], hv);
             }
         }
-        else
-        {
-            const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * C;
-            for (int kt = (int)hf; kt < L::KT; kt += 2)
-                store_row16(&act[tok][16 * kt], gload_row16(xin + 16 * kt));
-        }
     }
-    __builtin_amdgcn_wave_barrier();
+    else
+    {
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi)
+        {
+            const int tok = 16 * (wv * MT + mi) + m, ty = tok >> 3, tx = tok & 7;
+            const int X = mirror(8 * bx - p.sx + tx, p.W), Y = mirror(8 * by - p.sy + ty, p.H);
+            if constexpr (L::CIN != 0)
+            {
+                const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * L::CIN;
+                op_t xe[L::KE];
+#pragma unroll
+                for (int ks = 0; ks < L::KE; ++ks)
+                    xe[ks] = op_gload(xin + 16 * ks);
+#pragma unroll
+                for (int nt = 0; nt < C / 16; ++nt)
+                {
+                    f8v d = acc_vec<L>(img, p0.w, 32 * nt, L::V_EMB + nt);
+#pragma unroll
+                    for (int ks = 0; ks < L::KE; ++ks)
+                        d = mma16(op_imgt(img, L::T_EMB + ks * (C / 16) + nt), xe[ks], d);
+                    half_t xo[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        xo[i] = hmax((half_t)d[i], (half_t)0.0f);
+                    op_store(&act[tok][16 * nt], operand_from_dt(xo));
+                }
+            }
+            else
+            {
+                const half_t* xin = (const half_t*)p.in + (size_t)(Y * p.W + X) * C;
+                for (int kt = (int)hf; kt < L::KT; kt += 2)
+                    store_row16(&act[tok][16 * kt], gload_row16(xin + 16 * kt));
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
     STAMP(21);
     pos_recompute_core<L, MT>(p, img, bias, act, hb);
     STAMP(26);

@@ -1,6 +1,10 @@
 #include "game_e.h"
 #include "game_internal.h"
 
+#include <algorithm>
+#include <array>
+#include <vector>
+
 namespace d4r {
 
 struct GameUpscalerE::Impl {
@@ -9,6 +13,16 @@ struct GameUpscalerE::Impl {
     uint32_t width, height, outputWidth, outputHeight, motionWidth, motionHeight;
     game_detail::CanonicalInputs fallback;
     bool started = false;
+    // The engine keeps one descriptor set per distinct combination of input and output views (runtime_e.inc, at most
+    // 16) and gives up on the feature beyond that. Games that rotate or keep reallocating these textures (Unreal's
+    // transient textures: Townfall reached the limit after ~6800 frames) would then fall back to the CUDA backend for
+    // the rest of the feature. As in game_rr.cpp: an input (colour, motion, depth, output) that shows more than
+    // kRotating distinct views goes through the adapter's own plane from then on, and once kCombinations
+    // combinations exist, all four do, which leaves a single stable combination.
+    static constexpr size_t kRotating = 4, kCombinations = 12;
+    std::array<std::vector<VkImageView>, 4> seenViews;
+    std::array<bool, 4> needsCopy = {};
+    std::vector<std::array<VkImageView, 5>> combinations;   // colour, motion, depth, exposure, output as bound
     Impl(EModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, bool hdr, bool lowRes,
          bool autoExposure)
         : model(m), engine(m, rw, rh, ow, oh, hdr, lowRes, autoExposure), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
@@ -25,11 +39,37 @@ void GameUpscalerE::record(VkCommandBuffer cb, const GameFrameE& frame) {
     if (!gameColorFormat(frame.color.format) || !gameMotionFormat(frame.motion.format) ||
         !gameDepthFormat(frame.depth.format, frame.depth.aspect) || !gameOutputFormat(frame.output.format))
         throw std::runtime_error("unsupported game texture format");
-    const bool directColor = frame.color.view != VK_NULL_HANDLE && !frame.color.x && !frame.color.y;
-    const bool directMotion = frame.motion.view != VK_NULL_HANDLE && !frame.motion.x && !frame.motion.y;
-    const bool directDepth = frame.depth.view != VK_NULL_HANDLE && !frame.depth.x && !frame.depth.y;
-    const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, false) &&
-        !frame.output.x && !frame.output.y;
+    const GameImage* const tracked[4] = {&frame.color, &frame.motion, &frame.depth, &frame.output};
+    for (size_t i = 0; i < 4; ++i) {
+        const VkImageView view = tracked[i]->view;
+        auto& seen = g.seenViews[i];
+        if (view != VK_NULL_HANDLE && std::find(seen.begin(), seen.end(), view) == seen.end()) {
+            seen.push_back(view);
+            if (seen.size() > Impl::kRotating) g.needsCopy[i] = true;
+        }
+    }
+    bool directColor, directMotion, directDepth, directOutput;
+    auto decide = [&] {
+        directColor = !g.needsCopy[0] && frame.color.view != VK_NULL_HANDLE && !frame.color.x && !frame.color.y;
+        directMotion = !g.needsCopy[1] && frame.motion.view != VK_NULL_HANDLE && !frame.motion.x && !frame.motion.y;
+        directDepth = !g.needsCopy[2] && frame.depth.view != VK_NULL_HANDLE && !frame.depth.x && !frame.depth.y;
+        directOutput = !g.needsCopy[3] && game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, false) &&
+            !frame.output.x && !frame.output.y;
+        // the adapter's planes stand for every copied input; the engine's own image (null here) for a copied output
+        return std::array<VkImageView, 5>{directColor ? frame.color.view : VK_NULL_HANDLE,
+                                          directMotion ? frame.motion.view : VK_NULL_HANDLE,
+                                          directDepth ? frame.depth.view : VK_NULL_HANDLE, frame.exposure.view,
+                                          directOutput ? frame.output.view : VK_NULL_HANDLE};
+    };
+    auto combination = decide();
+    if (std::find(g.combinations.begin(), g.combinations.end(), combination) == g.combinations.end()) {
+        if (g.combinations.size() >= Impl::kCombinations) {
+            g.needsCopy = {true, true, true, true};
+            combination = decide();
+        }
+        if (std::find(g.combinations.begin(), g.combinations.end(), combination) == g.combinations.end())
+            g.combinations.push_back(combination);
+    }
     if (!g.started) {
         if (!g.model.uploadRecorded()) g.model.recordUpload(cb);
         g.engine.recordInitialize(cb);

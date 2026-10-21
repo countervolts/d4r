@@ -5,6 +5,9 @@
 // PWIN_VEC_FROM_WEIGHTS)
 // norm / residual / embedding ReLU on packed f16 pairs (PWIN_PK_ELEM with the packed g2/b2 table; same ops, -1 %)
 // d4r-build-flags: -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DWM_CVT_ASM -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL
+// RDNA3: one token per lane in the norm (POS_NORM_LANE: the same sums, half the norm work; 0.288 -> 0.286 ms at 1440p,
+// byte-identical)
+// d4r-build-flags-gfx11: -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DWM_CVT_ASM -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_NORM_LANE
 // RDNA4: no WM_CVT_ASM (its inline asm needs the compiler's real-true16 mode on gfx12; the plain conversion
 // costs one pack per pair and gfx12 operands need no lane exchange anyway)
 // d4r-build-flags-gfx12: -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL

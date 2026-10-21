@@ -7,7 +7,7 @@ d4r runs NVIDIA's official DLSS Super Resolution (`nvngx_dlss.dll`) and experime
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus L for Ultra Performance). Ray Reconstruction presets D, E and F are experimental ([building](docs/building.md)). DLSS 5 is PURPOSELY not supported.
 
-**Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It depends on unreleased patches to ZLUDA and vkd3d-proton. See [supported games](SUPPORTED_GAMES.md) for the tested games and models.
+**Proof of concept:** d4r shows that dlss can be ran on radeon gpus, See [supported games](SUPPORTED_GAMES.md) for the tested games and models. As well check the charts out below.
 
 > **Not affiliated with NVIDIA or AMD.**
 
@@ -17,16 +17,38 @@ To contact me my discord is `._ayo`. or join the [d4r discord server](https://di
 
 [DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss) · [more videos](docs/videos.md)
 
-Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, every DLSS result is presented in the frame it belongs to (no added latency).
+All tests are using DLSS K and FSR 4.1.1 (unless specified otherwise).
 
-| Mode | DLSS 3 CNN (preset E) | DLSS 4 (preset K) | DLSS 4.5 (preset M) | FSR 4\* |
+Radeon RX 7700 XT, SILENT HILL Townfall.
+
+| Mode | DLSS 3 CNN (E)\* | DLSS 4 (K) | DLSS 4.5 (M)\* | FSR FPS | DLSS K upscale time | FSR upscale time |
+|---|---|---|---|---|---|---|
+| Quality | 71.7 fps | **75.7** | 49.3 | 73.3 | **2.05 ms** | 2.42 ms |
+| Balanced | 80.8 | **82.5** | 58.0 | 80.2 | **2.01 ms** | 2.39 ms |
+| Ultra Performance | 89.1 | **100.6** | 92.2 | 96.9 | **1.99 ms** | 2.26 ms |
+
+DLSS 4 (K) FPS was measured on 2026-10-21.
+\* Presets E and M are from 2026-09-29, on an older d4r build, so compare them with each other rather than with the newer columns.
+
+Radeon RX 7700 XT, Ghost of Tsushima.
+
+| Mode | DLSS 4 (K) average FPS | FSR average FPS | DLSS upscale time | FSR upscale time |
 |---|---|---|---|---|
-| Quality (1705×960) | **71.7** fps | 67.9 | 49.3 | 76.0 |
-| Balanced (1488×837) | **80.8** | 75.9 | 58.0 | 84.5 |
-| Performance (1280×720) | **89.7** | 84.1 | 69.0 | 94.0 |
-| Ultra Performance (853×480) | 89.1 | **95.5** | 92.2 | 107.3 |
+| Quality | **90.9** | 90.2 | **1.99 ms** | 2.50 ms |
+| Balanced | **93.8** | 93.2 | **1.96 ms** | 2.47 ms |
+| Ultra Performance | 101.7 | **102.5** | **1.91 ms** | 2.36 ms |
 
-\* FSR 4 was measured on 2026-09-27, the DLSS columns on 2026-09-29, when the same machine ran about 2–4% slower overall. Native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49.1 fps on the same walk. How the numbers were measured: [docs/performance.md](docs/performance.md).
+Measured on 2026-10-21. K and FSR 4.1.1 are within 1% across all three modes, with K slightly ahead at Quality and Balanced and FSR slightly ahead at Ultra Performance.
+
+Radeon RX 7700 XT, Cyberpunk 2077.
+
+| Mode | DLSS 4 (K) | FSR average FPS | DLSS upscale time | FSR upscale time |
+|---|---|---|---|---|
+| Quality | **87.6** | 86.4 | **2.08 ms** | 2.28 ms |
+| Balanced | **99.5** | 98.0 | **2.04 ms** | 2.20 ms |
+| Ultra Performance | **134.0** | 132.5 | **1.98 ms** | 2.08 ms |
+
+Measured on 2026-10-21; DLSS averages 1.1–1.5% higher FPS than FSR across these runs, with upscale times 0.10–0.20 ms lower.
 
 ## Switching models and FSR in game
 

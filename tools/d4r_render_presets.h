@@ -33,33 +33,58 @@ inline D4rRenderPresetOverride d4r_parse_render_preset_override(const char* over
 
 // OptiScaler's own preset override (its menu's "Render Presets Override" and "Apply Changes", or
 // RenderPresetOverride=true in OptiScaler.ini) recreates the feature with the presets the player picked. The
-// first creation carries the game's presets; a later one that carries different presets was changed in
-// OptiScaler, and those win over [DLSS] Model / [RayReconstruction] Model until they change back to the game's.
-// Super Sampling and Ray Reconstruction keep a follower each.
+// first creation with given creation flags carries the game's presets; a later one with the same flags that carries
+// different presets was changed in OptiScaler, and those win over [DLSS] Model / [RayReconstruction] Model until they
+// change back to the game's. Baselines are kept per flags because a game's own presets can differ between callers:
+// SILENT HILL Townfall's first feature (flags 0xb) has none, its gameplay features (0x49) ask for F, which a single
+// baseline took for the player's choice. A choice that was followed is followed for new flags too (OptiScaler applies
+// its override to every creation while it is ticked). Super Sampling and Ray Reconstruction keep a follower each.
 inline constexpr unsigned int kD4rPresetLatest = 0x00FFFFFF; // OptiScaler's "Latest": the DLL's choice
 
 struct D4rPresetFollower
 {
-    bool haveBaseline = false;
-    unsigned int baseline[6] = {};
+    struct Baseline { int flags; unsigned int presets[6]; };
+    Baseline baselines[16] = {};
+    unsigned int count = 0;
+    bool haveFollowed = false;
+    unsigned int followed[6] = {};
+
+    static bool same(const unsigned int (&a)[6], const unsigned int (&b)[6])
+    {
+        for (int index = 0; index < 6; ++index)
+            if (a[index] != b[index])
+                return false;
+        return true;
+    }
 
     // true when `presets` were chosen in OptiScaler. `iniOverride`: OptiScaler.ini enables the override, so
-    // even the first creation carries the player's choice.
-    bool follow(const unsigned int (&presets)[6], bool iniOverride)
+    // even the first creation carries the player's choice. `flags`: the creation's DLSS.Feature.Create.Flags.
+    bool follow(const unsigned int (&presets)[6], bool iniOverride, int flags = 0)
     {
-        if (!haveBaseline)
+        Baseline* baseline = nullptr;
+        for (unsigned int index = 0; index < count; ++index)
+            if (baselines[index].flags == flags)
+                baseline = &baselines[index];
+        bool chosen;
+        if (baseline == nullptr)
         {
-            for (int index = 0; index < 6; ++index)
-                baseline[index] = presets[index];
-            haveBaseline = true;
-            return iniOverride;
+            // new flags: the game's own presets, unless they are the choice already followed
+            chosen = iniOverride || (haveFollowed && same(presets, followed));
+            if (!chosen && count < 16)
+            {
+                baselines[count].flags = flags;
+                for (int index = 0; index < 6; ++index)
+                    baselines[count].presets[index] = presets[index];
+                ++count;
+            }
         }
-        if (iniOverride)
-            return true;
-        for (int index = 0; index < 6; ++index)
-            if (presets[index] != baseline[index])
-                return true;
-        return false;
+        else
+            chosen = iniOverride || !same(presets, baseline->presets);
+        haveFollowed = chosen;
+        if (chosen)
+            for (int index = 0; index < 6; ++index)
+                followed[index] = presets[index];
+        return chosen;
     }
 };
 

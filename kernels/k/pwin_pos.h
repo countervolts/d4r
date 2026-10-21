@@ -18,6 +18,60 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
     PROF_INIT;
 
     // ---- L2 norm of every tile of this wave -> hb
+#ifdef POS_NORM_LANE
+    // MT=2: one token per lane (half-wave hf takes tile 2 wv + hf) instead of both half-waves summing every token
+    // of both tiles. Each token's sum, rounding and gamma product are the original ones; the same wave writes
+    // the same hb elements (each once), so the barriers stay as they are.
+    if constexpr (MT == 2)
+    {
+        const int tok = 16 * (2 * wv + (int)hf) + (int)m;
+        const half_t* arow = act[tok];
+        half_t* hrow = hb[tok];
+        float ss = 0.0f;
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt)
+        {
+            const u8v xv = lds_row16(arow + 16 * kt);
+#pragma unroll
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_SS)
+            for (int j = 0; j < 8; ++j)
+            {
+                const uint32_t xj = xv[j];
+                const hv2 v = __builtin_bit_cast(hv2, xj), q = v * v;
+                ss += (float)q[0];
+                ss += (float)q[1];
+            }
+#else
+            for (int c = 0; c < 16; ++c)
+            {
+                const half_t v = op_get(xv, c);
+                ss += (float)(half_t)(v * v);
+            }
+#endif
+        }
+        const half_t r16 = half_rsqrt((half_t)ss);
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt)
+        {
+            const u8v xv = lds_row16(arow + 16 * kt);
+            const u8v gv = lds_row16((const half_t*)(w + L::G1) + 16 * kt);
+            u8v hv;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
+            {
+                const uint32_t xj = xv[j], gj = gv[j];
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+            }
+#else
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+#endif
+            store_row16(hrow + 16 * kt, hv);
+        }
+    }
+    else
+#endif
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi)
     {

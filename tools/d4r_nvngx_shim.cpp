@@ -9148,10 +9148,10 @@ static NgxResult create_cuda_feature(Feature& feature)
 }
 
 // Whether the presets of this creation were picked in OptiScaler (d4r_render_presets.h): its override is on in
-// OptiScaler.ini, or the presets changed since the game's first creation. (OptiScaler forwards the game's
-// AllocateParameters to this DLL, so the table itself does not say who filled it.) D4R_FOLLOW_OPTISCALER=0 always
+// OptiScaler.ini, or the presets changed since the game's first creation with the same creation flags. (OptiScaler
+// forwards the game's AllocateParameters to this DLL, so the table itself does not say who filled it.) D4R_FOLLOW_OPTISCALER=0 always
 // keeps d4r's model. g.mutex is held.
-static bool optiscaler_chose_presets(bool rayReconstruction, const unsigned int (&presets)[6])
+static bool optiscaler_chose_presets(bool rayReconstruction, const unsigned int (&presets)[6], int flags)
 {
     static D4rPresetFollower followers[2];
     static bool iniOverride[2] = {};
@@ -9174,7 +9174,7 @@ static bool optiscaler_chose_presets(bool rayReconstruction, const unsigned int 
         iniOverride[1] = ini_flag(ini, "dlssd", "RenderPresetOverride", 0) == 1;
         logf("OptiScaler.ini: RenderPresetOverride DLSS=%d DLSSD=%d", iniOverride[0], iniOverride[1]);
     });
-    return followers[rayReconstruction].follow(presets, iniOverride[rayReconstruction]);
+    return followers[rayReconstruction].follow(presets, iniOverride[rayReconstruction], flags);
 }
 
 static NgxResult fsr_rr_create(Feature& feature, void* parameters);
@@ -9264,7 +9264,7 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
     // Flagged, retired or unknown values count as Default, both for spotting OptiScaler's change and in what is followed
     if (presetOverride.enabled)
         d4r_sanitize_presets(presets, rayReconstruction);
-    const bool followed = presetOverride.enabled && optiscaler_chose_presets(rayReconstruction, presets);
+    const bool followed = presetOverride.enabled && optiscaler_chose_presets(rayReconstruction, presets, flags);
     if (followed)
     {
         logf("DLSS model: OptiScaler's preset override [DLAA=%u Quality=%u Balanced=%u Performance=%u "

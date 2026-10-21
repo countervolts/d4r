@@ -56,3 +56,31 @@ Vulkan games (native Vulkan frontend, engine path; see docs/vulkan.md):
   D3D12 games (`PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100`). The lsfg-vk layer made the game's swap chain creation
   fail under GE-Proton11-7 even without d4r; disable it (`DISABLE_LSFGVK=1`) if the game exits with
   `Graphics_InitializationFailed`.
+
+## Community compatibility reports
+
+The following reports were contributed by **ribbit902** from the [d4r Discord server](https://discord.gg/mgTWpSq8f5). These are separate from the model-by-model validation above; GPU, driver, d4r version and individual model coverage were not supplied. Timings are reporter observations, not directly comparable benchmarks.
+
+| Game | Reported status | Notes |
+|---|---|---|
+| Control Ultimate Edition | 🟩 Works | Works with ray tracing disabled. |
+| Crimson Desert | Not specified | Listed without a result or setup notes. |
+| Cyberpunk 2077 | 🟩 Works | Both Ray Reconstruction and Super Resolution work. |
+| Deep Rock Galactic | 🟩 Works | No additional setup notes supplied. |
+| DOOM Eternal | 🟥 Does not work | Unable to get DLSS inputs with d4r without OptiPatcher. |
+| DOOM: The Dark Ages | 🟥 Does not work | Reports a ray tracing incompatible GPU error. |
+| Forza Horizon 5 | 🟥 Does not work | Crashes on startup with d4r without OptiPatcher. |
+| Ghost of Tsushima DIRECTOR'S CUT | 🟩 Works | Use DLSS inputs; FSR and XeSS inputs produce black or grey screens. |
+| Ghostrunner | 🟩 Works | No additional setup notes supplied. |
+| Ghostrunner 2 | 🟩 Works | DLSS inputs add some performance overhead; XeSS inputs do not work. FSR inputs recommended. |
+| Half-Life 2 RTX | 🟥 Does not work | “Failed to create D3D device” error and a driver update prompt; the reporter attributes the prompt to AMD driver version numbers being lower than NVIDIA's. |
+| Helldivers 2 | 🟥 Does not work | Crashes on startup; the reporter attributes this to the game now using EAC. |
+| Horizon Zero Dawn Remastered | 🟩 Works | Requires the specific wiki setup; see the game-specific setup above. |
+| No Man's Sky | 🟩 Works | Install OptiScaler as `dbghelp.dll`. All DLSS presets have a larger performance cost than usual; preset M at Performance was reported at 6 ms. |
+| Overwatch | 🟥 Does not work | OptiScaler loads, but no DLSS upscaler is available. |
+| Palworld | 🟩 Works | No additional setup notes supplied. |
+| Portal RTX | 🟥 Does not work | “Failed to create D3D device” error and a driver update prompt; the reporter attributes the prompt to AMD driver version numbers being lower than NVIDIA's. |
+| Satisfactory | 🟩 Works | Install in `Engine/Binaries/Win64`. DLSS shows shimmering absent with FSR 4, more noticeable at lower resolutions. Preset M has a larger performance cost than usual: Performance (50%) 2.4 ms, Balanced (58%) 2.8 ms, Quality (66%) 3.3 ms, Native AA 6 ms. |
+| Sons of the Forest | 🟥 Does not work | Reaches the menu and exposes DLSS inputs, but freezes when rendering gameplay. The reporter suspects the DX11 rendering path. |
+| Subnautica 2 | 🟩 Works | No additional setup notes supplied. |
+| Warhammer 40,000: Space Marine 2 | 🟩 Works | Requires launching without anti-cheat; the reporter used [this Nexus Mods setup](https://www.nexusmods.com/warhammer40000spacemarine2/mods/615). No online play with EAC disabled. |

@@ -199,6 +199,23 @@ int main() {
     assert(!follower.follow(game, false));          // override unticked: OptiScaler restores the game's presets
 ''')
 
+    def test_game_presets_that_differ_between_callers_are_baselines(self):
+        self.run_policy(r'''
+    // SILENT HILL Townfall: the first feature (flags 0xb) has no presets, gameplay features (0x49) ask for F
+    D4rPresetFollower follower;
+    const unsigned int none[6] = {0, 0, 0, 0, 0, 0};
+    const unsigned int f[6] = {6, 6, 6, 6, 6, 6};
+    assert(!follower.follow(none, false, 0xb));
+    assert(!follower.follow(f, false, 0x49));       // the game's own hint, not the player's choice
+    assert(!follower.follow(f, false, 0x49));       // quality changes recreate with the same presets
+    const unsigned int k[6] = {11, 11, 11, 11, 11, 11};
+    assert(follower.follow(k, false, 0x49));        // OptiScaler: override K, Apply Changes
+    assert(follower.follow(k, false, 0x4b));        // still applied when the game recreates with new flags
+    assert(!follower.follow(f, false, 0x49));       // override unticked: back to the game's presets
+    const unsigned int h[6] = {6, 6, 6, 6, 6, 6};
+    assert(!follower.follow(h, false, 0x41));       // new flags after unticking: the game's presets again
+''')
+
     def test_explicit_game_presets_are_the_baseline_too(self):
         self.run_policy(r'''
     D4rPresetFollower follower;

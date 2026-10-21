@@ -34,6 +34,48 @@ RT int output_tile_coord(int relative, int lo, int hi)
     return relative > 0 ? __builtin_elementwise_min(lo + relative, hi) : lo;
 }
 
+// LDR "max" kernels: the same tile through their own conversion (no exposure or tonemap weight). The
+// operations are the translated PTX's, in its order, with plain f16 casts (see kernels/build.sh).
+RT void output_color_pack_ldr(f4 color, uint32_t* a, uint32_t* b)
+{
+    const float zero = asf(0x00000000u);
+    const float r = fmaxn(color[0], zero), g = fmaxn(color[1], zero), blue = fmaxn(color[2], zero);
+    const float qr = r * asf(0x3E800000u), hg = g * asf(0x3F000000u);
+    const float rg = qr + hg, qb = blue * asf(0x3E800000u);
+    const float y = rg + qb;
+    const float co = __builtin_fmaf(r, asf(0x3F000000u), g * asf(0x00000000u)) - blue * asf(0x3F000000u);
+    const float cg = (hg - qr) - qb;
+    *a = pack16(ashu((h1)(y)), ashu((h1)(co)));
+    *b = pack16(ashu((h1)(cg)), ashu((h1)(color[3])));
+}
+
+// The LDR kernels' path-B fill without the flattened index (one signed division per texel): each work-item
+// takes x = tid.x + 16 i, y = tid.y + 16 j. Every texel 0 <= x < width <= 24, 0 <= y < height <= 24 is written once,
+// at the original 24-column LDS offsets, before the caller's barrier. Parameters as the original reads them.
+RT void output_tile_fill_ldr(const AS4 uint8_t* args, int x0, int y0, int width, int height,
+                             AS3 uint8_t* color_tile, AS3 uint8_t* depth_tile)
+{
+    const uint64_t color = *(const AS4 uint64_t*)(args + 200);
+    const uint64_t depth = *(const AS4 uint64_t*)(args + 248);
+    const int cx0 = *(const AS4 int32_t*)(args + 208), cy0 = *(const AS4 int32_t*)(args + 212);
+    const int cx1 = *(const AS4 int32_t*)(args + 216), cy1 = *(const AS4 int32_t*)(args + 220);
+    const int dx0 = *(const AS4 int32_t*)(args + 96), dy0 = *(const AS4 int32_t*)(args + 100);
+    const int dx1 = *(const AS4 int32_t*)(args + 104), dy1 = *(const AS4 int32_t*)(args + 108);
+    for (int y = __builtin_amdgcn_workitem_id_y(); y < height; y += 16)
+        for (int x = __builtin_amdgcn_workitem_id_x(); x < width; x += 16)
+        {
+            const int sx = x0 + x, sy = y0 + y;
+            const f4 c = tex_fetch(color, output_tile_coord(sx, cx0, cx1), output_tile_coord(sy, cy0, cy1));
+            uint32_t a, b;
+            output_color_pack_ldr(c, &a, &b);
+            AS3 uint32_t* dst = (AS3 uint32_t*)(color_tile + y * 192 + x * 8);
+            dst[0] = a;
+            dst[1] = b;
+            const f4 d = tex_fetch(depth, output_tile_coord(sx, dx0, dx1), output_tile_coord(sy, dy0, dy1));
+            *(AS3 float*)(depth_tile + y * 96 + x * 4) = d[0];
+        }
+}
+
 RT void output_tile_fill(const AS4 uint8_t* args, int x0, int y0, int width, int height,
                          float exposure, AS3 uint8_t* color_tile, AS3 uint8_t* depth_tile)
 {

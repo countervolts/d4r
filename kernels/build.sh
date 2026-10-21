@@ -215,11 +215,14 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             [[ "$native_out" =~ ^hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_ldr_max_v2_rel$ ]] ||
                 { echo "not an LDR max output kernel: $native_out" >&2; exit 2; }
             ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
-            # LDR has another CFG/parameter layout than HDR: no tile rewrite. The 96-VGPR cap keeps the DLAA path's
-            # spills in its own blocks and runs Quality..UltraPerf at 8 waves per SIMD (0.825 -> 0.776 ms).
+            # LDR has another CFG and its own conversion, so its own tile rewrite (output_tile_fill_ldr). The 96-VGPR
+            # cap keeps the DLAA path's spills in its own blocks and runs Quality..UltraPerf at 8 waves per SIMD (0.825 -> 0.776 ms).
             # Plain f16 conversions, not f2h_rn: ZLUDA's compile of these LDR kernels folds the f32 product into the
             # f16 rounding too, so only the folded form reproduces it (f2h_rn: 33 of 60 harness frames differ).
-            python3 "$NAT/ptx2hip.py" --as1 "$ptx" "$native_out" | sed 's/f2h_rn(/(h1)(/g' > "$NT/$native_out.hip"
+            # Path B's tile fill traverses x/y directly (rewrite_output_ldr.py; no per-texel division): output
+            # 0.770 -> 0.763 ms at 1712x960 -> 2560x1440, every harness frame and internal buffer byte-identical.
+            python3 "$NAT/ptx2hip.py" --as1 "$ptx" "$native_out" | sed 's/f2h_rn(/(h1)(/g' > "$NT/translated.hip"
+            python3 "$NAT/rewrite_output_ldr.py" "$NT/translated.hip" > "$NT/$native_out.hip"
             sed -i "s/__attribute__((amdgpu_flat_work_group_size(1, 256))) void $native_out(/__attribute__((amdgpu_flat_work_group_size(1, 256), amdgpu_num_vgpr(96))) void $native_out(/" "$NT/$native_out.hip"
             grep -q "amdgpu_num_vgpr(96)" "$NT/$native_out.hip" || { echo "VGPR cap not applied: $native_out" >&2; exit 2; }
             D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
