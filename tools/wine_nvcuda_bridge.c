@@ -3115,6 +3115,90 @@ CUresult WINAPI cuMemcpy2D(const void* copy)
     return result;
 }
 
+/* CUDA returns from an asynchronous copy out of pageable host memory once the source has been staged, so the
+   caller may reuse it; HIP may read it later. NGX uploads every weight blob through one host buffer, with a
+   cuCtxSynchronize before each reuse: with D4R_ELIDE_NGX_SYNC that sync is gone, and on the Steam Deck preset M's
+   input-stage weights arrived as zeros whenever the uploads ran back to back (warm kernel cache). With elision the
+   bridge stages the source itself and frees each copy once an event behind it has completed. */
+typedef struct StagedUpload
+{
+    void* data;
+    CUevent done;
+    struct StagedUpload* next;
+} StagedUpload;
+static pthread_mutex_t staged_upload_lock = PTHREAD_MUTEX_INITIALIZER;
+static StagedUpload* staged_uploads;
+
+static const void* stage_upload(const void* source, size_t bytes, StagedUpload** entry)
+{
+    typedef CUresult(__attribute__((sysv_abi)) *CUEVENTQUERY_FN)(CUevent);
+    static CUEVENTCREATE_FN create;
+    static CUEVENTQUERY_FN query;
+    static CUEVENTDESTROY_FN destroy;
+    *entry = NULL;
+    if (!elide_ngx_sync() || bytes == 0)
+        return source;
+    if (create == NULL)
+    {
+        create = (CUEVENTCREATE_FN)find_zluda_symbol("cuEventCreate");
+        query = (CUEVENTQUERY_FN)find_zluda_symbol("cuEventQuery");
+        destroy = (CUEVENTDESTROY_FN)find_zluda_symbol("cuEventDestroy_v2");
+    }
+    pthread_mutex_lock(&staged_upload_lock);
+    for (StagedUpload** p = &staged_uploads; *p != NULL;)
+    {
+        StagedUpload* staged = *p;
+        if (query != NULL && query(staged->done) == CUDA_SUCCESS)
+        {
+            *p = staged->next;
+            destroy(staged->done);
+            free(staged->data);
+            free(staged);
+        }
+        else
+            p = &staged->next;
+    }
+    pthread_mutex_unlock(&staged_upload_lock);
+    StagedUpload* staged = (StagedUpload*)calloc(1, sizeof(StagedUpload));
+    void* data = malloc(bytes);
+    if (create == NULL || query == NULL || destroy == NULL || staged == NULL || data == NULL ||
+        create(&staged->done, 0x2 /* CU_EVENT_DISABLE_TIMING */) != CUDA_SUCCESS)
+    {
+        free(staged);
+        free(data);
+        d4rCtxSynchronize(); /* no event: the previous copies complete before the source is used */
+        return source;
+    }
+    memcpy(data, source, bytes);
+    staged->data = data;
+    *entry = staged;
+    return data;
+}
+
+static void staged_upload_queued(StagedUpload* staged, CUstream stream, CUresult result)
+{
+    static CUEVENTRECORD_FN record;
+    if (staged == NULL)
+        return;
+    if (record == NULL)
+        record = (CUEVENTRECORD_FN)find_zluda_symbol("cuEventRecord");
+    if (result != CUDA_SUCCESS || record == NULL || record(staged->done, stream) != CUDA_SUCCESS)
+    {
+        /* not queued, or no completion to wait for: drain before the copy can be released */
+        d4rCtxSynchronize();
+        CUEVENTDESTROY_FN destroy = (CUEVENTDESTROY_FN)find_zluda_symbol("cuEventDestroy_v2");
+        if (destroy != NULL)
+            destroy(staged->done);
+        free(staged->data);
+        free(staged);
+        return;
+    }
+    pthread_mutex_lock(&staged_upload_lock);
+    staged->next = staged_uploads;
+    staged_uploads = staged;
+    pthread_mutex_unlock(&staged_upload_lock);
+}
+
 CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, size_t bytes, CUstream stream)
 {
     if (trace_verbose()) tracef("CUDA_BEGIN api=cuMemcpyHtoDAsync bytes=%zu dst=0x%llx stream=%p", bytes,
@@ -3122,7 +3206,11 @@ CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, s
     CUMEMCPYHTODASYNC_FN function = (CUMEMCPYHTODASYNC_FN)find_zluda_symbol("cuMemcpyHtoDAsync_v2");
     if (microcuda_k_write) microcuda_k_write(destination, bytes);
     stream = d4r_ngx_stream(stream);
+    StagedUpload* staged = NULL;
+    if (function != NULL)
+        source = stage_upload(source, bytes, &staged);
     CUresult result = function != NULL ? function(destination, source, bytes, stream) : missing("cuMemcpyHtoDAsync_v2");
+    staged_upload_queued(staged, stream, result);
     TRACE_CALL(result, "cuMemcpyHtoDAsync->v2 dst=0x%llx src=%p bytes=%zu stream=%p result=%d",
            (unsigned long long)destination, source, bytes, stream, result);
     return result;

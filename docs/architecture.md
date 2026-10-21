@@ -74,7 +74,7 @@ Split frames reserve the current frame's alpha slot before its producer runs. Pr
 | `[Interop] VramInterop` | `D4R_SHIM_VRAM_INTEROP` | keep inputs and output in VRAM |
 | `[Interop] LinearInputs` | `D4R_SHIM_LINEAR_INPUTS` | NGX samples the input buffers in place |
 | `[Interop] DirectOutput` | `D4R_SHIM_OUTPUT_DIRECT` | the output kernel writes the game-side buffer directly (preset K) |
-| `[Interop] ElideNgxSync` | `D4R_ELIDE_NGX_SYNC` | skip NGX's internal CPU waits |
+| `[Interop] ElideNgxSync` | `D4R_ELIDE_NGX_SYNC` | skip NGX's internal CPU waits (the bridge then stages NGX's asynchronous uploads itself) |
 | `[Paths] JitCacheDir` | `XDG_CACHE_HOME` | where ZLUDA caches compiled kernels |
 
 ## Portable installs (the release zip)
