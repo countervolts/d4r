@@ -9305,13 +9305,15 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
 
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
-    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation. With the
-    // engine on, every feature creates its CUDA feature only when a frame falls back: NGX's L kernels take ZLUDA
-    // about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch, 2026-10-11),
-    // and the denoiser's 310.9 kernels 44 s (RE Requiem, 2026-10-14). A feature the engine refuses pays that at its
-    // first frame instead.
+    // With the engine on, every feature creates its CUDA feature only when a frame falls back: NGX's L kernels take
+    // ZLUDA about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch,
+    // 2026-10-11), and the denoiser's 310.9 kernels 44 s (RE Requiem, 2026-10-14); M's 12 minutes in the Vulkan
+    // harness on a loaded machine. A feature the engine refuses pays that at its first frame instead. The native
+    // Vulkan frontend's engine (D4R_VULKAN_ENGINE, Super Sampling only) does the same; its staging path creates the
+    // CUDA feature at the first frame it takes.
     const bool fsrBackend = rayReconstruction && rr_backend() == RrBackend::Fsr;
-    feature->cudaCreationDeferred = !nativeVulkan && !fsrBackend && engine_requested();
+    feature->cudaCreationDeferred = nativeVulkan ? engine_requested() && env_uint("D4R_VULKAN_ENGINE", 1) != 0
+                                                 : !fsrBackend && engine_requested();
     // Backend = fsr: no CUDA denoiser feature at all; AMD's denoiser and an internal Super Sampling feature.
     const NgxResult result = fsrBackend                      ? fsr_rr_create(*feature, parameters)
                              : feature->cudaCreationDeferred ? NGX_SUCCESS
