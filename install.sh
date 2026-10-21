@@ -173,9 +173,9 @@ models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 $(bash "$BUILDER" --list-sr-models)
 key() {   # key EXACT(0|1)
   { echo "exact=$1"
     echo "models=${models[*]}"
-    # Model compilers accept per-layer K_DEFS_*, M_* arithmetic/tile options, and D4R_RR_* choices.
-    # A cache hit must not silently replace a model built with different compiler options.
-    env | LC_ALL=C sort | sed -n -e '/^K_/p' -e '/^M_/p' -e '/^D4R_RR_/p'
+    # Model compilers accept per-layer K_DEFS_*, M_* arithmetic/tile options, and D4R_RR_*, D4R_RR2_* and
+    # D4R_PTX2RR_* choices. A cache hit must not silently replace a model built with different compiler options.
+    env | LC_ALL=C sort | sed -n -e '/^K_/p' -e '/^M_/p' -e '/^D4R_RR_/p' -e '/^D4R_RR2_/p' -e '/^D4R_PTX2RR_/p'
     sha256sum -- "$RUNTIME/nvngx_dlss.dll" "$RUNTIME/nvngx_dlssd.dll" 2>/dev/null | cut -d' ' -f1
     (cd "$RUNTIME/tools" && find . -type f ! -name '*.pyc' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum); } | sha256sum | cut -c1-16
 }
