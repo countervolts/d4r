@@ -43,7 +43,17 @@ layout(set = 0, binding = 6) uniform sampler2D mvATex;
 layout(set = 0, binding = 7) uniform sampler2D mvBTex;
 layout(set = 0, binding = 8) uniform sampler2D mvCTex;          // bilinear
 layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D histOut;
+// HALF_RGB10: the half-resolution mean in an RGB10A2 image (4 bytes instead of 16; its codes are 10-bit unorm), for
+// the dot2 stages (RDNA2), which do not reproduce NGX's arithmetic anyway: the hardware's filtering of the unorm codes
+// differs from the RGBA32F backing's by up to three float ulps
+#ifndef HALF_RGB10
+#define HALF_RGB10 0
+#endif
+#if HALF_RGB10
+layout(set = 0, binding = 10, rgb10_a2) uniform writeonly image2D halfOut;
+#else
 layout(set = 0, binding = 10, rgba32f) uniform writeonly image2D halfOut;
+#endif
 layout(set = 0, binding = 11, std430) writeonly buffer Packed { uint w[]; } packed;
 #if !PRESET_L
 layout(set = 0, binding = 12) uniform sampler2D motionTex;     // the game's display-resolution motion, nearest

@@ -1476,7 +1476,7 @@ network and downsample are shared). The two differ from `mvlo` only in where the
 - Reconstruction (`post_m.comp` binding 12, `mvSize > 0`): the game's motion texture is read per reconstruction
   pixel at `int((x + 0.5) / reconstruction size * output size)`, in f32 (not the binary16 surfaces), and
   `q = fma(scale, texel + offset, x + 0.5)` serves both candidates; the candidate weights are chosen as before.
-- `compile_m.py` writes `D4RM0005`; the runtime binds the motion texture for such models only (`MModel::
+- `compile_m.py` writes `D4RM0005` (now `D4RM0006`, the same plus int8 Q/V in the dot2 layers); the runtime binds the motion texture for such models only (`MModel::
   hasDisplayMotion`), and the shim keeps older M packages and L on the CUDA backend for these games. The adapter's
   motion fallback is output-sized, as K's.
 
@@ -1494,9 +1494,9 @@ RDNA2 has neither the FP8 cooperative matrices of `layer_m.comp` nor `VK_EXT_sha
 CUDA backend there. `layer_m_dot2.comp` is `layer_m.comp`'s relaxed build (`M_RELAXED`, `M_RESIDUAL_F32`: what
 RDNA3/4 run by default) on `v_dot2_f32_f16`, the same way `layer_dot2.comp` is K's: binary16 pairs, f32
 accumulation. FP8 values are exact in binary16, so those products are exact; FP8 conversions are packed binary16 and
-integer arithmetic (`fp8_soft.glsl`). The MLP, two thirds of the network's multiply-adds, and the attention output
-projection run on `v_dot4_i32_i8` (twice the rate) instead: int8 inputs with one scale per token, int8 weights with
-one scale per column. `enc0_m.comp`
+integer arithmetic (`fp8_soft.glsl`). The MLP (two thirds of the network's multiply-adds), Q and V and the attention
+output projection run on `v_dot4_i32_i8` (twice the rate) instead: int8 inputs with one scale per token, int8 weights
+with one scale per column (`D4RM0006`; `D4RM0005` and older packages keep binary16 Q and V, `widenM` packs per marker). `enc0_m.comp`
 and `dec0_m.comp` have `DOT2` builds of their products, and `merge_m_dot2.comp` is the encoders' patch merge (int8
 as well).
 
@@ -1566,16 +1566,37 @@ Accuracy:
 
 Steam Deck (gfx1033, RADV, GPU fixed at 1600 MHz), 2026-10-20/21:
 
-| | First version | binary16 MLP | int8 MLP | int8 merges, wave32 reconstruction, SEG 2 | int8 output projection (now) |
-|---|---:|---:|---:|---:|---:|
-| `d4r-m`, 640x360 -> 1280x720, GPU time per frame | 24.6 ms | 17.2 ms | 14.8 ms | 14.5 ms (14.68) | 14.35 ms |
-| of it: network | 20.6 ms | 13.8 ms | 11.4 ms | 11.35 ms (11.44) | 11.10 ms |
-| input / expansion / reconstruction / downsample | | 0.93 / 0.54 / 1.36 / 0.50 ms | the same | 0.93 / 0.54 / 1.25 / 0.39 ms | the same |
-| D3D12 harness through the shim, 640x400 -> 1280x800 | 28.4 ms | 20.6 ms | 18.0 ms | 17.7 ms | 17.3 ms |
-| D3D12 harness through the shim, 960x540 -> 1920x1080 | 51.5 ms | 36.5 ms | 31.7 ms | 31.2 ms | 30.7 ms |
+| | First version | binary16 MLP | int8 MLP | int8 merges, wave32 reconstruction, SEG 2 | int8 output projection | int8 Q/V, no FP8 grid before int8 | MLP chunk pairs, RGB10A2 half history (now) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `d4r-m`, 640x360 -> 1280x720, GPU time per frame | 24.6 ms | 17.2 ms | 14.8 ms | 14.5 ms (14.68) | 14.35 ms | 13.0 ms (14.45) | 12.4 ms |
+| of it: network | 20.6 ms | 13.8 ms | 11.4 ms | 11.35 ms (11.44) | 11.10 ms | 9.70 ms (11.08) | 9.25 ms (9.72) |
+| input / expansion / reconstruction / downsample | | 0.93 / 0.54 / 1.36 / 0.50 ms | the same | 0.93 / 0.54 / 1.25 / 0.39 ms | the same | the same | 0.92 / 0.55 / 1.24 / 0.41 ms |
+| D3D12 harness through the shim, 640x400 -> 1280x800 | 28.4 ms | 20.6 ms | 18.0 ms | 17.7 ms | 17.3 ms | 16.0 ms | 15.4 ms |
+| D3D12 harness through the shim, 960x540 -> 1920x1080 | 51.5 ms | 36.5 ms | 31.7 ms | 31.2 ms | 30.7 ms | 28.3 ms | 27.1 ms |
 
-The last two columns are three interleaved `d4r-m` runs and two interleaved harness runs of 200 frames each
+The last four columns are three interleaved `d4r-m` runs and two interleaved harness runs of 200 frames each
 (medians; in brackets the earlier build in those runs).
+
+The last column (2026-10-21): the products of Q and V on `v_dot4` like the MLP's (norm 1 writes int8 rows with one
+scale per token, as norm 2), and the values the int8 quantisation takes (the normalised rows, the MLP's hidden
+values) no longer rounded to the FP8 grid first: that rounding only added a coarser step before the int8 one. Per
+layer on the frame test's inputs (Steam Deck, us): enc1 2122 -> 1842, enc2 1360 -> 1160, tube 573 -> 494, dec2 1361
+-> 1196, dec1 2301 -> 2046. Accuracy: `test_m.py --dot2` 35.0-41.8 dB per layer (was 34.4-41.7), `DOT2=1
+test_frame_m.py` 36.9 and 36.8 dB (was 36.5 and 36.4), the harness on the Deck 35.9 dB against the exact build's
+CUDA reference (was 35.6). Each alone: without the FP8 grid before the MLP's int8, -0.31 ms and +0.5 dB; int8 Q/V
+-1.24 ms and -0.8 dB per layer. The MLP then takes two of NGX's 32-channel chunks per round, their scales in one exchange (two barriers per pair instead of four, the same arithmetic: -0.8%). Not useful: GELU on binary16 pairs (unchanged time); one int8 scale and one epilogue for the pair (the w2 blocks with joint column scales: -3.5%, but the first frame 0.3 dB further); unrolled int8 product loops (C 96 2% faster, C 128 28% slower: registers); four tokens per lane in the MLP (the
+weights reused twice as often, but 5.9 against 4.9 ms per pass: registers and shared memory), so 128-token
+workgroups would be slower.
+The last column: the pair's one int8 scale and one epilogue after all (`MLP_PAIR_SCALE`, part of `D4RM0006`: the
+pair's w2 blocks with joint column scales in `widenM`), and the reconstruction's half-resolution mean in RGB10A2
+instead of RGBA32F (`post_m_dot2*.spv`, `HALF_RGB10`; the input stage samples it: -30 us there, -50 us in the
+reconstruction). Accuracy against the exact build's CUDA reference, ten moving frames in the harness (display-
+resolution motion scene): the RDNA2 stages 34.68 dB, the RDNA4 default (relaxed matrix) build 34.68 dB (the
+previous column 34.59, the morning's build 34.2). On a reset frame they stay 0.6-0.9 dB behind (`DOT2=1
+test_frame_m.py`: 36.6 against 37.5 dB on the first frame, 36.8 on the second for both). Where the 9.2 ms of layer time
+goes now (ablations): the MLP 5.3 ms (its two products about 3.6 ms, 82% of the int8 rate; GELU, scaling,
+requantisation, the per-chunk epilogue and barriers the rest), Q/V 1.0 ms, the attention core 0.33 ms, the rest
+(norms, output projection, loads, stores) about 2.5 ms, no single part of it above 2%.
 
 K in the same harness: 11.6 ms at 800p, 18.7 ms at 1080p. The layers at 640x360 -> 1280x720 (us, merges included):
 enc1 2424, enc2 1560, tube 559-621 each, dec2 1462, dec1 2347 (fp16 output projection: 2478, 1622, 576-644, 1515,
@@ -1593,8 +1614,8 @@ What changed from the first version: the patch merge out of the block, the paral
 the input and expansion stages over 2x2 blocks, the two roundings above, the int8 MLP (its first matrix alone: the
 layers 9-15% faster, final image -0.3 dB; both: 12-22%, -0.4 dB), the int8 patch merges and the int8 output
 projection.
-Not kept: Q and V in int8 as well (norm 1 like norm 2): another 5-10% per layer, but 1-2.3 dB per layer against
-NGX and the final image 0.7 dB further (36.4 and 36.1 dB): attention is sensitive to them. Not useful:
+Q and V in int8 were first not kept (1-2.3 dB per layer, final image 0.7 dB further) until the FP8-grid removal above
+gave that accuracy back. Not useful:
 four-dword-aligned shared-memory reads in the input stage (unchanged). Also not kept, 2026-10-21:
 - The decoders' expansion in int8 (one scale per low-resolution token): dec2 1513 -> 1470 us, dec1 2432 -> 2347 us,
   but those layers 1.6 and 1.8 dB further from NGX and the first frame 0.3 dB.

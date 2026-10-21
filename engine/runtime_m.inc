@@ -72,8 +72,11 @@ struct Tex {
 // The attention output projection, MLP and patch merge matrices (v_dot4_i32_i8) are int8 instead: [K/4][N] words of four (W[4k + i][n] in byte i), each column
 // scaled by its largest magnitude / 127 (rounded to nearest even), followed by the N column scales as f32
 // (test_m.widen does the same).
+// qvInt8 (D4RM0006): the heads' q and v matrices are int8 as well (layer_m_dot2.comp gemmHeadI8) and the MLP's w2
+// blocks share their column scales in pairs (MLP_PAIR_SCALE); older packages' shaders read q and v as binary16 pairs
 std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::array<uint32_t, 74>, MLayers>& layers,
-                         const uint32_t enc0[3], const uint32_t dec0[2]) {
+                         const uint32_t enc0[3], const uint32_t dec0[2], bool qvInt8) {
+    const bool pairScale = qvInt8;
     uint16_t half[256];
     for (unsigned c = 0; c < 256; ++c) {
         // E4M3 -> binary16: the magnitude bits shifted into binary16's exponent and mantissa are the value times 2^-8;
@@ -99,23 +102,30 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
         const double v = mag >= 8 ? std::ldexp(1.0 + (mag & 7) / 8.0, int(mag >> 3) - 7) : std::ldexp(double(mag), -9);
         return c & 0x80 ? -v : v;
     };
-    auto int8 = [&](size_t off, unsigned K, unsigned N) {
-        auto at = [&](unsigned k, unsigned n) { return off + 256 * ((k / 16) * (N / 16) + n / 16) + (n % 16) * 16 + k % 16; };
+    // int8 matrices: [K/4][N] words and N column scales at dword off / 2; with off2 the matrix at off2 shares the
+    // column scales (the largest magnitude of both)
+    auto int8 = [&](size_t off, unsigned K, unsigned N, size_t off2 = SIZE_MAX) {
+        auto at = [&](size_t o, unsigned k, unsigned n) { return o + 256 * ((k / 16) * (N / 16) + n / 16) + (n % 16) * 16 + k % 16; };
         for (unsigned n = 0; n < N; ++n) {
             double largest = 0;
-            for (unsigned k = 0; k < K; ++k) largest = std::max(largest, std::abs(value(byte(at(k, n)))));
+            for (unsigned k = 0; k < K; ++k) largest = std::max(largest, std::abs(value(byte(at(off, k, n)))));
+            if (off2 != SIZE_MAX)
+                for (unsigned k = 0; k < K; ++k) largest = std::max(largest, std::abs(value(byte(at(off2, k, n)))));
             const double scale = largest > 0 ? largest / 127.0 : 1.0;
-            for (unsigned k = 0; k < K; k += 4) {
-                uint32_t word = 0;
-                for (unsigned i = 0; i < 4; ++i) {
-                    const double q = std::clamp(std::nearbyint(value(byte(at(k + i, n))) / scale), -127.0, 127.0);
-                    word |= uint32_t(uint8_t(int8_t(q))) << (8 * i);
-                }
-                put(off / 2 + (k / 4) * N + n, word);
-            }
             const float f = float(scale);
             uint32_t bits; std::memcpy(&bits, &f, 4);
-            put(off / 2 + (K / 4) * N + n, bits);
+            for (size_t o : {off, off2}) {
+                if (o == SIZE_MAX) continue;
+                for (unsigned k = 0; k < K; k += 4) {
+                    uint32_t word = 0;
+                    for (unsigned i = 0; i < 4; ++i) {
+                        const double q = std::clamp(std::nearbyint(value(byte(at(o, k + i, n))) / scale), -127.0, 127.0);
+                        word |= uint32_t(uint8_t(int8_t(q))) << (8 * i);
+                    }
+                    put(o / 2 + (k / 4) * N + n, word);
+                }
+                put(o / 2 + (K / 4) * N + n, bits);
+            }
         }
     };
     auto plain = [&](size_t off, unsigned K, unsigned N) {
@@ -127,13 +137,19 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
         const uint32_t* o = layers[i].data() + 2;
         const unsigned C = MChannels[i], NH = MHeads[i];
         for (unsigned h = 0; h < NH; ++h) {
-            blocked(base + o[4 + 4 * h], C, 32); blocked(base + o[5 + 4 * h], C, 32);
+            if (qvInt8) { int8(base + o[4 + 4 * h], C, 32); int8(base + o[5 + 4 * h], C, 32); }
+            else { blocked(base + o[4 + 4 * h], C, 32); blocked(base + o[5 + 4 * h], C, 32); }
             // the heads' output projections are one [NA][C] matrix (consecutive [32][C] blocks)
             if (o[7 + 4 * h] != o[7] + h * 32 * C)
                 throw std::runtime_error("M weights: the output projections are not consecutive");
         }
         int8(base + o[7], 32 * NH, C);
-        for (unsigned c = 0; c < C / 8; ++c) { int8(base + o[20 + 3 * c], C, 32); int8(base + o[22 + 3 * c], 32, C); }
+        for (unsigned c = 0; c < C / 8; ++c) int8(base + o[20 + 3 * c], C, 32);
+        // D4RM0006 (layer_m_dot2.comp MLP_PAIR_SCALE): a chunk pair's w2 blocks share their column scales
+        for (unsigned c = 0; c < C / 8; c += pairScale ? 2 : 1) {
+            if (pairScale) int8(base + o[22 + 3 * c], 32, C, base + o[22 + 3 * (c + 1)]);
+            else int8(base + o[22 + 3 * c], 32, C);
+        }
         if (MMerged[i]) int8(base + o[68], 4 * C, MMerged[i]);
         if (MExpanded[i]) blocked(base + o[68], MExpanded[i], 4 * C);
     }
@@ -171,6 +187,8 @@ struct MModel::Impl {
     // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
     bool presetL = false, dynamicResolution = false;
     bool displayMotion = false;     // D4RM0005: enc0_m and post_m read display-resolution motion (post_m binding 12)
+    bool qvInt8 = false;            // D4RM0006: layer_m_dot2's q and v matrices are int8 (widenM)
+    bool halfRgb10 = false;         // the half-resolution history is RGB10A2 (post_m_dot2.spv), else RGBA32F
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t dither16 = 0;
     float lConst[5]{};
@@ -187,7 +205,9 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
-    m.displayMotion = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0005", 8);
+    // D4RM0006: D4RM0005 plus the dot2 layers' int8 Q and V
+    m.qvInt8 = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0006", 8);
+    m.displayMotion = m.qvInt8 || (head.size() >= 8 && !std::memcmp(head.data(), "D4RM0005", 8));
     m.dynamicResolution = head.size() >= 8 && (m.displayMotion || !std::memcmp(head.data(), "D4RM0004", 8) ||
                                                !std::memcmp(head.data(), "D4RL0002", 8));
     const size_t expect = m.presetL ? 40 + (MLayers + 2) * 74 * 4 : 16 + 5 * 4 + MLayers * 74 * 4;
@@ -218,7 +238,7 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m.w16.create(m.device, b16.size(), usage);
     m.bytes16 = b16;
-    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0); m.w16x.create(m.device, m.bytes8.size(), usage); }
+    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8); m.w16x.create(m.device, m.bytes8.size(), usage); }
     else { m.w8.create(m.device, b8.size(), usage); m.bytes8 = b8; }
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const std::string variant = m.dot2 ? "_dot2" : "";
@@ -245,10 +265,13 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const uint32_t wave = forced ? forced : 64, postWave = forced ? forced : m.dot2 ? 32 : 64;
     auto postTypes = std::vector<VkDescriptorType>{b,t,t,t,t,t,t,t,t,s,s,b};
     if (m.displayMotion) postTypes.push_back(t);    // the game's motion texture
-    m.post.create(device, directory + "/" + po + ".spv", postTypes, postWave, cache);
-    m.postQuality.create(device, directory + "/" + po + "_q.spv", postTypes, postWave, cache);
-    if (exists(directory + "/" + po + "_c.spv"))
-        m.postCompact.create(device, directory + "/" + po + "_c.spv", postTypes, postWave, cache);
+    // the dot2 models' reconstruction writes its half-resolution mean as RGB10A2 (post_m.comp HALF_RGB10)
+    m.halfRgb10 = m.dot2 && exists(directory + "/" + po + "_dot2.spv");
+    const std::string pv = m.halfRgb10 ? "_dot2" : "";
+    m.post.create(device, directory + "/" + po + pv + ".spv", postTypes, postWave, cache);
+    m.postQuality.create(device, directory + "/" + po + "_q" + pv + ".spv", postTypes, postWave, cache);
+    if (exists(directory + "/" + po + "_c" + pv + ".spv"))
+        m.postCompact.create(device, directory + "/" + po + "_c" + pv + ".spv", postTypes, postWave, cache);
     // the dot2 models' downsample builds split its horizontal pass finer (down_m.comp SEG)
     const std::string down = m.dot2 && exists(directory + "/down_m_dot2.spv") ? "_dot2" : "";
     m.down.create(device, directory + "/down_m" + down + ".spv", {b,t,s,b}, wave, cache);
@@ -353,7 +376,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     e.cov.create(d, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT);
     for (auto& t : e.hist) t.create(d, e.hw, e.hh, VK_FORMAT_R16G16B16A16_SFLOAT);
     // The native formatted RGB10 history has RGBA32F backing. UNORM filtering differs by up to three ulps.
-    for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, VK_FORMAT_R32G32B32A32_SFLOAT);
+    for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, model.impl->halfRgb10 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT);
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 24; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
