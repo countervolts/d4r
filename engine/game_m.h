@@ -14,6 +14,7 @@ struct GameFrameM {
     bool reset = false;
     bool depthInverted = true;
     uint32_t renderWidth = 0, renderHeight = 0; // zero selects the adapter capacity
+    GameProfile profile;
 };
 class GameUpscalerM {
 public:

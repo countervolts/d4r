@@ -1028,6 +1028,7 @@ static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* 
         if (presetM)
         {
             d4r::GameFrameM game;
+            game.profile = engine_stage_profile(frame, name);
             game.color = color; game.depth = depth; game.motion = motion; game.output = output;
             if (color.x || color.y || depth.x || depth.y || motion.x || motion.y)
                 return releaseEvent(), refuse("input rectangles must start at the origin");
@@ -1083,6 +1084,7 @@ static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* 
                 !model->hasDirectOrigins())
                 return releaseEvent(), refuse("texture rectangles need a model with direct origins");
             d4r::GameFrame game;
+            game.profile = engine_stage_profile(frame, "K");
             game.color = color; game.depth = depth; game.motion = motion; game.output = output;
             if (gameExposure) game.exposure = exposure;
             auto& settings = game.settings;

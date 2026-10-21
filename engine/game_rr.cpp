@@ -1,5 +1,6 @@
 #include "game_rr.h"
 #include "game_internal.h"
+#include "game_profile.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@ struct GameDenoiser::Impl {
     RModel& model;
     REngine engine;
     uint32_t width, height, outputWidth, outputHeight;
+    game_detail::StageProfile profile;
     game_detail::CanonicalInputs fallback;                 // colour, motion, depth
     std::array<game_detail::Plane, 8> guides;              // the guides and optional inputs, when one cannot be sampled directly
     bool started = false;
@@ -33,7 +35,7 @@ struct GameDenoiser::Impl {
     uint32_t dumpFrame = 0;
     Impl(RModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh)
         : model(m), engine(m, rw, rh, ow, oh), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
-          fallback(p, d, rw, rh, rw, rh), physical(p), device(d) {}
+          profile(p, d), fallback(p, d, rw, rh, rw, rh), physical(p), device(d) {}
     ~Impl() {
         if (dumpBuffer) vkDestroyBuffer(device, dumpBuffer, nullptr);
         if (dumpMemory) vkFreeMemory(device, dumpMemory, nullptr);
@@ -92,6 +94,8 @@ GameDenoiser::~GameDenoiser() = default;
 
 void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
     auto& g = *impl;
+    g.profile.begin(cb, frame.profile, g.width, g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "exposure", "network", "reconstruction", "output"});
     const uint32_t w = g.width, h = g.height;
     const char* dump = std::getenv("D4R_ENGINE_RR_DUMP");
     static uint32_t frameCount = 0;
@@ -162,12 +166,13 @@ void GameDenoiser::record(VkCommandBuffer cb, const GameFrameR& frame) {
         frame.output.layout == VK_IMAGE_LAYOUT_GENERAL && !frame.output.x && !frame.output.y &&
         frame.output.image != frame.color.image && frame.output.image != frame.motion.image && frame.output.image != frame.depth.image;
     g.engine.setFrame(images, frame.settings, directOutput ? FrameOutput{frame.output.view, frame.output.format} : FrameOutput{});
-    g.engine.recordFrame(cb);
+    g.engine.recordFrame(cb, g.profile.pool(), g.profile.first());
     if (dump) g.recordDump(cb, frameCount);
     if (directOutput)   // the output stage wrote the game's texture: make it visible to whatever the game does next
         game_detail::barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     else
         game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.outputWidth, g.outputHeight);
+    g.profile.end(cb);
 }
 } // namespace d4r

@@ -1,5 +1,6 @@
 #include "game.h"
 #include "game_internal.h"
+#include "game_profile.h"
 
 namespace d4r {
 namespace {
@@ -31,12 +32,13 @@ struct GameUpscaler::Impl {
     Shape shape;
     Engine engine;
     uint32_t maxWidth, maxHeight;
+    game_detail::StageProfile profile;
     game_detail::CanonicalInputs fallback;
     bool started = false;
     uint32_t frames = 0;
     Impl(Model& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetwork* external)
         : model(m), shape(makeKShape(ow, oh)), engine(m, shape, external), maxWidth(rw), maxHeight(rh),
-          fallback(p, d, rw, rh, ow, oh) {}
+          profile(p, d), fallback(p, d, rw, rh, ow, oh) {}
     void inputs(VkCommandBuffer cb, const GameFrame& frame);
     void result(VkCommandBuffer cb, const GameFrame& frame);
 };
@@ -113,16 +115,29 @@ void GameUpscaler::Impl::result(VkCommandBuffer cb, const GameFrame& frame) {
     game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.shape.outputWidth, g.shape.outputHeight);
 }
 void GameUpscaler::record(VkCommandBuffer cb, const GameFrame& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFrame(cb); // begins and ends with barriers against all other work
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.settings.renderWidth, frame.settings.renderHeight,
+                    g.shape.outputWidth, g.shape.outputHeight,
+                    {"prepare", "setup", "exposure", "input", "enc0", "enc1", "enc2", "enc3", "enc4",
+                     "dec5", "dec4", "dec3", "dec2", "dec1", "dec0", "reconstruction", "sync", "output"});
+    g.inputs(cb, frame);
+    g.engine.recordFrame(cb, g.profile.callback());
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 void GameUpscaler::recordFront(VkCommandBuffer cb, const GameFrame& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFront(cb);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.settings.renderWidth, frame.settings.renderHeight,
+                    g.shape.outputWidth, g.shape.outputHeight,
+                    {"prepare", "setup", "exposure", "input", "external_network_wait", "reconstruction", "output"});
+    g.inputs(cb, frame);
+    g.profile.mark(cb, 1);
+    g.engine.recordFront(cb, g.profile.pool(), g.profile.first(2));
 }
 void GameUpscaler::recordBack(VkCommandBuffer cb, const GameFrame& frame) {
-    impl->engine.recordBack(cb);
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.engine.recordBack(cb, g.profile.pool(), g.profile.first(5));
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 } // namespace d4r

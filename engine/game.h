@@ -15,11 +15,19 @@ struct GameImage {
     // Null selects the existing copy/conversion path. Sampled views use layout above.
     VkImageView view = VK_NULL_HANDLE;
 };
+// Optional asynchronous GPU profiling. The sink receives complete log lines on later record() calls.
+struct GameProfile {
+    void (*log)(const char*) = nullptr; // null disables profiling and allocates no queries
+    const char* name = "K";
+    uint32_t frame = 0;
+    bool sampled = false;
+};
 struct GameFrame {
     GameImage color, depth, motion, output;
     // Optional 1x1 float exposure (texel 0 is read): the game's value replaces measurement. Exclusive with settings.autoExposure.
     GameImage exposure;
     FrameSettings settings; // render size, jitter, motion scale, reset
+    GameProfile profile;
 };
 // Formats record() converts. Depth may be a depth-aspect D32 image or a one-channel colour image.
 bool gameColorFormat(VkFormat format);

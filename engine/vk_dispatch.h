@@ -5,6 +5,12 @@
 #ifdef D4R_ENGINE_VK_TABLE
 namespace d4r {
 struct VkTable {
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
+    PFN_vkCmdSetEvent CmdSetEvent = nullptr;
+    PFN_vkResetEvent ResetEvent = nullptr;
+    PFN_vkGetEventStatus GetEventStatus = nullptr;
+    PFN_vkDestroyEvent DestroyEvent = nullptr;
+    PFN_vkCreateEvent CreateEvent = nullptr;
     PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
@@ -106,4 +112,10 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkMapMemory ::d4r::vkTable.MapMemory
 #define vkUnmapMemory ::d4r::vkTable.UnmapMemory
 #define vkUpdateDescriptorSets ::d4r::vkTable.UpdateDescriptorSets
+#define vkCreateEvent ::d4r::vkTable.CreateEvent
+#define vkDestroyEvent ::d4r::vkTable.DestroyEvent
+#define vkGetEventStatus ::d4r::vkTable.GetEventStatus
+#define vkResetEvent ::d4r::vkTable.ResetEvent
+#define vkCmdSetEvent ::d4r::vkTable.CmdSetEvent
+#define vkGetPhysicalDeviceQueueFamilyProperties ::d4r::vkTable.GetPhysicalDeviceQueueFamilyProperties
 #endif

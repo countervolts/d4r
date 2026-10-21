@@ -12,6 +12,7 @@ struct GameFrameR {
     // optional too: DLSSD.ScreenSpaceSubsurfaceScatteringGuide, DLSSD.ColorBeforeParticles
     GameImage subsurfaceGuide, colorBeforeParticles;
     RFrameSettings settings;
+    GameProfile profile;
 };
 class GameDenoiser {
 public:

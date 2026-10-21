@@ -1,5 +1,6 @@
 #include "game_m.h"
 #include "game_internal.h"
+#include "game_profile.h"
 
 namespace d4r {
 
@@ -7,11 +8,12 @@ struct GameUpscalerM::Impl {
     MModel& model;
     MEngine engine;
     uint32_t width, height, outputWidth, outputHeight;
+    game_detail::StageProfile profile;
     game_detail::CanonicalInputs fallback;
     bool started = false;
     Impl(MModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetwork* external)
         : model(m), engine(m, rw, rh, ow, oh, external), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
-          fallback(p, d, rw, rh, ow, oh) {}   // the motion fallback holds display-resolution vectors too
+          profile(p, d), fallback(p, d, rw, rh, ow, oh) {}   // the motion fallback holds display-resolution vectors too
     void inputs(VkCommandBuffer cb, const GameFrameM& frame);
     void result(VkCommandBuffer cb, const GameFrameM& frame);
 };
@@ -64,16 +66,27 @@ void GameUpscalerM::Impl::result(VkCommandBuffer cb, const GameFrameM& frame) {
     game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.outputWidth, g.outputHeight);
 }
 void GameUpscalerM::record(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFrame(cb); // begins and ends with barriers against all other work
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.renderWidth ? frame.renderWidth : g.width,
+                    frame.renderHeight ? frame.renderHeight : g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "exposure", "input", "network", "expansion", "reconstruction", "downsample", "output"});
+    g.inputs(cb, frame);
+    g.engine.recordFrame(cb, g.profile.pool(), g.profile.first());
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 void GameUpscalerM::recordFront(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFront(cb);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.renderWidth ? frame.renderWidth : g.width,
+                    frame.renderHeight ? frame.renderHeight : g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "exposure", "input", "external_network_wait", "expansion", "reconstruction", "downsample", "output"});
+    g.inputs(cb, frame);
+    g.engine.recordFront(cb, g.profile.pool(), g.profile.first());
 }
 void GameUpscalerM::recordBack(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->engine.recordBack(cb);
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.engine.recordBack(cb, g.profile.pool(), g.profile.first(4));
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 } // namespace d4r

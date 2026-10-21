@@ -11,6 +11,7 @@ struct GameFrameE {
     float motionScale[2] = {1, 1};              // NGX's MV scale
     float preExposure = 1, exposureScale = 1;   // the game's (DLSS.Pre.Exposure, DLSS.Exposure.Scale)
     bool reset = false;
+    GameProfile profile;
 };
 class GameUpscalerE {
 public:

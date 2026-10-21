@@ -8,6 +8,9 @@
 #include <cmath>
 
 namespace {
+bool stageTimingEnabled = false;
+unsigned stageTimingRows = 0;
+void stageTimingLog(const char* line) { std::cout << line << '\n'; ++stageTimingRows; }
 constexpr unsigned rotatingMasks[] = {15u, 14u, 13u, 11u, 15u, 8u};
 struct TestImage {
     Context& context;
@@ -139,6 +142,7 @@ std::vector<char> evaluate(Context& c, d4r::Model& model, const Case& test, unsi
         if (!queued) c.begin();
         const unsigned frameMask = rotateInputs ? rotatingMasks[frame] : mask;
         d4r::GameFrame f;
+        if (stageTimingEnabled) f.profile = {stageTimingLog, "test", frame + 1, true};
         f.color = color[slot]->game(7,9,frameMask&1,inputLayout);
         f.motion = motion[slot]->game(3,5,frameMask&2,inputLayout);
         f.depth = depth[slot]->game(11,13,frameMask&4,inputLayout);
@@ -217,6 +221,7 @@ std::vector<char> evaluateM(Context& c, d4r::MModel& model, const Case& test, un
         const unsigned slot = frame%slots;
         if (!queued) c.begin();
         d4r::GameFrameM f;
+        if (stageTimingEnabled) f.profile = {stageTimingLog, "test", frame + 1, true};
         const unsigned frameMask = rotateInputs ? rotatingMasks[frame] : mask;
         f.color=color[slot]->game(0,0,frameMask&1,layout); f.motion=motion[slot]->game(0,0,frameMask&2,layout);
         f.depth=depth[slot]->game(0,0,frameMask&4,layout); f.output=output[slot]->game(0,0,frameMask&8,VK_IMAGE_LAYOUT_GENERAL);
@@ -279,6 +284,25 @@ void checkDynamicM(Context& c, d4r::MModel& m) {
 }
 int main(int argc,char** argv) {
     try {
+        // Six temporal frames per model: read five completed profiles without waiting in the profiler,
+        // and compare the entire output sequence against the same adapter with instrumentation disabled.
+        if (argc == 5 && !std::strcmp(argv[1], "--profile")) {
+            Context c; c.create(2, true);
+            d4r::Model k(c.physical, c.device, argv[2], c.cache);
+            Case test;
+            auto reference = evaluate(c, k, test, 15, false);
+            stageTimingEnabled = true;
+            expectEqual(reference, evaluate(c, k, test, 15, false), "K profiling preserves output");
+            for (int i = 3; i <= 4; ++i) {
+                d4r::MModel model(c.physical, c.device, argv[i], c.cache);
+                stageTimingEnabled = false;
+                reference = evaluateM(c, model, test, 15, false);
+                stageTimingEnabled = true;
+                expectEqual(reference, evaluateM(c, model, test, 15, false), "M/L profiling preserves output");
+            }
+            if (stageTimingRows != 15) throw std::runtime_error("expected five completed stage profiles per model");
+            return 0;
+        }
         if (argc == 3 && !std::strcmp(argv[1], "--dynamic-ml")) {
             Context c; c.create(2,true);
             d4r::MModel m(c.physical,c.device,argv[2],c.cache);
@@ -286,7 +310,7 @@ int main(int argc,char** argv) {
             checkDynamicM(c,m);
             return 0;
         }
-        if(argc!=2 && argc!=3) throw std::runtime_error("usage: test-game K_MODEL_DIR [M_MODEL_DIR] | --dynamic-ml M_OR_L_MODEL_DIR");
+        if(argc!=2 && argc!=3) throw std::runtime_error("usage: test-game K_MODEL_DIR [M_MODEL_DIR] | --dynamic-ml M_OR_L_MODEL_DIR | --profile K_MODEL_DIR M_MODEL_DIR L_MODEL_DIR");
         // The reconstruction table NGX itself selected at these sizes (measured through its launch arguments),
         // on both sides of every threshold and for unequal axis ratios: {render w, h, output w, h, table}.
         {

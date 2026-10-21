@@ -929,6 +929,13 @@ static bool profile_log_frame(uint32_t frame)
     return profile_log_enabled() && (frame <= 5 || frame % profile_log_every() == 0);
 }
 
+static d4r::GameProfile engine_stage_profile(uint32_t frame, const char* name)
+{
+    if (!profile_enabled() || env_uint("D4R_PROFILE_GPU_TIMESTAMPS", 1) == 0)
+        return {};
+    return {[](const char* line) { logf("%s", line); }, name, frame, profile_log_frame(frame)};
+}
+
 using ProfileClock = std::chrono::steady_clock;
 static double profile_ms(ProfileClock::time_point start, ProfileClock::time_point end)
 {
@@ -10251,6 +10258,7 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     if (color == output || depth == output || motion == output)
         return refuse("input/output texture aliasing is not supported");
     d4r::GameFrameM game;
+    game.profile = engine_stage_profile(frame, name);
     using Source = EngineFrameSource;
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
@@ -10514,6 +10522,7 @@ static bool engine_evaluate_e(Feature& feature, ID3D12GraphicsCommandList* list,
     if (p.renderWidth > feature.outWidth || p.renderHeight > feature.outHeight)
         return refuse("the render size exceeds the output size");
     d4r::GameFrameE game;
+    game.profile = engine_stage_profile(frame, feature.preset == 6 ? "F" : "E");
     using Source = EngineFrameSource;
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
@@ -10935,6 +10944,7 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         if (input == output)
             return refuse("input/output texture aliasing is not supported");
     d4r::GameFrameR game;
+    game.profile = engine_stage_profile(frame, feature.preset == 6 ? "RR_F" : (feature.preset == 4 ? "RR_D" : "RR_E"));
     using Source = EngineFrameSource;
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
@@ -11171,6 +11181,7 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return refuse("input/output texture aliasing is not supported");
 
     d4r::GameFrame game;
+    game.profile = engine_stage_profile(frame, "K");
     using Source = EngineFrameSource;
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));

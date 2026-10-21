@@ -1,5 +1,6 @@
 #include "game_e.h"
 #include "game_internal.h"
+#include "game_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@ struct GameUpscalerE::Impl {
     EModel& model;
     EEngine engine;
     uint32_t width, height, outputWidth, outputHeight, motionWidth, motionHeight;
+    game_detail::StageProfile profile;
     game_detail::CanonicalInputs fallback;
     bool started = false;
     // The engine keeps one descriptor set per distinct combination of input and output views (runtime_e.inc, at most
@@ -26,7 +28,7 @@ struct GameUpscalerE::Impl {
     Impl(EModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, bool hdr, bool lowRes,
          bool autoExposure)
         : model(m), engine(m, rw, rh, ow, oh, hdr, lowRes, autoExposure), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
-          motionWidth(lowRes ? rw : ow), motionHeight(lowRes ? rh : oh), fallback(p, d, rw, rh, motionWidth, motionHeight) {}
+          motionWidth(lowRes ? rw : ow), motionHeight(lowRes ? rh : oh), profile(p, d), fallback(p, d, rw, rh, motionWidth, motionHeight) {}
 };
 GameUpscalerE::GameUpscalerE(EModel& model, VkPhysicalDevice physical, VkDevice device, uint32_t outputWidth, uint32_t outputHeight,
                              uint32_t renderWidth, uint32_t renderHeight, bool hdr, bool lowResMotion, bool autoExposure)
@@ -36,6 +38,8 @@ GameUpscalerE::~GameUpscalerE() = default;
 
 void GameUpscalerE::record(VkCommandBuffer cb, const GameFrameE& frame) {
     auto& g = *impl;
+    g.profile.begin(cb, frame.profile, g.width, g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "input_exposure", "network", "reconstruction", "output"});
     if (!gameColorFormat(frame.color.format) || !gameMotionFormat(frame.motion.format) ||
         !gameDepthFormat(frame.depth.format, frame.depth.aspect) || !gameOutputFormat(frame.output.format))
         throw std::runtime_error("unsupported game texture format");
@@ -92,7 +96,8 @@ void GameUpscalerE::record(VkCommandBuffer cb, const GameFrameE& frame) {
     images.exposure = frame.exposure.view;
     images.exposureLayout = frame.exposure.layout;
     g.engine.setFrame(images, s, directOutput ? FrameOutput{frame.output.view, frame.output.format} : FrameOutput{});
-    g.engine.recordFrame(cb);
+    g.engine.recordFrame(cb, g.profile.pool(), g.profile.first());
     if (!directOutput) game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.outputWidth, g.outputHeight);
+    g.profile.end(cb);
 }
 } // namespace d4r

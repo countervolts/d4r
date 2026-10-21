@@ -217,6 +217,7 @@ MangoHudConfig = fps,frametime,frame_timing=0,gpu_stats=0,cpu_stats=0,position=t
 
 [Debug]
 ; Measure stage timings and write sampled timing lines in the shim log (d4r_nvngx.log)
+; All engine backends emit D4R_ENGINE_STAGE_PROFILE rows (GPU milliseconds per stage).
 Profile = false
 ; Log the first 5 frames, then every Nth frame. 1 = every frame. Restart after changing.
 ; FSR RR stage summaries average N completed GPU samples. Env: D4R_PROFILE_LOG_EVERY

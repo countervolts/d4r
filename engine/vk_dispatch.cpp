@@ -7,6 +7,12 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     auto deviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instanceProc(instance, "vkGetDeviceProcAddr"));
     if (!deviceProc) return false;
     bool ok = true;
+    ok &= (vkTable.CreateEvent = reinterpret_cast<PFN_vkCreateEvent>(deviceProc(device, "vkCreateEvent"))) != nullptr;
+    ok &= (vkTable.DestroyEvent = reinterpret_cast<PFN_vkDestroyEvent>(deviceProc(device, "vkDestroyEvent"))) != nullptr;
+    ok &= (vkTable.GetEventStatus = reinterpret_cast<PFN_vkGetEventStatus>(deviceProc(device, "vkGetEventStatus"))) != nullptr;
+    ok &= (vkTable.ResetEvent = reinterpret_cast<PFN_vkResetEvent>(deviceProc(device, "vkResetEvent"))) != nullptr;
+    ok &= (vkTable.CmdSetEvent = reinterpret_cast<PFN_vkCmdSetEvent>(deviceProc(device, "vkCmdSetEvent"))) != nullptr;
+    ok &= (vkTable.GetPhysicalDeviceQueueFamilyProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(instanceProc(instance, "vkGetPhysicalDeviceQueueFamilyProperties"))) != nullptr;
     ok &= (vkTable.GetPhysicalDeviceFormatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(instanceProc(instance, "vkGetPhysicalDeviceFormatProperties"))) != nullptr;
     ok &= (vkTable.GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(instanceProc(instance, "vkGetPhysicalDeviceMemoryProperties"))) != nullptr;
     ok &= (vkTable.GetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(instanceProc(instance, "vkGetPhysicalDeviceProperties"))) != nullptr;
