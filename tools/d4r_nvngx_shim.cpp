@@ -10741,12 +10741,60 @@ static int start_engine_model_rr(const Feature& feature)
     return slot;
 }
 
+// Whether this game can use Ray Reconstruction: it ships NVIDIA's denoiser, as a game that offers it must, beside its
+// executable or in a folder it gave NGX init. d4r's own copy (the one the NGX core loads, also on the feature search
+// path) does not count; it is recognised by file identity, since Wine can reach the same folder through two drive
+// letters.
+static bool game_ships_denoiser()
+{
+    auto identify = [](const std::wstring& path, BY_HANDLE_FILE_INFORMATION& info) {
+        const HANDLE file = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        const bool known = GetFileInformationByHandle(file, &info) != 0;
+        CloseHandle(file);
+        return known;
+    };
+    auto same = [](const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMATION& b) {
+        return a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow &&
+               a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow;
+    };
+    auto directory_of = [](HMODULE module) {
+        wchar_t path[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+        std::wstring directory = length > 0 && length < MAX_PATH ? std::wstring(path, length) : std::wstring();
+        const size_t slash = directory.find_last_of(L"\\/");
+        directory.resize(slash == std::wstring::npos ? 0 : slash);
+        return directory;
+    };
+    BY_HANDLE_FILE_INFORMATION own = {};
+    const std::wstring self = directory_of(g_selfModule);
+    const bool haveOwn = !self.empty() && identify(self + L"\\nvngx_dlssd.dll", own);
+    std::vector<std::wstring> folders = g.paths;
+    folders.push_back(directory_of(nullptr));
+    for (std::wstring folder : folders)
+    {
+        while (!folder.empty() && (folder.back() == L'\\' || folder.back() == L'/'))
+            folder.pop_back();
+        if (folder.empty())
+            continue;
+        BY_HANDLE_FILE_INFORMATION info = {};
+        if (!identify(folder + L"\\nvngx_dlssd.dll", info) || (haveOwn && same(info, own)))
+            continue;
+        logf("engine backend: the game ships a denoiser (%ls\\nvngx_dlssd.dll)", folder.c_str());
+        return true;
+    }
+    return false;
+}
+
 // At NGX init, starts loading the engine models this configuration will use: Ray Reconstruction's (the model a feature
-// without a preset hint runs, normally preset F) and Super Sampling's when [DLSS] Model forces K, L or M (its HDR
-// model; LDR models still load at first use). On a cold shader cache their pipelines take seconds to compile (preset F
-// 3.7 s in Witcher 3 after a driver update), and games create their features well after they initialise NGX (64 s
-// there), so the compile no longer holds up the first frame. Only the models (pipelines and weights) load early;
-// every feature still creates its own resources at its first frame. D4R_ENGINE_PRELOAD=0 turns this off.
+// without a preset hint runs, normally preset F) when the game can use it (game_ships_denoiser, or [RayReconstruction]
+// Enable = true) and Super Sampling's when [DLSS] Model forces K, L or M (its HDR model; LDR models still load at
+// first use). On a cold shader cache their pipelines take seconds to compile (preset F 3.7 s in Witcher 3 after a
+// driver update), and games create their features well after they initialise NGX (64 s there), so the compile no
+// longer holds up the first frame. Only the models (pipelines and weights) load early; every feature still creates
+// its own resources at its first frame. D4R_ENGINE_PRELOAD=0 turns this off.
 static void start_engine_preload()
 {
     static std::once_flag once;
@@ -10760,7 +10808,13 @@ static void start_engine_preload()
         std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
         if (g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
             return;
-        const bool rr = rr_enabled() && rr_backend() == RrBackend::Dlss;
+        // without the game's denoiser, Ray Reconstruction's model loads at its first feature (most DLSS games have
+        // none: 4.7 - 5.4 s of one core on a cold shader cache and ~7 MiB of VRAM for nothing)
+        const bool rr = rr_enabled() && rr_backend() == RrBackend::Dlss &&
+                        (!env_string("D4R_RR_ENABLE").empty() || game_ships_denoiser());
+        if (rr_enabled() && rr_backend() == RrBackend::Dlss && !rr)
+            logf("engine backend: the game ships no nvngx_dlssd.dll: Ray Reconstruction's model loads at its first "
+                 "feature ([RayReconstruction] Enable = true loads it at NGX init)");
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
         const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || (sr == 13 && engine_m_dot2()));

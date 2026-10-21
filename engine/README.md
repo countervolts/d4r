@@ -338,11 +338,12 @@ The shim loads each model on first use from a folder next to it, or from a varia
 
 The models the configuration will use are loaded at NGX init instead, each on a thread of its own (2026-10-20):
 Ray Reconstruction's (the model a feature without a preset hint runs, preset F when `engine\rr-f` exists) when
-`[RayReconstruction] Backend = dlss`, and the HDR model of the preset `[DLSS] Model` forces (K when `[Engine]` runs K,
-L or M). On a cold shader cache (after a driver or model update) their pipelines take seconds to compile, and games
-create their features long after they initialise NGX, so the first frame no longer waits for them. Only the models
-load early (pipelines and weights: 8 MB for preset F, 2 MB for L); a feature still creates its own resources at its
-first frame. `D4R_ENGINE_PRELOAD=0` loads on first use as before.
+`[RayReconstruction] Backend = dlss` and the game ships `nvngx_dlssd.dll` (beside its executable or in a folder it
+gives NGX init; d4r's own copy does not count) or `[RayReconstruction] Enable = true`, and the HDR model of the preset
+`[DLSS] Model` forces (K when `[Engine]` runs K, L or M). On a cold shader cache (after a driver or model update) their
+pipelines take seconds to compile, and games create their features long after they initialise NGX, so the first frame
+no longer waits for them. Only the models load early (pipelines and weights: 8 MB for preset F, 2 MB for L); a
+feature still creates its own resources at its first frame. `D4R_ENGINE_PRELOAD=0` loads on first use as before.
 
 | D3D12 test app through the shim (`rr_backend_check.exe`, proton, 1280x720 -> 1440p) | Before | After |
 |---|---|---|
