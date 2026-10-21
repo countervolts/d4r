@@ -104,6 +104,21 @@ d4r's compilers, shaders, the D3D12 harness and glslang into the release):
   build K, M and L from that, and `--ldr` their LDR variants from the same frame (NGX's HDR and LDR stages read the
   same weights). About a minute per preset, ~280 MB of dumps that are deleted afterwards. The results are identical
   to the models built from full captures.
+- On RDNA2 the builder makes E, F, K and M (L has no engine path there). M's and L's network kernels (`rrlite_enc0`
+  ... `rrlite_dec0`) would be compiled by ZLUDA with emulated matrix products, minutes each, only for a frame whose
+  launches compile_m reads: `model_tools.py stub-ptx DLL DIR` writes each of their modules with empty kernel bodies
+  (same parameters and launch bounds) as `DIR/<FNV-1a 64 of the fatbin>.ptx`, and the test frame runs with
+  `D4R_CUDA_REPLACE_DIR=DIR` (the bridge loads it in place of the fatbin); its pixels are then not checked. On the
+  Deck the cold Super Resolution build with M takes about 150 s (M's frame about 30 s, over 10 minutes without the
+  stubs); `D4R_ENGINE_STUB_NETWORK=0|1` forces either. The M model is byte-identical to one built from a real frame.
+- The test frames run with `D4R_SHIM_GPU_INPUT_WAIT=0`: the replay dump synchronises and reads device memory at
+  every launch, and behind the GPU-side input wait NGX's output then came out empty.
+- NGX uploads every weight blob with `cuMemcpyHtoDAsync` from one reused host buffer and a `cuCtxSynchronize`
+  before each reuse. CUDA's asynchronous copies from pageable memory return once the source is staged; HIP's may
+  read it later, so with that synchronisation elided (`ElideNgxSync`) tensors arrived as zeros when the uploads
+  ran back to back: M's input-stage weights with the stubs (every time on the Deck), and in every E/F capture the
+  80-byte last head tensor of the reconstruction kernel. With the elision the bridge stages the source itself and
+  frees the copy once an event behind the upload has completed.
 
 ## Ordinary frames, without a capture
 

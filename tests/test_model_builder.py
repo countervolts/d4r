@@ -78,6 +78,51 @@ class ModelBuildTests(unittest.TestCase):
             pixels.tofile(directory / 'out.raw')
             with self.assertRaises(ValueError): model_tools.capture(directory, 'k')
 
+    def test_stub_ptx_empties_network_kernels_and_keys_them_by_fatbin_hash(self):
+        import struct
+        def fatbin(ptx):
+            entry = struct.pack('<HHIQ', 1, 0, 64, len(ptx)) + bytes(48) + ptx
+            return struct.pack('<IHHQ', 0xBA55ED50, 1, 16, len(entry)) + entry
+        body = '{\n.reg .b32 %r<9>;\nmma.sync.aligned.m16n8k16;\nret;\n}\n'
+        layer = ('.version 8.7\n.target sm_89\n.address_size 64\n\n.visible .entry rrlite_enc1_4x4(\n'
+                 '.param .align 8 .b8 rrlite_enc1_4x4_param_0[56]\n)\n.maxntid 64, 1, 1\n' + body).encode()
+        other = b'.version 8.7\n.target sm_89\n.address_size 64\n.visible .entry rrlite_post_3_1_mvlo_hdr(\n)\n{\nret;\n}\n'
+        image = b'MZ' + bytes(30) + fatbin(layer) + bytes(13) + fatbin(other)
+        with tempfile.TemporaryDirectory() as t, contextlib.redirect_stdout(io.StringIO()):
+            dll, out = Path(t) / 'nvngx_dlss.dll', Path(t) / 'stubs'
+            dll.write_bytes(image)
+            model_tools.stub_ptx(dll, out)
+            h = 0xcbf29ce484222325
+            for b in fatbin(layer):
+                h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+            self.assertEqual([p.name for p in out.iterdir()], [f'{h:016x}.ptx'])   # the post kernel stays real
+            stub = (out / f'{h:016x}.ptx').read_text()
+            self.assertIn('.param .align 8 .b8 rrlite_enc1_4x4_param_0[56]', stub)
+            self.assertIn('.maxntid 64, 1, 1', stub)
+            self.assertIn('ret;', stub)
+            self.assertNotIn('mma', stub)
+            self.assertTrue(stub.startswith('.version 8.7\n.target sm_89\n.address_size 64\n'))
+
+    def test_stubbed_capture_skips_only_the_pixel_check(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as t:
+            directory = Path(t)
+            np.zeros((720, 1280, 4), dtype=np.float16).tofile(directory / 'out.raw')
+            replay = directory / 'replay'
+            replay.mkdir()
+            kernels = ['rrlite_enc1_4x4', 'rrlite_enc2_4x4'] + ['rrlite_enc3_tube_4x4'] * 6 + [
+                'rrlite_dec2_4x4', 'rrlite_dec1_4x4', 'rrlite_enc0_4x4_mvlo_hdr_folded', 'rrlite_dec0_4x4_folded']
+            for i, kernel in enumerate(kernels):
+                d = replay / f'replay-{i + 1:06d}-{kernel}'
+                d.mkdir()
+                (d / 'manifest.txt').write_text(f'kernel {kernel}\nargs 8\nalloc 0 0x1000 4\npointer 0 0 0\n')
+                (d / 'args.bin').write_bytes(bytes(8))
+                (d / 'alloc-0.bin').write_bytes(bytes(4))
+            with self.assertRaises(ValueError): model_tools.capture(directory, 'm')
+            model_tools.capture(directory, 'm', stubbed=True)
+            (d / 'alloc-0.bin').write_bytes(b'')
+            with self.assertRaises(ValueError): model_tools.capture(directory, 'm', stubbed=True)
+
     def test_model_files_lists_every_file_rr_txt_names(self):
         text = (ROOT / 'packaging/build_engine_models.sh').read_text()
         start = text.index('model_files() {')

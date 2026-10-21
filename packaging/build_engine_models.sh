@@ -6,8 +6,8 @@
 #        bash d4r/tools/build-engine-models.sh --find-proton      prints the GE-Proton it would use (or nothing)
 #        bash d4r/tools/build-engine-models.sh --list-sr-models   prints the Super Resolution models it builds here
 #   Ray Reconstruction  engine/rr-d, rr-e, rr-f   from d4r/nvngx_dlssd.dll 310.9.1 alone (about half a minute)
-#   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr (on RDNA2 only e, f, k, k-ldr; D4R_ENGINE_ALL_MODELS=1
-#                       builds L and M there too, which takes most of an hour)
+#   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr (on RDNA2 no l, l-ldr; D4R_ENGINE_ALL_MODELS=1
+#                       builds L there too)
 #                       NVIDIA's DLSS keeps these weights packed in nvngx_dlss.dll; they are read where NGX unpacks
 #                       them: the bundled D3D12 test app renders one frame per model through this d4r folder under
 #                       GE-Proton, and the uploads are saved (the frames after the first render at the same time;
@@ -60,13 +60,23 @@ gpu_arch() {   # the GPU the native kernels are chosen for: D4R_GPU_ARCH, else t
   [[ -z "$found" ]] || printf 'gfx%d%d%x\n' $((found / 10000)) $((found / 100 % 100)) $((found % 100))
 }
 sr_models() {
-  # RDNA2 has native kernels for K's layers only: L's and M's test frames would compile their transformer layers
-  # with emulated matrix products for most of an hour, so d4r's normal path keeps those two models there
+  # RDNA2: M runs on the engine's v_dot2 stages; L has no such stages (the engine cannot run it there), so its test
+  # frame would only cost the compile of its transformer layers with emulated matrix products
   if [[ "${D4R_ENGINE_ALL_MODELS:-0}" != 1 && "$(gpu_arch)" == gfx103* ]]; then
-    echo e f k k-ldr
+    echo e f k k-ldr m m-ldr
   else
     echo e f k k-ldr l l-ldr m m-ldr
   fi
+}
+stub_network() {
+  # The L/M test frames only provide their network layers' launches (arguments and weight uploads): on RDNA2 those
+  # layers run as empty kernels (model_tools.py stub-ptx), so ZLUDA does not compile them with emulated matrix
+  # products for minutes each. D4R_ENGINE_STUB_NETWORK=0 / 1 forces either.
+  case "${D4R_ENGINE_STUB_NETWORK:-auto}" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) [[ "$(gpu_arch)" == gfx103* ]] ;;
+  esac
 }
 if (( LIST_SR )); then sr_models; exit 0; fi
 if (( FIND_PROTON )); then find_proton; [[ -z "$PROTON" ]] || printf '%s\n' "$PROTON"; exit 0; fi
@@ -173,19 +183,24 @@ if (( DO_SR )); then
   fi
   PTX="$WORK/ptx"
   winpath() { printf 'Z:%s' "$(printf '%s' "$1" | tr '/' '\\')"; }
+  STUBS="$WORK/stubs"
   dump() {   # dump NAME PRESET PATTERN [FLAGS]: the uploads of one frame of preset PRESET in WORK/NAME/replay
-    local w="$WORK/$1"
+    local w="$WORK/$1" stub=()
     mkdir -p "$w/replay"
+    # L and M with empty network kernels (stub_network): their frame's pixels are not checked
+    [[ ! -d "${STUBS:-}" || ( "$1" != l && "$1" != m ) ]] || stub=(D4R_CUDA_REPLACE_DIR="$STUBS")
+    # CPU input polling: the replay dump synchronizes and reads device memory at every launch, which the GPU-side
+    # input wait does not allow (NGX's output came out empty)
     printf '  rendering one frame with model %s through d4r (GE-Proton %s)...\n' "$1" "$(basename "$PROTON")"
     (cd "$APP" && python3 "$MODEL_TOOLS" run --log "$w/run.log" --timeout "${D4R_MODEL_TIMEOUT:-900}" -- \
       env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" STEAM_COMPAT_DATA_PATH="$WORK/prefix" \
       PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='d3d12=n,b;d3d12core=n,b;d4r12core=n,b' \
-      D4R_ENGINE=0 D4R_DLSS_PRESET="$2" D4R_HARNESS_CREATE_FLAGS="${4:-0x4B}" D4R_SHIM_LOG="$(winpath "$w/shim.log")" \
+      D4R_ENGINE=0 D4R_SHIM_GPU_INPUT_WAIT=0 "${stub[@]}" D4R_DLSS_PRESET="$2" D4R_HARNESS_CREATE_FLAGS="${4:-0x4B}" D4R_SHIM_LOG="$(winpath "$w/shim.log")" \
       D4R_CUDA_TRACE="$(winpath "$w/cuda.log")" D4R_CUDA_VERBOSE=1 \
       D4R_CUDA_REPLAY_DUMP_DIR="$w/replay" D4R_CUDA_REPLAY_DUMP_LIMIT=60 \
       "$PROTON/proton" run "$APP/d3d12_dlss_harness.exe" "$(winpath "$RUNTIME/nvngx.dll")" "$(winpath "$w/out.raw")" \
       1 640 360 1280 720) || fail "model $1: capture process failed; diagnostics in $w"
-    if ! python3 "$MODEL_TOOLS" capture "$w" "$1"; then
+    if ! python3 "$MODEL_TOOLS" capture "$w" "$1" ${stub[@]:+--stubbed}; then
       [[ ! -f "$w/shim.log" ]] || tail -n 15 "$w/shim.log" >&2
       fail "model $1: incomplete or invalid test frame (diagnostics in $w)"
     fi
@@ -193,8 +208,11 @@ if (( DO_SR )); then
   mkdir -p "$WORK/prefix"
   models=" $(sr_models) "
   echo "Building the Super Resolution models ($(sr_models)) from what NGX uploads..."
-  [[ "$models" == *" m "* ]] || echo "  (L and M are left to d4r's normal path on this GPU ($(gpu_arch)); D4R_ENGINE_ALL_MODELS=1 builds them)"
+  [[ "$models" == *" l "* ]] || echo "  (L is left to d4r's normal path on this GPU ($(gpu_arch)); D4R_ENGINE_ALL_MODELS=1 builds it)"
   run ptx.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$PTX"
+  if [[ "$models" == *" m "* || "$models" == *" l "* ]] && stub_network; then
+    run stubs.log python3 "$MODEL_TOOLS" stub-ptx "$DLL" "$STUBS"
+  fi
   # Each test frame compiles its DLSS kernels in one thread, so the frames render at the same time; the first
   # renders alone because it creates the Proton prefix. A model is built as soon as its frame is done.
   declare -A JOBS
@@ -204,10 +222,8 @@ if (( DO_SR )); then
   dump e 5 cuda_engine_input_kernel_rel 0xa
   start f 6 cuda_engine_input_kernel_rel 0xa
   start k 11 dltss_pwin_dec0_layer
-  if [[ "$models" == *" m "* ]]; then
-    start l 12 'rrlite_enc0_4x4_mvlo_hdr$'
-    start m 13 rrlite_enc0_4x4_mvlo_hdr_folded
-  fi
+  [[ "$models" != *" l "* ]] || start l 12 'rrlite_enc0_4x4_mvlo_hdr$'
+  [[ "$models" != *" m "* ]] || start m 13 rrlite_enc0_4x4_mvlo_hdr_folded
   for c in "e E" "f F"; do
     set -- $c
     [[ $1 == e ]] || finish "$1"

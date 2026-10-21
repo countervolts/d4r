@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -31,15 +32,16 @@ def manifest(directory, write=False):
         raise ValueError(f'{directory}: missing, changed or unexpected model files; rebuild the models')
 
 
-def capture(directory, name):
-    """A completed, finite frame and all files referenced by each network-layer capture."""
+def capture(directory, name, stubbed=False):
+    """A completed, finite frame and all files referenced by each network-layer capture. With stubbed (the network's
+    kernels replaced by empty ones, stub_ptx) the frame's pixels are not checked: only its launches are used."""
     import numpy as np
     directory = Path(directory)
     output = directory / 'out.raw'
     if output.stat().st_size != 1280 * 720 * 8:
         raise ValueError('capture did not produce a complete RGBA16F frame')
     pixels = np.fromfile(output, dtype=np.float16).reshape(-1, 4)
-    if not np.isfinite(pixels).all() or not np.any(pixels[:, :3]):
+    if not stubbed and (not np.isfinite(pixels).all() or not np.any(pixels[:, :3])):
         raise ValueError('capture produced a nonfinite or empty frame')
     if name in ('e', 'f'):
         launches = sorted((directory / 'replay').glob('replay-*'))
@@ -90,6 +92,50 @@ def capture(directory, name):
         for r in rows:
             if r[0] == 'pointer' and (r[2] not in allocations or not 0 <= int(r[3]) < allocations[r[2]]):
                 raise ValueError(f'{kernel}: invalid captured pointer')
+
+
+# The network layers of presets L and M, whose launches compile_m.py reads (their arguments and weight uploads, never
+# their results). On RDNA2 ZLUDA compiles each of them for minutes (matrix products emulated), so the model build
+# replaces them with empty kernels of the same parameters.
+NETWORK_KERNELS = re.compile(r'rrlite_(enc0_4x4_\w+|enc1_4x4|enc2_4x4|enc3_tube_4x4|dec2_4x4|dec1_4x4|dec0_4x4\w*)$')
+
+
+def stub_ptx(dll, out):
+    """For every CUDA fatbin of dll whose PTX has a network kernel: out/<FNV-1a 64 of the fatbin>.ptx, the PTX with
+    every kernel's body empty (the wine_nvcuda_bridge D4R_CUDA_REPLACE_DIR hook loads it in place of the fatbin)"""
+    tools = Path(__file__).resolve().parent
+    for d in (tools / 'kernels' / 'tools', tools.parent / 'kernels' / 'tools'):
+        if (d / 'extract_dlss_ptx.py').is_file():
+            sys.path.insert(0, str(d))
+            break
+    import extract_dlss_ptx as x
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    stubs = 0
+    for _, fatbin in x.fatbins(Path(dll).read_bytes()):
+        entries = list(x.ptx_entries(fatbin))
+        if len(entries) != 1:
+            continue
+        text = entries[0].rstrip(b'\0').decode('latin-1')
+        kernels = re.findall(r'\.visible\s+\.entry\s+(\w+)\s*\(', text)
+        if not kernels or not all(NETWORK_KERNELS.match(k) for k in kernels):
+            continue
+        if re.search(r'^\s*\.(global|const)\s', text, re.M):
+            raise ValueError(f'{kernels[0]}: module globals; cannot stub it')
+        head = re.match(r'(.*?)(?=\.visible\s+\.entry)', text, re.S).group(1)
+        head = ''.join(l + '\n' for l in head.splitlines() if l.startswith(('.version', '.target', '.address_size')))
+        # each kernel's declaration and performance directives up to its body, then an empty body
+        bodies = [m.group(1) + '{\n\tret;\n}\n' for m in re.finditer(r'(\.visible\s+\.entry\s+\w+\s*\([^)]*\)[^{]*)\{', text)]
+        if len(bodies) != len(kernels):
+            raise ValueError(f'{kernels[0]}: unexpected PTX layout')
+        h = 0xcbf29ce484222325
+        for b in fatbin:
+            h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+        (out / f'{h:016x}.ptx').write_text(head + '\n'.join(bodies), encoding='latin-1')
+        stubs += 1
+    if not stubs:
+        raise ValueError(f'{dll}: no network kernels found')
+    print(f'{stubs} network modules stubbed in {out}')
 
 
 def run(log, timeout, command):
@@ -164,6 +210,10 @@ def main():
     p = sub.add_parser('capture')
     p.add_argument('directory', type=Path)
     p.add_argument('name', choices=('e', 'f', 'k', 'm', 'l'))
+    p.add_argument('--stubbed', action='store_true')
+    p = sub.add_parser('stub-ptx')
+    p.add_argument('dll', type=Path)
+    p.add_argument('out', type=Path)
     p = sub.add_parser('run')
     p.add_argument('--log', required=True)
     p.add_argument('--timeout', type=float, default=900)
@@ -173,7 +223,9 @@ def main():
         if a.action == 'run':
             return run(a.log, a.timeout, a.command)
         if a.action == 'capture':
-            capture(a.directory, a.name)
+            capture(a.directory, a.name, a.stubbed)
+        elif a.action == 'stub-ptx':
+            stub_ptx(a.dll, a.out)
         elif a.action == 'manifest':
             manifest(a.directory, write=True)
         else:
