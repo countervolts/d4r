@@ -5,6 +5,12 @@
 #ifndef EP
 #define EP p
 #endif
+// F8T: the type of an FP8 feature slot; F8OF(h): a binary16 value on the FP8 grid as one. Without FP8 support (the
+// v_dot2 stages, fp8_soft.glsl) the slots are binary16 values on the FP8 grid.
+#ifndef F8T
+#define F8T floate4m3_t
+#define F8OF(h) floate4m3_t(h)
+#endif
 const float L10 = 3.3219281;
 // LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no exposure and no
 // range compression anywhere.
@@ -31,17 +37,17 @@ float colour1(float v) { return compress1(isinf(v) || isnan(v) ? 0.0 : min(v, 32
 ivec2 texel(ivec2 t) { return ivec2(t.x > 0 ? min(t.x, EP.size.x - 1) : 0, t.y > 0 ? min(t.y, EP.size.y - 1) : 0); }
 vec2 motion(ivec2 t) { return EP.mvScale * (EP.mvOffs + texelFetch(motionTex, texel(t), 0).xy); }
 // NGX's dithered truncation of an f16 value to the FP8 grid
-floate4m3_t dither(float v, uint n)
+F8T dither(float v, uint n)
 {
     const float16_t h = float16_t(isinf(v) || isnan(v) ? 0.0 : min(v, 1024.0));
     const uint e = uint(float16BitsToUint16(h)) & 0xFC00u;
     precise float16_t added = h + uint16BitsToFloat16(uint16_t(e | n));
     precise float16_t t = added - uint16BitsToFloat16(uint16_t(e));
     const float16_t r = uint16BitsToFloat16(uint16_t(uint(float16BitsToUint16(t)) & 0xFF80u));
-    return floate4m3_t(clamp(r, float16_t(-448.0), float16_t(448.0)));
+    return F8OF(clamp(r, float16_t(-448.0), float16_t(448.0)));
 }
 // The 32 dithered FP8 feature slots of block pixel pi (16 per plane) and the motion candidates of the pixel.
-void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, out floate4m3_t fe[32])
+void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, out F8T fe[32])
 {
     const uint px = pi & 7u, py = pi >> 3;
     const ivec2 raw = block + ivec2(px, py), a = abs(raw);

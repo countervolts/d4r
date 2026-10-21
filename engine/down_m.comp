@@ -29,8 +29,12 @@ layout(set = 0, binding = 2, FINAL_OUTPUT_FORMAT) uniform writeonly image2D outI
 layout(set = 0, binding = 3, std430) readonly buffer Src { uint w[]; } src;
 shared f16vec4 rows[TILE_H * BLOCK_X];      // after the horizontal pass
 // The horizontal pass reads the source texels straight into registers, without a shared tile: an invocation filters
-// SEG output columns of one source row from the 3 SEG / 2 + 4 texels around them.
+// SEG output columns of one source row from the 3 SEG / 2 + 4 texels around them (SEG even). SEG 4 keeps 200 of the
+// 512 invocations busy, SEG 2 400 with more texels read: the dot2 build (RDNA2) takes 2 (Steam Deck at 720p 498 ->
+// 393 us), the others 4 (RX 9070 XT 16.4 against 18.0 us). The output is the same.
+#ifndef SEG
 #define SEG 4
+#endif
 #define SPAN (3 * SEG / 2 + 4)
 f16vec3 unpack(uint w)
 {

@@ -48,7 +48,8 @@ shader uses wave64 and computes reconstruction and temporal accumulation in one 
 Requirements: C++17, Vulkan headers/loader, Python with NumPy, and `glslangValidator`. The GPU/driver must support
 Vulkan 1.3, `VK_KHR_cooperative_matrix` with 16x16x16 f16 operands/f32 accumulation, wave32/wave64 subgroup control,
 f16 storage/arithmetic, shader int16, and extended storage-image formats. The executable checks these capabilities.
-K also runs without cooperative matrices (RDNA2): see [Preset K without cooperative matrices](#preset-k-without-cooperative-matrices-rdna2).
+K also runs without cooperative matrices (RDNA2): see [Preset K without cooperative matrices](#preset-k-without-cooperative-matrices-rdna2),
+and M without cooperative matrices or FP8: see [Preset M without cooperative matrices or FP8](#preset-m-without-cooperative-matrices-or-fp8-rdna2).
 
 A model directory holds values read from NVIDIA's DLSS (`weights.bin`, `offsets.bin`, `lut.bin`, `hipnet.bin`,
 `model.json`) next to d4r's compiled shaders. Build it from your own `nvngx_dlss.dll` and keep it on your machine:
@@ -1443,6 +1444,122 @@ issue all loads first (one memory latency instead of one per element: 1.9 ms of 
 (a full instruction); RADV caps shared-memory loads at 64 bits. One miscompile: an array copy `tb = tn` followed by
 a store to `tn` read the new values; the shader copies element by element.
 
+## Preset M without cooperative matrices or FP8 (RDNA2)
+
+RDNA2 has neither the FP8 cooperative matrices of `layer_m.comp` nor `VK_EXT_shader_float8`, so preset M ran on the
+CUDA backend there. `layer_m_dot2.comp` is `layer_m.comp`'s relaxed build (`M_RELAXED`, `M_RESIDUAL_F32`: what
+RDNA3/4 run by default) on `v_dot2_f32_f16`, the same way `layer_dot2.comp` is K's: binary16 pairs, f32
+accumulation. FP8 values are exact in binary16, so those products are exact; FP8 conversions are packed binary16 and
+integer arithmetic (`fp8_soft.glsl`). The MLP, two thirds of the network's multiply-adds, and the attention output
+projection run on `v_dot4_i32_i8` (twice the rate) instead: int8 inputs with one scale per token, int8 weights with
+one scale per column. `enc0_m.comp`
+and `dec0_m.comp` have `DOT2` builds of their products, and `merge_m_dot2.comp` is the encoders' patch merge (int8
+as well).
+
+- The weights: the runtime widens `weights8.bin`'s FP8 matrices to binary16 pairs when it loads the model
+  (`runtime_m.inc` `widenM`; matrix W[K][N] at FP8 byte offset o becomes [K/2][N] pairs at dword o / 2), and packs
+  the MLP's, the output projections' and the patch merges' as int8 words with their column scales there, so a model
+  directory serves both networks. `compile_m.py` writes `<layer>_dot2.spv`, `m_merge1/2_dot2.spv`,
+  `enc0_m_dot2.spv`, `dec0_m_dot2.spv` and `down_m[_rgb10]_dot2.spv` (shapes: `test_m.dot2_defines`,
+  `dot2_merge_defines`).
+- A workgroup is an 8x8-token block (four windows), two waves per head (`TSPLIT`), a lane owns two tokens. The
+  products with weights take them from scalar memory (the waves split the output channels); attention runs in
+  registers with DPP8 broadcasts within groups of eight lanes, as in K. The norms' sums of squares are per wave
+  partial sums that meet in shared memory, so every wave normalises its own channels.
+- The MLP in int8: norm 2 keeps its FP8-grid values in registers, the tokens' largest magnitudes meet in shared
+  memory, and every wave writes its channels as int8 in place of the binary16 rows (no extra shared memory). A
+  hidden chunk's 32 values get one scale per token and chunk the same way (one more barrier per chunk); the int32
+  sums times the two scales go into the f32 residual. The weights' int8 is per column of each chunk's w1 and w2.
+- The attention output projection in int8: every head writes its 32 outputs' largest magnitude per token to shared
+  memory, the heads' outputs get one scale per token across the heads and replace the normalised rows as int8; wo is
+  one [32 NH][C] int8 matrix with C column scales (the heads' [32][C] blocks are consecutive in `weights8.bin`; the
+  runtime checks it). The layers 2-4.4% faster (network 11.44 -> 11.10 ms at 720p), the final image 0.4 dB further
+  on the first frame, the second unchanged.
+- The encoders' patch merge is its own dispatch after the block (8x8 merged tokens per workgroup, waves split the
+  output channels, scalar weights): inside the block the weights would be per lane, about twice the time. Its
+  products are int8, one scale per sub-token from its largest FP8 code (the codes' magnitudes are ordered like the
+  values, so a shared-memory `atomicMax` finds it): merge1 323 -> 303 us, merge2 173 -> 160 us at 800p, the merged
+  tokens 0.1 dB further from NGX's. Half of the merge's time is the products, the rest the loads and quantisation.
+- `enc0_m`/`dec0_m` `DOT2`: workgroups of 2x2 blocks (four waves); every wave gathers or loads its block into
+  shared memory, then lanes are tokens and waves split the channels, with scalar weights.
+- Roundings. RADV folds `float(float16_t(x))` and the `packHalf2x16` round trip away (`round_half.glsl`), so
+  `layer_m.comp`'s relaxed build in fact rounds its f32 accumulators straight to FP8. The dot2 stages do the same,
+  exactly: `e4m3GridF32` is x + M - M with M = 1.5 * 2^(e + 20) for x's exponent e, as two fmas (equal to the
+  integer conversion for every finite f32 but the sign of zero, checked on 4.2 million values on both GPUs).
+  Rounding to binary16 first and then to FP8 in packed arithmetic was 1-2.6 dB further from the relaxed build per
+  layer. The input and expansion stages' binary16 rounding after every 32 products uses the hardware conversion with
+  a binary16 clamp in between, which RADV does not fold (`roundHalfSat`: equal to `roundHalfValue` but that sums from
+  65520 saturate at 65504): input stage 1170 -> 933 us, expansion 642 -> 542 us on the Deck, same output bits.
+- Barriers: between the dot2 network's dispatches the runtime records a memory barrier (`nextStage`), not the
+  execution-only one the matrix layers use (`emptyStage`). With the execution-only barrier one 4x4 window came out
+  wrong in about every second 720p frame, a different one run to run: the layers read their inputs through the
+  vector caches, which then served lines of a ping-pong buffer read two layers earlier. The matrix network was
+  deterministic over six runs with `emptyStage` and is unchanged.
+- The stages around the network: with the dot2 network the reconstruction runs as wave32 (1362 -> 1252 us on the
+  Deck; `D4R_ENGINE_M_STAGE_WAVE=32|64` forces either), and the downsample uses `down_m_dot2.spv`, built with
+  `SEG=2` (two pixels per lane instead of four: 498 -> 393 us, same output; on the RX 9070 XT `SEG=2` is slower,
+  16.4 -> 18.0 us, so the matrix path keeps 4).
+
+Selection: `MModel(..., dot2)`; the shim (`engine_m_dot2()`) runs these stages when the device has neither
+`VK_EXT_shader_float8` nor f16 cooperative matrices, so RDNA3 keeps its native HIP M kernels and L, which has no
+such stages, stays on the CUDA backend without FP8; `D4R_ENGINE_M_NETWORK=dot2` forces them on a GPU without FP8
+(and `dot2|matrix` overrides in `d4r-m`; dot2 also runs on RDNA3/4 for testing). `d4r-m` picks dot2 when the
+device has no FP8 cooperative matrices. A model built before this has no `_dot2` shaders: loading it fails with
+the message to rebuild it with the current `compile_m.py`, and the shim uses the CUDA backend.
+
+Accuracy:
+- `test_m.py --dot2`, each layer on NGX's captured inputs (640x360 -> 1280x720) against NGX's outputs: 34.4-41.7 dB
+  (before the int8 output projection 34.7-42.0 dB); the relaxed matrix build
+  (`M_DEFS='-DM_RELAXED -DM_RESIDUAL_F32 -DWPW=2'`) 35.4-42.6 dB, the dot2 stages with a binary16 MLP 35.3-42.5 dB.
+  Against the relaxed matrix build on random FP8 inputs (RX 9070 XT): 38.5-41 dB (with the binary16 MLP 40-44 dB).
+- `DOT2=1 test_frame_m.py`, two frames with the engine's own intermediate data and history, final image against
+  the capture: 36.5 and 36.4 dB (before the int8 output projection 36.9 and 36.5 dB, before the int8 merge 37.1
+  and 36.4 dB); the relaxed matrix build 37.5 and 36.8 dB, with the binary16 MLP 37.6 and 36.8 dB.
+- The D3D12 harness (ten temporal frames, 640x360 -> 1280x720, RX 9070 XT): 35.5 dB against the exact build, the
+  same as before the int8 output projection (then 35.7 dB against the relaxed matrix network, which is itself
+  35.9 dB from the exact one; int8 MLP only: 35.6 and 35.9 dB; binary16 MLP: 35.8 and 35.9 dB).
+  The dot2 output is the same on every run.
+
+Steam Deck (gfx1033, RADV, GPU fixed at 1600 MHz), 2026-10-20/21:
+
+| | First version | binary16 MLP | int8 MLP | int8 merges, wave32 reconstruction, SEG 2 | int8 output projection (now) |
+|---|---:|---:|---:|---:|---:|
+| `d4r-m`, 640x360 -> 1280x720, GPU time per frame | 24.6 ms | 17.2 ms | 14.8 ms | 14.5 ms (14.68) | 14.35 ms |
+| of it: network | 20.6 ms | 13.8 ms | 11.4 ms | 11.35 ms (11.44) | 11.10 ms |
+| input / expansion / reconstruction / downsample | | 0.93 / 0.54 / 1.36 / 0.50 ms | the same | 0.93 / 0.54 / 1.25 / 0.39 ms | the same |
+| D3D12 harness through the shim, 640x400 -> 1280x800 | 28.4 ms | 20.6 ms | 18.0 ms | 17.7 ms | 17.3 ms |
+| D3D12 harness through the shim, 960x540 -> 1920x1080 | 51.5 ms | 36.5 ms | 31.7 ms | 31.2 ms | 30.7 ms |
+
+The last two columns are three interleaved `d4r-m` runs and two interleaved harness runs of 200 frames each
+(medians; in brackets the earlier build in those runs).
+
+K in the same harness: 11.6 ms at 800p, 18.7 ms at 1080p. The layers at 640x360 -> 1280x720 (us, merges included):
+enc1 2424, enc2 1560, tube 559-621 each, dec2 1462, dec1 2347 (fp16 output projection: 2478, 1622, 576-644, 1515,
+2392; binary16 MLP: 2876, 1953, 750-830, 1819, 2753). The network is 15.1 GMAC per frame there (the windows of the
+shifted grid included), 9.7 of them in the MLP: 6.3 ms at the Deck's v_dot2 rate (1.64 TMAC/s, 1.51 measured in a
+pure loop) and v_dot4 rate for the MLP, so the network runs at 55% of that; with the binary16 MLP it ran at 67% of
+its 9.2 ms. The tube has 66 workgroups for eight CUs. Removing parts of a layer (binary16 MLP, 320x200 tokens,
+enc1): the Q/V and output projections cost what the peak rate predicts
+(320 and 175 us against 340 and 170), the MLP runs at about 80%; the rest is the FP8 roundings (12% before the fma
+form, which took 2-5% off every layer), GELU (3%), the norms, loads, stores and barriers. Every layer has 128 VGPRs
+(no spills) and 13 KiB (C = 64) or 22 KiB of shared memory: eight waves per SIMD either way.
+
+What changed from the first version: the patch merge out of the block, the parallel norms, two waves per head
+(`TSPLIT`), the expansion over 8 low-resolution tokens per task when the workgroup has more lanes than column quads,
+the input and expansion stages over 2x2 blocks, the two roundings above, the int8 MLP (its first matrix alone: the
+layers 9-15% faster, final image -0.3 dB; both: 12-22%, -0.4 dB), the int8 patch merges and the int8 output
+projection.
+Not kept: Q and V in int8 as well (norm 1 like norm 2): another 5-10% per layer, but 1-2.3 dB per layer against
+NGX and the final image 0.7 dB further (36.4 and 36.1 dB): attention is sensitive to them. Not useful:
+four-dword-aligned shared-memory reads in the input stage (unchanged). Also not kept, 2026-10-21:
+- The decoders' expansion in int8 (one scale per low-resolution token): dec2 1513 -> 1470 us, dec1 2432 -> 2347 us,
+  but those layers 1.6 and 1.8 dB further from NGX and the first frame 0.3 dB.
+- The tube's tail: its time is linear in the workgroup count (7.7 us each), so the last partial round of the 66
+  workgroups on eight CUs costs nothing extra.
+- What is left outside the network is texture-bound: of the input stage's 934 us the product is 240 us (at the
+  v_dot2 rate), the gather the rest; of the reconstruction's 1250 us the history fetches are about 350 us and the
+  Gaussian loop 60 us, over a floor of about 680 us.
+
 ## Files
 
 | File | Role |
@@ -1456,6 +1573,7 @@ a store to `tn` read the new values; the shader copies element by element.
 | `prepare_frames.py` | Ordinary raw HDR frame preparation without NGX parameter blocks |
 | `input_k.comp`, `layer.comp`, `output_k.comp` | Own input, fused network, and reconstruction shaders |
 | `layer_dot2.comp` | Preset K's network without cooperative matrices (RDNA2), `<layer>_dot2.spv` |
+| `layer_m_dot2.comp`, `merge_m_dot2.comp`, `fp8_soft.glsl` | Preset M's network and the encoders' patch merges without cooperative matrices or FP8 (RDNA2): v_dot2 and v_dot4 (int8 MLP and patch merges), FP8 in binary16 and integer arithmetic |
 | `m_model.py`, `layer_m.comp`, `test_m.py` | Preset M: logical weights and numpy model, layer shader, tiled FP8 packer and per-layer test |
 | `hip_net.h`, `hip_net.cpp` | Shared M/K native HIP network loading and immutable graph execution, for native Linux programs |
 | `enc0_m.comp`, `dec0_m.comp`, `post_m.comp`, `down_m.comp` | Preset M: input, expansion, reconstruction and downsample stages |

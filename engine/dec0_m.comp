@@ -3,16 +3,36 @@
 // values per render pixel (one matrix product per 4x4-token block) and turns them into the reconstruction's
 // per-pixel inputs: a recurrent four-channel feature blended with its reprojected history, three gate values,
 // three softmax weights and a 2x2 covariance. See M_NOTES.md.
+// DOT2: the same stage for GPUs without cooperative matrices or FP8 (RDNA2): the product on v_dot2_f32_f16 with the
+// same binary16 rounding after every 32 products, FP8 in integer arithmetic (fp8_soft.glsl); binding 8 holds the
+// matrix widened to binary16 pairs [32][80] by the runtime. A workgroup is four of the blocks (2x2), so the product
+// runs with a token per lane and wave-uniform weights.
+#ifndef DOT2
+#define DOT2 0
+#endif
+#if DOT2
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_GOOGLE_include_directive : require
+#include "fp8_soft.glsl"
+#else
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_float_e4m3 : require
 #extension GL_GOOGLE_include_directive : require
+#endif
 #include "round_half.glsl"
 #include "normalized_store.glsl"
 #include "activation_m.glsl"
+#if DOT2
+layout(local_size_x = 128) in;      // four waves: 2x2 blocks of 16 tokens = 8x8 render pixels, two pixels per lane
+#else
 layout(local_size_x = 32) in;       // one wave: 16 tokens = 8x8 render pixels, two pixels per lane
+#endif
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
     ivec2 size;             // render size
@@ -30,6 +50,17 @@ layout(set = 0, binding = 3, rgba8_snorm) uniform writeonly image2D featOut;
 layout(set = 0, binding = 4, rgba8) uniform writeonly image2D gateOut;
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D mixOut;
 layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D covOut;
+#if DOT2
+layout(set = 0, binding = 7, std430) readonly buffer Tokens { uint a[]; } tok;             // [tokH][tokW][64] FP8
+layout(set = 0, binding = 8, std430) readonly buffer W8 { uint w[]; } w8;                  // [32][80] binary16 pairs
+layout(set = 0, binding = 9, std430) readonly buffer W16 { uint w[]; } w16;                // bias (its first row of 80)
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+shared uint TK[64 * 36];                    // the 64 tokens (four blocks of 16) as binary16 pairs, rows of 32 + 4 dwords
+shared f16vec4 EO[64 * 88 / 4];
+float16_t q8(float16_t v) { return e4m3Round(float(v)); }
+#else
 layout(set = 0, binding = 7, std430) readonly buffer Tokens { floate4m3_t a[]; } tok;      // [tokH][tokW][64]
 layout(set = 0, binding = 8, std430) readonly buffer W8 { floate4m3_t w[]; } w8;           // [64][80]: 20 columns per sub-position
 layout(set = 0, binding = 9, std430) readonly buffer W16 { f16vec4 w[]; } w16;             // bias, 16 equal rows of 80
@@ -41,6 +72,7 @@ layout(set = 0, binding = 9, std430) readonly buffer W16 { f16vec4 w[]; } w16;  
 shared floate4m3_t TK[16 * 72];
 shared f16vec4 EO[16 * 88 / 4];
 float16_t q8(float16_t v) { return float16_t(floate4m3_t(clamp(v, float16_t(-448.0), float16_t(448.0)))); }
+#endif
 f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
 // NVIDIA's expansion GEMM is chained m16n8k32 mma with an f16 accumulator: the bias is the initial C and every
 // 32 products are summed with one f16 rounding (swin_model.py mma_chain; the same k32 step the native kernels'
@@ -49,7 +81,8 @@ f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
 #ifndef K32_ROUND
 #define K32_ROUND 1
 #endif
-#if K32_ROUND
+#if DOT2
+#elif K32_ROUND
 #define R32(m, column) ROUND_HALF_STORE(m, EO, (column) * 4u, 22u)
 #else
 #define R32(m, column)
@@ -59,6 +92,56 @@ f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
 #endif
 void main()
 {
+#if DOT2
+#if PLANES
+#error "the plane layout is for the HIP network, which needs FP8"
+#endif
+    // wave w loads block w (2x2 blocks per workgroup) and writes its pixels; the product is over all 64 tokens
+    const uint lane = gl_SubgroupInvocationID, wave = gl_SubgroupID, row = lane & 15u, hf = lane >> 4;
+    const ivec2 t0 = 8 * ivec2(gl_WorkGroupID.xy) + 4 * ivec2(wave & 1u, wave >> 1);
+    const uint first = 16u * wave;
+    // a block without pixels (the workgroup grid's last column or row) loads nothing
+    if (all(lessThan(2 * t0, p.size)))
+    {
+        const uint src = uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u)) * 64u + hf * 32u;
+        for (uint d = 0u; d < 8u; ++d)
+        {
+            const uvec2 v = e4m3Unpack4(tok.a[src / 4u + d]);
+            TK[(first + row) * 36u + hf * 16u + 2u * d] = v.x; TK[(first + row) * 36u + hf * 16u + 2u * d + 1u] = v.y;
+        }
+    }
+    memoryBarrierShared(); barrier();
+    // a lane computes columns 20 w .. 20 w + 19 of tokens lane and lane + 32 (wave-uniform weights): the bias, then 32
+    // products at a time summed in f32 and added to the binary16 accumulator with one rounding
+    {
+        const uint c0 = 20u * wave;
+        float a[2][20];
+        [[unroll]] for (uint n = 0u; n < 20u; n += 2u)
+        {
+            const vec2 b = vec2(unpackFloat2x16(w16.w[(c0 + n) / 2u]));
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) { a[t][n] = b.x; a[t][n + 1u] = b.y; }
+        }
+        for (uint k0 = 0u; k0 < 32u; k0 += 16u)
+        {
+            float s[2][20];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; ++n) s[t][n] = 0.0;
+            [[unroll]] for (uint kp = k0; kp < k0 + 16u; kp += 4u)
+            {
+                const uint r0 = lane * 36u + kp, r1 = (lane + 32u) * 36u + kp;
+                const uvec4 f0 = uvec4(TK[r0], TK[r0 + 1u], TK[r0 + 2u], TK[r0 + 3u]);
+                const uvec4 f1 = uvec4(TK[r1], TK[r1 + 1u], TK[r1 + 2u], TK[r1 + 3u]);
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) [[unroll]] for (uint n = 0u; n < 20u; ++n)
+                {
+                    const uint w = w8.w[(kp + j) * 80u + c0 + n];
+                    s[0][n] = d2(f0[j], w, s[0][n]); s[1][n] = d2(f1[j], w, s[1][n]);
+                }
+            }
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; ++n) a[t][n] = roundHalfSat(s[t][n] + a[t][n]);
+        }
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; n += 4u)
+            EO[((lane + 32u * t) * 88u + c0 + n) / 4u] = f16vec4(a[t][n], a[t][n + 1u], a[t][n + 2u], a[t][n + 3u]);
+    }
+#else
     const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;
     const ivec2 t0 = 4 * ivec2(gl_WorkGroupID.xy);
 #if PLANES
@@ -110,13 +193,18 @@ void main()
         coopMatStore(HACC(a0), EO, 12u, 22u, RM);
         coopMatStore(HACC(a1), EO, 16u, 22u, RM);
     }
+#endif
     memoryBarrierShared(); barrier();
     for (uint pi = lane; pi < 64u; pi += 32u)
     {
         const uint px = pi & 7u, py = pi >> 3;
         const ivec2 at = 2 * t0 + ivec2(px, py);
         if (at.x >= p.size.x || at.y >= p.size.y) continue;
+#if DOT2
+        const uint e = ((first + (py >> 1) * 4u + (px >> 1)) * 88u + ((py & 1u) * 2u + (px & 1u)) * 20u) / 4u;
+#else
         const uint e = (((py >> 1) * 4u + (px >> 1)) * 88u + ((py & 1u) * 2u + (px & 1u)) * 20u) / 4u;
+#endif
         const f16vec4 v0 = q8(EO[e]), v1 = q8(EO[e + 1u]), v2 = q8(EO[e + 2u]), v3 = q8(EO[e + 3u]), v4 = q8(EO[e + 4u]);
         // values: 0, 1, 10 gates; 2..5 feature; 6..9 its blend; 11..13 mix; 14, 15, 16 covariance
         imageStore(gateOut, at, unorm8Value(vec4(sig16(v0.x), sig16(v0.y), sig16(v2.z), 0.0)));

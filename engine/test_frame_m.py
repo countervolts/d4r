@@ -2,6 +2,8 @@
 """Run whole preset M frames on the engine's own stages and compare the output with the capture.
 
 usage: test_frame_m.py CAPTURE_DIR WORK_DIR KVK EVK [frames]
+DOT2=1 runs the stages for GPUs without cooperative matrices or FP8 (RDNA2): enc0_m/dec0_m's DOT2 builds,
+layer_m_dot2.comp and merge_m_dot2.comp on the matrices widened to binary16 pairs.
 Every stage runs as its own process (kvk for the texture stages, evk for the network layers). Only the frame's
 colour, motion and depth, the exposure values and the kernels' parameter blocks come from the capture; all
 intermediate data and all temporal history are the engine's own.
@@ -12,7 +14,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import m_model as mm
 import swin_model as sm
-from test_m import pack_layer, defines, token_codes, report
+from test_m import pack_layer, defines, dot2_defines, dot2_merge_defines, widen, token_codes, report
+import model_enc3 as me
 cap, work, kvk, evk = sys.argv[1:5]
 frames = int(sys.argv[5]) if len(sys.argv) > 5 else 2
 os.makedirs(work, exist_ok=True)
@@ -25,6 +28,14 @@ POST = os.environ.get('POST_KERNEL') or next((k for k in (f'rrlite_post_3_1_mvlo
 POST_TILE = ['-DTILE_W=15', '-DTILE_H=15'] if '3_2' in POST else []
 NAMES = {'enc0': f'rrlite_enc0_4x4_mvlo_{R}_folded', 'dec0': 'rrlite_dec0_4x4_folded', 'post': POST, 'down': f'rrlite_downsample_kernel_static_{R}'}
 STAGE = ['-DLDR=1'] if LDR else []
+DOT2 = os.environ.get('DOT2') == '1'
+BLOCKS = 2 if DOT2 else 1      # the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks
+
+
+def widen_plain(w):
+    """a plain FP8 matrix [K][N] as [K/2][N] binary16 pairs (engine/runtime_m.inc widenM): the dot2 stages' layout"""
+    h = me.E4M3.astype(np.float16).view(np.uint16).astype(np.uint32)[w]
+    return (h[0::2] | (h[1::2] << 16)).astype(np.uint32)
 
 
 class Launch:
@@ -73,7 +84,8 @@ for f in range(frames):
     hw, hh = L.i2(248)
     wb = L.blob(L.u8(0))
     g = sm.gp(np.arange(64))
-    np.ascontiguousarray(wb[sm.woff_table(4096, 512, 2048, 128, 64)][:, g]).tofile(f'{D}/e0.w8')
+    e0w = np.ascontiguousarray(wb[sm.woff_table(4096, 512, 2048, 128, 64)][:, g])
+    (widen_plain(e0w) if DOT2 else e0w).tofile(f'{D}/e0.w8')
     np.tile(wb[12288:12288 + 128].view(np.float16)[g][None, :], (16, 1)).tofile(f'{D}/e0.w16')
     wb[:4096].tofile(f'{D}/e0.noise')
     open(f'{D}/e0.params', 'wb').write(struct.pack('<2i2i2i2f2f2f2f2f2f2fff3Iffffff', rw, rh, *L.i2(8), tw, th, *L.f2(168), *L.f2(176), *L.f2(200), *L.f2(208),
@@ -85,12 +97,12 @@ for f in range(frames):
     pfeat = prev['feat'] if prev else zeros(f'{D}/zero.feat', rw * rh * 4, np.int8)
     phist = prev['hist'] if prev else zeros(f'{D}/zero.hist', hw * hh * 4)
     open(f'{D}/e0.manifest', 'w').write('\n'.join([
-        f'param {D}/e0.params', f'grid {(gw + L.i2(8)[0] + 7) // 8} {(gh + L.i2(8)[1] + 7) // 8}',
+        f'param {D}/e0.params', f'grid {((gw + L.i2(8)[0] + 7) // 8 + BLOCKS - 1) // BLOCKS} {((gh + L.i2(8)[1] + 7) // 8 + BLOCKS - 1) // BLOCKS}',
         f'tex 1 {colour} {rw} {rh} 4 16 nearest', f'tex 2 {motion} {rw} {rh} 2 16 nearest', f'tex 3 {depth} {rw} {rh} 1 32 nearest',
         f'tex 4 {pmv} {rw} {rh} 2 16 linear', f'tex 5 {phalf} {hw // 2} {hh // 2} 4 32 linear', f'tex 6 {pfeat} {rw} {rh} 4 9 linear',
         f'surf 7 {rw} {rh} 2 16 - {D}/mvA', f'surf 8 {rw} {rh} 2 16 - {D}/mvB', f'surf 9 {rw} {rh} 2 16 - {D}/mvC',
         f'lut {D}/e0.w8', f'lut {D}/e0.w16', f'lut {D}/e0.noise', f'outbuf {D}/tokens {tw * th * 64}']) + '\n')
-    run([kvk, shader('enc0_m', STAGE), f'{D}/e0.manifest', '1', '32'])
+    run([kvk, shader('enc0_m', STAGE + (['-DDOT2=1'] if DOT2 else [])), f'{D}/e0.manifest', '1', '32'])
     ref_tokens = token_codes(np.fromfile(L.res[40], np.uint8), L.u8(48) - next(a for a, b in L.allocs.values() if a <= L.u8(48) < a + b.size), tw, th, 64)
     print(f'frame {f}: ' + report('input tokens', np.fromfile(f'{D}/tokens', np.uint8).reshape(th, tw, 64), ref_tokens), flush=True)
     # ---------------------------------------------------------------- network
@@ -101,11 +113,15 @@ for f in range(frames):
         o, b8, b16 = pack_layer(mm.plain_layer(P, name), name)
         W, H = P.W, P.H
         pre = f'{D}/l{i}'
-        open(pre + '.params', 'wb').write(struct.pack('<4i72I', W, H, P.sx, P.sy, *o)); b8.tofile(pre + '.w8'); b16.tofile(pre + '.w16')
+        open(pre + '.params', 'wb').write(struct.pack('<4i72I', W, H, P.sx, P.sy, *o)); b16.tofile(pre + '.w16')
+        (widen(b8, o, name) if DOT2 else b8).tofile(pre + '.w8')
         skip = own[P.p32] if CIN else zeros(pre + '.noskip', 64, np.uint8)
         msize = (H // 2) * (W // 2) * NPM if NPM else 64
-        run([evk, shader('layer_m', defines(name)), str((W + P.sx + 7) // 8), str((H + P.sy + 7) // 8), '1', f'in:0={pre}.params', f'in:1={pre}.w8', f'in:2={pre}.w16',
-             f'in:3={own[P.inp]}', f'in:4={skip}', f'out:5={pre}.out:{H * W * C}', f'out:6={pre}.merged:{msize}'])
+        run([evk, shader('layer_m_dot2', dot2_defines(name)) if DOT2 else shader('layer_m', defines(name)), str((W + P.sx + 7) // 8), str((H + P.sy + 7) // 8), '1',
+             f'in:0={pre}.params', f'in:1={pre}.w8', f'in:2={pre}.w16', f'in:3={own[P.inp]}', f'in:4={skip}', f'out:5={pre}.out:{H * W * C}', f'out:6={pre}.merged:{msize}'])
+        if DOT2 and NPM:    # the encoders' patch merge is its own dispatch
+            run([evk, shader('merge_m_dot2', dot2_merge_defines(name)), str((W // 2 + 7) // 8), str((H // 2 + 7) // 8), '1', f'in:0={pre}.params', f'in:1={pre}.w8',
+                 f'in:2={pre}.w16', f'in:3={pre}.out', f'out:4={pre}.merged:{msize}'])
         own[P.out] = pre + '.out'
         if NPM: own[P.p48] = pre + '.merged'
     seq = int(os.path.basename(dirs[-1]).split('-')[1])
@@ -116,14 +132,15 @@ for f in range(frames):
     L = Launch(NAMES['dec0'], f)
     wb = L.blob(L.u8(0))
     cols = (np.arange(4)[:, None] * 32 + np.arange(20)[None, :]).ravel()
-    np.concatenate([wb[sm.woff_table(0, 512, 1024, 64, 128)][:, cols].ravel(), np.zeros(64, np.uint8)]).tofile(f'{D}/d0.w8')
+    d0w = wb[sm.woff_table(0, 512, 1024, 64, 128)][:, cols]
+    (np.concatenate([widen_plain(d0w).ravel(), np.zeros(16, np.uint32)]) if DOT2 else np.concatenate([d0w.ravel(), np.zeros(64, np.uint8)])).tofile(f'{D}/d0.w8')
     np.concatenate([np.tile(wb[8192:8192 + 256].view(np.float16)[cols][None, :], (16, 1)).ravel(), np.zeros(32, np.float16)]).tofile(f'{D}/d0.w16')
     open(f'{D}/d0.params', 'wb').write(struct.pack('<2iiI2f2f2f2f2f2f', rw, rh, tw, L.P[120], *L.f2(72), *L.f2(88), float(L.i2(96)[0]), float(L.i2(96)[1]), *L.f2(80), *L.f2(160), *L.f2(104)))
     open(f'{D}/d0.manifest', 'w').write('\n'.join([
-        f'param {D}/d0.params', f'grid {gw // 8} {gh // 8}', f'tex 1 {D}/mvA {rw} {rh} 2 16 nearest', f'tex 2 {pfeat} {rw} {rh} 4 9 linear',
+        f'param {D}/d0.params', f'grid {(gw // 8 + 1) // 2} {(gh // 8 + 1) // 2}' if DOT2 else f'grid {gw // 8} {gh // 8}', f'tex 1 {D}/mvA {rw} {rh} 2 16 nearest', f'tex 2 {pfeat} {rw} {rh} 4 9 linear',
         f'surf 3 {rw} {rh} 4 9 - {D}/feat', f'surf 4 {rw} {rh} 4 8 - {D}/gates', f'surf 5 {rw} {rh} 4 8 - {D}/mix', f'surf 6 {rw} {rh} 4 16 - {D}/cov',
         f'lut {own[Ps[-1].out]}', f'lut {D}/d0.w8', f'lut {D}/d0.w16']) + '\n')
-    run([kvk, shader('dec0_m'), f'{D}/d0.manifest', '1', '32'])
+    run([kvk, shader('dec0_m', ['-DDOT2=1'] if DOT2 else []), f'{D}/d0.manifest', '1', '32'])
     for off, name, dt in ((128, 'feat', np.int8), (136, 'gates', np.uint8), (144, 'mix', np.uint8)):
         a = np.fromfile(L.res[off], dt).astype(np.int32); b = np.fromfile(f'{D}/{name}', dt).astype(np.int32)
         print(f'frame {f}: dec0 {name:5s} identical {100 * (a == b).mean():5.1f}%, within one step {100 * (np.abs(a - b) <= 1).mean():5.1f}%, mean |diff| {np.abs(a - b).mean():.3f} steps', flush=True)

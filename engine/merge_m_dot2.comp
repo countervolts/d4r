@@ -1,0 +1,110 @@
+#version 460
+// d4r engine, preset M: an encoder's patch merge for GPUs without cooperative matrices or FP8 (RDNA2), dispatched after
+// the encoder's layer_m_dot2.comp block. Merged token m of the W/2 x H/2 grid is the 4C channels of block-output tokens
+// (2 mx + (s & 1), 2 my + (s >> 1)), sub-token s first to last, times the [4C][XC] matrix plus the bias, clamped to
+// +-2 pi as binary16 (NVIDIA's encoders) and encoded as FP8. The products run on v_dot4_i32_i8: each sub-token's C
+// channels as int8 with one scale (its largest code's value / 127; the codes' magnitudes are ordered like the values),
+// the matrix as int8 [4C/4][XC] words followed by XC f32 column scales (runtime_m.inc widenM); a sub-position's
+// integer sums are scaled into the f32 sums.
+//  - A workgroup is 8x8 merged tokens, NW waves; a lane owns two (lane and lane + 32, row-major) and the waves split the
+//    XC output channels, so the weights are wave-uniform (scalar memory). The sub-tokens' channels come through shared
+//    memory one sub-position at a time.
+//  - In a layer's block of 16 merged tokens the weights would be per lane (vector memory): about twice the time.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#include "fp8_soft.glsl"
+#ifndef NW
+#define NW 4
+#endif
+layout(local_size_x = 32 * NW) in;
+// the encoder layer's parameter block, weights (runtime_m.inc widenM) and f16 vectors: o[68] is the
+// merge matrix, o[69] its bias
+layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx; int sy; uint o[72]; } p;
+layout(set = 0, binding = 1, std430) readonly buffer Wb { uint w[]; } wb;
+layout(set = 0, binding = 2, std430) readonly buffer W16 { uint w[]; } w16;
+layout(set = 0, binding = 3, std430) readonly buffer Ib { uint a[]; } inb;            // FP8 [H][W][C]: the block output
+layout(set = 0, binding = 4, std430) writeonly buffer Ob { uint a[]; } outb;          // FP8 [H/2][W/2][XC]
+const uint UC = uint(C), XW = uint(XC) / uint(NW), QS = UC / 4u + 4u, NT = 32u * uint(NW);
+shared uint L[64u * QS];        // one sub-position's channels of the 64 merged tokens, int8 words
+shared uint MX[64];             // their largest code magnitudes
+uvec4 lds4(uint i) { i &= ~3u; return uvec4(L[i], L[i + 1u], L[i + 2u], L[i + 3u]); }
+void main()
+{
+    const uint gi = gl_LocalInvocationID.x, wave = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const int W2 = p.W / 2, H2 = p.Hh / 2, MX0 = 8 * int(gl_WorkGroupID.x), MY0 = 8 * int(gl_WorkGroupID.y);
+    const uint col0 = wave * XW;
+    float acc[2][XW];
+    [[unroll]] for (uint n = 0u; n < XW; n += 2u)
+    {
+        const f16vec2 b = unpackFloat2x16(w16.w[(p.o[69] + col0 + n) / 2u]);
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) { acc[t][n] = float(b.x); acc[t][n + 1u] = float(b.y); }
+    }
+    for (uint s = 0u; s < 4u; ++s)
+    {
+        if (gi < 64u) MX[gi] = 0u;
+        barrier();      // every wave has read the previous sub-position
+        uint word[(64u * (UC / 4u) + NT - 1u) / NT];
+        [[unroll]] for (uint e = 0u; e < word.length(); ++e)
+        {
+            const uint i = gi + e * NT, tok = i / (UC / 4u), d = i % (UC / 4u);
+            if (i < 64u * (UC / 4u))
+            {
+                const int mx = min(MX0 + int(tok & 7u), W2 - 1), my = min(MY0 + int(tok >> 3), H2 - 1);
+                const uint src = uint((2 * my + int(s >> 1)) * p.W + 2 * mx + int(s & 1u));
+                word[e] = inb.a[src * (UC / 4u) + d];
+                const uvec4 m = (uvec4(word[e]) >> uvec4(0u, 8u, 16u, 24u)) & 0x7fu;
+                atomicMax(MX[tok], max(max(m.x, m.y), max(m.z, m.w)));
+            }
+        }
+        barrier();
+        [[unroll]] for (uint e = 0u; e < word.length(); ++e)
+        {
+            const uint i = gi + e * NT, tok = i / (UC / 4u), d = i % (UC / 4u);
+            if (i < 64u * (UC / 4u))
+            {
+                const float m = float(e4m3Value(MX[tok])), inv = m > 0.0 ? 127.0 / m : 0.0;
+                const uvec2 v = e4m3Unpack4(word[e]);
+                const ivec4 q = ivec4(round(vec4(unpackFloat2x16(v.x), unpackFloat2x16(v.y)) * inv));
+                L[tok * QS + d] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+            }
+        }
+        barrier();
+        float sc[2];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) sc[t] = float(e4m3Value(MX[lane + 32u * t])) * (1.0 / 127.0);
+        int ia[2][XW];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < XW; ++n) ia[t][n] = 0;
+        const uint wbase = p.o[68] / 2u + s * (UC / 4u) * uint(XC) + col0;
+        [[dont_unroll]] for (uint kq = 0u; kq < UC / 4u; kq += 4u)
+        {
+            const uvec4 a0 = lds4(lane * QS + kq), a1 = lds4((lane + 32u) * QS + kq);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                [[unroll]] for (uint n = 0u; n < XW; ++n)
+                {
+                    const int w = int(wb.w[wbase + (kq + j) * uint(XC) + n]);
+                    ia[0][n] += dotPacked4x8EXT(int(a0[j]), w); ia[1][n] += dotPacked4x8EXT(int(a1[j]), w);
+                }
+        }
+        [[unroll]] for (uint n = 0u; n < XW; ++n)
+        {
+            const float sw = uintBitsToFloat(wb.w[p.o[68] / 2u + UC * uint(XC) + col0 + n]);
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) acc[t][n] += float(ia[t][n]) * (sc[t] * sw);
+        }
+    }
+    const float16_t MCL = float16_t(6.2831855);
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        const uint tok = lane + 32u * t;
+        const int mx = MX0 + int(tok & 7u), my = MY0 + int(tok >> 3);
+        if (mx < W2 && my < H2)
+            [[unroll]] for (uint n = 0u; n < XW; n += 4u)
+            {
+                const uint w01 = e4m3RoundHalf2(clamp(f16vec2(acc[t][n], acc[t][n + 1u]), -MCL, MCL));
+                const uint w23 = e4m3RoundHalf2(clamp(f16vec2(acc[t][n + 2u], acc[t][n + 3u]), -MCL, MCL));
+                outb.a[uint(my * W2 + mx) * (uint(XC) / 4u) + (col0 + n) / 4u] = e4m3CodesHalf2(w01) | (e4m3CodesHalf2(w23) << 16);
+            }
+    }
+}

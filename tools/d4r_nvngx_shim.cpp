@@ -9400,6 +9400,14 @@ static bool engine_k_refused()
            !g_vk.float8;
 }
 
+// Preset M on the engine's v_dot2 stages (layer_m_dot2.comp): on GPUs without FP8 and without the f16 matrix tuple
+// (RDNA2), where the CUDA backend's M kernels are translated. RDNA3 keeps its native M kernels unless
+// D4R_ENGINE_M_NETWORK=dot2.
+static bool engine_m_dot2()
+{
+    return !g_vk.float8 && (!g_vk.matrixF16 || env_string("D4R_ENGINE_M_NETWORK") == "dot2");
+}
+
 static void init_engine_vulkan()
 {
     VkInstance instance = VK_NULL_HANDLE;
@@ -9454,8 +9462,8 @@ static void init_engine_vulkan()
     g_vk.float8 = g_vk.float8 && fp8;
     logf("engine backend: f16 matrix tuple %s; FP8 matrix tuple %s", g_vk.matrixF16 ? "supported" : "unsupported",
          g_vk.float8 ? "supported" : "unsupported");
-    logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)" : "unavailable: "
-         "M and L run on the CUDA backend");
+    logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)"
+         : engine_m_dot2() ? "unavailable: M runs its v_dot2 stages, L the CUDA backend" : "unavailable: M and L run on the CUDA backend");
     // the features vkd3d-proton created its device with
     const VkPhysicalDeviceFeatures2* features = nullptr;
     if (SUCCEEDED(g_vk.interop->GetDeviceFeatures(&features)) && features != nullptr)
@@ -9620,7 +9628,8 @@ static void init_engine_backend_m_variant(bool presetL, bool ldr)
     const auto start = std::chrono::steady_clock::now();
     try
     {
-        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path);
+        // without FP8 (RDNA2) preset M runs layer_m_dot2.comp's stages; L has none
+        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !presetL && !g_vk.float8);
         if (model->isPresetL() != presetL)
             throw std::runtime_error(presetL ? "the directory holds a preset M model" : "the directory holds a preset L model");
         slot = std::move(model);
@@ -10212,9 +10221,9 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     };
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
     const bool ldr = (feature.flags & 0x1) == 0; // NGX's LDR stages: a model directory of its own, no exposure
-    // The model's pipelines include the FP8 layers even when the HIP network runs them; creating those without
-    // VK_EXT_shader_float8 crashes the driver (RADV on RDNA3, vkCreateComputePipelines), so never load the model.
-    if (!g_vk.float8)
+    // The FP8 pipelines need VK_EXT_shader_float8: creating them without it crashes the driver (RADV on RDNA3,
+    // vkCreateComputePipelines), so never load such a model. M loads its v_dot2 stages instead where engine_m_dot2().
+    if (!g_vk.float8 && (presetL || !engine_m_dot2()))
         return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
     std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
     d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
@@ -10747,7 +10756,7 @@ static void start_engine_preload()
         const bool rr = rr_enabled() && rr_backend() == RrBackend::Dlss;
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
-        const bool srM = (sr == 12 || sr == 13) && g_vk.float8;
+        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || (sr == 13 && engine_m_dot2()));
         const bool srK = sr == 11 && !engine_k_refused();
         if (!rr && !srM && !srK)
             return;

@@ -1,0 +1,503 @@
+#version 460
+// d4r engine, preset M: one Swin block over 4x4-token windows for GPUs without cooperative matrices or FP8 (RDNA2).
+// The mathematics, parameters, bindings 0 and 2-5 and the build-time shape (C, NH, KIND 0 or 2, XC) are layer_m.comp's
+// relaxed build (M_RELAXED, M_RESIDUAL_F32); the products run on v_dot2_f32_f16 (binary16 pairs, f32 accumulation),
+// the MLP's and the attention output projection's on v_dot4_i32_i8 (int8 with per-token and per-column scales: the
+// MLP about 0.4 dB of the final image for 12-22% of every layer's time, the output projection 0.4 dB for 2-4%). The
+// encoders are built with KIND 0: their patch merge is merge_m_dot2.comp, dispatched after the block. FP8 values are
+// exact in binary16, so the v_dot2 products are exact and only the f32 summation order and the binary16 roundings
+// inside the 32-deep steps (which layer_m.comp's relaxed build keeps) differ. FP8 conversions are packed binary16 and
+// integer arithmetic (fp8_soft.glsl).
+//  - A workgroup is an 8x8-token block (four windows), one wave32 per head (two with TSPLIT=2). A lane owns two tokens (lane and
+//    lane + 32), ordered window-major, so a half-wave holds one window's 16 tokens.
+//  - Products with weights take the weight from scalar memory (wave-uniform): the waves split the output channels.
+//    Binding 1 holds the FP8 matrices widened to binary16 pairs by the runtime: matrix W[K][N] (FP8 byte offset o)
+//    is [K/2][N] pairs at dword o / 2, the MLP's and output projection's as int8 words and column scales from there
+//    (engine/runtime_m.inc widenM).
+//  - Attention runs in registers: the keys are the queries, a lane's window partners' come as DPP8 broadcasts within
+//    its group of eight lanes and a swap of the two groups.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_AMD_shader_ballot : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#include "fp8_soft.glsl"
+// TSPLIT 2: two waves per head, each taking one of a lane's two tokens through the attention: twice the waves at half
+// the shared memory and residual registers per wave (TSPLIT 1: one wave per head)
+#ifndef TSPLIT
+#define TSPLIT 2
+#endif
+#define NW (NH * TSPLIT)
+layout(local_size_x = 32 * NW) in;
+// o: 0 g1, 1 bo, 2 g2, 3 b2 (f16); per head h at 4 + 4h: q, v (FP8), bias (f16), wo (FP8);
+//    per MLP chunk c at 20 + 3c: w1 (FP8), b1 (f16), w2 (FP8); 68, 69: expand weights (FP8) and bias (f16)
+layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx; int sy; uint o[72]; } p;
+layout(set = 0, binding = 1, std430) readonly buffer Wb { uint w[]; } wb;             // binary16 pairs
+layout(set = 0, binding = 2, std430) readonly buffer W16 { uint w[]; } w16;           // f16 vectors, as pairs
+layout(set = 0, binding = 3, std430) readonly buffer Ib { uint a[]; } inb;            // FP8 [H][W][C]; decoders [H/2][W/2][XC]
+layout(set = 0, binding = 4, std430) readonly buffer Sb { uint a[]; } skb;            // decoders: skip, FP8 [H][W][C]
+layout(set = 0, binding = 5, std430) writeonly buffer O0 { uint a[]; } out0;          // FP8 [H][W][C]
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+const uint UC = uint(C), CW = UC / uint(NW), HC = UC / 2u, NA = 32u * uint(NH);
+const uint HW = 32u / uint(NW);             // hidden columns per wave of a 32-channel MLP chunk
+const uint TT = 2u / uint(TSPLIT);          // a lane's tokens in the attention
+// shared memory, in dwords (binary16 pairs), rows padded by four dwords: the token rows (the block input, the normalised
+// tokens, the heads' attention outputs, the residual stream), then an area for the norms' per-wave sums, an MLP
+// chunk's int8 hidden rows (HQS words) and the waves' largest magnitudes or, before the attention, the decoder's
+// low-resolution tokens
+const uint RS = max(UC, NA) / 2u + 4u, HQS = 12u;
+const uint XA = 0u, RH = 64u * RS, HMX = RH + 64u * HQS;
+#if KIND == 2
+const uint XH = uint(XC) / 2u, LRS = XH + 4u;
+const uint AREA = max(64u * (HQS + uint(NW)), 16u * LRS);
+#else
+const uint AREA = 64u * (HQS + uint(NW));
+#endif
+shared uint L[RH + AREA];
+uint lane, wave, gi;
+uvec4 lds4(uint i) { i &= ~3u; return uvec4(L[i], L[i + 1u], L[i + 2u], L[i + 3u]); }
+void sts4(uint i, uvec4 v) { i &= ~3u; L[i] = v.x; L[i + 1u] = v.y; L[i + 2u] = v.z; L[i + 3u] = v.w; }
+int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
+float lo(uint v) { return float(unpackFloat2x16(v).x); }
+float hi(uint v) { return float(unpackFloat2x16(v).y); }
+uint pk(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
+// q8 of two f32 values (the relaxed build converts its f32 accumulators to FP8 directly)
+uint q8p(float a, float b) { return e4m3PackF32(a, b); }
+// block position of token i (window-major: window i >> 4, 4x4 within it) and back
+uvec2 tokPos(uint i) { const uint mt = i >> 4, r = i & 15u; return uvec2(4u * (mt & 1u) + (r & 3u), 4u * (mt >> 1) + (r >> 2)); }
+uint tokAt(uint bx, uint by) { return ((by >> 2) * 2u + (bx >> 2)) * 16u + (by & 3u) * 4u + (bx & 3u); }
+uint f16w(uint halfOffset) { return w16.w[halfOffset / 2u]; }
+// NVIDIA's softmax numerator, two neighbouring keys in one 32-bit word (the even key's carry reaches the odd)
+uint softmax2(uint s)
+{
+    const f16vec2 lim = f16vec2(0.55615234375), cs = f16vec2(0.0972222164273262 / 5.656854152679443);
+    const f16vec2 t = clamp(unpackFloat2x16(s) * cs, -lim, lim);
+    const f16vec2 q = fma(t, fma(t, -t, f16vec2(0.92730712890625)), f16vec2(1.375));
+    return (packFloat2x16(q) << 5) + 0x7FF88000u;
+}
+// layer_m.comp's relaxed GELU of a binary16 value, in f32
+float gelu(float x)
+{
+    const float y = clamp(x, -2.0, 2.0);
+    return x * fma(y, fma(-abs(y), 0.08108133, 0.41216981), 0.5);
+}
+// RSQ16 of layer_m.comp (TEXL): the binary16 sum of squares plus 2^-13, the hardware reciprocal square root
+float16_t rsq16(float sumSquares) { return float16_t(inversesqrt(float(float16_t(sumSquares) + float16_t(0.0001220703125)))); }
+// acc[t][n] += sum over kp < KP of L[ab + tok_t * as + kp] * W2[wbase + kp * ws + n]: TN of this lane's tokens from
+// token slot tb on (rows lane + 32 (tb + t)), NN outputs from a [K/2][ws] pair matrix whose first column is wbase
+#define GEMM_TOK(NAME, TN, NN) \
+void NAME(inout float acc[TN][NN], uint ab, uint as, uint KP, uint wbase, uint ws, uint tb) \
+{ \
+    [[dont_unroll]] for (uint kp = 0u; kp < KP; kp += 4u) \
+    { \
+        uvec4 a[TN]; \
+        [[unroll]] for (uint t = 0u; t < TN; ++t) a[t] = lds4(ab + (lane + 32u * (tb + t)) * as + kp); \
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) \
+            [[unroll]] for (uint n = 0u; n < NN; ++n) \
+            { \
+                const uint w = wb.w[wbase + (kp + j) * ws + n]; \
+                [[unroll]] for (uint t = 0u; t < TN; ++t) acc[t][n] = d2(a[t][j], w, acc[t][n]); \
+            } \
+    } \
+}
+GEMM_TOK(gemmHead, TT, 32)
+// The MLP runs on v_dot4_i32_i8 (twice v_dot2's rate): its inputs as int8 with one scale per token (the largest
+// magnitude / 127) and its weights as int8 with one scale per column (runtime_m.inc widenM). The normalised tokens
+// replace their binary16 rows as words of four int8 (channel low first); a chunk's hidden values are rows of HQS
+// words in the hidden area (one scale per token and chunk), the waves' largest magnitudes after them. w1 [C][32] is
+// [C/4][32] words followed by its 32 column scales (f32), w2 [32][C] is [8][C] words followed by its C column scales.
+// The attention output projection is int8 the same way: the heads' outputs with one scale per token across the heads
+// (the per-head largest magnitudes meet in the hidden area), wo [NA][C] as [NA/4][C] words, then C column scales.
+// acc[t][n] += the int8 products of the normalised rows of the lane's tokens (KQ words) with HW columns of the
+// [C/4][32] word matrix whose first column is wbase
+void gemmI8(inout int acc[2][HW], uint KQ, uint wbase)
+{
+    [[dont_unroll]] for (uint kq = 0u; kq < KQ; kq += 4u)
+    {
+        uvec4 a[2];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) a[t] = lds4(XA + (lane + 32u * t) * RS + kq);
+        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+            [[unroll]] for (uint n = 0u; n < HW; ++n)
+            {
+                const int w = int(wb.w[wbase + (kq + j) * 32u + n]);
+                [[unroll]] for (uint t = 0u; t < 2u; ++t) acc[t][n] += dotPacked4x8EXT(int(a[t][j]), w);
+            }
+    }
+}
+// norm 2 (gain at f16 offset gain) of the lane's two tokens into registers on the FP8 grid; the tokens' largest
+// magnitudes meet after the sums of squares, then every wave writes its channels as int8 words in place of the
+// binary16 rows; scale: the tokens' int8 steps
+void normInt8(uint gain, out float scale[2])
+{
+    float hv[2][CW];
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        float sum = 0.0;
+        [[unroll]] for (uint w = 0u; w < uint(NW); ++w) sum += uintBitsToFloat(L[RH + w * 64u + lane + 32u * t]);
+        const float rn = float(rsq16(sum));
+        const uint r = XA + (lane + 32u * t) * RS + wave * (CW / 2u);
+        float mx = 0.0;
+        [[unroll]] for (uint d = 0u; d < CW / 2u; ++d)
+        {
+            const vec2 x = vec2(unpackFloat2x16(L[r + d])), g = vec2(unpackFloat2x16(f16w(gain + wave * CW + 2u * d)));
+            const vec2 h = x * (rn * g);
+            hv[t][2u * d] = e4m3GridF32(h.x); hv[t][2u * d + 1u] = e4m3GridF32(h.y);
+            mx = max(mx, max(abs(hv[t][2u * d]), abs(hv[t][2u * d + 1u])));
+        }
+        L[RH + uint(NW) * 64u + wave * 64u + lane + 32u * t] = floatBitsToUint(mx);
+    }
+    barrier();
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        float m = 0.0;
+        [[unroll]] for (uint w = 0u; w < uint(NW); ++w) m = max(m, uintBitsToFloat(L[RH + uint(NW) * 64u + w * 64u + lane + 32u * t]));
+        const float inv = m > 0.0 ? 127.0 / m : 0.0;
+        scale[t] = m * (1.0 / 127.0);
+        const uint r = XA + (lane + 32u * t) * RS + wave * (CW / 4u);
+        [[unroll]] for (uint d = 0u; d < CW / 4u; ++d)
+        {
+            const ivec4 q = ivec4(round(vec4(hv[t][4u * d], hv[t][4u * d + 1u], hv[t][4u * d + 2u], hv[t][4u * d + 3u]) * inv));
+            L[r + d] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+        }
+    }
+}
+#define BC8(v, r) swizzleInvocationsMaskedAMD(v, uvec3(0x18u, r, 0u))
+void main()
+{
+    gi = gl_LocalInvocationID.x; wave = gl_SubgroupID; lane = gl_SubgroupInvocationID;
+    const int X0 = 8 * int(gl_WorkGroupID.x) - p.sx, Y0 = 8 * int(gl_WorkGroupID.y) - p.sy;
+    const uint NT = 32u * uint(NW);
+    // ------------------------------------------------------------ the block input x0 into the token rows (binary16)
+#if KIND == 2
+    {
+        // the 16 low-resolution tokens, then this block's 4C expansion columns of them: x0 = q8(E) + skip
+        const int W2 = p.W / 2, H2 = p.Hh / 2;
+        for (uint i = gi; i < 16u * (XH / 2u); i += NT)
+        {
+            const uint r = i / (XH / 2u), d = i % (XH / 2u);
+            const uint lt = uint(mirror((Y0 >> 1) + int(r >> 2), H2) * W2 + mirror((X0 >> 1) + int(r & 3u), W2));
+            const uvec2 v = e4m3Unpack4(inb.a[lt * (uint(XC) / 4u) + d]);
+            L[RH + r * LRS + 2u * d] = v.x; L[RH + r * LRS + 2u * d + 1u] = v.y;
+        }
+        barrier();
+        // a lane computes four consecutive columns (sub-position q, channels c..c+3) of ER low-resolution tokens (all 16,
+        // or half of them when the workgroup has more lanes than column quads)
+        const uint ER = NT > UC ? 8u : 16u;
+        for (uint task = gi; task < UC * (16u / ER); task += NT)
+        {
+            const uint qd = task % UC, r0 = (task / UC) * ER;
+            const uint col = 4u * qd, q = col / UC, c = col % UC;
+            const uvec2 b01 = uvec2(f16w(p.o[69] + col), f16w(p.o[69] + col + 2u));
+            float e[ER][4];
+            [[unroll]] for (uint r = 0u; r < ER; ++r) { e[r][0] = lo(b01.x); e[r][1] = hi(b01.x); e[r][2] = lo(b01.y); e[r][3] = hi(b01.y); }
+            const uint wbase = p.o[68] / 2u + col;
+            [[dont_unroll]] for (uint kp = 0u; kp < XH; kp += 4u)
+            {
+                uvec4 w[4];
+                [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                {
+                    const uint at = wbase + (kp + j) * 4u * UC;
+                    w[j] = uvec4(wb.w[at], wb.w[at + 1u], wb.w[at + 2u], wb.w[at + 3u]);
+                }
+                [[unroll]] for (uint r = 0u; r < ER; ++r)
+                {
+                    const uvec4 a = lds4(RH + (r0 + r) * LRS + kp);
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                        [[unroll]] for (uint n = 0u; n < 4u; ++n) e[r][n] = d2(a[j], w[j][n], e[r][n]);
+                }
+            }
+            // q8 of the binary16 sums; sub-position q of low-resolution token r is block token (2 rx + (q & 1), 2 ry + (q >> 1))
+            [[unroll]] for (uint r = 0u; r < ER; ++r)
+            {
+                const uint lr = r0 + r, tok = tokAt(2u * (lr & 3u) + (q & 1u), 2u * (lr >> 2) + (q >> 1u));
+                L[XA + tok * RS + c / 2u] = q8p(e[r][0], e[r][1]);
+                L[XA + tok * RS + c / 2u + 1u] = q8p(e[r][2], e[r][3]);
+            }
+        }
+        barrier();
+        // plus the skip connection, one binary16 addition
+        for (uint i = gi; i < 64u * (UC / 4u); i += NT)
+        {
+            const uint tok = i / (UC / 4u), d = i % (UC / 4u);
+            const uvec2 bp = tokPos(tok);
+            const uint src = uint(mirror(Y0 + int(bp.y), p.Hh) * p.W + mirror(X0 + int(bp.x), p.W));
+            const uvec2 s = e4m3Unpack4(skb.a[src * (UC / 4u) + d]);
+            const uint r = XA + tok * RS + 2u * d;
+            L[r] = packFloat2x16(unpackFloat2x16(L[r]) + unpackFloat2x16(s.x));
+            L[r + 1u] = packFloat2x16(unpackFloat2x16(L[r + 1u]) + unpackFloat2x16(s.y));
+        }
+    }
+#else
+    for (uint i = gi; i < 64u * (UC / 4u); i += NT)
+    {
+        const uint tok = i / (UC / 4u), d = i % (UC / 4u);
+        const uvec2 bp = tokPos(tok);
+        const uint src = uint(mirror(Y0 + int(bp.y), p.Hh) * p.W + mirror(X0 + int(bp.x), p.W));
+        const uvec2 v = e4m3Unpack4(inb.a[src * (UC / 4u) + d]);
+        L[XA + tok * RS + 2u * d] = v.x; L[XA + tok * RS + 2u * d + 1u] = v.y;
+    }
+#endif
+    barrier();
+    // ------------------------------------------------------------ the residual stream (this wave's channels) = x0 + bo,
+    // then norm 1 in place: h1 = q8(x0 * rsqrt(sum x0^2) * g1)
+    // The norms: each wave sums the squares of its channels of a token, the sums meet in the hidden area, and each wave
+    // normalises its own channels of the rows in place (h = q8(x * rsqrt(sum x^2) * g))
+    float acc[2][CW], s2[2] = {0.0, 0.0};
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; n += 2u)
+    {
+        const f16vec2 x = unpackFloat2x16(L[XA + (lane + 32u * t) * RS + (wave * CW + n) / 2u]);
+        const vec2 f = vec2(x);
+        s2[t] += f.x * f.x + f.y * f.y;
+        const f16vec2 y = x + unpackFloat2x16(f16w(p.o[1] + wave * CW + n));
+        acc[t][n] = float(y.x); acc[t][n + 1u] = float(y.y);
+    }
+#define NORM_SUMS L[RH + wave * 64u + lane] = floatBitsToUint(s2[0]); L[RH + wave * 64u + lane + 32u] = floatBitsToUint(s2[1]);
+#define NORM(GAIN) \
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) \
+    { \
+        float sum = 0.0; \
+        [[unroll]] for (uint w = 0u; w < uint(NW); ++w) sum += uintBitsToFloat(L[RH + w * 64u + lane + 32u * t]); \
+        const float rn = float(rsq16(sum)); \
+        const uint r = XA + (lane + 32u * t) * RS + wave * (CW / 2u); \
+        [[unroll]] for (uint d = 0u; d < CW / 2u; ++d) \
+        { \
+            const vec2 x = vec2(unpackFloat2x16(L[r + d])), g = vec2(unpackFloat2x16(f16w(GAIN + wave * CW + 2u * d))); \
+            const vec2 h = x * (rn * g); \
+            L[r + d] = q8p(h.x, h.y); \
+        } \
+    }
+    NORM_SUMS
+    barrier();
+    NORM(p.o[0])
+    barrier();
+    // ------------------------------------------------------------ attention: wave h TSPLIT + tb is head h for the lane's
+    // tokens from slot tb on
+    {
+        const uint h = wave / uint(TSPLIT), tb = wave - h * uint(TSPLIT);
+        // q8(Q) (the keys as well) and V (binary16) of the lane's two tokens, V transposed into key pairs: a lane and its
+        // neighbour swap halves, so an even lane holds channel 2k of both tokens, the odd lane channel 2k + 1
+        uint qc[TT][16], vc[TT][16];
+        {
+            float a[TT][32];
+            [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) a[t][n] = 0.0;
+            gemmHead(a, XA, RS, HC, p.o[4u + 4u * h] / 2u, 32u, tb);
+            [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+                qc[t][n / 2u] = q8p(a[t][n], a[t][n + 1u]);
+        }
+        {
+            float a[TT][32];
+            [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) a[t][n] = 0.0;
+            gemmHead(a, XA, RS, HC, p.o[5u + 4u * h] / 2u, 32u, tb);
+            const bool odd = (lane & 1u) != 0u;
+            [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+            {
+                const uint own = pk(a[t][n], a[t][n + 1u]), other = subgroupShuffleXor(own, 1u);
+                vc[t][n / 2u] = odd ? ((other >> 16) | (own & 0xFFFF0000u)) : ((own & 0xFFFFu) | (other << 16));
+            }
+        }
+        // scores of the lane's query against the window's 16 keys: the own group of eight (keys 8 og + r), then the other
+        // (the registers of the two groups swapped), plus the relative position bias [query][key], one binary16 rounding
+        const uint og = (lane >> 3) & 1u, qr = lane & 15u, ob = p.o[6u + 4u * h];
+        uint e[TT][2][4];       // [token][group: own, other][key pair] softmax numerators, binary16 pairs
+        [[unroll]] for (uint g = 0u; g < 2u; ++g)
+        {
+            float s[TT][8];
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+            {
+                const uint b = f16w(ob + qr * 16u + 8u * (og ^ g) + 2u * j);
+                [[unroll]] for (uint t = 0u; t < TT; ++t) { s[t][2u * j] = lo(b); s[t][2u * j + 1u] = hi(b); }
+            }
+            [[unroll]] for (uint kp = 0u; kp < 16u; ++kp)
+                [[unroll]] for (uint t = 0u; t < TT; ++t)
+                {
+                    const uint k = g == 0u ? qc[t][kp] : subgroupShuffleXor(qc[t][kp], 8u);
+#define SC(r) s[t][r] = d2(BC8(k, r), qc[t][kp], s[t][r]);
+                    SC(0u) SC(1u) SC(2u) SC(3u) SC(4u) SC(5u) SC(6u) SC(7u)
+#undef SC
+                }
+            [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                e[t][g][j] = softmax2(pk(s[t][2u * j], s[t][2u * j + 1u]));
+        }
+        // probabilities: numerators times the binary16 reciprocal of their sum, rounded to binary16
+        [[unroll]] for (uint t = 0u; t < TT; ++t)
+        {
+            float sum = 0.0;
+            [[unroll]] for (uint g = 0u; g < 2u; ++g) [[unroll]] for (uint j = 0u; j < 4u; ++j) sum += lo(e[t][g][j]) + hi(e[t][g][j]);
+            const float16_t rc = float16_t(1.0 / float(float16_t(sum)));
+            [[unroll]] for (uint g = 0u; g < 2u; ++g) [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                e[t][g][j] = packFloat2x16(unpackFloat2x16(e[t][g][j]) * rc);
+        }
+        // O = P V: value pair (2 rp, 2 rp + 1) of channel 2k + c sits in lane 2 rp + c of a group
+        float o[TT][32];
+        [[unroll]] for (uint t = 0u; t < TT; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) o[t][n] = 0.0;
+        [[unroll]] for (uint g = 0u; g < 2u; ++g)
+            [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                [[unroll]] for (uint t = 0u; t < TT; ++t)
+                {
+                    const uint v = g == 0u ? vc[t][k] : subgroupShuffleXor(vc[t][k], 8u);
+#define PV(rp, c) o[t][2u * k + c] = d2(BC8(v, 2u * rp + c), e[t][g][rp], o[t][2u * k + c]);
+                    PV(0u, 0u) PV(0u, 1u) PV(1u, 0u) PV(1u, 1u) PV(2u, 0u) PV(2u, 1u) PV(3u, 0u) PV(3u, 1u)
+#undef PV
+                }
+        // q8 of the outputs, their largest magnitude per head and token into the hidden area; after the barrier the
+        // outputs replace the normalised rows as int8 (head h's 32 channels at words 8 h ..)
+        [[unroll]] for (uint t = 0u; t < TT; ++t)
+        {
+            float mx = 0.0;
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) { o[t][n] = e4m3GridF32(o[t][n]); mx = max(mx, abs(o[t][n])); }
+            L[RH + h * 64u + lane + 32u * (tb + t)] = floatBitsToUint(mx);
+        }
+        barrier();      // every wave has read the normalised rows and written its largest magnitudes
+        [[unroll]] for (uint t = 0u; t < TT; ++t)
+        {
+            float m = 0.0;
+            [[unroll]] for (uint g = 0u; g < uint(NH); ++g) m = max(m, uintBitsToFloat(L[RH + g * 64u + lane + 32u * (tb + t)]));
+            const float inv = m > 0.0 ? 127.0 / m : 0.0;
+            [[unroll]] for (uint n = 0u; n < 32u; n += 4u)
+            {
+                const ivec4 q = ivec4(round(vec4(o[t][n], o[t][n + 1u], o[t][n + 2u], o[t][n + 3u]) * inv));
+                L[XA + (lane + 32u * (tb + t)) * RS + 8u * h + n / 4u] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+            }
+        }
+    }
+    barrier();
+    // the output projection of every head's 32 channels into this wave's residual channels
+    {
+        float os[2];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t)
+        {
+            float m = 0.0;
+            [[unroll]] for (uint g = 0u; g < uint(NH); ++g) m = max(m, uintBitsToFloat(L[RH + g * 64u + lane + 32u * t]));
+            os[t] = m * (1.0 / 127.0);
+        }
+        int ia[2][CW];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; ++n) ia[t][n] = 0;
+        const uint wq = p.o[7u] / 2u, c0 = wave * CW;
+        [[dont_unroll]] for (uint kq = 0u; kq < NA / 4u; kq += 4u)
+        {
+            uvec4 a[2];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) a[t] = lds4(XA + (lane + 32u * t) * RS + kq);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                [[unroll]] for (uint n = 0u; n < CW; ++n)
+                {
+                    const int w = int(wb.w[wq + (kq + j) * UC + c0 + n]);
+                    [[unroll]] for (uint t = 0u; t < 2u; ++t) ia[t][n] += dotPacked4x8EXT(int(a[t][j]), w);
+                }
+        }
+        [[unroll]] for (uint n = 0u; n < CW; ++n)
+        {
+            const float sw = uintBitsToFloat(wb.w[wq + (NA / 4u) * UC + c0 + n]);
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) acc[t][n] += float(ia[t][n]) * (os[t] * sw);
+        }
+    }
+    barrier();          // every wave has read the attention outputs
+    // ------------------------------------------------------------ norm 2: the residual as binary16 into the rows, h1 =
+    // q8(x * rsqrt(sum x^2) * g2) in place as int8, and the stream continues as x + b2
+    s2[0] = 0.0; s2[1] = 0.0;
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; n += 2u)
+    {
+        const f16vec2 x = f16vec2(acc[t][n], acc[t][n + 1u]);
+        L[XA + (lane + 32u * t) * RS + (wave * CW + n) / 2u] = packFloat2x16(x);
+        const vec2 f = vec2(x);
+        s2[t] += f.x * f.x + f.y * f.y;
+        const f16vec2 y = x + unpackFloat2x16(f16w(p.o[3] + wave * CW + n));
+        acc[t][n] = float(y.x); acc[t][n + 1u] = float(y.y);
+    }
+    NORM_SUMS
+    barrier();
+    float tokScale[2];
+    normInt8(p.o[2], tokScale);
+    barrier();
+    // ------------------------------------------------------------ the MLP, one chunk of 32 hidden channels at a time
+    // (the residual stays f32 across the chunks: M_RESIDUAL_F32): h = q8(gelu(b1 + h1 w1)) as int8, then the
+    // residual += h w2, the int32 sums times the token's and the column's scales
+    float chunkScale[2];
+    for (uint c = 0u; c < UC / 8u; ++c)
+    {
+        {
+            const uint col = wave * HW;
+            float hh[2][HW];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < HW; n += 2u)
+            {
+                const uint b = f16w(p.o[21u + 3u * c] + col + n);
+                hh[t][n] = lo(b); hh[t][n + 1u] = hi(b);
+            }
+            {
+                int ia[2][HW];
+                [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < HW; ++n) ia[t][n] = 0;
+                const uint wq = p.o[20u + 3u * c] / 2u;
+                gemmI8(ia, UC / 4u, wq + col);
+                [[unroll]] for (uint n = 0u; n < HW; ++n)
+                {
+                    const float sw = uintBitsToFloat(wb.w[wq + (UC / 4u) * 32u + col + n]);
+                    [[unroll]] for (uint t = 0u; t < 2u; ++t) hh[t][n] += float(ia[t][n]) * (tokScale[t] * sw);
+                }
+            }
+            float mx[2];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t)
+            {
+                mx[t] = 0.0;
+                [[unroll]] for (uint n = 0u; n < HW; ++n) { hh[t][n] = e4m3GridF32(gelu(hh[t][n])); mx[t] = max(mx[t], abs(hh[t][n])); }
+                L[HMX + wave * 64u + lane + 32u * t] = floatBitsToUint(mx[t]);
+            }
+            barrier();
+            [[unroll]] for (uint t = 0u; t < 2u; ++t)
+            {
+                float m = 0.0;
+                [[unroll]] for (uint w = 0u; w < uint(NW); ++w) m = max(m, uintBitsToFloat(L[HMX + w * 64u + lane + 32u * t]));
+                const float inv = m > 0.0 ? 127.0 / m : 0.0;
+                chunkScale[t] = m * (1.0 / 127.0);
+                [[unroll]] for (uint n = 0u; n < HW; n += 4u)
+                {
+                    const ivec4 q = ivec4(round(vec4(hh[t][n], hh[t][n + 1u], hh[t][n + 2u], hh[t][n + 3u]) * inv));
+                    L[RH + (lane + 32u * t) * HQS + (col + n) / 4u] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+                }
+            }
+        }
+        barrier();
+        {
+            int ia[2][CW];
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; ++n) ia[t][n] = 0;
+            const uint wq = p.o[22u + 3u * c] / 2u, c0 = wave * CW;
+            [[unroll]] for (uint kq = 0u; kq < 8u; kq += 4u)
+            {
+                uvec4 a[2];
+                [[unroll]] for (uint t = 0u; t < 2u; ++t) a[t] = lds4(RH + (lane + 32u * t) * HQS + kq);
+                [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    [[unroll]] for (uint n = 0u; n < CW; ++n)
+                    {
+                        const int w = int(wb.w[wq + (kq + j) * UC + c0 + n]);
+                        [[unroll]] for (uint t = 0u; t < 2u; ++t) ia[t][n] += dotPacked4x8EXT(int(a[t][j]), w);
+                    }
+            }
+            [[unroll]] for (uint n = 0u; n < CW; ++n)
+            {
+                const float sw = uintBitsToFloat(wb.w[wq + 8u * UC + c0 + n]);
+                [[unroll]] for (uint t = 0u; t < 2u; ++t) acc[t][n] += float(ia[t][n]) * (chunkScale[t] * sw);
+            }
+        }
+        barrier();
+    }
+    // ------------------------------------------------------------ the block output: q8 of the binary16 stream, into the
+    // rows, then out
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; n += 2u)
+        L[XA + (lane + 32u * t) * RS + (wave * CW + n) / 2u] = q8p(acc[t][n], acc[t][n + 1u]);
+    barrier();
+    for (uint i = gi; i < 64u * (UC / 4u); i += NT)
+    {
+        const uint tok = i / (UC / 4u), d = i % (UC / 4u);
+        const uvec2 bp = tokPos(tok);
+        const int ty = Y0 + int(bp.y), tx = X0 + int(bp.x);
+        if (ty >= 0 && ty < p.Hh && tx >= 0 && tx < p.W)
+        {
+            const uint r = XA + tok * RS + 2u * d;
+            out0.a[uint(ty * p.W + tx) * (UC / 4u) + d] = e4m3CodesHalf2(L[r]) | (e4m3CodesHalf2(L[r + 1u]) << 16);
+        }
+    }
+}

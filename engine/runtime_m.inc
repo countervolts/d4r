@@ -7,6 +7,9 @@ constexpr const char* MShader[MLayers] = {"m_enc1", "m_enc2", "m_tube", "m_tube"
 constexpr int32_t MShift[MLayers] = {2, 2, 2, 0, 2, 0, 2, 0, 0, 0};
 constexpr unsigned MScale[MLayers] = {1, 2, 4, 4, 4, 4, 4, 4, 2, 1};       // token grid divisor
 constexpr unsigned MChannels[MLayers] = {64, 96, 128, 128, 128, 128, 128, 128, 96, 64};
+constexpr unsigned MHeads[MLayers] = {2, 4, 4, 4, 4, 4, 4, 4, 4, 2};
+constexpr unsigned MMerged[MLayers] = {96, 128, 0, 0, 0, 0, 0, 0, 0, 0};    // encoders: channels after the patch merge
+constexpr unsigned MExpanded[MLayers] = {0, 0, 0, 0, 0, 0, 0, 0, 128, 96};  // decoders: channels before the patch expand
 struct MEnc0Params {
     int32_t size[2], shift[2], tok[2];
     float jitter[2], prevJitter[2], mvScale[2], mvOffs[2], rnd2hi[2], hi2rnd[2], hiSize[2];
@@ -57,6 +60,80 @@ struct Tex {
         VKCHECK(vkCreateImageView(d.handle, &vi, nullptr, &view));
     }
 };
+// The v_dot2 stages' weights: every FP8 matrix W[K][N] at byte offset o of weights8.bin as binary16 pairs [K/2][N]
+// (W[2k][n] low, W[2k + 1][n] high) at dword o / 2, in a buffer twice the size (the matrices do not overlap). The
+// layers' matrices are blocked as test_m.pack8 ([K/16][N/16][16 n][16 k]); the input and expansion stages' are plain.
+// The attention output projection, MLP and patch merge matrices (v_dot4_i32_i8) are int8 instead: [K/4][N] words of four (W[4k + i][n] in byte i), each column
+// scaled by its largest magnitude / 127 (rounded to nearest even), followed by the N column scales as f32
+// (test_m.widen does the same).
+std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::array<uint32_t, 74>, MLayers>& layers,
+                         const uint32_t enc0[3], const uint32_t dec0[2]) {
+    uint16_t half[256];
+    for (unsigned c = 0; c < 256; ++c) {
+        // E4M3 -> binary16: the magnitude bits shifted into binary16's exponent and mantissa are the value times 2^-8;
+        // adding 8 to the exponent field undoes that for normal codes, subnormal codes become normal binary16 values
+        const unsigned mag = c & 0x7f, sign = (c & 0x80) << 8;
+        unsigned bits;
+        if (mag >= 8) bits = (mag << 7) + (8u << 10);
+        else if (mag == 0) bits = 0;
+        else { unsigned e = 1; while (!((mag << e) & 8)) ++e; bits = (((mag << e) & 7) << 7) | ((9 - e) << 10); }  // mag 2^-9
+        half[c] = uint16_t(sign | bits);
+    }
+    std::vector<char> out(b8.size() * 2, 0);
+    auto byte = [&](size_t at) { if (at >= b8.size()) throw std::runtime_error("M weights out of range"); return uint8_t(b8[at]); };
+    auto put = [&](size_t dword, uint32_t v) { std::memcpy(out.data() + 4 * dword, &v, 4); };
+    auto blocked = [&](size_t off, unsigned K, unsigned N) {
+        for (unsigned k = 0; k < K; k += 2) for (unsigned n = 0; n < N; ++n) {
+            auto at = [&](unsigned kk) { return off + 256 * ((kk / 16) * (N / 16) + n / 16) + (n % 16) * 16 + kk % 16; };
+            put(off / 2 + (k / 2) * N + n, half[byte(at(k))] | (uint32_t(half[byte(at(k + 1))]) << 16));
+        }
+    };
+    auto value = [&](uint8_t c) {
+        const unsigned mag = c & 0x7f;
+        const double v = mag >= 8 ? std::ldexp(1.0 + (mag & 7) / 8.0, int(mag >> 3) - 7) : std::ldexp(double(mag), -9);
+        return c & 0x80 ? -v : v;
+    };
+    auto int8 = [&](size_t off, unsigned K, unsigned N) {
+        auto at = [&](unsigned k, unsigned n) { return off + 256 * ((k / 16) * (N / 16) + n / 16) + (n % 16) * 16 + k % 16; };
+        for (unsigned n = 0; n < N; ++n) {
+            double largest = 0;
+            for (unsigned k = 0; k < K; ++k) largest = std::max(largest, std::abs(value(byte(at(k, n)))));
+            const double scale = largest > 0 ? largest / 127.0 : 1.0;
+            for (unsigned k = 0; k < K; k += 4) {
+                uint32_t word = 0;
+                for (unsigned i = 0; i < 4; ++i) {
+                    const double q = std::clamp(std::nearbyint(value(byte(at(k + i, n))) / scale), -127.0, 127.0);
+                    word |= uint32_t(uint8_t(int8_t(q))) << (8 * i);
+                }
+                put(off / 2 + (k / 4) * N + n, word);
+            }
+            const float f = float(scale);
+            uint32_t bits; std::memcpy(&bits, &f, 4);
+            put(off / 2 + (K / 4) * N + n, bits);
+        }
+    };
+    auto plain = [&](size_t off, unsigned K, unsigned N) {
+        for (unsigned k = 0; k < K; k += 2) for (unsigned n = 0; n < N; ++n)
+            put(off / 2 + (k / 2) * N + n, half[byte(off + k * N + n)] | (uint32_t(half[byte(off + (k + 1) * N + n)]) << 16));
+    };
+    for (unsigned i = 0; i < MLayers; ++i) {
+        const size_t base = layers[i][0];
+        const uint32_t* o = layers[i].data() + 2;
+        const unsigned C = MChannels[i], NH = MHeads[i];
+        for (unsigned h = 0; h < NH; ++h) {
+            blocked(base + o[4 + 4 * h], C, 32); blocked(base + o[5 + 4 * h], C, 32);
+            // the heads' output projections are one [NA][C] matrix (consecutive [32][C] blocks)
+            if (o[7 + 4 * h] != o[7] + h * 32 * C)
+                throw std::runtime_error("M weights: the output projections are not consecutive");
+        }
+        int8(base + o[7], 32 * NH, C);
+        for (unsigned c = 0; c < C / 8; ++c) { int8(base + o[20 + 3 * c], C, 32); int8(base + o[22 + 3 * c], 32, C); }
+        if (MMerged[i]) int8(base + o[68], 4 * C, MMerged[i]);
+        if (MExpanded[i]) blocked(base + o[68], MExpanded[i], 4 * C);
+    }
+    plain(enc0[0], 128, 64); plain(dec0[0], 64, 80);
+    return out;
+}
 void bindRange(VkDevice device, VkDescriptorSet set, uint32_t binding, const Buffer& buffer, VkDeviceSize offset) {
     VkDescriptorBufferInfo info{buffer.handle, offset, VK_WHOLE_SIZE};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -70,11 +147,17 @@ struct MModel::Impl {
     Device device;
     Buffer w8, w16;
     std::vector<char> bytes8, bytes16;   // until recordUpload
+    bool dot2 = false;                   // the v_dot2 stages: the FP8 matrices widened (widenM) instead of w8
+    // the matrices' buffer and the byte offset of the FP8 matrix at o in it
+    const Buffer& weights() const { return dot2 ? w16x : w8; }
+    VkDeviceSize weightsAt(uint32_t o) const { return dot2 ? VkDeviceSize(o) * 2 : o; }
+    Buffer w16x;                         // dot2: the widened matrices
     uint32_t enc0[3]{}, dec0[2]{};
     std::array<std::array<uint32_t, 74>, MLayers> layers{};
     std::array<Pipeline, MLayers> network;      // one per layer (five distinct shaders)
     Pipeline input, expand, post, postQuality, postCompact, down, downRgb10;
     Pipeline inputPlanes, expandPlanes;         // token buffers in NGX's plane layout, for an external (HIP) network
+    std::array<Pipeline, 2> mergeDot2;          // dot2: the encoders' patch merges (merge_m_dot2.comp), after enc1, enc2
     bool planes = false;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, ldr = false;
@@ -86,9 +169,14 @@ struct MModel::Impl {
     float lConst[5]{};
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
+MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool dot2)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
+    if (const char* force = std::getenv("D4R_ENGINE_M_NETWORK")) {
+        if (!std::strcmp(force, "dot2")) dot2 = true;
+        else if (!std::strcmp(force, "matrix")) dot2 = false;
+    }
+    m.dot2 = dot2;
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
@@ -114,31 +202,50 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
     }
     for (auto& l : m.layers) inside(l[0], l[1]);
+    if (m.dot2 && m.presetL) throw std::runtime_error("preset L has no stages for GPUs without cooperative matrices");
+    if (m.dot2 && !exists(directory + "/m_enc1_dot2.spv"))
+        throw std::runtime_error("the model has no stages for GPUs without cooperative matrices (" + directory +
+                                 "/m_enc1_dot2.spv): rebuild it with the current compile_m.py");
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    m.w8.create(m.device, b8.size(), usage); m.w16.create(m.device, b16.size(), usage);
-    m.bytes8 = b8; m.bytes16 = b16;
+    m.w16.create(m.device, b16.size(), usage);
+    m.bytes16 = b16;
+    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0); m.w16x.create(m.device, m.bytes8.size(), usage); }
+    else { m.w8.create(m.device, b8.size(), usage); m.bytes8 = b8; }
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    for (unsigned i = 0; i < MLayers; ++i) m.network[i].create(device, directory + "/" + MShader[i] + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+    const std::string variant = m.dot2 ? "_dot2" : "";
+    for (unsigned i = 0; i < MLayers; ++i) m.network[i].create(device, directory + "/" + MShader[i] + variant + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+    if (m.dot2)
+        for (unsigned i = 0; i < 2; ++i)
+            m.mergeDot2[i].create(device, directory + "/m_merge" + std::to_string(i + 1) + "_dot2.spv", {b,b,b,b,b}, 32, cache);
     // layer_m.comp's L stages: bindings 0-6 of a layer, then the stage's own (layer_m.comp KIND 3 and 4)
     const std::vector<VkDescriptorType> lIn{b,b,b,b,b,b,b,b,t,t,t,t,t,t,s,s,s,b}, lEx{b,b,b,b,b,b,b,b,s,s,s,s};
     const std::string in = m.presetL ? "enc0_l" : "enc0_m", ex = m.presetL ? "dec0_l" : "dec0_m", po = m.presetL ? "post_l" : "post_m";
     const auto inTypes = m.presetL ? lIn : std::vector<VkDescriptorType>{b,t,t,t,t,t,t,s,s,s,b,b,b,b};
     const auto exTypes = m.presetL ? lEx : std::vector<VkDescriptorType>{b,t,t,s,s,s,s,b,b,b};
-    m.input.create(device, directory + "/" + in + ".spv", inTypes, 32, cache);
-    m.expand.create(device, directory + "/" + ex + ".spv", exTypes, 32, cache);
-    if ((m.planes = exists(directory + "/" + in + "_planes.spv") && exists(directory + "/" + ex + "_planes.spv"))) {
-        m.inputPlanes.create(device, directory + "/" + in + "_planes.spv", inTypes, 32, cache);
-        m.expandPlanes.create(device, directory + "/" + ex + "_planes.spv", exTypes, 32, cache);
+    m.input.create(device, directory + "/" + in + variant + ".spv", inTypes, 32, cache);
+    m.expand.create(device, directory + "/" + ex + variant + ".spv", exTypes, 32, cache);
+    if ((m.planes = exists(directory + "/" + in + "_planes" + variant + ".spv") && exists(directory + "/" + ex + "_planes" + variant + ".spv"))) {
+        m.inputPlanes.create(device, directory + "/" + in + "_planes" + variant + ".spv", inTypes, 32, cache);
+        m.expandPlanes.create(device, directory + "/" + ex + "_planes" + variant + ".spv", exTypes, 32, cache);
     }
-    m.post.create(device, directory + "/" + po + ".spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    m.postQuality.create(device, directory + "/" + po + "_q.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
+    // the reconstruction, downsample and exposure stages: the reconstruction as wave32 with the dot2 stages (RDNA2, Steam
+    // Deck: 1362 -> 1252 us at 720p; the downsample was slower as wave32), the rest wave64. D4R_ENGINE_M_STAGE_WAVE=32|64
+    // forces one size for all of them; they use no subgroup operations, so the outputs are identical.
+    const char* waveEnv = std::getenv("D4R_ENGINE_M_STAGE_WAVE");
+    const uint32_t forced = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : waveEnv && !std::strcmp(waveEnv, "64") ? 64 : 0;
+    const uint32_t wave = forced ? forced : 64, postWave = forced ? forced : m.dot2 ? 32 : 64;
+    auto postTypes = std::vector<VkDescriptorType>{b,t,t,t,t,t,t,t,t,s,s,b};
+    m.post.create(device, directory + "/" + po + ".spv", postTypes, postWave, cache);
+    m.postQuality.create(device, directory + "/" + po + "_q.spv", postTypes, postWave, cache);
     if (exists(directory + "/" + po + "_c.spv"))
-        m.postCompact.create(device, directory + "/" + po + "_c.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    m.down.create(device, directory + "/down_m.spv", {b,t,s,b}, 64, cache);
-    if (exists(directory + "/down_m_rgb10.spv"))
-        m.downRgb10.create(device, directory + "/down_m_rgb10.spv", {b,t,s,b}, 64, cache);
-    m.exposure[0].create(device, directory + "/exposure_m0.spv", {b,t,b}, 64, cache);
-    m.exposure[1].create(device, directory + "/exposure_m1.spv", {b,b,b,b,b,b}, 64, cache);
+        m.postCompact.create(device, directory + "/" + po + "_c.spv", postTypes, postWave, cache);
+    // the dot2 models' downsample builds split its horizontal pass finer (down_m.comp SEG)
+    const std::string down = m.dot2 && exists(directory + "/down_m_dot2.spv") ? "_dot2" : "";
+    m.down.create(device, directory + "/down_m" + down + ".spv", {b,t,s,b}, wave, cache);
+    if (exists(directory + "/down_m_rgb10" + down + ".spv"))
+        m.downRgb10.create(device, directory + "/down_m_rgb10" + down + ".spv", {b,t,s,b}, wave, cache);
+    m.exposure[0].create(device, directory + "/exposure_m0.spv", {b,t,b}, wave, cache);
+    m.exposure[1].create(device, directory + "/exposure_m1.spv", {b,b,b,b,b,b}, wave, cache);
 }
 MModel::~MModel() = default;
 bool MModel::uploadRecorded() const { return impl->uploaded; }
@@ -146,10 +253,11 @@ bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
 bool MModel::hasDynamicResolution() const { return impl->dynamicResolution; }
 bool MModel::isPresetL() const { return impl->presetL; }
+bool MModel::dot2Network() const { return impl->dot2; }
 void MModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
     if (m.uploaded) throw std::runtime_error("model upload already recorded");
-    recordContents(cb, m.w8, m.bytes8); recordContents(cb, m.w16, m.bytes16);
+    recordContents(cb, m.weights(), m.bytes8); recordContents(cb, m.w16, m.bytes16);
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     m.uploaded = true;
 }
@@ -167,6 +275,7 @@ struct MEngine::Impl {
     bool outputNew = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MLayers> layerSets{};
+    std::array<VkDescriptorSet, 2> mergeSets{};     // dot2: the encoders' patch merges
     std::array<VkDescriptorSet, 2> enc0Sets{}, dec0Sets{}, postSets{}, expSets{};
     VkDescriptorSet downSet = VK_NULL_HANDLE;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
@@ -255,8 +364,14 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         std::memcpy(lp.o, m.layers[i].data() + 2, sizeof(lp.o));
         std::memcpy(e.layerP[i].mapped, &lp, sizeof(lp));
         auto set = e.layerSets[i] = descriptorSet(dev, e.pool, m.network[i].descriptors);
-        bindBuffer(dev, set, 0, e.layerP[i]); bindRange(dev, set, 1, m.w8, m.layers[i][0]); bindRange(dev, set, 2, m.w16, m.layers[i][1]);
+        bindBuffer(dev, set, 0, e.layerP[i]); bindRange(dev, set, 1, m.weights(), m.weightsAt(m.layers[i][0])); bindRange(dev, set, 2, m.w16, m.layers[i][1]);
         bindBuffer(dev, set, 3, *in[i]); bindBuffer(dev, set, 4, *skip[i]); bindBuffer(dev, set, 5, *out[i]); bindBuffer(dev, set, 6, *merged[i]);
+        if (m.dot2 && i < 2) {
+            // the merge reads the layer's parameter block, weights and block output
+            auto ms = e.mergeSets[i] = descriptorSet(dev, e.pool, m.mergeDot2[i].descriptors);
+            bindBuffer(dev, ms, 0, e.layerP[i]); bindRange(dev, ms, 1, m.weights(), m.weightsAt(m.layers[i][0])); bindRange(dev, ms, 2, m.w16, m.layers[i][1]);
+            bindBuffer(dev, ms, 3, *out[i]); bindBuffer(dev, ms, 4, *merged[i]);
+        }
     }
     if (m.presetL) {
         // the input stage's pixel-resolution block output (the expansion's skip input) and the two stages' layer
@@ -287,11 +402,11 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         bindBuffer(dev, s0, 0, e.enc0P);
         bindImage(dev, s0, 4, e.mvA[prev].view, e.linear); bindImage(dev, s0, 5, e.half[prev].view, e.linear); bindImage(dev, s0, 6, e.feat[prev].view, e.linear);
         bindImage(dev, s0, 7, e.mvA[i].view); bindImage(dev, s0, 8, e.mvB.view); bindImage(dev, s0, 9, e.mvC.view);
-        bindRange(dev, s0, 10, m.w8, m.enc0[0]); bindRange(dev, s0, 11, m.w16, m.enc0[1]); bindRange(dev, s0, 12, m.w16, m.enc0[2]); bindBuffer(dev, s0, 13, e.tokens);
+        bindRange(dev, s0, 10, m.weights(), m.weightsAt(m.enc0[0])); bindRange(dev, s0, 11, m.w16, m.enc0[1]); bindRange(dev, s0, 12, m.w16, m.enc0[2]); bindBuffer(dev, s0, 13, e.tokens);
         auto s1 = e.dec0Sets[i] = descriptorSet(dev, e.pool, (external ? m.expandPlanes : m.expand).descriptors);
         bindBuffer(dev, s1, 0, e.dec0P); bindImage(dev, s1, 1, e.mvA[i].view, e.nearest); bindImage(dev, s1, 2, e.feat[prev].view, e.linear);
         bindImage(dev, s1, 3, e.feat[i].view); bindImage(dev, s1, 4, e.gates.view); bindImage(dev, s1, 5, e.mix.view); bindImage(dev, s1, 6, e.cov.view);
-        bindBuffer(dev, s1, 7, e.dec1Out); bindRange(dev, s1, 8, m.w8, m.dec0[0]); bindRange(dev, s1, 9, m.w16, m.dec0[1]);
+        bindBuffer(dev, s1, 7, e.dec1Out); bindRange(dev, s1, 8, m.weights(), m.weightsAt(m.dec0[0])); bindRange(dev, s1, 9, m.w16, m.dec0[1]);
         }
         auto s2 = e.postSets[i] = descriptorSet(dev, e.pool, m.post.descriptors);
         bindBuffer(dev, s2, 0, e.postP);
@@ -414,7 +529,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 bindImage(dev, in, 4, e.mvA[1 - i].view, e.linear); bindImage(dev, in, 5, e.half[1 - i].view, e.linear);
                 bindImage(dev, in, 6, e.feat[1 - i].view, e.linear);
                 bindImage(dev, in, 7, e.mvA[i].view); bindImage(dev, in, 8, e.mvB.view); bindImage(dev, in, 9, e.mvC.view);
-                bindRange(dev, in, 10, m.w8, m.enc0[0]); bindRange(dev, in, 11, m.w16, m.enc0[1]);
+                bindRange(dev, in, 10, m.weights(), m.weightsAt(m.enc0[0])); bindRange(dev, in, 11, m.w16, m.enc0[1]);
                 bindRange(dev, in, 12, m.w16, m.enc0[2]); bindBuffer(dev, in, 13, e.tokens);
                 }
                 bindBuffer(dev, post, 0, e.postP); bindImage(dev, post, 1, images.color, e.nearest, images.colorLayout);
@@ -477,7 +592,9 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     }
     stamp();
     // (preset L's input stage covers the same blocks: its shift is at most 2 in x and 2 in y)
-    dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], (e.gw + 2 + 7) / 8, (e.gh + 2 + 7) / 8);
+    // the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks
+    const uint32_t blocks = m.dot2 ? 2 : 1;
+    dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], ((e.gw + 2 + 7) / 8 + blocks - 1) / blocks, ((e.gh + 2 + 7) / 8 + blocks - 1) / blocks);
     stamp();
     if (e.external) closeStages(cb); else nextStage(cb);
     e.frontDone = true;
@@ -493,6 +610,8 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     stamp();
     if (m.presetL)      // one block more in x on frames whose expansion shift is 2
         dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], (e.gw + (e.frame & 1u) * 2u + 7) / 8, e.gh / 8);
+    else if (m.dot2)    // workgroups of 2x2 blocks
+        dispatch(cb, m.expand, e.dec0Sets[i], (e.gw / 8 + 1) / 2, (e.gh / 8 + 1) / 2);
     else
         dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], e.gw / 8, e.gh / 8);
     nextStage(cb);
@@ -514,9 +633,14 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     recordFront(cb, stamps, first);
     // timing only: D4R_ENGINE_M_LAYER_STAMPS=1 also stamps after every network layer, from query first + 7 on
     static const bool layerStamps = std::getenv("D4R_ENGINE_M_LAYER_STAMPS") != nullptr;
+    // the dot2 network's layers read their inputs through the vector caches, which an execution-only dependency
+    // (emptyStage) leaves stale: a ping-pong buffer read two layers earlier then serves old lines (one window in
+    // about every second 720p frame, run to run)
+    auto layerBarrier = [&] { if (m.dot2) nextStage(cb); else emptyStage(cb); };
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
-        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); emptyStage(cb);
+        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); layerBarrier();
+        if (m.dot2 && l < 2) { dispatch(cb, m.mergeDot2[l], e.mergeSets[l], (w / 2 + 7) / 8, (h / 2 + 7) / 8); layerBarrier(); }
         if (stamps && layerStamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, first + 7 + l);
     }
     recordBack(cb, stamps, stamps ? first + 3 : 0);

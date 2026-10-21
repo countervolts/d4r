@@ -23,8 +23,9 @@ What you need
   optimisations are included only for targets supplied by the builder.
   RDNA2 (RX 6000 series, Steam Deck, RDNA2 integrated GPUs; gfx1030–gfx1036) has no WMMA instructions:
   this build gives it native DLSS 4 (K) layers that do the matrix products in software, bit-identical
-  to the WMMA kernels when run on RDNA3. Use K or E there; M and L run fully translated (slow). RDNA2
-  itself has not been tested on a real GPU.
+  to the WMMA kernels when run on RDNA3. Use K or E there; L runs fully translated (slow), M on d4r's
+  engine (its v_dot2 stages; on the Steam Deck about 17.3 ms at 800p, K about 11.6 ms). Of RDNA2, only
+  the Steam Deck has been tested.
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.

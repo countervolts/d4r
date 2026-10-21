@@ -4,14 +4,36 @@
 // feature, a motion-change measure), rounds them to FP8 with NGX's dither, and embeds each 2x2-pixel token
 // (128 feature slots) into 64 channels with one matrix product per 4x4-token block. It also writes the three
 // motion candidates the reconstruction uses.
+// DOT2: the same stage for GPUs without cooperative matrices or FP8 (RDNA2): the product on v_dot2_f32_f16 with the
+// same binary16 rounding after every 32 products, FP8 in binary16 and integer arithmetic (fp8_soft.glsl); binding 10
+// holds the matrix widened to binary16 pairs [64][64] by the runtime. A workgroup is four of the blocks (2x2), so the
+// product runs with a token per lane and wave-uniform weights (one block: per-lane weights, 3.4x the product's time).
+#ifndef DOT2
+#define DOT2 0
+#endif
+#if DOT2
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_GOOGLE_include_directive : require
+#include "fp8_soft.glsl"
+#define F8T float16_t
+#define F8OF(h) e4m3Round(float(h))
+#else
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_float_e4m3 : require
 #extension GL_GOOGLE_include_directive : require
+#endif
 #include "round_half.glsl"
+#if DOT2
+layout(local_size_x = 128) in;      // four waves: 2x2 blocks of 16 tokens = 8x8 render pixels, two pixels per lane
+#else
 layout(local_size_x = 32) in;       // one wave: 16 tokens = 8x8 render pixels, two pixels per lane
+#endif
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
     ivec2 size;             // render size
@@ -35,10 +57,90 @@ layout(set = 0, binding = 6) uniform sampler2D featTex;        // recurrent feat
 layout(set = 0, binding = 7, rg16f) uniform writeonly image2D mvAOut;
 layout(set = 0, binding = 8, rg16f) uniform writeonly image2D mvBOut;
 layout(set = 0, binding = 9, rg16f) uniform writeonly image2D mvCOut;
+#if DOT2
+layout(set = 0, binding = 10, std430) readonly buffer W8 { uint w[]; } w8;             // [64][64] binary16 pairs
+layout(set = 0, binding = 11, std430) readonly buffer W16 { uint w[]; } w16;           // bias (its first row of 64)
+layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
+layout(set = 0, binding = 13, std430) writeonly buffer Out { uint a[]; } outb;         // [tok.y][tok.x][64] FP8
+#else
 layout(set = 0, binding = 10, std430) readonly buffer W8 { floate4m3_t w[]; } w8;      // [128][64]
 layout(set = 0, binding = 11, std430) readonly buffer W16 { f16vec4 w[]; } w16;        // bias, 16 equal rows of 64
 layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
 layout(set = 0, binding = 13, std430) writeonly buffer Out { floate4m3_t a[]; } outb;  // [tok.y][tok.x][64]
+#endif
+#ifndef PLANES
+#define PLANES 0
+#endif
+#if DOT2
+#if PLANES
+#error "the plane layout is for the HIP network, which needs FP8"
+#endif
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+// the workgroup's 64 tokens (four blocks of 16, block-major) as 128 feature slots in binary16 pairs, rows of 64 + 4
+shared uint FE[64 * 68];
+#include "enc0_features.glsl"
+void gatherPixel(uint pi, ivec2 block, uint first, float e1, float e2, bool fusedFourth)
+{
+    float16_t fe[32];
+    gatherFeatures(pi, block, e1, e2, fusedFourth, fe);
+    const uint px = pi & 7u, py = pi >> 3;
+    const uint at = (first + (py >> 1) * 4u + (px >> 1)) * 68u + ((py & 1u) * 2u + (px & 1u)) * 16u;
+    for (uint k = 0u; k < 32u; k += 2u) FE[at + k / 2u] = packFloat2x16(f16vec2(fe[k], fe[k + 1u]));
+}
+uvec4 fe4(uint i) { return uvec4(FE[i], FE[i + 1u], FE[i + 2u], FE[i + 3u]); }
+// the block of token b (0..63) of this workgroup: 2x2 blocks of 8x8 pixels
+ivec2 blockOf(uint b) { return 8 * (2 * ivec2(gl_WorkGroupID.xy) + ivec2(b & 1u, b >> 1)) - p.shift; }
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    // wave w gathers block w's 64 pixels (16 tokens), two per lane
+    gatherPixel(lane, blockOf(wave), 16u * wave, e1, e2, true);
+    gatherPixel(lane + 32u, blockOf(wave), 16u * wave, e1, e2, false);
+    memoryBarrierShared(); barrier();
+    // a lane computes channels 16 w .. 16 w + 15 of tokens lane and lane + 32 (wave-uniform weights): the bias, then
+    // 32 products at a time summed in f32 and added to the binary16 accumulator with one rounding (NVIDIA's chained
+    // k32 steps)
+    const uint c0 = 16u * wave;
+    float a[2][16];
+    [[unroll]] for (uint n = 0u; n < 16u; n += 2u)
+    {
+        const vec2 b = vec2(unpackFloat2x16(w16.w[(c0 + n) / 2u]));
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) { a[t][n] = b.x; a[t][n + 1u] = b.y; }
+    }
+    for (uint k0 = 0u; k0 < 64u; k0 += 16u)
+    {
+        float s[2][16];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n) s[t][n] = 0.0;
+        [[unroll]] for (uint kp = k0; kp < k0 + 16u; kp += 4u)
+        {
+            const uvec4 f0 = fe4(lane * 68u + kp), f1 = fe4((lane + 32u) * 68u + kp);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) [[unroll]] for (uint n = 0u; n < 16u; ++n)
+            {
+                const uint w = w8.w[(kp + j) * 64u + c0 + n];
+                s[0][n] = d2(f0[j], w, s[0][n]); s[1][n] = d2(f1[j], w, s[1][n]);
+            }
+        }
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n) a[t][n] = roundHalfSat(s[t][n] + a[t][n]);
+    }
+    // token r of a block is (r & 3, r >> 2) from the block's first token; FP8 codes of the clamped values, four channels a word
+    const float16_t CL = float16_t(6.2831855);
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        const uint tr = lane + 32u * t, r = tr & 15u;
+        const ivec2 tk = (blockOf(tr >> 4) >> 1) + ivec2(int(r & 3u), int(r >> 2));
+        if (tk.x < 0 || tk.y < 0 || tk.x >= p.tok.x || tk.y >= p.tok.y) continue;
+        [[unroll]] for (uint n = 0u; n < 16u; n += 4u)
+        {
+            const uint w01 = e4m3RoundHalf2(clamp(f16vec2(a[t][n], a[t][n + 1u]), -CL, CL));
+            const uint w23 = e4m3RoundHalf2(clamp(f16vec2(a[t][n + 2u], a[t][n + 3u]), -CL, CL));
+            outb.a[uint(tk.y * p.tok.x + tk.x) * 16u + (c0 + n) / 4u] = e4m3CodesHalf2(w01) | (e4m3CodesHalf2(w23) << 16);
+        }
+    }
+}
+#else
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define HACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -59,9 +161,6 @@ layout(set = 0, binding = 13, std430) writeonly buffer Out { floate4m3_t a[]; } 
 shared floate4m3_t FE[16 * 136];
 shared float16_t RS[gl_WorkGroupSize.x * 8u];
 // PLANES: the tokens in NGX's layout, two planes of 32 channels ([2][tok.y][tok.x][32]), for the HIP network
-#ifndef PLANES
-#define PLANES 0
-#endif
 #include "enc0_features.glsl"
 void gatherPixel(uint pi, ivec2 block, float e1, float e2, bool fusedFourth)
 {
@@ -158,3 +257,4 @@ void main()
 #undef ROW_OFF
 #undef TOK_STRIDE
 }
+#endif

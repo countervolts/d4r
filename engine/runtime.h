@@ -208,7 +208,10 @@ struct MFrameSettings {
 };
 class MModel {
 public:
-    MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    // dot2: the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2), the
+    // model directory's *_dot2.spv (D4R_ENGINE_M_NETWORK=dot2|matrix overrides); preset M only
+    MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+           bool dot2 = false);
     ~MModel();
     MModel(const MModel&) = delete;
     MModel& operator=(const MModel&) = delete;
@@ -218,6 +221,7 @@ public:
     bool hasRgb10Output() const;
     bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
+    bool dot2Network() const;  // the v_dot2 stages (no cooperative matrices, no FP8)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

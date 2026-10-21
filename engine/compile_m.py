@@ -24,7 +24,7 @@ import m_model as mm
 import l_model as lm
 import model_enc3 as me
 import swin_model as sm
-from test_m import pack_layer, defines
+from test_m import pack_layer, defines, dot2_defines, dot2_merge_defines
 
 # The network is built with this GPU's own arithmetic and two windows per wave by default (layer_m.comp M_RELAXED, WPW;
 # engine/README.md): the fastest build, about 1 dB further from an NVIDIA card than NVIDIA's roundings reproduced
@@ -122,6 +122,13 @@ def main():
     glsl('post_m.comp', 'post_m_c.spv', ['-DTILE_W=11', '-DTILE_H=11'] + (['-DLDR=1'] if a.ldr else []))
     # the same stages with the token buffers in NGX's plane layout, for a network that runs outside the engine
     for s in ('enc0_m', 'dec0_m'): glsl(s + '.comp', s + '_planes.spv', ['-DPLANES=1'] + (['-DLDR=1'] if a.ldr and s != 'dec0_m' else []))
+    # the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2): v_dot2 on the
+    # matrices widened to binary16 at load (layer_m_dot2.comp, runtime_m.inc widenM), the relaxed build's arithmetic
+    for name, out in SHADERS.items(): glsl('layer_m_dot2.comp', out + '_dot2.spv', dot2_defines(name))
+    for name, out in (('enc1', 'm_merge1'), ('enc2', 'm_merge2')): glsl('merge_m_dot2.comp', out + '_dot2.spv', dot2_merge_defines(name))
+    for s in ('enc0_m', 'dec0_m'): glsl(s + '.comp', s + '_dot2.spv', ['-DDOT2=1'] + (['-DLDR=1'] if a.ldr and s != 'dec0_m' else []))
+    for out, flags in (('down_m_dot2', []), ('down_m_rgb10_dot2', ['-DOUTPUT_RGB10=1'])):
+        glsl('down_m.comp', out + '.spv', ['-DSEG=2'] + flags + (['-DLDR=1'] if a.ldr else []))
     if a.hip:
         package_hip(a, Ps)
     marker = a.output / 'ldr'      # tells the runtime to skip exposure

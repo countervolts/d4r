@@ -96,12 +96,15 @@ int main(int argc, char** argv) try {
     VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
     vkGetPhysicalDeviceFeatures2(c.physical, &f2);
-    if (!cm.cooperativeMatrix || !f8.shaderFloat8 || !f8.shaderFloat8CooperativeMatrix) throw std::runtime_error("GPU lacks FP8 cooperative matrices (VK_EXT_shader_float8)");
+    // without FP8 cooperative matrices (RDNA2) the model's v_dot2 stages run (MModel dot2)
+    const bool dot2 = !cm.cooperativeMatrix || !f8.shaderFloat8 || !f8.shaderFloat8CooperativeMatrix;
+    if (dot2 && hip) throw std::runtime_error("GPU lacks FP8 cooperative matrices (VK_EXT_shader_float8)");
+    if (dot2) { v13.pNext = nullptr; vkGetPhysicalDeviceFeatures2(c.physical, &f2); }
     uint32_t nq = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(c.physical, &nq, qf);
     uint32_t qi = 0; for (uint32_t i = 0; i < nq; ++i) if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qf[i].timestampValidBits) { qi = i; break; }
     float prio = 1; VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     const char* exts[] = {"VK_KHR_cooperative_matrix", "VK_EXT_shader_float8", "VK_KHR_external_memory_fd"};
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.enabledExtensionCount = hip ? 3 : 2; dci.ppEnabledExtensionNames = exts;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.enabledExtensionCount = dot2 ? 0 : hip ? 3 : 2; dci.ppEnabledExtensionNames = exts;
     CK(vkCreateDevice(c.physical, &dci, nullptr, &c.device)); vkGetDeviceQueue(c.device, qi, 0, &c.queue);
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pi.queueFamilyIndex = qi; pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     CK(vkCreateCommandPool(c.device, &pi, nullptr, &c.pool));
@@ -117,7 +120,7 @@ int main(int argc, char** argv) try {
     };
     auto begin = [&] { CK(vkResetCommandBuffer(cb, 0)); VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CK(vkBeginCommandBuffer(cb, &bi)); };
     {
-        d4r::MModel m(c.physical, c.device, model);
+        d4r::MModel m(c.physical, c.device, model, VK_NULL_HANDLE, dot2);
         d4r::ExternalNetwork external;
 #ifdef D4R_ENGINE_HIP
         std::unique_ptr<d4r::HipNetwork> network;
