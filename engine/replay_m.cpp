@@ -135,8 +135,12 @@ int main(int argc, char** argv) try {
         uint32_t cw = rw, ch = rh;
         if (const char* capacity = std::getenv("D4R_M_CAPACITY")) std::sscanf(capacity, "%ux%u", &cw, &ch);
         d4r::MEngine engine(m, cw, ch, ow, oh, hip ? &external : nullptr);
-        Image color = image(c, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT), motion = image(c, rw, rh, VK_FORMAT_R16G16_SFLOAT), depth = image(c, rw, rh, VK_FORMAT_R32_SFLOAT);
-        const VkDeviceSize sizes[3] = {VkDeviceSize(rw) * rh * 8, VkDeviceSize(rw) * rh * 4, VkDeviceSize(rw) * rh * 4};
+        // D4R_M_DISPLAY_MV=1: the frames' motion is resampled to display resolution (nearest, in output pixels) and
+        // passed as display-resolution motion (MFrameSettings::displayMotion)
+        const bool displayMv = std::getenv("D4R_M_DISPLAY_MV") != nullptr;
+        const uint32_t mw = displayMv ? ow : rw, mh = displayMv ? oh : rh;
+        Image color = image(c, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT), motion = image(c, mw, mh, VK_FORMAT_R16G16_SFLOAT), depth = image(c, rw, rh, VK_FORMAT_R32_SFLOAT);
+        const VkDeviceSize sizes[3] = {VkDeviceSize(rw) * rh * 8, VkDeviceSize(mw) * mh * 4, VkDeviceSize(rw) * rh * 4};
         Staging in[3] = {staging(c, sizes[0]), staging(c, sizes[1]), staging(c, sizes[2])}, out = staging(c, VkDeviceSize(ow) * oh * 8);
         Image* images[3] = {&color, &motion, &depth};
         begin(); m.recordUpload(cb); engine.recordInitialize(cb);
@@ -151,6 +155,19 @@ int main(int argc, char** argv) try {
         for (int f = 0; f < frames; ++f)
             for (int k = 0; k < 3; ++k) {
                 auto data = slurp(argv[sep + 1 + 5 * f + k]);
+                if (k == 1 && displayMv) {
+                    if (data.size() != size_t(rw) * rh * 4) throw std::runtime_error("wrong input size");
+                    std::vector<char> hi(sizes[1]);
+                    const _Float16* lo = reinterpret_cast<const _Float16*>(data.data());
+                    _Float16* d = reinterpret_cast<_Float16*>(hi.data());
+                    for (uint32_t y = 0; y < oh; ++y)
+                        for (uint32_t x = 0; x < ow; ++x) {
+                            const size_t t = size_t(uint64_t(y) * rh / oh) * rw + uint64_t(x) * rw / ow;
+                            d[2 * (size_t(y) * ow + x)] = _Float16(float(lo[2 * t]) * float(ow) / float(rw));
+                            d[2 * (size_t(y) * ow + x) + 1] = _Float16(float(lo[2 * t + 1]) * float(oh) / float(rh));
+                        }
+                    data = std::move(hi);
+                }
                 if (data.size() != sizes[k]) throw std::runtime_error("wrong input size");
                 frameInputs.push_back(std::move(data));
             }
@@ -165,11 +182,14 @@ int main(int argc, char** argv) try {
                     for (int k = 0; k < 3; ++k)
                         std::memcpy(in[k].map, frameInputs[3 * f + k].data(), sizes[k]);
                 begin();
-                VkBufferImageCopy region{}; region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; region.imageExtent = {rw, rh, 1};
+                VkBufferImageCopy region{}; region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 if (pass == 0 || frames > 1)
-                    for (int k = 0; k < 3; ++k) vkCmdCopyBufferToImage(cb, in[k].buffer, images[k]->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                    for (int k = 0; k < 3; ++k) {
+                        region.imageExtent = k == 1 ? VkExtent3D{mw, mh, 1} : VkExtent3D{rw, rh, 1};
+                        vkCmdCopyBufferToImage(cb, in[k].buffer, images[k]->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                    }
                 d4r::MFrameSettings s; s.jitter[0] = std::atof(a[3]); s.jitter[1] = std::atof(a[4]); s.reset = (pass == 0 && f == 0) || resetAll;
-                s.renderWidth = rw; s.renderHeight = rh;
+                s.renderWidth = rw; s.renderHeight = rh; s.displayMotion = displayMv;
                 const double t0 = now();
                 engine.setFrame({color.view, motion.view, depth.view}, s);
                 vkCmdResetQueryPool(cb, qp, 0, 17);

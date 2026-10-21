@@ -1,0 +1,469 @@
+#version 460
+// d4r engine, preset L: the input stage (KIND 3, rrlite_enc0_4x4_*) and the expansion stage (KIND 4, rrlite_dec0_4x4)
+// for GPUs without cooperative matrices or FP8 (RDNA2). The mathematics, parameters and bindings are layer_m.comp's
+// KIND 3 and 4 (L_NOTES.md) in its relaxed build; the products and number formats are layer_m_dot2.comp's (v_dot4_i32_i8
+// on int8 with per-token and per-column scales, v_dot2_f32_f16 on exact FP8 values in binary16), on the matrices
+// runtime_m.inc widenM packs for preset L. The input stage's patch merge is merge_l_dot2.comp, dispatched after it.
+//  - A workgroup is one 8x8-pixel block, two waves: a lane owns one pixel's token (window-major, so a half-wave holds one
+//    4x4-pixel window) with all its 32 channels. The norms, the int8 scales, the embedding and the MLP's hidden values
+//    therefore stay in the lane's registers: no shared memory or barrier but the expansion stage's patch expand
+//    (layer_m_dot2.comp splits a token's channels across waves; at C 32 its exchanges cost more than its products).
+//  - Weights are wave-uniform (scalar memory). Attention as layer_m_dot2.comp: a window's keys come as DPP8
+//    broadcasts within groups of eight lanes and a swap of the two groups.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_AMD_shader_ballot : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#include "fp8_soft.glsl"
+#if KIND != 3 && KIND != 4
+#error layer_l_dot2.comp: KIND 3 (input stage) or 4 (expansion stage)
+#endif
+#if KIND == 4
+layout(local_size_x = 128) in;      // two blocks side by side (the patch expand's weights are then wave-uniform)
+#else
+layout(local_size_x = 64) in;
+#endif
+// o: 0 g1, 1 bo, 2 g2, 3 b2 (f16); per head h at 4 + 4h: q, v (int8), bias (f16), wo (int8, the heads' as one [64][32]);
+//    per MLP chunk c at 20 + 3c: w1 (int8), b1 (f16), w2 (int8, pairs of chunks sharing column scales); 60-63 (KIND 3):
+//    the embedding's W1 (binary16 pairs), b1, W2 (int8), b2; 68, 69 (KIND 4): the patch expand (int8) and its bias
+layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx; int sy; uint o[72]; } p;
+layout(set = 0, binding = 1, std430) readonly buffer Wb { uint w[]; } wb;
+layout(set = 0, binding = 2, std430) readonly buffer W16 { uint w[]; } w16;
+layout(set = 0, binding = 3, std430) readonly buffer Ib { uint a[]; } inb;            // KIND 4: FP8 [H/2][W/2][64]
+layout(set = 0, binding = 4, std430) readonly buffer Sb { uint a[]; } skb;            // KIND 4: the skip, FP8 [H][W][32]
+layout(set = 0, binding = 5, std430) writeonly buffer O0 { uint a[]; } out0;          // KIND 3: the block output, FP8 [H][W][32]
+#if KIND == 3
+layout(set = 0, binding = 7, std430) readonly buffer Ep
+{
+    ivec2 size, shift, tok;
+    vec2 jitter, prevJitter;
+    vec2 mvScale, mvOffs;
+    vec2 rnd2hi, hi2rnd;
+    vec2 hiSize;
+    float changeScale, changeGain;
+    uint depthFlag, reset, frame;
+    float expo, expoPrev;
+    float halfInvX, halfInvY, renderInvX, renderInvY;
+    uint displayMv;
+    ivec2 mvMax;
+    vec2 mvPix;
+} ep;
+layout(set = 0, binding = 8) uniform sampler2D colorTex;
+layout(set = 0, binding = 9) uniform sampler2D motionTex;
+layout(set = 0, binding = 10) uniform sampler2D depthTex;
+layout(set = 0, binding = 11) uniform sampler2D prevMvTex;
+layout(set = 0, binding = 12) uniform sampler2D halfTex;
+layout(set = 0, binding = 13) uniform sampler2D featTex;
+layout(set = 0, binding = 14, rg16f) uniform writeonly image2D mvAOut;
+layout(set = 0, binding = 15, rg16f) uniform writeonly image2D mvBOut;
+layout(set = 0, binding = 16, rg16f) uniform writeonly image2D mvCOut;
+layout(set = 0, binding = 17, std430) readonly buffer Noise { uint16_t n[]; } noise;
+#define F8T float16_t
+#define F8OF(h) e4m3Round(float(h))
+#define ENC0_DEDUP 1
+#define ENC0_DISPLAY_MV 1
+#define EP ep
+#include "enc0_features.glsl"
+#undef EP
+#else
+#include "normalized_store.glsl"
+#include "round_half.glsl"
+layout(set = 0, binding = 7, std430) readonly buffer Dp
+{
+    ivec2 size;
+    int tokW; uint reset;
+    vec2 rndOffs, rnd2hi, hiSize, histOffs;
+    float sigma, rho;
+    vec2 renderInv;
+} dp;
+layout(set = 0, binding = 8, rgba8_snorm) uniform writeonly image2D featOut;
+layout(set = 0, binding = 9, rgba8) uniform writeonly image2D gateOut;
+layout(set = 0, binding = 10, rgba8) uniform writeonly image2D mixOut;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D covOut;
+// layer_m.comp's head activations: a sigmoid rounded to binary16, NVIDIA's tanh
+float sigmoidL(float v) { return roundHalfValue(1.0 / (exp2(v * -1.442695) + 1.0)); }
+float tanhL(float t)
+{
+    const float m = abs(t), s = t * t;
+    const float big = m >= 9.0109138 ? 1.0 : fma(1.0 / (exp2(m * 2.88539) + 1.0), -2.0, 1.0);
+    return m >= 0.6 ? (t < 0.0 ? -big : big) :
+        fma(fma(fma(fma(fma(0.01573968306183815, s, -0.05230396240949631), s, 0.13315297663211823), s, -0.33332768082618713), s, 0.0), t, t);
+}
+// the patch expand: q8 of the expansion's 4 x 32 columns of the two blocks' 32 low-resolution tokens as binary16 pairs
+// (rows of ERS: sub-position q at 16 q)
+const uint ERS = 64u + 4u;
+shared uint EX[32 * ERS];
+#endif
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
+float lo(uint v) { return float(unpackFloat2x16(v).x); }
+float hi(uint v) { return float(unpackFloat2x16(v).y); }
+uint pk(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
+uint q8p(float a, float b) { return e4m3PackF32(a, b); }
+uint f16w(uint halfOffset) { return w16.w[halfOffset / 2u]; }
+// block position of token i (window-major: window i >> 4, 4x4 within it)
+uvec2 tokPos(uint i) { const uint mt = i >> 4, r = i & 15u; return uvec2(4u * (mt & 1u) + (r & 3u), 4u * (mt >> 1) + (r >> 2)); }
+uint softmax2(uint s)
+{
+    const f16vec2 lim = f16vec2(0.55615234375), cs = f16vec2(0.0972222164273262 / 5.656854152679443);
+    const f16vec2 t = clamp(unpackFloat2x16(s) * cs, -lim, lim);
+    const f16vec2 q = fma(t, fma(t, -t, f16vec2(0.92730712890625)), f16vec2(1.375));
+    return (packFloat2x16(q) << 5) + 0x7FF88000u;
+}
+float gelu(float x)
+{
+    const float y = clamp(x, -2.0, 2.0);
+    return x * fma(y, fma(-abs(y), 0.08108133, 0.41216981), 0.5);
+}
+float16_t rsq16(float sumSquares) { return float16_t(inversesqrt(float(float16_t(sumSquares) + float16_t(0.0001220703125)))); }
+// The int8 quantisation in packed binary16: NP binary16 pairs (natural channel order) as NP / 2 int8 words with one
+// scale, the largest magnitude / 127. v inv + 1536 rounded once to binary16 (v_pk_fma_f16) has spacing 1 in [1024, 2048),
+// so its low byte is the rounded int8 value (q8x4); the pairs regroup as (v0, v2), (v1, v3) so one mask and shift
+// pack the bytes in channel order. inv is binary16 (at most 65504): |v inv| stays below 127.5.
+uint q8g(uint u02, uint u13, uint inv2)
+{
+    const f16vec2 i = unpackFloat2x16(inv2), c = f16vec2(1536.0);
+    const uint a = packFloat2x16(fma(unpackFloat2x16(u02), i, c)), b = packFloat2x16(fma(unpackFloat2x16(u13), i, c));
+    return (a & 0x00FF00FFu) | ((b & 0x00FF00FFu) << 8);
+}
+uint q8h(uint u0, uint u1, uint inv2) { return q8g((u0 & 0xFFFFu) | (u1 << 16), (u0 >> 16) | (u1 & 0xFFFF0000u), inv2); }
+uint absMax16(uint m, uint v) { const u16vec2 a = unpack16(m), b = unpack16(v & 0x7FFF7FFFu); return pack32(max(a, b)); }
+// the step for the largest magnitude (two binary16 halves of m): returns the scale, inv2 the binary16 reciprocal pair
+float scaleOf(uint m, out uint inv2)
+{
+    const float mx = float(uint16BitsToFloat16(uint16_t(max(m & 0xFFFFu, m >> 16))));
+    const float16_t inv = float16_t(mx > 0.0 ? min(127.0 / mx, 65504.0) : 0.0);
+    inv2 = packFloat2x16(f16vec2(inv));
+    return mx * (1.0 / 127.0);
+}
+float quant16(uint v[16], out uint q[8])
+{
+    uint m = 0u, inv2;
+    [[unroll]] for (uint d = 0u; d < 16u; ++d) m = absMax16(m, v[d]);
+    const float s = scaleOf(m, inv2);
+    [[unroll]] for (uint d = 0u; d < 8u; ++d) q[d] = q8h(v[2u * d], v[2u * d + 1u], inv2);
+    return s;
+}
+// the same for pairs already grouped as (v0, v2), (v1, v3) (made from f32 values, where the grouping is free)
+float quant16g(uint v[16], out uint q[8])
+{
+    uint m = 0u, inv2;
+    [[unroll]] for (uint d = 0u; d < 16u; ++d) m = absMax16(m, v[d]);
+    const float s = scaleOf(m, inv2);
+    [[unroll]] for (uint d = 0u; d < 8u; ++d) q[d] = q8g(v[2u * d], v[2u * d + 1u], inv2);
+    return s;
+}
+float quant32g(uint v[32], out uint q[16])
+{
+    uint m = 0u, inv2;
+    [[unroll]] for (uint d = 0u; d < 32u; ++d) m = absMax16(m, v[d]);
+    const float s = scaleOf(m, inv2);
+    [[unroll]] for (uint d = 0u; d < 16u; ++d) q[d] = q8g(v[2u * d], v[2u * d + 1u], inv2);
+    return s;
+}
+// layer_m_dot2.comp's GELU on a binary16 pair
+uint gelu2(uint v)
+{
+    const f16vec2 x = unpackFloat2x16(v), y = clamp(x, f16vec2(-2.0), f16vec2(2.0));
+    return packFloat2x16(x * fma(y, fma(-abs(y), f16vec2(0.08108133), f16vec2(0.41216981)), f16vec2(0.5)));
+}
+// ia[n] = the int8 products of the lane's 8 words with the 32 columns of the [32/4][32] int8 matrix at word w
+void gemm8(out int ia[32], uint a[8], uint w)
+{
+    [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] = 0;
+    [[unroll]] for (uint k = 0u; k < 8u; ++k)
+        [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] += dotPacked4x8EXT(int(a[k]), int(wb.w[w + k * 32u + n]));
+}
+// the same with 16 words: the [64/4][32] matrix at word w (16 words = 512 dot4 per lane)
+void gemm16(out int ia[32], uint a[16], uint w)
+{
+    [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] = 0;
+    [[unroll]] for (uint k = 0u; k < 16u; ++k)
+        [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] += dotPacked4x8EXT(int(a[k]), int(wb.w[w + k * 32u + n]));
+}
+#define BC8(v, r) swizzleInvocationsMaskedAMD(v, uvec3(0x18u, r, 0u))
+void main()
+{
+    const uint gi = gl_LocalInvocationID.x & 63u, lane = gl_SubgroupInvocationID;
+#if KIND == 4
+    const uint blk = gl_LocalInvocationID.x >> 6;
+    const int X0 = 8 * (2 * int(gl_WorkGroupID.x) + int(blk)) - p.sx, Y0 = 8 * int(gl_WorkGroupID.y) - p.sy;
+#else
+    const int X0 = 8 * int(gl_WorkGroupID.x) - p.sx, Y0 = 8 * int(gl_WorkGroupID.y) - p.sy;
+#endif
+    const uvec2 bp = tokPos(gi);
+    // ------------------------------------------------------------ the block input x0, binary16 pairs
+    uint xh[16];
+#if KIND == 3
+    {
+        // the pixel's 32 feature slots (enc0_features.glsl; NGX's first pixel row of a lane, rows 0-3, fuses its fourth
+        // history coordinate), then the embedding: z = W1 f + b1 on v_dot2 (the exact FP8 products; the slot pairs 5, 7,
+        // ..., 15 are always zero), x0 = W2 q8(relu(z)) + b2 on int8
+        const float e1 = ep.expo == 0.0 ? 1.0 : ep.expo, e2 = ep.expoPrev == 0.0 ? 1.0 : ep.expoPrev;
+        float16_t fe[32];
+        gatherFeatures(bp.y * 8u + bp.x, ivec2(X0, Y0), e1, e2, bp.y < 4u, fe);
+        float z[32];
+        [[unroll]] for (uint n = 0u; n < 32u; n += 2u) { const uint b = f16w(p.o[61] + n); z[n] = lo(b); z[n + 1u] = hi(b); }
+        const uint w1 = p.o[60] / 2u;
+        [[unroll]] for (uint kp = 0u; kp < 16u; ++kp)
+        {
+            if (kp >= 5u && (kp & 1u) != 0u) continue;
+            const uint f = packFloat2x16(f16vec2(fe[2u * kp], fe[2u * kp + 1u]));
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) z[n] = d2(f, wb.w[w1 + kp * 32u + n], z[n]);
+        }
+        uint zh[16], g[8];
+        [[unroll]] for (uint d = 0u; d < 8u; ++d)
+        {
+            zh[2u * d] = pk(max(z[4u * d], 0.0), max(z[4u * d + 2u], 0.0));
+            zh[2u * d + 1u] = pk(max(z[4u * d + 1u], 0.0), max(z[4u * d + 3u], 0.0));
+        }
+        const float gs = quant16g(zh, g);
+        int ia[32];
+        const uint w2 = p.o[62] / 2u;
+        gemm8(ia, g, w2);
+        [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+        {
+            const uint b = f16w(p.o[63] + n);
+            xh[n / 2u] = pk(fma(float(ia[n]), gs * uintBitsToFloat(wb.w[w2 + 256u + n]), lo(b)),
+                            fma(float(ia[n + 1u]), gs * uintBitsToFloat(wb.w[w2 + 256u + n + 1u]), hi(b)));
+        }
+    }
+#else
+    {
+        // the patch expand: x0 = q8(E) + skip, E the 4 x 32 columns of the low-resolution tokens (the blocks' 2x2 pixel
+        // groups), sub-position q in columns 32 q ... Wave q computes sub-position q of all 32 tokens of the two blocks, a
+        // token per lane (its 64 channels as int8 with one scale): the weights are wave-uniform.
+        {
+            const uint t = gl_SubgroupInvocationID, q = gl_SubgroupID, r = t & 15u;
+            const int W2 = p.W / 2, H2 = p.Hh / 2, bx = 8 * (2 * int(gl_WorkGroupID.x) + int(t >> 4)) - p.sx;
+            const uint lt = uint(mirror((Y0 >> 1) + int(r >> 2), H2) * W2 + mirror((bx >> 1) + int(r & 3u), W2));
+            uint v[32], m = 0u;
+            [[unroll]] for (uint d = 0u; d < 16u; ++d)
+            {
+                const uvec2 u = e4m3Unpack4(inb.a[lt * 16u + d]);
+                v[2u * d] = u.x; v[2u * d + 1u] = u.y;
+                m = absMax16(absMax16(m, u.x), u.y);
+            }
+            uint inv2, a[16];
+            const float ts = scaleOf(m, inv2);
+            [[unroll]] for (uint d = 0u; d < 16u; ++d) a[d] = q8h(v[2u * d], v[2u * d + 1u], inv2);
+            const uint we = p.o[68] / 2u + 32u * q;
+            int ie[32];
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) ie[n] = 0;
+            [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                [[unroll]] for (uint n = 0u; n < 32u; ++n) ie[n] += dotPacked4x8EXT(int(a[k]), int(wb.w[we + k * 128u + n]));
+            [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+            {
+                const uint b = f16w(p.o[69] + 32u * q + n);
+                EX[t * ERS + 16u * q + n / 2u] = q8p(fma(float(ie[n]), ts * uintBitsToFloat(wb.w[we + 16u * 128u + n]), lo(b)),
+                                                     fma(float(ie[n + 1u]), ts * uintBitsToFloat(wb.w[we + 16u * 128u + n + 1u]), hi(b)));
+            }
+        }
+        barrier();
+        // pixel (bx, by) is sub-position (bx & 1) + 2 (by & 1) of low-resolution token (bx >> 1) + 4 (by >> 1)
+        const uint r = 16u * blk + (bp.y >> 1) * 4u + (bp.x >> 1), q = (bp.y & 1u) * 2u + (bp.x & 1u);
+        const uint src = uint(mirror(Y0 + int(bp.y), p.Hh) * p.W + mirror(X0 + int(bp.x), p.W));
+        [[unroll]] for (uint d = 0u; d < 8u; ++d)
+        {
+            const uvec2 s = e4m3Unpack4(skb.a[src * 8u + d]);
+            xh[2u * d] = packFloat2x16(unpackFloat2x16(EX[r * ERS + 16u * q + 2u * d]) + unpackFloat2x16(s.x));
+            xh[2u * d + 1u] = packFloat2x16(unpackFloat2x16(EX[r * ERS + 16u * q + 2u * d + 1u]) + unpackFloat2x16(s.y));
+        }
+    }
+#endif
+    // ------------------------------------------------------------ the residual stream = x0 + bo, norm 1: h = x0 rsqrt(sum
+    // x0^2) g1 as int8
+    float acc[32];
+    uint h8[8];
+    float hs;
+    {
+        float s2 = 0.0;
+        uint h[16];
+        [[unroll]] for (uint d = 0u; d < 16u; ++d)
+        {
+            const f16vec2 x = unpackFloat2x16(xh[d]);
+            const vec2 f = vec2(x);
+            s2 += f.x * f.x + f.y * f.y;
+            const f16vec2 y = x + unpackFloat2x16(f16w(p.o[1] + 2u * d));
+            acc[2u * d] = float(y.x); acc[2u * d + 1u] = float(y.y);
+        }
+        const float16_t rn = rsq16(s2);
+        [[unroll]] for (uint d = 0u; d < 16u; ++d)
+            h[d] = packFloat2x16(unpackFloat2x16(xh[d]) * unpackFloat2x16(f16w(p.o[0] + 2u * d)) * rn);
+        hs = quant16(h, h8);
+    }
+    // ------------------------------------------------------------ attention, one head at a time; both heads' outputs as
+    // int8 with one scale into the output projection
+    {
+        const uint og = (lane >> 3) & 1u, qr = lane & 15u;
+        const bool odd = (lane & 1u) != 0u;
+        const uint wo = p.o[7] / 2u;
+        uint oh[32];
+        [[unroll]] for (uint h = 0u; h < 2u; ++h)
+        {
+            // q8(Q) (the keys as well) and V (binary16), V transposed into key pairs: an even lane holds channel 2k of
+            // itself and its neighbour, the odd lane channel 2k + 1
+            uint qc[16], vc[16];
+            {
+                int ia[32];
+                const uint wq = p.o[4u + 4u * h] / 2u;
+                gemm8(ia, h8, wq);
+                [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+                    qc[n / 2u] = e4m3RoundHalf2(f16vec2(float(ia[n]) * (hs * uintBitsToFloat(wb.w[wq + 256u + n])),
+                                                        float(ia[n + 1u]) * (hs * uintBitsToFloat(wb.w[wq + 256u + n + 1u]))));
+            }
+            {
+                int ia[32];
+                const uint wv = p.o[5u + 4u * h] / 2u;
+                gemm8(ia, h8, wv);
+                [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+                {
+                    const uint own = pk(float(ia[n]) * (hs * uintBitsToFloat(wb.w[wv + 256u + n])),
+                                        float(ia[n + 1u]) * (hs * uintBitsToFloat(wb.w[wv + 256u + n + 1u])));
+                    const uint other = subgroupShuffleXor(own, 1u);
+                    vc[n / 2u] = odd ? ((other >> 16) | (own & 0xFFFF0000u)) : ((own & 0xFFFFu) | (other << 16));
+                }
+            }
+            // scores against the window's 16 keys: the own group of eight, then the other, plus the relative position bias
+            const uint ob = p.o[6u + 4u * h];
+            uint e[2][4];
+            [[unroll]] for (uint g = 0u; g < 2u; ++g)
+            {
+                float s[8];
+                [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                {
+                    const uint b = f16w(ob + qr * 16u + 8u * (og ^ g) + 2u * j);
+                    s[2u * j] = lo(b); s[2u * j + 1u] = hi(b);
+                }
+                [[unroll]] for (uint kp = 0u; kp < 16u; ++kp)
+                {
+                    const uint k = g == 0u ? qc[kp] : subgroupShuffleXor(qc[kp], 8u);
+#define SC(r) s[r] = d2(BC8(k, r), qc[kp], s[r]);
+                    SC(0u) SC(1u) SC(2u) SC(3u) SC(4u) SC(5u) SC(6u) SC(7u)
+#undef SC
+                }
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) e[g][j] = softmax2(pk(s[2u * j], s[2u * j + 1u]));
+            }
+            {
+                float sum = 0.0;
+                [[unroll]] for (uint g = 0u; g < 2u; ++g) [[unroll]] for (uint j = 0u; j < 4u; ++j) sum += lo(e[g][j]) + hi(e[g][j]);
+                const float16_t rc = float16_t(1.0 / float(float16_t(sum)));
+                [[unroll]] for (uint g = 0u; g < 2u; ++g) [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    e[g][j] = packFloat2x16(unpackFloat2x16(e[g][j]) * rc);
+            }
+            // O = P V: value pair (2 rp, 2 rp + 1) of channel 2k + c sits in lane 2 rp + c of a group
+            float o[32];
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) o[n] = 0.0;
+            [[unroll]] for (uint g = 0u; g < 2u; ++g)
+                [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                {
+                    const uint v = g == 0u ? vc[k] : subgroupShuffleXor(vc[k], 8u);
+#define PV(rp, c) o[2u * k + c] = d2(BC8(v, 2u * rp + c), e[g][rp], o[2u * k + c]);
+                    PV(0u, 0u) PV(0u, 1u) PV(1u, 0u) PV(1u, 1u) PV(2u, 0u) PV(2u, 1u) PV(3u, 0u) PV(3u, 1u)
+#undef PV
+                }
+            [[unroll]] for (uint d = 0u; d < 8u; ++d)
+            {
+                oh[16u * h + 2u * d] = pk(o[4u * d], o[4u * d + 2u]);
+                oh[16u * h + 2u * d + 1u] = pk(o[4u * d + 1u], o[4u * d + 3u]);
+            }
+        }
+        // the output projection, both heads' 64 channels against the [64][32] wo
+        uint oq[16];
+        const float os = quant32g(oh, oq);
+        int ia[32];
+        gemm16(ia, oq, wo);
+        [[unroll]] for (uint n = 0u; n < 32u; ++n) acc[n] = fma(float(ia[n]), os * uintBitsToFloat(wb.w[wo + 16u * 32u + n]), acc[n]);
+    }
+    // ------------------------------------------------------------ norm 2: the residual rounded to binary16, h = x rsqrt(sum
+    // x^2) g2 as int8, and the stream continues as x + b2
+    {
+        float s2 = 0.0;
+        uint h[16];
+        f16vec2 x[16];
+        [[unroll]] for (uint d = 0u; d < 16u; ++d)
+        {
+            x[d] = f16vec2(acc[2u * d], acc[2u * d + 1u]);
+            const vec2 f = vec2(x[d]);
+            s2 += f.x * f.x + f.y * f.y;
+            const f16vec2 y = x[d] + unpackFloat2x16(f16w(p.o[3] + 2u * d));
+            acc[2u * d] = float(y.x); acc[2u * d + 1u] = float(y.y);
+        }
+        const float16_t rn = rsq16(s2);
+        [[unroll]] for (uint d = 0u; d < 16u; ++d) h[d] = packFloat2x16(x[d] * unpackFloat2x16(f16w(p.o[2] + 2u * d)) * rn);
+        hs = quant16(h, h8);
+    }
+    // ------------------------------------------------------------ the MLP, two chunks of 32 hidden channels at a time:
+    // h = gelu(b1 + h1 w1) in binary16, the pair's 64 values as int8 with one scale, the residual += h w2 (the pair's w2
+    // blocks share their column scales, widenM: one int32 sum and one epilogue for both)
+    [[unroll]] for (uint c = 0u; c < 4u; c += 2u)
+    {
+        uint hh[32];
+        [[unroll]] for (uint k = 0u; k < 2u; ++k)
+        {
+            int ia[32];
+            const uint w1 = p.o[20u + 3u * (c + k)] / 2u;
+            gemm8(ia, h8, w1);
+            float v[32];
+            [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+            {
+                const uint b = f16w(p.o[21u + 3u * (c + k)] + n);
+                v[n] = fma(float(ia[n]), hs * uintBitsToFloat(wb.w[w1 + 256u + n]), lo(b));
+                v[n + 1u] = fma(float(ia[n + 1u]), hs * uintBitsToFloat(wb.w[w1 + 256u + n + 1u]), hi(b));
+            }
+            [[unroll]] for (uint d = 0u; d < 8u; ++d)
+            {
+                hh[16u * k + 2u * d] = gelu2(pk(v[4u * d], v[4u * d + 2u]));
+                hh[16u * k + 2u * d + 1u] = gelu2(pk(v[4u * d + 1u], v[4u * d + 3u]));
+            }
+        }
+        uint g8[16];
+        const float cs = quant32g(hh, g8);
+        int ia[32];
+        [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] = 0;
+        [[unroll]] for (uint k = 0u; k < 2u; ++k)
+        {
+            const uint w2 = p.o[22u + 3u * (c + k)] / 2u;
+            [[unroll]] for (uint d = 0u; d < 8u; ++d)
+                [[unroll]] for (uint n = 0u; n < 32u; ++n) ia[n] += dotPacked4x8EXT(int(g8[8u * k + d]), int(wb.w[w2 + d * 32u + n]));
+        }
+        const uint ws = p.o[22u + 3u * c] / 2u + 8u * 32u;
+        [[unroll]] for (uint n = 0u; n < 32u; ++n) acc[n] = fma(float(ia[n]), cs * uintBitsToFloat(wb.w[ws + n]), acc[n]);
+    }
+#if KIND == 3
+    // ------------------------------------------------------------ the block output, FP8 (the expansion's skip input)
+    {
+        const int ty = Y0 + int(bp.y), tx = X0 + int(bp.x);
+        if (ty >= 0 && ty < p.Hh && tx >= 0 && tx < p.W)
+        {
+            const uint dst = uint(ty * p.W + tx) * 8u;
+            [[unroll]] for (uint d = 0u; d < 8u; ++d)
+                out0.a[dst + d] = e4m3CodesHalf2(q8p(acc[4u * d], acc[4u * d + 1u])) | (e4m3CodesHalf2(q8p(acc[4u * d + 2u], acc[4u * d + 3u])) << 16);
+        }
+    }
+#else
+    // ------------------------------------------------------------ the head: the block output as binary16, per pixel the
+    // reconstruction's inputs (layer_m.comp KIND 4): natural channels 0, 1, 12 (gates), 4, 5, 8, 9 (feature, no history),
+    // 13, 16, 17 (mix), 20, 21, 24 (covariance a, b, rho)
+    {
+        const ivec2 at = ivec2(X0 + int(bp.x), Y0 + int(bp.y));
+        if (at.x >= 0 && at.y >= 0 && at.x < dp.size.x && at.y < dp.size.y)
+        {
+#define V(c) float(float16_t(acc[c]))
+            imageStore(gateOut, at, unorm8Value(vec4(sigmoidL(V(0)), sigmoidL(V(1)), sigmoidL(V(12)), 0.0)));
+            const vec3 m = vec3(V(13), V(16), V(17)), ex = exp2((m - max(max(m.x, m.y), m.z)) * 1.442695);
+            imageStore(mixOut, at, unorm8Value(vec4(ex * (1.0 / (ex.z + (ex.x + ex.y))), 0.0)));
+            const float a = dp.sigma * sigmoidL(clamp(V(20), -20.0, 20.0)), b = dp.sigma * sigmoidL(clamp(V(21), -20.0, 20.0));
+            imageStore(covOut, at, vec4(a * a, b * b, a * b * tanhL(V(24) * dp.rho), 0.0));
+            imageStore(featOut, at, snorm8Value(vec4(tanhL(V(4)), tanhL(V(5)), tanhL(V(8)), tanhL(V(9)))));
+#undef V
+        }
+    }
+#endif
+}

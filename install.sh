@@ -167,7 +167,7 @@ if [[ ! -f "$BUILDER" ]]; then
   [[ "$DO_ENGINE" != 1 ]] || fail "missing $BUILDER (this release has no engine-model builder)"
   done_msg; exit 0
 fi
-# the Super Resolution models depend on the GPU (RDNA2 builds no L), so the builder lists them
+# the builder lists the Super Resolution models it builds (today the same on every GPU)
 models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 $(bash "$BUILDER" --list-sr-models))
 # One build serves every game with the same DLLs, builder and model set: the key covers them and the accuracy choice.
 key() {   # key EXACT(0|1)
@@ -195,7 +195,7 @@ if [[ "$DO_ENGINE" == ask ]]; then
   echo "Set up d4r's own DLSS engine (recommended)?"
   echo '  + Faster on RDNA4: DLSS 4 / 4.5 and Ray Reconstruction run on d4r'"'"'s Vulkan engine instead of NVIDIA'"'"'s kernels'
   echo '    through CUDA emulation (for example Ray Reconstruction at 720p -> 4K in about 3.6 ms per frame).'
-  echo '  + On RDNA2 (Steam Deck) it is the route for DLSS 3'"'"'s CNN presets E and F and for DLSS 4 and 4.5 (K and M): those run without cooperative matrices.'
+  echo '  + On RDNA2 (Steam Deck) it is the route for DLSS 3'"'"'s CNN presets E and F and for DLSS 4 and 4.5 (K, M and L): those run without cooperative matrices.'
   echo '  + Lower latency: the game shows the upscaled result of the frame it just rendered, not an older one.'
   echo '  + No minute-long freeze while DLSS'"'"'s CUDA kernels compile the first time a model is used.'
   echo '  - Longer setup, once: building its models takes a few minutes (it renders a test frame per model'

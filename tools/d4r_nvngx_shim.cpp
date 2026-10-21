@@ -9402,9 +9402,9 @@ static bool engine_k_refused()
            !g_vk.float8;
 }
 
-// Preset M on the engine's v_dot2 stages (layer_m_dot2.comp): on GPUs without FP8 and without the f16 matrix tuple
-// (RDNA2), where the CUDA backend's M kernels are translated. RDNA3 keeps its native M kernels unless
-// D4R_ENGINE_M_NETWORK=dot2.
+// Presets M and L on the engine's v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp): on GPUs without FP8 and
+// without the f16 matrix tuple (RDNA2), where the CUDA backend's M and L kernels are translated. RDNA3 keeps its
+// native kernels unless D4R_ENGINE_M_NETWORK=dot2.
 static bool engine_m_dot2()
 {
     return !g_vk.float8 && (!g_vk.matrixF16 || env_string("D4R_ENGINE_M_NETWORK") == "dot2");
@@ -9465,7 +9465,7 @@ static void init_engine_vulkan()
     logf("engine backend: f16 matrix tuple %s; FP8 matrix tuple %s", g_vk.matrixF16 ? "supported" : "unsupported",
          g_vk.float8 ? "supported" : "unsupported");
     logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)"
-         : engine_m_dot2() ? "unavailable: M runs its v_dot2 stages, L the CUDA backend" : "unavailable: M and L run on the CUDA backend");
+         : engine_m_dot2() ? "unavailable: M and L run their v_dot2 stages" : "unavailable: M and L run on the CUDA backend");
     // the features vkd3d-proton created its device with
     const VkPhysicalDeviceFeatures2* features = nullptr;
     if (SUCCEEDED(g_vk.interop->GetDeviceFeatures(&features)) && features != nullptr)
@@ -9630,8 +9630,8 @@ static void init_engine_backend_m_variant(bool presetL, bool ldr)
     const auto start = std::chrono::steady_clock::now();
     try
     {
-        // without FP8 (RDNA2) preset M runs layer_m_dot2.comp's stages; L has none
-        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !presetL && !g_vk.float8);
+        // without FP8 (RDNA2) M and L run their v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp)
+        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !g_vk.float8);
         if (model->isPresetL() != presetL)
             throw std::runtime_error(presetL ? "the directory holds a preset M model" : "the directory holds a preset L model");
         slot = std::move(model);
@@ -10224,8 +10224,9 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
     const bool ldr = (feature.flags & 0x1) == 0; // NGX's LDR stages: a model directory of its own, no exposure
     // The FP8 pipelines need VK_EXT_shader_float8: creating them without it crashes the driver (RADV on RDNA3,
-    // vkCreateComputePipelines), so never load such a model. M loads its v_dot2 stages instead where engine_m_dot2().
-    if (!g_vk.float8 && (presetL || !engine_m_dot2()))
+    // vkCreateComputePipelines), so never load such a model. M and L load their v_dot2 stages instead where
+    // engine_m_dot2().
+    if (!g_vk.float8 && !engine_m_dot2())
         return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
     std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
     d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
@@ -10238,8 +10239,9 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     }
     // MVLowRes clear: display-resolution vectors (one per output pixel, in output pixels), NGX's *_mvhi_* kernels
     const bool displayMotion = (feature.flags & 0x2) == 0;
-    if (displayMotion && (presetL || !model->hasDisplayMotion()))
-        return refuse(presetL ? "needs render-resolution motion vectors"
+    // (L: its v_dot2 stages only; its FP8 stages have no such variant)
+    if (displayMotion && !model->hasDisplayMotion())
+        return refuse(presetL ? "display-resolution motion vectors need the v_dot2 stages (no FP8) and the current compile_m.py"
                               : "display-resolution motion vectors need an M model rebuilt by the current compile_m.py");
     if (!model->hasDynamicResolution() && feature.engineM != nullptr &&
         (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
@@ -10817,7 +10819,7 @@ static void start_engine_preload()
                  "feature ([RayReconstruction] Enable = true loads it at NGX init)");
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
-        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || (sr == 13 && engine_m_dot2()));
+        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || engine_m_dot2());
         const bool srK = sr == 11 && !engine_k_refused();
         if (!rr && !srM && !srK)
             return;

@@ -191,13 +191,27 @@ def compile_l(a, one, R):
         glsl('post_m.comp', out + '.spv', ['-DPRESET_L=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr)
     glsl('down_m.comp', 'down_m.spv', ldr)
     glsl('down_m.comp', 'down_m_rgb10.spv', ['-DOUTPUT_RGB10=1'] + ldr)
+    # the stages for GPUs without cooperative matrices or FP8 (RDNA2): preset M's network, the input stage
+    # (layer_l_dot2.comp KIND 3, its patch merge merge_l_dot2.comp) and the expansion stage (KIND 4) on v_dot2 / v_dot4
+    # (runtime_m.inc widenM: int8 as preset M's D4RM0007), the reconstruction's half-resolution mean in RGB10A2; these
+    # take display-resolution motion as M's do (post_m.comp DISPLAY_MV, enc0_features.glsl)
+    for name, out in SHADERS.items(): glsl('layer_m_dot2.comp', out + '_dot2.spv', dot2_defines(name))
+    for name, out in (('enc1', 'm_merge1'), ('enc2', 'm_merge2')): glsl('merge_m_dot2.comp', out + '_dot2.spv', dot2_merge_defines(name))
+    glsl('layer_l_dot2.comp', 'enc0_l_dot2.spv', ['-DKIND=3'] + ldr)
+    glsl('merge_l_dot2.comp', 'merge_l_dot2.spv')
+    glsl('layer_l_dot2.comp', 'dec0_l_dot2.spv', ['-DKIND=4'])
+    for out, tile in (('post_l_dot2', 11), ('post_l_q_dot2', 16), ('post_l_c_dot2', 12)):
+        glsl('post_m.comp', out + '.spv', ['-DPRESET_L=1', '-DHALF_RGB10=1', '-DDISPLAY_MV=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr)
+    for out, flags in (('down_m_dot2', []), ('down_m_rgb10_dot2', ['-DOUTPUT_RGB10=1'])):
+        glsl('down_m.comp', out + '.spv', ['-DSEG=2'] + flags + ldr)
     if a.hip:
         package_hip(a, Ps)
     marker = a.output / 'ldr'
     if a.ldr: marker.write_text('1\n')
     elif marker.exists(): marker.unlink()
     for p in '01': glsl('exposure_k.comp', f'exposure_m{p}.spv', ['-DMODE=1', '-DPASS=' + p])
-    for stale in ('enc0_m.spv', 'dec0_m.spv', 'post_m.spv', 'post_m_q.spv', 'post_m_c.spv', 'enc0_m_planes.spv', 'dec0_m_planes.spv'):
+    for stale in ('enc0_m.spv', 'dec0_m.spv', 'post_m.spv', 'post_m_q.spv', 'post_m_c.spv', 'enc0_m_planes.spv', 'dec0_m_planes.spv',
+                  'enc0_m_dot2.spv', 'dec0_m_dot2.spv', 'post_m_dot2.spv', 'post_m_q_dot2.spv', 'post_m_c_dot2.spv'):
         (a.output / stale).unlink(missing_ok=True)
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv')) + sorted(a.output.glob('hip/*.hsaco'))
     (a.output / 'model.json').write_text(json.dumps({'format': 'D4RL0002', 'preset': 'L', 'files': {str(f.relative_to(a.output)): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}, indent=1))

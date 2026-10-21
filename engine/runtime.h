@@ -212,7 +212,7 @@ struct MFrameSettings {
 class MModel {
 public:
     // dot2: the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2), the
-    // model directory's *_dot2.spv (D4R_ENGINE_M_NETWORK=dot2|matrix overrides); preset M only
+    // model directory's *_dot2.spv (D4R_ENGINE_M_NETWORK=dot2|matrix overrides); presets M and L
     MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
            bool dot2 = false);
     ~MModel();
@@ -223,7 +223,7 @@ public:
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
     bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
-    bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005
+    bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005, L's dot2
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
     bool dot2Network() const;  // the v_dot2 stages (no cooperative matrices, no FP8)
 private:

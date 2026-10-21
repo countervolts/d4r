@@ -76,8 +76,12 @@ struct Tex {
 // blocks share their column scales in pairs (MLP_PAIR_SCALE); older packages' shaders read q and v as binary16 pairs
 // stageInt8 (D4RM0007): the expansion stage's matrix (dec0_m.comp INT8, plain [K/4][N] words) and the decoders'
 // expansion matrices (layer_m_dot2.comp EXPAND_INT8) are int8 as well
+// Preset L (lEnc0 / lDec0 set; its packages have no older dot2 form): the network as D4RM0007, the input stage's block
+// (C 32) with its patch merge (merge_l_dot2.comp) and its embedding (W1 as binary16 pairs, W2 int8), the
+// expansion stage's block with its patch expand, all int8 as the network's.
 std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::array<uint32_t, 74>, MLayers>& layers,
-                         const uint32_t enc0[3], const uint32_t dec0[2], bool qvInt8, bool stageInt8) {
+                         const uint32_t enc0[3], const uint32_t dec0[2], bool qvInt8, bool stageInt8,
+                         const std::array<uint32_t, 74>* lEnc0 = nullptr, const std::array<uint32_t, 74>* lDec0 = nullptr) {
     const bool pairScale = qvInt8;
     uint16_t half[256];
     for (unsigned c = 0; c < 256; ++c) {
@@ -136,10 +140,7 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
         for (unsigned k = 0; k < K; k += 2) for (unsigned n = 0; n < N; ++n)
             put(off / 2 + (k / 2) * N + n, half[byte(off + k * N + n)] | (uint32_t(half[byte(off + (k + 1) * N + n)]) << 16));
     };
-    for (unsigned i = 0; i < MLayers; ++i) {
-        const size_t base = layers[i][0];
-        const uint32_t* o = layers[i].data() + 2;
-        const unsigned C = MChannels[i], NH = MHeads[i];
+    auto block = [&](size_t base, const uint32_t* o, unsigned C, unsigned NH, unsigned merged, unsigned expanded) {
         for (unsigned h = 0; h < NH; ++h) {
             if (qvInt8) { int8(base + o[4 + 4 * h], C, 32); int8(base + o[5 + 4 * h], C, 32); }
             else { blocked(base + o[4 + 4 * h], C, 32); blocked(base + o[5 + 4 * h], C, 32); }
@@ -154,9 +155,17 @@ std::vector<char> widenM(const std::vector<char>& b8, const std::array<std::arra
             if (pairScale) int8(base + o[22 + 3 * c], 32, C, base + o[22 + 3 * (c + 1)]);
             else int8(base + o[22 + 3 * c], 32, C);
         }
-        if (MMerged[i]) int8(base + o[68], 4 * C, MMerged[i]);
-        if (MExpanded[i] && stageInt8) int8(base + o[68], MExpanded[i], 4 * C);
-        else if (MExpanded[i]) blocked(base + o[68], MExpanded[i], 4 * C);
+        if (merged) int8(base + o[68], 4 * C, merged);
+        if (expanded && stageInt8) int8(base + o[68], expanded, 4 * C);
+        else if (expanded) blocked(base + o[68], expanded, 4 * C);
+    };
+    for (unsigned i = 0; i < MLayers; ++i) block(layers[i][0], layers[i].data() + 2, MChannels[i], MHeads[i], MMerged[i], MExpanded[i]);
+    if (lEnc0 && lDec0) {
+        const uint32_t* o = lEnc0->data() + 2;
+        block((*lEnc0)[0], o, 32, 2, 64, 0);
+        blocked((*lEnc0)[0] + o[60], 32, 32); int8((*lEnc0)[0] + o[62], 32, 32);
+        block((*lDec0)[0], lDec0->data() + 2, 32, 2, 0, 64);
+        return out;
     }
     plain(enc0[0], 128, 64);
     if (stageInt8) int8(dec0[0], 64, 80, SIZE_MAX, true); else plain(dec0[0], 64, 80);
@@ -186,13 +195,15 @@ struct MModel::Impl {
     Pipeline input, expand, post, postQuality, postCompact, down, downRgb10;
     Pipeline inputPlanes, expandPlanes;         // token buffers in NGX's plane layout, for an external (HIP) network
     std::array<Pipeline, 2> mergeDot2;          // dot2: the encoders' patch merges (merge_m_dot2.comp), after enc1, enc2
+    Pipeline mergeL;                            // dot2, preset L: the input stage's patch merge, after the stage
     bool planes = false;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, ldr = false;
-    // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
+    // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4
+    // (dot2: layer_l_dot2.comp's),
     // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
     bool presetL = false, dynamicResolution = false;
-    bool displayMotion = false;     // D4RM0005: enc0_m and post_m read display-resolution motion (post_m binding 12)
+    bool displayMotion = false;     // D4RM0005, L's dot2: the input stage and post_m read display-resolution motion (binding 12)
     bool qvInt8 = false;            // D4RM0006: layer_m_dot2's q and v matrices are int8 (widenM)
     bool stageInt8 = false;         // D4RM0007: the expansion stage's and the decoders' expansion matrices are int8
     bool halfRgb10 = false;         // the half-resolution history is RGB10A2 (post_m_dot2.spv), else RGBA32F
@@ -240,14 +251,20 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
     }
     for (auto& l : m.layers) inside(l[0], l[1]);
-    if (m.dot2 && m.presetL) throw std::runtime_error("preset L has no stages for GPUs without cooperative matrices");
-    if (m.dot2 && !exists(directory + "/m_enc1_dot2.spv"))
+    const std::string dot2Probe = m.presetL ? "/enc0_l_dot2.spv" : "/m_enc1_dot2.spv";
+    if (m.dot2 && !exists(directory + dot2Probe))
         throw std::runtime_error("the model has no stages for GPUs without cooperative matrices (" + directory +
-                                 "/m_enc1_dot2.spv): rebuild it with the current compile_m.py");
+                                 dot2Probe + "): rebuild it with the current compile_m.py");
+    // preset L's dot2 stages read display-resolution motion as M's do (post_l_dot2 binding 12); its matrix stages do not
+    if (m.dot2 && m.presetL) m.displayMotion = true;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m.w16.create(m.device, b16.size(), usage);
     m.bytes16 = b16;
-    if (m.dot2) { m.bytes8 = widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8, m.stageInt8); m.w16x.create(m.device, m.bytes8.size(), usage); }
+    if (m.dot2) {
+        m.bytes8 = m.presetL ? widenM(b8, m.layers, m.enc0, m.dec0, true, true, &m.lEnc0, &m.lDec0)
+                             : widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8, m.stageInt8);
+        m.w16x.create(m.device, m.bytes8.size(), usage);
+    }
     else { m.w8.create(m.device, b8.size(), usage); m.bytes8 = b8; }
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const std::string variant = m.dot2 ? "_dot2" : "";
@@ -255,6 +272,8 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     if (m.dot2)
         for (unsigned i = 0; i < 2; ++i)
             m.mergeDot2[i].create(device, directory + "/m_merge" + std::to_string(i + 1) + "_dot2.spv", {b,b,b,b,b}, 32, cache);
+    // preset L's input stage merges its pixel-resolution output into the network's tokens as a stage of its own
+    if (m.dot2 && m.presetL) m.mergeL.create(device, directory + "/merge_l_dot2.spv", {b,b,b,b,b}, 32, cache);
     // layer_m.comp's L stages: bindings 0-6 of a layer, then the stage's own (layer_m.comp KIND 3 and 4)
     const std::vector<VkDescriptorType> lIn{b,b,b,b,b,b,b,b,t,t,t,t,t,t,s,s,s,b}, lEx{b,b,b,b,b,b,b,b,s,s,s,s};
     const std::string in = m.presetL ? "enc0_l" : "enc0_m", ex = m.presetL ? "dec0_l" : "dec0_m", po = m.presetL ? "post_l" : "post_m";
@@ -319,6 +338,7 @@ struct MEngine::Impl {
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MLayers> layerSets{};
     std::array<VkDescriptorSet, 2> mergeSets{};     // dot2: the encoders' patch merges
+    VkDescriptorSet mergeLSet = VK_NULL_HANDLE;     // dot2, preset L: the input stage's patch merge
     std::array<VkDescriptorSet, 2> enc0Sets{}, dec0Sets{}, postSets{}, expSets{};
     VkDescriptorSet downSet = VK_NULL_HANDLE;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
@@ -386,7 +406,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     for (auto& t : e.hist) t.create(d, e.hw, e.hh, VK_FORMAT_R16G16B16A16_SFLOAT);
     // The native formatted RGB10 history has RGBA32F backing. UNORM filtering differs by up to three ulps.
     for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, model.impl->halfRgb10 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT);
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 160}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 24; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
     VKCHECK(vkCreateDescriptorPool(dev, &pi, nullptr, &e.pool));
@@ -424,19 +444,24 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         MLayerParams lp{int32_t(e.gw), int32_t(e.gh), 2, 2, {}};
         std::memcpy(lp.o, m.lEnc0.data() + 2, sizeof(lp.o)); std::memcpy(e.enc0LP.mapped, &lp, sizeof(lp));
         lp.sx = lp.sy = 0; std::memcpy(lp.o, m.lDec0.data() + 2, sizeof(lp.o)); std::memcpy(e.dec0LP.mapped, &lp, sizeof(lp));
+        if (m.dot2) {
+            auto ms = e.mergeLSet = descriptorSet(dev, e.pool, m.mergeL.descriptors);
+            bindBuffer(dev, ms, 0, e.enc0LP); bindRange(dev, ms, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, ms, 2, m.w16, m.lEnc0[1]);
+            bindBuffer(dev, ms, 3, e.skipL); bindBuffer(dev, ms, 4, e.tokens);
+        }
     }
     for (unsigned i = 0; i < 2; ++i) {      // i: the index of this frame's history outputs
         const unsigned prev = 1 - i;
         if (m.presetL) {
             auto s0 = e.enc0Sets[i] = descriptorSet(dev, e.pool, (external ? m.inputPlanes : m.input).descriptors);
-            bindBuffer(dev, s0, 0, e.enc0LP); bindRange(dev, s0, 1, m.w8, m.lEnc0[0]); bindRange(dev, s0, 2, m.w16, m.lEnc0[1]);
+            bindBuffer(dev, s0, 0, e.enc0LP); bindRange(dev, s0, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, s0, 2, m.w16, m.lEnc0[1]);
             bindBuffer(dev, s0, 3, e.dummy); bindBuffer(dev, s0, 4, e.dummy); bindBuffer(dev, s0, 5, e.skipL); bindBuffer(dev, s0, 6, e.tokens);
             bindBuffer(dev, s0, 7, e.enc0P);
             bindImage(dev, s0, 11, e.mvA[prev].view, e.linear); bindImage(dev, s0, 12, e.half[prev].view, e.linear); bindImage(dev, s0, 13, e.feat[prev].view, e.linear);
             bindImage(dev, s0, 14, e.mvA[i].view); bindImage(dev, s0, 15, e.mvB.view); bindImage(dev, s0, 16, e.mvC.view);
             bindRange(dev, s0, 17, m.w16, m.dither16);
             auto s1 = e.dec0Sets[i] = descriptorSet(dev, e.pool, (external ? m.expandPlanes : m.expand).descriptors);
-            bindBuffer(dev, s1, 0, e.dec0LP); bindRange(dev, s1, 1, m.w8, m.lDec0[0]); bindRange(dev, s1, 2, m.w16, m.lDec0[1]);
+            bindBuffer(dev, s1, 0, e.dec0LP); bindRange(dev, s1, 1, m.weights(), m.weightsAt(m.lDec0[0])); bindRange(dev, s1, 2, m.w16, m.lDec0[1]);
             bindBuffer(dev, s1, 3, e.dec1Out); bindBuffer(dev, s1, 4, e.skipL); bindBuffer(dev, s1, 5, e.dummy); bindBuffer(dev, s1, 6, e.dummy);
             bindBuffer(dev, s1, 7, e.dec0P);
             bindImage(dev, s1, 8, e.feat[i].view); bindImage(dev, s1, 9, e.gates.view); bindImage(dev, s1, 10, e.mix.view); bindImage(dev, s1, 11, e.cov.view);
@@ -562,7 +587,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 }
                 auto in = b.input[i], post = b.post[i];
                 if (L) {
-                    bindBuffer(dev, in, 0, e.enc0LP); bindRange(dev, in, 1, m.w8, m.lEnc0[0]); bindRange(dev, in, 2, m.w16, m.lEnc0[1]);
+                    bindBuffer(dev, in, 0, e.enc0LP); bindRange(dev, in, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, in, 2, m.w16, m.lEnc0[1]);
                     bindBuffer(dev, in, 3, e.dummy); bindBuffer(dev, in, 4, e.dummy); bindBuffer(dev, in, 5, e.skipL); bindBuffer(dev, in, 6, e.tokens);
                     bindBuffer(dev, in, 7, e.enc0P);
                     bindImage(dev, in, 8, images.color, e.nearest, images.colorLayout);
@@ -644,9 +669,10 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     }
     stamp();
     // (preset L's input stage covers the same blocks: its shift is at most 2 in x and 2 in y)
-    // the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks
-    const uint32_t blocks = m.dot2 ? 2 : 1;
+    // the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks (preset M; L's are one block)
+    const uint32_t blocks = m.dot2 && !m.presetL ? 2 : 1;
     dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], ((e.gw + 2 + 7) / 8 + blocks - 1) / blocks, ((e.gh + 2 + 7) / 8 + blocks - 1) / blocks);
+    if (m.dot2 && m.presetL) { nextStage(cb); dispatch(cb, m.mergeL, e.mergeLSet, (e.gw / 2 + 7) / 8, (e.gh / 2 + 7) / 8); }
     stamp();
     if (e.external) closeStages(cb); else nextStage(cb);
     e.frontDone = true;
@@ -660,8 +686,12 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
     stamp();
-    if (m.presetL)      // one block more in x on frames whose expansion shift is 2
-        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], (e.gw + (e.frame & 1u) * 2u + 7) / 8, e.gh / 8);
+    if (m.presetL) {
+        // the blocks with a pixel of the render size (the stage writes no other; a block's windows are its own): one
+        // more in x on frames whose expansion shift is 2; dot2: workgroups of two blocks in x
+        const uint32_t bx = (e.rw + (e.frame & 1u) * 2u + 7) / 8, by = (e.rh + 7) / 8;
+        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], m.dot2 ? (bx + 1) / 2 : bx, by);
+    }
     else if (m.dot2)    // workgroups of 2x2 blocks
         dispatch(cb, m.expand, e.dec0Sets[i], (e.gw / 8 + 1) / 2, (e.gh / 8 + 1) / 2);
     else

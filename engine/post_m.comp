@@ -15,6 +15,8 @@
 // (11, 12, 16), and the history is blended in linear light: each candidate's bicubic sample is expanded and divided by
 // the previous exposure on its own, a candidate off screen (or after a reset) takes the linear colour texel, and the
 // blend is scaled by the current exposure.
+// DISPLAY_MV (default: not PRESET_L): the game's display-resolution motion texture (binding 12) is read when mvSize is
+// set; preset L's dot2 build (post_l_dot2) takes it as M does, NVIDIA's L kernels have no such variant in the capture.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
 #include "normalized_store.glsl"
@@ -55,7 +57,13 @@ layout(set = 0, binding = 10, rgb10_a2) uniform writeonly image2D halfOut;
 layout(set = 0, binding = 10, rgba32f) uniform writeonly image2D halfOut;
 #endif
 layout(set = 0, binding = 11, std430) writeonly buffer Packed { uint w[]; } packed;
-#if !PRESET_L
+#ifndef PRESET_L
+#define PRESET_L 0
+#endif
+#ifndef DISPLAY_MV
+#define DISPLAY_MV (!PRESET_L)
+#endif
+#if DISPLAY_MV
 layout(set = 0, binding = 12) uniform sampler2D motionTex;     // the game's display-resolution motion, nearest
 #endif
 // the render-texel tile around the block; the taps of every pixel stay inside it (see the file comment)
@@ -64,9 +72,6 @@ layout(set = 0, binding = 12) uniform sampler2D motionTex;     // the game's dis
 #endif
 #ifndef TILE_H
 #define TILE_H 10
-#endif
-#ifndef PRESET_L
-#define PRESET_L 0
 #endif
 #if PRESET_L
 const int TAP_LO = -1, TAP_HI = 2;
@@ -222,7 +227,7 @@ void main()
             const vec3 cur = inv * vec3(a0[r].rgb), m = inv * vec3(a0[r].w, a1[r].x, a1[r].y), g = inv * vec3(a1[r].z, a1[r].w, a2[r]);
             // the two most likely motion candidates
             vec2 mvA, mvB, mvC;
-#if !PRESET_L
+#if DISPLAY_MV
             const bool displayMv = p.mvSize.x > 0;
             if (displayMv)
             {
@@ -251,13 +256,9 @@ void main()
             float b2 = k2 * kn, b1 = k1 * kn;
             if (b2 < (1.0 / 255.0)) { b2 = 0.0; b1 = 1.0; }
             const vec2 size = vec2(p.hiSize);
-#if !PRESET_L
             // display-resolution: the position is one fma of the raw texel (rrlite_post_3_*_mvhi_*)
             precise vec2 qd = fma(p.mvScale, big.xy + p.mvOffs, centre);
             const vec2 q1 = displayMv ? qd : centre + big.xy;
-#else
-            const vec2 q1 = centre + big.xy;
-#endif
             // the fallback colour is only fetched where the history sample leaves the image or the history was reset:
             // the value is the same either way, so computing it in the branch saves the fetch on ordinary pixels
             const bool out1 = q1.x < 0.0 || q1.y < 0.0 || q1.x > size.x || q1.y > size.y || p.reset != 0u;
@@ -271,7 +272,7 @@ void main()
             if (b2 > 0.0)
             {
                 const vec2 q2 = centre + second.xy;
-                if (same)
+                if (same || displayMv)
                     h2 = h1;
                 else if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
                     h2 = out1 ? h1 : texelFetch(colorTex, colourTexel(near), 0).rgb;

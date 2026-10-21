@@ -49,7 +49,8 @@ Requirements: C++17, Vulkan headers/loader, Python with NumPy, and `glslangValid
 Vulkan 1.3, `VK_KHR_cooperative_matrix` with 16x16x16 f16 operands/f32 accumulation, wave32/wave64 subgroup control,
 f16 storage/arithmetic, shader int16, and extended storage-image formats. The executable checks these capabilities.
 K also runs without cooperative matrices (RDNA2): see [Preset K without cooperative matrices](#preset-k-without-cooperative-matrices-rdna2),
-and M without cooperative matrices or FP8: see [Preset M without cooperative matrices or FP8](#preset-m-without-cooperative-matrices-or-fp8-rdna2).
+and M and L without cooperative matrices or FP8: see [Preset M without cooperative matrices or FP8](#preset-m-without-cooperative-matrices-or-fp8-rdna2)
+and [Preset L without cooperative matrices or FP8](#preset-l-without-cooperative-matrices-or-fp8-rdna2).
 
 A model directory holds values read from NVIDIA's DLSS (`weights.bin`, `offsets.bin`, `lut.bin`, `hipnet.bin`,
 `model.json`) next to d4r's compiled shaders. Build it from your own `nvngx_dlss.dll` and keep it on your machine:
@@ -104,7 +105,7 @@ d4r's compilers, shaders, the D3D12 harness and glslang into the release):
   build K, M and L from that, and `--ldr` their LDR variants from the same frame (NGX's HDR and LDR stages read the
   same weights). About a minute per preset, ~280 MB of dumps that are deleted afterwards. The results are identical
   to the models built from full captures.
-- On RDNA2 the builder makes E, F, K and M (L has no engine path there). M's and L's network kernels (`rrlite_enc0`
+- On RDNA2 the builder makes every model, M and L for their v_dot2 stages. M's and L's network kernels (`rrlite_enc0`
   ... `rrlite_dec0`) would be compiled by ZLUDA with emulated matrix products, minutes each, only for a frame whose
   launches compile_m reads: `model_tools.py stub-ptx DLL DIR` writes each of their modules with empty kernel bodies
   (same parameters and launch bounds) as `DIR/<FNV-1a 64 of the fatbin>.ptx`, and the test frame runs with
@@ -1546,8 +1547,8 @@ as well).
   16.4 -> 18.0 us, so the matrix path keeps 4).
 
 Selection: `MModel(..., dot2)`; the shim (`engine_m_dot2()`) runs these stages when the device has neither
-`VK_EXT_shader_float8` nor f16 cooperative matrices, so RDNA3 keeps its native HIP M kernels and L, which has no
-such stages, stays on the CUDA backend without FP8; `D4R_ENGINE_M_NETWORK=dot2` forces them on a GPU without FP8
+`VK_EXT_shader_float8` nor f16 cooperative matrices, so RDNA3 keeps its native HIP M kernels (L takes the same
+route since it got its own dot2 stages, see below); `D4R_ENGINE_M_NETWORK=dot2` forces them on a GPU without FP8
 (and `dot2|matrix` overrides in `d4r-m`; dot2 also runs on RDNA3/4 for testing). `d4r-m` picks dot2 when the
 device has no FP8 cooperative matrices. A model built before this has no `_dot2` shaders: loading it fails with
 the message to rebuild it with the current `compile_m.py`, and the shim uses the CUDA backend.
@@ -1642,6 +1643,69 @@ steps near zero, with one scale per token or per pixel alike); software pipelini
 reconstruction is not bandwidth-bound; its history fetches about 220 us, the stores 160 us, the Gaussians' `exp2` 8 us).
 What remains in the layers (ablations): GELU about 260 us, the attention core 440 us; an MLP scale and epilogue per
 four chunks instead of two would save at most 125 us.
+
+## Preset L without cooperative matrices or FP8 (RDNA2)
+
+Preset L's ten network layers are M's (`D4RL0002` packs them the same way), so on RDNA2 they are `layer_m_dot2.comp`
+as in `D4RM0007`. What L adds are its full-resolution input and expansion stages, each a C 32 transformer block with
+two heads on every render pixel (`layer_m.comp` KIND 3 and 4, `L_NOTES.md`). `layer_l_dot2.comp` builds them for
+RDNA2 (KIND 3: input, KIND 4: expansion), and `merge_l_dot2.comp` is the input stage's patch merge, which runs as its
+own dispatch. The arithmetic is the same as M's dot2 stages: int8 on `v_dot4` with one scale per token and per
+column, and FP8 values as exact binary16 on `v_dot2`. `widenM` packs L's two stage blocks, embedding and merge when it
+is given `lEnc0`/`lDec0`. `compile_m.py` writes `enc0_l_dot2.spv`, `merge_l_dot2.spv`, `dec0_l_dot2.spv` and
+`post_l[_q|_c]_dot2.spv` next to the matrix stages, so one `engine/l` directory serves both GPUs.
+
+- One lane owns one pixel's token with all 32 channels in registers. The norms, int8 scales, embedding and MLP hidden
+  values therefore never leave the lane. At C 32, `layer_m_dot2.comp`'s layout (channels split across waves) spends
+  more on exchanges than on products. Weights are wave-uniform (scalar loads). Attention uses DPP8 broadcasts within
+  eight lanes plus a swap of the two groups, as in M. Q is rounded to the FP8 grid and V stays binary16. Both heads'
+  outputs are quantised with one scale for an int8 `wo` [64][32]. The MLP works on chunk pairs with one scale per
+  pair (`MLP_PAIR_SCALE`).
+- Input (KIND 3): one 8x8-pixel block per 64-lane workgroup. The features come from `enc0_features.glsl` (as in
+  `enc0_m.comp`, with `ENC0_DEDUP` and display-resolution motion). The embedding's first product is on binary16 pairs
+  and skips the slot pairs that are always zero; the second is int8. The output is FP8 codes.
+- Patch merge: one merged token per lane, its 128 inputs as int8 with one scale, the int8 [32][64] matrix
+  wave-uniform, no shared memory. The waves-split-columns layout of `merge_m_dot2.comp` took 214 us of the Deck's
+  720p frame, against about 145 us now.
+- Expansion (KIND 4): two blocks per 128-lane workgroup. Each wave takes one sub-position of the 2x2 patch expand
+  over the blocks' 32 low-resolution tokens (int8, scale in-lane, weights wave-uniform), and the expanded rows meet
+  in shared memory. The head is `layer_m.comp` KIND 4's.
+- Both L back ends dispatch only the blocks that cover the render size, not the 32-aligned grid. The matrix path's
+  output is unchanged (byte-identical at 720p and 1080p).
+- Display-resolution motion (MVLowRes clear): `post_l_dot2*` are built with `DISPLAY_MV=1` (`post_m.comp`), so they
+  take the game's motion texture the way M's reconstruction does, and the input stage reads it through
+  `enc0_features.glsl`. The L dot2 model therefore reports `hasDisplayMotion()`. L's FP8 matrix stages still have no
+  such variant: on RDNA3/4 those games keep L on the CUDA backend.
+
+Selection: the shim loads `engine/l` with its dot2 stages wherever it does so for M (`engine_m_dot2()`: no FP8 and no
+f16 cooperative matrices, or `D4R_ENGINE_M_NETWORK=dot2`). `build-engine-models.sh` now builds `l` and `l-ldr` on
+RDNA2 as well, with the network kernels stubbed as for M. On the Deck, the whole cold Super Resolution build with L
+took 133 s.
+
+Accuracy against L's matrix build on the RX 9070 XT (six frames of the 720p capture, pooled RGB):
+- 426x240 -> 1278x720: 37.50 dB
+- 640x360 -> 1920x1080: 37.06 dB
+- With the motion passed at display resolution (`d4r-m` `D4R_M_DISPLAY_MV=1`, the render vectors resampled):
+  37.28 and 37.00 dB.
+For comparison, M's dot2 stages are 35.8 dB from its relaxed matrix build.
+
+Steam Deck (gfx1033, RADV, GPU fixed at 1600 MHz), `d4r-m`, 2026-10-21:
+
+| | First version | now |
+|---|---:|---:|
+| 426x240 -> 1278x720 (Ultra Performance), GPU time per frame | 9.82 ms | 9.03 ms |
+| of it: input (with the merge) / network / expansion | 1.99 / 4.46 / 1.59 ms | 1.63 / 4.46 / 1.16 ms |
+| reconstruction / downsample | 1.42 / 0.34 ms | the same |
+| 640x360 -> 1280x720 | | 16.8 ms (input 3.41, network 8.88, expansion 2.58, reconstruction 1.43 ms) |
+
+M at 640x360 -> 1280x720 is 11.8 ms. L's network costs the same as M's at a given render size, but its per-pixel
+input and expansion blocks scale with render pixels, which is why L belongs at Ultra Performance. Through the shim
+(D3D12 harness, 426x240 -> 1280x720) the median call+submit+wait is 11.1 ms, with motion at either resolution.
+
+Not useful:
+- A smaller reconstruction tile for L at 3x and above: tile 9 or 10 instead of 11 saves about 10 us.
+- Restricting the expansion's MLP to the 13 channels the head reads: the compiler had already removed the dead
+  products.
 
 ## Files
 

@@ -6,8 +6,7 @@
 #        bash d4r/tools/build-engine-models.sh --find-proton      prints the GE-Proton it would use (or nothing)
 #        bash d4r/tools/build-engine-models.sh --list-sr-models   prints the Super Resolution models it builds here
 #   Ray Reconstruction  engine/rr-d, rr-e, rr-f   from d4r/nvngx_dlssd.dll 310.9.1 alone (about half a minute)
-#   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr (on RDNA2 no l, l-ldr; D4R_ENGINE_ALL_MODELS=1
-#                       builds L there too)
+#   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr
 #                       NVIDIA's DLSS keeps these weights packed in nvngx_dlss.dll; they are read where NGX unpacks
 #                       them: the bundled D3D12 test app renders one frame per model through this d4r folder under
 #                       GE-Proton, and the uploads are saved (the frames after the first render at the same time;
@@ -60,13 +59,8 @@ gpu_arch() {   # the GPU the native kernels are chosen for: D4R_GPU_ARCH, else t
   [[ -z "$found" ]] || printf 'gfx%d%d%x\n' $((found / 10000)) $((found / 100 % 100)) $((found % 100))
 }
 sr_models() {
-  # RDNA2: M runs on the engine's v_dot2 stages; L has no such stages (the engine cannot run it there), so its test
-  # frame would only cost the compile of its transformer layers with emulated matrix products
-  if [[ "${D4R_ENGINE_ALL_MODELS:-0}" != 1 && "$(gpu_arch)" == gfx103* ]]; then
-    echo e f k k-ldr m m-ldr
-  else
-    echo e f k k-ldr l l-ldr m m-ldr
-  fi
+  # every GPU: on RDNA2 M and L run on the engine's v_dot2 stages (their network kernels stubbed, stub_network)
+  echo e f k k-ldr l l-ldr m m-ldr
 }
 stub_network() {
   # The L/M test frames only provide their network layers' launches (arguments and weight uploads): on RDNA2 those
@@ -208,7 +202,6 @@ if (( DO_SR )); then
   mkdir -p "$WORK/prefix"
   models=" $(sr_models) "
   echo "Building the Super Resolution models ($(sr_models)) from what NGX uploads..."
-  [[ "$models" == *" l "* ]] || echo "  (L is left to d4r's normal path on this GPU ($(gpu_arch)); D4R_ENGINE_ALL_MODELS=1 builds it)"
   run ptx.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$PTX"
   if [[ "$models" == *" m "* || "$models" == *" l "* ]] && stub_network; then
     run stubs.log python3 "$MODEL_TOOLS" stub-ptx "$DLL" "$STUBS"
