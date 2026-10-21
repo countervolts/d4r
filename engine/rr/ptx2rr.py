@@ -156,7 +156,7 @@ void SA32(uint a, uint v) { CHECKS(a + 2u);
 // lowering of exp (lowerFEXP, fast-FMA path): the same fused operations, hardware exp2, ldexp and reciprocal.
 // Up to 2026-10-19 every fused operation went through f64 (the product exact there, the sum rounded to 53 bits, then
 // to f32), which this GPU runs at a small fraction of the f32 rate. They are the driver's f32 fma now, with two
-// exceptions that keep every result bit for bit what it was, on all 2^32 arguments (RX 9070 XT, RADV; NaN payloads
+// exceptions that keep every result bit for bit what it was, on all 2^32 arguments (RX 9070, RADV; NaN payloads
 // included):
 // - the polynomial stays in f64: the driver drops the f32 rounding between nested f64 operations (it folds
 //   f2f64(f2f32(x)) to x; the conversions are not NoContraction), so its four nested steps always ran in f64 with one
