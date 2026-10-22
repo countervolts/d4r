@@ -530,6 +530,60 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
     PROF_INIT;
     STAMP(1);
     // ---- L2 norm: h1 = x0 * (rsqrt(sum x0^2) * gamma1) -> hb
+#if defined(PWIN_NORM_OWNER) && !defined(D4R_ACCURACY)
+    static_assert(C == 64 && !L::POS, "norm ownership is validated for the general C64 layers");
+    // Each of two producer waves normalizes 32 distinct rows. The original four-wave WMMA
+    // mapping stays unchanged; both cross-wave barriers are required because input staging
+    // was wave-local and later attention reads the producer waves' normalized rows.
+    block_sync();
+    if (wv < 2)
+    {
+        const int token = 32*wv + int(l);
+        const half_t* normA = act[token];
+        half_t* normH = hb[token];
+        float ss = 0.0f;
+        for (int kt = 0; kt < KT; ++kt)
+        {
+            const u8v xv = lds_row16(normA + 16 * kt);
+#pragma unroll
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_SS)
+            for (int j = 0; j < 8; ++j)
+            {
+                const uint32_t xj = xv[j]; // (no __builtin_bit_cast of a vector subscript: clang bug, REWRITE.md)
+                const hv2 v = __builtin_bit_cast(hv2, xj), q = v * v;
+                ss += (float)q[0];
+                ss += (float)q[1];
+            }
+#else
+            for (int c = 0; c < 16; ++c)
+            {
+                const half_t v = op_get(xv, c);
+                ss += (float)(half_t)(v * v);
+            }
+#endif
+        }
+        const half_t r16 = half_rsqrt((half_t)ss);
+        for (int kt = 0; kt < KT; ++kt)
+        {
+            const u8v xv = lds_row16(normA + 16 * kt);
+            u8v hv;
+            const u8v gv = lds_row16((const half_t*)(w + L::G1) + 16 * kt); // 16 contiguous gammas
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
+            {
+                const uint32_t xj = xv[j], gj = gv[j];
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+            }
+#else
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+#endif
+            store_row16(normH + 16 * kt, hv);
+        }
+    }
+    block_sync();
+#else
     float ss = 0.0f;
     for (int kt = 0; kt < KT; ++kt)
     {
@@ -570,6 +624,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #endif
         store_row16(hrow + 16 * kt, hv);
     }
+#endif
     __builtin_amdgcn_wave_barrier();
 #ifdef PWIN_DBG
     if (DBG_ON && !hf)
