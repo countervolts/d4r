@@ -6,7 +6,7 @@ set -euo pipefail
 # the game launcher takes as D4R_VKD3D_DIR.
 # usage: build_vkd3d_proton_d4r.sh OUT_DIR
 # Env: VKD3D_PROTON_SRC (clone, default ~/.cache/d4r-vkd3d-proton),
-#      VKD3D_PROTON_COMMIT (default 3dfc6f07, the base GE-Proton11-3 ships),
+#      VKD3D_PROTON_COMMIT (default ef9a02e8; tested with GE-Proton11-11),
 #      D4R_VKD3D_FSR_RR=1: also what AMD's FSR Ray Regeneration needs on RDNA 3
 #        ([RayReconstruction] Backend = fsr): dxil-spirv's accepted scalar FP8 fallback (upstream PR 307,
 #        merge f9f6294f, cherry-picked onto the linked translator) and -Denable_extended_emulation=true,
@@ -18,7 +18,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(realpath -m "$1")"
 SRC="${VKD3D_PROTON_SRC:-$HOME/.cache/d4r-vkd3d-proton}"
-COMMIT="${VKD3D_PROTON_COMMIT:-3dfc6f07}"
+COMMIT="${VKD3D_PROTON_COMMIT:-ef9a02e8}"
 BUILD="$SRC-build"
 
 [[ -d "$SRC/.git" ]] || git clone https://github.com/HansKristian-Work/vkd3d-proton.git "$SRC"

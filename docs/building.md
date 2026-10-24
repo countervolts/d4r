@@ -6,9 +6,9 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 | Component | Tested version |
 |---|---|
 | ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0014` in order |
-| vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` through `0005` in order |
+| vkd3d-proton | `ef9a02e8` (updated upstream base; tested with GE-Proton11-11), plus `patches/vkd3d-proton/0001` through `0005` in order |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
-| Proton | GE-Proton11-3 (with its OptiScaler integration) |
+| Proton | GE-Proton11-3 (original); GE-Proton11-11 (tested with this VKD3D update) |
 | DLSS | `nvngx_dlss.dll` 310.7.0 |
 
 ## 1. ZLUDA

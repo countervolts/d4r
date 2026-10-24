@@ -1,12 +1,8 @@
-vkd3d-proton (d4r, opt-in): VKD3D_D4R_LINEAR_RGBA8=WxH also creates RGBA8 UNORM textures of exactly that size with
-unordered access linear and exportable (with VKD3D_D4R_LINEAR_TEXTURES=1), so the d4r shim can write DLSS's packed
-RGBA8 output in place (D4R_SHIM_INPLACE=1) instead of copying it. Every selected texture is logged (warn).
-Applies on top of 0001-0003.
-
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a7684464..29285e19 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
-@@ -720,7 +720,25 @@
+@@ -735,7 +735,25 @@ static bool d4r_linear_texture_candidate(const D3D12_HEAP_PROPERTIES *heap_prope
              desc->DepthOrArraySize != 1 || desc->SampleDesc.Count != 1 ||
              (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
          return false;
