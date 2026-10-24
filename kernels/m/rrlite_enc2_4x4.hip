@@ -1,7 +1,8 @@
 // fast numerics: intermediate activations f16 (no FP8 re-quantisation), f32 accumulation through GEMM chains
 // RX 7700 XT: packed FP8 input decode, packed norm1 sums, half-wave exchange via ds_bpermute, MLP loop unrolled 4x;
 // byte-identical to the default build, gfx1101 only (not measured on other targets)
-// d4r-build-flags-gfx1101: -DSWIN_PACKED_INPUT -DSWIN_PACKED_NORM1 -DSWIN_HALF_BPERMUTE -DSWIN_UNROLL_MLP=4
+// Uniform-offset weight loads retain the same operand bytes and accumulation order.
+// d4r-build-flags-gfx1101: -DSWIN_PACKED_INPUT -DSWIN_PACKED_NORM1 -DSWIN_HALF_BPERMUTE -DSWIN_UNROLL_MLP=4 -DSWIN_BUFFER_BLOAD_FAST
 #define SWIN_NO_Q8
 #define SWIN_F32ACC
 #ifndef SWIN_MAX_VGPR

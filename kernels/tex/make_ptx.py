@@ -533,7 +533,20 @@ def dec0l_spec(name):
     first = next(i for i in range(body, end) if lines[i].strip() and not lines[i].lstrip().startswith((".", "//")))
     drop = {i for i in range(first, end + 1) if i not in keep}
     loads = "\n".join(f"ld.shared.u32 {reg}, [%rdl0+{128 * r}];" for r, reg in enumerate(x2))
-    return dict(file=path.name, drop=drop, insert_at=end + 1, insert=DEC0L_CALL.format(name=name) + "\n" + loads,
+    output_wave = ""
+    if os.environ.get("D4R_TEX_WAVES", "1") == "4":
+        # The native block's workgroup barrier publishes every window's result;
+        # one wave then runs the unchanged CUDA surface epilogue.
+        output_wave = """{
+.reg .u32 %zw;
+.reg .pred %zp;
+mov.u32 %zw, %tid.z;
+setp.ne.u32 %zp, %zw, 0;
+@%zp ret;
+}
+"""
+    return dict(file=path.name, drop=drop, insert_at=end + 1,
+                insert=DEC0L_CALL.format(name=name) + "\n" + output_wave + loads,
                 sust=True, extern=DEC0L_EXTERN, regs=[".reg .b32 %rdl<8>;", ".reg .b64 %rddl<3>;"])
 
 
@@ -870,6 +883,14 @@ def main():
         head, tail = lines[:j] + k["stub"].split("\n") + [""] + lines[b:], []
     else:
         head, tail = lines, []
+    if os.environ.get("D4R_TEX_WAVES", "1") == "4" and ENC0L_RE.fullmatch(name):
+        # Wave zero alone builds the 8x8 feature image. The native tail begins
+        # with a workgroup barrier before four independent window waves read it.
+        entry0 = next(i for i,l in enumerate(head) if l.startswith(".visible .entry"))
+        start = next(i for i in range(entry0, len(head)) if head[i].startswith("mov.b64"))
+        head[start:start] = [".reg .u32 %d4rz;", ".reg .pred %d4rp;", "mov.u32 %d4rz, %tid.z;",
+                             "setp.ne.u32 %d4rp, %d4rz, 0;", "@%d4rp bra D4R_L_WINDOWS;"]
+        tail.insert(0, "D4R_L_WINDOWS:")
     entry = next(i for i, l in enumerate(head) if l.startswith(".visible .entry"))
     body, n = replace_sust(head[entry:]) if k.get("sust") else (head[entry:], {"b16": 0, "p": 0, "b32": 0})
     if k.get("regs"):

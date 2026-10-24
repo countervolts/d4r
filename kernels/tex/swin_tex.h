@@ -42,7 +42,15 @@ namespace d4r_swin
 #endif
 #define SWIN_PV_ZLUDA_ORDER
 #define SWIN_APPROX_RECIP
-#ifndef D4R_FP8_WMMA
+#ifdef D4R_TEX_GFX11
+#ifdef D4R_TEX_GFX11_SCALED
+#define SWIN_GFX11_ROW
+#define SWIN_GFX11_SCALED
+#else
+#error "D4R_TEX_GFX11 requires the validated scaled-half operand path"
+#endif
+#endif
+#if !defined(D4R_FP8_WMMA) && !defined(D4R_TEX_GFX11_SCALED)
 #define D4R_FP8_WMMA
 #endif
 #include "../m/swin_common.h"

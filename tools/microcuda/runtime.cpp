@@ -684,11 +684,15 @@ static int identity_prep(Function* f,const unsigned char* block,hipStream_t stre
     if(!key||!identity_of(key,generation,epoch)) return prep(); // untracked weights: no reuse
     for(auto& p:f->prepared) if(p.key==key) {
         if(p.generation==generation&&p.epoch==epoch) { f->prep_skips.fetch_add(1,std::memory_order_relaxed); return SUCCESS; }
-        p.generation=generation; p.epoch=epoch; return prep(); // same slot (claimed by key), new contents
+        // A failed submission must not certify the old image as current.
+        int r=prep();
+        if(!r) { p.generation=generation; p.epoch=epoch; }
+        return r; // same slot (claimed by key), new contents
     }
     // a new key claims the next free slot; beyond the slots it shares the overflow slot and prepares every launch
-    if(f->prepared.size()<f->prep_slots) f->prepared.push_back({key,generation,epoch});
-    return prep();
+    int r=prep();
+    if(!r&&f->prepared.size()<f->prep_slots) f->prepared.push_back({key,generation,epoch});
+    return r;
 }
 
 // CUDA's packed-argument tokens are POINTER=1, SIZE=2, END=0; HIP's END is 3.

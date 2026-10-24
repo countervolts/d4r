@@ -1,4 +1,4 @@
-// Native block of preset L's unfolded rrlite_dec0_4x4, RDNA4 native FP8 only.
+// Native block of preset L's unfolded rrlite_dec0_4x4, RDNA4 native FP8 or gfx11 scaled FP16 WMMA.
 //
 // The original kernel is, per 8x8-pixel block (one wave): the patch expand of the block's 16 half-resolution
 // tokens (K 64 -> 4 x 32 channels), x0 = f16(q8(expand) + skip) with enc0's pixel tokens as the skip input, a
@@ -8,10 +8,13 @@
 // output code reads (the D fragments of NVIDIA's last 16 MMAs), which the edited PTX loads back.
 // The arithmetic is the token-lane block of ../m/swin_tok.h in the order of ZLUDA's lowering (see
 // enc0l_tail.hip): harness frames are byte-identical to the original kernel's.
+#ifdef D4R_TEX_GFX11
+#define D4R_WMMA_LAYOUT 12
+#endif
 #include "tex_common.h"
 
-#if !defined(D4R_TEX_FP8) || D4R_WMMA_LAYOUT != 12
-#error "dec0l_block.hip needs the gfx12 native-FP8 build (D4R_TEX_FP8=1)"
+#if (!defined(D4R_TEX_FP8) && !defined(D4R_TEX_GFX11)) || D4R_WMMA_LAYOUT != 12
+#error "dec0l_block.hip needs gfx12 native FP8 or D4R_TEX_GFX11 scaled operands"
 #endif
 
 #include "swin_tex.h"
@@ -26,9 +29,19 @@ constexpr TokTables<DC, DNH, 0, DCIN> g_dl_tok = make_tok_tables<DC, DNH, 0, DCI
 
 __attribute__((device)) d4r_swin::wslot g_dl_w16[DL::TOTAL];
 __attribute__((device)) d4r_swin::h8 g_dl_c16[DL::CTOTAL];
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+DEV __attribute__((used)) uint32_t d4r_block_z = 4;
+#endif
 DEV __attribute__((used)) uint32_t d4r_prep_blocks = ((DL::TOTAL > DL::CTOTAL ? DL::TOTAL : DL::CTOTAL) + 127) / 128;
-// the prep reads only prm.w (offset 0): the hook skips it while that pointer repeats
+#ifdef D4R_TEX_GFX11_SCALED
+// Re-read weights on both runtimes: NGX may recycle an address on feature
+// recreation. This single-image module intentionally has no persistent cache.
+DEV __attribute__((used)) uint32_t d4r_prep_key_at = 0;
+DEV __attribute__((used)) uint32_t d4r_prep_identity_at = 0;
+#else
+// Existing gfx12 path: preserve its preparation policy.
 DEV __attribute__((used)) uint32_t d4r_prep_key_at = 0 + 1;
+#endif
 
 struct Dec0LParams
 {
@@ -60,12 +73,22 @@ DEV uint32_t d4r_dec0l_block(uint64_t wp, uint64_t inp, uint64_t skipp, int32_t 
     constexpr int C = DC, NT = DNT, CIN = DCIN;
     const int lane = (int)lane_id(), l16 = lane & 15, hf = lane >> 4;
     (void)wp; // the images were prepared from it
+#ifdef D4R_TEX_GFX11_SCALED
+    const h8* const ch = g_dl_c16 + hf;
+    const tok_weight* const wl = (const tok_weight*)g_dl_w16 + l16;
+#ifdef SWIN_L_BUFFER_WEIGHTS
+    auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return tok_weight_image(wl, dst + ((kc * 2 + st) * nt_count + nt) * 16, l16); };
+#else
+    auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return wl[dst + ((kc * 2 + st) * nt_count + nt) * 16]; };
+#endif
+#else
     uintptr_t chv = (uintptr_t)(g_dl_c16 + hf), wlv = (uintptr_t)((const gop*)g_dl_w16 + 2 * l16 + hf);
     asm("" : "+v"(chv));
     asm("" : "+v"(wlv));
     const h8* const ch = (const h8*)chv;
     const gop* const wl = (const gop*)wlv;
     auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return wl[2 * (dst + ((kc * 2 + st) * nt_count + nt) * 16)]; };
+#endif
 
     __shared__ __attribute__((aligned(16))) uint8_t E8[64 * C];
     __shared__ __attribute__((aligned(16))) uint32_t X2[32 * 32];
@@ -82,10 +105,15 @@ DEV uint32_t d4r_dec0l_block(uint64_t wp, uint64_t inp, uint64_t skipp, int32_t 
             const uint8_t* b = (const uint8_t*)inp + ((size_t)(kc * H2 + MY) * W2 + MX) * 32 + tok_half(hf);
 #pragma unroll
             for (int st = 0; st < 2; ++st)
-                pa[kc][st] = (u2v){*(const uint32_t*)(b + tok_word(st, 0)), *(const uint32_t*)(b + tok_word(st, 1))};
+                pa[kc][st] = tok_operand(*(const uint32_t*)(b + tok_word(st, 0)), *(const uint32_t*)(b + tok_word(st, 1)));
         }
 #pragma unroll 1
-        for (int q = 0; q < 4; ++q)
+        for (int q =
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+             __builtin_amdgcn_workitem_id_z(); q < 4; q += 4)
+#else
+             0; q < 4; ++q)
+#endif
         {
             const int tx = 2 * (l16 & 3) + (q & 1), ty = 2 * (l16 >> 2) + (q >> 1);
             const int Tc = (tx & 3) + 4 * (ty & 3) + 16 * (tx >> 2) + 32 * (ty >> 2);
@@ -96,15 +124,27 @@ DEV uint32_t d4r_dec0l_block(uint64_t wp, uint64_t inp, uint64_t skipp, int32_t 
                 T16 e = tok_t16(ch[K::CPEB + 2 * (NT * q + ct)]);
 #pragma unroll
                 for (int kc = 0; kc < CIN / 32; ++kc)
-                    k32(e, wt(pew, NT, kc, 0, ct), pa[kc][0], wt(pew, NT, kc, 1, ct), pa[kc][1]);
-                *(u2v*)(E8 + Tc * C + 16 * ct + 8 * hf) = tok_codes(e);
+                    tok_weight_k32(e, wt(pew, NT, kc, 0, ct), pa[kc][0], wt(pew, NT, kc, 1, ct), pa[kc][1]);
+                *(u2v*)(E8 + Tc * C + 16 * ct + 8 * hf) = (u2v){codes4(e.pair(0), e.pair(1)), codes4(e.pair(2), e.pair(3))};
             }
         }
     }
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    __syncthreads();
+#else
     wave_sync();
+#endif
 
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    const int window_wave = __builtin_amdgcn_workitem_id_z();
+#endif
 #pragma unroll 1
-    for (int wv = 0; wv < 4; ++wv)
+    for (int wv =
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+         window_wave; wv < 4; wv += 4)
+#else
+         0; wv < 4; ++wv)
+#endif
     {
         const int T = 16 * wv + l16;
         const int Xm = mirror(8 * bx - sx + tok_x(T), tw), Ym = mirror(8 * by - sy + tok_y(T), th);
@@ -137,6 +177,10 @@ DEV uint32_t d4r_dec0l_block(uint64_t wp, uint64_t inp, uint64_t skipp, int32_t 
                 X2[32 * R + L] = __builtin_bit_cast(uint32_t, x2[t][k]);
             }
     }
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    __syncthreads();
+#else
     wave_sync();
+#endif
     return (uint32_t)(uintptr_t)(__attribute__((address_space(3))) void*)X2;
 }

@@ -1,4 +1,6 @@
 // fast numerics: intermediate activations f16 (no FP8 re-quantisation), f32 accumulation through GEMM chains
+// Uniform-offset weight loads on RX 7700 XT; preparation/invalidation is unchanged.
+// d4r-build-flags-gfx1101: -DSWIN_BUFFER_BLOAD_FAST -DSWIN_DENSE_G_FAST
 #define SWIN_NO_Q8
 #define SWIN_F32ACC
 #ifndef SWIN_MAX_VGPR
@@ -15,6 +17,9 @@
 #define SWIN_PREP_KEY_AT 0
 #define SWIN_PREP_IDENTITY_AT 1
 #define SWIN_PREP_SLOTS 8
+#ifdef D4R_ENC3_CONTENT_CACHE
+#define SWIN_PREP_CONTENT_CACHE
+#endif
 // RDNA4 native FP8 builds use the token-lane block (swin_tok.h); -DSWIN_NO_TOKEN_LANES keeps swin_block.h
 #ifndef SWIN_NO_TOKEN_LANES
 #define SWIN_TOKEN_LANES

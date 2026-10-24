@@ -1,4 +1,6 @@
 // fast numerics: intermediate activations f16 (no FP8 re-quantisation), f32 accumulation through GEMM chains
+// Uniform-offset weight loads on RX 7700 XT; same weight bytes and neural arithmetic.
+// d4r-build-flags-gfx1101: -DSWIN_BUFFER_BLOAD_FAST
 #define SWIN_NO_Q8
 #define SWIN_F32ACC
 #ifndef SWIN_MAX_VGPR

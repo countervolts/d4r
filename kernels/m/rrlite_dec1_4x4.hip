@@ -1,6 +1,7 @@
 // fast numerics: intermediate activations f16 (no FP8 re-quantisation), f32 accumulation through GEMM chains
 // RX 7700 XT: VGPR cap 160 removes the scratch use; byte-identical to the default build, gfx1101 only
-// d4r-build-flags-gfx1101: -DSWIN_MAX_VGPR=160
+// Uniform-offset weight loads retain the same operand bytes and accumulation order.
+// d4r-build-flags-gfx1101: -DSWIN_MAX_VGPR=160 -DSWIN_BUFFER_BLOAD_FAST
 #define SWIN_NO_Q8
 #define SWIN_F32ACC
 #ifndef SWIN_MAX_VGPR

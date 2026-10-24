@@ -12,6 +12,14 @@
 #   D4R_NATIVE_FP8  1 (RDNA4 only): the variant for ZLUDA's native FP8 WMMA (d4r.ini [Kernels] NativeFp8):
 #                   M's layers on FP8 WMMA with NVIDIA's e4m3 activations, texture tails matching ZLUDA's
 #                   D4R_ZLUDA_WMMA_FP8_NATIVE lowering. K is the same in both variants.
+#   D4R_L_GFX11    auto (default): native four-wave L enc0/dec0 on gfx1101 fast sets;
+#                   0 keeps the original texture neural bodies; 1 opts in on other gfx11 targets.
+#                   Uses scaled FP16 WMMA, never requires native FP8. Accuracy sets stay unchanged.
+#   D4R_SWIN_TOKEN_GFX11  1: experimental RDNA3 token-major M/L Swin with exact quantization,
+#                   f16 WMMA and register-only layout exchange; no native FP8 required.
+#   D4R_ENC3_CONTENT_CACHE  1: validate every enc3 weight tile by its complete source bytes,
+#                   skipping expansion/stores for unchanged content (still launches prep).
+#   D4R_SWIN_CFLAGS  extra experimental Swin compiler flags, appended after per-target flags.
 #   D4R_WMMA_SOFT   1: RDNA2's software matrix products (kernels/common/wmma_layout.h) on an RDNA3 target, to
 #                   validate and time the RDNA2 kernels on RDNA3 hardware (gfx103x targets always use them)
 #   D4R_PREFER_ACCURACY  1: preserve FP8 quantization, per-MMA f16 rounding and denormal handling;
@@ -36,6 +44,21 @@ OUT="$(realpath -m "${2:-$DEFAULT_OUT}")"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ARCH="${D4R_GPU_ARCH:-gfx1101}"
 FP8="${D4R_NATIVE_FP8:-0}"
+L11="${D4R_L_GFX11:-auto}"
+case "$L11" in
+    auto) L11=0; [[ "$ARCH" == gfx1101 && "$ACCURACY" == 0 ]] && L11=1 ;;
+    0) ;;
+    1) [[ "$ARCH" == gfx11* && "$ACCURACY" == 0 ]] || { echo 'D4R_L_GFX11=1 requires a gfx11 fast set' >&2; exit 2; } ;;
+    *) echo 'D4R_L_GFX11 must be auto, 0 or 1' >&2; exit 2 ;;
+esac
+TOKEN11="${D4R_SWIN_TOKEN_GFX11:-0}"
+[[ "$TOKEN11" == 0 || "$TOKEN11" == 1 ]] || { echo "D4R_SWIN_TOKEN_GFX11 must be 0 or 1" >&2; exit 2; }
+if [[ "$TOKEN11" == 1 && "$ARCH" != gfx11* ]]; then
+    echo "D4R_SWIN_TOKEN_GFX11 requires an RDNA3 target" >&2; exit 2
+fi
+if [[ "$TOKEN11" == 1 && "$ACCURACY" != 1 ]]; then
+    echo "D4R_SWIN_TOKEN_GFX11 requires D4R_PREFER_ACCURACY=1 (exact intermediate quantization)" >&2; exit 2
+fi
 case "$ARCH" in
     gfx11[0-9][0-9]) [[ "$FP8" == 1 ]] && { echo "D4R_NATIVE_FP8 needs an RDNA4 (gfx12) target" >&2; exit 2; } ;;
     gfx12[0-9][0-9]) ;;
@@ -92,7 +115,13 @@ if [[ "$WHAT" == all || "$WHAT" == k ]]; then
 fi
 if [[ "$RDNA2" == 0 && ( "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ) ]]; then
     echo "== DLSS 4.5 (presets L/M) shared Swin layers"
-    for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$([[ "$FP8" == 1 ]] && echo -DD4R_FP8_WMMA)"; done
+    swin_flags=""
+    [[ "$FP8" == 1 ]] && swin_flags+=" -DD4R_FP8_WMMA"
+    [[ "$TOKEN11" == 1 ]] && swin_flags+=" -DSWIN_GFX11_TOKEN -DWM_HALF_BPERMUTE -DSWIN_HALF_BPERMUTE"
+    [[ "${D4R_ENC3_CONTENT_CACHE:-0}" == 1 ]] && swin_flags+=" -DD4R_ENC3_CONTENT_CACHE"
+    # Experimental scheduling/register tuning; appended after per-target flags.
+    swin_flags+=" ${D4R_SWIN_CFLAGS:-}"
+    for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$swin_flags"; done
 fi
 if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     echo "== texture kernels (NVIDIA PTX with native parts)"
@@ -126,14 +155,15 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             done
         done
     fi
-    # L's unfolded variants keep their complete neural arithmetic. The folded M
-    # GEMM heads/tails are incompatible; substitute only the surface stores.
+    # L uses unfolded enc0/dec0; folded M GEMM heads/tails are incompatible.
+    # The fallback substitutes surface stores only. gfx1101 fast sets instead
+    # use the four-wave scaled-half neural bodies (D4R_L_GFX11=0 restores fallback).
     # RDNA4 native FP8: enc0 after its feature staging (embedding, Swin block, patch merge: enc0l_tail.hip) and
     # dec0 before its output code (patch expand, Swin block: dec0l_block.hip) are native token-lane code in the
     # order of ZLUDA's lowering. Harness frames are byte-identical to the sust_only builds (RX 9070 XT,
     # 1280x720 render: enc0 1.71 -> 0.63 ms, dec0 1.26 -> 0.54 ms).
     enc0l=sust_only dec0l=sust_only
-    [[ "$ARCH" == gfx12* && "$FP8" == 1 ]] && enc0l=enc0l_tail dec0l=dec0l_block
+    [[ "$ARCH" == gfx12* && "$FP8" == 1 || "$L11" == 1 ]] && enc0l=enc0l_tail dec0l=dec0l_block
     specs+=("rrlite_dec0_4x4:$dec0l")
     for mv in mvhi mvlo; do
         for range in hdr ldr; do
@@ -185,8 +215,15 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             [[ "$ACCURACY" == 0 ]] && w64=1
             [[ "$ARCH" == gfx12* && "$kernel" == rrlite_@(post|downsample)_* ]] && w64=1
         fi
+        texture_flags="${D4R_TEX_CFLAGS:-}" texture_waves=1
+        if [[ "$L11" == 1 && ( "$src" == enc0l_tail || "$src" == dec0l_block ) ]]; then
+            texture_flags+=" -DD4R_TEX_GFX11 -DD4R_TEX_GFX11_SCALED -DWM_HALF_BPERMUTE -DSWIN_HALF_BPERMUTE"
+            texture_flags+=" -DSWIN_L_BUFFER_WEIGHTS"
+            texture_waves=4
+        fi
         D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_ACCURACY_WAVE64="$w64" \
             D4R_ZLUDA_WAVE64="$w64" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
+            D4R_TEX_CFLAGS="$texture_flags" D4R_TEX_WAVES="$texture_waves" \
             D4R_TEX_FP8="$FP8" D4R_DLSS_PTX_DIR="$PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" "$src" "$OUT"
     done
     if [[ "$WHAT" != l && "$ACCURACY" == 0 ]]; then

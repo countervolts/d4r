@@ -1,4 +1,4 @@
-// Native tail of preset L's unfolded rrlite_enc0_4x4_* (all flag combinations), RDNA4 native FP8 only.
+// Native tail of preset L's unfolded rrlite_enc0_4x4_* (all flag combinations), RDNA4 native FP8 or gfx11 scaled FP16 WMMA.
 //
 // The kernel is ZLUDA's compile of NVIDIA's PTX up to the barrier that ends the feature staging: one wave per
 // 8x8-pixel block has then written 32 e4m3 features per pixel to shared memory. Everything after it is this
@@ -9,10 +9,13 @@
 //   patch merge 2x2 pixels (K 128) -> 64 channels, clamped to +-2 pi, at half resolution (the input of enc1)
 // with NVIDIA's arithmetic (e4m3 activations, an f16 accumulator rounded after every k32 step) in the order of
 // ZLUDA's lowering of it (swin_tex.h): harness frames are byte-identical to the original kernel's.
+#ifdef D4R_TEX_GFX11
+#define D4R_WMMA_LAYOUT 12
+#endif
 #include "tex_common.h"
 
-#if !defined(D4R_TEX_FP8) || D4R_WMMA_LAYOUT != 12
-#error "enc0l_tail.hip needs the gfx12 native-FP8 build (D4R_TEX_FP8=1)"
+#if (!defined(D4R_TEX_FP8) && !defined(D4R_TEX_GFX11)) || D4R_WMMA_LAYOUT != 12
+#error "enc0l_tail.hip needs gfx12 native FP8 or D4R_TEX_GFX11 scaled operands"
 #endif
 
 #include "swin_tex.h"
@@ -35,9 +38,19 @@ constexpr TokConst g_el_embc[2] = {{ECB1, TC_PI, E_EMB + 32 * EC}, {ECB2, TC_X, 
 
 __attribute__((device)) d4r_swin::wslot g_el_w16[EW_TOTAL];
 __attribute__((device)) d4r_swin::h8 g_el_c16[EC_TOTAL];
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+DEV __attribute__((used)) uint32_t d4r_block_z = 4;
+#endif
 DEV __attribute__((used)) uint32_t d4r_prep_blocks = (EW_TOTAL + 127) / 128;
-// the prep reads only prm.w (offset 0): the hook skips it while that pointer repeats
+#ifdef D4R_TEX_GFX11_SCALED
+// Re-read weights on both runtimes: NGX may recycle an address on feature
+// recreation. This single-image module intentionally has no persistent cache.
+DEV __attribute__((used)) uint32_t d4r_prep_key_at = 0;
+DEV __attribute__((used)) uint32_t d4r_prep_identity_at = 0;
+#else
+// Existing gfx12 path: preserve its preparation policy.
 DEV __attribute__((used)) uint32_t d4r_prep_key_at = 0 + 1;
+#endif
 
 struct Enc0LParams
 {
@@ -69,8 +82,12 @@ KERNEL __attribute__((amdgpu_flat_work_group_size(128, 128))) void D4R_CAT(D4R_K
 // e4m3 codes of four halves that are already within +-448 (no saturation clamp)
 __attribute__((device, always_inline)) static inline uint32_t el_codes4(d4r_swin::hv2 a, d4r_swin::hv2 b)
 {
+#ifdef D4R_TEX_GFX11
+    return d4r_swin::codes4(a, b);
+#else
     const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
     return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
+#endif
 }
 
 // smem: the staged features, byte k of pixel (px, py) of the block at 1024 (k >> 4) + 128 py + 16 px + (k & 15).
@@ -79,24 +96,45 @@ __attribute__((device, always_inline)) static inline uint32_t el_codes4(d4r_swin
 DEV void d4r_enc0l_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint64_t mergedp, int32_t sx, int32_t sy, int32_t tw,
                         int32_t th, int32_t bx, int32_t by)
 {
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    __syncthreads(); // wave zero finished the PTX texture/feature head
+#endif
     using K = EL;
     constexpr int C = EC, NT = ENT, XB = C + 4, NTP = ENPM / 16;
     const int lane = (int)lane_id(), l16 = lane & 15, hf = lane >> 4;
     const lds_u8* const s = (const lds_u8*)(uintptr_t)smem;
     (void)wp; // the images were prepared from it
     // this lane's bases into the two images, as in swin_tok_block
+#ifdef D4R_TEX_GFX11_SCALED
+    const h8* const ch = g_el_c16 + hf;
+    const tok_weight* const wl = (const tok_weight*)g_el_w16 + l16;
+#ifdef SWIN_L_BUFFER_WEIGHTS
+    auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return tok_weight_image(wl, dst + ((kc * 2 + st) * nt_count + nt) * 16, l16); };
+#else
+    auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return wl[dst + ((kc * 2 + st) * nt_count + nt) * 16]; };
+#endif
+#else
     uintptr_t chv = (uintptr_t)(g_el_c16 + hf), wlv = (uintptr_t)((const gop*)g_el_w16 + 2 * l16 + hf);
     asm("" : "+v"(chv));
     asm("" : "+v"(wlv));
     const h8* const ch = (const h8*)chv;
     const gop* const wl = (const gop*)wlv;
     auto wt = [&](int dst, int nt_count, int kc, int st, int nt) { return wl[2 * (dst + ((kc * 2 + st) * nt_count + nt) * 16)]; };
+#endif
 
     // the output codes of the block's 64 tokens, for the patch merge
     __shared__ __attribute__((aligned(16))) uint8_t U[64 * XB];
 
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    const int window_wave = __builtin_amdgcn_workitem_id_z();
+#endif
 #pragma unroll 1
-    for (int wv = 0; wv < 4; ++wv)
+    for (int wv =
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+         window_wave; wv < 4; wv += 4)
+#else
+         0; wv < 4; ++wv)
+#endif
     {
         const int T = 16 * wv + l16, px = tok_x(T), py = tok_y(T);
         // features: K slot 8 half + i of WMMA st is feature 16 st + 8 half + i, 8 contiguous staged bytes
@@ -105,7 +143,10 @@ DEV void d4r_enc0l_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint64_t merg
             const lds_u8* f = s + 128 * py + 16 * px + 8 * hf;
 #pragma unroll
             for (int st = 0; st < 2; ++st)
-                fa[st] = *(const __attribute__((address_space(3))) u2v*)(f + 1024 * st);
+                {
+                const u2v raw = *(const __attribute__((address_space(3))) u2v*)(f + 1024 * st);
+                fa[st] = tok_operand(raw[0], raw[1]);
+            }
         }
         // embedding: the layout of an MLP chunk (32 hidden as two tiles), ReLU instead of the GELU
         gop gz[2];
@@ -113,19 +154,19 @@ DEV void d4r_enc0l_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint64_t merg
         for (int nt = 0; nt < 2; ++nt)
         {
             T16 z = tok_t16(ch[ECB1 + 2 * nt]);
-            k32(z, wt(EW1, 2, 0, 0, nt), fa[0], wt(EW1, 2, 0, 1, nt), fa[1]);
+            tok_weight_k32(z, wt(EW1, 2, 0, 0, nt), fa[0], wt(EW1, 2, 0, 1, nt), fa[1]);
             hv2 r[4];
 #pragma unroll
             for (int k = 0; k < 4; ++k)
                 r[k] = __builtin_elementwise_maximumnum(z.pair(k), (hv2){(half_t)0.0f, (half_t)0.0f});
-            gz[nt] = (u2v){codes4(r[0], r[1]), codes4(r[2], r[3])};
+            gz[nt] = tok_operand(codes4(r[0], r[1]), codes4(r[2], r[3]));
         }
         hv2 v[NT][4];
 #pragma unroll
         for (int t = 0; t < NT; ++t)
         {
             T16 x0 = tok_t16(ch[ECB2 + 2 * t]);
-            k32(x0, wt(EW2, NT, 0, 0, t), gz[0], wt(EW2, NT, 0, 1, t), gz[1]);
+            tok_weight_k32(x0, wt(EW2, NT, 0, 0, t), gz[0], wt(EW2, NT, 0, 1, t), gz[1]);
 #pragma unroll
             for (int k = 0; k < 4; ++k)
                 v[t][k] = x0.pair(k);
@@ -149,7 +190,11 @@ DEV void d4r_enc0l_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint64_t merg
                 *(uint32_t*)(U + T * XB + tok_word(t, g) + tok_half(hf)) = co[t][g];
     }
     // every lane's codes are in U before any lane reads them
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+    __syncthreads();
+#else
     wave_sync();
+#endif
 
     // patch merge: lanes = the block's 16 merged tokens, the four source pixels' codes as in swin_tok_block
     {
@@ -168,19 +213,24 @@ DEV void d4r_enc0l_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint64_t merg
                     const int k0 = tok_merge_k(kc, st, rr), q = k0 / C;
                     run4[rr] = *(const uint32_t*)(ub + ((q & 1) + 4 * (q >> 1)) * XB + k0 % C);
                 }
-                as[kc][st] = (u2v){run4[0], run4[1]};
+                as[kc][st] = tok_operand(run4[0], run4[1]);
             }
         const int W2 = tw / 2, H2 = th / 2;
         const int MX = (8 * bx - sx) / 2 + mx, MY = (8 * by - sy) / 2 + my;
         const bool inside = MX >= 0 && MX < W2 && MY >= 0 && MY < H2;
         const hv2 lim = {(half_t)6.2831855f, (half_t)6.2831855f};
 #pragma unroll 1
-        for (int u = 0; u < NTP; ++u)
+        for (int u =
+#ifdef D4R_TEX_PARALLEL_WINDOWS
+             window_wave; u < NTP; u += 4)
+#else
+             0; u < NTP; ++u)
+#endif
         {
             T16 y = tok_t16(ch[K::CPMB + 2 * u]);
 #pragma unroll
             for (int kc = 0; kc < C / 8; ++kc)
-                k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
+                tok_weight_k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
             hv2 c[4];
 #pragma unroll
             for (int k = 0; k < 4; ++k)

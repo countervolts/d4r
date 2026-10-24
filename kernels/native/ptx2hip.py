@@ -486,6 +486,10 @@ class Translator:
             c = [x.strip() for x in m.group(2).split(',')]
             if 'base' in mods and mods >= {'2d', 'v4', 's32'} and mods & {'f32', 'f16'}:
                 E(f'{{ ::f4 t_ = tex_fetch({h}, (int32_t){V(c[0], "u32")}, (int32_t){V(c[1], "u32")});')
+            elif op in ('tex.base.2d.v4.f32.f32', 'tex.base.2d.v4.f16.f32') and len(a) == 2:
+                # PTX base mode samples level zero with the texture's sampler
+                # (float coordinates retain filtering/addressing semantics).
+                E(f'{{ ::f4 t_ = tex_level({h}, {V(c[0], "f32")}, {V(c[1], "f32")}, 0.0f);')
             elif mods >= {'level', '2d', 'v4', 'f32'} and op.endswith('f32.f32'):
                 E(f'{{ ::f4 t_ = tex_level({h}, {V(c[0], "f32")}, {V(c[1], "f32")}, {V(a[2], "f32")});')
             else:
@@ -727,10 +731,32 @@ def main():
     mpart = None
     if '--m-tail' in flags:
         lines = ptx.replace('\r\n', '\n').split('\n')
-        if kernel == 'rrlite_enc0_4x4_mvhi_hdr_folded':
-            if lines[2547].strip() != 'bar.warp.sync -1;':
-                raise Err('enc0 cut changed')
-            lines = lines[:2548] + ['d4r.enc0 %r259, %rd106, %rd78, %r1066, %r1067, %r1230, %r1233;', 'ret;', '}']
+        if re.fullmatch(r'rrlite_enc0_4x4_mv(hi|lo)_(hdr|ldr)_folded', kernel):
+            # Share the existing structural proof used by the ZLUDA texture
+            # builder: every variant's neural tail must match the reference
+            # modulo a consistent register renaming. Never apply M's folded
+            # tail to L's unfolded encoder.
+            import importlib.util
+            from pathlib import Path
+            spec = importlib.util.spec_from_file_location('d4r_texture_splice', Path(__file__).resolve().parents[1] / 'tex/make_ptx.py')
+            splice = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(splice)
+            splice.PTX_DIR = Path(args[0]).resolve().parent
+            ref = splice.read_lines(splice.module_file(splice.ENC0_REF, splice.KERNELS[splice.ENC0_REF]))
+            cut, regs = splice.enc0_registers(lines)
+            refcut, _ = splice.enc0_registers(ref)
+            count = next(i for i, line in enumerate(ref[refcut:]) if line.startswith('}'))
+            mapping = {}
+            for a, b in zip(ref[refcut:refcut + count], lines[cut:cut + count]):
+                if splice.REG_RE.sub('R', a) != splice.REG_RE.sub('R', b):
+                    raise Err('enc0 neural tail differs from reference')
+                for x, y in zip(splice.REG_RE.findall(a), splice.REG_RE.findall(b)):
+                    if mapping.setdefault(x, y) != y:
+                        raise Err('enc0 inconsistent register mapping')
+            if len(lines[cut:cut + count]) != count:
+                raise Err('enc0 truncated neural tail')
+            call = [mapping['%r259'], mapping['%rd106']] + [regs[k] for k in ('out', 'dimx', 'dimy', 'ox', 'oy')]
+            lines = lines[:cut] + ['d4r.enc0 ' + ', '.join(call) + ';', 'ret;', '}']
             mpart = 'enc0_tail'
         elif kernel == 'rrlite_dec0_4x4_folded':
             if lines[138].strip() != 'mov.u32 %r17, %laneid;' or lines[586].strip() != 'st.shared.v2.u16 [%r570+1168], {%rs63, %rs64};':
@@ -818,6 +844,14 @@ def main():
         if not 1 <= n <= 1024:
             raise Err('invalid --max-block')
         lb = f'__attribute__((amdgpu_flat_work_group_size(1, {n})))'
+    budgets = [f.split('=', 1)[1] for f in flags if f.startswith('--max-vgpr=')]
+    if budgets:
+        if len(budgets) != 1:
+            raise Err('specify only one --max-vgpr budget')
+        n = int(budgets[0])
+        if not 4 <= n <= 256 or n % 4:
+            raise Err('--max-vgpr must be a multiple of four in 4..256')
+        lb += f' __attribute__((amdgpu_num_vgpr({n})))'
     out.append(f'extern "C" __attribute__((global)) {lb} void {kernel}({kernel}_params)')
     out.append('{')
     out.append('    const AS4 uint8_t* KARGP = (const AS4 uint8_t*)__builtin_amdgcn_kernarg_segment_ptr();')

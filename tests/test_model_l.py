@@ -43,6 +43,39 @@ class ModelLTests(unittest.TestCase):
                     self.assertNotIn('d4r_enc0_tail', output)
                     self.assertNotIn('d4r_dec0_head', output)
 
+    def test_parallel_encoder_skips_duplicate_feature_heads(self):
+        # The splice's shape gate is independent of proprietary model data.
+        name = 'rrlite_enc0_4x4_mvlo_hdr'
+        mma = 'mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%r1,%r2}, {%r3,%r4,%r5,%r6}, {%r7,%r8}, {%r9,%r10};'
+        text = (f'.visible .entry {name}(\n)\n{{\n.reg .b64 %rd<2>;\n'
+                '.shared .align 16 .b8 features[2048];\n'
+                'mov.b64 %rd1, 0;\nbar.warp.sync -1;\n' + (mma+'\n')*336 +
+                'bar.warp.sync -1;\nbar.warp.sync -1;\nret;\n}\n')
+        with tempfile.TemporaryDirectory() as directory:
+            ptx=Path(directory); (ptx/'input.ptx').write_text(text)
+            env=dict(os.environ, D4R_DLSS_PTX_DIR=directory, D4R_TEX_SRC='enc0l_tail',
+                     D4R_TEX_WAVES='4', D4R_SUST_KINDS='b16,p,b32')
+            subprocess.run(['python3', str(ROOT/'kernels/tex/make_ptx.py'), name, str(ptx/'out.ptx')],
+                           env=env, check=True, capture_output=True)
+            output=(ptx/'out.ptx').read_text()
+            guard=output.index('@%d4rp bra D4R_L_WINDOWS;')
+            head=output.index('mov.b64 %rd1, 0;')
+            rendezvous=output.index('D4R_L_WINDOWS:')
+            call=output.index('call.uni d4r_enc0l_tail')
+            self.assertLess(guard, head)
+            self.assertLess(head, rendezvous)
+            self.assertLess(rendezvous, call)
+            self.assertNotIn(mma, output)
+
+    def test_gfx11_native_build_rejects_accuracy_and_other_architectures(self):
+        for arch, accuracy in [('gfx1201','0'), ('gfx1101','1')]:
+            with self.subTest(arch=arch, accuracy=accuracy), tempfile.TemporaryDirectory() as directory:
+                p=subprocess.run(['bash', str(ROOT/'kernels/build.sh'), 'm', directory],
+                    env=dict(os.environ,D4R_L_GFX11='1',D4R_GPU_ARCH=arch,D4R_PREFER_ACCURACY=accuracy),
+                    capture_output=True,text=True)
+                self.assertNotEqual(p.returncode,0)
+                self.assertIn('D4R_L_GFX11=1 requires a gfx11 fast set',p.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

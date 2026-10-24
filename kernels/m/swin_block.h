@@ -43,6 +43,18 @@ template <int C, int NW, int NPM, int CIN> constexpr SwinDescs<C, NW, NPM, CIN> 
     return r;
 }
 
+#ifdef SWIN_DENSE_G
+// Dense LDS rows with an 8-half XOR tile swizzle. Two 16-byte reads recover
+// exactly the original 16 K slots, with no arithmetic or accumulation change.
+__device__ __forceinline__ gop ping_lda(const half_t* base,int row,int col) {
+    const int mask=8*((row>>1)&3);
+    const h8 lo=*(const h8*)(base+row*32+(col^mask));
+    const h8 hi=*(const h8*)(base+row*32+((col+8)^mask));
+    return __builtin_shufflevector(lo,hi,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+}
+
+#endif
+
 // NH heads (NVIDIA's warps per block) run on NW waves (NW = NH, or 2 NH to halve LDS per wave)
 template <int C, int NH, int NW, int NPM, bool TUBE, int CIN>
 __device__ __forceinline__ void swin_block(const CommonParams& p, const TubeParams* tp, const wslot* w16, const int bx,
@@ -52,7 +64,12 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     static_assert(NW % NH == 0 && NW / NH <= 4, "waves per head");
     constexpr int NPL = L::NPL, NT = L::NT, INNER = L::INNER;
     constexpr int AST = (C > INNER ? C : INNER) + 8;
-    constexpr int GST = 40, QST = 40, PST = 24;
+#ifdef SWIN_DENSE_G
+    constexpr int GST = 32;
+#else
+    constexpr int GST = 40;
+#endif
+    constexpr int QST = 40, PST = 24;
 #ifndef SWIN_MLP_R
 #define SWIN_MLP_R(NW) ((NW) / 2)
 #endif
@@ -802,8 +819,14 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                                           (hv2)((hv2){f16(0.08108133f), f16(0.08108133f)} * az);
                         const hv2 gl = zv * (hv2)((hv2){0.5f16, 0.5f16} + (hv2)(cz * inner));
                         const hv2 gq = q8x2(gl);
+#ifdef SWIN_DENSE_G
+                        const int r0 = 16 * (mb + mm) + mrow(i), r1 = 16 * (mb + mm) + mrow(i + 1);
+                        Gc[r0 * GST + (col ^ (8 * ((r0 >> 1) & 3)))] = gq[0];
+                        Gc[r1 * GST + (col ^ (8 * ((r1 >> 1) & 3)))] = gq[1];
+#else
                         Gc[(16 * (mb + mm) + mrow(i)) * GST + col] = gq[0];
                         Gc[(16 * (mb + mm) + mrow(i + 1)) * GST + col] = gq[1];
+#endif
                     }
 #endif
                 }
@@ -821,8 +844,13 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
                 for (int mm = 0; mm < MT; ++mm)
                 {
+#ifdef SWIN_DENSE_G
+                    const gop a0 = ping_lda(G + cc * 64 * GST, 16 * (mg * MT + mm) + l16, 0);
+                    const gop a1 = ping_lda(G + cc * 64 * GST, 16 * (mg * MT + mm) + l16, 16);
+#else
                     const gop a0 = lda(G8 + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST);
                     const gop a1 = lda(G8 + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST + 16);
+#endif
 #pragma unroll
                     for (int j = 0; j < NTW; ++j)
                         k32(x[mm][j], a0, b[0][j], a1, b[1][j]);
@@ -1071,6 +1099,7 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
     using NAME##_L = SwinLayout<C, NH, NPM, CIN>;                                                                       \
     constexpr int NAME##_S = SWIN_PREP_SLOTS;                                                                           \
     __device__ wslot g_w16[(NAME##_S + 1) * NAME##_L::TOTAL];                                                           \
+    SWIN_RAW_DECLARE((NAME##_S + 1) * NAME##_L::TOTAL)                                                                  \
     extern "C" __device__ __attribute__((used)) uint64_t g_prep_keys[NAME##_S + 1] = {};                                \
     __constant__ SwinDescs<C, NH, NPM, CIN> g_descs = make_descs<C, NH, NPM, CIN>();                                    \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_block_z = NWAVES;                                         \
@@ -1085,7 +1114,8 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
         const uint8_t* w = ((const CommonParams*)&p)->w;                                                                \
         const int slot = NAME##_S ? prep_slot_claim<NAME##_S>(g_prep_keys, (uint64_t)w, idx == 0) : 0;                 \
         if (idx < NAME##_L::TOTAL)                                                                                      \
-            expand_weights(w, g_w16 + slot * NAME##_L::TOTAL, g_descs.d, NAME##_L::NDESC, idx);                        \
+            expand_weights(w, g_w16 + slot * NAME##_L::TOTAL, g_descs.d, NAME##_L::NDESC, idx,                        \
+                           SWIN_RAW_PTR(slot * NAME##_L::TOTAL));                                                    \
     }                                                                                                                   \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_grid_x = SWIN_PERSIST;                                     \
     extern "C" __global__ void __launch_bounds__(32 * NWAVES) SWIN_VGPR_ATTR NAME(PARAMS p)                             \
@@ -1109,7 +1139,7 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
 
 // RDNA4 native FP8: a module that defines SWIN_TOKEN_LANES is built from the token-lane block instead
 // (swin_tok.h: one wave per window, transposed GEMMs, results stay in registers)
-#if defined(SWIN_A8) && defined(SWIN_TOKEN_LANES)
+#if (defined(SWIN_A8) || defined(SWIN_GFX11_TOKEN)) && defined(SWIN_TOKEN_LANES)
 #include "swin_tok.h"
 #undef SWIN_MODULE_W
 #define SWIN_MODULE_W(NAME, C, NH, NWAVES, NPM, TUBE, PARAMS, CIN) SWIN_TOK_MODULE(NAME, C, NH, NPM, TUBE, PARAMS, CIN)

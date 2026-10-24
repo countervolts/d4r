@@ -12,6 +12,30 @@
 #include <hip/hip_runtime.h>
 #endif
 #include <stdint.h>
+#ifdef SWIN_GFX11_ROW
+#if !defined(SWIN_GFX11_SCALED) || !defined(SWIN_EXACT) || defined(D4R_FP8_WMMA)
+#error "SWIN_GFX11_ROW is reserved for the exact scaled-half texture path"
+#endif
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
+#error "SWIN_GFX11_ROW requires RDNA3"
+#endif
+// Permute A rows when preparing/loading operands so gfx11's physical row
+// 2i+h already represents logical row i+8h. No accumulator exchanges per MMA.
+#define D4R_WMMA_LAYOUT 12
+#endif
+#ifdef SWIN_GFX11_TOKEN
+// Token-major execution on gfx11 uses contiguous logical accumulator rows.
+// wmma_layout supplies the register-only gfx11 operand duplication/row exchange.
+// No native FP8 instruction is used; quantized intermediates remain binary16.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
+#error "SWIN_GFX11_TOKEN requires RDNA3"
+#endif
+#if defined(SWIN_NO_TOKEN_LANES)
+#error "SWIN_GFX11_TOKEN cannot be combined with SWIN_NO_TOKEN_LANES"
+#endif
+#define D4R_WMMA_LAYOUT 12
+#define SWIN_EXACT
+#endif
 #include "../common/wmma_layout.h"
 #ifdef D4R_ACCURACY
 #define SWIN_EXACT
@@ -30,6 +54,18 @@
 // an f16 accumulator rounded after every k32 step)
 #if defined(SWIN_EXACT) && defined(SWIN_F32ACC)
 #undef SWIN_F32ACC
+#endif
+
+// gfx1101's validated fast-set tuning. Keep accuracy-set selection independent;
+// SWIN_BUFFER_BLOAD can still be requested explicitly for controlled comparisons.
+#if defined(SWIN_BUFFER_BLOAD_FAST) && !defined(SWIN_EXACT) && !defined(SWIN_BUFFER_BLOAD)
+#define SWIN_BUFFER_BLOAD
+#endif
+
+// Dense bank-swizzled MLP scratch on the measured gfx1101 fast tube path.
+// Exact/native-FP8 and other architecture selections retain their original LDS layout.
+#if defined(SWIN_DENSE_G_FAST) && defined(__GFX11__) && !defined(SWIN_EXACT) && !defined(D4R_FP8_WMMA)
+#define SWIN_DENSE_G
 #endif
 
 // SWIN_A8 (RDNA4 native FP8): the e4m3 GEMMs' activations live in LDS as e4m3 bytes, encoded once where they
@@ -97,7 +133,8 @@ __device__ __forceinline__ uint32_t half_to_e4m3(half_t h)
     return ((half >> 8) & 0x80u) | code;
 }
 
-// e4m3 RNE satfinite round trip evaluated in the f16 domain (exhaustively equal to decode(encode(h)))
+// e4m3 RNE satfinite round trip evaluated in the f16 domain for finite values
+// and infinities; NaNs retain their half payload instead of becoming a code.
 __device__ __forceinline__ half_t q8_exact(half_t h);
 __device__ __forceinline__ half_t q8(half_t h)
 {
@@ -136,6 +173,7 @@ __device__ __forceinline__ h4 decode4(uint32_t bytes)
 }
 
 // q8_exact on two halves with packed 16-bit integer / f16 ops (same per-half logic; no carries cross halves)
+template <uint16_t NAN_BITS = 0>
 __device__ __forceinline__ hv2 q8x2_exact(hv2 h)
 {
     const u16x2 u = __builtin_bit_cast(u16x2, h);
@@ -148,7 +186,10 @@ __device__ __forceinline__ hv2 q8x2_exact(hv2 h)
     const u16x2 lt = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)(m - (unsigned short)0x2400)) >> 15));
     r = (sub & lt) | (r & ~lt);
     const u16x2 gt = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
-    r = (m & gt) | (r & ~gt);
+    if constexpr (NAN_BITS != 0)
+        r = ((u16x2){NAN_BITS, NAN_BITS} & gt) | (r & ~gt);
+    else
+        r = (m & gt) | (r & ~gt);
     return __builtin_bit_cast(hv2, (u16x2)(r | (u & (unsigned short)0x8000)));
 }
 
@@ -337,6 +378,13 @@ typedef h16 sop;
 #endif
 typedef uint32_t u2v __attribute__((ext_vector_type(2)));
 typedef uint32_t u4v_t __attribute__((ext_vector_type(4)));
+#ifdef SWIN_PREP_CONTENT_CACHE
+#define SWIN_RAW_DECLARE(N) __device__ u4v_t g_prep_raw[N];
+#define SWIN_RAW_PTR(OFFSET) (g_prep_raw + (OFFSET))
+#else
+#define SWIN_RAW_DECLARE(N)
+#define SWIN_RAW_PTR(OFFSET) nullptr
+#endif
 #ifdef D4R_FP8_WMMA
 typedef u2v gop;
 typedef u4v_t wslot; // weight image slot: 16 e4m3 bytes (K slots 0..15)
@@ -348,7 +396,12 @@ typedef h16 wslot; // weight image slot: 16 f16 values
 __device__ __forceinline__ f8v wmma(sop a, sop b, f8v c)
 {
 #if D4R_WMMA_LAYOUT == 12
+#ifdef SWIN_GFX11_ROW
+    return wm_mma11(wm_shim_operand_zluda(__builtin_bit_cast(wm_op, a)),
+                    wm_shim_operand_zluda(__builtin_bit_cast(wm_op, b)), c);
+#else
     return wm_mma(__builtin_bit_cast(wm_op, a), __builtin_bit_cast(wm_op, b), c);
+#endif
 #else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #endif
@@ -465,10 +518,31 @@ struct T16
     __device__ void set(int i, half_t h) { f[i] = (float)h; }
 #else
     hv2 v[4];
+#ifdef SWIN_GFX11_TOKEN
+    // Keep chained accumulators in gfx11's physical (even/odd row) layout.
+    // Logical contiguous rows are needed only at norm/activation boundaries.
+    __device__ hv2 pair(int k) const {
+        const hv2 mine = {v[k / 2][k & 1], v[2 + k / 2][k & 1]};
+        const hv2 other = __builtin_bit_cast(hv2, wm_other_half(__builtin_bit_cast(uint32_t, mine)));
+        return m_half() ? (hv2){other[1], mine[1]} : (hv2){mine[0], other[0]};
+    }
+    __device__ void set_pair(int k, hv2 p) {
+        const hv2 other = __builtin_bit_cast(hv2, wm_other_half(__builtin_bit_cast(uint32_t, p)));
+        const half_t lo = m_half() ? other[1] : p[0];
+        const half_t hi = m_half() ? p[1] : other[0];
+        v[k / 2][k & 1] = lo;
+        v[2 + k / 2][k & 1] = hi;
+    }
+    __device__ half_t get(int i) const { return pair(i / 2)[i & 1]; }
+    __device__ void set(int i, half_t h) {
+        hv2 p = pair(i / 2); p[i & 1] = h; set_pair(i / 2, p);
+    }
+#else
     __device__ hv2 pair(int k) const { return v[k]; }
     __device__ void set_pair(int k, hv2 p) { v[k] = p; }
     __device__ half_t get(int i) const { return v[i / 2][i & 1]; }
     __device__ void set(int i, half_t h) { v[i / 2][i & 1] = h; }
+#endif
 #endif
 };
 
@@ -518,7 +592,31 @@ __device__ unsigned d4r_k32_bad[4 + 64 * 4];
 // f16 accumulate of one k32 step (NVIDIA m16n8k32 semantics: products summed, one rounding with C)
 __device__ __forceinline__ void k32(T16& acc, gop a0, gop b0, gop a1, gop b1)
 {
-#if defined(SWIN_F32ACC)
+#if defined(SWIN_GFX11_SCALED)
+    // Match the original ZLUDA texture k32 lowering: scaled FP16 operands,
+    // scaled f32 C, two k16 products, then a single half rounding.
+    f8v c;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) c[i] = (float)acc.get(i) * 0x1p-16f;
+    c = wmma8(a1, b1, wmma8(a0, b0, c));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc.set(i, (half_t)(c[i] * 0x1p16f));
+#elif defined(SWIN_GFX11_TOKEN)
+    // Stay in the physical gfx11 accumulator layout across both k16 products.
+    // The generic shim would exchange all eight accumulator registers twice
+    // between them. Norm/activation boundaries use T16::pair for logical rows.
+    f8v c;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        c[i] = (float)acc.v[i / 2][i & 1];
+    c = wm_mma11(wm_shim_operand(__builtin_bit_cast(wm_op, a0)),
+                 wm_shim_operand(__builtin_bit_cast(wm_op, b0)), c);
+    c = wm_mma11(wm_shim_operand(__builtin_bit_cast(wm_op, a1)),
+                 wm_shim_operand(__builtin_bit_cast(wm_op, b1)), c);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        acc.v[i / 2][i & 1] = (half_t)c[i];
+#elif defined(SWIN_F32ACC)
     acc.f = wmma8(a1, b1, wmma8(a0, b0, acc.f));
 #elif defined(K32_MIX)
     f8v P = wmma8(a0, b0, (f8v){0, 0, 0, 0, 0, 0, 0, 0});
@@ -642,7 +740,8 @@ __device__ __forceinline__ uint32_t input_word(const uint32_t* p)
 #endif
 }
 
-__device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, const GemmDesc* descs, int ndesc, int idx)
+__device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, const GemmDesc* descs, int ndesc, int idx,
+                                               u4v_t* raw = nullptr)
 {
     int d = 0;
     while (d + 1 < ndesc && idx >= descs[d + 1].dst)
@@ -654,7 +753,7 @@ __device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, con
     const int l16 = local & 15, rest = local >> 4;
     const int nt = rest % g.NT, s = (rest / g.NT) & 1, kc = rest / g.NT / 2;
     const int n = 16 * nt + l16;
-#ifdef D4R_FP8_WMMA
+#if defined(D4R_FP8_WMMA) || defined(SWIN_PREP_CONTENT_CACHE)
     u4v_t v;
 #pragma unroll
     for (int j = 0; j < 4; ++j)
@@ -665,13 +764,31 @@ __device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, con
             word |= (uint32_t)w[woff(g.base, g.Ks, g.Ns, 32 * kc + kslot(s, 4 * j + b), n)] << (8 * b);
         v[j] = word;
     }
+#ifdef SWIN_PREP_CONTENT_CACHE
+    // Exact content comparison, never pointer identity or a probabilistic hash.
+    // Zero-initialized raw and prepared globals also represent all-zero weights.
+    const u4v_t old = raw[idx];
+    if (old[0] == v[0] && old[1] == v[1] && old[2] == v[2] && old[3] == v[3])
+        return;
+    raw[idx] = v;
+#endif
+#ifndef D4R_FP8_WMMA
+    h16 decoded;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        decoded[i] = e4m3_to_half((v[i / 4] >> (8 * (i % 4))) & 255u);
+    w16[idx] = decoded;
+    return;
+#endif
 #else
     h16 v;
 #pragma unroll
     for (int i = 0; i < 16; ++i)
         v[i] = e4m3_to_half(w[woff(g.base, g.Ks, g.Ns, 32 * kc + kslot(s, i), n)]);
 #endif
+#if defined(D4R_FP8_WMMA) || !defined(SWIN_PREP_CONTENT_CACHE)
     w16[idx] = v;
+#endif
 }
 
 // ---------------------------------------------------------------- weight layout of a block

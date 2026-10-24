@@ -19,6 +19,12 @@ trap 'rm -rf "$B"' EXIT
 # D4R_TEX_CFLAGS: extra flags for SRC.hip (tests, e.g. -DD4R_WMMA_LAYOUT=12 for the gfx12-layout shim on gfx11)
 read -r -a FLAGS <<< "${D4R_TEX_CFLAGS:-}"
 [[ "$FP8" == 1 ]] && FLAGS+=(-DD4R_TEX_FP8)
+WAVES="${D4R_TEX_WAVES:-1}"
+[[ "$WAVES" == 1 || "$WAVES" == 4 ]] || { echo 'D4R_TEX_WAVES must be 1 or 4' >&2; exit 2; }
+if [[ "$WAVES" == 4 ]]; then
+    [[ "$SRC" == enc0l_tail || "$SRC" == dec0l_block ]] || { echo 'parallel windows require unfolded L kernels' >&2; exit 2; }
+    FLAGS+=(-DD4R_TEX_PARALLEL_WINDOWS)
+fi
 [[ "$ACCURACY" == 1 ]] && FLAGS+=(-DD4R_ACCURACY)
 # SRC.hip -> bitcode without target attributes, so ZLUDA's own target settings apply after linking
 "$LLVM/clang++" -x hip -std=c++20 -nogpuinc -nogpulib -O3 -mno-wavefrontsize64 --offload-device-only \
@@ -27,7 +33,7 @@ read -r -a FLAGS <<< "${D4R_TEX_CFLAGS:-}"
 "$LLVM/llvm-dis" "$B/raw.bc" -o "$B/raw.ll"
 sed -E -e '/@llvm.used/d' -e '/wchar_size/d' -e '/llvm.module.flags/d' -e '/__hip_cuid/d' -e 's/optnone//g' \
     -e "s/\"target-cpu\"=\"$ARCH\"//g" -e 's/"target-features"="[^"]+"//g' "$B/raw.ll" | "$LLVM/llvm-as" -o "$B/extra.bc" -
-D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_FP8="$FP8" D4R_TEX_SRC="$SRC" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
+D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_FP8="$FP8" D4R_TEX_SRC="$SRC" D4R_TEX_WAVES="$WAVES" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
 # the code-generation switches of the runtime (d4r.ini [Kernels]), which ZLUDA's module cache keys on
 env LD_LIBRARY_PATH="$R/lib" D4R_ZLUDA_EXTRA_BC="$B/extra.bc" D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 \
     D4R_ZLUDA_WMMA_FP8_NATIVE="$FP8" D4R_ZLUDA_IGNORE_DENORMAL="$((1 - ACCURACY))" \
