@@ -25,10 +25,10 @@ index 860640d5..fc91e283 100644
      uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
      object,
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index fd753830..3ba6b1b0 100644
+index 2ecdcab3..e8ea6e55 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
-@@ -4659,7 +4659,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
+@@ -3753,7 +3753,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice2)
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3)
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDeviceD4R)
@@ -38,7 +38,7 @@ index fd753830..3ba6b1b0 100644
      {
          d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
          *object = &device->ID3D12DXVKInteropDevice_iface;
-@@ -11381,7 +11382,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
+@@ -10466,7 +10467,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
  }
  
  extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
@@ -48,7 +48,7 @@ index fd753830..3ba6b1b0 100644
  extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
  
 diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
-index fc5290da..f18e3c1a 100644
+index 74f6706f..4dcfa6ad 100644
 --- a/libs/vkd3d/device_vkd3d_ext.c
 +++ b/libs/vkd3d/device_vkd3d_ext.c
 @@ -1145,6 +1145,35 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanHeapInfo(d3d
@@ -105,12 +105,12 @@ index fc5290da..f18e3c1a 100644
 +    d3d12_dxvk_interop_device_GetVulkanLinearImageInfo,
  };
  
- static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)
+ void d3d12_device_notify_vk_swapchain_creation(struct d3d12_device *device, struct dxgi_vk_swap_chain *chain)
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-index e521ec69..0683c75e 100644
+index a8fc26b1..a7684464 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
-@@ -701,6 +701,28 @@ static bool d3d12_device_supports_universal_color_ds_copy(struct d3d12_device *d
+@@ -716,6 +716,28 @@ static bool d3d12_device_supports_universal_color_ds_copy(struct d3d12_device *d
      return true;
  }
  
@@ -139,7 +139,7 @@ index e521ec69..0683c75e 100644
  static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
          const D3D12_HEAP_PROPERTIES *heap_properties,
          const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
-@@ -749,6 +771,14 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+@@ -764,6 +786,14 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
          external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
          vk_prepend_struct(image_info, external_info);
      }
@@ -154,7 +154,7 @@ index e521ec69..0683c75e 100644
  
      disable_compression = false;
  
-@@ -905,6 +935,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+@@ -920,6 +950,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
      image_info->mipLevels = min(desc->MipLevels, max_miplevel_count(desc));
      image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
      image_info->tiling = format->vk_image_tiling;
@@ -163,7 +163,7 @@ index e521ec69..0683c75e 100644
      image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
  
      if (resource && (resource->flags & VKD3D_RESOURCE_COMMITTED) &&
-@@ -4430,6 +4462,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4483,6 +4515,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
  #endif
          }
  
@@ -180,10 +180,10 @@ index e521ec69..0683c75e 100644
          if (dedicated_requirements.prefersDedicatedAllocation)
          {
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index b2f66434..c60ffe00 100644
+index dc42e358..62ec2025 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -1081,7 +1081,8 @@ enum vkd3d_resource_flag
+@@ -1096,7 +1096,8 @@ enum vkd3d_resource_flag
      VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
      VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
      VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
@@ -193,7 +193,7 @@ index b2f66434..c60ffe00 100644
  };
  
  #define VKD3D_INVALID_TILE_INDEX (~0u)
-@@ -5480,7 +5481,7 @@ HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *li
+@@ -5559,7 +5560,7 @@ HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *li
  
  HRESULT d3d12_command_list_retain_external_resources(struct d3d12_command_list *list, IUnknown *resources);
  

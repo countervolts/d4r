@@ -1,8 +1,8 @@
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 3ba6b1b0..d2a421d7 100644
+index e8ea6e55..008f635b 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
-@@ -111,6 +111,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+@@ -115,6 +115,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
      VK_EXTENSION(EXT_DEVICE_GENERATED_COMMANDS, EXT_device_generated_commands),
      VK_EXTENSION(EXT_IMAGE_VIEW_MIN_LOD, EXT_image_view_min_lod),
      VK_EXTENSION(EXT_ROBUSTNESS_2, EXT_robustness2),
@@ -10,7 +10,7 @@ index 3ba6b1b0..d2a421d7 100644
      VK_EXTENSION(EXT_SHADER_STENCIL_EXPORT, EXT_shader_stencil_export),
      VK_EXTENSION(EXT_TRANSFORM_FEEDBACK, EXT_transform_feedback),
      VK_EXTENSION(EXT_VERTEX_ATTRIBUTE_DIVISOR, EXT_vertex_attribute_divisor),
-@@ -2142,6 +2143,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+@@ -1298,6 +1299,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
          vk_prepend_struct(&info->properties2, &info->robustness2_properties);
      }
  
@@ -24,10 +24,10 @@ index 3ba6b1b0..d2a421d7 100644
      {
          info->xfb_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index c60ffe00..dd5d4643 100644
+index 62ec2025..88702df0 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -168,6 +168,7 @@ struct vkd3d_vulkan_info
+@@ -172,6 +172,7 @@ struct vkd3d_vulkan_info
      bool EXT_device_generated_commands;
      bool EXT_image_view_min_lod;
      bool EXT_robustness2;
@@ -35,7 +35,7 @@ index c60ffe00..dd5d4643 100644
      bool EXT_shader_stencil_export;
      bool EXT_transform_feedback;
      bool EXT_vertex_attribute_divisor;
-@@ -5292,6 +5293,7 @@ struct vkd3d_physical_device_info
+@@ -5355,6 +5356,7 @@ struct vkd3d_physical_device_info
      VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vertex_divisor_features;
      VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color_features;
      VkPhysicalDeviceRobustness2FeaturesEXT robustness2_features;
