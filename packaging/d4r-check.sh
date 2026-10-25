@@ -135,12 +135,19 @@ fi
 
 # Optional features are only requirements when selected. Their absence must not
 # make an ordinary SR/RR installation fail this checker.
+use_fake=$(ini_value fakenvapi usefakenvapi 2>/dev/null | tr '[:upper:]' '[:lower:]')
 fg_enabled=$(ini_value framegen enabled 2>/dev/null | tr '[:upper:]' '[:lower:]')
 fg_output=$(ini_value framegen fgoutput 2>/dev/null | tr '[:upper:]' '[:lower:]')
 fg_input=$(ini_value framegen fginput 2>/dev/null | tr '[:upper:]' '[:lower:]')
 feature_file() {
   feature_path=$(ini_value libraries "$1" 2>/dev/null) || feature_path=auto
-  case "$feature_path" in auto|'') feature_path="$D4R/$2" ;;
+  case "$feature_path" in auto|'')
+    if [ -n "$use_fake" ]; then
+      feature_base=$(ini_value libraries optidllpath 2>/dev/null) || feature_base=auto
+      case "$feature_base" in auto|'') feature_base="$GAME/OptiScaler" ;;
+        *) feature_base=$(wine_file "$feature_base") || feature_base= ;; esac
+      feature_path="$feature_base/$2"
+    else feature_path="$D4R/$2"; fi ;;
     *) feature_path=$(wine_file "$feature_path") || feature_path= ;; esac
   [ ! -d "$feature_path" ] || feature_path="$feature_path/$2"
   [ -f "$feature_path" ] && ok "$2 (optional feature)" || bad "$2 (selected optional feature; check its library override)"
@@ -150,10 +157,15 @@ if [ "$fg_enabled" = true ]; then
   case "$fg_output" in
     xefg) feature_file xefgpath libxess_fg.dll; feature_file xellpath libxell.dll
           note 'XeFG requires borderless SDR/HDR10, Reflex markers and FG activation after restart' ;;
-    fsrfg) feature_file ffxdx12fgpath amd_fidelityfx_framegeneration_dx12.dll ;;
+    fsrfg) feature_file ffxdx12fgpath amd_fidelityfx_framegeneration_dx12.dll
+           if [ -n "$use_fake" ]; then feature_file ffxdx12path amd_fidelityfx_loader_dx12.dll; fi ;;
     ''|auto|nofg) misconfigured 'FG is enabled but no FGOutput is selected' ;;
     *) note "custom FG output: $fg_output (not checked)" ;;
   esac
+fi
+if [ -n "$use_fake" ]; then
+  [ "$use_fake" = false ] || misconfigured 'd4r requires fakenvapi.UseFakenvapi=false with OptiScaler v10 to retain Proton GPU topology'
+  note 'OptiScaler v10 uses integrated latency hooks on Proton NVAPI; no external fakenvapi.dll is required'
 fi
 nvapi_path=$(ini_value libraries nvapipath 2>/dev/null | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
 nvapi_override=$(ini_value nvapi overridenvapidll 2>/dev/null | tr '[:upper:]' '[:lower:]')

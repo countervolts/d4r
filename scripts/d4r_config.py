@@ -220,6 +220,11 @@ def main(argv):
         fail("[Engine] Network must be auto, hip or vulkan")
     if network in ("hip", "vulkan"):
         env["D4R_ENGINE_NETWORK"] = network
+    vkhip = flag("Engine", "ExperimentalVkHip")
+    if vkhip is not None:
+        env["D4R_ENGINE_VKHIP"] = "1" if vkhip else "0"
+        if vkhip:
+            env["D4R_ENGINE_K"] = "1"
 
     engine = path_value("Game", "EngineIni")
     cvars = get("Game", "Cvars")

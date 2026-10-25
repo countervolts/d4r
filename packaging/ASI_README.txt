@@ -1,8 +1,15 @@
 d4r ASI add-on for Linux / Proton
 ================================
 
+Change settings in the Insert overlay and use Save INI normally. Setup preserves
+the existing upscaler and spoofing preferences, and does not reset your saved
+settings on later launches or runtime updates. If you move the plugin folder,
+setup refreshes only paths still pointing at its previous location.
+
 Optional FG/latency: d4r/d4r-features.py configures OptiScaler with an exact INI
-backup. Pass the game folder and --runtime /path/to/plugins/d4r. Copy the matching
+backup. With v10, keep its complete OptiScaler/ dependency folder and use the
+integrated latency provider; no separate fakenvapi.dll/router is needed.
+For 0.9, pass the game folder and --runtime /path/to/plugins/d4r. Copy the matching
 OptiScaler release's fakenvapi.dll, libxell.dll, libxess_fg.dll and (for FSR FG)
 amd_fidelityfx_framegeneration_dx12.dll into that d4r folder, retaining licenses.
 Example: python3 plugins/d4r/d4r-features.py . --runtime plugins/d4r --fg xefg --input dlssg
@@ -20,7 +27,7 @@ Disable: --fg off --latency proton. Setup preserves these choices.
    the bundled D3D12 wrapper and private core and updates OptiScaler's settings after the game exits,
    with backups. Wait for the ready message, then launch the game again.
 
-Requires OptiScaler 0.9.4 through a game-local proxy (dxgi.dll, winmm.dll, etc.)
+Requires OptiScaler 0.9.4 or v10 through a game-local proxy (dxgi.dll, winmm.dll, etc.)
 or GE-Proton's built-in loader, with [Plugins] LoadAsiPlugins=true already enabled. A plugin cannot enable
 its own loader before it has been loaded. OptiScaler's nvngx.dll mode does not
 load ASIs. OptiScaler installed as d3d12.dll conflicts with the patched D3D12 pair;

@@ -6,9 +6,13 @@
 #include "game.h"
 #include "game_m.h"
 #include <cmath>
+#ifdef D4R_TEST_BUILD_VKHIP
+#include "vkhip/vkhip_net.h"
+#endif
 
 namespace {
 bool stageTimingEnabled = false;
+std::string vkhipModelDirectory;
 unsigned stageTimingRows = 0;
 void stageTimingLog(const char* line) { std::cout << line << '\n'; ++stageTimingRows; }
 constexpr unsigned rotatingMasks[] = {15u, 14u, 13u, 11u, 15u, 8u};
@@ -45,6 +49,24 @@ struct TestImage {
         if (memory) vkFreeMemory(context.device, memory, nullptr);
     }
     void put(uint32_t x, uint32_t y, uint32_t channel, float value) {
+        if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+            if (channel >= 3) return;
+            auto& word=static_cast<uint32_t*>(upload.map)[size_t(y)*w+x];
+            const uint32_t shift=channel==0 ? 0 : channel==1 ? 11 : 22;
+            const uint32_t width=channel==2 ? 10 : 11;
+            uint16_t half;_Float16 v=static_cast<_Float16>(std::max(0.f,value));std::memcpy(&half,&v,2);
+            const uint32_t mask=(1u<<width)-1;
+            word=(word & ~(mask<<shift)) | ((uint32_t(half) >> (15-width) & mask)<<shift);
+            return;
+        }
+        if (format == VK_FORMAT_D16_UNORM) {
+            static_cast<uint16_t*>(upload.map)[size_t(y)*w+x]=uint16_t(std::lround(std::clamp(value,0.f,1.f)*65535.f));
+            return;
+        }
+        if (format == VK_FORMAT_D24_UNORM_S8_UINT) {
+            static_cast<uint32_t*>(upload.map)[size_t(y)*w+x]=uint32_t(std::lround(std::clamp(value,0.f,1.f)*16777215.f));
+            return;
+        }
         const size_t i = (size_t(y)*w+x)*channels+channel;
         if (bits == 32) static_cast<float*>(upload.map)[i] = value;
         else static_cast<_Float16*>(upload.map)[i] = static_cast<_Float16>(value);
@@ -78,11 +100,25 @@ struct Case {
     bool dynamicM = false, largerCapacityM = false, explicitSizeResetM = false;
     bool displayMotion = false;                   // K: motion vectors at output resolution, in output pixels
     bool gameExposure = false; float exposureValue = 1; // K: the game's 1x1 exposure texture instead of measurement
+    bool packedColor = false;
+    bool packedFloatOutput = false;
+    VkFormat packedDepth = VK_FORMAT_UNDEFINED;
 };
 void validateFrames(const Buffer& results, VkDeviceSize stride, const std::array<std::unique_ptr<TestImage>, 3>& output, unsigned count) {
     for (unsigned frame = 0; frame < count; ++frame) {
         const auto& image = *output[frame % output.size()];
         if (image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) continue;
+        if (image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+            const auto* words=reinterpret_cast<const uint32_t*>(static_cast<const char*>(results.map)+frame*stride);
+            bool nonzero=false;
+            for(uint32_t y=7;y<image.h;++y) for(uint32_t x=5;x<image.w;++x) {
+                uint32_t word=words[size_t(y)*image.w+x];nonzero|=word!=0;
+                if (((word>>6)&31)==31 || ((word>>17)&31)==31 || ((word>>27)&31)==31)
+                    throw std::runtime_error("nonfinite R11G11B10 output");
+            }
+            if(!nonzero)throw std::runtime_error("empty R11G11B10 output");
+            continue;
+        }
         const auto* data = static_cast<const char*>(results.map) + frame * stride;
         for (VkDeviceSize i = 0; i < image.upload.size / (image.bits / 8); ++i)
             if (!std::isfinite(image.bits == 32 ? reinterpret_cast<const float*>(data)[i] : float(reinterpret_cast<const _Float16*>(data)[i])))
@@ -90,20 +126,25 @@ void validateFrames(const Buffer& results, VkDeviceSize stride, const std::array
     }
 }
 std::vector<char> evaluate(Context& c, d4r::Model& model, const Case& test, unsigned mask,
-                           bool queued, bool bareEngine = false, bool rotateInputs = false) {
-    constexpr uint32_t rw = 640, rh = 360, count = 6, slots = 3;
+                           bool queued, bool bareEngine = false, bool rotateInputs = false, unsigned count = 6) {
+    constexpr uint32_t rw = 640, rh = 360, slots = 3;
     std::array<std::unique_ptr<TestImage>, slots> color, motion, depth, output;
     TestImage exposureTexture(c, VK_FORMAT_R32_SFLOAT, 1, 1, 1, 32);
     exposureTexture.put(0,0,0,test.exposureValue);
     const auto inputLayout = test.readonly ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
     for (unsigned slot = 0; slot < slots; ++slot) {
-        color[slot] = std::make_unique<TestImage>(c, test.wideColor ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT, rw+16,rh+16,4,test.wideColor ? 32 : 16);
+        color[slot] = std::make_unique<TestImage>(c, test.packedColor ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 :
+            test.wideColor ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT,
+            rw+16,rh+16,test.packedColor ? 1 : 4,test.packedColor || test.wideColor ? 32 : 16);
         const uint32_t mw = test.displayMotion ? test.ow+16 : rw+16, mh = test.displayMotion ? test.oh+16 : rh+16;
         motion[slot] = std::make_unique<TestImage>(c, test.wideMotion ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R16G16_SFLOAT, mw,mh,2,test.wideMotion ? 32 : 16);
-        depth[slot] = std::make_unique<TestImage>(c, test.depthAspect ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R32_SFLOAT, rw+16,rh+16,1,32,
+        depth[slot] = std::make_unique<TestImage>(c, test.packedDepth != VK_FORMAT_UNDEFINED ? test.packedDepth :
+            test.depthAspect ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R32_SFLOAT, rw+16,rh+16,1,
+                                                test.packedDepth==VK_FORMAT_D16_UNORM ? 16 : 32,
                                                 test.depthAspect ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
-        const bool packed = test.rgb10Output && (!test.rotateOutputFormats || slot != 1);
-        output[slot] = std::make_unique<TestImage>(c, packed ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 :
+        const bool packed = test.packedFloatOutput || (test.rgb10Output && (!test.rotateOutputFormats || slot != 1));
+        output[slot] = std::make_unique<TestImage>(c, test.packedFloatOutput ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 :
+            packed ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 :
             test.wideOutput ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT,
             test.ow+16,test.oh+16,packed ? 1 : 4,packed || test.wideOutput ? 32 : 16);
         for (uint32_t y = 0; y < rh+16; ++y) for (uint32_t x = 0; x < rw+16; ++x) {
@@ -121,10 +162,27 @@ std::vector<char> evaluate(Context& c, d4r::Model& model, const Case& test, unsi
         std::memset(output[slot]->upload.map,0,output[slot]->upload.size);
     }
     // The borrowed views above outlive both the adapter/engine and their immutable descriptor cache.
-    d4r::GameUpscaler adapter(model,c.physical,c.device,test.ow,test.oh,rw,rh);
+    d4r::ExternalNetwork external{};
+#ifdef D4R_TEST_BUILD_VKHIP
+    std::unique_ptr<vkhip::KNetwork> native;
+    if (std::getenv("D4R_TEST_VKHIP")) {
+        vkhip::NetFiles files;
+        auto bytes=read(vkhipModelDirectory+"/hipnet.bin");files.hipnet.assign(bytes.begin(),bytes.end());
+        for (const char* layer : {"enc0","enc1","enc2","enc3","enc4","dec5","dec4","dec3","dec2","dec1","dec0"}) {
+            std::string name=std::string("dltss_pwin_")+layer+"_layer";
+            bytes=read(vkhipModelDirectory+"/hip/"+name+".hsaco");files.code[name].assign(bytes.begin(),bytes.end());
+        }
+        native=std::make_unique<vkhip::KNetwork>();std::string error;
+        if(!native->create(c.device,vkGetDeviceProcAddr,c.memory,files,test.ow,test.oh,
+             d4r::Engine::networkTokenBytes(test.ow,test.oh),d4r::Engine::networkHeadBytes(test.ow,test.oh),error))
+            throw std::runtime_error(error);
+        external={native->tokens(),native->head()};
+    }
+#endif
+    d4r::GameUpscaler adapter(model,c.physical,c.device,test.ow,test.oh,rw,rh,external.tokens ? &external : nullptr);
     auto shape = d4r::makeKShape(test.ow,test.oh);
     std::unique_ptr<d4r::Engine> engine;
-    if (bareEngine) engine = std::make_unique<d4r::Engine>(model,shape);
+    if (bareEngine) engine = std::make_unique<d4r::Engine>(model,shape,external.tokens ? &external : nullptr);
     const auto bytes = std::max({output[0]->upload.size, output[1]->upload.size, output[2]->upload.size});
     Buffer results(c,bytes*count);
     std::memset(results.map,0,results.size);
@@ -140,7 +198,7 @@ std::vector<char> evaluate(Context& c, d4r::Model& model, const Case& test, unsi
     for (unsigned frame = 0; frame < count; ++frame) {
         unsigned slot = frame%slots;
         if (!queued) c.begin();
-        const unsigned frameMask = rotateInputs ? rotatingMasks[frame] : mask;
+        const unsigned frameMask = rotateInputs ? rotatingMasks[frame % std::size(rotatingMasks)] : mask;
         d4r::GameFrame f;
         if (stageTimingEnabled) f.profile = {stageTimingLog, "test", frame + 1, true};
         f.color = color[slot]->game(7,9,frameMask&1,inputLayout);
@@ -168,8 +226,18 @@ std::vector<char> evaluate(Context& c, d4r::Model& model, const Case& test, unsi
             exposure.game=test.gameExposure;
             auto windows=d4r::makeKWindows(shape,frame);
             engine->setFrame({f.color.view,f.motion.view,f.depth.view,inputLayout,inputLayout,inputLayout,f.exposure.view,inputLayout},p.input,p.output,&windows,&exposure,{f.output.view,f.output.format});
+#ifdef D4R_TEST_BUILD_VKHIP
+            if (native) {engine->recordFront(c.command);native->record(c.command,f.settings.reset);engine->recordBack(c.command);}
+            else
+#endif
             engine->recordFrame(c.command);
-        } else adapter.record(c.command,f);
+        } else {
+#ifdef D4R_TEST_BUILD_VKHIP
+            if (native) {adapter.recordFront(c.command,f);native->record(c.command,f.settings.reset);adapter.recordBack(c.command,f);}
+            else
+#endif
+            adapter.record(c.command,f);
+        }
         auto r=region(output[slot]->w,output[slot]->h);r.bufferOffset=frame*bytes;
         vkCmdCopyImageToBuffer(c.command,output[slot]->image,VK_IMAGE_LAYOUT_GENERAL,results.handle,1,&r);
         if (!queued) {
@@ -222,7 +290,7 @@ std::vector<char> evaluateM(Context& c, d4r::MModel& model, const Case& test, un
         if (!queued) c.begin();
         d4r::GameFrameM f;
         if (stageTimingEnabled) f.profile = {stageTimingLog, "test", frame + 1, true};
-        const unsigned frameMask = rotateInputs ? rotatingMasks[frame] : mask;
+        const unsigned frameMask = rotateInputs ? rotatingMasks[frame % std::size(rotatingMasks)] : mask;
         f.color=color[slot]->game(0,0,frameMask&1,layout); f.motion=motion[slot]->game(0,0,frameMask&2,layout);
         f.depth=depth[slot]->game(0,0,frameMask&4,layout); f.output=output[slot]->game(0,0,frameMask&8,VK_IMAGE_LAYOUT_GENERAL);
         if (test.dynamicM) {
@@ -249,7 +317,7 @@ std::vector<char> evaluateM(Context& c, d4r::MModel& model, const Case& test, un
 }
 void expectEqual(const std::vector<char>& expected,const std::vector<char>& actual,const std::string& name) {
     if(expected!=actual) throw std::runtime_error(name+": output mismatch");
-    std::cout<<name<<": byte-identical (six temporal frames)\n";
+    std::cout<<name<<": byte-identical (full temporal sequence)\n";
 }
 } // namespace
 // Normalized bilinear sampling can round differently when the allocation extent changes.
@@ -284,6 +352,7 @@ void checkDynamicM(Context& c, d4r::MModel& m) {
 }
 int main(int argc,char** argv) {
     try {
+        if(argc >= 2) vkhipModelDirectory=argv[1];
         // Six temporal frames per model: read five completed profiles without waiting in the profiler,
         // and compare the entire output sequence against the same adapter with instrumentation disabled.
         if (argc == 5 && !std::strcmp(argv[1], "--profile")) {
@@ -326,6 +395,19 @@ int main(int argc,char** argv) {
         Context c;c.create(2,argc==3);d4r::Model model(c.physical,c.device,argv[1],c.cache);
         if (!model.hasDirectOrigins()) throw std::runtime_error("recompile the model with compile_k.py before testing direct rectangles");
         c.begin();model.recordUpload(c.command);c.submit();
+        if (std::getenv("D4R_TEST_VKHIP_FORMATS_ONLY")) {
+            for(bool regular : {false,true}) for(VkFormat depth :
+                {VK_FORMAT_UNDEFINED,VK_FORMAT_D16_UNORM,VK_FORMAT_D24_UNORM_S8_UINT}) {
+                Case packed;packed.packedColor=packed.packedFloatOutput=true;
+                packed.regularDepth=regular;packed.packedDepth=depth;packed.depthAspect=depth!=VK_FORMAT_UNDEFINED;
+                packed.wideMotion=true;packed.readonly=true;
+                auto reference=evaluate(c,model,packed,15,false,false,false,16);
+                expectEqual(reference,evaluate(c,model,packed,15,true,false,false,16),
+                            "R11 colour/output, RG32 motion, packed/regular depth, rotating descriptors, 16 frames");
+            }
+            std::cout<<"All vkhip packed-format checks passed\n";
+            return 0;
+        }
         for(bool depthAspect:{false,true}) {
             Case test;test.depthAspect=depthAspect;
             auto reference=evaluate(c,model,test,0,false);
@@ -395,6 +477,19 @@ int main(int argc,char** argv) {
             expectEqual(reference,evaluate(c,model,display,15,false,true),"display-resolution motion matches the Engine");
             Case wide;wide.displayMotion=true;wide.wideColor=true;wide.wideMotion=true;wide.readonly=true;
             expectEqual(evaluate(c,model,wide,15,false,true),evaluate(c,model,wide,15,true),"display-resolution motion RGBA32F/RG32F match unquantized Engine");
+        }
+        for (bool regular : {false,true}) {
+            Case packed;packed.regularDepth=regular;packed.packedColor=true;
+            expectEqual(evaluate(c,model,packed,0,false),evaluate(c,model,packed,15,true),
+                        "R11G11B10 colour, direct and converted, regular/inverted depth");
+            packed.packedFloatOutput=true;
+            expectEqual(evaluate(c,model,packed,15,false),evaluate(c,model,packed,15,true),
+                        "R11G11B10 colour/output, regular/inverted depth");
+            for(VkFormat depth : {VK_FORMAT_D16_UNORM,VK_FORMAT_D24_UNORM_S8_UINT}) {
+                packed.depthAspect=true;packed.packedDepth=depth;
+                expectEqual(evaluate(c,model,packed,15,false),evaluate(c,model,packed,15,true),
+                            "packed D16/D24 depth, queued descriptors, regular/inverted depth");
+            }
         }
         if (argc==3) {
             d4r::MModel m(c.physical,c.device,argv[2],c.cache);

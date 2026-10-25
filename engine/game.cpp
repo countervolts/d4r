@@ -4,13 +4,19 @@
 
 namespace d4r {
 namespace {
-bool depthAspect(VkFormat format) { return format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+bool depthAspect(VkFormat format) {
+    return format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+           format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_D16_UNORM_S8_UINT ||
+           format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_X8_D24_UNORM_PACK32;
+}
 } // namespace
 
 bool gameColorFormat(VkFormat format) {
     switch (format) {
     case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R8G8B8A8_SNORM:
     case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:   // R9G9B9E5_SHAREDEXP (RE Requiem's colour and output): sampled and blitted
         return true;
     default: return false;
@@ -23,7 +29,7 @@ bool gameMotionFormat(VkFormat format) {
 }
 bool gameDepthFormat(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) return depthAspect(format);
-    return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16_UNORM;
+    return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16_UNORM;
 }
 bool gameOutputFormat(VkFormat format) { return gameColorFormat(format); }
 
@@ -65,6 +71,11 @@ void GameUpscaler::Impl::inputs(VkCommandBuffer cb, const GameFrame& frame) {
     const bool directColor = frame.color.view != VK_NULL_HANDLE;
     const bool directMotion = frame.motion.view != VK_NULL_HANDLE;
     const bool directDepth = frame.depth.view != VK_NULL_HANDLE;
+    // D16/D24 must be sampled as normalized depth. The legacy D32 fallback
+    // copies raw depth bits into R32F and cannot reinterpret packed UNORM.
+    if (!directDepth && (frame.depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+        frame.depth.format != VK_FORMAT_D32_SFLOAT && frame.depth.format != VK_FORMAT_D32_SFLOAT_S8_UINT)
+        throw std::runtime_error("packed depth requires a sampleable depth view");
     const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasRgb10Output());
     auto origin = [&](const GameImage& image, bool direct, int32_t* inOrigin, int32_t* outOrigin, int32_t* outMax) {
         if (!direct) return;

@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x_id=0, local_size_y_id=1, local_size_z_id=2) in;
+layout(constant_id=3) const uint LDS_WORDS=1;
+layout(constant_id=4) const uint PIPELINE_ID=0;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint words[]; };
+layout(push_constant) uniform Push { Words args; } pc;
+shared uint scratch[LDS_WORDS];
+void main() {
+    uint tid=gl_LocalInvocationIndex;
+    uint i=gl_WorkGroupID.x + gl_WorkGroupID.y + gl_WorkGroupID.z + tid;
+    scratch[tid % LDS_WORDS]=pc.args.words[i] + PIPELINE_ID;
+    barrier();
+    pc.args.words[i]=scratch[(tid+1) % LDS_WORDS];
+}

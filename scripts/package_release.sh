@@ -6,7 +6,8 @@
 # usage: scripts/package_release.sh [OUT_DIR]          (default: dist/)
 #
 # Inputs (environment):
-#   D4R_OPTISCALER   OptiScaler release archive (.7z or .zip) or extracted folder (required; 0.9.4 tested)
+#   D4R_OPTISCALER   OptiScaler v10 archive (.7z/.zip) or extracted folder;
+#                    default: checksum-pinned packaging/optiscaler-release.json
 #   D4R_INSTALL_MODE proxy (default), or asi: add-on for an existing OptiScaler install
 #   D4R_DLSS_DLLS    colon-separated nvngx_dlss.dll files whose kernel code the native kernels accept
 #                    (required; only hashes of their PTX go into the release)
@@ -68,7 +69,7 @@ ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
 ARCHS="${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
 if [[ "$INSTALL_MODE" == proxy ]]; then
-  : "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
+  D4R_OPTISCALER="${D4R_OPTISCALER:-$(python3 "$ROOT/scripts/fetch_optiscaler.py")}"
 fi
 : "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
 for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
@@ -102,25 +103,7 @@ else
     *) echo "D4R_OPTISCALER must be a .7z, a .zip or a folder" >&2; exit 2 ;;
   esac
 fi
-cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
-python3 "$ROOT/scripts/configure_optiscaler.py" \
-  "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini"
-# AMD's FidelityFX loader and upscaler (MIT) from the OptiScaler release, beside OptiScaler: its "FSR 3.X/4"
-# upscaler. FSR 4 on RDNA3/RDNA4 comes from Proton's amdxcffx64.dll; the shim gives OptiScaler and these
-# modules the real GPU identity (tools/d4r_fsr4_identity.h).
-for ffx in amd_fidelityfx_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
-  [[ -f "$OPTI/$ffx" ]] || { echo "the OptiScaler release has no $ffx" >&2; exit 2; }
-  cp "$OPTI/$ffx" "$STAGE/$ffx"
-done
-cp "$OPTI/Licenses/FidelityFX_v2_LICENSE.md" "$STAGE/d4r/licenses/FidelityFX-LICENSE.txt"
-# Optional FG/latency implementations from the same OptiScaler release. Keep
-# them private until d4r-features.py sets explicit per-library overrides.
-for feature in fakenvapi.dll libxell.dll libxess_fg.dll amd_fidelityfx_framegeneration_dx12.dll; do
-  [[ -f "$OPTI/$feature" ]] || { echo "the OptiScaler release has no $feature (FG/latency support)" >&2; exit 2; }
-  cp "$OPTI/$feature" "$STAGE/d4r/$feature"
-done
-cp "$OPTI/Licenses/XeSS_LICENSE.txt" "$STAGE/d4r/licenses/XeSS-LICENSE.txt"
-[[ ! -f "$OPTI/fakenvapi.ini" ]] || cp "$OPTI/fakenvapi.ini" "$STAGE/d4r/fakenvapi.ini"
+python3 "$ROOT/scripts/stage_optiscaler.py" "$OPTI" "$STAGE"
 else
   cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
   # Same NGX exports and implementation, delivered through the ASI loader.
@@ -146,7 +129,10 @@ cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
 cp "$ROOT/packaging/d4r-features.py" "$STAGE/d4r/d4r-features.py"
-cp "$ROOT/build/d4r_nvapi64.dll" "$STAGE/d4r/d4r_nvapi64.dll"
+# Legacy ASI installs may still use OptiScaler 0.9's external latency router.
+if [[ "$INSTALL_MODE" == asi ]]; then
+  cp "$ROOT/build/d4r_nvapi64.dll" "$STAGE/d4r/d4r_nvapi64.dll"
+fi
 # AMD FSR Ray Regeneration 1.2 for [RayReconstruction] Backend = fsr: AMD's unmodified denoiser DLL (MIT)
 if [[ -n "${D4R_BUNDLE_FSR_RR_DLL:-}" ]]; then
   cp "$D4R_BUNDLE_FSR_RR_DLL" "$STAGE/d4r/amd_fidelityfx_denoiser_dx12.dll"

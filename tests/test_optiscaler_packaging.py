@@ -49,11 +49,12 @@ class OptiScalerConfigTests(unittest.TestCase):
         ini = configparser.ConfigParser()
         ini.read_string(data.decode())
         self.assertEqual(ini['Libraries']['NvngxPath'], r'd4r\nvngx.dll')
-        self.assertEqual(ini['Libraries']['OptiDllPath'], 'd4r')
+        self.assertEqual(ini['Libraries']['OptiDllPath'], 'OptiScaler')
         self.assertEqual(ini['Upscalers']['Dx12Upscaler'], 'dlss')
         self.assertEqual(ini['DLSS']['Enabled'], 'true')
         self.assertEqual(ini['Hooks']['HookOriginalNvngxOnly'], 'true')
         self.assertEqual(ini['Menu']['ShowFps'], 'true')
+        self.assertEqual(ini['fakenvapi']['UseFakenvapi'], 'false')
 
     def test_generated_config_and_line_endings(self):
         for newline in ('\n', '\r\n'):
@@ -90,7 +91,7 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs = Path(temporary) / 'inputs'
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
-            for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh',
+            for name in ('package_release.sh', 'configure_optiscaler.py', 'stage_optiscaler.py', 'check_glibc_compat.sh',
                          'check_redistributable.py', 'private_d3d12_core.py', 'stage_engine_kit.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
@@ -139,9 +140,12 @@ class OptiScalerConfigTests(unittest.TestCase):
             for name in ('d3d12.dll', 'd3d12core.dll'):
                 fixture(inputs / 'vkd3d' / name, b'MZ fixture d3d12core.dll\0 then d3d12core.dll\0' if name == 'd3d12.dll' else b'fixture')
             fixture(inputs / 'opti/OptiScaler.dll')
-            for name in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'Licenses/FidelityFX_v2_LICENSE.md',
-                         'fakenvapi.dll', 'libxell.dll', 'libxess_fg.dll',
-                         'amd_fidelityfx_framegeneration_dx12.dll', 'Licenses/XeSS_LICENSE.txt'):
+            for name in ('OptiScaler/amd_fidelityfx_loader_dx12.dll', 'OptiScaler/amd_fidelityfx_upscaler_dx12.dll',
+                         'Licenses/FidelityFX_v2_LICENSE.md', 'Licenses/XeSS_LICENSE.txt',
+                         'OptiScaler/libxell.dll', 'OptiScaler/libxess_fg.dll', 'OptiScaler/libxess.dll',
+                         'OptiScaler/dlssg_to_fsr3_amd_is_better.dll',
+                         'OptiScaler/D3D12_OptiScaler/D3D12Core.dll',
+                         'OptiScaler/amd_fidelityfx_framegeneration_dx12.dll'):
                 fixture(inputs / 'opti' / name)
             fixture(inputs / 'opti/OptiScaler.ini', upstream_ini().replace('\n', '\r\n').encode())
             dlss = fixture(inputs / 'nvngx_dlss.dll')
@@ -199,15 +203,19 @@ class OptiScalerConfigTests(unittest.TestCase):
                             cfg = configparser.ConfigParser()
                             cfg.read_string(data.decode())
                             self.assertEqual(cfg['FrameGen']['Enabled'], 'false')
-                            self.assertEqual(cfg['NvApi']['OverrideNvapiDll'], 'false')
-                            for dependency in ('fakenvapi.dll', 'libxell.dll', 'libxess_fg.dll',
-                                               'amd_fidelityfx_framegeneration_dx12.dll', 'd4r_nvapi64.dll',
-                                               'd4r-features.py', 'licenses/XeSS-LICENSE.txt'):
+                            self.assertEqual(cfg['fakenvapi']['UseFakenvapi'], 'false')
+                            self.assertNotIn('d4r/d4r_nvapi64.dll', archive.namelist())
+                            self.assertNotIn('d4r/fakenvapi.dll', archive.namelist())
+                            for dependency in ('d4r-features.py', 'licenses/XeSS-LICENSE.txt', 'source/optiscaler.json'):
                                 self.assertIn('d4r/' + dependency, archive.namelist())
                             configs.append(data)
                             self.assertEqual(data, (repo / 'dist' / name / 'OptiScaler.ini').read_bytes())
-                            # OptiScaler's FSR 3.X/4 upscaler: AMD's loader and upscaler beside it
-                            for ffx in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
+                            # Providers retain upstream's v10 folder, including all FG implementations.
+                            for ffx in ('OptiScaler/amd_fidelityfx_loader_dx12.dll', 'OptiScaler/amd_fidelityfx_upscaler_dx12.dll',
+                                        'OptiScaler/amd_fidelityfx_framegeneration_dx12.dll',
+                                        'OptiScaler/libxell.dll', 'OptiScaler/libxess_fg.dll',
+                                        'OptiScaler/dlssg_to_fsr3_amd_is_better.dll',
+                                        'OptiScaler/D3D12_OptiScaler/D3D12Core.dll',
                                         'd4r/licenses/FidelityFX-LICENSE.txt'):
                                 self.assertIn(ffx, archive.namelist())
                         else:

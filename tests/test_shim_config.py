@@ -10,6 +10,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShimConfigTests(unittest.TestCase):
+    def test_vkhip_is_explicit_opt_in_and_environment_takes_precedence(self):
+        for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
+            config = configparser.ConfigParser(inline_comment_prefixes=(';',))
+            config.read(ROOT / name)
+            self.assertFalse(config.getboolean('Engine', 'ExperimentalVkHip'))
+        with tempfile.TemporaryDirectory() as directory:
+            ini=Path(directory)/'d4r.ini'
+            env={k:v for k,v in os.environ.items() if not k.startswith('D4R_')}
+            command=['python3',str(ROOT/'scripts/d4r_config.py'),'--config',str(ini)]
+            for value,want in (('false','0'),('true','1')):
+                ini.write_text('[Engine]\nEnabled=true\nExperimentalVkHip='+value+'\n')
+                result=subprocess.run(command,env=env,text=True,capture_output=True,check=True)
+                self.assertIn('export D4R_ENGINE_VKHIP='+want+'\n',result.stdout)
+                if value=='true':self.assertIn('export D4R_ENGINE_K=1\n',result.stdout)
+            result=subprocess.run(command,env=dict(env,D4R_ENGINE_VKHIP='0'),text=True,capture_output=True,check=True)
+            self.assertNotIn('export D4R_ENGINE_VKHIP=',result.stdout)
+            ini.write_text('[Engine]\nExperimentalVkHip=invalid\n')
+            self.assertEqual(subprocess.run(command,env=env,capture_output=True).returncode,2)
+
     def test_profile_log_interval_validation_and_environment_precedence(self):
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'

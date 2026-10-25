@@ -4,15 +4,15 @@
 # OptiScaler's first _nvngx.dll probe to load Proton's system core before trying nvngx.dll.
 Upscalers.Dx12Upscaler=dlss
 DLSS.Enabled=true
-Libraries.OptiDllPath=d4r
+Libraries.OptiDllPath=OptiScaler
 Libraries.NvngxPath=d4r\nvngx.dll
 # Do not use d4r\ngx\_nvngx.dll here: that NVIDIA core is loaded internally by the shim.
 # The game's DLSS calls reach OptiScaler; d4r's own load of NVIDIA's NGX core is left alone
 Inputs.EnableDlssInputs=true
 Hooks.HookOriginalNvngxOnly=true
-# Proton's NVAPI serves the game by default. d4r-features.py opts into the
-# latency-only router without replacing NGX's GPU/topology interfaces.
-NvApi.OverrideNvapiDll=false
+# v10 hooks latency interfaces on Proton's NVAPI. Never substitute its synthetic
+# GPU identity provider for Proton's GPU/topology interfaces used by NGX.
+fakenvapi.UseFakenvapi=false
 # The game sees an NVIDIA GPU through DXGI, so it offers DLSS
 Spoofing.Dxgi=true
 FrameGen.Enabled=false

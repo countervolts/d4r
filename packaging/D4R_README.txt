@@ -140,10 +140,12 @@ Settings
     still sees an NVIDIA one ([OptiScaler] Fsr4 = false turns that off).
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
-  [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=d4r is also
+  Change upscaler, presets, sharpening, FG and overlay settings and use Save INI normally.
+  These are initial defaults; later launches do not reapply them over your saved choices.
+  [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=OptiScaler is also
   needed for the other DLLs. Keep this route when restoring a customized INI during an update.
   Do not point NvngxPath at d4r\ngx\_nvngx.dll: that is NVIDIA's core for the shim's internal use.
-  OptiScaler 0.9.4 resolves this relative override from the game's working directory. If a custom
+  OptiScaler resolves this relative override from the game's working directory. If a custom
   launcher uses a different working directory, use the shim's absolute Windows filename instead.
 
 Each game has its own copy of both files.
@@ -205,7 +207,8 @@ If something goes wrong
 - Ray Reconstruction needs the CUDA-capable 3.10.7 nvngx_dlssd.dll beside the shim, the matching
   patched d3d12.dll/d3d12core.dll, and the ICU launch overrides from the Ray Reconstruction section
   above. Enable [Kernels] NativeFp8; the scalar FP8 RR path is not validated.
-- Optional frame generation: with the game closed, run
+- XeFG, FSR FG and Nukem's DLL are included in OptiScaler/, with upstream licenses.
+  FG is off by default. Select its input/output in the Insert menu, or with the game closed run
     python3 d4r/d4r-features.py . --fg xefg --input dlssg
   from its main executable folder. Use --input fsrfg for native FSR 3.1 FG or
   --input upscaler for games without native FG. --fg fsrfg selects FSR FG output.
@@ -214,9 +217,11 @@ If something goes wrong
 - Optional Reflex-to-AL2/XeLL/LFX: python3 d4r/d4r-features.py . --latency auto
   Then enable Reflex in-game. The provider selects an available method; AL2 on
   Proton also requires host/vkd3d support. This does not change FrameAge.
-  The router preserves NGX's real NVAPI topology queries. Both features are
-  experimental and off by default. Each setup change creates an exact INI backup.
-  Disable: python3 d4r/d4r-features.py . --fg off --latency proton
+  v10 hooks latency interfaces on Proton's NVAPI; keep [fakenvapi] UseFakenvapi=false
+  to preserve GPU/topology queries. No separate fakenvapi.dll or d4r router is needed.
+  Latency output defaults to OptiScaler's automatic selection. FG is experimental and off
+  by default. Each setup change creates an exact INI backup.
+  Disable FG and request Proton Reflex output: python3 d4r/d4r-features.py . --fg off --latency proton
 - Not supported: NVIDIA's DLSS Frame Generation network and DirectX 11.
   OptiScaler can instead convert DLSSG inputs into XeFG or FSR FG as above.
 - Development builds expose an experimental native Vulkan NGX path using CPU staging.
@@ -227,14 +232,14 @@ If something goes wrong
 Uninstall
 ---------
 Delete dxgi.dll, OptiScaler.ini, OptiScaler.log (if present), d3d12.dll, d3d12core.dll,
-D4R_README.txt, install.sh (if present) and the d4r folder from the game folder, and clear the launch options. The kernel
+D4R_README.txt, install.sh (if present), the OptiScaler folder and the d4r folder from the game folder, and clear the launch options. The kernel
 cache in ~/.cache/d4r can be deleted too; it also holds install.sh's copies of the NVIDIA DLLs and the engine models.
 
 
 Licenses
 --------
 d4r is GNU General Public License, version 3 only (GPL-3.0-only). The release also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton
-(LGPL 2.1, patched) and OptiScaler 0.9.4 (GPL 3.0, unmodified). d4r/source/SOURCES.txt says where
+(LGPL 2.1, patched) and OptiScaler 10.0.0-pre1 (GPL 3.0, unmodified; pinned nightly-20261024 prerelease). d4r/source/SOURCES.txt says where
 each file comes from, and d4r/licenses has the license texts. d4r is not affiliated with NVIDIA,
 AMD or the OptiScaler project, and is provided "as is", without warranty of any kind (GPL-3.0,
 sections 15 and 16).

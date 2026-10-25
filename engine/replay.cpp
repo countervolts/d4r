@@ -116,9 +116,13 @@ struct Context {
             throw std::runtime_error("32/64-lane compute subgroups required");
         // Enable only the features this engine needs, rather than every supported feature.
         features.features = {}; features.features.shaderInt16 = VK_TRUE;
+        // Optional native vkhip regression runner; ordinary replay needs neither.
+        const bool vkhipTest = std::getenv("D4R_TEST_VKHIP") != nullptr;
+        features.features.shaderInt64 = vkhipTest ? VK_TRUE : VK_FALSE;
         features.features.shaderStorageImageExtendedFormats = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12}; f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13}; f12.shaderFloat16 = VK_TRUE;
+        f12.bufferDeviceAddress = vkhipTest ? VK_TRUE : VK_FALSE;
         f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, matrices ? &matrix : nullptr}; f13.subgroupSizeControl = f13.computeFullSubgroups = VK_TRUE;
         matrix = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr}; matrix.cooperativeMatrix = VK_TRUE;
         if (fp8) {

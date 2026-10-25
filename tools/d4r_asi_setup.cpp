@@ -97,8 +97,12 @@ static bool same_file(const fs::path& source, const fs::path& destination)
     return fs::is_regular_file(destination) && fs::file_size(source) == fs::file_size(destination) && read(source) == read(destination);
 }
 
-static std::string configure(std::string source, const fs::path& plugin)
+static std::string configure(std::string source, const fs::path& plugin, const std::string& previousPlugin)
 {
+    const std::string currentPlugin = utf8(plugin.wstring());
+    // Setup is not a settings policy. A later Save INI, including auto values,
+    // belongs to the user. Only relocate our own paths when the plugin moves.
+    if (!previousPlugin.empty() && lower(previousPlugin) == lower(currentPlugin)) return source;
     const std::string bom = source.starts_with("\xef\xbb\xbf") ? "\xef\xbb\xbf" : "";
     if (!bom.empty()) source.erase(0, 3);
     std::string newline = source.find("\r\n") == std::string::npos ? "\n" : "\r\n";
@@ -118,6 +122,9 @@ static std::string configure(std::string source, const fs::path& plugin)
         {"Plugins", "LoadAsiPlugins", "true"}, {"Plugins", "Path", utf8(plugin.parent_path().wstring())},
         {"Libraries", "NvngxPath", utf8(plugin.wstring())}}};
     for (const auto& setting : settings) {
+        const bool route = (setting.section == "Libraries" && setting.key == "NvngxPath") ||
+                           (setting.section == "Plugins" && setting.key == "Path");
+        if (!previousPlugin.empty() && !route) continue;
         size_t start = lines.size(), end = lines.size(), match = lines.size();
         for (size_t i = 0; i < lines.size(); ++i)
             if (lower(trim(lines[i])) == "[" + lower(setting.section) + "]") {
@@ -125,6 +132,7 @@ static std::string configure(std::string source, const fs::path& plugin)
                 start = i;
             }
         if (start == lines.size()) {
+            if (!previousPlugin.empty()) continue;
             if (!lines.empty() && !lines.back().ends_with('\n')) lines.back() += newline;
             lines.push_back("[" + setting.section + "]" + newline);
             lines.push_back(setting.key + "=" + setting.value + newline);
@@ -144,9 +152,20 @@ static std::string configure(std::string source, const fs::path& plugin)
             // Keep original spelling, spacing and comments if the active value already matches.
             auto line = trim(lines[match]);
             auto value = trim(line.substr(line.find('=') + 1));
+            if (!previousPlugin.empty()) {
+                const auto previous = setting.section == "Libraries" ? previousPlugin :
+                    previousPlugin.substr(0, previousPlugin.find_last_of("\\/"));
+                // A deliberately selected different backend/path is not ours to replace.
+                if (lower(value) != lower(previous)) continue;
+            } else if (setting.section == "Upscalers" || setting.section == "DLSS" ||
+                       setting.section == "Spoofing") {
+                // Preserve the existing installation's upscaler and title-specific spoofing.
+                continue;
+            }
             if (lower(value) != lower(setting.value))
                 lines[match] = setting.key + "=" + setting.value + ending;
         } else {
+            if (!previousPlugin.empty()) continue;
             if (end && !lines[end - 1].ends_with('\n')) lines[end - 1] += newline;
             lines.insert(lines.begin() + end, setting.key + "=" + setting.value + newline);
         }
@@ -196,8 +215,10 @@ int wmain(int argc, wchar_t** argv)
         if (!fs::is_regular_file(config))
             throw std::runtime_error("OptiScaler.ini not found: " + utf8(config.wstring()) +
                                      "; keep the INI beside the OptiScaler loader");
+        const fs::path initialized = runtime / "installation-plugin.txt";
+        const std::string previousPlugin = fs::is_regular_file(initialized) ? trim(read(initialized)) : "";
         const std::string original = read(config);
-        const std::string updated = configure(original, plugin); // reject ambiguity before mutations
+        const std::string updated = configure(original, plugin, previousPlugin); // reject ambiguity before mutations
         if (!fs::is_regular_file(runtime / "nvngx_dlss.dll") || !fs::is_regular_file(runtime / "ngx/_nvngx.dll"))
             throw std::runtime_error("Run bash install.sh inside the plugin's d4r folder to download and verify the NVIDIA DLLs, then launch the game again");
         for (const char* name : {"d3d12.dll", "d4r12core.dll"})
@@ -208,7 +229,10 @@ int wmain(int argc, wchar_t** argv)
             throw std::runtime_error("OptiScaler is installed as d3d12.dll. Use a supported loader such as dxgi.dll or winmm.dll before installing d4r, so setup can preserve your OptiScaler loader");
         bool pairChanged = !same_file(runtime / "d3d12.dll", game / "d3d12.dll") ||
                            !same_file(runtime / "d4r12core.dll", game / "d4r12core.dll");
-        if (original == updated && !pairChanged) return 0;
+        if (original == updated && !pairChanged) {
+            if (previousPlugin.empty()) write(initialized, utf8(plugin.wstring()) + "\r\n");
+            return 0;
+        }
         // A running game may hold these DLLs mapped or save its old INI on exit.
         // The ASI gives us its Windows PID; finish only after that game closes.
         if (argc >= 4) {
@@ -237,7 +261,7 @@ int wmain(int argc, wchar_t** argv)
         } cleanup{temporary, configStage};
         // Merge the latest settings in case OptiScaler changed them during setup.
         const std::string current = read(config);
-        const std::string finalConfig = configure(current, plugin);
+        const std::string finalConfig = configure(current, plugin, previousPlugin);
         std::vector<Replacement> replacements;
         for (const char* name : {"d3d12.dll", "d4r12core.dll"}) {
             fs::path source = runtime / name, destination = game / name;
@@ -251,6 +275,7 @@ int wmain(int argc, wchar_t** argv)
             replacements.push_back({configStage, config, {}});
         }
         commit(replacements);
+        write(initialized, utf8(plugin.wstring()) + "\r\n");
         write(runtime / "installation-status.txt", "d4r setup complete. Launch the game again to activate DLSS.\r\n");
         if (!silent) MessageBoxW(nullptr, L"d4r is ready. Launch the game again to activate DLSS.\n\nChanged D3D12 files and OptiScaler settings have been backed up.",
                                  L"d4r ready", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);

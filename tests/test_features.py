@@ -83,6 +83,42 @@ class FeatureConfigTests(unittest.TestCase):
             self.assertEqual(cfg['NvApi']['OverrideNvapiDll'], 'true')
             self.assertEqual(cfg['FrameGen']['Enabled'], 'false')
 
+    def test_v10_uses_bundled_providers_without_external_nvapi_router(self):
+        for fg in ('xefg', 'fsrfg', 'off'):
+            with self.subTest(fg=fg), tempfile.TemporaryDirectory() as directory:
+                ini, runtime = self.fixture(directory)
+                original = ini.read_bytes() + b'[fakenvapi]\r\nUseFakenvapi=false\r\n'
+                ini.write_bytes(original)
+                providers = ini.parent / 'OptiScaler'
+                providers.mkdir()
+                for name in ('libxell.dll', 'libxess_fg.dll', 'amd_fidelityfx_loader_dx12.dll',
+                             'amd_fidelityfx_framegeneration_dx12.dll'):
+                    (providers / name).write_bytes(b'fixture')
+                shutil.rmtree(runtime)
+                backup = features.configure(ini, runtime, fg, 'dlssg' if fg != 'off' else None, 'auto')
+                self.assertEqual(backup.read_bytes(), original)
+                cfg = configparser.ConfigParser()
+                cfg.read_string(ini.read_bytes().decode('utf-8-sig'))
+                self.assertEqual(cfg['fakenvapi']['UseFakenvapi'], 'false')
+                self.assertEqual(cfg['fakenvapi']['LowLatencyOutput'], 'auto')
+                self.assertFalse(cfg.has_option('Libraries', 'NvapiPath'))
+                self.assertFalse(cfg.has_section('NvApi'))
+                self.assertEqual(cfg['Libraries']['NvngxPath'], r'plugins\d4r.asi')
+                self.assertIsNone(features.configure(ini, runtime, fg, 'dlssg' if fg != 'off' else None, 'auto'))
+                features.configure(ini, runtime, 'off', None, 'proton')
+                cfg.read_string(ini.read_bytes().decode('utf-8-sig'))
+                self.assertEqual(cfg['fakenvapi']['LowLatencyOutput'], '6')
+
+    def test_v10_missing_fg_provider_leaves_config_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ini, runtime = self.fixture(directory)
+            ini.write_bytes(ini.read_bytes() + b'[fakenvapi]\r\nUseFakenvapi=false\r\n')
+            original = ini.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'extract the complete OptiScaler/'):
+                features.configure(ini, runtime, 'xefg', 'dlssg', 'auto')
+            self.assertEqual(ini.read_bytes(), original)
+            self.assertFalse(list(ini.parent.glob('*.d4r-features-backup-*')))
+
 
 @unittest.skipUnless(shutil.which('wine') and shutil.which('x86_64-w64-mingw32-g++'), 'needs Wine and MinGW')
 class NvapiRouterTests(unittest.TestCase):

@@ -144,6 +144,53 @@ int wmain(int argc, wchar_t** argv) {
                 self.assertFalse(list(game.glob('*.d4r-backup.*')))
                 self.assertFalse(list(game.glob('.d4r-setup.*')))
 
+    def test_saved_overlay_settings_survive_later_setup_and_runtime_update(self):
+        with tempfile.TemporaryDirectory(dir=self.directory) as tmp:
+            game = Path(tmp)
+            plugin = self.fixture(game, b'[Plugins]\nLoadAsiPlugins=true\n')
+            self.assertEqual(self.setup(game, plugin).returncode, 0)
+            ini = game / 'OptiScaler.ini'
+            saved = ini.read_bytes().replace(b'Dx12Upscaler=dlss', b'Dx12Upscaler=ffx')
+            saved = saved.replace(b'Dxgi=true', b'Dxgi=false').replace(b'Enabled=true', b'Enabled=auto')
+            saved += b'[FrameGen]\nEnabled=true\nFGInput=dlssg\nFGOutput=xefg\n[Menu]\nScale=1.25\n'
+            ini.write_bytes(saved)
+            # Normal relaunch must be a byte-for-byte no-op, including auto values.
+            self.assertEqual(self.setup(game, plugin).returncode, 0)
+            self.assertEqual(ini.read_bytes(), saved)
+            # A runtime update can replace its DLLs without resetting overlay choices.
+            (plugin.parent / 'd4r/d4r12core.dll').write_bytes(b'updated core')
+            self.assertEqual(self.setup(game, plugin).returncode, 0)
+            self.assertEqual((game / 'd4r12core.dll').read_bytes(), b'updated core')
+            self.assertEqual(ini.read_bytes(), saved)
+
+    def test_first_setup_keeps_existing_upscaler_and_spoofing_preferences(self):
+        with tempfile.TemporaryDirectory(dir=self.directory) as tmp:
+            game = Path(tmp)
+            original = (b'[Upscalers]\nDx12Upscaler=ffx\n[DLSS]\nEnabled=auto\n'
+                        b'[Spoofing]\nDxgi=false\n[FrameGen]\nFGOutput=fsrfg\n')
+            plugin = self.fixture(game, original)
+            self.assertEqual(self.setup(game, plugin).returncode, 0)
+            saved = (game / 'OptiScaler.ini').read_bytes()
+            for line in (b'Dx12Upscaler=ffx', b'Enabled=auto', b'Dxgi=false', b'FGOutput=fsrfg'):
+                self.assertIn(line, saved)
+            self.assertIn(self.winpath(plugin).encode(), saved)
+
+    def test_relocated_plugin_refreshes_only_its_paths(self):
+        with tempfile.TemporaryDirectory(dir=self.directory) as tmp:
+            game = Path(tmp)
+            plugin = self.fixture(game, b'[Plugins]\nLoadAsiPlugins=true\n')
+            self.assertEqual(self.setup(game, plugin).returncode, 0)
+            ini = game / 'OptiScaler.ini'
+            saved = ini.read_bytes().replace(b'Dx12Upscaler=dlss', b'Dx12Upscaler=ffx')
+            saved += b'[FrameGen]\nFGOutput=xefg\n'
+            ini.write_bytes(saved)
+            destination = game / 'moved plugins'
+            shutil.move(str(plugin.parent), destination)
+            moved = destination / plugin.name
+            self.assertEqual(self.setup(game, moved).returncode, 0)
+            expected = saved.replace(self.winpath(plugin.parent).encode(), self.winpath(destination).encode())
+            self.assertEqual(ini.read_bytes(), expected)
+
     @unittest.skipUnless((ROOT / 'build/d4r.asi').exists(), 'Build the ASI first')
     def test_actual_asi_load_and_automatic_configuration(self):
         with tempfile.TemporaryDirectory(dir=self.directory) as tmp:

@@ -20,16 +20,15 @@ Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
 @installer                        License: d4r/licenses/glslang-LICENSE.txt
 
 Third-party software, unmodified or patched by d4r:
-  d4r/fakenvapi.dll      from the supplied OptiScaler release (GPL-3.0),
-                         https://github.com/optiscaler/fakenvapi
-  d4r/libxell.dll, d4r/libxess_fg.dll
-                         Intel XeLL/XeFG from the same OptiScaler release,
-                         https://github.com/intel/xess; d4r/licenses/XeSS-LICENSE.txt
-  d4r/amd_fidelityfx_framegeneration_dx12.dll
-                         AMD FSR FG from the same OptiScaler release (MIT),
-                         d4r/licenses/FidelityFX-LICENSE.txt
-  (These optional third-party files ship in proxy packages. ASI add-ons use
-   the existing OptiScaler installation's matching dependencies.)
+  OptiScaler/            OptiScaler v10's complete unmodified dependency folder, including:
+                         Intel XeSS/XeLL/XeFG (XeSS license), AMD FidelityFX loader/upscaler/FG (MIT),
+                         dlssg_to_fsr3_amd_is_better.dll (Nukem9, GPL-3.0,
+                         https://github.com/Nukem9/dlssg-to-fsr3), and Microsoft's private D3D12
+                         interop core (DirectX license). Upstream license texts are preserved under
+                         d4r/licenses/OptiScaler/. No NVIDIA DLSSG or Streamline DLLs are added.
+                         Fakenvapi is integrated in OptiScaler v10; no separate DLL is needed.
+                         Proxy packages include these files; ASI add-ons use the host installation.
+                         The legacy d4r NVAPI router ships only with ASI add-ons for 0.9 compatibility.
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
                          commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0014 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).
@@ -49,15 +48,15 @@ Third-party software, unmodified or patched by d4r:
                          GNU LGPL 2.1), unmodified, from Ubuntu 22.04's libelf1 and libnuma1 packages; their
                          sources are Ubuntu's elfutils 0.186-1ubuntu0.1 and numactl 2.0.14-3ubuntu2 source packages.
                          Licenses: d4r/licenses/ROCm-lib*-copyright.txt
-  dxgi.dll               OptiScaler 0.9.4 (GNU GPL 3.0), unmodified OptiScaler.dll renamed to dxgi.dll.
-                         Source: https://github.com/optiscaler/OptiScaler/tree/v0.9.4
+  dxgi.dll               OptiScaler 10.0.0-pre1 (GNU GPL 3.0), unmodified OptiScaler.dll renamed.
+                         Pinned nightly-20261024. Exact source, archive digest and per-file hashes:
+                         d4r/source/optiscaler.json (custom build inputs are identified separately).
+                         https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261024
                          License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
-  OptiScaler.ini         OptiScaler 0.9.4's OptiScaler.ini with the values d4r needs set
-                         (packaging/optiscaler.settings in the d4r repository)
-  amd_fidelityfx_dx12.dll, amd_fidelityfx_upscaler_dx12.dll
-                         AMD FidelityFX SDK 2.3 loader and FSR 4.1.1 upscaler (MIT), unmodified, as shipped in
-                         the OptiScaler 0.9.4 release. https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
-                         License: d4r/licenses/FidelityFX-LICENSE.txt
+  OptiScaler.ini         Upstream v10 INI with packaging/optiscaler.settings applied.
+                         NvngxPath selects d4r; OptiDllPath selects the OptiScaler/ dependency folder.
+                         FG is bundled but disabled by default. UseFakenvapi=false preserves Proton
+                         NVAPI GPU/topology queries; v10's latency hooks can translate Reflex markers.
 
 @clean Not included: NVIDIA's DLSS libraries (nvngx_dlss.dll, nvngx_dlssd.dll) and NGX runtime (_nvngx.dll). You supply them
 @clean and are responsible for complying with NVIDIA's license terms.

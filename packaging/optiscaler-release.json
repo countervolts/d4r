@@ -1,0 +1,27 @@
+{
+  "version": "10.0.0-pre1",
+  "tag": "nightly-20261024",
+  "url": "https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261024/OptiScaler_v10.0.0-pre1_20261024.7z",
+  "sha256": "74f20189e0ec76288c86d69057b3feb4750f4680118a9852fb743b343274ac1d",
+  "source_commit": "fd3a45a6cac6d610a35c570479f80dae95ca4eac",
+  "source_url": "https://github.com/optiscaler/OptiScaler/tree/fd3a45a6cac6d610a35c570479f80dae95ca4eac",
+  "dll_sha256": "ed8e58d324a54de0ac9d1e582cae42250b0438406ea84eae71b4a8966f3a49cb",
+  "files": {
+    "Licenses/DirectX_LICENSE.txt": "5239850894610071566f7ecee0b751fde43c862032d92b99d7d0f596b3433ebd",
+    "Licenses/FidelityFX_v2_LICENSE.md": "f0da09d71ad5c82759a179e774535d4a829e5c96c49294167c1152402b2cb400",
+    "Licenses/XeSS_LICENSE.txt": "784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7eaf208df",
+    "OptiScaler/D3D12_OptiScaler/D3D12Core.dll": "07d286c306f8117321422affd9e6388c12d0fb4be1c7fc689d9e899324feeb24",
+    "OptiScaler/Streamlined_fetcher_windows.bat": "4052e172f464235c9b33bcefd63965250a592f11129d0dee032942db3453cae3",
+    "OptiScaler/amd_fidelityfx_framegeneration_dx12.dll": "02297beedd285e822d3a64f314cf00faf378dcec0edc47ff0c4dd71b3a8c2f18",
+    "OptiScaler/amd_fidelityfx_loader_dx12.dll": "e2d85aa05a9bd9ed8b38935fdf5199372cca6f74c12015143bb6f945ee1608aa",
+    "OptiScaler/amd_fidelityfx_upscaler_dx12.dll": "d0dcccc74a43c44ba435b7a369b456e0970d8a4464e4bd683119b374f2c9fb46",
+    "OptiScaler/amd_fidelityfx_vk.dll": "a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78",
+    "OptiScaler/dlssg_to_fsr3_amd_is_better.dll": "14e83096f4e7648b89a724208c6219508b44563ce8c44967c60a5fa46a9221e2",
+    "OptiScaler/libxell.dll": "d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7",
+    "OptiScaler/libxess.dll": "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7",
+    "OptiScaler/libxess_dx11.dll": "c7cfe86f0c9d94e4fb3696d3cd5035e2bbb6a8b1b0572f8b7395a4cdfd0c625e",
+    "OptiScaler/libxess_fg.dll": "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27",
+    "OptiScaler.dll": "ed8e58d324a54de0ac9d1e582cae42250b0438406ea84eae71b4a8966f3a49cb",
+    "OptiScaler.ini": "5adbd98daa6e17bcc4def8b152cfd6348925dfaf44d5c207fd989e92d5b89fe4"
+  }
+}

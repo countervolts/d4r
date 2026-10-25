@@ -112,6 +112,7 @@
 #include "../engine/game_e.h"
 #include "../engine/game_rr.h"
 #include "../engine/vk_dispatch.h"
+#include "../engine/vkhip/vkhip_net.h"
 
 // --- NGX types (declared locally: the core's exports differ from the SDK) --
 
@@ -774,6 +775,9 @@ static void load_portable_config()
         if (enabled.empty() || enabled == "auto")
             portable_set("D4R_ENGINE_K", "0");
     }
+    const bool experimentalVkHip = ini_flag(ini, "engine", "ExperimentalVkHip", 0) != 0;
+    portable_set("D4R_ENGINE_VKHIP", experimentalVkHip ? "1" : "0");
+    if (experimentalVkHip) portable_set("D4R_ENGINE_K", "1");
     if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
         portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
     // Network: the network on the engine's Vulkan shader ("vulkan", and the default: "auto") or on the native HIP
@@ -2997,6 +3001,7 @@ struct Feature
     uint64_t engineViewBytes = 0;
     bool engineViewBudgetReported = false;
     std::vector<std::unique_ptr<EngineBorrowedView>> engineViews; // destroyed after engine descriptor pools
+    std::unique_ptr<vkhip::KNetwork> engineVkHip; // buffers outlive the adapter's descriptor sets
     std::unique_ptr<d4r::GameUpscaler> engine;
     std::unique_ptr<d4r::GameUpscalerM> engineM; // preset M/L, original network
     std::unique_ptr<d4r::GameUpscalerM> engineMDynamic; // Vulkan at changing sizes; original HIP resources stay alive
@@ -3459,6 +3464,9 @@ struct VulkanInterop
     ID3D12DXVKInteropDeviceD4R* split = nullptr; // only with the d4r vkd3d-proton patch
     ID3D12DXVKInteropDeviceD4R3* linear = nullptr; // experimental: linear exportable game textures
     VkDevice device = VK_NULL_HANDLE;
+    PFN_vkGetDeviceProcAddr deviceProc = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     VkPhysicalDeviceMemoryProperties memory = {};
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     // VK_EXT_shader_float8 (vkd3d-proton enables it when the GPU has it): M's and L's engine layers are FP8
@@ -3903,6 +3911,9 @@ static void init_vram_interop()
         instanceProc(instance, "vkGetPhysicalDeviceMemoryProperties"));
     if (deviceProc == nullptr || memoryProperties == nullptr)
         return;
+    g_vk.deviceProc = deviceProc;
+    g_vk.instance = instance;
+    g_vk.instanceProc = instanceProc;
     memoryProperties(physical, &g_vk.memory);
     g_vk.physical = physical;
     g_vk.formatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
@@ -9552,7 +9563,9 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
                                 d4r::GameImage& image, bool isOutput, bool originSupported,
                                 D3D12_RESOURCE_STATES& state)
 {
-    if (image.format == VK_FORMAT_D32_SFLOAT || image.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+    if (image.format == VK_FORMAT_D32_SFLOAT || image.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+        image.format == VK_FORMAT_D16_UNORM || image.format == VK_FORMAT_D16_UNORM_S8_UINT ||
+        image.format == VK_FORMAT_D24_UNORM_S8_UINT || image.format == VK_FORMAT_X8_D24_UNORM_PACK32)
         image.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     const VkImageUsageFlags usage = isOutput ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
     VkFormatProperties properties{};
@@ -9867,6 +9880,7 @@ static bool record_ngx_input_ready(Feature& feature, ID3D12GraphicsCommandList* 
 // Only once no command list uses the engine and no network launch is pending.
 static void release_engine_network(Feature& feature)
 {
+    feature.engineVkHip.reset();
     if (feature.engineNet != nullptr && g_engineNet.destroy != nullptr)
         g.worker.call([&feature] {
             g_engineNet.destroy(feature.engineNet);
@@ -11119,6 +11133,69 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
     return true;
 }
 
+static bool create_engine_vkhip(Feature& feature, const std::string& directory,
+                                size_t tokenBytes, size_t headBytes)
+{
+    if (env_uint("D4R_ENGINE_VKHIP", 0) == 0) return false;
+    auto unavailable = [&](const std::string& reason) {
+        logf("experimental vkhip unavailable: %s; using the standard engine network", reason.c_str());
+        return false;
+    };
+    // Device IDs can be spoofed by Proton/OptiScaler. Authenticate the actual
+    // render adapter's PCI identity before injecting gfx1101 machine code.
+    const std::string pci = env_string("D4R_RENDER_PCI");
+    std::string vendor, device;
+    // sysfs reports a synthetic file size; read its short value directly.
+    auto pciValue = [](const std::wstring& path, std::string& value) {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        char bytes[64]{}; DWORD count = 0;
+        bool ok = ReadFile(file, bytes, sizeof(bytes), &count, nullptr) && count != 0;
+        CloseHandle(file);
+        if (ok) value.assign(bytes, count);
+        return ok;
+    };
+    if (pci.empty() || !pciValue(widen("Z:\\sys\\bus\\pci\\devices\\" + pci + "\\vendor"), vendor) ||
+        !pciValue(widen("Z:\\sys\\bus\\pci\\devices\\" + pci + "\\device"), device) ||
+        std::strtoul(vendor.c_str(), nullptr, 0) != 0x1002 || std::strtoul(device.c_str(), nullptr, 0) != 0x747e)
+        return unavailable("the physical render adapter is not verified gfx1101");
+    auto properties = g_vk.instanceProc ? reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        g_vk.instanceProc(g_vk.instance, "vkGetPhysicalDeviceProperties2")) : nullptr;
+    if (!properties || !g_vk.deviceProc) return unavailable("Vulkan device properties unavailable");
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    properties(g_vk.physical, &props);
+    if (driver.driverID != VK_DRIVER_ID_MESA_RADV) return unavailable("requires Mesa RADV");
+    auto load = [](const std::wstring& name, std::vector<uint8_t>& bytes) {
+        HANDLE file = CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER size{};
+        bool ok = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 128 * 1024 * 1024;
+        if (ok) {
+            bytes.resize(static_cast<size_t>(size.QuadPart)); DWORD read = 0;
+            ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+        }
+        CloseHandle(file);
+        return ok;
+    };
+    vkhip::NetFiles files;
+    if (!load(widen(directory + "/hipnet.bin"), files.hipnet)) return unavailable("missing hipnet.bin");
+    for (const char* layer : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
+        const std::string name = std::string("dltss_pwin_") + layer + "_layer";
+        if (!load(widen(directory + "/hip/" + name + ".hsaco"), files.code[name]))
+            return unavailable(name + ".hsaco missing");
+    }
+    auto network = std::make_unique<vkhip::KNetwork>();
+    std::string error;
+    if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
+                         feature.outHeight, tokenBytes, headBytes, error)) return unavailable(error);
+    logf("experimental vkhip ready: %u native dispatches, shared image-format adapter, regular/inverted depth",
+         network->dispatchesPerFrame());
+    feature.engineVkHip = std::move(network);
+    return true;
+}
+
 // Records the whole evaluation of `frame` into `list`. False: nothing usable was recorded and the
 // CUDA backend takes this feature over.
 static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
@@ -11216,7 +11293,9 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
                             (source.x == 0 && source.y == 0) || model->hasDirectOrigins(), source.copyState);
         g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
     }
-    if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32_SFLOAT &&
+    if (gameExposure && (game.exposure.view == VK_NULL_HANDLE || (game.exposure.format != VK_FORMAT_R32G32_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R16G16_SFLOAT &&
+                                                                  game.exposure.format != VK_FORMAT_R32_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R16_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT &&
                                                                   game.exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
@@ -11269,15 +11348,21 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         {
             const size_t tokenBytes = static_cast<size_t>(d4r::Engine::networkTokenBytes(feature.outWidth, feature.outHeight));
             const size_t headBytes = static_cast<size_t>(d4r::Engine::networkHeadBytes(feature.outWidth, feature.outHeight));
-            const bool hip = create_engine_network(feature, ldr ? g_engine.directoryLdr : g_engine.directory, "K", true,
-                                                   feature.outWidth, feature.outHeight, tokenBytes, headBytes);
-            const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
+            const std::string& directory = ldr ? g_engine.directoryLdr : g_engine.directory;
+            const bool vkhip = create_engine_vkhip(feature, directory, tokenBytes, headBytes);
+            const bool hip = !vkhip && env_uint("D4R_ENGINE_VKHIP", 0) == 0 &&
+                create_engine_network(feature, directory, "K", true,
+                                      feature.outWidth, feature.outHeight, tokenBytes, headBytes);
+            const d4r::ExternalNetwork external = vkhip ?
+                d4r::ExternalNetwork{feature.engineVkHip->tokens(), feature.engineVkHip->head()} :
+                d4r::ExternalNetwork{feature.engineTokens.buffer, feature.engineHead.buffer};
             feature.engine = std::make_unique<d4r::GameUpscaler>(*model, g_vk.physical, g_vk.device,
                                                                  feature.outWidth, feature.outHeight,
                                                                  feature.outWidth, feature.outHeight,
-                                                                 hip ? &external : nullptr);
+                                                                 (hip || vkhip) ? &external : nullptr);
             logf("engine backend: feature %u runs preset K in the game's command list (%ux%u -> %ux%u), network on %s",
                  feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
+                 vkhip ? "experimental vkhip (one Vulkan command list)" :
                  hip ? "the native HIP layers (list split around it)" : "Vulkan");
         }
     }
@@ -11356,7 +11441,11 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
     {
         try
         {
-            feature.engine->record(command, game);
+            if (feature.engineVkHip) {
+                feature.engine->recordFront(command, game);
+                feature.engineVkHip->record(command, game.settings.reset);
+                feature.engine->recordBack(command, game);
+            } else feature.engine->record(command, game);
         }
         catch (const std::exception& error)
         {

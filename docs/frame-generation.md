@@ -1,82 +1,89 @@
 # Frame generation and latency reduction (Linux/Proton)
 
-d4r supplies OptiScaler's XeFG and FSR FG implementations and a latency-only
-NVAPI router. These features are experimental and opt-in. A fresh full package
-keeps FG off and uses Proton's original NVAPI. Neither DLSS model selection nor
-RR backend selection changes when enabling them. NVIDIA's DLSS Frame Generation
-network is not implemented: a game's DLSSG input can feed XeFG or FSR FG instead.
+d4r's full proxy package includes OptiScaler **10.0.0-pre1**, pinned to
+[nightly-20261024](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261024).
+This is a prerelease. Its complete `OptiScaler/` dependency folder ships with the
+package, including XeFG, XeLL, AMD FSR frame generation and Nukem's
+`dlssg_to_fsr3_amd_is_better.dll`. Upstream license files are preserved in
+`d4r/licenses/OptiScaler/`. The archive digest and source revision are pinned in
+`packaging/optiscaler-release.json`; packaged provenance is in
+`d4r/source/optiscaler.json`.
 
-Close the game before changing its configuration. From the game's main executable
-folder, enable XeFG using its native Streamline 2 DLSSG input, for example Cyberpunk:
+FG is disabled by default. Open OptiScaler's Insert menu, select the FG input
+provided by the game and choose **XeFG** or **FSR FG** as output. Enable the matching
+FG setting in-game. For games without native FG, use **Upscaler / OptiFG** input;
+HUD handling may be less reliable. Restart when requested by OptiScaler.
+
+Alternatively, close the game and run this from its executable folder:
 
 ```sh
 python3 d4r/d4r-features.py . --fg xefg --input dlssg
 ```
 
-For native FSR 3.1 FG use `--input fsrfg`, or `fsrfg30` for FSR 3.0.
-For a game without native FG use `--input upscaler` (OptiFG); this has less reliable
-HUD handling. To use FSR FG output replace `--fg xefg` with `--fg fsrfg`.
-The command validates dependencies, preserves other settings and backs up the
-original INI before replacing it. Errors leave the config untouched.
+Use `--input fsrfg` for native FSR 3.1 FG, `fsrfg30` for FSR 3.0, or `upscaler`
+for OptiFG. To select FSR FG output, replace `--fg xefg` with `--fg fsrfg`.
+The helper checks dependencies before changing anything, preserves SR/RR choices,
+and creates an exact INI backup. It also supports older 0.9 ASI installations.
 
-Restart, enable the corresponding FG option in-game (except for `upscaler`),
-and activate FG in OptiScaler's Insert menu. Use borderless mode for XeFG;
-it supports SDR/HDR10, not scRGB/FP16 HDR. Native Vulkan games cannot use this
-D3D12 XeFG route. D3D12 games under Proton still require game testing.
-Streamline 1 DLSSG inputs are not supported by this setup.
+XeFG needs borderless mode and SDR/HDR10 rather than scRGB/FP16 HDR. Treat D3D12
+under Proton as requiring per-game testing. d4r's native Vulkan route has not been
+validated with FG. NVIDIA's DLSS FG network is not implemented by d4r. The bundled
+Nukem DLL is an alternate DLSSG replacement; v10's DLSSG-output routes additionally
+require matching Streamline files, which d4r does not bundle. The direct XeFG/FSR FG
+routes above are the starting point for testing.
 
-For latency conversion alone, leaving FG disabled:
+## Latency and GPU identity
+
+v10 integrates Fakenvapi and hooks latency interfaces on the system NVAPI. Keep
+`[fakenvapi] UseFakenvapi=false`: Proton must supply GPU identity, architecture and
+topology for NGX. A separate `fakenvapi.dll` and d4r NVAPI router are unnecessary
+with v10. OptiScaler selects its latency output automatically when it receives
+supported latency markers. Enable Reflex in-game and check the active output in
+OptiScaler. Host/vkd3d support is still needed for Anti-Lag 2. XeFG owns its XeLL
+context. These settings do not change d4r's `[Latency] FrameAge`.
+
+To explicitly restore automatic latency selection with FG disabled:
 
 ```sh
 python3 d4r/d4r-features.py . --fg off --latency auto
 ```
 
-Enable Reflex in-game. Fakenvapi selects Anti-Lag 2 when its D3D12 extension is
-available, then XeLL, then LatencyFlex. On Proton, AL2 depends on vkd3d-proton
-and the host's `VK_AMD_anti_lag` support, including any enabled latency layer;
-installing the DLL does not create that support. XeFG uses its XeLL context and
-requires the router so the game's Reflex markers reach that context.
-This is separate from d4r's `[Latency] FrameAge`, which remains unchanged.
-
-The router sends only six D3D latency interfaces and Fakenvapi's context/FG
-interfaces to `fakenvapi.dll`. GPU handles, architecture, LUID/topology, driver
-information and other NVAPI interfaces stay with Proton's original provider.
-Initialize/Unload are forwarded to both providers, preserving the original
-provider's status. Missing latency exports fall back to Proton. The router
-is selected through OptiScaler's `Libraries.NvapiPath`; no system32 DLL is replaced.
-`Hooks.UseNtdllHooks=false` prevents OptiScaler from redirecting the router's
-own load of the real NVAPI back to itself. Keep it false with this router.
-OptiScaler 0.9.4 accidentally reads XeLLPath/XeFGPath into its XeSS override.
-The helper uses directory overrides and sets OptiDllPath to the private runtime
-folder, so startup discovery finds the right DLLs. Existing explicit NGX/SR library
-paths remain unchanged. The router preloads its colocated XeLL DLL without changing
-the process's DLL search path.
-
-Return to the default routes:
+To disable FG and request Reflex output through Proton:
 
 ```sh
 python3 d4r/d4r-features.py . --fg off --latency proton
 ```
 
-For exact rollback, copy the printed `OptiScaler.ini.d4r-features-backup-*` file
-over `OptiScaler.ini` while the game is closed. The disable command leaves inactive
-library paths in place; it disables their NVAPI override and FG selection.
+In v10, `--latency proton` selects `LowLatencyOutput=6` (Reflex); OptiScaler may
+fall back if that output is unavailable. It does not remove OptiScaler's hooks.
+For exact rollback, restore the printed `OptiScaler.ini.d4r-features-backup-*` file
+while the game is closed.
 
-For ASI installations, pass `--runtime /path/to/plugins/d4r` to the helper in
-the actual plugin's `d4r/` folder. Copy the needed `fakenvapi.dll`, `libxell.dll`,
-`libxess_fg.dll` and (for FSR FG) `amd_fidelityfx_framegeneration_dx12.dll` from
-the existing matching OptiScaler release into that folder. Keep their licenses.
-ASI setup preserves FG and NVAPI selections.
+## Existing ASI installations
 
-Enable OptiScaler file logging for verification. Check that NGX still loads d4r's
-shim, the router loads through `NvapiPath`, and the chosen FG DLL/context initializes.
-Check the reported latency method rather than assuming AL2 was selected. Enable
-the FG debug view and inspect generated frames; an FPS overlay alone is not proof
-of interpolation or lower latency. These checks need an actual game session;
-package/ABI tests cannot establish image quality or latency.
+ASI add-ons keep the existing OptiScaler version, dependencies and FG choices.
+Use **Save INI** normally. Later setup runs and runtime updates leave saved
+upscaler, FG, spoofing and overlay preferences untouched. Moving the plugin
+refreshes only paths that still point to its previous location.
+For v10, retain its complete dependency folder and `Libraries.OptiDllPath`; the
+helper uses that directory even if d4r itself is in a custom plugin folder.
+For OptiScaler 0.9, pass `--runtime /path/to/plugins/d4r` and place matching
+`fakenvapi.dll`, `libxell.dll`, `libxess_fg.dll` and (for FSR FG)
+`amd_fidelityfx_framegeneration_dx12.dll` in that runtime folder with their licenses.
+The legacy helper uses d4r's latency-only NVAPI router and directory overrides to
+work around 0.9's XeLL/XeFG path parsing. Keep `Hooks.UseNtdllHooks=false` with it.
+
+## Testing
+
+Enable OptiScaler file logging. First verify that DLSS/RR still loads d4r's shim,
+then select FG and confirm that its provider/context initializes. Use the FG debug
+view to inspect interpolated frames, HUD handling and frame pacing. Check the
+reported latency method. An FPS overlay alone does not prove interpolation or
+reduced latency. Package tests establish staging and configuration only; game
+image quality, timing and compatibility require actual game sessions.
 
 Upstream references:
 
-- [OptiScaler FG setup and limitations](https://github.com/optiscaler/OptiScaler/wiki/Frame-Generation-Options)
-- [OptiScaler v0.9.4 configuration](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler.ini)
-- [Proton Reflex/AL2 layer setup](https://github.com/Korthos-Software/low_latency_layer#usage-and-configuration)
+- [OptiScaler v10 changes](https://github.com/optiscaler/OptiScaler/releases/tag/nightly)
+- [OptiScaler FG setup](https://github.com/optiscaler/OptiScaler/wiki/Frame-Generation-Options)
+- [Pinned source configuration](https://github.com/optiscaler/OptiScaler/blob/fd3a45a6cac6d610a35c570479f80dae95ca4eac/OptiScaler.ini)
