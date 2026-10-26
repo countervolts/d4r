@@ -220,11 +220,8 @@ def main(argv):
         fail("[Engine] Network must be auto, hip or vulkan")
     if network in ("hip", "vulkan"):
         env["D4R_ENGINE_NETWORK"] = network
-    vkhip = flag("Engine", "ExperimentalVkHip")
-    if vkhip is not None:
-        env["D4R_ENGINE_VKHIP"] = "1" if vkhip else "0"
-        if vkhip:
-            env["D4R_ENGINE_K"] = "1"
+    # vkhip is on unless disabled; under Enabled = auto the shim keeps K on the native kernels when it cannot load
+    env["D4R_ENGINE_VKHIP"] = "0" if flag("Engine", "ExperimentalVkHip") is False else "1"
 
     engine = path_value("Game", "EngineIni")
     cvars = get("Game", "Cvars")

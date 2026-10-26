@@ -25,6 +25,7 @@
 #   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
 #   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
 #   D4R_BUILD_INFO    optional build-toolchain/provenance text to include in d4r/source/
+#   D4R_VERSION       optional nightly artifact version; stable packaging/VERSION is unchanged
 #   D4R_PACKAGE_KERNEL_JOBS  independent target builds at once (default 1)
 # The zip contains texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
@@ -47,7 +48,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(realpath -m "${1:-$ROOT/dist}")"
-VERSION="$(cat "$ROOT/packaging/VERSION")"
+VERSION="${D4R_VERSION:-$(cat "$ROOT/packaging/VERSION")}"
+[[ "$VERSION" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo 'invalid D4R_VERSION' >&2; exit 2; }
 case "${D4R_BUNDLE_NVIDIA:-installer}" in
   installer) VARIANT=installer ;;
   1) VARIANT=full ;;
@@ -161,6 +163,11 @@ if [[ "$VARIANT" != clean ]]; then
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
+# every variant: uninstall.sh where install.sh goes (the game folder; ASI: the plugin's d4r folder)
+uninstaller_dir="$STAGE"
+[[ "$INSTALL_MODE" != asi ]] || uninstaller_dir="$STAGE/d4r"
+cp "$ROOT/uninstall.sh" "$uninstaller_dir/uninstall.sh"
+chmod +x "$uninstaller_dir/uninstall.sh"
 if [[ -n "${D4R_BUNDLE_ENGINE:-}" ]]; then
   for f in input_k.spv output_k.spv exposure_k0.spv exposure_k1.spv; do
     [[ -f "$D4R_BUNDLE_ENGINE/$f" ]] || { echo "D4R_BUNDLE_ENGINE lacks $f (run engine/compile_k.py)" >&2; exit 2; }

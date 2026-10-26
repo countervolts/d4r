@@ -1,6 +1,7 @@
 // vkhip: run native AMDGPU (HIP code object) kernels as Vulkan compute pipelines on RADV, unchanged.
 //
-// A HIP kernel on gfx11 starts with its kernarg pointer in s[0:1] (two user SGPRs), the workgroup ids after
+// A HIP kernel on gfx11 starts with its kernarg pointer in s[0:1] (two user SGPRs; on gfx1100/gfx1102 LLVM pads
+// them to 16 user + system SGPRs for a wave32 init bug, which the kernel's own rsrc2 keeps), the workgroup ids after
 // them, packed thread ids in v0, and reaches its globals PC-relative (s_getpc_b64 + s_add_u32 + s_addc_u32).
 // A RADV compute shader whose only interface is one 64-bit push constant gets exactly that SGPR layout
 // (gfx11 compute declares no ring offsets; the push constant is inlined into the first user SGPRs). So:
@@ -26,7 +27,7 @@ namespace vkhip {
 struct Kernel {
     std::string name;
     uint64_t entry = 0;  // virtual address
-    uint32_t lds = 0, scratch = 0, kernarg = 0, rsrc1 = 0, rsrc2 = 0, rsrc3 = 0, props = 0;
+    uint32_t lds = 0, scratch = 0, kernarg = 0, rsrc1 = 0, rsrc2 = 0, rsrc3 = 0, props = 0, preload = 0;
 };
 
 struct Global { uint64_t va = 0, size = 0; };
@@ -35,6 +36,7 @@ struct Global { uint64_t va = 0, size = 0; };
 struct Module {
     std::vector<uint8_t> text;
     uint64_t textVa = 0;
+    uint32_t mach = 0;                // EF_AMDGPU_MACH_* (gfx1100 0x41, gfx1101 0x46, gfx1102 0x47, gfx1103 0x44)
     uint64_t dataLo = 0, dataHi = 0;  // the .data/.bss range
     std::vector<uint8_t> dataInit;    // initial contents of [dataLo, dataHi)
     std::map<std::string, Kernel> kernels;
@@ -48,6 +50,9 @@ struct Module {
     // .text with every data site redirected to dataAddress + (target - dataLo)
     std::vector<uint32_t> patchedText(uint64_t dataAddress) const;
 };
+
+// The ELF machine of code objects for a KFD gfx_target_version (110001 = gfx1101); 0 outside RDNA3.
+uint32_t gfx11Mach(uint32_t gfxTargetVersion);
 
 // Vulkan entry points (device-level) the injector needs.
 struct Device {

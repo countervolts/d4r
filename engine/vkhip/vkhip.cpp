@@ -2,6 +2,7 @@
 #include "vkhip.h"
 #include "donor_spv.h"
 #include <algorithm>
+#include <bit>
 
 namespace vkhip {
 namespace {
@@ -33,10 +34,21 @@ bool sop2Literal(uint32_t w, uint32_t op, uint32_t reg) {
 
 } // namespace
 
+uint32_t gfx11Mach(uint32_t gfxTargetVersion) {
+    switch (gfxTargetVersion) {
+    case 110000: return 0x41;  // gfx1100
+    case 110001: return 0x46;  // gfx1101
+    case 110002: return 0x47;  // gfx1102
+    case 110003: return 0x44;  // gfx1103
+    default: return 0;
+    }
+}
+
 bool Module::parse(const std::vector<uint8_t>& f) {
+    mach = f.size() >= 64 ? rd<uint32_t>(f, 48) & 255 : 0;
     if (f.size() < 64 || std::memcmp(f.data(), "\x7f" "ELF", 4) || f[4] != 2 || f[5] != 1 ||
-        rd<uint16_t>(f, 18) != 224 || (rd<uint32_t>(f, 48) & 255) != 0x46) {
-        error = "requires a little-endian gfx1101 AMDGPU ELF64 code object"; return false;
+        rd<uint16_t>(f, 18) != 224 || (mach != 0x41 && mach != 0x46 && mach != 0x47 && mach != 0x44)) {
+        error = "requires a little-endian gfx1100-gfx1103 AMDGPU ELF64 code object"; return false;
     }
     const uint64_t shoff = rd<uint64_t>(f, 0x28);
     const uint16_t shentsize = rd<uint16_t>(f, 0x3a), shnum = rd<uint16_t>(f, 0x3c), shstrndx = rd<uint16_t>(f, 0x3e);
@@ -99,7 +111,7 @@ bool Module::parse(const std::vector<uint8_t>& f) {
             k.lds = rd<uint32_t>(f, o); k.scratch = rd<uint32_t>(f, o + 4); k.kernarg = rd<uint32_t>(f, o + 8);
             k.entry = value + uint64_t(rd<int64_t>(f, o + 16));
             k.rsrc3 = rd<uint32_t>(f, o + 44); k.rsrc1 = rd<uint32_t>(f, o + 48); k.rsrc2 = rd<uint32_t>(f, o + 52);
-            k.props = rd<uint16_t>(f, o + 56);
+            k.props = rd<uint16_t>(f, o + 56); k.preload = rd<uint16_t>(f, o + 58);
             kernels[k.name] = k;
         } else if ((info & 0xf) == 1 /* STT_OBJECT */) {
             globals[name] = Global{value, size};
@@ -129,7 +141,14 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     }
     for (const auto& [name, k] : kernels) {
         if (k.entry < textVa || k.entry >= textVa + this->text.size() || (k.entry - textVa) % 4) { error = name + ": entry outside .text"; return false; }
-        if (((k.rsrc2 >> 1) & 0x1f) != 2) { error = name + ": not a kernarg-only kernel (user SGPRs != 2)"; return false; }
+        // Only the kernarg pointer (s[0:1]) is enabled and nothing is preloaded: any further user SGPRs are
+        // LLVM's UserSGPRInit16Bug padding (gfx1100/gfx1102), unread, and the kernel's rsrc2 places its
+        // workgroup ids after them.
+        const uint32_t user = (k.rsrc2 >> 1) & 0x1f;
+        const uint32_t ids = uint32_t(std::popcount((k.rsrc2 >> 7) & 0xfu));  // tgid x/y/z, tg size (not the wave offset)
+        if ((k.props & 0x7f) != (1u << 3) || (k.preload & 0x7f) || user < 2 || (user > 2 && user + ids != 16)) {
+            error = name + ": not a kernarg-only kernel"; return false;
+        }
         if (!(k.props & (1u << 10))) { error = name + ": not wave32"; return false; }
     }
     return true;

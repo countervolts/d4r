@@ -155,6 +155,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                                   if line.startswith('DLSS_SHA256=') else line
                                   for line in installer.splitlines()) + '\n'
             (repo / 'install.sh').write_text(installer)
+            shutil.copy2(ROOT / 'uninstall.sh', repo / 'uninstall.sh')
             license_path = fixture(inputs / 'license.txt')
             for name in ('LICENSE-APACHE', 'LICENSE-MIT', 'ext/llvm-project/llvm/LICENSE.TXT', 'LICENSE', 'COPYING'):
                 fixture(inputs / 'source' / name)
@@ -206,6 +207,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertEqual(cfg['fakenvapi']['UseFakenvapi'], 'false')
                             self.assertNotIn('d4r/d4r_nvapi64.dll', archive.namelist())
                             self.assertNotIn('d4r/fakenvapi.dll', archive.namelist())
+                            self.assertIn('uninstall.sh', archive.namelist())
                             for dependency in ('d4r-features.py', 'licenses/XeSS-LICENSE.txt', 'source/optiscaler.json'):
                                 self.assertIn('d4r/' + dependency, archive.namelist())
                             configs.append(data)
@@ -224,6 +226,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertEqual(archive.read('d4r.asi'), archive.read('d4r/nvngx.dll'))
                             self.assertIn('d4r/d4r-setup.exe', archive.namelist())
                             self.assertEqual('d4r/install.sh' in archive.namelist(), bundled == 'installer')
+                            self.assertIn('d4r/uninstall.sh', archive.namelist())
                             if bundled != 'installer':
                                 self.assertFalse(any(n.endswith('.py') and n != 'd4r/d4r-features.py'
                                                      for n in archive.namelist()))

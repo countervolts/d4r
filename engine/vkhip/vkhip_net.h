@@ -6,6 +6,7 @@ namespace vkhip {
 struct NetFiles {
     std::vector<uint8_t> hipnet;
     std::map<std::string, std::vector<uint8_t>> code;
+    uint32_t mach = 0;  // the render GPU's EF_AMDGPU_MACH_* (gfx11Mach); 0: any, as long as all layers agree
 };
 class KNetwork {
 public:

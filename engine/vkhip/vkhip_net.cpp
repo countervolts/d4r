@@ -138,6 +138,9 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
         auto it = files.code.find(names[i]);
         if (it == files.code.end()) { error = names[i] + ".hsaco missing"; return false; }
         if (!modules[i].parse(it->second)) { error = names[i] + ": " + modules[i].error; return false; }
+        if (modules[i].mach != (files.mach ? files.mach : modules[0].mach)) {
+            error = names[i] + ".hsaco was built for another GPU (rebuild the engine models)"; return false;
+        }
     }
 
     // the pooled layout: tokens, head, weights, activations, per-module globals, kernarg blocks

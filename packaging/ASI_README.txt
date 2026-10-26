@@ -58,7 +58,7 @@ archives already include them. Internet access and NVIDIA's license terms apply:
   https://github.com/NVIDIA/DLSS/blob/v310.7.0/LICENSE.txt
   https://www.nvidia.com/en-us/drivers/nvidia-license/
 
-Use GE-Proton 11 with these Steam launch options:
+Use a Proton version (tested: GE-Proton11-3) with these Steam launch options:
   PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
 Keep PROTON_USE_OPTISCALER for Proton's built-in OptiScaler. Remove it only when
 using a separate game-local OptiScaler install.
@@ -72,10 +72,11 @@ active. HookOriginalNvngxOnly=true keeps the internal NVIDIA core load separate.
 CUDA/GPU initialization stays lazy until NGX Init. Installation and loader tests
 do not prove successful rendering in a game; native Vulkan remains experimental.
 
-Uninstall: close the game and setup helper, restore your OptiScaler.ini backup beside its loader and
-the D3D12 backups beside the EXE (or delete this setup's D3D12 files if none existed
-before), then remove only d4r.asi and this d4r folder from the plugins directory.
-Keep your existing OptiScaler loader and other plugins.
+Uninstall: close the game and run bash d4r/uninstall.sh (--dry-run lists the changes first).
+It restores the game's own d3d12.dll from its .d4r-backup (or removes setup's D3D12 files if
+none existed before), sets OptiScaler.ini's [Libraries] NvngxPath back to auto where it points
+at this d4r.asi (keeping a backup), and removes only d4r.asi and this d4r folder. Your
+OptiScaler loader, its other settings and other plugins stay.
 
 d4r is GPL-3.0-only. Third-party notices and provenance are in d4r/licenses/ and
 d4r/source/SOURCES.txt. NVIDIA files and derived kernels have separate terms.

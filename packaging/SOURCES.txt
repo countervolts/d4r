@@ -11,6 +11,9 @@ Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
   d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
                          (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
   d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
+  Experimental vkhip: engine/vkhip/ and the opt-in in tools/d4r_nvngx_shim.cpp.
+                         The donor is built from engine/vkhip/donor.comp; native code objects and
+                         model weights are runtime inputs, not embedded in these sources.
 @installer   install.sh           downloads and verifies NVIDIA DLLs; no driver installation. Then builds the engine's
 @installer                        models from them with d4r/tools/build-engine-models.sh
 @installer   d4r/tools/models/    d4r's engine-model compilers and shader sources (engine/, kernels/tools, kernels/rr,

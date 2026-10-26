@@ -771,13 +771,12 @@ static void load_portable_config()
         portable_set("D4R_ENGINE", on ? "1" : "0");
         // auto leaves K on the native kernels on RDNA3: K's Vulkan network is slower there (2026-10-17, 7700 XT,
         // 1706x960 -> 1440p: 3.59 ms vs 2.35 ms dlss_gpu). RDNA4 keeps K on the engine (engine_k_refused).
-        // Enabled = true, or Network = hip with a model that has the HIP layers, keeps it on every GPU.
+        // Enabled = true, or Network = hip with a model that has the HIP layers, keeps it on every GPU; vkhip
+        // (the native layers inside the game's command list, faster than both) takes K there when it loads.
         if (enabled.empty() || enabled == "auto")
             portable_set("D4R_ENGINE_K", "0");
     }
-    const bool experimentalVkHip = ini_flag(ini, "engine", "ExperimentalVkHip", 0) != 0;
-    portable_set("D4R_ENGINE_VKHIP", experimentalVkHip ? "1" : "0");
-    if (experimentalVkHip) portable_set("D4R_ENGINE_K", "1");
+    portable_set("D4R_ENGINE_VKHIP", ini_flag(ini, "engine", "ExperimentalVkHip", 1) ? "1" : "0");
     if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
         portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
     // Network: the network on the engine's Vulkan shader ("vulkan", and the default: "auto") or on the native HIP
@@ -9414,10 +9413,17 @@ static bool engine_requested()
 // network, on RDNA2 (no f16 matrix tuple) they emulate WMMA and on RDNA4 (FP8 matrix tuple) the engine is faster
 // (2026-10-21, RX 9070 XT, preset K HDR: 1920x1080 -> 3840x2160 2.93 ms vs 9.19 ms, 960x540 -> 1920x1080 0.95 ms
 // vs 4.35 ms on the game queue). Needs init_engine_vulkan.
-static bool engine_k_refused()
+static bool engine_k_native_rdna3()
 {
     return env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip" && g_vk.matrixF16 &&
            !g_vk.float8;
+}
+
+// ... except through vkhip (on by default): there K runs on the engine when vkhip loads, and on the native
+// kernels when it does not (engine_evaluate).
+static bool engine_k_refused()
+{
+    return engine_k_native_rdna3() && env_uint("D4R_ENGINE_VKHIP", 1) == 0;
 }
 
 // Presets M and L on the engine's v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp): on GPUs without FP8 and
@@ -11136,30 +11142,64 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
 static bool create_engine_vkhip(Feature& feature, const std::string& directory,
                                 size_t tokenBytes, size_t headBytes)
 {
-    if (env_uint("D4R_ENGINE_VKHIP", 0) == 0) return false;
+    if (env_uint("D4R_ENGINE_VKHIP", 1) == 0) return false;
     auto unavailable = [&](const std::string& reason) {
         logf("experimental vkhip unavailable: %s; using the standard engine network", reason.c_str());
         return false;
     };
-    // Device IDs can be spoofed by Proton/OptiScaler. Authenticate the actual
-    // render adapter's PCI identity before injecting gfx1101 machine code.
+    // Device IDs can be spoofed by Proton/OptiScaler. Authenticate the actual render adapter before injecting
+    // gfx11 machine code: its PCI vendor, then the gfx target of the amdgpu KFD node at the same PCI address.
     const std::string pci = env_string("D4R_RENDER_PCI");
-    std::string vendor, device;
-    // sysfs reports a synthetic file size; read its short value directly.
-    auto pciValue = [](const std::wstring& path, std::string& value) {
+    // sysfs reports a synthetic file size; read until the end.
+    auto sysfs = [](const std::wstring& path, std::string& value) {
         HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                   nullptr, OPEN_EXISTING, 0, nullptr);
         if (file == INVALID_HANDLE_VALUE) return false;
-        char bytes[64]{}; DWORD count = 0;
-        bool ok = ReadFile(file, bytes, sizeof(bytes), &count, nullptr) && count != 0;
+        value.clear();
+        char bytes[4096]; DWORD count = 0;
+        while (value.size() < 65536 && ReadFile(file, bytes, sizeof(bytes), &count, nullptr) && count != 0)
+            value.append(bytes, count);
         CloseHandle(file);
-        if (ok) value.assign(bytes, count);
-        return ok;
+        return !value.empty();
     };
-    if (pci.empty() || !pciValue(widen("Z:\\sys\\bus\\pci\\devices\\" + pci + "\\vendor"), vendor) ||
-        !pciValue(widen("Z:\\sys\\bus\\pci\\devices\\" + pci + "\\device"), device) ||
-        std::strtoul(vendor.c_str(), nullptr, 0) != 0x1002 || std::strtoul(device.c_str(), nullptr, 0) != 0x747e)
-        return unavailable("the physical render adapter is not verified gfx1101");
+    // "key value" lines of a KFD properties file
+    auto property = [](const std::string& text, const char* key, unsigned long long& value) {
+        const std::string want = std::string(key) + " ";
+        for (size_t at = 0; at < text.size();) {
+            const size_t end = std::min(text.find('\n', at), text.size());
+            if (text.compare(at, want.size(), want) == 0) {
+                value = std::strtoull(text.c_str() + at + want.size(), nullptr, 0);
+                return true;
+            }
+            at = end + 1;
+        }
+        return false;
+    };
+    std::string vendor;
+    unsigned domain = 0, bus = 0, slot = 0, function = 0;
+    if (pci.empty() || std::sscanf(pci.c_str(), "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4 ||
+        !sysfs(widen("Z:\\sys\\bus\\pci\\devices\\" + pci + "\\vendor"), vendor) ||
+        std::strtoul(vendor.c_str(), nullptr, 0) != 0x1002)
+        return unavailable("the physical render adapter is not a verified AMD GPU");
+    uint32_t target = 0;
+    const std::wstring nodes = L"Z:\\sys\\class\\kfd\\kfd\\topology\\nodes\\";
+    WIN32_FIND_DATAW node{};
+    HANDLE find = FindFirstFileW((nodes + L"*").c_str(), &node);
+    for (bool more = find != INVALID_HANDLE_VALUE; more && !target; more = FindNextFileW(find, &node)) {
+        if (node.cFileName[0] == L'.') continue;
+        std::string text;
+        unsigned long long location = 0, nodeDomain = 0, version = 0;
+        if (sysfs(nodes + node.cFileName + L"\\properties", text) && property(text, "location_id", location) &&
+            property(text, "gfx_target_version", version) && location == ((bus << 8) | (slot << 3) | function) &&
+            (!property(text, "domain", nodeDomain) || nodeDomain == domain))
+            target = static_cast<uint32_t>(version);
+    }
+    if (find != INVALID_HANDLE_VALUE) FindClose(find);
+    if (!target) return unavailable("no amdgpu KFD node for the render adapter " + pci);
+    const uint32_t mach = vkhip::gfx11Mach(target);
+    char gfx[16];
+    std::snprintf(gfx, sizeof(gfx), "gfx%u%u%x", target / 10000, target / 100 % 100, target % 100);
+    if (!mach) return unavailable(std::string("requires an RDNA3 GPU (gfx1100-gfx1103), not ") + gfx);
     auto properties = g_vk.instanceProc ? reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
         g_vk.instanceProc(g_vk.instance, "vkGetPhysicalDeviceProperties2")) : nullptr;
     if (!properties || !g_vk.deviceProc) return unavailable("Vulkan device properties unavailable");
@@ -11180,6 +11220,7 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
         return ok;
     };
     vkhip::NetFiles files;
+    files.mach = mach;
     if (!load(widen(directory + "/hipnet.bin"), files.hipnet)) return unavailable("missing hipnet.bin");
     for (const char* layer : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
         const std::string name = std::string("dltss_pwin_") + layer + "_layer";
@@ -11190,8 +11231,8 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     std::string error;
     if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
                          feature.outHeight, tokenBytes, headBytes, error)) return unavailable(error);
-    logf("experimental vkhip ready: %u native dispatches, shared image-format adapter, regular/inverted depth",
-         network->dispatchesPerFrame());
+    logf("experimental vkhip ready on %s: %u native dispatches, shared image-format adapter, regular/inverted depth",
+         gfx, network->dispatchesPerFrame());
     feature.engineVkHip = std::move(network);
     return true;
 }
@@ -11350,7 +11391,10 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
             const size_t headBytes = static_cast<size_t>(d4r::Engine::networkHeadBytes(feature.outWidth, feature.outHeight));
             const std::string& directory = ldr ? g_engine.directoryLdr : g_engine.directory;
             const bool vkhip = create_engine_vkhip(feature, directory, tokenBytes, headBytes);
-            const bool hip = !vkhip && env_uint("D4R_ENGINE_VKHIP", 0) == 0 &&
+            if (!vkhip && engine_k_native_rdna3())
+                return refuse("vkhip is unavailable, and [Engine] Enabled = auto keeps K on the native kernels on "
+                              "RDNA3 (faster than the Vulkan network)");
+            const bool hip = !vkhip &&
                 create_engine_network(feature, directory, "K", true,
                                       feature.outWidth, feature.outHeight, tokenBytes, headBytes);
             const d4r::ExternalNetwork external = vkhip ?

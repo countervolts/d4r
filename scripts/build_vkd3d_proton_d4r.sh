@@ -38,7 +38,7 @@ if [[ "${D4R_VKD3D_FSR_RR:-0}" == 1 ]]; then
   EXTRA=(-Denable_extended_emulation=true)
 fi
 [[ -d "$BUILD" ]] || meson setup --cross-file "$SRC/build-win64.txt" --buildtype release -Denable_tests=false "${EXTRA[@]}" "$BUILD" "$SRC"
-ninja -C "$BUILD"
+ninja -j "${D4R_BUILD_JOBS:-4}" -C "$BUILD"
 mkdir -p "$OUT"
 x86_64-w64-mingw32-strip -o "$OUT/d3d12.dll" "$BUILD/libs/d3d12/d3d12.dll"
 x86_64-w64-mingw32-strip -o "$OUT/d3d12core.dll" "$BUILD/libs/d3d12core/d3d12core.dll"

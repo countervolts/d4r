@@ -132,11 +132,16 @@ Leave `D4R_SHIM_VRAM_VERIFY`, `D4R_SHIM_ALPHA_VERIFY` and output capture disable
 
 ```sh
 scripts/fetch_rocm_runtime.sh         # -> ~/.cache/d4r-rocm-runtime (AMD's ROCm 7.2.4 runtime, checksummed)
-D4R_OPTISCALER=/path/to/OptiScaler_0.9.4.7z \
 D4R_DLSS_DLLS=/path/to/310.7/nvngx_dlss.dll:/path/to/310.9/nvngx_dlss.dll \
 D4R_ZLUDA_DIR=~/.cache/d4r-zluda-current D4R_VKD3D_DIR=~/.cache/d4r-vkd3d-d4r D4R_ROCM_DIR=/opt/rocm \
 scripts/package_release.sh            # -> dist/d4r-<version>.zip
 ```
+
+OptiScaler defaults to the archive pinned in `packaging/optiscaler-release.json`,
+including its frame-generation providers. Set `D4R_OPTISCALER` only for a custom
+v10 archive or extracted folder. To name a nightly without changing the stable
+version file, set `D4R_VERSION=0.1.5-nightly.20261024`. The layout and installer
+are the same as the normal release; `ExperimentalVkHip` is true by default.
 
 Set `D4R_INSTALL_MODE=asi` to build `d4r-<version>-asi.zip` for an existing
 game-local OptiScaler installation. Its only top-level entries are `d4r.asi`

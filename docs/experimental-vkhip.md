@@ -1,24 +1,28 @@
 # Experimental vkhip network
 
-`[Engine] ExperimentalVkHip = false` is the shipped default. To opt into native
-preset-K HIP kernels recorded inside the game's Vulkan command list:
+`[Engine] ExperimentalVkHip = true` is the shipped default: preset K runs its
+native HIP kernels recorded inside the game's Vulkan command list. With
+`Enabled = auto` on RDNA3, K uses vkhip when it loads and otherwise stays on the
+native kernels (the engine's Vulkan network is slower there). With
+`Enabled = true`, K falls back to the engine's Vulkan network instead.
 
 ```ini
 [Engine]
-Enabled = true
-ExperimentalVkHip = true
-Network = vulkan
+ExperimentalVkHip = false   ; turn it off
 ```
 
-`D4R_ENGINE_VKHIP=0|1` overrides the INI. The explicit opt-in also enables K when
-`Enabled=auto` would leave K on the normal CUDA path. `Enabled=false` still
-turns the engine off. Other presets retain their existing routes.
+`D4R_ENGINE_VKHIP=0|1` overrides the INI. `Enabled=false` still turns the engine
+off. Other presets retain their existing routes.
 
-The experimental loader currently requires a physically verified gfx1101
-adapter (PCI device 1002:747e), Mesa RADV and compatible gfx1101 code objects.
-It verifies the driver's cached shader layout before replacing code. A missing
-model, unsupported device, or incompatible code object leaves the ordinary
-engine network available and logs the reason. The model needs its original
+The experimental loader requires an RDNA3 GPU (gfx1100, gfx1101, gfx1102 or
+gfx1103), Mesa RADV and code objects built for that GPU. It identifies the real
+render adapter from sysfs (its PCI vendor and the amdgpu KFD node at its PCI
+address), so spoofed device IDs do not matter. `build_engine_models.sh` packages
+the shipped `kernels/<gfx>/` layers for the GPU it runs on; after changing GPUs,
+rebuild the engine models. It verifies the driver's cached shader layout before
+replacing code. A missing model, unsupported device, or code object for another
+GPU leaves the ordinary engine network available and logs the reason. Only
+gfx1101 (RX 7700 XT) has been tested on hardware. The model needs its original
 `hipnet.bin` and `hip/dltss_pwin_*_layer.hsaco` files. It uses original native
 network instructions and weights; it does not run HIP on another queue.
 

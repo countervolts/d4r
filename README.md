@@ -62,6 +62,8 @@ Both are on by default; `[OptiScaler] FollowPresets` and `Fsr4` in `d4r.ini` tur
 Change OptiScaler settings and use **Save INI** normally. Steam launches use the
 saved INI; d4r's ASI setup also preserves your choices after initial installation.
 
+The [vkhip backend](docs/experimental-vkhip.md) runs preset K on RDNA3 and is on by default.
+
 Experimental [XeFG/FSR frame generation and XeLL/Anti-Lag latency conversion](docs/frame-generation.md)
 are bundled in the `OptiScaler/` folder. Enable FG in OptiScaler’s Insert menu or use the
 per-game setup command with INI backups. Fresh installs keep FG off. The pinned v10
@@ -101,7 +103,7 @@ The shim keeps the game's inputs and output in VRAM through vkd3d-proton's Vulka
 
 1. Extract `d4r-<version>.zip` into the folder that holds the game's main `.exe` (OptiScaler 10.0.0-pre1 as `dxgi.dll`, its `OptiScaler/` dependencies, the d4r-patched vkd3d-proton, AMD's FSR files and the `d4r` folder).
 2. Run `bash install.sh` there. It downloads NVIDIA's DLSS and NGX files from NVIDIA, checks their SHA-256 hashes and puts them in `d4r/`. Needs Bash, curl, sha256sum and 7-Zip; no sudo, ROCm not required.
-3. In Steam, select GE-Proton 11 for the game and set the launch options `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
+3. In Steam, select a Proton version for the game (most work; tested: GE-Proton11-3) and set the launch options `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
 
 When updating, replace `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together. Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)). The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt).
 

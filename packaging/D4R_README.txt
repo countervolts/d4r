@@ -28,7 +28,8 @@ What you need
   the Steam Deck has been tested.
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
-- GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
+- Proton, selected for the game in Steam. Most versions work; tested: GE-Proton11-3. GE-Proton also
+  supplies AMD's FSR 4 library for FSR 4.1.
 @installer - Internet access, Bash, curl, sha256sum and 7-Zip to run the included install.sh, and python3
 @installer   with numpy for the engine models it builds. NVIDIA DLLs are downloaded during installation,
 @installer   under NVIDIA's terms.
@@ -67,8 +68,8 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @installer    download. install.sh then asks whether to set up d4r's own DLSS engine (recommended: faster,
 @installer    lower latency). That builds the engine's models in d4r/engine from the DLLs: Ray Reconstruction
 @installer    D, E and F straight from nvngx_dlssd.dll, and Super Resolution K, M and L (with their LDR
-@installer    variants) by rendering one test frame per model through d4r under GE-Proton 11, found in Steam's
-@installer    compatibility tools (or set D4R_PROTON=/path/to/GE-Proton11-3). It takes a minute or two once;
+@installer    variants) by rendering one test frame per model through d4r under a Proton found in Steam
+@installer    (GE-Proton11-3 first, or set D4R_PROTON=/path/to/proton-folder). It takes a minute or two once;
 @installer    the models are kept in ~/.cache/d4r/engine-models for the next game. bash install.sh --help lists
 @installer    options for scripted installs.
 @installer    RR D/E also have separate gfx11 models; devices without compatible matrix support retain CUDA
@@ -78,7 +79,7 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @installer 3. In Steam, open the game's Properties:
 @clean 3. In Steam, open the game's Properties:
 @full 2. In Steam, open the game's Properties:
-   - Compatibility: force GE-Proton11-3.
+   - Compatibility: force a Proton version (tested: GE-Proton11-3).
    - Launch options:
        PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
 @installer 4. Optional: check the install from a terminal in that folder:
@@ -149,6 +150,15 @@ Settings
   launcher uses a different working directory, use the shim's absolute Windows filename instead.
 
 Each game has its own copy of both files.
+
+vkhip (preset K, RDNA3/RADV): [Engine] ExperimentalVkHip=true is the release
+default. With the local K model's hipnet.bin and hip/ files present (install.sh
+builds them on RDNA3), it runs the native K kernels inside the game's Vulkan
+command list; without them, Enabled=auto keeps K on the native kernels. The ordinary engine image adapter handles regular
+and inverted depth and supported color/motion/output formats. This uses the
+existing Vulkan image-stage numerics, not the deleted exact prototype's stages;
+full CUDA output identity and in-game FG compatibility are not claimed.
+Unsupported hardware/code objects use the ordinary network with a log message.
 
 
 Performance
@@ -231,9 +241,12 @@ If something goes wrong
 
 Uninstall
 ---------
-Delete dxgi.dll, OptiScaler.ini, OptiScaler.log (if present), d3d12.dll, d3d12core.dll,
-D4R_README.txt, install.sh (if present), the OptiScaler folder and the d4r folder from the game folder, and clear the launch options. The kernel
-cache in ~/.cache/d4r can be deleted too; it also holds install.sh's copies of the NVIDIA DLLs and the engine models.
+Close the game and run bash uninstall.sh in the game folder. It lists what it will remove and asks first
+(--dry-run only lists it). It removes only d4r's files: dxgi.dll, OptiScaler.ini, OptiScaler.log, the
+OptiScaler folder, d3d12.dll, d3d12core.dll, D4R_README.txt, install.sh, uninstall.sh and the d4r folder;
+a dxgi.dll or d3d12.dll that is not d4r's is kept. It then asks whether to delete the shared cache in
+~/.cache/d4r (install.sh's copies of the NVIDIA DLLs, the engine models and the compiled kernels; other
+games with d4r reuse it; --purge-cache deletes it without asking). Clear the launch options afterwards.
 
 
 Licenses

@@ -10,20 +10,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShimConfigTests(unittest.TestCase):
-    def test_vkhip_is_explicit_opt_in_and_environment_takes_precedence(self):
+    def test_vkhip_is_on_by_default_and_environment_takes_precedence(self):
         for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
             config = configparser.ConfigParser(inline_comment_prefixes=(';',))
             config.read(ROOT / name)
-            self.assertFalse(config.getboolean('Engine', 'ExperimentalVkHip'))
+            self.assertTrue(config.getboolean('Engine', 'ExperimentalVkHip'))
         with tempfile.TemporaryDirectory() as directory:
             ini=Path(directory)/'d4r.ini'
             env={k:v for k,v in os.environ.items() if not k.startswith('D4R_')}
             command=['python3',str(ROOT/'scripts/d4r_config.py'),'--config',str(ini)]
-            for value,want in (('false','0'),('true','1')):
-                ini.write_text('[Engine]\nEnabled=true\nExperimentalVkHip='+value+'\n')
+            for text,want in (('[Engine]\nEnabled=true\nExperimentalVkHip=false\n','0'),
+                              ('[Engine]\nEnabled=true\nExperimentalVkHip=true\n','1'),('','1'),
+                              ('[Engine]\nEnabled=auto\n','1')):
+                ini.write_text(text)
                 result=subprocess.run(command,env=env,text=True,capture_output=True,check=True)
                 self.assertIn('export D4R_ENGINE_VKHIP='+want+'\n',result.stdout)
-                if value=='true':self.assertIn('export D4R_ENGINE_K=1\n',result.stdout)
+                # vkhip does not force K onto the engine: auto still leaves the RDNA3 fallback to the shim
+                self.assertNotIn('export D4R_ENGINE_K=1\n',result.stdout)
             result=subprocess.run(command,env=dict(env,D4R_ENGINE_VKHIP='0'),text=True,capture_output=True,check=True)
             self.assertNotIn('export D4R_ENGINE_VKHIP=',result.stdout)
             ini.write_text('[Engine]\nExperimentalVkHip=invalid\n')

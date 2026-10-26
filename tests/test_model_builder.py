@@ -17,6 +17,26 @@ spec.loader.exec_module(model_tools)
 
 
 class ModelBuildTests(unittest.TestCase):
+    def test_model_install_preserves_native_kernel_subdirectories(self):
+        text = (ROOT / 'packaging/build_engine_models.sh').read_text()
+        start = text.index('place() {')
+        function = text[start:text.index('\nmodel_files()', start)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'built'
+            (source / 'hip').mkdir(parents=True)
+            (source / 'model.json').write_text('{"format":"fixture"}')
+            (source / 'hipnet.bin').write_bytes(b'local weight fixture')
+            (source / 'hip/layer.hsaco').write_bytes(b'native code fixture')
+            prefix = 'set -euo pipefail\nRUNTIME=$1/runtime; WORK=$1/work; MODEL_TOOLS=$2\n'
+            subprocess.run(['bash', '-c', prefix + function + '\nplace k "$1/built" model.json hipnet.bin hip\n',
+                            '_', temporary, str(ROOT / 'packaging/model_tools.py')], check=True,
+                           capture_output=True, text=True)
+            installed = root / 'runtime/engine/k'
+            self.assertEqual((installed / 'hip/layer.hsaco').read_bytes(), b'native code fixture')
+            self.assertEqual((installed / 'hipnet.bin').read_bytes(), b'local weight fixture')
+            model_tools.manifest(installed)
+
     def test_installer_key_tracks_model_arithmetic_options(self):
         text = (ROOT / 'install.sh').read_text()
         key = text[text.index('key() {'):text.index('have() {')]

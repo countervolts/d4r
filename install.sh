@@ -25,8 +25,8 @@ usage() {
     '   driver 596.36 (~1 GiB, once: verified copies are kept in ~/.cache/d4r/nvidia).' \
     '2. Builds the native engine'"'"'s models from those DLLs into d4r/engine (once per DLL set and builder version:' \
     '   ~/.cache/d4r/engine-models). Faster on RDNA4; d4r.ini [Engine] Enabled = auto uses it.' \
-    'Requires Bash, curl, sha256sum, 7zz/7z/7za, python3 with numpy, and GE-Proton 11 in Steam (or' \
-    'D4R_PROTON=/path/to/GE-Proton11-3). No sudo needed. NVIDIA license terms apply. D4R_CACHE_DIR moves the cache.'
+    'Requires Bash, curl, sha256sum, 7zz/7z/7za, python3 with numpy, and a Proton in Steam (or' \
+    'D4R_PROTON=/path/to/proton-folder). No sudo needed. NVIDIA license terms apply. D4R_CACHE_DIR moves the cache.'
 }
 DO_DLLS=1 DO_ENGINE=ask EXACT=ask REBUILD=0 YES=0
 while [[ $# -gt 0 ]]; do
@@ -199,8 +199,7 @@ if [[ "$DO_ENGINE" == ask ]]; then
   echo '  + Lower latency: the game shows the upscaled result of the frame it just rendered, not an older one.'
   echo '  + No minute-long freeze while DLSS'"'"'s CUDA kernels compile the first time a model is used.'
   echo '  - Longer setup, once: building its models takes a few minutes (it renders a test frame per model'
-  echo '    through GE-Proton) and needs ~300 MB of temporary space. Later installs reuse the models.'
-  echo '  - Slower for K and M on RDNA3; there d4r keeps those two models on its normal path.'
+  echo '    through Proton) and needs ~300 MB of temporary space. Later installs reuse the models.'
   echo '  Without it, d4r uses its normal path; anything the engine does not cover uses that path anyway.'
   if ask 'Set up the engine now?' y; then DO_ENGINE=1; else DO_ENGINE=0; fi
 fi
@@ -227,15 +226,15 @@ else
   flags=(); (( EXACT == 0 )) || flags=(--exact)
   bash "$BUILDER" --rr-only "${flags[@]}" "$RUNTIME" || failed+=('Ray Reconstruction')
   if [[ -z "${D4R_PROTON:-}" && -z "$(bash "$BUILDER" --find-proton)" ]] && interactive; then
-    echo 'The Super Resolution models render one test frame through GE-Proton 11, which was not found in Steam.'
-    read -r -p 'Path to a GE-Proton folder (Enter to skip): ' D4R_PROTON || D4R_PROTON=''
+    echo 'The Super Resolution models render one test frame through Proton, and none was found in Steam.'
+    read -r -p 'Path to a Proton folder (Enter to skip): ' D4R_PROTON || D4R_PROTON=''
     export D4R_PROTON
   fi
   if [[ -n "${D4R_PROTON:-}" || -n "$(bash "$BUILDER" --find-proton)" ]]; then
     bash "$BUILDER" --sr-only "${flags[@]}" "$RUNTIME" || failed+=('Super Resolution')
   else
     failed+=('Super Resolution')
-    echo 'install.sh: no GE-Proton 11 found for the Super Resolution models.' >&2
+    echo 'install.sh: no Proton found for the Super Resolution models.' >&2
   fi
   if (( ${#failed[@]} )); then
     printf 'install.sh: the engine models for %s were not built (reason above). d4r runs those on its normal path;\n' \

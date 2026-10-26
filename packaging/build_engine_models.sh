@@ -3,15 +3,15 @@
 # the d4r folder. Shipped as d4r/tools/build-engine-models.sh; install.sh runs it.
 #
 # usage: bash d4r/tools/build-engine-models.sh [--rr-only | --sr-only] [--exact] [D4R_FOLDER]
-#        bash d4r/tools/build-engine-models.sh --find-proton      prints the GE-Proton it would use (or nothing)
+#        bash d4r/tools/build-engine-models.sh --find-proton      prints the Proton it would use (or nothing)
 #        bash d4r/tools/build-engine-models.sh --list-sr-models   prints the Super Resolution models it builds here
 #   Ray Reconstruction  engine/rr-d, rr-e, rr-f   from d4r/nvngx_dlssd.dll 310.9.1 alone (about half a minute)
 #   Super Resolution    engine/e, f, k, k-ldr, l, l-ldr, m, m-ldr
 #                       NVIDIA's DLSS keeps these weights packed in nvngx_dlss.dll; they are read where NGX unpacks
 #                       them: the bundled D3D12 test app renders one frame per model through this d4r folder under
-#                       GE-Proton, and the uploads are saved (the frames after the first render at the same time;
+#                       Proton, and the uploads are saved (the frames after the first render at the same time;
 #                       the first run also compiles DLSS's kernels and creates a temporary Proton prefix)
-# Needs python3 with numpy, and for Super Resolution a GE-Proton (D4R_PROTON=/path/to/GE-Proton11-3 to choose one).
+# Needs python3 with numpy, and for Super Resolution a Proton (D4R_PROTON=/path/to/proton-folder to choose one).
 # The models are the fastest builds (this GPU's own arithmetic; engine/README.md). --exact builds NVIDIA's roundings
 # instead: bit-identical to the CUDA path, about 20% slower (K is the same either way).
 # Everything written is derived from NVIDIA's DLLs: it stays in this folder and must not be redistributed.
@@ -31,21 +31,39 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 find_proton() {
-  # a GE-Proton: D4R_PROTON, else GE-Proton11-3 (the tested one), else the newest stock GE-Proton11-N in Steam's
-  # compatibility tools. Renamed or rebuilt variants (2026-10-14: one with a suffix after the version number) can
-  # fail NGX's CUDA initialisation, so they are only used when named.
-  PROTON="${D4R_PROTON:-}"
-  if [[ -z "$PROTON" ]]; then
-    best=-1
-    for d in "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/steam" \
-             "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
-      for p in "$d"/compatibilitytools.d/GE-Proton11-*; do
-        n="${p##*/GE-Proton11-}"
-        [[ -x "$p/proton" && "$n" =~ ^[0-9]+$ ]] || continue
-        if [[ "$n" == 3 ]]; then best=1000; PROTON="$p"; elif (( n > best )); then best=$n; PROTON="$p"; fi
+  # a Proton for the test frames: D4R_PROTON, else GE-Proton11-3 (the tested one), else the newest GE-Proton, else
+  # the newest other Proton in Steam's compatibility tools or libraries (most Proton versions run d4r fine)
+  PROTON="${D4R_PROTON:-}" PROTON_STEAM=''
+  [[ -z "$PROTON" ]] || return 0
+  local d p lib ge=() other=()
+  declare -A root=()
+  for d in "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/steam" \
+           "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+    [[ -d "$d" ]] || continue
+    for p in "$d"/compatibilitytools.d/*; do
+      [[ -x "$p/proton" ]] || continue
+      root[$p]=$d
+      if [[ "${p##*/}" == GE-Proton* ]]; then ge+=("$p"); else other+=("$p"); fi
+    done
+    # Valve's Proton, in every Steam library
+    for lib in "$d" $(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+                      "$d/steamapps/libraryfolders.vdf" 2>/dev/null | tr ' ' '\001'); do
+      lib=$(tr '\001' ' ' <<< "$lib")
+      for p in "$lib"/steamapps/common/Proton*; do
+        [[ -x "$p/proton" ]] || continue
+        root[$p]=$d; other+=("$p")
       done
     done
-  fi
+  done
+  for p in "${ge[@]}"; do [[ "${p##*/}" != GE-Proton11-3 ]] || { PROTON=$p; PROTON_STEAM=${root[$p]}; return 0; }; done
+  for list in ge other; do
+    local -n candidates=$list
+    (( ${#candidates[@]} )) || continue
+    PROTON=$(for p in "${candidates[@]}"; do printf '%s\t%s\n' "${p##*/}" "$p"; done | sort -V | tail -n 1 | cut -f2)
+    PROTON_STEAM=${root[$PROTON]}
+    return 0
+  done
+  return 0
 }
 gpu_arch() {   # the GPU the native kernels are chosen for: D4R_GPU_ARCH, else the KFD node with the most SIMDs
   if [[ -n "${D4R_GPU_ARCH:-}" ]]; then printf '%s\n' "$D4R_GPU_ARCH"; return; fi
@@ -118,7 +136,7 @@ place() {   # place NAME DIR FILE...
   local name=$1 src=$2 dst="$RUNTIME/engine/$1" f
   shift 2
   mkdir -p "$RUNTIME/engine" "$WORK/place/$name"
-  for f in "$@"; do cp -- "$src/$f" "$WORK/place/$name/"; done
+  for f in "$@"; do cp -r -- "$src/$f" "$WORK/place/$name/"; done
   python3 "$MODEL_TOOLS" manifest "$WORK/place/$name"
   rm -rf -- "$dst.new"; mv -- "$WORK/place/$name" "$dst.new"
   rm -rf -- "$dst.old"; [[ ! -e "$dst" ]] || mv -- "$dst" "$dst.old"
@@ -162,8 +180,8 @@ if (( DO_SR )); then
   [[ -f "$RUNTIME/ngx/_nvngx.dll" ]] || fail "missing $RUNTIME/ngx/_nvngx.dll (run install.sh)"
   find_proton
   [[ -n "$PROTON" && -x "$PROTON/proton" ]] ||
-    fail 'no GE-Proton found: set D4R_PROTON=/path/to/GE-Proton11-3 (the folder holding the proton script)'
-  STEAM_ROOT="$(dirname -- "$(dirname -- "$PROTON")")"
+    fail 'no Proton found: set D4R_PROTON=/path/to/proton-folder (the folder holding the proton script)'
+  STEAM_ROOT="${PROTON_STEAM:-$(dirname -- "$(dirname -- "$PROTON")")}"
   [[ -d "$STEAM_ROOT/steamapps" || ! -d "$HOME/.local/share/Steam" ]] || STEAM_ROOT="$HOME/.local/share/Steam"
   # the test app beside the D3D12 pair the game uses (proxy release: the game folder; ASI release: the d4r folder)
   APP="$WORK/app"; mkdir -p "$APP"
@@ -185,7 +203,7 @@ if (( DO_SR )); then
     [[ ! -d "${STUBS:-}" || ( "$1" != l && "$1" != m ) ]] || stub=(D4R_CUDA_REPLACE_DIR="$STUBS")
     # CPU input polling: the replay dump synchronizes and reads device memory at every launch, which the GPU-side
     # input wait does not allow (NGX's output came out empty)
-    printf '  rendering one frame with model %s through d4r (GE-Proton %s)...\n' "$1" "$(basename "$PROTON")"
+    printf '  rendering one frame with model %s through d4r (%s)...\n' "$1" "$(basename "$PROTON")"
     (cd "$APP" && python3 "$MODEL_TOOLS" run --log "$w/run.log" --timeout "${D4R_MODEL_TIMEOUT:-900}" -- \
       env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" STEAM_COMPAT_DATA_PATH="$WORK/prefix" \
       PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='d3d12=n,b;d3d12core=n,b;d4r12core=n,b' \
@@ -227,9 +245,15 @@ if (( DO_SR )); then
   finish k
   run k-extract.log python3 "$KIT/engine/extract_k.py" "$WORK/k/replay" "$WORK/k/model"
   run k-lut.log python3 "$KIT/engine/prepare_k.py" "$WORK/k" "$WORK/k/case" --lut-only
+  # RDNA3 vkhip uses these same captured weights and the shipped native kernels.
+  hip_args=()
+  arch=$(gpu_arch)
+  if [[ "$arch" == gfx110[0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
+    hip_args=(--hip "$RUNTIME/kernels/$arch" --capture "$WORK/k")
+  fi
   for v in k k-ldr; do
     run "$v.log" python3 "$KIT/engine/compile_k.py" "$WORK/k/model" "$WORK/k/case/lut.bin" "$WORK/$v-out" \
-      $([[ $v == k-ldr ]] && echo --ldr)
+      "${hip_args[@]}" $([[ $v == k-ldr ]] && echo --ldr)
     place "$v" "$WORK/$v-out" $(ls "$WORK/$v-out")
   done
   rm -rf -- "$WORK/k"
