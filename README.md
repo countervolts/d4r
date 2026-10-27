@@ -108,6 +108,8 @@ The shim keeps the game's inputs and output in VRAM through vkd3d-proton's Vulka
 
 When updating, replace `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together. Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)). The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt).
 
+Northlight games (Control, Alan Wake 2) keep their original motion vectors by default. Experimental display-resolution motion-vector reconstruction requires `[Interop] NativeMotionVectors = true` in `d4r.ini` and a matching patched driver. It can cause motion artifacts; restart the game after changing it.
+
 ## Building from source
 
 Linux with an RDNA2, RDNA3 or RDNA4 GPU, ROCm 7.2 with HIP and its clang, GE-Proton 11, a Rust toolchain, meson/ninja, `winegcc`, `x86_64-w64-mingw32-g++`, `clang-cl` and Python 3. The full sequence is in [docs/building.md](docs/building.md); `scripts/package_release.sh` builds the release zip.

@@ -390,6 +390,7 @@ static HMODULE g_selfModule = nullptr;
 struct PortableInstall
 {
     bool active = false;
+    bool nativeMotionVectors = false;
     std::wstring dir;                                         // the d4r folder
     std::string unixDir;                                      // the same folder as a Linux path
     std::vector<std::pair<std::string, std::string>> unixEnv; // for the bridge's d4rSetEnv
@@ -789,6 +790,8 @@ static void load_portable_config()
         g_portable.notes.push_back("[Engine] Network must be auto, hip or vulkan; using auto");
 
     portable_set("D4R_SHIM_WATERMARK", ini_flag(ini, "dlss", "ShowWatermark", 0) ? "1" : "0");
+    g_portable.nativeMotionVectors = ini_flag(ini, "interop", "NativeMotionVectors", 0) != 0;
+    portable_set("D4R_NATIVE_MV_LIVE", g_portable.nativeMotionVectors ? "1" : "0");
     portable_set("D4R_MOTION_THIN_SKY", ini_flag(ini, "interop", "MotionDilationThinSky", 0) ? "1" : "0");
     const std::string dilation = ini_value(ini, "interop", "MotionVectorDilation");
     if (dilation.empty() || dilation == "0" || dilation == "1" || dilation == "2")
@@ -4789,7 +4792,8 @@ static void record_native_gpu_check(Feature& feature, ID3D12GraphicsCommandList*
 {
     slot.nativeGpuCheckReady=false;
     slot.nativeLive=false;
-    const bool live=env_uint("D4R_NATIVE_MV_LIVE",0)==1 && !feature.rayReconstruction && (feature.flags&2)!=0;
+    const bool live=(!g_portable.active || g_portable.nativeMotionVectors) &&
+        env_uint("D4R_NATIVE_MV_LIVE",0)==1 && !feature.rayReconstruction && (feature.flags&2)!=0;
     const bool check=env_uint("D4R_NATIVE_MV_GPU_COMPOSE_CHECK",0)==1 && slot.nativeOpaqueCaptureReady &&
         slot.ownedSceneCaptureReady && slot.ownedMatrixCaptureReady && slot.ownedDepthCaptureReady &&
         slot.ownedValidityCaptureReady;
@@ -9135,7 +9139,8 @@ static NgxResult create_cuda_feature(Feature& feature)
             const int startResult = g.cu.eventCreate(&feature.profileStart, 0);
             const int endResult = startResult == 0 ? g.cu.eventCreate(&feature.profileEnd, 0) : -1;
             feature.profileEventsReady = startResult == 0 && endResult == 0;
-            if(feature.profileEventsReady && env_uint("D4R_NATIVE_MV_LIVE",0)==1)
+            if(feature.profileEventsReady && (!g_portable.active || g_portable.nativeMotionVectors) &&
+                env_uint("D4R_NATIVE_MV_LIVE",0)==1)
             {
                 bool ready=true;
                 for(CudaEvent& event:feature.nativePassEvents)

@@ -368,7 +368,13 @@ policy has been enabled. Restart after changing this setting.
 ### Experimental AW2 native motion coverage
 
 The private AW2 driver prototype can feed output-resolution raster motion to
-NGX with `D4R_NATIVE_MV_LIVE=1`. Its live path also uses a thin-silhouette halo:
+NGX with `[Interop] NativeMotionVectors = true` in `d4r.ini`. This Northlight
+experiment is disabled by default: the game's original vectors are retained.
+Enabling it can cause motion artifacts and requires the matching patched driver;
+restart after changing it. With a portable INI present, the INI opt-in is required
+even if an old launch option sets `D4R_NATIVE_MV_LIVE=1`; setting that variable to
+`0` can still disable it. Developer layouts without a portable INI use that variable
+directly. Its live path also uses a thin-silhouette halo:
 `D4R_NATIVE_MV_THIN_HALO=0` selects the original 3x3 native compositor instead.
 The halo extends only sky pixels toward foreground runs shorter than five output
 pixels on at least one axis. Its radius tracks two render pixels, capped at six

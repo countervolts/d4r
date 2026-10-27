@@ -106,6 +106,10 @@ IgnoreDenormals = true
 ImplicitMaxBlock = 256
 
 [Interop]
+; Experimental Northlight (Control / Alan Wake 2) display-resolution motion-vector reconstruction.
+; Default off: keep the game's original vectors. Enabling can cause motion artifacts.
+; Requires the matching patched driver. Restart to change. (D4R_NATIVE_MV_LIVE)
+NativeMotionVectors = false
 ; Experimental foreground motion coverage for thin geometry. 0 = original vectors;
 ; 1/2 = opaque-surface dilation radius in render pixels; both automatically fill sky gaps
 ; from the nearest foreground within 8 render pixels. Needs render- or display-resolution, unjittered motion vectors

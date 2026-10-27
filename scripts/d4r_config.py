@@ -195,6 +195,7 @@ def main(argv):
         if value is not None:
             env[var] = "1" if value else "0"
     value = get("Interop", "MarkerPollUs")
+    env["D4R_NATIVE_MV_LIVE"] = "1" if flag("Interop", "NativeMotionVectors") else "0"
     env["D4R_MOTION_THIN_SKY"] = "1" if flag("Interop", "MotionDilationThinSky") else "0"
     dilation = get("Interop", "MotionVectorDilation")
     if dilation is not None and dilation not in ("0", "1", "2"):
