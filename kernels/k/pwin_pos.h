@@ -49,7 +49,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
             }
 #endif
         }
-        const half_t r16 = half_rsqrt((half_t)ss);
+        const half_t r16 = PWIN_NORM_R16(ss, C, arow);
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt)
         {
@@ -99,7 +99,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
             }
 #endif
         }
-        const half_t r16 = half_rsqrt((half_t)ss);
+        const half_t r16 = PWIN_NORM_R16(ss, C, arow);
         for (int kt = (int)hf; kt < KT; kt += 2)
         {
             const u8v xv = lds_row16(arow + 16 * kt);
@@ -130,7 +130,17 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
         const pacc bo = acc_vec_p<L>(img, w, L::BO + 32 * nt, L::V_BO + nt);
 #pragma unroll
         for (int mi = 0; mi < MT; ++mi)
+        {
             acc[mi][nt] = bo;
+#ifdef PWIN_RESIDUAL_IN_WO
+            // the reference's order for this layer: the output projection accumulates onto f16(bias + x0), so
+            // the residual is rounded into every k16 step instead of added once afterwards
+            const op_t xv = op_lds(&act[16 * (wv * MT + mi) + m][16 * nt]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                acc[mi][nt][i] = (float)(half_t)((half_t)bo[i] + wm_op_acc_elem(xv, i));
+#endif
+        }
     }
 #ifdef POS_VSHARE
     // V^T operands of every head: each wave computes those of its own key tiles, shared through LDS
@@ -233,6 +243,23 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
     }
 
     STAMP(3);
+#ifdef PWIN_PROBE_Y
+    // diagnostic: the attention output Y (before the residual) to out32 at ((window * 64 + token) * C + channel)
+    {
+        const int win = (int)(blockIdx.y * gridDim.x + blockIdx.x);
+        if (win < PWIN_PROBE_Y)
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int nt = 0; nt < KT; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        ((half_t*)p.out32)[(size_t)(win * 64 + 16 * (wv * MT + mi) + m) * C + 16 * nt + wm_acc_row(i)] =
+                            (half_t)acc[mi][nt][i];
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_endpgm();
+    }
+#endif
     // ---- residual, MLP init acc = x1 + b2, MLP input m = x1 * g2 (-> hb)
 #pragma unroll
     for (int nt = 0; nt < KT; ++nt)
@@ -251,8 +278,13 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #pragma unroll
             for (int j = 0; j < 4; ++j)
             {
+#ifdef PWIN_RESIDUAL_IN_WO
+                const hv2 x1 = __builtin_bit_cast(hv2, acc_pair(acc[mi][nt], j));
+                (void)xv;
+#else
                 const hv2 x1 = __builtin_bit_cast(hv2, acc_pair(acc[mi][nt], j)) +
                                __builtin_bit_cast(hv2, wm_op_acc_pair(xv, j));
+#endif
                 mine[j] = __builtin_bit_cast(uint32_t, x1 * (hv2){g2[2 * j], g2[2 * j + 1]});
                 const hv2 y = x1 + (hv2){b2[2 * j], b2[2 * j + 1]};
                 acc_set_pair(acc[mi][nt], j, y);
@@ -263,7 +295,11 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #pragma unroll
             for (int i = 0; i < 8; ++i)
             {
+#ifdef PWIN_RESIDUAL_IN_WO
+                const half_t x1 = (half_t)acc[mi][nt][i];
+#else
                 const half_t x1 = (half_t)acc[mi][nt][i] + wm_op_acc_elem(xv, i);
+#endif
                 mv[i] = x1 * g2[i];
                 acc[mi][nt][i] = (float)(half_t)(x1 + b2[i]);
             }
@@ -384,6 +420,17 @@ __device__ void pos_encoder(const PwinParams& p0, const u8v* __restrict__ img, c
     }
     __builtin_amdgcn_wave_barrier();
     STAMP(21);
+#ifdef PWIN_PROBE_X0
+    // diagnostic: the embedded tokens x0 to out32 at ((window * 64 + token) * C + channel), then stop
+    block_sync();
+    {
+        const int win = by * (int)gridDim.x + bx;
+        if (win < PWIN_PROBE_X0)
+            for (int i = (int)(threadIdx.z * 32 + l); i < 64 * C; i += 32 * NW)
+                ((half_t*)p.out32)[(size_t)(win * 64 + i / C) * C + i % C] = act[i / C][i % C];
+        return;
+    }
+#endif
     pos_core<L, MT>(p, img, bias, act, hb);
     STAMP(26);
 

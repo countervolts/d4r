@@ -70,7 +70,7 @@ __device__ void phase_attn(const PwinParams& p, const u8v* __restrict__ img, con
                 ss += (float)(half_t)(v * v);
             }
         }
-        const half_t r16 = half_rsqrt((half_t)ss);
+        const half_t r16 = PWIN_NORM_R16(ss, L::C, xin);
         for (int kt = (int)hf; kt < KT; kt += 2)
         {
             const u8v xv = gload_row16(xin + 16 * kt);
@@ -111,8 +111,7 @@ __device__ void phase_attn(const PwinParams& p, const u8v* __restrict__ img, con
                         rs += (float)e[kt][i];
                 }
             }
-            rs = row_sum_total(rs, e);
-            const half_t rc = half_reciprocal((half_t)rs);
+            const half_t rc = PWIN_SOFTMAX_RC(rs, e);
             op_t pop[4];
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt)
@@ -236,7 +235,11 @@ __device__ void phase_fc2(const PwinParams& p, const u8v* __restrict__ img, cons
         const int Y0 = 8 * by - p.sy + (tok >> 3), X0 = 8 * bx - p.sx + (tok & 7);
         const bool inb = Y0 >= 0 && Y0 < p.H && X0 >= 0 && X0 < p.W;
         half_t* yout = (half_t*)dst + (size_t)(Y0 * p.W + X0) * C;
-        const op_t y = operand_from_f8(acc);
+        op_t y = operand_from_f8(acc);
+#if defined(D4R_ACCURACY) && defined(__GFX11__) && D4R_WMMA_LAYOUT == 11
+        if constexpr (C == 160)
+            y = ptx_mask_store_row(p, bx, by, tok, y);
+#endif
         op_gstore(yout + 16 * nt, y, inb);
         if (gY)
             op_gstore(gY + ((size_t)wi * 64 + tok) * C + 16 * nt, y, true);

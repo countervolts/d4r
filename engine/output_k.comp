@@ -102,9 +102,17 @@ ivec2 clampOrigin(ivec2 v, ivec2 origin, ivec2 hi)      // the reference's clamp
 }
 vec4 softIn(vec4 v) { return mix(0.99 + (v - 0.99) * 0.001, v, lessThan(v, vec4(0.99))); }      // stored luma -> working luma
 // Catmull-Rom weights of the four taps around a fraction t
+#ifdef D4R_ACCURACY
+// The PTX rounds the coefficient products and differences separately. Fusing them changes a filtered
+// history sample by a few f32 ulps, enough to cross a half-store boundary and feed subsequent frames.
+void crWeights(float t, precise out float w0, precise out float w1, precise out float w2, precise out float w3)
+{
+    precise const float t2 = t * t, t3 = t2 * t;
+#else
 void crWeights(float t, out float w0, out float w1, out float w2, out float w3)
 {
     const float t2 = t * t, t3 = t2 * t;
+#endif
     w0 = t2 - 0.5 * (t + t3);
     w1 = 1.5 * t3 - 2.5 * t2 + 1.0;
     w3 = 0.5 * (t3 - t2);
@@ -117,13 +125,23 @@ void crWeights(float t, out float w0, out float w1, out float w2, out float w3)
 struct CrAxis { float mid, split, s0, s1, s2, s3; };
 CrAxis crAxis(float w0, float w1, float w2, float w3, float mid)
 {
+#ifdef D4R_ACCURACY
+    precise const float split = 1.0 - mid, s0 = p.sharp * w0, s1 = p.sharp * (w1 - mid),
+                        s2 = p.sharp * (w2 - split), s3 = p.sharp * w3;
+    return CrAxis(mid, split, s0, s1, s2, s3);
+#else
     return CrAxis(mid, 1.0 - mid, p.sharp * w0, p.sharp * (w1 - mid), p.sharp * (w2 - (1.0 - mid)), p.sharp * w3);
+#endif
 }
 // One pass along one axis: the two middle taps are bilinear, the four sharpened taps are saturated, and
 // every term is the reference's own rounded product/fma.
 float crPass(float t0, float t1, float t2, float t3, CrAxis c)
 {
+#ifdef D4R_ACCURACY
+    precise float t = c.split * t2;
+#else
     float t = c.split * t2;
+#endif
     t = fma(c.mid, t1, t);
     t = fma(c.s0, clamp(t0, 0.0, 1.0), t);
     t = fma(c.s1, clamp(t1, 0.0, 1.0), t);
@@ -202,7 +220,11 @@ void main()
         const vec2 fr = clamp(h - base, 0.0, 1.0);
         float x0, x1, x2, x3, y0, y1, y2, y3;
         crWeights(fr.x, x0, x1, x2, x3); crWeights(fr.y, y0, y1, y2, y3);
+#ifdef D4R_ACCURACY
+        precise const float mx = x1 / (x1 + x2), my = y1 / (y1 + y2);
+#else
         const float mx = x1 / (x1 + x2), my = y1 / (y1 + y2);
+#endif
         const vec2 ts = p.invOut * 0.5;
         // 5x5 texels T[col][row] from nine gathers (gather: x = (0,1), y = (1,1), z = (1,0), w = (0,0))
         vec4 g00 = textureGather(hiresTex, ts * (base + vec2(-0.5, -0.5)), 0);
@@ -265,7 +287,15 @@ void main()
     // ---------------------------------------------------------------- current colour, bilinear from the tile
     // Positions, weights and sums of this part are half floats, as in the reference: the filter below is sensitive
     // to where the samples sit, and half precision moves them by up to 1/64 texel.
+#ifdef D4R_ACCURACY
+    // As with the sub-pixel filter positions below, the reference rounds the global fma before subtracting
+    // the tile origin. Moving that subtraction into the fma changes columns on binary16 rounding ties.
+    precise const vec2 currentPos = fma(pc, p.out2rnd, p.rndOffs);
+    precise const vec2 currentLocal = currentPos - vec2(t0);
+    const f16vec2 u = f16vec2(currentLocal);
+#else
     const f16vec2 u = f16vec2(pc * p.out2rnd + p.rndOffs - vec2(t0));
+#endif
     const ivec2 ui = ivec2(floor(vec2(u)));
     const f16vec2 uf = clamp(u - f16vec2(ui), float16_t(0.0), float16_t(1.0)), ug = float16_t(1.0) - uf;
     const int ci = ui.y * 24 + ui.x;

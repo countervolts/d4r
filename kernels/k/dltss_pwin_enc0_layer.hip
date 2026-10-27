@@ -12,5 +12,14 @@
 // costs one pack per pair and gfx12 operands need no lane exchange anyway)
 // d4r-build-flags-gfx12: -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL
 #define PWIN_F32ACC
+// the reference folds the residual into the output projection in this layer (accuracy builds follow it)
+#ifdef D4R_ACCURACY
+#define PWIN_RESIDUAL_IN_WO
+#endif
 #include "pwin_pos.h"
+#ifdef D4R_ACCURACY
+// The reference restarts its eight-phase window schedule on an NGX reset. The inline network loader reads
+// this accuracy-set contract; older/fast sets keep their existing evaluation-counter schedule.
+extern "C" __device__ __attribute__((used)) uint32_t d4r_reset_window_cycle = 1;
+#endif
 POS_ENCODER(dltss_pwin_enc0_layer, 2, 32, 64, 16, 2)

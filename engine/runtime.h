@@ -126,7 +126,7 @@ enum class KNetwork { Auto, Matrix, Dot2 };
 class Model {
 public:
     Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
-          KNetwork network = KNetwork::Auto);
+          KNetwork network = KNetwork::Auto, bool accuracy = false);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -139,6 +139,7 @@ public:
     bool hasDisplayMotion() const; // packaged shaders read FrameFlagDisplayMotion (render-resolution motion otherwise)
     bool hasGameExposure() const; // packaged shaders read FrameImages::exposure (exposure flag 4)
     bool hasRatioTables() const; // lut.bin holds all sixteen reconstruction tables, not only one ratio's
+    bool hasAccuracyStages() const; // reconstruction compiled with D4R_ACCURACY
     bool hasRgb10Output() const; // a packaged RGB10A2 final-store variant is available
     bool hasDirectOutput(VkFormat format) const; // the final store can write a borrowed output of this format
     bool dot2Network() const; // the network runs layer_dot2.comp (no cooperative matrices)

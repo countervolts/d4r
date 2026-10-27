@@ -21,6 +21,31 @@ struct PwinParams
 };
 static_assert(sizeof(PwinParams) == 176, "param block");
 
+#if defined(D4R_ACCURACY) && defined(__GFX11__) && D4R_WMMA_LAYOUT == 11
+// The translated reference's deep-layer epilogues materialize the NVIDIA accumulator fragment inside
+// each predicated store. Its two half values come from WMMA lanes g + 8*b and g + 8*b + 16, where
+// g = token % 8 and b = (token % 16) / 8. ds_bpermute returns zero for a source lane outside that
+// store's execution mask. Reproduce that mask before writing the canonical rows; the register/LDS
+// values used by an encoder's patch merge remain intact.
+__device__ __forceinline__ bool ptx_store_source_live(const PwinParams& p, int bx, int by, int token, int parity)
+{
+    const int b = (token & 15) >> 3;
+    const int source = (token & 7) + 8 * b + 16 * parity;
+    const int srcToken = (token & ~15) + (source >> 2) + 8 * b;
+    const int x = 8 * bx - p.sx + (srcToken & 7), y = 8 * by - p.sy + (srcToken >> 3);
+    return x >= 0 && x < p.W && y >= 0 && y < p.H;
+}
+__device__ __forceinline__ u8v ptx_mask_store_row(const PwinParams& p, int bx, int by, int token, u8v row)
+{
+    const uint32_t mask = (ptx_store_source_live(p, bx, by, token, 0) ? 0x0000ffffu : 0u) |
+                          (ptx_store_source_live(p, bx, by, token, 1) ? 0xffff0000u : 0u);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        row[i] &= mask;
+    return row;
+}
+#endif
+
 template <int H_, int C_, int COUT_, bool POS_ = false> struct PwinLayout
 {
     static constexpr bool POS = POS_; // position-only attention (trait flag 2): the table is P itself
@@ -472,6 +497,37 @@ __device__ __forceinline__ float row_sum_total(float rs, const half_t (&e)[4][8]
     }
     return s[0] + s[1];
 }
+#ifdef D4R_ACCURACY
+// The reference's softmax row sum as f16 pairs (keys 2p, 2p + 1), reduced in its order (ptx_reduce).
+// gfx11 splits each key pair across half-waves; gfx12 assigns eight consecutive keys to each half-wave.
+__device__ __forceinline__ half_t ptx_row_sum(const half_t (&e)[4][8])
+{
+    const bool hf = wm_half() != 0;
+    uint32_t pairs[32];
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt)
+#pragma unroll
+        for (int j = 0; j < 8; j += 2)
+        {
+            const uint32_t own = pack2(e[kt][j], e[kt][j + 1]), other = other_half(own);
+#if D4R_WMMA_LAYOUT == 12
+            pairs[8 * kt + 4 * int(hf) + j / 2] = own;
+            pairs[8 * kt + 4 * int(!hf) + j / 2] = other;
+#else
+#pragma unroll
+            for (int b = 0; b < 2; ++b)
+            {
+                const half_t mine = b ? hi16(own) : lo16(own), theirs = b ? hi16(other) : lo16(other);
+                pairs[8 * kt + j + b] = hf ? pack2(theirs, mine) : pack2(mine, theirs);
+            }
+#endif
+        }
+    return ptx_reduce<64, false>([&](int q) { return pairs[q]; });
+}
+#define PWIN_SOFTMAX_RC(rs, e) half_reciprocal(ptx_row_sum(e))
+#else
+#define PWIN_SOFTMAX_RC(rs, e) half_reciprocal((half_t)row_sum_total(rs, e))
+#endif
 
 // The Swin core for one window: x0 rows of this wave's 16 tokens are in act (f16, C per token).
 // On return act holds the block output y. hb: normalised input rows; K/V of one head at a time in kl/vt.
@@ -562,7 +618,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
             }
 #endif
         }
-        const half_t r16 = half_rsqrt((half_t)ss);
+        const half_t r16 = PWIN_NORM_R16(ss, C, normA);
         for (int kt = 0; kt < KT; ++kt)
         {
             const u8v xv = lds_row16(normA + 16 * kt);
@@ -605,7 +661,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         }
 #endif
     }
-    const half_t r16 = half_rsqrt((half_t)ss);
+    const half_t r16 = PWIN_NORM_R16(ss, C, arow);
     for (int kt = (int)hf; kt < KT; kt += 2)
     {
         const u8v xv = lds_row16(arow + 16 * kt);
@@ -797,8 +853,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
                     rs += (float)e[kt][i];
             }
         }
-        rs = row_sum_total(rs, e);
-        const half_t rc = half_reciprocal((half_t)rs);
+        const half_t rc = PWIN_SOFTMAX_RC(rs, e);
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt)
         {

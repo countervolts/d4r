@@ -165,7 +165,14 @@ void main()
     precise const float scaled = p.gameScale * current, scaledPrevious = p.gameScale * previous;
     precise const float exposure = p.invPre * scaled;
     precise const float ratio = scaled / scaledPrevious;
+#ifdef D4R_ACCURACY
+    // The input stage's luma scale: the reference divides the scaled exposure by itself, (scale * exposure) *
+    // rcp(scale * exposure), which is one ulp below 1 for some exposures (0.987305: 0x3F7FFFFF).
+    precise const float lumaScale = scaled / scaled;
+    inp.w[28] = exposure; inp.w[29] = lumaScale; inp.w[30] = ratio;
+#else
     inp.w[28] = exposure; inp.w[29] = 1.0; inp.w[30] = ratio;
+#endif
     outp.w[37] = exposure; outp.w[38] = ratio;
 #elif MODE == 1
     inp.w[25] = current; inp.w[26] = previous;

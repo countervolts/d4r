@@ -170,7 +170,8 @@ def main():
     p.add_argument('--capture', type=Path, metavar='CAPTURE_DIR', help='with --hip: the dump directory holding one '
                    'captured frame of the eleven dltss_pwin_*_layer launches (D4R_CUDA_REPLAY_DUMP_DIR)')
     p.add_argument('--hip-accuracy', type=Path, metavar='KERNEL_DIR', help='with --hip: also package the accuracy '
-                   'layer set as hip-accuracy/ (taken with [Kernels] PreferAccuracy: byte-identical to the CUDA backend)')
+                   'layers as hip-accuracy/ and the accuracy reconstruction shaders '
+                   '(selected with [Kernels] PreferAccuracy)')
     a = p.parse_args()
     if a.hip and a.capture is None:
         p.error('--hip needs --capture (the weights come from a captured frame)')
@@ -226,6 +227,14 @@ def main():
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-D{define}=1',
                         *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
                         '-o', str(a.output / f'output_k_{store}.spv')], check=True)
+    if a.hip_accuracy:
+        for define, store in ((None, ''), ('OUTPUT_RGB10', '_rgb10'), ('OUTPUT_RGBA8', '_store_rgba8'),
+                              ('OUTPUT_R11G11B10', '_store_r11g11b10')):
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', '-DD4R_ACCURACY=1',
+                            *([f'-D{define}=1'] if define else []), *(['-DLDR=1'] if a.ldr else []),
+                            str(HERE / 'output_k.comp'), '-o', str(a.output / f'output_k{store}_accuracy.spv')], check=True)
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', '-DD4R_ACCURACY=1', '-DPASS=1',
+                        str(HERE / 'exposure_k.comp'), '-o', str(a.output / 'exposure_k1_accuracy.spv')], check=True)
     for stage in '01':
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', '-DPASS=' + stage, str(HERE / 'exposure_k.comp'),
                         '-o', str(a.output / f'exposure_k{stage}.spv')], check=True)

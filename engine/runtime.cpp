@@ -388,10 +388,11 @@ struct Model::Impl {
     }
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
-         hasGameExposure = false, hasRatioTables = false, dot2 = false;
+         hasGameExposure = false, hasRatioTables = false, accuracyStages = false, dot2 = false;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network)
+Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network,
+             bool accuracy)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
     if (const char* force = std::getenv("D4R_ENGINE_K_NETWORK")) {
@@ -480,16 +481,24 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     const uint32_t wave = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : 64;
     const uint32_t stageWave = waveEnv ? wave : m.dot2 ? 32 : 64;
     m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, stageWave, cache, 0, nullptr, true);
-    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
-    if (exists(directory + "/output_k_rgb10.spv"))
-        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
-    if (exists(directory + "/output_k_store_rgba8.spv"))
-        m.outputRgba8.create(device, directory + "/output_k_store_rgba8.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
-    if (exists(directory + "/output_k_store_r11g11b10.spv"))
-        m.outputR11.create(device, directory + "/output_k_store_r11g11b10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    // Older packages retain their existing stage. New accuracy packages provide a separate shader for each
+    // final-store format; the fast paths continue to load exactly their original files.
+    m.accuracyStages = accuracy && exists(directory + "/output_k_accuracy.spv");
+    const auto outputFile = [&](const char* name) {
+        return directory + "/" + name + (m.accuracyStages ? "_accuracy.spv" : ".spv");
+    };
+    m.output.create(device, outputFile("output_k"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_rgb10")))
+        m.outputRgb10.create(device, outputFile("output_k_rgb10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_store_rgba8")))
+        m.outputRgba8.create(device, outputFile("output_k_store_rgba8"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_store_r11g11b10")))
+        m.outputR11.create(device, outputFile("output_k_store_r11g11b10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
         m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache, 0, nullptr, true);
-        m.exposure[1].create(device, directory + "/exposure_k1.spv", {b,b,b,b,b,t}, wave, cache);
+        const std::string update = directory + (m.accuracyStages && exists(directory + "/exposure_k1_accuracy.spv")
+                                                    ? "/exposure_k1_accuracy.spv" : "/exposure_k1.spv");
+        m.exposure[1].create(device, update, {b,b,b,b,b,t}, wave, cache);
         m.hasExposure = true;
     }
 }
@@ -499,6 +508,7 @@ bool Model::hasRegularDepth() const { return impl->hasRegularDepth; }
 bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
+bool Model::hasAccuracyStages() const { return impl->accuracyStages; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
 bool Model::hasDirectOutput(VkFormat format) const { return impl->outputFor(format) != nullptr; }
 bool Model::dot2Network() const { return impl->dot2; }

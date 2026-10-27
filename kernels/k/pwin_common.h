@@ -49,6 +49,56 @@ __device__ __forceinline__ half_t half_rsqrt(half_t h)
 #endif
 }
 
+#ifdef D4R_ACCURACY
+// The reference kernel's L2 norm and softmax row sum use a fixed f16 tree: four lanes t take channel pairs
+// t + 4k as f16x2 words; each sums its even and its odd words
+// (pairs of neighbours, then a balanced tree, the words past the largest power of two added last) and adds the two;
+// the lanes combine through two butterflies as (L0 + L1) + (L2 + L3); the result is the low half plus the high half.
+// pair(p) returns the bits of channels 2p, 2p + 1. One lane computes the whole token (the same values).
+template <int B, int N, int S, class F> __device__ __forceinline__ hv2 ptx_tree_sum(const F& word)
+{
+    if constexpr (N == 1)
+        return word(B);
+    else
+    {
+        constexpr int P = (N & (N - 1)) == 0 ? N / 2 : 1 << (31 - __builtin_clz(N));
+        return ptx_tree_sum<B, P, S>(word) + ptx_tree_sum<B + S * P, N - P, S>(word);
+    }
+}
+template <int C, bool SQUARE, class F> __device__ __forceinline__ half_t ptx_reduce(const F& pair)
+{
+    constexpr int KW = C / 8; // words per lane
+    static_assert(C % 16 == 0 && KW % 2 == 0, "rows of whole words per lane, split into even and odd");
+    hv2 lane[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+    {
+        const auto word = [&](int k) {
+            const hv2 v = __builtin_bit_cast(hv2, (uint32_t)pair(t + 4 * k));
+            if constexpr (SQUARE)
+                return v * v;
+            else
+                return v;
+        };
+        lane[t] = ptx_tree_sum<0, KW / 2, 2>(word) + ptx_tree_sum<1, KW / 2, 2>(word);
+    }
+    const hv2 s = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    return s[0] + s[1];
+}
+template <int C, class F> __device__ __forceinline__ half_t ptx_sumsq(const F& pair)
+{
+    return ptx_reduce<C, true>(pair);
+}
+template <int C> __device__ __forceinline__ half_t ptx_sumsq_row(const half_t* row)
+{
+    return ptx_sumsq<C>([&](int p) { return *(const uint32_t*)(row + 2 * p); });
+}
+// The norm's reciprocal square root follows the reference order only in accuracy builds.
+#define PWIN_NORM_R16(ss, C, row) half_rsqrt(ptx_sumsq_row<C>(row))
+#else
+#define PWIN_NORM_R16(ss, C, row) half_rsqrt((half_t)(ss))
+#endif
+
 // LDS row padding in halves: activation rows of N halves are stored N + PWIN_PAD apart, so the 16 token rows a
 // WMMA operand load (op_lds / lds_row16) touches start on distinct banks (row stride = 16 mod 32 bytes). With
 // unpadded 128- or 256-byte rows every lane hits the same banks (measured: 6x slower WMMA feed). 0 = old layout.

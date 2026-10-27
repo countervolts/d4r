@@ -178,8 +178,8 @@ void GameUpscaler::Impl::inputs(VkCommandBuffer cb, const GameFrame& frame) {
     exposure.measure = !gameExposure && (g.frames % 2 == 0 || frame.settings.reset);
     exposure.reset = frame.settings.reset;
     exposure.exposureScale = frame.settings.exposureScale; exposure.preExposure = frame.settings.preExposure;
-    // The window schedule follows the evaluation counter, which advances every frame and is not restarted by a
-    // reset; the external network's phase counter must advance in lockstep, so this is the only place it moves.
+    // The built-in network keeps its evaluation-counter schedule. The inline native accuracy set advertises
+    // its reference reset schedule separately; its loader owns the external network's window counter.
     auto windows = makeKWindows(g.shape, g.frames++);
     FrameImages images{directColor ? frame.color.view : g.fallback.color.view, directMotion ? frame.motion.view : g.fallback.motion.view,
         directDepth ? frame.depth.view : g.fallback.depth.view, directColor ? frame.color.layout : VK_IMAGE_LAYOUT_GENERAL,

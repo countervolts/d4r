@@ -10,5 +10,9 @@
 // costs one pack per pair and gfx12 operands need no lane exchange anyway)
 // d4r-build-flags-gfx12: -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL
 #define PWIN_F32ACC
+// the reference folds the residual into the output projection in this layer (accuracy builds follow it)
+#ifdef D4R_ACCURACY
+#define PWIN_RESIDUAL_IN_WO
+#endif
 #include "pwin_pos.h"
 POS_DECODER(dltss_pwin_dec0_layer, 2, 32, 64, 40, 48, 2)

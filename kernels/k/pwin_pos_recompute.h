@@ -56,7 +56,7 @@ __device__ void pos_recompute_core(const PwinParams& p, const u8v* __restrict__ 
             }
 #endif
         }
-        const half_t r16 = half_rsqrt((half_t)ss);
+        const half_t r16 = PWIN_NORM_R16(ss, C, arow);
         for (int kt = (int)hf; kt < KT; kt += 2)
         {
             const u8v xv = lds_row16(arow + 16 * kt);
@@ -339,7 +339,11 @@ __device__ void pos_recompute_encoder(const PwinParams& p0, const u8v* __restric
                 }
 #endif
             }
+#ifdef D4R_ACCURACY
+            const half_t r16 = half_rsqrt(ptx_sumsq<L::C>([&](int q) { return (uint32_t)xr[q >> 3][q & 7]; }));
+#else
             const half_t r16 = half_rsqrt((half_t)ss);
+#endif
 #pragma unroll
             for (int kt = 0; kt < L::KT; ++kt)
             {

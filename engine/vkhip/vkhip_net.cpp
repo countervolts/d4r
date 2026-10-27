@@ -112,7 +112,8 @@ struct KNetwork::Impl {
     // contents written once, on the first record: (arena offset, bytes)
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> contents;
     bool uploaded = false;
-    uint32_t frame = 0;
+    uint32_t frame = 0, windowFrame = 0;
+    bool resetWindowCycle = false;
 
     // optional per-dispatch timestamps: slot s holds queries [s*stampCount, (s+1)*stampCount)
     static constexpr uint32_t StampSlots = 8;
@@ -268,6 +269,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
         auto it = files.code.find(names[i]);
         if (it == files.code.end()) { error = names[i] + ".hsaco missing"; return false; }
         if (!modules[i].parse(it->second)) { error = names[i] + ": " + modules[i].error; return false; }
+        if (i == 0) n.resetWindowCycle = global32(modules[i], "d4r_reset_window_cycle", 0) != 0;
         if (modules[i].mach != (files.mach ? files.mach : modules[0].mach)) {
             error = names[i] + ".hsaco was built for another GPU (rebuild the engine models)"; return false;
         }
@@ -443,9 +445,9 @@ void KNetwork::record(VkCommandBuffer cb, bool reset) {
         n.run(cb, n.preps);
         n.uploaded = true;
     }
-    // A reset clears temporal images, not NGX's eight-phase window schedule.
-    // GameUpscaler advances that schedule on every evaluation, including resets.
-    (void)reset;
+    // The accuracy set follows the reference's reset schedule. Keep the evaluation count separate for
+    // timestamps and dumps, and preserve the legacy window schedule for sets without this contract.
+    if (reset && n.resetWindowCycle) n.windowFrame = 0;
     const bool dump = n.dumpBuffer && n.frame < n.dumpFrames;
     if (dump) {
         Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -456,7 +458,7 @@ void KNetwork::record(VkCommandBuffer cb, bool reset) {
                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     }
     const uint32_t dumpFrame = n.frame;
-    const auto& list = n.nodes[n.frame % 8];
+    const auto& list = n.nodes[n.windowFrame % 8];
     n.stampActive = -1;
     if (n.stampPool) {
         n.collectStamps(list);
@@ -470,6 +472,7 @@ void KNetwork::record(VkCommandBuffer cb, bool reset) {
     }
     n.run(cb, list);
     ++n.frame;
+    ++n.windowFrame;
     Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     if (dump) {

@@ -93,7 +93,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
             ss += (float)(half_t)(v * v);
         }
     }
-    const half_t r16 = half_rsqrt((half_t)ss);
+    const half_t r16 = PWIN_NORM_R16(ss, C, arow);
     for (int kt = 2 * g + (int)hf; kt < KT; kt += 2 * NG)
     {
         const u8v xv = lds_row16(arow + 16 * kt);
@@ -198,8 +198,7 @@ __device__ void wide_core(const PwinParams& p, const u8v* __restrict__ img, cons
                         rs += (float)e[kt][i];
                 }
             }
-            rs = row_sum_total(rs, e);
-            const half_t rc = half_reciprocal((half_t)rs);
+            const half_t rc = PWIN_SOFTMAX_RC(rs, e);
             op_t pop[4];
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt)
@@ -350,7 +349,14 @@ template <class L, int NG> __device__ void wide_store_y(const PwinParams& p, hal
     {
         half_t* yout = (half_t*)dst + (size_t)(Y0 * p.W + X0) * L::C;
         for (int kt = 2 * g + (int)hf; kt < L::KT; kt += 2 * NG)
-            gstore_row16(yout + 16 * kt, lds_row16(&hb[tok][16 * kt]));
+        {
+            u8v row = lds_row16(&hb[tok][16 * kt]);
+#if defined(D4R_ACCURACY) && defined(__GFX11__) && D4R_WMMA_LAYOUT == 11
+            if constexpr (L::C == 128)
+                row = ptx_mask_store_row(p, blockIdx.x, blockIdx.y, tok, row);
+#endif
+            gstore_row16(yout + 16 * kt, row);
+        }
     }
 }
 

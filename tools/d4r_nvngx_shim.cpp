@@ -9527,7 +9527,8 @@ static void init_engine_backend()
     {
         // without the f16 matrix tuple (RDNA2) the network runs layer_dot2.comp's shaders
         g_engine.model = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE,
-                                                      g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2);
+                                                      g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2,
+                                                      env_uint("D4R_PREFER_ACCURACY", 0) != 0);
         g_engine.directory = path;
     }
     catch (const std::exception& error)
@@ -9539,6 +9540,7 @@ static void init_engine_backend()
     logf("engine backend: model %s loaded and pipelines compiled in %.0f ms (network: %s)", path.c_str(),
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
          g_engine.model->dot2Network() ? "v_dot2, no cooperative matrices" : "cooperative matrices");
+    logf("engine backend: K reconstruction uses %s stages", g_engine.model->hasAccuracyStages() ? "accuracy" : "fast");
 }
 
 static void init_engine_backend_ldr()
@@ -9556,9 +9558,11 @@ static void init_engine_backend_ldr()
     try
     {
         g_engine.modelLdr = std::make_unique<d4r::Model>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE,
-                                                         g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2);
+                                                         g_vk.matrixF16 ? d4r::KNetwork::Matrix : d4r::KNetwork::Dot2,
+                                                         env_uint("D4R_PREFER_ACCURACY", 0) != 0);
         g_engine.directoryLdr = path;
         logf("engine backend: LDR model %s loaded", path.c_str());
+        logf("engine backend: K LDR reconstruction uses %s stages", g_engine.modelLdr->hasAccuracyStages() ? "accuracy" : "fast");
     }
     catch (const std::exception& error)
     {
