@@ -3,6 +3,10 @@
 #include "vkhip_net.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace vkhip {
 namespace {
@@ -23,6 +27,40 @@ void kShift(int role, uint32_t frame, int32_t& sx, int32_t& sy) {
     for (int d = 0; d < role; ++d) { x = (2 * x + 4) & 7; y = (2 * y + 4) & 7; }
     sx = x; sy = y;
 }
+// The windows of each layer (x, y group counts) the frame's results depend on: engine/runtime.cpp's kLayerGroups
+// (the same rule, kept identical): nothing reads the windows that only cover the padded token grid's rows and
+// columns past the output, so they are not launched. w/h/sx/sy per layer, out = output width or height.
+void trimmedGroups(const int32_t (&size)[2][11], const int32_t (&shift)[2][11], const uint32_t (&out)[2],
+                   uint32_t (&groups)[2][11]) {
+    auto mirror = [](int v, int n) { v = std::abs(v); return std::min(v, 2 * n - 2 - v); };
+    auto tdiv2 = [](int v) { return v < 0 ? -(-v / 2) : v / 2; };
+    for (unsigned a = 0; a < 2; ++a) {
+        auto full = [&](unsigned i) { return uint32_t(size[a][i] + shift[a][i] + 7) / 8; };
+        for (unsigned i = 0; i < 11; ++i) groups[a][i] = full(i);
+        auto windows = [&](unsigned i, int n) { return std::clamp(uint32_t(n + shift[a][i] + 7) / 8, 1u, full(i)); };
+        auto reads = [&](unsigned i, bool half) {
+            int last = 0;
+            for (int w = 0; w < int(groups[a][i]); ++w)
+                for (int t = 0; t < (half ? 4 : 8); ++t) {
+                    const int origin = 8 * w - shift[a][i];
+                    last = std::max(last, half ? mirror(tdiv2(origin) + t, size[a][i] / 2) : mirror(origin + t, size[a][i]));
+                }
+            return last + 1;
+        };
+        int need = std::min(size[a][10], int(out[a] + 3) / 4 + 2), skip[5] = {};
+        for (unsigned i = 10; i >= 6; --i) {
+            groups[a][i] = windows(i, need);
+            skip[10 - i] = reads(i, false);
+            need = reads(i, true);
+        }
+        groups[a][5] = windows(5, need);
+        int merged = reads(5, false);
+        for (int i = 4; i >= 0; --i) {
+            groups[a][i] = windows(unsigned(i), std::max(skip[i], 2 * merged));
+            merged = reads(unsigned(i), false);
+        }
+    }
+}
 uint32_t global32(const Module& m, const std::string& name, uint32_t fallback) {
     auto it = m.globals.find(name);
     if (it == m.globals.end() || it->second.size != 4 || it->second.va < m.dataLo || it->second.va + 4 > m.dataHi) return fallback;
@@ -34,7 +72,17 @@ constexpr uint64_t kWeightTail = 1ull << 20;  // dec5's prep reads its generic l
 constexpr uint64_t kTail = 65536, kGuard = 4ull << 20;
 // Donor keys must not collide when features are recreated at different GPU
 // addresses on the same device. Reusing a key could reuse relocated code.
-std::atomic<uint64_t> nextPipelineId{0x6b680000u};
+// They must not repeat across processes either: Mesa's on-disk shader cache keeps the patched kernels under the
+// donor keys, so a fixed first id handed a later run's donors an earlier run's patched code (the layout check then
+// refused the layers that use scratch and the feature left vkhip). Each process starts at its own id.
+uint64_t firstPipelineId() {
+    uint64_t x = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                 uint64_t(std::chrono::system_clock::now().time_since_epoch().count()) ^
+                 reinterpret_cast<uintptr_t>(&x);
+    x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return (x ^ (x >> 31)) & 0x7fffffffu;  // leaves 2^31 ids before the key space check
+}
+std::atomic<uint64_t> nextPipelineId{firstPipelineId()};
 
 } // namespace
 
@@ -48,20 +96,93 @@ struct KNetwork::Impl {
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
     PFN_vkCmdBindPipeline cmdBind = nullptr; PFN_vkCmdPushConstants cmdPush = nullptr; PFN_vkCmdDispatch cmdDispatch = nullptr;
     PFN_vkCmdPipelineBarrier cmdBarrier = nullptr; PFN_vkCmdUpdateBuffer cmdUpdate = nullptr; PFN_vkCmdFillBuffer cmdFill = nullptr;
+    PFN_vkCreateQueryPool createQueries = nullptr; PFN_vkDestroyQueryPool destroyQueries = nullptr;
+    PFN_vkGetQueryPoolResults queryResults = nullptr; PFN_vkCmdResetQueryPool cmdResetQueries = nullptr;
+    PFN_vkCmdWriteTimestamp cmdStamp = nullptr; PFN_vkCreateEvent createEvent = nullptr; PFN_vkDestroyEvent destroyEvent = nullptr;
+    PFN_vkResetEvent resetEvent = nullptr; PFN_vkGetEventStatus eventStatus = nullptr; PFN_vkCmdSetEvent cmdSetEvent = nullptr;
+    PFN_vkCmdCopyBuffer cmdCopy = nullptr; PFN_vkMapMemory mapMemory = nullptr; PFN_vkDeviceWaitIdle waitIdle = nullptr;
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer arena = VK_NULL_HANDLE, tokens = VK_NULL_HANDLE, head = VK_NULL_HANDLE;
     uint64_t arenaSize = 0, base = 0;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<VkPipeline> pipelines;
-    struct Dispatch { VkPipeline pipeline; uint32_t gx, gy; uint64_t args; };
+    struct Dispatch { VkPipeline pipeline; uint32_t gx, gy; uint64_t args; std::string label; };
     std::vector<Dispatch> preps, nodes[8];
     // contents written once, on the first record: (arena offset, bytes)
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> contents;
     bool uploaded = false;
     uint32_t frame = 0;
 
+    // optional per-dispatch timestamps: slot s holds queries [s*stampCount, (s+1)*stampCount)
+    static constexpr uint32_t StampSlots = 8;
+    void (*stampLog)(const char*) = nullptr;
+    VkQueryPool stampPool = VK_NULL_HANDLE;
+    uint32_t stampCount = 0;
+    double nsPerTick = 0;
+    struct StampSlot { VkEvent done = VK_NULL_HANDLE; bool pending = false; uint32_t frame = 0; };
+    StampSlot stampSlots[StampSlots];
+    int stampActive = -1;
+    uint32_t stampNext = 0;
+
+    void stamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage) {
+        if (stampActive >= 0) cmdStamp(cb, stage, stampPool, uint32_t(stampActive) * stampCount + stampNext++);
+    }
+    void collectStamps(const std::vector<Dispatch>& list) {
+        for (uint32_t i = 0; i < StampSlots; ++i) {
+            auto& slot = stampSlots[i];
+            if (!slot.pending || eventStatus(device, slot.done) != VK_EVENT_SET) continue;
+            std::vector<uint64_t> t(stampCount);
+            if (queryResults(device, stampPool, i * stampCount, stampCount, t.size() * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) continue;
+            slot.pending = false;
+            auto ms = [&](uint32_t a, uint32_t b) { return double(int64_t(t[b] - t[a])) * nsPerTick / 1e6; };
+            // t[0] network start, t[1 + 2k] dispatch k start, t[2 + 2k] dispatch k end, t[last] network end
+            const uint32_t last = stampCount - 1;
+            std::string text = "D4R_VKHIP_STAMPS frame=" + std::to_string(slot.frame);
+            char item[96];
+            std::snprintf(item, sizeof(item), " total=%.4f", ms(0, last)); text += item;
+            double busy = 0, gaps = 0;
+            for (uint32_t k = 0; k < list.size(); ++k) {
+                const double b = ms(1 + 2 * k, 2 + 2 * k), g = ms(k ? 2 * k : 0, 1 + 2 * k);
+                busy += b; gaps += g;
+                std::snprintf(item, sizeof(item), " b.%s=%.4f g.%s=%.4f", list[k].label.c_str(), b, list[k].label.c_str(), g);
+                text += item;
+            }
+            std::snprintf(item, sizeof(item), " tail=%.4f busy=%.4f gaps=%.4f", ms(last - 1, last), busy, gaps); text += item;
+            stampLog(text.c_str());
+        }
+    }
+
+    // optional dumps of the tokens and the head (debug)
+    std::string dumpDir;
+    uint32_t dumpFrames = 0;
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
+    uint64_t tokenBytes = 0, headBytes = 0;
+    VkBuffer dumpBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory dumpMemory = VK_NULL_HANDLE;
+    void writeDumps() {
+        if (!dumpBuffer || !frame) return;
+        waitIdle(device);
+        void* mapped = nullptr;
+        if (mapMemory(device, dumpMemory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) return;
+        const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
+        for (uint32_t f = 0; f < std::min(frame, dumpFrames); ++f)
+            for (int part = 0; part < 2; ++part) {
+                const std::string path = dumpDir + (part ? "/head-" : "/tokens-") + std::to_string(f) + ".bin";
+                if (FILE* out = std::fopen(path.c_str(), "wb")) {
+                    const uint64_t at = f * (tokenBytes + headBytes) + (part ? tokenBytes : 0);
+                    std::fwrite(bytes + at, 1, part ? headBytes : tokenBytes, out);
+                    std::fclose(out);
+                }
+            }
+    }
+
     ~Impl() {
+        writeDumps();
+        if (dumpBuffer) destroyBuffer(device, dumpBuffer, nullptr);
+        if (dumpMemory) freeMemory(device, dumpMemory, nullptr);
+        for (auto& slot : stampSlots) if (slot.done) destroyEvent(device, slot.done, nullptr);
+        if (stampPool) destroyQueries(device, stampPool, nullptr);
         for (VkPipeline p : pipelines) if (p) vk.destroyPipeline(device, p, nullptr);
         if (layout) destroyLayout(device, layout, nullptr);
         for (VkBuffer b : {tokens, head, arena}) if (b) destroyBuffer(device, b, nullptr);
@@ -87,7 +208,9 @@ struct KNetwork::Impl {
         for (const auto& d : list) {
             cmdBind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipeline);
             cmdPush(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &d.args);
+            stamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);  // RADV emits the pending barrier first
             cmdDispatch(cb, d.gx, d.gy, 1);
+            stamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             // the next layer's vector and scalar loads (SHADER_STORAGE_READ invalidates both caches on RADV)
             barrier(cmdBarrier, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -106,6 +229,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
                       std::string& error) {
     auto& n = *impl;
     n.device = device;
+    n.memoryProperties = memoryProperties;
     bool ok = n.vk.load(device, proc);
     ok &= n.load(proc, n.createBuffer, "vkCreateBuffer") && n.load(proc, n.destroyBuffer, "vkDestroyBuffer") &&
           n.load(proc, n.requirements, "vkGetBufferMemoryRequirements") && n.load(proc, n.allocate, "vkAllocateMemory") &&
@@ -114,7 +238,13 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
           n.load(proc, n.destroyLayout, "vkDestroyPipelineLayout") && n.load(proc, n.cmdBind, "vkCmdBindPipeline") &&
           n.load(proc, n.cmdPush, "vkCmdPushConstants") && n.load(proc, n.cmdDispatch, "vkCmdDispatch") &&
           n.load(proc, n.cmdBarrier, "vkCmdPipelineBarrier") && n.load(proc, n.cmdUpdate, "vkCmdUpdateBuffer") &&
-          n.load(proc, n.cmdFill, "vkCmdFillBuffer");
+          n.load(proc, n.cmdFill, "vkCmdFillBuffer") && n.load(proc, n.createQueries, "vkCreateQueryPool") &&
+          n.load(proc, n.destroyQueries, "vkDestroyQueryPool") && n.load(proc, n.queryResults, "vkGetQueryPoolResults") &&
+          n.load(proc, n.cmdResetQueries, "vkCmdResetQueryPool") && n.load(proc, n.cmdStamp, "vkCmdWriteTimestamp") &&
+          n.load(proc, n.createEvent, "vkCreateEvent") && n.load(proc, n.destroyEvent, "vkDestroyEvent") &&
+          n.load(proc, n.resetEvent, "vkResetEvent") && n.load(proc, n.eventStatus, "vkGetEventStatus") &&
+          n.load(proc, n.cmdSetEvent, "vkCmdSetEvent") && n.load(proc, n.cmdCopy, "vkCmdCopyBuffer") &&
+          n.load(proc, n.mapMemory, "vkMapMemory") && n.load(proc, n.waitIdle, "vkDeviceWaitIdle");
     if (!ok) { error = "missing Vulkan entry points"; return false; }
     const auto& file = files.hipnet;
     uint32_t count = 0;
@@ -148,6 +278,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
     auto carve = [&](uint64_t bytes) { used = (used + kAlign - 1) / kAlign * kAlign; const uint64_t at = used; used += bytes; return at; };
     const uint64_t planTokens = uint64_t(tw) * th * 16 * 2, planHead = uint64_t(tw) * th * 40 * 2;
     const uint64_t tokensSize = std::max(planTokens, tokenBytes), headSize = std::max(planHead, headBytes);
+    n.tokenBytes = tokensSize; n.headBytes = headSize;
     const uint64_t tokensAt = carve(tokensSize + kTail), headAt = carve(headSize + kTail);
     std::vector<uint64_t> wAt(11), act(11, ~0ull), full(5, ~0ull), gAt(11);
     for (uint32_t i = 0; i < 11; ++i) wAt[i] = carve(weightBytes[i] + kWeightTail);
@@ -228,9 +359,18 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
         if (!blocks) { error = names[i] + ": prep kernel without d4r_prep_blocks"; return false; }
         VkPipeline p = pipe(i, prep, {128, 1, 1});
         if (!p) return false;
-        n.preps.push_back({p, blocks, 1, argBlock(baseParams[i])});
+        n.preps.push_back({p, blocks, 1, argBlock(baseParams[i]), prep});
     }
-    for (uint32_t phase = 0; phase < 8; ++phase)
+    const char* trimEnv = std::getenv("D4R_ENGINE_K_TRIM");
+    const bool trim = !trimEnv || std::strcmp(trimEnv, "0") != 0;
+    for (uint32_t phase = 0; phase < 8; ++phase) {
+        int32_t size[2][11], shift[2][11];
+        for (uint32_t i = 0; i < 11; ++i) {
+            size[0][i] = baseParams[i].W; size[1][i] = baseParams[i].H;
+            kShift(KPlan[i].role, phase, shift[0][i], shift[1][i]);
+        }
+        uint32_t groups[2][11];
+        trimmedGroups(size, shift, {width, height}, groups);
         for (uint32_t i = 0; i < 11; ++i) {
             const auto& m = modules[i];
             LayerParamsK params = baseParams[i];
@@ -248,7 +388,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
                 if (!gx) { error = names[i] + ": phase kernel without d4r_grid_x"; return false; }
                 VkPipeline p = pipe(i, names[i], {32, 1, blockZ});
                 if (!p) return false;
-                n.nodes[phase].push_back({p, gx, gy, a});
+                n.nodes[phase].push_back({p, gx, gy, a, KPlan[i].name});
                 for (const auto& post : posts) {
                     const std::string s = post.substr(names[i].size());
                     uint32_t pgx = global32(m, "d4r" + s + "_grid_x", 0);
@@ -256,14 +396,17 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
                     VkPipeline pp = pipe(i, post, {global32(m, "d4r" + s + "_block_x", 32), global32(m, "d4r" + s + "_block_y", 1),
                                                     global32(m, "d4r" + s + "_block_z", 1)});
                     if (!pp) return false;
-                    n.nodes[phase].push_back({pp, pgx, global32(m, "d4r" + s + "_grid_y", 1), a});
+                    n.nodes[phase].push_back({pp, pgx, global32(m, "d4r" + s + "_grid_y", 1), a, KPlan[i].name + s});
                 }
             } else {
                 VkPipeline p = pipe(i, names[i], {32, 1, blockZ});
                 if (!p) return false;
-                n.nodes[phase].push_back({p, uint32_t(params.W + params.sx + 7) / 8, uint32_t(params.H + params.sy + 7) / 8, a});
+                const uint32_t gx = trim ? groups[0][i] : uint32_t(params.W + params.sx + 7) / 8;
+                const uint32_t gy = trim ? groups[1][i] : uint32_t(params.H + params.sy + 7) / 8;
+                n.nodes[phase].push_back({p, gx, gy, a, KPlan[i].name});
             }
         }
+    }
     if (args.size() > 256 * (11 + 8 * 32)) { error = "kernarg space"; return false; }
     // first-record contents: weights, the globals' initialized data, the kernarg blocks
     for (uint32_t i = 0; i < 11; ++i)
@@ -303,10 +446,88 @@ void KNetwork::record(VkCommandBuffer cb, bool reset) {
     // A reset clears temporal images, not NGX's eight-phase window schedule.
     // GameUpscaler advances that schedule on every evaluation, including resets.
     (void)reset;
-    n.run(cb, n.nodes[n.frame % 8]);
+    const bool dump = n.dumpBuffer && n.frame < n.dumpFrames;
+    if (dump) {
+        Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{0, n.frame * (n.tokenBytes + n.headBytes), n.tokenBytes};
+        n.cmdCopy(cb, n.tokens, n.dumpBuffer, 1, &copy);
+        Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    const uint32_t dumpFrame = n.frame;
+    const auto& list = n.nodes[n.frame % 8];
+    n.stampActive = -1;
+    if (n.stampPool) {
+        n.collectStamps(list);
+        auto& slot = n.stampSlots[n.frame % Impl::StampSlots];
+        if (!slot.pending && n.resetEvent(n.device, slot.done) == VK_SUCCESS) {
+            n.stampActive = int(n.frame % Impl::StampSlots); n.stampNext = 0;
+            slot.pending = true; slot.frame = n.frame;
+            n.cmdResetQueries(cb, n.stampPool, uint32_t(n.stampActive) * n.stampCount, n.stampCount);
+            n.stamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
+    }
+    n.run(cb, list);
     ++n.frame;
     Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    if (dump) {
+        Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{0, dumpFrame * (n.tokenBytes + n.headBytes) + n.tokenBytes, n.headBytes};
+        n.cmdCopy(cb, n.head, n.dumpBuffer, 1, &copy);
+        Impl::barrier(n.cmdBarrier, cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+    if (n.stampActive >= 0) {
+        n.stamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        n.cmdSetEvent(cb, n.stampSlots[n.stampActive].done, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        n.stampActive = -1;
+    }
+}
+
+void KNetwork::enableDump(const std::string& directory, uint32_t frames) {
+    auto& n = *impl;
+    if (n.dumpBuffer || directory.empty() || !frames || n.frame) return;
+    frames = std::min(frames, 8u);
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = frames * (n.tokenBytes + n.headBytes); info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (n.createBuffer(n.device, &info, nullptr, &n.dumpBuffer) != VK_SUCCESS) { n.dumpBuffer = VK_NULL_HANDLE; return; }
+    VkMemoryRequirements r; n.requirements(n.device, n.dumpBuffer, &r);
+    uint32_t type = ~0u;
+    for (uint32_t t = 0; t < n.memoryProperties.memoryTypeCount && type == ~0u; ++t)
+        if ((r.memoryTypeBits & (1u << t)) && (n.memoryProperties.memoryTypes[t].propertyFlags &
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) type = t;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = r.size; mai.memoryTypeIndex = type;
+    if (type == ~0u || n.allocate(n.device, &mai, nullptr, &n.dumpMemory) != VK_SUCCESS ||
+        n.bind(n.device, n.dumpBuffer, n.dumpMemory, 0) != VK_SUCCESS) {
+        n.destroyBuffer(n.device, n.dumpBuffer, nullptr); n.dumpBuffer = VK_NULL_HANDLE;
+        if (n.dumpMemory) { n.freeMemory(n.device, n.dumpMemory, nullptr); n.dumpMemory = VK_NULL_HANDLE; }
+        return;
+    }
+    n.dumpDir = directory; n.dumpFrames = frames;
+}
+
+void KNetwork::enableStamps(void (*log)(const char*), float timestampPeriod) {
+    auto& n = *impl;
+    if (n.stampPool || !log || !(timestampPeriod > 0) || n.nodes[0].empty()) return;
+    n.nsPerTick = timestampPeriod;
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    n.stampCount = 2 * uint32_t(n.nodes[0].size()) + 2;
+    qi.queryCount = Impl::StampSlots * n.stampCount;
+    if (n.createQueries(n.device, &qi, nullptr, &n.stampPool) != VK_SUCCESS) { n.stampPool = VK_NULL_HANDLE; return; }
+    for (auto& slot : n.stampSlots) {
+        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        if (n.createEvent(n.device, &ei, nullptr, &slot.done) != VK_SUCCESS) {
+            for (auto& s : n.stampSlots) if (s.done) { n.destroyEvent(n.device, s.done, nullptr); s.done = VK_NULL_HANDLE; }
+            n.destroyQueries(n.device, n.stampPool, nullptr); n.stampPool = VK_NULL_HANDLE;
+            return;
+        }
+    }
+    n.stampLog = log;
 }
 
 } // namespace vkhip

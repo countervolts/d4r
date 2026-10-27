@@ -4,9 +4,16 @@
 //   the current luma and the reprojected history luma of one pixel (range-compressed, sRGB-encoded),
 //   one channel of the previous frame's token feature, reprojected and averaged over the token,
 //   and how far the history's colour lies outside the current 3x3 neighbourhood.
-// One thread computes one token (the reference uses one thread per sub-block and warp shuffles for the average).
+// One thread computes one sub-block, as in the reference; the token's four threads exchange their feature samples
+// through shared memory for the average. A workgroup covers 8x8 tokens (the dispatch is one group per 8x8 tokens).
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-layout(local_size_x = 8, local_size_y = 8) in;
+#extension GL_GOOGLE_include_directive : require
+#include "input_quant.glsl"
+// Specialization constant 7 (set by the runtime per pipeline): the frame's colour and motion take the CUDA backend's
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
+// pipeline without it carries no conversion code for games whose textures are already in binary16.
+layout(constant_id = 7) const bool CANONICAL_INPUT = true;
+layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
     vec2 out2rnd, rndOffs;          // render position = (pixel + .5) * out2rnd - .5 + rndOffs
@@ -16,7 +23,8 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     ivec2 colOrigin, colSize, depOrigin, depSize, mvOrigin, mvSize;
     int tokW;
     uint flags;                     // bit 0: reset; bit 1: regular depth (larger is farther), otherwise inverted;
-                                    // bit 2: display-resolution motion (one vector per output pixel, no depth)
+                                    // bit 2: display-resolution motion (one vector per output pixel, no depth);
+                                    // bits 4, 5: canonical binary16 colour, motion (the pipeline's CANONICAL_INPUT)
     float expo, expoIn, expoRatio;  // exposure of the statistics; of the luma channels; previous / current
     float minW;
 } p;
@@ -59,11 +67,12 @@ float depthAt(ivec2 t)
     const float d = texelFetch(depthTex, ivec2(clamp1(t.x, p.depOrigin.x, hi.x), clamp1(t.y, p.depOrigin.y, hi.y)), 0).r;
     return (p.flags & 2u) != 0u ? -d : d;
 }
+vec2 motionIn(vec2 mv) { return CANONICAL_INPUT ? canonicalHalf(mv) : mv; }
 // motion vector of a texel, clamped to the motion rectangle, in output pixels
 vec2 motionTexel(ivec2 t)
 {
     const ivec2 hi = p.mvOrigin + p.mvSize;
-    return p.mvScale * (texelFetch(motionTex, ivec2(clamp1(t.x, p.mvOrigin.x, hi.x), clamp1(t.y, p.mvOrigin.y, hi.y)), 0).xy + p.mvOffs);
+    return p.mvScale * (motionIn(texelFetch(motionTex, ivec2(clamp1(t.x, p.mvOrigin.x, hi.x), clamp1(t.y, p.mvOrigin.y, hi.y)), 0).xy) + p.mvOffs);
 }
 // motion of the render texel nearest to a pixel, taken from the nearest of its diagonal depth neighbours;
 // with display-resolution vectors (flag 4) t is the pixel itself, and its own vector is used
@@ -81,22 +90,24 @@ vec2 motionOf(ivec2 t)
         if (dpp > m) { d = ivec2(1, 1); }
     }
     const ivec2 v = t + d, hi = p.mvOrigin + p.mvSize;
-    return p.mvScale * (texelFetch(motionTex, ivec2(clamp1(v.x, p.mvOrigin.x, hi.x), clamp1(v.y, p.mvOrigin.y, hi.y)), 0).xy + p.mvOffs);
+    return p.mvScale * (motionIn(texelFetch(motionTex, ivec2(clamp1(v.x, p.mvOrigin.x, hi.x), clamp1(v.y, p.mvOrigin.y, hi.y)), 0).xy) + p.mvOffs);
 }
 vec3 colourAt(ivec2 t)       // exposed, non-negative
 {
     const ivec2 hi = p.colOrigin + p.colSize;
-    return p.expo * max(texelFetch(colorTex, ivec2(clamp1(t.x, p.colOrigin.x, hi.x), clamp1(t.y, p.colOrigin.y, hi.y)), 0).rgb, 0.0);
+    const vec3 c = texelFetch(colorTex, ivec2(clamp1(t.x, p.colOrigin.x, hi.x), clamp1(t.y, p.colOrigin.y, hi.y)), 0).rgb;
+    return p.expo * max(CANONICAL_INPUT ? canonicalHalf(c) : c, 0.0);
 }
+shared vec4 featShared[16 * 16];  // the token feature seen from each sub-block of the group
 void main()
 {
-    const ivec2 tok = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 tok = ivec2(gl_GlobalInvocationID.xy) >> 1;
+    const ivec2 sub = ivec2(gl_GlobalInvocationID.xy) & 1;
+    const int s = sub.x + 2 * sub.y;
     const vec2 tokCentre = (vec2(tok) + 0.5) * 4.0;
-    vec4 feat[4];       // the token feature seen from each sub-block
-    vec4 res[4];
-    for (int s = 0; s < 4; ++s)
+    vec4 feat;
+    vec4 res;
     {
-        const ivec2 sub = ivec2(s & 1, s >> 1);
         const ivec2 X = tok * 4 + sub * 2;                    // top-left pixel of the sub-block
         // history colour of the four pixels, in linear exposed units of this frame
         vec3 lin[4];
@@ -157,7 +168,7 @@ void main()
         const ivec2 pr = X + ivec2(1 - sub.y, sub.x);
         const vec3 cr = colourAt(nearest(vec2(pr) + 0.5));
         const float Yc = 0.25 * cr.r + 0.5 * cr.g + 0.25 * cr.b;
-        feat[s] = invalid ? vec4(0.0) : textureLod(featTex, (tokCentre + dq[jr]) * p.tok2uv, 0.0);
+        feat = invalid ? vec4(0.0) : textureLod(featTex, (tokCentre + dq[jr]) * p.tok2uv, 0.0);
         const float Yh = invalid ? Yc : lin[jr].x;
         if (invalid) mismatch = 0.0;
         // luma channels: exposure ratio of the network's own scale (p.expoIn relative to p.expo)
@@ -166,15 +177,15 @@ void main()
 #else
         const float tc = p.expoIn * Yc, th = p.expoIn * Yh;
 #endif
-        res[s] = vec4(srgb(tc * max(1.0 / (tc + 1.0), p.minW)), srgb(th * max(1.0 / (th + 1.0), p.minW)), 0.0, mismatch);
+        res = vec4(srgb(tc * max(1.0 / (tc + 1.0), p.minW)), srgb(th * max(1.0 / (th + 1.0), p.minW)), 0.0, mismatch);
     }
-    const vec4 fs = 0.25 * (feat[0] + feat[1] + feat[2] + feat[3]);
+    featShared[gl_LocalInvocationIndex] = feat;
+    barrier();
+    const uint t0 = (gl_LocalInvocationID.y & ~1u) * 16u + (gl_LocalInvocationID.x & ~1u);  // the token's sub-block 0
+    const float fs = 0.25 * (featShared[t0][s] + featShared[t0 + 1u][s] + featShared[t0 + 16u][s] + featShared[t0 + 17u][s]);
     const uint o = uint(tok.y * p.tokW + tok.x) * 4u;
-    for (int s = 0; s < 4; ++s)
-    {
-        float f = fs[s], mm = res[s].w;
-        if (!(abs(f) < uintBitsToFloat(0x7F800000u))) f = 0.0;
-        if (!(abs(mm) < uintBitsToFloat(0x7F800000u))) mm = 0.0;
-        outb.v[o + uint(s)] = f16vec4(res[s].x, res[s].y, f, mm);
-    }
+    float f = fs, mm = res.w;
+    if (!(abs(f) < uintBitsToFloat(0x7F800000u))) f = 0.0;
+    if (!(abs(mm) < uintBitsToFloat(0x7F800000u))) mm = 0.0;
+    outb.v[o + uint(s)] = f16vec4(res.x, res.y, f, mm);
 }

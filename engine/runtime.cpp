@@ -170,14 +170,18 @@ struct Pipeline {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline handle = VK_NULL_HANDLE;
+    // K's input, output and exposure stages: the same shader with CANONICAL_INPUT (specialization constant 7)
+    // false, for frames whose colour and motion are already exact in binary16 (no conversion code at all)
+    VkPipeline f16Inputs = VK_NULL_HANDLE;
     ~Pipeline() {
+        if (f16Inputs) vkDestroyPipeline(device, f16Inputs, nullptr);
         if (handle) vkDestroyPipeline(device, handle, nullptr);
         if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
     }
     void create(VkDevice dev, const std::string& file, const std::vector<VkDescriptorType>& types,
                 uint32_t subgroup, VkPipelineCache cache, VkPipelineCreateFlags flags = 0,
-                const VkSpecializationInfo* specialization = nullptr) {
+                const VkSpecializationInfo* specialization = nullptr, bool f16InputVariant = false) {
         device = dev;
         std::vector<VkDescriptorSetLayoutBinding> bindings;
         for (uint32_t i = 0; i < types.size(); ++i)
@@ -205,6 +209,13 @@ struct Pipeline {
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &required,
                     VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", specialization};
         VkResult result = vkCreateComputePipelines(dev, cache, 1, &ci, nullptr, &handle);
+        if (result == VK_SUCCESS && f16InputVariant) {
+            const VkBool32 canonical = VK_FALSE;
+            const VkSpecializationMapEntry entry{7, 0, sizeof(canonical)};
+            const VkSpecializationInfo variant{1, &entry, sizeof(canonical), &canonical};
+            ci.stage.pSpecializationInfo = &variant;
+            result = vkCreateComputePipelines(dev, cache, 1, &ci, nullptr, &f16Inputs);
+        }
         vkDestroyShaderModule(dev, shader, nullptr);
         check(result, "vkCreateComputePipelines");
     }
@@ -232,8 +243,8 @@ void bindImage(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageVi
     write.pImageInfo = &info;
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
-void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y) {
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f16Inputs && pipeline.f16Inputs ? pipeline.f16Inputs : pipeline.handle);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
     vkCmdDispatch(cb, x, y, 1);
 }
@@ -331,7 +342,8 @@ FrameParams makeKFrameParams(const Shape& shape, const FrameSettings& settings) 
     FrameParams params{}; auto& in = params.input; auto& out = params.output;
     auto base = shape.layers[0];
     in.tokW = out.tokW = base.w; out.tokH = base.h;
-    in.flags = out.flags = (settings.reset ? FrameFlagReset : 0) | (settings.depthInverted ? 0 : FrameFlagRegularDepth) | (settings.displayMotion ? FrameFlagDisplayMotion : 0);
+    in.flags = out.flags = (settings.reset ? FrameFlagReset : 0) | (settings.depthInverted ? 0 : FrameFlagRegularDepth) | (settings.displayMotion ? FrameFlagDisplayMotion : 0) |
+        (settings.canonicalColor ? FrameFlagCanonicalColor : 0) | (settings.canonicalMotion ? FrameFlagCanonicalMotion : 0);
     out.flags |= kReconstructionTable(shape.outputWidth, shape.outputHeight, settings.renderWidth, settings.renderHeight) << FrameFlagTableShift;
     in.expo = out.expo = settings.colorExposure;
     in.expoRatio = out.expoRatio = settings.historyExposureRatio;
@@ -342,12 +354,16 @@ FrameParams makeKFrameParams(const Shape& shape, const FrameSettings& settings) 
         float render = axis ? settings.renderHeight : settings.renderWidth, output = axis ? shape.outputHeight : shape.outputWidth;
         float tokens = axis ? base.h : base.w;
         (axis ? out.kB : out.kA) = -16.f * output / render;
-        in.out2rnd[axis] = out.out2rnd[axis] = out.near2rnd[axis] = render / output;
-        out.sub2rnd[axis] = .5f * render / output; out.out2tok[axis] = .5f;
+        // NGX's f32 associations: render * (1 / output) (one ulp below render / output at 720/1080), the motion scale
+        // as its reciprocal, and the history uv over the 16-padded history (on-screen tests use the output itself)
+        const float out2rnd = render * (1.f / output), padded = float((uint32_t(output) + 15) / 16 * 16);
+        in.out2rnd[axis] = out.out2rnd[axis] = out.near2rnd[axis] = out2rnd;
+        out.sub2rnd[axis] = .5f * out2rnd; out.out2tok[axis] = .5f;
         in.rndOffs[axis] = settings.jitter[axis]; out.rndOffs[axis] = settings.jitter[axis] - .5f;
-        in.mvScale[axis] = out.mvScale[axis] = settings.motionScale[0] == 0 && settings.motionScale[1] == 0 ? (settings.displayMotion ? 1.f : output / render) : settings.motionScale[axis];
+        in.mvScale[axis] = out.mvScale[axis] = settings.motionScale[0] == 0 && settings.motionScale[1] == 0 ? (settings.displayMotion ? 1.f : 1.f / out2rnd) : settings.motionScale[axis];
         in.mvOffs[axis] = out.mvOffs[axis] = settings.motionOffset[axis];
-        in.invHist[axis] = in.invValid[axis] = out.invOut[axis] = out.invOutValid[axis] = 1.f / output;
+        in.invHist[axis] = out.invOut[axis] = 1.f / padded;
+        in.invValid[axis] = out.invOutValid[axis] = 1.f / output;
         in.tok2uv[axis] = 1.f / (tokens * 4.f);
         in.colSize[axis] = in.depSize[axis] = out.colMax[axis] = out.depMax[axis] = int32_t(render) - 1;
         in.mvSize[axis] = out.mvMax[axis] = int32_t(settings.displayMotion ? output : render) - 1;
@@ -362,7 +378,14 @@ struct Model::Impl {
     std::vector<char> weightBytes, lutBytes;   // until recordUpload
     std::array<std::array<uint32_t, 108>, KLayers> offsets{};
     std::array<Pipeline, KLayers> network;
-    Pipeline input, output, outputRgb10;
+    Pipeline input, output, outputRgb10, outputRgba8, outputR11;
+    // the final-store pipeline for a borrowed output texture of this format; null when none is packaged
+    const Pipeline* outputFor(VkFormat format) const {
+        const Pipeline* p = format == VK_FORMAT_R16G16B16A16_SFLOAT ? &output :
+            format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? &outputRgb10 : format == VK_FORMAT_R8G8B8A8_UNORM ? &outputRgba8 :
+            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : nullptr;
+        return p && p->handle ? p : nullptr;
+    }
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
          hasGameExposure = false, hasRatioTables = false, dot2 = false;
@@ -456,12 +479,16 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     const char* waveEnv = std::getenv("D4R_ENGINE_K_STAGE_WAVE");
     const uint32_t wave = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : 64;
     const uint32_t stageWave = waveEnv ? wave : m.dot2 ? 32 : 64;
-    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, stageWave, cache);
-    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache);
+    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, stageWave, cache, 0, nullptr, true);
+    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/output_k_rgb10.spv"))
-        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache);
+        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(directory + "/output_k_store_rgba8.spv"))
+        m.outputRgba8.create(device, directory + "/output_k_store_rgba8.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(directory + "/output_k_store_r11g11b10.spv"))
+        m.outputR11.create(device, directory + "/output_k_store_r11g11b10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
-        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache);
+        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache, 0, nullptr, true);
         m.exposure[1].create(device, directory + "/exposure_k1.spv", {b,b,b,b,b,t}, wave, cache);
         m.hasExposure = true;
     }
@@ -473,6 +500,7 @@ bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
+bool Model::hasDirectOutput(VkFormat format) const { return impl->outputFor(format) != nullptr; }
 bool Model::dot2Network() const { return impl->dot2; }
 Model::~Model() = default;
 bool Model::uploadRecorded() const { return impl->uploaded; }
@@ -504,7 +532,9 @@ struct Engine::Impl {
     std::array<VkDescriptorSet, 2> inputSets{}, outputSets{};
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     unsigned previous = 0;
-    bool initialized = false, frameSet = false, reset = false, windowsChanged = false, rgb10Output = false;
+    bool initialized = false, frameSet = false, reset = false, windowsChanged = false;
+    const Pipeline* finalStore = nullptr; // setFrame: the final-store pipeline for the frame's output
+    bool f16Inputs = false;  // the frame's colour and motion are exact in binary16: the stages without the conversion
     bool external = false;   // the caller owns the token and head buffers; the layers run outside
     bool trim = true;        // only the windows the results depend on (kLayerGroups)
     bool frontDone = false;  // recordFront has run and recordBack is due
@@ -597,8 +627,11 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
     VKCHECK(vkCreateSampler(dev, &si, nullptr, &e.linear));
     for (unsigned i = 0; i < 2; ++i) {
         auto& h = e.history[i];
-        h.color.create(d, shape.outputWidth, shape.outputHeight);
-        h.luma.create(d, shape.outputWidth * 2, shape.outputHeight * 2, true);
+        // NGX's histories cover the output padded to 16 pixels (its output kernel's 16x16 blocks write the padding,
+        // and the bilinear history fetches near the last row and column read it)
+        const uint32_t hw = (shape.outputWidth + 15) / 16 * 16, hh = (shape.outputHeight + 15) / 16 * 16;
+        h.color.create(d, hw, hh);
+        h.luma.create(d, hw * 2, hh * 2, true);
         h.feature.create(d, base.w, base.h);
     }
     if (e.model.hasExposure) {
@@ -651,9 +684,8 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                       const std::array<LayerShape, KLayers>* windows, const ExposureControl* exposure,
                       FrameOutput finalOutput) {
     auto& e = *impl;
-    if (finalOutput.view && finalOutput.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
-        (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.outputRgb10.handle))
-        throw std::runtime_error("unsupported borrowed output format or missing RGB10A2 shader");
+    if (finalOutput.view && !e.model.outputFor(finalOutput.format))
+        throw std::runtime_error("unsupported borrowed output format or missing final-store shader for it");
     if (exposure) {
         if (!e.model.hasExposure) throw std::runtime_error("the model has no exposure shaders (recompile it with compile_k.py)");
         if (exposure->game && (!e.model.hasGameExposure || !images.exposure)) throw std::runtime_error("game exposure needs recompiled K shaders and an exposure view");
@@ -666,7 +698,7 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     }
     if (!images.color || !images.motion || !images.depth) throw std::runtime_error("frame has a null image view");
     if (input.tokW != e.shape.layers[0].w || output.tokW != input.tokW || output.tokH != e.shape.layers[0].h ||
-        input.flags != (output.flags & ~FrameFlagTableMask) || (input.flags & ~(FrameFlagReset | FrameFlagRegularDepth | FrameFlagDisplayMotion)) || output.outSize[0] != int32_t(e.shape.outputWidth) || output.outSize[1] != int32_t(e.shape.outputHeight) ||
+        input.flags != (output.flags & ~FrameFlagTableMask) || (input.flags & ~(FrameFlagReset | FrameFlagRegularDepth | FrameFlagDisplayMotion | FrameFlagCanonicalColor | FrameFlagCanonicalMotion)) || output.outSize[0] != int32_t(e.shape.outputWidth) || output.outSize[1] != int32_t(e.shape.outputHeight) ||
         (finalOutput.view ? output.outOrigin[0] < 0 || output.outOrigin[1] < 0 : output.outOrigin[0] || output.outOrigin[1]) || output.out2tok[0] != .5f || output.out2tok[1] != .5f)
         throw std::runtime_error("frame parameters do not match engine dimensions");
     if ((input.flags & FrameFlagRegularDepth) && !e.model.hasRegularDepth)
@@ -776,8 +808,9 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     e.inputSets = found->input; e.outputSets = found->output;
     e.exposureSets[0] = found->exposure;
     e.exposureSets[1] = found->exposureUpdate;
-    e.rgb10Output = finalOutput.view && finalOutput.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : &e.model.output;
     e.reset = (input.flags & FrameFlagReset) != 0; e.frameSet = true;
+    e.f16Inputs = (input.flags & (FrameFlagCanonicalColor | FrameFlagCanonicalMotion)) == 0;
 }
 void Engine::recordFrame(VkCommandBuffer cb) {
     recordFrame(cb, {});
@@ -809,7 +842,7 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     if (e.exposureOn) {
         const auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         if (e.exposure.flags & 1u) {
-            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
+            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX, e.f16Inputs);
             memoryBarrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
         dispatch(cb, e.model.exposure[1], e.exposureSets[1], 1, 1);
@@ -817,7 +850,7 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     }
     mark(2);
     auto base = e.shape.layers[0];
-    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8);
+    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8, e.f16Inputs);
     mark(3);
     const auto groups = kLayerGroups(e.shape, e.trim);
     for (unsigned i = 0; i < KLayers; ++i) {
@@ -827,8 +860,8 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
         mark(4 + i);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    dispatch(cb, e.rgb10Output ? e.model.outputRgb10 : e.model.output, e.outputSets[e.previous],
-             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+    dispatch(cb, *e.finalStore, e.outputSets[e.previous],
+             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16, e.f16Inputs);
     mark(4 + KLayers);
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -858,7 +891,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     stamp(); // setup
     if (e.exposureOn) {
         if (e.exposure.flags & 1u) {
-            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
+            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX, e.f16Inputs);
             memoryBarrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
         dispatch(cb, e.model.exposure[1], e.exposureSets[1], 1, 1);
@@ -866,7 +899,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     }
     stamp(); // exposure
     auto base = e.shape.layers[0];
-    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8);
+    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8, e.f16Inputs);
     stamp(); // input
     memoryBarrier(cb, compute, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     e.frontDone = true;
@@ -881,8 +914,8 @@ void Engine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) 
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
     stamp(); // before the final store
-    dispatch(cb, e.rgb10Output ? e.model.outputRgb10 : e.model.output, e.outputSets[e.previous],
-             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+    dispatch(cb, *e.finalStore, e.outputSets[e.previous],
+             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16, e.f16Inputs);
     memoryBarrier(cb, compute, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     stamp(); // after the final store
     e.previous = 1 - e.previous; e.frameSet = false; e.frontDone = false;

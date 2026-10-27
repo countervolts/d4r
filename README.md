@@ -1,4 +1,3 @@
-<!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
 # d4r (dlss 4 radeon)
 
 want to run xess (xmx) on radeon? check out [x4r](https://github.com/countervolts/x4r)!
@@ -27,7 +26,7 @@ Radeon RX 7700 XT, SILENT HILL Townfall.
 | Balanced | 80.8 | **82.5** | 58.0 | 80.2 | **2.01 ms** | 2.39 ms |
 | Ultra Performance | 89.1 | **100.6** | 92.2 | 96.9 | **1.99 ms** | 2.26 ms |
 
-DLSS 4 (K) FPS was measured on 2026-10-21.
+DLSS 4 (K) FPS was measured on 2026-10-21, Using no approximations. 
 \* Presets E and M are from 2026-09-29, on an older d4r build, so compare them with each other rather than with the newer columns.
 
 Radeon RX 7700 XT, Ghost of Tsushima.
@@ -38,7 +37,8 @@ Radeon RX 7700 XT, Ghost of Tsushima.
 | Balanced | **93.8** | 93.2 | **1.96 ms** | 2.47 ms |
 | Ultra Performance | 101.7 | **102.5** | **1.91 ms** | 2.36 ms |
 
-Measured on 2026-10-21. K and FSR 4.1.1 are within 1% across all three modes, with K slightly ahead at Quality and Balanced and FSR slightly ahead at Ultra Performance.
+Measured on 2026-10-21, Using no approximations. 
+K and FSR 4.1.1 are within 1% across all three modes, with K slightly ahead at Quality and Balanced and FSR slightly ahead at Ultra Performance.
 
 Radeon RX 7700 XT, Cyberpunk 2077.
 
@@ -48,7 +48,8 @@ Radeon RX 7700 XT, Cyberpunk 2077.
 | Balanced | **99.5** | 98.0 | **2.04 ms** | 2.20 ms |
 | Ultra Performance | **134.0** | 132.5 | **1.98 ms** | 2.08 ms |
 
-Measured on 2026-10-21; DLSS averages 1.1–1.5% higher FPS than FSR across these runs, with upscale times 0.10–0.20 ms lower.
+Measured on 2026-10-21, Using no approximations. 
+DLSS averages 1.1–1.5% higher FPS than FSR across these runs, with upscale times 0.10–0.20 ms lower.
 
 ## Switching models and FSR in game
 

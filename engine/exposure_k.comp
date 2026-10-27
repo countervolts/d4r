@@ -16,6 +16,12 @@
 //           input and output stages' parameter blocks. It also runs on frames that do not measure.
 //           With flag 4 (MODE 0) the game's 1x1 exposure texture replaces the measurement; nothing is measured then.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "input_quant.glsl"
+// Specialization constant 7 (set by the runtime per pipeline): the frame's colour take the CUDA backend's
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
+// pipeline without it carries no conversion code for games whose textures are already in binary16.
+layout(constant_id = 7) const bool CANONICAL_INPUT = true;
 #ifndef MODE
 #define MODE 0
 #endif
@@ -63,7 +69,13 @@ void main()
             if (at.x >= grid.x || at.y >= grid.y) continue;
             // endpoint-aligned nearest-texel lookup from the grid to the colour rectangle
             const ivec2 sampleAt = ivec2(floor(fma(vec2(at) / vec2(grid - 1), vec2(p.size - 1), vec2(0.5))));
+            #if MODE == 0
+            // K: the CUDA backend's canonical binary16 colour (input_quant.glsl)
+            const vec3 t = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+            const vec3 c = CANONICAL_INPUT ? canonicalHalf(t) : t;
+#else
             const vec3 c = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+#endif
             // the reference accumulates the logarithm of the exposed luma (cuda_luma_convert_kernel). The
             // constant is applied to Y = fma(b, 0.25, fma(r, 0.25, g * 0.5)); MODE 1 keeps its own expression.
 #if LOG_MEAN

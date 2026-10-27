@@ -1,6 +1,7 @@
 // Adapter between a game's own textures and the preset K engine. Everything is recorded into the
 // game's command buffer: direct texture access (or format conversion), inference and output.
 #pragma once
+#include <string>
 #include "runtime.h"
 
 namespace d4r {
@@ -52,6 +53,9 @@ public:
     // caller orders them (the shim splits the game's command list there).
     void recordFront(VkCommandBuffer command, const GameFrame& frame);
     void recordBack(VkCommandBuffer command, const GameFrame& frame);
+    // Debug: copies the three histories each of the first `frames` evaluations writes (at most 8) into host memory and
+    // writes them as DIR/hist-{color,luma,feature}-N.bin when this object is destroyed.
+    void enableHistoryDump(const std::string& directory, uint32_t frames);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

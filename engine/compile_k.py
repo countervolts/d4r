@@ -73,7 +73,7 @@ def hip_weight_place(launch, offset=64):
     raise ValueError(f'{launch}: the weights allocation is missing')
 
 
-def package_hip(output, kernels, capture):
+def package_hip(output, kernels, capture, accuracy=None):
     """Writes hipnet.bin + hip/*.hsaco. The kernels' PwinParams.w is the launch's argument at byte 64.
     NGX packs the eleven layers back to back in one allocation, so a layer's blob is its region up to the
     next layer's weights pointer (the last one to the end of the allocation)."""
@@ -103,12 +103,17 @@ def package_hip(output, kernels, capture):
         head += struct.pack('<32siiIIQQ', HIP_KERNEL.format(name).encode(), sx, sy, HIP_DIVISOR[name], 0, at, len(w))
         blobs += [w, bytes(pad)]; at += len(w) + pad
     (output / 'hipnet.bin').write_bytes(head + b''.join(blobs))
-    (output / 'hip').mkdir(exist_ok=True)
-    for name in HIP_ORDER:
-        src = kernels / f'{HIP_KERNEL.format(name)}.hsaco'
-        if not src.exists():
-            raise ValueError(f'{src} is missing')
-        (output / 'hip' / src.name).write_bytes(src.read_bytes())
+    # hip/: the layers vkhip runs by default; hip-accuracy/ (optional): the accuracy set, taken with
+    # [Kernels] PreferAccuracy. Both read the same hipnet.bin.
+    for folder, source in (('hip', kernels), ('hip-accuracy', accuracy)):
+        if source is None:
+            continue
+        (output / folder).mkdir(exist_ok=True)
+        for name in HIP_ORDER:
+            src = source / f'{HIP_KERNEL.format(name)}.hsaco'
+            if not src.exists():
+                raise ValueError(f'{src} is missing')
+            (output / folder / src.name).write_bytes(src.read_bytes())
 
 
 def tensor_spans(e):
@@ -164,9 +169,13 @@ def main():
                    'hip/dltss_pwin_*_layer.hsaco from KERNEL_DIR (kernels/build.sh output)')
     p.add_argument('--capture', type=Path, metavar='CAPTURE_DIR', help='with --hip: the dump directory holding one '
                    'captured frame of the eleven dltss_pwin_*_layer launches (D4R_CUDA_REPLAY_DUMP_DIR)')
+    p.add_argument('--hip-accuracy', type=Path, metavar='KERNEL_DIR', help='with --hip: also package the accuracy '
+                   'layer set as hip-accuracy/ (taken with [Kernels] PreferAccuracy: byte-identical to the CUDA backend)')
     a = p.parse_args()
     if a.hip and a.capture is None:
         p.error('--hip needs --capture (the weights come from a captured frame)')
+    if a.hip_accuracy and not a.hip:
+        p.error('--hip-accuracy needs --hip')
     weights = Path(str(a.model_prefix) + '.bin')
     index = json.loads(Path(str(a.model_prefix) + '.json').read_text())
     validate(index, weights.stat().st_size)
@@ -210,9 +219,13 @@ def main():
     for name in ('input_k', 'output_k'):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(['-DLDR=1'] if a.ldr else []),
                         str(HERE / (name + '.comp')), '-o', str(a.output / (name + '.spv'))], check=True)
-    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', '-DOUTPUT_RGB10=1',
-                    *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
-                    '-o', str(a.output / 'output_k_rgb10.spv')], check=True)
+    # final stores straight into the game's packed output textures (output_store.glsl); RGBA16F is output_k.spv
+    # (output_k_rgb10.spv keeps its name; the newer stores are output_k_store_*.spv, so a stale output_k_rgba8.spv
+    # left in a model folder by older experimental builds is never picked up)
+    for define, store in (('OUTPUT_RGB10', 'rgb10'), ('OUTPUT_RGBA8', 'store_rgba8'), ('OUTPUT_R11G11B10', 'store_r11g11b10')):
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-D{define}=1',
+                        *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
+                        '-o', str(a.output / f'output_k_{store}.spv')], check=True)
     for stage in '01':
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', '-DPASS=' + stage, str(HERE / 'exposure_k.comp'),
                         '-o', str(a.output / f'exposure_k{stage}.spv')], check=True)
@@ -222,14 +235,17 @@ def main():
     # texture (exposure flag 4).
     (a.output / 'direct_origins.bin').write_bytes(b'D4RO0003')
     if a.hip:
-        package_hip(a.output, a.hip, a.capture)
+        package_hip(a.output, a.hip, a.capture, a.hip_accuracy)
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv'))
     if a.hip:
         files += sorted(a.output.glob('hip/*.hsaco'))
+    accuracy_files = sorted(a.output.glob('hip-accuracy/*.hsaco')) if a.hip_accuracy else []
     manifest = {'format': 'd4r-k', 'version': MANIFEST_VERSION, 'layers': list(index),
                 'variant': 'ldr' if a.ldr else 'hdr',
                 'numerics': 'folded-gains' if all(e.get('fold_gains', True) for e in index.values()) else 'explicit-f16-gains',
                 'sha256': {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in files}}
+    if accuracy_files:  # the same names as hip/: keyed by their path
+        manifest['sha256'].update({f'hip-accuracy/{f.name}': hashlib.sha256(f.read_bytes()).hexdigest() for f in accuracy_files})
     (a.output / 'model.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(f'Compiled native preset K model in {a.output}' + (f' with native HIP kernels from {a.hip}' if a.hip else ''))
 

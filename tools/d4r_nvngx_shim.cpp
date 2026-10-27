@@ -719,6 +719,8 @@ static void load_portable_config()
     const std::string native = ascii_lower(ini_value(ini, "kernels", "NativeKernels"));
     // The bridge selects accuracy variants and enforces their compiler/sync policy before cuInit.
     portable_set_unix("D4R_PREFER_ACCURACY", ini_flag(ini, "kernels", "PreferAccuracy", 0) ? "1" : "0");
+    // ... and for the shim: vkhip's K network takes the accuracy kernel set (create_engine_vkhip)
+    portable_set("D4R_PREFER_ACCURACY", ini_flag(ini, "kernels", "PreferAccuracy", 0) ? "1" : "0");
     portable_set_unix("D4R_NATIVE_SWIN_ENCODERS", ini_flag(ini, "kernels", "NativeSwinEncoders", 1) ? "1" : "0");
     const bool nativeOn = native.empty() || native == "on" || native == "true" || native == "1" || native == "fast";
     if (!nativeOn && native != "off" && native != "false" && native != "0")
@@ -9578,7 +9580,9 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
     d4r::vkTable.GetPhysicalDeviceFormatProperties(g_vk.physical, image.format, &properties);
     const bool enabled = env_uint(isOutput ? "D4R_ENGINE_DIRECT_OUTPUT" : "D4R_ENGINE_DIRECT_INPUTS", 1) != 0;
     const bool compatible = desc.DepthOrArraySize == 1 && originSupported && (isOutput ?
-        (image.format == VK_FORMAT_R16G16B16A16_SFLOAT || image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) &&
+        // the final-store formats (K packages a store per format; other models copy what they cannot store)
+        (image.format == VK_FORMAT_R16G16B16A16_SFLOAT || image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+         image.format == VK_FORMAT_R8G8B8A8_UNORM || image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
             (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) :
         !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -11222,17 +11226,26 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     vkhip::NetFiles files;
     files.mach = mach;
     if (!load(widen(directory + "/hipnet.bin"), files.hipnet)) return unavailable("missing hipnet.bin");
+    // [Kernels] PreferAccuracy: the accuracy layers (NVIDIA's f16 rounding after every k16 step; byte-identical to
+    // the CUDA backend, about 0.12 ms slower at 1080p) when the model has them, otherwise the fast set in hip/
+    const bool accuracy = env_uint("D4R_PREFER_ACCURACY", 0) != 0 &&
+        GetFileAttributesW(widen(directory + "/hip-accuracy/dltss_pwin_enc0_layer.hsaco").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const std::string hipDir = directory + (accuracy ? "/hip-accuracy/" : "/hip/");
     for (const char* layer : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
         const std::string name = std::string("dltss_pwin_") + layer + "_layer";
-        if (!load(widen(directory + "/hip/" + name + ".hsaco"), files.code[name]))
+        if (!load(widen(hipDir + name + ".hsaco"), files.code[name]))
             return unavailable(name + ".hsaco missing");
     }
     auto network = std::make_unique<vkhip::KNetwork>();
     std::string error;
     if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
                          feature.outHeight, tokenBytes, headBytes, error)) return unavailable(error);
-    logf("experimental vkhip ready on %s: %u native dispatches, shared image-format adapter, regular/inverted depth",
-         gfx, network->dispatchesPerFrame());
+    logf("experimental vkhip ready on %s: %u native dispatches, %s layers, shared image-format adapter, regular/inverted depth",
+         gfx, network->dispatchesPerFrame(), accuracy ? "accuracy" : "fast");
+    if (env_uint("D4R_VKHIP_STAMPS", 0) != 0)
+        network->enableStamps([](const char* line) { logf("%s", line); }, props.properties.limits.timestampPeriod);
+    if (const std::string dump = env_string("D4R_VKHIP_DUMP_DIR"); !dump.empty())
+        network->enableDump(dump, env_uint("D4R_VKHIP_DUMP_FRAMES", 4));
     feature.engineVkHip = std::move(network);
     return true;
 }
@@ -11352,18 +11365,27 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return refuse("a texture format is not implemented");
     }
     if (frame <= 2)
-        logf("engine direct textures: color %d, motion %d, depth %d, output %d (format %d, RGB10A2 pipeline %d)",
+        logf("engine direct textures: color %d, motion %d, depth %d, output %d (format %d, final store for it %d)",
              game.color.view != VK_NULL_HANDLE, game.motion.view != VK_NULL_HANDLE,
              game.depth.view != VK_NULL_HANDLE, game.output.view != VK_NULL_HANDLE,
-             game.output.format, model->hasRgb10Output());
+             game.output.format, model->hasDirectOutput(game.output.format));
     game.settings.renderWidth = p.renderWidth;
     game.settings.renderHeight = p.renderHeight;
+    // The CUDA backend converts other colour and motion formats to binary16 (toward zero) before NGX reads them;
+    // the engine repeats that conversion, which these formats do not need (exact in binary16).
+    game.settings.canonicalColor = game.color.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                   game.color.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    game.settings.canonicalMotion = game.motion.format != VK_FORMAT_R16G16_SFLOAT &&
+                                    game.motion.format != VK_FORMAT_R16G16B16A16_SFLOAT;
     game.settings.jitter[0] = p.jitterX;
     game.settings.jitter[1] = p.jitterY;
     game.settings.displayMotion = displayMotion;
     // The engine takes motion in output pixels; MV.Scale gives render pixels (display-resolution vectors are output pixels already).
-    const float toOutput = displayMotion ? 1.0f : static_cast<float>(feature.outWidth) / static_cast<float>(p.renderWidth);
-    const float toOutputY = displayMotion ? 1.0f : static_cast<float>(feature.outHeight) / static_cast<float>(p.renderHeight);
+    // NGX's association: the reciprocal of render * (1 / output) (1.5000001 at 720 -> 1080, not 1080 / 720)
+    const float toOutput = displayMotion ? 1.0f :
+        1.0f / (static_cast<float>(p.renderWidth) * (1.0f / static_cast<float>(feature.outWidth)));
+    const float toOutputY = displayMotion ? 1.0f :
+        1.0f / (static_cast<float>(p.renderHeight) * (1.0f / static_cast<float>(feature.outHeight)));
     game.settings.motionScale[0] = p.mvScaleX * toOutput;
     game.settings.motionScale[1] = p.mvScaleY * toOutputY;
     // MVJittered: NGX adds the change of the jitter (render pixels) to the vectors before scaling them
@@ -11404,6 +11426,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
                                                                  feature.outWidth, feature.outHeight,
                                                                  feature.outWidth, feature.outHeight,
                                                                  (hip || vkhip) ? &external : nullptr);
+            if (const std::string dump = env_string("D4R_ENGINE_HISTORY_DUMP_DIR"); !dump.empty())
+                feature.engine->enableHistoryDump(dump, env_uint("D4R_VKHIP_DUMP_FRAMES", 4));
             logf("engine backend: feature %u runs preset K in the game's command list (%ux%u -> %ux%u), network on %s",
                  feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
                  vkhip ? "experimental vkhip (one Vulkan command list)" :
@@ -12182,16 +12206,53 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
     return NGX_SUCCESS;
 }
 
+// The command list an evaluation records into, as vkd3d-proton's own object: its interop calls (Vulkan recording,
+// RetainExternalResources) accept nothing else. Streamline's proxy lists (sl.interposer.dll) hand out the list they
+// wrap for this interface; games whose FSR inputs OptiScaler forwards to NGX can pass such a proxy. The proxy keeps
+// the wrapped list alive for the call.
+static const GUID kStreamlineRetrieveBaseInterface = {0xADEC44E2, 0x61F0, 0x45C3, {0xAD, 0x9F, 0x1B, 0x37, 0x37, 0x92, 0x84, 0xFF}};
+static ID3D12GraphicsCommandList* native_command_list(ID3D12GraphicsCommandList* list)
+{
+    if (!list)
+        return list;
+    static std::atomic<bool> logged{false};
+    IUnknown* base = nullptr;
+    if (SUCCEEDED(list->QueryInterface(kStreamlineRetrieveBaseInterface, reinterpret_cast<void**>(&base))) && base)
+    {
+        ID3D12GraphicsCommandList* native = nullptr;
+        const HRESULT hr = base->QueryInterface(__uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&native));
+        base->Release();
+        if (SUCCEEDED(hr) && native)
+        {
+            native->Release();
+            if (!logged.exchange(true))
+                logf("evaluate: the command list is a Streamline proxy; recording into the list it wraps");
+            return native;
+        }
+    }
+    if (!logged.exchange(true))
+    {
+        // which module implements the list (vkd3d-proton's d3d12core.dll unless something wraps it)
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>((*reinterpret_cast<void***>(list))[0]), &module))
+            GetModuleFileNameA(module, path, sizeof(path));
+        logf("evaluate: command list implemented by %s", path);
+    }
+    return list;
+}
+
 D4R_EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
                                                      void* parameters, void*)
 {
-    return evaluate(list, handle, parameters);
+    return evaluate(native_command_list(list), handle, parameters);
 }
 
 D4R_EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
                                                        void* parameters, void*)
 {
-    return evaluate(list, handle, parameters);
+    return evaluate(native_command_list(list), handle, parameters);
 }
 
 static void fsr_rr_release(Feature& feature);

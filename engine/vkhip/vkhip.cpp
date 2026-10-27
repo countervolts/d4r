@@ -3,6 +3,7 @@
 #include "donor_spv.h"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 
 namespace vkhip {
 namespace {
@@ -274,7 +275,12 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                                       ((rsrc1 & 0x3f) + 1) * 8 < vgprs + 8 && lds >= declared && lds < declared + 1024 &&
                                       ((donorRsrc2 & RSRC2_LDS_MASK) != 0) == (lds != 0) && scratch == 0 && fmode < 256 &&
                                       object[CFG + WGP_MODE] <= 1 && ((rsrc1 >> 12) & 0xff) == fmode;
-                    if (!sane) { fail("unrecognized RADV shader binary layout (Mesa changed?)"); bad = true; break; }
+                    if (!sane) {
+                        char fields[160];
+                        std::snprintf(fields, sizeof(fields), " [sgprs %u vgprs %u rsrc1 %#x rsrc2 %#x lds %u/%u scratch %u fmode %u wgp %u]",
+                                      sgprs, vgprs, rsrc1, donorRsrc2, lds, declared, scratch, fmode, object[CFG + WGP_MODE]);
+                        fail(std::string("unrecognized RADV shader binary layout (Mesa changed?)") + fields); bad = true; break;
+                    }
                 }
                 std::vector<uint8_t> patched(object.begin(), object.begin() + h);
                 // code: s_branch to the entry, padding to 256 bytes, .text (its 256-byte alignment kept), tail

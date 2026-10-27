@@ -287,21 +287,29 @@ engine.recordFrame(frameCommand);
 Borrowed images must be sampleable, accessible to the recording queue family, and alive (including their views)
 until Engine destruction after GPU completion. `FrameImages` supplies each sampled layout, defaulting to `GENERAL`.
 The caller must enable the device features listed in `runtime.h`. Optional `FrameOutput{view, format}` passed to
-`setFrame` receives reconstruction directly: RGBA16F or RGB10A2 storage, `GENERAL`, covering
+`setFrame` receives reconstruction directly: RGBA16F or RGB10A2 storage (K also RGBA8 and R11G11B10), `GENERAL`, covering
 `outOrigin + outSize`. In this mode `outputImage()` still names the owned, unwritten fallback image.
 
 [game.h](game.h) is the adapter for game textures: provide `GameImage::view` for compatible sampled inputs and
-an RGBA16F or RGB10A2 storage output. It samples inputs and writes the output directly, respecting rectangle origins.
-Null views retain per-plane copies. Other output formats and packages without the RGB10A2 variant retain the final conversion blit;
+an RGBA16F or RGB10A2 storage output (K: also RGBA8 and R11G11B10). It samples inputs and writes the output directly,
+respecting rectangle origins. Null views retain per-plane copies. Other output formats and packages without the matching
+final-store variant retain the final conversion blit (about 0.13 ms at 1440p on an RX 7700 XT);
 input/output image aliasing also uses the output blit. Views and images must outlive the adapter. Input formats
 are sampled in their original precision, so f32 colour/motion avoid the former f16 intermediate rounding.
 
 `compile_k.py` and `compile_m.py` package both final-store formats; `hasRgb10Output()` reports the packed variant.
+`compile_k.py` also packages `output_k_store_rgba8.spv` and `output_k_store_r11g11b10.spv` (`Model::hasDirectOutput(format)`;
+the names avoid the PTX-translated `output_k_rgba8.spv` some older experimental model folders carry).
 Both compilers accept `--ldr` for NGX evaluations without the HDR flag. RGB10A2 stores share `output_store.glsl`:
 the mantissa mask reproduces RADV's truncating RGBA16F store before UNORM conversion, rather than changing rounding
 when removing the intermediate image. A GPU corpus of 324,614 values (all half patterns, signed half ties and their
 adjacent floats, RGB/alpha quantization boundaries, random f32 and low-payload NaNs) matched the old half-store +
 blit on every pixel. This format-conversion proof applies to the tested RX 9070 XT/RADV driver, not all vendors.
+The RGBA8 store uses the same mask; R11G11B10 keeps values below binary16's normal range, so it takes the full
+toward-zero binary16 conversion of `input_quant.glsl` and the blit's canonical NaN. A 448,512-value corpus (every half
+pattern with its f32 neighbours and midpoints, UNORM quantization boundaries, overflow, Inf, NaN payloads, random
+values) matched the half store + blit for RGB10A2, RGBA8 and R11G11B10, with and without colour-attachment usage
+(RX 7700 XT, RADV); full K frames are byte-identical to the blit path for both kernel sets.
 
 Paired output-path timing (2026-10-10, LDR 1712×960 → 2560×1440, 20 alternating samples per mode,
 Vulkan network, warm GPU timestamps; not the in-game acceptance number):

@@ -36,7 +36,8 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
     const bool directColor = frame.color.view != VK_NULL_HANDLE && !frame.color.x && !frame.color.y;
     const bool directMotion = frame.motion.view != VK_NULL_HANDLE && !frame.motion.x && !frame.motion.y;
     const bool directDepth = frame.depth.view != VK_NULL_HANDLE && !frame.depth.x && !frame.depth.y;
-    const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasRgb10Output()) &&
+    const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth,
+                                  g.model.hasRgb10Output() && frame.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) &&
         !frame.output.x && !frame.output.y;
     if (!g.started) {
         if (!g.model.uploadRecorded()) g.model.recordUpload(cb);
@@ -62,7 +63,8 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
 }
 void GameUpscalerM::Impl::result(VkCommandBuffer cb, const GameFrameM& frame) {
     auto& g = *this;
-    if (game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasRgb10Output()) && !frame.output.x && !frame.output.y) return;
+    if (game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth,
+                                  g.model.hasRgb10Output() && frame.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) && !frame.output.x && !frame.output.y) return;
     game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.outputWidth, g.outputHeight);
 }
 void GameUpscalerM::record(VkCommandBuffer cb, const GameFrameM& frame) {

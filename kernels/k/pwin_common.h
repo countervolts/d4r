@@ -9,6 +9,12 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+// The accuracy set rounds every k16 step to f16 and widens it again (mma16); the inline-asm pair conversion hides
+// the last step's f16 from the compiler, which then converts it a third time. Without it the extra conversions
+// fold away (enc0 2739 -> 2147, dec0 3011 -> 2355; gfx1101 vkhip 1080p 181 -> 170 and 185 -> 174 us, byte-identical).
+#if defined(D4R_ACCURACY) && defined(WM_CVT_ASM)
+#undef WM_CVT_ASM
+#endif
 #include "../common/wmma_layout.h"
 #if defined(D4R_ACCURACY) && defined(PWIN_F32ACC)
 #undef PWIN_F32ACC

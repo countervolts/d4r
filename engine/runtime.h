@@ -28,6 +28,9 @@ struct OutputParams {
     float expo, expoRatio, sharp, minAlpha, alphaThr, lutScale, kA, kB, c184, c186;
 };
 constexpr uint32_t FrameFlagReset = 1, FrameFlagRegularDepth = 2, FrameFlagDisplayMotion = 4;
+// The colour / motion texels go through the CUDA backend's binary16 canonical conversion (input_quant.glsl): set
+// for textures whose format is not exact in binary16 (FrameSettings::canonicalColor / canonicalMotion).
+constexpr uint32_t FrameFlagCanonicalColor = 16, FrameFlagCanonicalMotion = 32;
 // OutputParams::flags only: the reconstruction table of this frame, 0..15 (kReconstructionTable). A model
 // holding a single table ignores it.
 constexpr uint32_t FrameFlagTableShift = 8, FrameFlagTableMask = 15u << FrameFlagTableShift;
@@ -70,6 +73,11 @@ struct FrameSettings {
     // GameUpscaler with autoExposure: the game's exposure scale and the factor it pre-multiplied the colour by.
     // Values other than 1 need Model::hasRegularDepth (the same shader revision).
     float exposureScale = 1, preExposure = 1;
+    // Round the colour / motion texels to binary16 toward zero, as the CUDA backend's conversion of the game's
+    // textures to its canonical RGBA16F / RG16F planes does; a no-op for textures already in binary16, which the
+    // caller can declare by clearing both (the stages then run pipelines without the conversion code; the
+    // automatic exposure measures the same colour).
+    bool canonicalColor = true, canonicalMotion = true;
 };
 struct FrameParams { InputParams input; OutputParams output; };
 // The network run by something else (the native HIP layers, engine/hip_net.h and the CUDA bridge's
@@ -132,6 +140,7 @@ public:
     bool hasGameExposure() const; // packaged shaders read FrameImages::exposure (exposure flag 4)
     bool hasRatioTables() const; // lut.bin holds all sixteen reconstruction tables, not only one ratio's
     bool hasRgb10Output() const; // a packaged RGB10A2 final-store variant is available
+    bool hasDirectOutput(VkFormat format) const; // the final store can write a borrowed output of this format
     bool dot2Network() const; // the network runs layer_dot2.comp (no cooperative matrices)
 private:
     struct Impl;

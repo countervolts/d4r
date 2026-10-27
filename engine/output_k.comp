@@ -13,9 +13,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
 #extension GL_GOOGLE_include_directive : require
 #include "output_store.glsl"
 #include "round_half.glsl"
+#include "input_quant.glsl"
+// Specialization constant 7 (set by the runtime per pipeline): the frame's colour and motion take the CUDA backend's
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
+// pipeline without it carries no conversion code for games whose textures are already in binary16.
+layout(constant_id = 7) const bool CANONICAL_INPUT = true;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
@@ -28,6 +34,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     int tokW, tokH;
     uint flags;                     // bit 0: reset; bit 1: regular depth (larger is farther), otherwise inverted;
                                     // bit 2: display-resolution motion (one vector per output pixel, no depth);
+                                    // bits 4, 5: canonical binary16 colour, motion (the pipeline's CANONICAL_INPUT);
                                     // bits 8..11: which of the model's reconstruction tables this frame uses
     float expo, expoRatio;          // exposure scale of this frame; previous / current
     float sharp, minAlpha, alphaThr;
@@ -58,7 +65,7 @@ float expandK(float v) { return 1.0; }
 // The reference's constants and association (output_color_pack): rcp.approx(y + 1), or above 1000
 // rcp.approx(y) * (lg2.approx(fma(y, 9, 1)) * ln2 / 9 + 0xBC4FAE29). Its offset differs by 1.7e-5
 // relative from 0.012676, and folding ln2/9 into one constant moves the result a further ulp.
-float compressK(float L)       // L * compressK(L) maps [0, inf) to [0, 1): Reinhard below 1000, logarithmic above
+float compressKAny(float L)    // L * compressK(L) maps [0, inf) to [0, 1): Reinhard below 1000, logarithmic above
 {
     if (L < 1000.0)
         return 1.0 / (L + 1.0);
@@ -66,12 +73,26 @@ float compressK(float L)       // L * compressK(L) maps [0, inf) to [0, 1): Rein
                           + uintBitsToFloat(0xBC4FAE29u);
     return t / L;
 }
-float expandK(float v)         // v * expandK(v) is the inverse
+float expandKAny(float v)      // v * expandK(v) is the inverse
 {
     if (v < uintBitsToFloat(0x3F7FBE88u))
         return 1.0 / (1.0 - v);
     precise const float y = (v + uintBitsToFloat(0x3C4FAE29u)) * 9.0;
     return (exp2(y * uintBitsToFloat(0x3FB8AA3Bu)) - 1.0) / (9.0 * v);
+}
+// The compiler evaluates both sides of the functions above for every lane; the logarithmic side is for luma of
+// 1000 and above, so a wave whose lanes are all below it takes the Reinhard side alone (the same value per lane).
+float compressK(float L)
+{
+    if (subgroupAll(L < 1000.0))
+        return 1.0 / (L + 1.0);
+    return compressKAny(L);
+}
+float expandK(float v)
+{
+    if (subgroupAll(v < uintBitsToFloat(0x3F7FBE88u)))
+        return 1.0 / (1.0 - v);
+    return expandKAny(v);
 }
 #endif
 float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
@@ -124,7 +145,8 @@ void main()
     for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256)
     {
         const ivec2 t = ivec2(i % tw, i / tw), g = t + t0;
-        const vec4 c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
+        const vec4 t0c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
+        const vec4 c = CANONICAL_INPUT ? canonicalHalf(t0c) : t0c;
         const vec3 rgb = max(c.rgb, 0.0);
         const float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
         const float L = p.expo * Y;
@@ -166,7 +188,8 @@ void main()
         }
         mvAt = ni + dsel;
     }
-    const vec2 mv = texelFetch(motionTex, clampOrigin(mvAt, p.mvOrigin, p.mvMax), 0).xy;
+    const vec2 mvt = texelFetch(motionTex, clampOrigin(mvAt, p.mvOrigin, p.mvMax), 0).xy;
+    const vec2 mv = CANONICAL_INPUT ? canonicalHalf(mvt) : mvt;
     const vec2 q = pc + p.mvScale * (mv + p.mvOffs);          // where this pixel was, in output pixels
     const vec2 qv = q * p.invOutValid;
     bool noHist = (p.flags & 1u) != 0u || qv.x < 0.0 || qv.x > 1.0 || qv.y < 0.0 || qv.y > 1.0;
@@ -323,9 +346,12 @@ void main()
         const f16vec4 sB = clamp(fma(dB, f16vec4(kB), f16vec4(4.5)), float16_t(0.0), float16_t(1.0));
         conf = fma(sA, f16vec4(e5), f16vec4(e6)) * sB;
     }
-    const float16_t hv = float16_t(f343), hv2 = float16_t(0.1) + float16_t(0.9) * hv;
+    // the reference rounds 0.9 * hv before adding 0.1 (mul.f16, add.f16): never fused
+    const float16_t hv = float16_t(f343);
+    precise const float16_t hv2 = float16_t(0.1) + float16_t(0.9) * hv;
     const float16_t lo = (hv - float16_t(p.c184)) * float16_t(p.c186), hi = (hv2 - float16_t(p.c184)) * float16_t(p.c186);
-    const float16_t avg = float16_t(0.25) * ((conf.x + conf.y) + (conf.z + conf.w));
+    // its packed halves add pairwise first: (c0 + c2) + (c1 + c3)
+    precise const float16_t avg = float16_t(0.25) * ((conf.x + conf.z) + (conf.y + conf.w));
     const float alphaC = float(clamp(fma(avg, hv2 - hi, hi), float16_t(0.0), float16_t(1.0)));
     const vec4 bl = vec4(clamp(fma(conf, f16vec4(hv - lo), f16vec4(lo)), float16_t(0.0), float16_t(1.0)));
     if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
@@ -341,7 +367,9 @@ void main()
     // the reference fuses the history product: fma(hc, 1 - alphaC, alphaC * cur)
     precise const vec3 C = fma(hc, vec3(1.0 - alphaC), alphaC * cur.xyz);
     precise const float Nm = 0.25 * (((N.x + N.y) + N.z) + N.w);
-    const vec2 chroma = C.yz / max(C.x, 1e-5) * Nm;
+    // the reference's association: (C.Co * rcp(max(C.Y, 1e-5))) * Nm
+    precise const float rY = 1.0 / max(C.x, 1e-5);
+    precise const vec2 chroma = (C.yz * rY) * Nm;
     {
         // history colour: chroma limited so that the RGB it stands for stays non-negative
         const float Y = max(Nm, 0.0);
@@ -356,8 +384,11 @@ void main()
     {
         // the reference multiplies by ginv(Nm) first and divides by the exposure afterwards; the other
         // association (ginv / exposure first) rounds differently before the RGB reconstruction
-        const vec3 ycc = vec3(Nm, chroma) * expandK(Nm) / p.expo;
-        imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(ycc.x + ycc.y - ycc.z, ycc.x + ycc.z, ycc.x - ycc.y - ycc.z, cur.a)));
+        // as the reference: rcp(exposure) * (v * ginv), then (Y + Co) - Cg, Y + Cg (its fma(Co, 0, Y) + Cg), (Y - Co) - Cg
+        precise const vec3 yg = vec3(Nm, chroma) * expandK(Nm);
+        precise const vec3 ycc = (1.0 / p.expo) * yg;
+        precise const vec3 rgb = vec3((ycc.x + ycc.y) - ycc.z, ycc.z + fma(ycc.y, 0.0, ycc.x), (ycc.x - ycc.y) - ycc.z);
+        imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(rgb, cur.a)));
     }
     // ---------------------------------------------------------------- per-token feature for the next frame's input stage
     if (pix.x < p.tokW && pix.y < p.tokH)

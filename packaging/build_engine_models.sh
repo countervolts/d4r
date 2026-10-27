@@ -245,11 +245,15 @@ if (( DO_SR )); then
   finish k
   run k-extract.log python3 "$KIT/engine/extract_k.py" "$WORK/k/replay" "$WORK/k/model"
   run k-lut.log python3 "$KIT/engine/prepare_k.py" "$WORK/k" "$WORK/k/case" --lut-only
-  # RDNA3 vkhip uses these same captured weights and the shipped native kernels.
+  # RDNA3 vkhip uses these same captured weights and the shipped native kernels: the fast set by default and,
+  # when the release has it, the accuracy set too ([Kernels] PreferAccuracy; byte-identical to the CUDA backend).
   hip_args=()
   arch=$(gpu_arch)
   if [[ "$arch" == gfx110[0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
     hip_args=(--hip "$RUNTIME/kernels/$arch" --capture "$WORK/k")
+    if [[ -f "$RUNTIME/kernels/accuracy/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
+      hip_args+=(--hip-accuracy "$RUNTIME/kernels/accuracy/$arch")
+    fi
   fi
   for v in k k-ldr; do
     run "$v.log" python3 "$KIT/engine/compile_k.py" "$WORK/k/model" "$WORK/k/case/lut.bin" "$WORK/$v-out" \
