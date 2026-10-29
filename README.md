@@ -14,7 +14,7 @@ To contact me my discord is `._ayo`. or join the [d4r discord server](https://di
 
 ## Results
 
-[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss) · [more videos](docs/videos.md)
+[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss) - [more videos](docs/videos.md)
 
 All tests are using DLSS K and FSR 4.1.1 and at 1440p (unless specified otherwise).
 
