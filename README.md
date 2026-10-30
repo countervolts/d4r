@@ -28,7 +28,7 @@ Radeon RX 7700 XT, SILENT HILL Townfall.
 
 DLSS 4 (K) FPS was measured on 2026-10-21, Using no approximations. 
 \* Presets E and M are from 2026-09-29, on an older d4r build, so compare them with each other rather than with the newer columns.
-
+ 
 Radeon RX 7700 XT, Ghost of Tsushima.
 
 | Mode | DLSS 4 (K) | FSR | DLSS upscale time | FSR upscale time |
