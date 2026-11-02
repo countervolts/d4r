@@ -34,6 +34,8 @@ struct Kernel {
     std::string name;
     uint64_t entry = 0;  // virtual address
     uint32_t lds = 0, scratch = 0, kernarg = 0, rsrc1 = 0, rsrc2 = 0, rsrc3 = 0, props = 0, preload = 0;
+    // the first SGPR of the kernarg pointer: 0, or 4 on gfx10 after the private segment buffer (unread: no scratch)
+    uint32_t kernargSgpr = 0;
 };
 
 struct Global { uint64_t va = 0, size = 0; };
@@ -58,6 +60,9 @@ struct Module {
     std::vector<uint32_t> patchedText(uint64_t dataAddress) const;
 };
 
+// Likewise for RDNA2 (100300 = gfx1030: 0x36); 0 outside gfx1030-gfx1036. Unofficial: only AMD's own driver
+// (VK_KHR_pipeline_binary) takes RDNA2 code objects; the RADV path stays RDNA3/4.
+uint32_t gfx10Mach(uint32_t gfxTargetVersion);
 // The ELF machine of code objects for a KFD gfx_target_version (110001 = gfx1101); 0 outside RDNA3.
 uint32_t gfx11Mach(uint32_t gfxTargetVersion);
 // Likewise for RDNA4 (120001 = gfx1201: 0x4e); 0 outside gfx1200/gfx1201. gfx12 code addresses its globals with an

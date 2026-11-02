@@ -4171,6 +4171,14 @@ static void init_vram_interop()
         pipelineRobustness |= std::strcmp(name, "VK_EXT_pipeline_robustness") == 0;
     if (pipelineRobustness && env_uint("D4R_ENGINE_BUFFER_ROBUSTNESS", 0) == 0)
         d4r::setBufferRobustnessDisabled(true);
+    // d4r's vkd3d-proton also enables VK_KHR_pipeline_binary (patches/vkd3d-proton/0013), with which vkhip injects its
+    // native layers on AMD's own driver (native Windows); RADV does not need it
+    bool binaries = false, maintenance5 = false;
+    for (const char* name : extensions)
+    {
+        binaries |= std::strcmp(name, "VK_KHR_pipeline_binary") == 0;
+        maintenance5 |= std::strcmp(name, "VK_KHR_maintenance5") == 0;
+    }
     logf("engine backend: buffer robustness %s", pipelineRobustness && env_uint("D4R_ENGINE_BUFFER_ROBUSTNESS", 0) == 0 ?
          "off for the engine's pipelines (VK_EXT_pipeline_robustness)" : "on (the device's default)");
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
@@ -4195,6 +4203,7 @@ static void init_vram_interop()
     g_vk.deviceProc = deviceProc;
     g_vk.instance = instance;
     g_vk.instanceProc = instanceProc;
+    g_vk.pipelineBinary = binaries && maintenance5 && deviceProc(g_vk.device, "vkCreatePipelineBinariesKHR") != nullptr;
     memoryProperties(physical, &g_vk.memory);
     g_vk.physical = physical;
     g_vk.formatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
@@ -12231,10 +12240,13 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     float timestampPeriod = 1.0f;
     uint32_t mach = 0;
     bool binaries = false;
-    if (!vkhip_adapter(false, false, mach, binaries, gfx, timestampPeriod, reason)) return unavailable(reason);
+    // AMD's own driver (native Windows, vkd3d-proton with VK_KHR_pipeline_binary) qualifies as for M, RDNA2 (gfx103x
+    // code objects) included, unofficially
+    if (!vkhip_adapter(false, true, mach, binaries, gfx, timestampPeriod, reason)) return unavailable(reason);
     auto& load = vkhip_load;
     vkhip::NetFiles files;
     files.mach = mach;
+    files.pipelineBinary = binaries;
     if (!load(widen(directory + "/hipnet.bin"), files.hipnet)) return unavailable("missing hipnet.bin");
     // [Kernels] PreferAccuracy: the accuracy layers (NVIDIA's f16 rounding after every k16 step; byte-identical to
     // the CUDA backend, about 0.12 ms slower at 1080p) when the model has them, otherwise the fast set in hip/

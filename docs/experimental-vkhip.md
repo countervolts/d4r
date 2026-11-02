@@ -181,6 +181,22 @@ expansion 1830.1, reconstruction 384.7, downsample 69.8 us. The same frame on th
 us against 2115.4 and 1830.1 here: the emulated `v_dot2` is what this route costs. `vkhip` is byte-identical to
 `hip` on all four frames and 52.24-53.87 dB against the DXIL engine.
 
+## RDNA2 on native Windows (unofficial, 2026-11-02)
+
+Untested on RDNA2 hardware. Preset K takes vkhip on gfx1030-gfx1036 through AMD's driver only
+(`VK_KHR_pipeline_binary`); RADV keeps refusing gfx10 code objects. `kernels/build.sh k` builds the RDNA2 layers
+(software matrix products, `kernels/common/wmma_layout.h`), and `build_engine_models.py` packages a single gfx103x
+folder as for gfx110x. The injector handles gfx10.3's own `s_getpc_b64`, `s_mov_b32` and `s_branch` encodings and
+its kernel ABI: without architected flat scratch LLVM always enables the private segment buffer, so the kernarg
+pointer arrives in s[4:5] (user SGPRs 6) and the donor's push constant is mapped there. The kernels use no scratch,
+so s[0:3] is never read. Offline checks only: all eleven gfx1030 K layers (24 kernels) parse and their patched
+data sites disassemble as gfx1030 `s_mov_b32` pairs.
+
+The Vulkan network fallback needs the LLPC builds: `compile_k.py` writes `<layer>_dot2_llpc.spv` and `compile_m.py`
+the M/L `*_dot2_llpc.spv` (`D4R_PORTABLE_DOT2` / `DOT2_SOFT`: no capability 6912), which the runtime loads on
+`VK_DRIVER_ID_AMD_PROPRIETARY`. The K model compiles its network pipelines before vkhip is tried, so without them
+K cannot load on RDNA2 under AMD's driver at all. M and L have no vkhip route on RDNA2: their Swin layers need WMMA.
+
 ## d3dhip: the HIP network inside the D3D12 engine (2026-10-30)
 
 `d4r-m-d3d12` and `d4r-rr-d3d12` accept a trailing `hip` argument, and default to it

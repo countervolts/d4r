@@ -66,6 +66,12 @@ struct MModel::Impl {
     Buffer w8, w16;
     std::vector<char> bytes8, bytes16;   // until recordUpload
     bool dot2 = false;                   // the v_dot2 stages: the FP8 matrices widened (widenM) instead of w8
+    bool llpc = false;                   // AMD's Windows driver: the v_dot2 stages' *_dot2_llpc.spv variants
+    // a v_dot2 stage file: its LLPC variant on that driver when the model has one (MModel::llpcDot2)
+    std::string dot2File(const std::string& dir, const std::string& stem) const {
+        const std::string soft = dir + "/" + stem + "_llpc.spv";
+        return llpc && exists(soft) ? soft : dir + "/" + stem + ".spv";
+    }
     // the matrices' buffer and the byte offset of the FP8 matrix at o in it
     const Buffer& weights() const { return dot2 ? w16x : w8; }
     VkDeviceSize weightsAt(uint32_t o) const { return dot2 ? VkDeviceSize(o) * 2 : o; }
@@ -103,7 +109,11 @@ struct MModel::Impl {
             const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             const std::string variant = dot2 ? "_dot2" : "";
             const VkDevice dev = device.handle;
-            for (unsigned i = 0; i < MLayers; ++i) network[i].create(dev, directory + "/" + MShader[i] + variant + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+            for (unsigned i = 0; i < MLayers; ++i) {
+                const std::string file = dot2 ? dot2File(directory, MShader[i] + variant) : directory + "/" + MShader[i] + variant + ".spv";
+                traceStage(file);
+                network[i].create(dev, file, {b,b,b,b,b,b,b}, 32, cache);
+            }
             if (dot2)
                 for (unsigned i = 0; i < 2; ++i)
                     mergeDot2[i].create(dev, directory + "/m_merge" + std::to_string(i + 1) + "_dot2.spv", {b,b,b,b,b}, 32, cache);
@@ -115,10 +125,14 @@ struct MModel::Impl {
     // constructor records the files and descriptor types here; MEngine calls this before its first frame.
     struct FrontStages {
         std::string merge, mergePlanes, features, input, expand;
+        bool llpcMissing = false; // AMD's Windows driver without the model's *_dot2_llpc.spv (MModel::llpcDot2)
         std::vector<VkDescriptorType> inTypes, exTypes;
     } front;
     std::once_flag frontOnce;
     void createFrontStages() {
+        if (front.llpcMissing)
+            throw std::runtime_error("AMD's Windows driver needs the model's LLPC v_dot2 stages (*_dot2_llpc.spv; it "
+                                     "crashes on the FP8 cooperative-matrix network): rebuild it with the current compile_m.py");
         std::call_once(frontOnce, [this] {
             const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             const VkDevice dev = device.handle;
@@ -149,6 +163,7 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         else if (!std::strcmp(force, "matrix")) dot2 = false;
     }
     m.dot2 = dot2;
+    m.llpc = driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY;
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
@@ -219,8 +234,12 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const auto exTypes = m.presetL ? lEx : std::vector<VkDescriptorType>{b,t,t,s,s,s,s,b,b,b};
     m.front.merge = m.dot2 && m.presetL ? directory + "/merge_l_dot2.spv" : "";
     m.front.features = splitFeatures ? directory + "/enc_features_l.spv" : "";
-    m.front.input = directory + "/" + in + variant + ".spv";
-    m.front.expand = directory + "/" + ex + variant + ".spv";
+    m.front.input = m.dot2 ? m.dot2File(directory, in + variant) : directory + "/" + in + variant + ".spv";
+    m.front.expand = m.dot2 ? m.dot2File(directory, ex + variant) : directory + "/" + ex + variant + ".spv";
+    // LLPC rejects the v_dot2 stages' capability at module creation and crashes on the matrix ones: refuse here,
+    // naming the files, rather than in the driver
+    if (m.llpc && m.dot2 && !llpcDot2(physical, directory))
+        m.front.llpcMissing = true;
     m.front.inTypes = inTypes; m.front.exTypes = exTypes;
     if ((m.planes = exists(directory + "/" + in + "_planes" + variant + ".spv") && exists(directory + "/" + ex + "_planes" + variant + ".spv"))) {
         traceStage(directory + "/" + in + "_planes" + variant + ".spv");
@@ -267,6 +286,19 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     m.exposure[1].create(device, directory + "/exposure_m1.spv", {b,b,b,b,b,b}, wave, cache);
 }
 MModel::~MModel() = default;
+bool MModel::llpcDriver(VkPhysicalDevice physical) { return driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY; }
+bool MModel::llpcDot2(VkPhysicalDevice physical, const std::string& directory) {
+    if (!llpcDriver(physical)) return false;
+    const auto head = read(directory + "/offsets.bin");
+    const bool presetL = head.size() >= 4 && !std::memcmp(head.data(), "D4RL", 4);
+    const char* front[2] = {presetL ? "enc0_l_dot2_llpc.spv" : "enc0_m_dot2_llpc.spv",
+                            presetL ? "dec0_l_dot2_llpc.spv" : "dec0_m_dot2_llpc.spv"};
+    for (const char* f : front)
+        if (!exists(directory + "/" + f)) return false;
+    for (unsigned i = 0; i < MLayers; ++i)
+        if (!exists(directory + "/" + MShader[i] + "_dot2_llpc.spv")) return false;
+    return true;
+}
 bool MModel::uploadRecorded() const { return impl->uploaded; }
 bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
@@ -333,7 +365,7 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     if (external && (!external->tokens || !external->head)) throw std::runtime_error("external network without its buffers");
     if (external && !e.model.planes) throw std::runtime_error("the M model has no stages for an external network");
     e.external = external != nullptr;
-    if (!external) { e.model.createNetwork(); e.model.createFrontStages(); }
+    if (!external) { e.model.createFrontStages(); e.model.createNetwork(); }   // the front first: it names missing LLPC stages
     else if (e.model.dot2 && e.model.presetL) {
         if (e.model.front.mergePlanes.empty())
             throw std::runtime_error("the dot2 preset L model has no merge_l_dot2_planes.spv for an external network (rebuild it with the current compile_m.py)");

@@ -245,6 +245,13 @@ def main():
     for name, out in (('enc1', 'm_merge1'), ('enc2', 'm_merge2')): glsl('merge_m_dot2.comp', out + '_dot2.spv', dot2_merge_defines(name))
     glsl('enc0_m.comp', 'enc0_m_dot2.spv', ['-DDOT2=1'] + (['-DLDR=1'] if a.ldr else []))
     glsl('dec0_m.comp', 'dec0_m_dot2.spv', ['-DDOT2=1', '-DINT8=1'])
+    # AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix network and front stages and rejects
+    # SPV_VALVE_mixed_float_dot_product (capability 6912): the Vulkan network there is the v_dot2 route with these
+    # variants of the stages that use it, the f16 pair products as two f32 FMAs (runtime_m.inc loads them on that
+    # driver only)
+    for name, out in SHADERS.items(): glsl('layer_m_dot2.comp', out + '_dot2_llpc.spv', dot2_defines(name) + ['-DD4R_PORTABLE_DOT2=1'])
+    glsl('enc0_m.comp', 'enc0_m_dot2_llpc.spv', ['-DDOT2=1', '-DD4R_PORTABLE_DOT2=1'] + (['-DLDR=1'] if a.ldr else []))
+    glsl('dec0_m.comp', 'dec0_m_dot2_llpc.spv', ['-DDOT2=1', '-DINT8=1', '-DD4R_PORTABLE_DOT2=1'])
     # the reconstruction with its half-resolution mean in RGB10A2 (post_m.comp HALF_RGB10)
     for out, flags in (('post_m_dot2', []), ('post_m_q_dot2', ['-DTILE_W=15', '-DTILE_H=15']), ('post_m_c_dot2', ['-DTILE_W=11', '-DTILE_H=11'])):
         glsl('post_m.comp', out + '.spv', ['-DHALF_RGB10=1'] + flags + (['-DLDR=1'] if a.ldr else []))
@@ -318,6 +325,10 @@ def compile_l(a, one, R):
     glsl('layer_l_dot2.comp', 'enc0_l_dot2.spv', ['-DKIND=3'] + ldr)
     glsl('merge_l_dot2.comp', 'merge_l_dot2.spv')
     glsl('layer_l_dot2.comp', 'dec0_l_dot2.spv', ['-DKIND=4'])
+    # LLPC: as preset M's *_dot2_llpc.spv (the network, the input and expansion stages without capability 6912)
+    for name, out in SHADERS.items(): glsl('layer_m_dot2.comp', out + '_dot2_llpc.spv', dot2_defines(name) + ['-DD4R_PORTABLE_DOT2=1'])
+    glsl('layer_l_dot2.comp', 'enc0_l_dot2_llpc.spv', ['-DKIND=3', '-DDOT2_SOFT=1'] + ldr)
+    glsl('layer_l_dot2.comp', 'dec0_l_dot2_llpc.spv', ['-DKIND=4', '-DDOT2_SOFT=1'])
     # the same stages with the token buffers in NGX's plane layout, for the native HIP network (vkhip/HIP, runtime_m.inc):
     # AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix plane stages (enc0_l_planes.spv) and rejects
     # SPV_VALVE_mixed_float_dot_product (capability 6912) when a shader module is created, so preset L takes these there

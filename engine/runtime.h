@@ -152,6 +152,11 @@ public:
     bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005, L's dot2
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
     bool dot2Network() const;  // the v_dot2 stages (no cooperative matrices, no FP8)
+    // AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix network and rejects the v_dot2 stages'
+    // SPV_VALVE_mixed_float_dot_product: there the Vulkan network is the v_dot2 route with the model's *_dot2_llpc.spv.
+    // True on that driver (driverID from VkPhysicalDeviceVulkan12Properties) when the directory has them.
+    static bool llpcDot2(VkPhysicalDevice physical, const std::string& directory);
+    static bool llpcDriver(VkPhysicalDevice physical);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

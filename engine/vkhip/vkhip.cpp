@@ -27,6 +27,10 @@ constexpr uint32_t S_WAIT_ALU_MASK = 0xffff0000u, S_WAIT_ALU = 0xbf880000u;  // 
 constexpr uint32_t SOP2_OP_MASK = 0xff800000u, S_ADD_U32 = 0x80000000u, S_ADDC_U32 = 0x82000000u;
 constexpr uint32_t S_MOV_B32_LIT = 0xbe8000ffu;  // | sdst << 16
 constexpr uint32_t S_NOP = 0xbf800000u, S_BRANCH = 0xbfa00000u, S_CODE_END = 0xbf9f0000u;
+// gfx10.3 (RDNA2) numbers three of them differently: s_getpc_b64 SOP1 0x1f, s_mov_b32 SOP1 3, s_branch SOPP 2 (the SOP2
+// adds, s_nop and s_code_end are the same)
+constexpr uint32_t GFX10_GETPC = 0xbe801f00u, GFX10_S_MOV_B32_LIT = 0xbe8003ffu, GFX10_S_BRANCH = 0xbf820000u;
+bool gfx10(uint32_t mach) { return (mach >= 0x36 && mach <= 0x39) || mach == 0x3d || mach == 0x3e || mach == 0x45; }
 
 // s_add_u32/s_addc_u32 sN, sN, literal (either operand order)
 bool sop2Literal(uint32_t w, uint32_t op, uint32_t reg) {
@@ -36,6 +40,19 @@ bool sop2Literal(uint32_t w, uint32_t op, uint32_t reg) {
 }
 
 } // namespace
+
+uint32_t gfx10Mach(uint32_t gfxTargetVersion) {
+    switch (gfxTargetVersion) {
+    case 100300: return 0x36;  // gfx1030
+    case 100301: return 0x37;  // gfx1031
+    case 100302: return 0x38;  // gfx1032
+    case 100303: return 0x39;  // gfx1033
+    case 100304: return 0x3e;  // gfx1034
+    case 100305: return 0x3d;  // gfx1035
+    case 100306: return 0x45;  // gfx1036
+    default: return 0;
+    }
+}
 
 uint32_t gfx11Mach(uint32_t gfxTargetVersion) {
     switch (gfxTargetVersion) {
@@ -59,8 +76,9 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     mach = f.size() >= 64 ? rd<uint32_t>(f, 48) & 255 : 0;
     if (f.size() < 64 || std::memcmp(f.data(), "\x7f" "ELF", 4) || f[4] != 2 || f[5] != 1 ||
         rd<uint16_t>(f, 18) != 224 || (mach != 0x41 && mach != 0x46 && mach != 0x47 && mach != 0x44 &&
-                                       mach != 0x48 && mach != 0x4e)) {
-        error = "requires a little-endian gfx1100-gfx1103 or gfx1200/gfx1201 AMDGPU ELF64 code object"; return false;
+                                       mach != 0x48 && mach != 0x4e && !gfx10(mach))) {
+        error = "requires a little-endian gfx1030-gfx1036, gfx1100-gfx1103 or gfx1200/gfx1201 AMDGPU ELF64 code object";
+        return false;
     }
     const bool gfx12 = mach == 0x48 || mach == 0x4e;
     const uint64_t shoff = rd<uint64_t>(f, 0x28);
@@ -136,7 +154,7 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     const uint32_t* w = reinterpret_cast<const uint32_t*>(this->text.data());
     const size_t n = this->text.size() / 4;
     for (size_t i = 0; i + 4 < n; ++i) {
-        if ((w[i] & GETPC_MASK) != GETPC) continue;
+        if ((w[i] & GETPC_MASK) != (gfx10(mach) ? GFX10_GETPC : GETPC)) continue;
         const uint32_t reg = (w[i] >> 16) & 0x7f;
         // gfx12: s_getpc_b64 s[n:n+1]; s_sext_i32_i16 s[n+1], s[n+1]; then the same add pair, with s_wait_alu
         // between any of them (the span is then longer than gfx11's five words)
@@ -166,14 +184,19 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         }
         i = addc + 1;
     }
-    for (const auto& [name, k] : kernels) {
+    for (auto& [name, k] : kernels) {
         if (k.entry < textVa || k.entry >= textVa + this->text.size() || (k.entry - textVa) % 4) { error = name + ": entry outside .text"; return false; }
         // Only the kernarg pointer (s[0:1]) is enabled and nothing is preloaded: any further user SGPRs are
         // LLVM's UserSGPRInit16Bug padding (gfx1100/gfx1102), unread, and the kernel's rsrc2 places its
         // workgroup ids after them.
+        // gfx10 has no architected flat scratch: LLVM always enables the private segment buffer (s[0:3]) before the
+        // kernarg pointer, which then arrives in s[4:5]. Without scratch the kernel never reads s[0:3].
         const uint32_t user = (k.rsrc2 >> 1) & 0x1f;
         const uint32_t ids = uint32_t(std::popcount((k.rsrc2 >> 7) & 0xfu));  // tgid x/y/z, tg size (not the wave offset)
-        if ((k.props & 0x7f) != (1u << 3) || (k.preload & 0x7f) || user < 2 || (user > 2 && user + ids != 16)) {
+        const bool segmentBuffer = gfx10(mach) && (k.props & 0x7f) == ((1u << 0) | (1u << 3)) && !k.scratch;
+        k.kernargSgpr = segmentBuffer ? 4 : 0;
+        if (((k.props & 0x7f) != (1u << 3) && !segmentBuffer) || (k.preload & 0x7f) || user < k.kernargSgpr + 2 ||
+            (user > k.kernargSgpr + 2 && user + ids != 16)) {
             error = name + ": not a kernarg-only kernel"; return false;
         }
         if (!(k.props & (1u << 10))) { error = name + ": not wave32"; return false; }
@@ -186,9 +209,10 @@ std::vector<uint32_t> Module::patchedText(uint64_t dataAddress) const {
     std::memcpy(w.data(), text.data(), text.size());
     for (const auto& site : sites) {
         const uint64_t a = dataAddress + (site.target - dataLo);
-        w[site.word + 0] = S_MOV_B32_LIT | (site.sdst << 16);
+        const uint32_t mov = gfx10(mach) ? GFX10_S_MOV_B32_LIT : S_MOV_B32_LIT;
+        w[site.word + 0] = mov | (site.sdst << 16);
         w[site.word + 1] = uint32_t(a);
-        w[site.word + 2] = S_MOV_B32_LIT | ((site.sdst + 1) << 16);
+        w[site.word + 2] = mov | ((site.sdst + 1) << 16);
         w[site.word + 3] = uint32_t(a >> 32);
         for (uint32_t k = 4; k < site.words; ++k) w[site.word + k] = S_NOP;
     }
@@ -250,7 +274,7 @@ std::vector<uint32_t> injectedCode(const Module& module, const Kernel& kernel, u
     std::vector<uint32_t> code(64, S_NOP);
     const int64_t simm = int64_t(64 + (kernel.entry - module.textVa) / 4) - 1;
     if (simm > 32767) return {};
-    code[0] = S_BRANCH | uint32_t(simm & 0xffff);
+    code[0] = (gfx10(module.mach) ? GFX10_S_BRANCH : S_BRANCH) | uint32_t(simm & 0xffff);
     const auto text = module.patchedText(dataAddress);
     code.insert(code.end(), text.begin(), text.end());
     code.insert(code.end(), 64, S_CODE_END);
@@ -442,11 +466,14 @@ std::vector<uint8_t> palBinary(const std::vector<uint8_t>& f, const Module& modu
     const uint32_t user = (kernel.rsrc2 >> 1) & 0x1f;
     if (map->a.size() < user) { why = "donor user data map too short"; return {}; }
     const uint64_t push = map->a[sgpr].u;
-    for (size_t k = 0; k < map->a.size(); ++k) map->a[k] = Mp::uint(k < 2 ? push + k : 0xffffffffu);
+    // the push constant in the kernel's kernarg SGPRs (s[0:1], or s[4:5] behind gfx10's private segment buffer)
+    for (size_t k = 0; k < map->a.size(); ++k)
+        map->a[k] = Mp::uint(k >= kernel.kernargSgpr && k < kernel.kernargSgpr + 2 ? push + k - kernel.kernargSgpr : 0xffffffffu);
     if (lds->u < kernel.lds) { why = "donor LDS smaller than the kernel's"; return {}; }
     if (kernel.scratch) { why = "kernel uses scratch (not supported through pipeline binaries)"; return {}; }
+    // gfx10.3 has these modes in the same rsrc1 bits as gfx11
     const bool gfx11 = gfx11Mach(110000) == module.mach || gfx11Mach(110001) == module.mach ||
-                       gfx11Mach(110002) == module.mach || gfx11Mach(110003) == module.mach;
+                       gfx11Mach(110002) == module.mach || gfx11Mach(110003) == module.mach || gfx10(module.mach);
     const uint32_t r1 = kernel.rsrc1, r2 = kernel.rsrc2;
     cs->set(".user_sgprs", Mp::uint(user));
     cs->set(".vgpr_count", Mp::uint(((r1 & 0x3f) + 1) * 8));
@@ -601,6 +628,12 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
         VkPipeline result = palPipeline(vk, ci, module, kernel, dataAddress, id, error);
         vk.destroyModule(vk.device, shader, nullptr);
         return result;
+    }
+    // RADV's cached shader takes the kernarg pointer in s[0:1] only (no gfx10 private segment buffer layout)
+    if (kernel.kernargSgpr) {
+        vk.destroyModule(vk.device, shader, nullptr);
+        error = kernel.name + ": gfx10 code objects need AMD's driver (VK_KHR_pipeline_binary)";
+        return VK_NULL_HANDLE;
     }
     VkPipeline result = VK_NULL_HANDLE;
     VkPipelineCache donorCache = VK_NULL_HANDLE, patchedCache = VK_NULL_HANDLE;

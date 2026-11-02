@@ -45,8 +45,14 @@ layout(set = 0, binding = 2, std430) readonly buffer Ib { uint a[]; } inb;
 layout(set = 0, binding = 3, std430) readonly buffer Sb { uint a[]; } skb;
 layout(set = 0, binding = 4, std430) writeonly buffer O0 { uint a[]; } out0;
 layout(set = 0, binding = 5, std430) writeonly buffer O1 { uint a[]; } out1;
+// D4R_PORTABLE_DOT2 (the LLPC builds, *_dot2_llpc.spv): AMD's Windows driver rejects SPV_VALVE_mixed_float_dot_product
+// (capability 6912), so the same products as two f32 FMAs of exact f16 products (layer_m_dot2.comp's switch)
+#if defined(D4R_PORTABLE_DOT2)
+float dot2acc(f16vec2 a, f16vec2 b, float c) { return fma(float(a.x), float(b.x), fma(float(a.y), float(b.y), c)); }
+#else
 spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
 float dot2acc(f16vec2 a, f16vec2 b, float c);
+#endif
 float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
 const uint UC = uint(C), CW = UC / uint(NW), HC = UC / 2u;     // channels per wave; dwords per token row
 // shared memory, in dwords (binary16 pairs). Rows are padded by four dwords.

@@ -321,7 +321,10 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     m.weightBytes = std::move(weights); m.lutBytes = std::move(lut);
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     for (unsigned i = 0; i < KLayers; ++i) {
-        const std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : ".spv");
+        std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : ".spv");
+        // AMD's Windows driver (LLPC) rejects the v_dot2 layers' capability 6912: their _dot2_llpc.spv there
+        const std::string llpc = directory + "/" + Names[i] + "_dot2_llpc.spv";
+        if (m.dot2 && driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY && exists(llpc)) spv = llpc;
         if (m.dot2 && !exists(spv))
             throw std::runtime_error("the model has no network shaders for GPUs without cooperative matrices (" + spv +
                                      "): rebuild it with the current compile_k.py");

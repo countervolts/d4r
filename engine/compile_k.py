@@ -330,6 +330,10 @@ def main():
             nw = [d for d in nw if d.split('=')[0] not in given]
             subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, nw + extra),
                             str(HERE / 'layer_dot2.comp'), '-o', str(a.output / (name + '_dot2.spv'))], check=True)
+            # AMD's Windows driver (LLPC) rejects SPV_VALVE_mixed_float_dot_product (capability 6912): the same layer
+            # with the f16 pair products as two f32 FMAs (runtime.cpp loads it on that driver only)
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, nw + extra + ['-DD4R_PORTABLE_DOT2=1']),
+                            str(HERE / 'layer_dot2.comp'), '-o', str(a.output / (name + '_dot2_llpc.spv'))], check=True)
     for name in ('input_k', 'output_k'):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(['-DLDR=1'] if a.ldr else []),
                         str(HERE / (name + '.comp')), '-o', str(a.output / (name + '.spv'))], check=True)
