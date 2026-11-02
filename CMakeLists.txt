@@ -238,6 +238,9 @@ if(NOT EXISTS "${D4R_MINHOOK_ROOT}/include/MinHook.h")
   message(FATAL_ERROR "Clone MinHook v1.3.4 into external/MinHook or set D4R_MINHOOK_ROOT")
 endif()
 add_subdirectory("${D4R_MINHOOK_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/minhook" EXCLUDE_FROM_ALL)
+# The older ZLUDA-only Windows NGX module: D3D12 exports only, no NVSDK_NGX_VULKAN_* (the model builder's Vulkan
+# harness then fails silently at GetProcAddress). It is not the release's nvngx.dll even though it is named
+# d4r_nvngx.dll: the release ships tools/d4r_nvngx_shim.cpp, built by scripts/build_d4r_nvngx_shim.sh.
 add_library(d4r_nvngx_windows SHARED tools/windows/d4r_nvngx_windows.cpp tools/windows/d3d12_command_hooks.cpp)
 add_dependencies(d4r_nvngx_windows d4r_pixel_code_object)
 set_target_properties(d4r_nvngx_windows PROPERTIES PREFIX "" OUTPUT_NAME "d4r_nvngx")

@@ -53,7 +53,8 @@ HMODULE select(const LUID* luid) {
         for (const char* name : {"HSA_OVERRIDE_GFX_VERSION", "HSA_OVERRIDE_GFX_VERSION_0"})
             if (std::getenv(name)) throw std::runtime_error(std::string("unset ") + name + "; d4r does not support architecture overrides");
         d4r::diag::HipApi hip((dir / L"hip").string());
-        if (hip.hipInit(0) != hipSuccess) throw std::runtime_error("the AMD HIP runtime found no usable GPU; update the AMD graphics driver");
+        if (hip.hipInit(0) != hipSuccess)
+            throw std::runtime_error("neither the bundled nor the driver's AMD HIP runtime found a usable GPU; update the AMD graphics driver");
         int count = 0; (void)hip.hipGetDeviceCount(&count);
         std::vector<d4r::diag::GpuCandidate> devices;
         for (int i = 0; i < count; ++i) {

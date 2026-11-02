@@ -28,18 +28,21 @@ fi
 [[ "$ACCURACY" == 1 ]] && FLAGS+=(-DD4R_ACCURACY)
 # SRC.hip -> bitcode without target attributes, so ZLUDA's own target settings apply after linking.
 # D4R_LLVM_AS: the llvm-as of ZLUDA's LLVM, when ROCm's clang is newer (the Windows HIP SDK 7.14 is LLVM 23, ZLUDA
-# reads LLVM 22 bitcode). The last three rewrites turn LLVM 23's IR into LLVM 22's; it has none of them:
+# reads LLVM 22 bitcode). The last three rewrites turn LLVM 23's IR into LLVM 22's (llvm23_constants.py its constants
+# after them); it has none of them:
 # denormal_fpenv(dynamic) is LLVM 22's "denormal-fp-math" pair, nocreateundeforpoison only an intrinsic hint, and
 # target_mem a memory location LLVM 22 has no name for (dropping it widens the access to the function's default).
+# The module summary (^N = ... lines, ThinLTO's index, which LLVM 23 gives a noRenameOnPromotion flag) is dropped too.
 LLVM_AS="${D4R_LLVM_AS:-$LLVM/llvm-as}"
 "$LLVM/clang++" -x hip -std=c++20 -nogpuinc -nogpulib -O3 -mno-wavefrontsize64 --offload-device-only \
     --offload-arch="$ARCH" -fgpu-rdc -emit-llvm -c -Xclang -fdenormal-fp-math=dynamic -DD4R_KERNEL_NAME="$K" \
     "${FLAGS[@]}" -o "$B/raw.bc" "$D/$SRC.hip"
 "$LLVM/llvm-dis" "$B/raw.bc" -o "$B/raw.ll"
-sed -E -e '/@llvm.used/d' -e '/wchar_size/d' -e '/llvm.module.flags/d' -e '/__hip_cuid/d' -e 's/optnone//g' \
+sed -E -e '/^\^[0-9]+ = /d' -e '/@llvm.used/d' -e '/wchar_size/d' -e '/llvm.module.flags/d' -e '/__hip_cuid/d' -e 's/optnone//g' \
     -e "s/\"target-cpu\"=\"$ARCH\"//g" -e 's/"target-features"="[^"]+"//g' \
     -e 's/denormal_fpenv\(dynamic\)/"denormal-fp-math"="dynamic,dynamic" "denormal-fp-math-f32"="dynamic,dynamic"/g' \
-    -e 's/ nocreateundeforpoison//g' -e 's/, target_mem[0-9]*: [a-z]+//g' "$B/raw.ll" | "$LLVM_AS" -o "$B/extra.bc" -
+    -e 's/ nocreateundeforpoison//g' -e 's/, target_mem[0-9]*: [a-z]+//g' "$B/raw.ll" |
+    python3 "$D/llvm23_constants.py" | "$LLVM_AS" -o "$B/extra.bc" -
 D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_FP8="$FP8" D4R_TEX_SRC="$SRC" D4R_TEX_WAVES="$WAVES" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/null
 # the code-generation switches of the runtime (d4r.ini [Kernels]), which ZLUDA's module cache keys on
 env LD_LIBRARY_PATH="$R/lib" D4R_ZLUDA_EXTRA_BC="$B/extra.bc" D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 \

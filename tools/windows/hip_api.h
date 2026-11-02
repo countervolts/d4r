@@ -6,6 +6,43 @@
 #include <string>
 
 namespace d4r::diag {
+// The HIP runtime this process uses: the release's own (ROOT\bin\amdhip64_7.dll) when it initializes and sees a GPU,
+// otherwise the AMD driver's (System32), e.g. when the bundled runtime is newer than the installed driver (issue 58).
+// D4R_HIP_RUNTIME=bundled|driver skips the probe; the choice is published there too, so the loader's choice holds for
+// the shim it loads. A runtime that failed is unloaded before the next is tried, so name-based loads (ZLUDA's) then
+// resolve to the chosen one, which stays loaded for the process.
+inline std::filesystem::path hip_runtime_path(const std::string& root) {
+    static const std::filesystem::path chosen = [&] {
+        const auto bundled = std::filesystem::path(wide(root)) / L"bin" / L"amdhip64_7.dll";
+        wchar_t system[MAX_PATH]{};
+        GetSystemDirectoryW(system, MAX_PATH);
+        const auto driver = std::filesystem::path(system) / L"amdhip64_7.dll";
+        const char* forced = std::getenv("D4R_HIP_RUNTIME");
+        if (forced && std::string(forced) == "bundled") return bundled;
+        if (forced && std::string(forced) == "driver") return driver;
+        auto usable = [](const std::filesystem::path& path) {
+            if (!std::filesystem::exists(path)) return false;
+            HMODULE module = LoadLibraryExW(path.c_str(), nullptr,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+            if (!module) return false;
+            auto init = reinterpret_cast<hipError_t (*)(unsigned)>(reinterpret_cast<void*>(GetProcAddress(module, "hipInit")));
+            auto count = reinterpret_cast<hipError_t (*)(int*)>(reinterpret_cast<void*>(GetProcAddress(module, "hipGetDeviceCount")));
+            int devices = 0;
+            const bool ok = init && count && init(0) == hipSuccess && count(&devices) == hipSuccess && devices > 0;
+            if (!ok) { FreeLibrary(module); return false; }
+            HMODULE pinned = nullptr;   // stays loaded: HIP is never unloaded once initialized
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(reinterpret_cast<void*>(init)), &pinned);
+            return true;
+        };
+        const bool useDriver = !usable(bundled) && usable(driver);
+        if (useDriver) std::fprintf(stderr, "d4r: the bundled HIP runtime found no GPU; using the driver's %s\n", utf8(driver.c_str()).c_str());
+        SetEnvironmentVariableA("D4R_HIP_RUNTIME", useDriver ? "driver" : "bundled");
+        _putenv_s("D4R_HIP_RUNTIME", useDriver ? "driver" : "bundled");
+        return useDriver ? driver : bundled;
+    }();
+    return chosen;
+}
 struct HipApi {
     bool verbose = true; // Probes log every call; the game can suppress successful API calls.
     SearchDirectory search;
@@ -38,7 +75,7 @@ struct HipApi {
 #undef D4R_HIP_FUNCTION
     explicit HipApi(const std::string& root) :
         search(std::filesystem::path(wide(root)) / L"bin"),
-        library(std::filesystem::path(wide(root)) / L"bin" / L"amdhip64_7.dll") {}
+        library(hip_runtime_path(root)) {}
     void check(hipError_t result, const char* call) const {
         if (verbose || result != hipSuccess) std::printf("HIP %s -> %d (%s)\n", call, static_cast<int>(result), hipGetErrorName(result));
         if (result != hipSuccess) throw std::runtime_error(std::string(call) + ": " + hipGetErrorString(result));
