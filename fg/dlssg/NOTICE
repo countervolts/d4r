@@ -1,0 +1,13 @@
+dlssg-amd
+Copyright (C) 2026 itchyfeetleech
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+License, version 3 only (see LICENSE).
+
+vkd3d-proton/patches/ modify vkd3d-proton and are offered under its license (LGPL-2.1-or-later).
+vkd3d-proton/patches/0001 is d4r's vkd3d-proton patches 0001-0003 (https://github.com/countervolts/d4r), which d4r
+offers under vkd3d-proton's license, ported to vkd3d-proton 22307558.
+
+NVIDIA DLSS, Streamline and nvngx_dlssg.dll are NVIDIA's. This project contains no NVIDIA binaries, code or data. The
+kernel cache that tools/dlssg-setup builds (~/.cache/nvxrt) is translated from the user's own copy of NVIDIA's DLL;
+it is not covered by this license and must not be redistributed.

@@ -1,6 +1,6 @@
 // FSR 4 from OptiScaler's upscaler menu while the game sees an NVIDIA GPU.
 //
-// d4r's games run with WINE_HIDE_AMD_GPU (PROTON_FORCE_NVAPI), so every DXGI adapter reports vendor 0x10de. Three
+// d4r's games run with WINE_HIDE_AMD_GPU's identity (d4r_boot.dll, or PROTON_FORCE_NVAPI), so every DXGI adapter reports vendor 0x10de. Three
 // parties then refuse FSR 4 on the AMD GPU that runs it: OptiScaler's own GPU check (RDNA3/RDNA4 -> FSR 4 update,
 // INT8 or FP8 model), AMD's amd_fidelityfx_upscaler_dx12.dll and the FSR 4 provider amdxcffx64.dll, each of which
 // reads the adapter's vendor before using the driver extension (2026-10-17: with the identity hidden, FSR 4.1.1

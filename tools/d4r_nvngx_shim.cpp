@@ -1581,9 +1581,24 @@ static std::wstring core_path_inside_exe_dir(const wchar_t* corePath)
     std::wstring core(corePath);
     wchar_t exe[MAX_PATH] = {};
     const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH || core.size() < 3 || core[1] != L':' || exe[1] != L':' ||
-        towlower(core[0]) != towlower(exe[0]))
+    if (length == 0 || length >= MAX_PATH || core.size() < 3 || core[1] != L':' || exe[1] != L':')
         return core;
+    // A core on another drive (an install in the Proton prefix's C: with the game on Steam's S: or on Z:) is
+    // named on the game's drive first, through the Linux path both drives map to.
+    if (towlower(core[0]) != towlower(exe[0]))
+    {
+        const std::string coreUnix = unix_path(core);
+        std::string root = unix_path(std::wstring{exe[0], L':', L'\\'});
+        if (!root.empty() && root.back() != '/')
+            root += '/';
+        if (coreUnix.empty() || root.empty() || coreUnix.compare(0, root.size(), root) != 0)
+            return core;
+        std::wstring rest = widen(coreUnix.substr(root.size()));
+        for (wchar_t& c : rest)
+            if (c == L'/')
+                c = L'\\';
+        core = std::wstring{exe[0], L':', L'\\'} + rest;
+    }
     std::wstring directory(exe);
     directory.resize(directory.find_last_of(L"\\/"));
     for (wchar_t& c : directory)

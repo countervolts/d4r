@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
-"""Opt-in OptiScaler FG/latency setup. Run with the game closed; no prefix changes."""
+"""Opt-in frame generation and latency setup. Run with the game closed.
+
+--fg xefg / fsrfg configure OptiScaler's FG outputs (no prefix changes). --fg dlssg runs NVIDIA's own DLSS Frame
+Generation (the game's nvngx_dlssg.dll, 2x/3x/4x) on RDNA3 and RDNA4 through d4r/fg/dlssg: it translates that DLL's
+CUDA kernels for this GPU (~/.cache/nvxrt on RDNA4, ~/.cache/nvxrt-gfx11 on RDNA3), routes OptiScaler's NGX path through the DLSS-G host and sets d4r.ini
+[FrameGeneration] Backend = dlssg (d4r_boot.dll then enables its Vulkan layer at launch; no launch options). It also
+sets HwSchMode=2 in the game's Proton prefix when it finds it (some games offer DLSS-G only with hardware GPU
+scheduling). --fg off undoes the routing."""
 import argparse
 import configparser
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import tempfile
+import time
+
+DLSSG_HOST = 'nvngx.dll_dlssg_host.dll'
 
 
 def update(source, settings):
@@ -82,6 +94,12 @@ def v10_settings(parsed, ini, fg, fg_input, latency):
             ('fakenvapi', 'ForceXeLL', 'false')]
 
 
+def ngx_route(ini, runtime, dlssg):
+    """NvngxPath for d4r's shim, or for the DLSS-G host in front of it, relative to the INI's folder"""
+    target = runtime / 'fg/dlssg' / DLSSG_HOST if dlssg else runtime / 'nvngx.dll'
+    return os.path.relpath(target, ini.parent).replace('/', '\\')
+
+
 def configure(ini, runtime, fg, fg_input, latency):
     if ini.is_symlink():
         raise ValueError('OptiScaler.ini must be a regular file, not a symlink')
@@ -90,8 +108,24 @@ def configure(ini, runtime, fg, fg_input, latency):
     parsed = configparser.ConfigParser(interpolation=None)
     parsed.read_string(source)
     route = parsed.get('Libraries', 'NvngxPath', fallback='').replace('\\', '/').lower()
-    if not route.endswith(('/nvngx.dll', '/d4r_nvngx.dll', '/d4r.asi')):
+    if not route.endswith(('/nvngx.dll', '/d4r_nvngx.dll', '/d4r.asi', '/' + DLSSG_HOST)):
         raise ValueError('configure d4r NvngxPath before enabling features')
+    via_host = route.endswith('/' + DLSSG_HOST)
+    if fg == 'dlssg':
+        # DLSS-G reaches NGX through Streamline; OptiScaler's own FG stays off. Streamline's DLSS-G needs Reflex,
+        # which dxvk-nvapi cannot provide on AMD (NvAPI_D3D_SetSleepMode etc. are not implemented; Ghost of Tsushima
+        # crashes when DLSS-G is switched on with OptiScaler 0.9.4): OptiScaler v10's integrated latency provider is
+        # set up as with --latency. 0.9's d4r NVAPI router with fakenvapi is not: with it in the path Streamline
+        # reports "Disabling DLSS-G since it is not supported on current hardware". Dxgi: the game sees an NVIDIA
+        # adapter; SpoofHAGS: Streamline offers DLSS-G only with hardware-accelerated GPU scheduling.
+        if not parsed.has_option('fakenvapi', 'UseFakenvapi'):
+            raise ValueError('DLSS-G needs OptiScaler v10 (its Reflex provider); this OptiScaler.ini is from an older '
+                             'version. Extract the current d4r zip into the game folder first.')
+        settings = [x for x in v10_settings(parsed, ini, 'off', None, latency) if x[0] != 'FrameGen']
+        settings += [('FrameGen', 'Enabled', 'false'), ('FrameGen', 'FGInput', 'nofg'),
+                     ('FrameGen', 'FGOutput', 'nofg'), ('Libraries', 'NvngxPath', ngx_route(ini, runtime, True)),
+                     ('Spoofing', 'Dxgi', 'true'), ('Spoofing', 'SpoofHAGS', 'true')]
+        return write_ini(ini, source, settings)
     if fg != 'off' and fg_input is None:
         raise ValueError('--input is required with FG: dlssg, fsrfg, fsrfg30 or upscaler')
     if fg == 'xefg' and latency == 'proton':
@@ -101,6 +135,13 @@ def configure(ini, runtime, fg, fg_input, latency):
         settings = v10_settings(parsed, ini, fg, fg_input, latency)
     else:
         settings = legacy_settings(runtime, fg, fg_input, latency)
+    if via_host:  # leaving DLSS-G: OptiScaler loads d4r's shim directly again
+        settings.append(('Libraries', 'NvngxPath', ngx_route(ini, runtime, False)))
+    return write_ini(ini, source, settings)
+
+
+def write_ini(ini, source, settings):
+    """applies SETTINGS with an exact backup; returns the backup's path, or None when nothing changed"""
     result = update(source, settings).encode('utf-8')
     original = ini.read_bytes()
     if original.startswith(b'\xef\xbb\xbf'):
@@ -158,21 +199,176 @@ def legacy_settings(runtime, fg, fg_input, latency):
     return settings
 
 
+# ---------------------------------------------------------------------------------------------- DLSS-G (fg/dlssg)
+
+def gpu_target():
+    """the gfx target of the largest KFD GPU node (as d4r-check.sh), or None"""
+    best, target = -1, None
+    for props in Path('/sys/class/kfd/kfd/topology/nodes').glob('*/properties'):
+        values = dict(line.split(' ', 1) for line in props.read_text().splitlines() if ' ' in line)
+        simds, version = int(values.get('simd_count', 0)), int(values.get('gfx_target_version', 0))
+        if simds > best and version:
+            best = simds
+            target = 'gfx%d%d%x' % (version // 10000, version // 100 % 100, version % 100)
+    return target
+
+
+def find_dlssg(game):
+    """the game's nvngx_dlssg.dll: in the executable's folder tree, else up to the game's install root
+    (Unreal keeps it under Engine/Plugins/.../Streamline)"""
+    roots = [game]
+    if game.parent.name != 'common':  # below the install root (Binaries/Win64): search up to that root
+        for parent in game.parents:
+            roots.append(parent)
+            if parent.parent.name == 'common' or len(roots) > 5:
+                break
+    for root in roots:
+        hits = sorted((p for p in root.rglob('nvngx_dlssg.dll')
+                       if 'd4r' not in p.relative_to(root).parts and 'backup' not in str(p).lower()),
+                      key=lambda p: len(p.parts))
+        if hits:
+            return hits[0]
+    return None
+
+
+def ini_value(path, section, key, fallback=None):
+    parsed = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(';',))
+    parsed.read_string(path.read_text(encoding='utf-8-sig'))
+    return parsed.get(section, key, fallback=fallback)
+
+
+def proton_prefix(game):
+    """the Proton prefix of the Steam game installed above GAME, or None"""
+    for parent in (game, *game.parents):
+        if parent.parent.name == 'common' and parent.parent.parent.name == 'steamapps':
+            steamapps = parent.parent.parent
+            for manifest in steamapps.glob('appmanifest_*.acf'):
+                text = manifest.read_text(errors='replace')
+                if re.search(r'"installdir"\s+"%s"' % re.escape(parent.name), text):
+                    appid = re.search(r'"appid"\s+"(\d+)"', text).group(1)
+                    prefix = steamapps / 'compatdata' / appid / 'pfx'
+                    return prefix if (prefix / 'system.reg').is_file() else None
+    return None
+
+
+def set_hags(prefix):
+    """HwSchMode=2 under GraphicsDrivers in the prefix's system.reg (Wine reports no GPU scheduling otherwise)"""
+    reg = prefix / 'system.reg'
+    text = reg.read_text(encoding='utf-8', errors='surrogateescape')
+    line = '"HwSchMode"=dword:00000002'
+    section = '[System\\\\ControlSet001\\\\Control\\\\GraphicsDrivers]'
+    if re.search(r'(?m)^' + re.escape(section) + r'.*\n(?:#time=.*\n)?(?:(?!\[).*\n)*?' + re.escape(line), text):
+        return False
+    backup = reg.with_name('system.reg.d4r-features-backup-' + datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S'))
+    shutil.copy2(reg, backup)
+    i = text.find('\n' + section)
+    if i < 0:
+        text = text.rstrip('\n') + '\n\n%s %d\n%s\n' % (section, int(time.time()), line)
+    else:
+        j = text.find('\n', i + 1)
+        if text.startswith('#time=', j + 1):
+            j = text.find('\n', j + 1)
+        k = text.find('\n[', j)
+        body = re.sub(r'(?m)^"HwSchMode"=.*\n', '', text[j + 1:k if k >= 0 else len(text)])
+        text = text[:j + 1] + line + '\n' + body + (text[k:] if k >= 0 else '')
+    reg.write_text(text, encoding='utf-8', errors='surrogateescape')
+    return backup
+
+
+def setup_dlssg(game, runtime, dll, exact, lite, force):
+    """everything d4r/fg/dlssg needs before the game starts; the OptiScaler route is set by configure()"""
+    fg = runtime / 'fg/dlssg'
+    for name in (DLSSG_HOST, 'layer/libVkLayer_nvxrt.so', 'layer/nvxrt_layer.json', 'tools/dlssg-setup'):
+        if not (fg / name).is_file():
+            raise ValueError(f'missing {fg / name}; this d4r package has no DLSS frame generation')
+    if not (runtime / 'nvngx.dll').is_file() or not (runtime / 'nvcuda.dll').is_file():
+        raise ValueError(f'{runtime} is not a d4r folder of the drag-in package (DLSS-G needs nvngx.dll and nvcuda.dll)')
+    target = gpu_target() or ''
+    arch = 'gfx12' if target.startswith('gfx12') else 'gfx11' if target.startswith('gfx11') else None
+    if arch is None:
+        if not force:
+            raise ValueError(f'DLSS frame generation runs on RDNA3 (gfx11) and RDNA4 (gfx12) GPUs; this GPU is '
+                             f'{target or "unknown"} (--force translates for RDNA4; the layer stays off elsewhere)')
+        arch = 'gfx12'
+    cache = Path.home() / '.cache' / ('nvxrt' if arch == 'gfx12' else 'nvxrt-gfx11')
+    dll = Path(dll).resolve() if dll else find_dlssg(game)
+    if not dll or not dll.is_file():
+        raise ValueError('no nvngx_dlssg.dll in the game: it does not ship DLSS frame generation (or pass --dll)')
+    # kernels first: a DLL the translator cannot handle (DLSS-G 3.x) leaves everything untouched
+    env = dict(os.environ, NVXRT_ARCH=arch, NVXRT_CACHE=str(cache))
+    kit = runtime / 'tools/models/bin'
+    if kit.is_dir():
+        env['PATH'] = f'{kit}:{env.get("PATH", "")}'
+    if subprocess.run(['bash', str(fg / 'tools/dlssg-setup'), str(dll)], env=env).returncode:
+        raise ValueError('kernel translation failed; nothing changed (see the message above)')
+    relative = Path(os.path.relpath(dll, game))
+    fg_path = (str(relative).replace('/', '\\') if relative.parts.count('..') <= 4
+               else 'Z:' + str(dll).replace('/', '\\'))
+    (fg / 'dlssg_host.ini').write_text(
+        '; written by d4r-features.py --fg dlssg. Relative paths are taken from the game executable\'s folder.\n'
+        '; ArchID 0x1b0 (Blackwell) enables multi-frame generation; Lite=1 is NVIDIA\'s FG Lite (DLSS-G >= 310.9.16).\n'
+        '[Host]\nNext=d4r\\d4r_dlssg_next.dll\nFG=%s\nArchID=0x1b0\nLite=%d\nLogLevel=1\nTiming=1\nLog=1\n'
+        % (fg_path, 1 if lite else 0))
+    shutil.copy2(runtime / 'nvngx.dll', runtime / 'd4r_dlssg_next.dll')  # d4r_boot.dll keeps it current
+    return dll, arch, cache
+
+
+def set_d4r_ini(runtime, backend, exact=False, cache=None):
+    ini = runtime / 'd4r.ini'
+    if not ini.is_file():
+        return
+    settings = [('FrameGeneration', 'Backend', backend)]
+    if backend == 'dlssg':
+        settings.append(('FrameGeneration', 'Exact', 'true' if exact else 'false'))
+        settings.append(('FrameGeneration', 'KernelCache', str(cache)))
+    source = ini.read_text(encoding='utf-8-sig')
+    result = update(source, settings)
+    if result != source:
+        ini.write_text(result, encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('game', type=Path, help='folder containing OptiScaler.ini')
     parser.add_argument('--runtime', type=Path, help='d4r folder (required for a custom ASI plugin folder)')
-    parser.add_argument('--fg', choices=('off', 'xefg', 'fsrfg'), default='off')
+    parser.add_argument('--fg', choices=('off', 'xefg', 'fsrfg', 'dlssg'), default='off',
+                        help='dlssg: NVIDIA DLSS Frame Generation on RDNA3/RDNA4 (d4r/fg/dlssg)')
     parser.add_argument('--input', choices=('dlssg', 'fsrfg', 'fsrfg30', 'upscaler'))
     parser.add_argument('--latency', choices=('proton', 'auto'), default='auto',
                         help='auto: OptiScaler selects latency output; proton: request Reflex (v10) or original NVAPI (0.9)')
+    parser.add_argument('--dll', help='dlssg: the DLSS-G DLL to run (default: the game\'s nvngx_dlssg.dll); 310.x only')
+    parser.add_argument('--exact', action='store_true',
+                        help='dlssg: bit-exact kernels (default: ~10%% faster, PSNR ~55 dB against exact)')
+    parser.add_argument('--lite', action='store_true', help='dlssg: NVIDIA FG Lite (DLSS-G >= 310.9.16)')
+    parser.add_argument('--force', action='store_true', help='dlssg: skip the RDNA3/RDNA4 check')
     args = parser.parse_args()
+    runtime = args.runtime or args.game / 'd4r'
+    ini = args.game / 'OptiScaler.ini'
     try:
-        backup = configure(args.game / 'OptiScaler.ini', args.runtime or args.game / 'd4r',
-                           args.fg, args.input, args.latency)
+        if args.fg == 'dlssg':
+            dll, arch, cache = setup_dlssg(args.game.resolve(), runtime.resolve(), args.dll, args.exact, args.lite,
+                                           args.force)
+        backup = configure(ini, runtime, args.fg, args.input, args.latency)
+        set_d4r_ini(runtime, 'dlssg' if args.fg == 'dlssg' else 'off', args.exact,
+                    cache if args.fg == 'dlssg' else None)
     except (OSError, ValueError, configparser.Error) as error:
         parser.exit(1, f'{error}\n')
     print(f'Backup: {backup}' if backup else 'Already configured.')
+    if args.fg == 'dlssg':
+        prefix = proton_prefix(args.game.resolve())
+        hags = set_hags(prefix) if prefix else None
+        print(f'DLSS-G: {dll} ({arch} kernels in {cache}, {"exact" if args.exact else "fast"} mode'
+              f'{", FG Lite" if args.lite else ""}).')
+        if arch == 'gfx11':
+            print('RDNA3 cost at 1440p (RX 7700 XT): about 5.4 ms of GPU time per real frame for 2x, plus about '
+                  '3 ms per further generated frame (4x: 11.7 ms).')
+        print(f'Hardware GPU scheduling set in {prefix} (backup {hags}).' if hags else
+              'Hardware GPU scheduling already set in the prefix.' if prefix else
+              'Proton prefix not found: if the game hides DLSS-G, launch it once, then run this again.')
+        print('Start the game and enable DLSS Frame Generation (2x/3x/4x) in its settings; no launch options needed.')
+        print('Logs: d4r/d4r_boot.log, d4r/fg/dlssg/dlssg_host.log, d4r/fg/dlssg/nvxrt.log.')
+        print('After a game update replaces nvngx_dlssg.dll, run this again to translate the new kernels.')
+        return
     print('Restart the game. Enable Reflex in-game for latency conversion.')
     if args.fg != 'off':
         print('Enable the selected native FG input in-game (unless upscaler), then activate FG in OptiScaler.')

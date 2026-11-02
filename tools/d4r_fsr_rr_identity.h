@@ -1,6 +1,6 @@
 // AMD's FSR Ray Regeneration runtime in a process that reports an NVIDIA GPU to the game.
 //
-// d4r's DLSS games run with WINE_HIDE_AMD_GPU (PROTON_FORCE_NVAPI): Vulkan, and so DXGI and
+// d4r's DLSS games run with WINE_HIDE_AMD_GPU's identity (d4r_boot.dll, or PROTON_FORCE_NVAPI): Vulkan, and so DXGI and
 // vkd3d-proton, report vendor 0x10de, which is what lets the game offer DLSS at all. vkd3d-proton
 // loads Proton's amdxc64.dll - the shim standing in for AMD's D3D12 driver-extension DLL, which
 // forwards to vkd3d-proton's own extensions - only when Vulkan reports vendor 0x1002

@@ -79,11 +79,24 @@ if [ "$asi_backend" = yes ]; then
 else
   [ -f "$GAME/dxgi.dll" ] && ok dxgi.dll || bad 'dxgi.dll (re-extract the d4r zip)'
 fi
+# d4r's dxgi.dll (OptiScaler) imports d4r_boot.dll, which shows the game an NVIDIA GPU (no launch options needed)
+boot=no
+if [ "$asi_backend" != yes ] && [ -f "$GAME/dxgi.dll" ] && grep -aqi 'd4r_boot\.dll' "$GAME/dxgi.dll"; then
+  if [ -f "$GAME/d4r_boot.dll" ]; then ok 'd4r_boot.dll (NVIDIA identity; no Steam launch options needed)'; boot=yes
+  else bad 'd4r_boot.dll: dxgi.dll needs it to load (re-extract the d4r zip)'; fi
+  if [ -f "$D4R/d4r_boot.log" ]; then note "last launch: $(tail -n 1 "$D4R/d4r_boot.log" | tr -d '\r')"; fi
+elif [ "$asi_backend" != yes ] && [ -f "$GAME/dxgi.dll" ]; then
+  note "dxgi.dll does not load d4r_boot.dll (replaced OptiScaler?): the Steam launch options below are needed"
+fi
 [ -f "$INI" ] && ok "OptiScaler config: $INI" || bad "OptiScaler config: $INI"
 core_name=d3d12core.dll
 [ "$asi_backend" != yes ] || [ ! -f "$D4R/d4r12core.dll" ] || core_name=d4r12core.dll
 for f in d3d12.dll "$core_name"; do
-  [ -f "$GAME/$f" ] && ok "$f" || bad "$f (re-extract the d4r zip)"
+  # Wine matches names case-insensitively (Unreal games ship the Agility SDK's D3D12Core.dll): one copy, any case
+  matches=$(find "$GAME" -maxdepth 1 -type f -iname "$f" | wc -l)
+  if [ "$matches" = 1 ]; then ok "$f"
+  elif [ "$matches" -gt 1 ]; then bad "$f exists in several letter cases; keep only d4r's copy"
+  else bad "$f (re-extract the d4r zip)"; fi
 done
 for f in nvcuda.dll zluda/libcuda.so d4r.ini; do
   [ -f "$D4R/$f" ] && ok "$D4R/$f" || bad "$D4R/$f (re-extract the d4r zip)"
@@ -204,6 +217,8 @@ fi
 if [ "$external_backend" = true ]; then
   note "AllowExternalBackend requires the patched OptiScaler DLL; keep native AMD identity visible for FSR4"
   printf '\nSteam launch options for this patched setup:\n  PROTON_ENABLE_NVAPI=1 DXVK_NVAPI_ALLOW_OTHER_DRIVERS=1 DXVK_NVAPI_GPU_ARCH=AD100 WINE_HIDE_AMD_GPU=0 %%command%%\n'
+elif [ "$boot" = yes ]; then
+  printf '\nNo Steam launch options are needed (d4r_boot.dll provides the NVIDIA identity); older\nPROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 launch options are harmless and can be removed.\n'
 else
   printf '\nSteam launch options for this game:\n  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %%command%%\n'
 fi

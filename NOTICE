@@ -22,13 +22,20 @@ third_party/fidelityfx/
     unmodified; the SDK license lists them under the MIT license (third_party/fidelityfx/LICENSE.txt).
     AMD's runtime DLLs are not included and remain under AMD's binary terms.
 
+fg/dlssg/
+    DLSS Frame Generation on RDNA3/RDNA4, ported from dlssg-amd (https://github.com/itchyfeetleech/dlssg-amd,
+    Copyright (C) 2026 itchyfeetleech, GPL-3.0-only; fg/dlssg/NOTICE). d4r's changes: the RDNA3 (gfx11) WMMA layout,
+    the layer's GPU/cache check, the host's NVAPI architecture wrap for DLSS-G 310.7 and d4r's setup in place of the
+    launch wrapper. Its vkd3d-proton fix is patches/vkd3d-proton/0006 (itchyfeetleech, LGPL-2.1 like the others).
+
 kernels/support/fsr_rr_prepare.comp
     Its diffuse/specular split follows the DLSS-RR to FSR-RR adapter in Zach Hembree's OptiScaler
     branch ffx-denoise-experimental and burak113's continuation (GPL-3.0).
 
 Release zips (scripts/package_release.sh) also bundle binaries of ZLUDA (Apache-2.0 or MIT, with
 LLVM under Apache-2.0 with LLVM exceptions), the patched vkd3d-proton (LGPL-2.1) and OptiScaler
-(https://github.com/optiscaler/OptiScaler, GPL-3.0, unmodified). Each zip carries their license
+(https://github.com/optiscaler/OptiScaler, GPL-3.0; its DLL gains one import, d4r_boot.dll, added by
+scripts/pe_add_import.py, so d4r's NVIDIA identity is set up before OptiScaler starts). Each zip carries their license
 texts in d4r/licenses and says where every file comes from in d4r/source/SOURCES.txt.
 Release zips include install.sh to download NVIDIA's nvngx_dlss.dll and _nvngx.dll separately.
 Optional builds may bundle those DLLs and nvngx_dlssd.dll. Release zips also include DLSS kernels compiled from NVIDIA's

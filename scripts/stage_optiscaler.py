@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Stage OptiScaler v10 with its complete upstream dependency layout and licenses."""
+"""Stage OptiScaler v10 with its complete upstream dependency layout and licenses.
+
+usage: stage_optiscaler.py SOURCE DESTINATION [BOOT_DLL]
+With BOOT_DLL (build/d4r_boot.dll), the staged dxgi.dll imports it first and it is staged next to dxgi.dll: d4r's
+in-process NVIDIA identity, so games need no Steam launch options (tools/d4r_boot.c)."""
 import hashlib
 import json
 from pathlib import Path
@@ -7,6 +11,7 @@ import shutil
 import sys
 
 from configure_optiscaler import configure
+from pe_add_import import add_import
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = ('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
@@ -14,7 +19,7 @@ REQUIRED = ('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll'
             'dlssg_to_fsr3_amd_is_better.dll')
 
 
-def stage(source, destination):
+def stage(source, destination, boot=None):
     source, destination = Path(source), Path(destination)
     required = ['OptiScaler.dll', 'OptiScaler.ini', 'Licenses/FidelityFX_v2_LICENSE.md',
                 'Licenses/XeSS_LICENSE.txt'] + ['OptiScaler/' + name for name in REQUIRED]
@@ -26,6 +31,10 @@ def stage(source, destination):
     # Keep all of upstream's providers, including nested interop DLLs, together.
     shutil.copytree(source / 'OptiScaler', destination / 'OptiScaler', dirs_exist_ok=True)
     shutil.copy2(source / 'OptiScaler.dll', destination / 'dxgi.dll')
+    if boot:
+        dxgi = destination / 'dxgi.dll'
+        dxgi.write_bytes(add_import(dxgi.read_bytes(), 'd4r_boot.dll', 'd4r_boot')[0])
+        shutil.copy2(boot, destination / 'd4r_boot.dll')
     with (destination / 'OptiScaler.ini').open('w', encoding='utf-8', newline='') as handle:
         handle.write(config)
     licenses = destination / 'd4r/licenses'
@@ -36,6 +45,8 @@ def stage(source, destination):
         shutil.copy2(source / 'Licenses' / original, licenses / name)
     lock = json.loads((ROOT / 'packaging/optiscaler-release.json').read_text())
     files = [destination / 'dxgi.dll', destination / 'OptiScaler.ini']
+    if boot:
+        files.append(destination / 'd4r_boot.dll')
     files += sorted(p for p in (destination / 'OptiScaler').rglob('*') if p.is_file())
     hashes = {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
     incoming = {p.relative_to(source).as_posix() for p in source.rglob('*') if p.is_file()

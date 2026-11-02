@@ -104,9 +104,11 @@ The shim keeps the game's inputs and output in VRAM through vkd3d-proton's Vulka
 
 1. Extract `d4r-<version>.zip` into the folder that holds the game's main `.exe` (OptiScaler 10.0.0-pre1 as `dxgi.dll`, its `OptiScaler/` dependencies, the d4r-patched vkd3d-proton, AMD's FSR files and the `d4r` folder).
 2. Run `bash install.sh` there. It downloads NVIDIA's DLSS and NGX files from NVIDIA, checks their SHA-256 hashes and puts them in `d4r/`. Needs Bash, curl, sha256sum and 7-Zip; no sudo, ROCm not required.
-3. In Steam, select a Proton version for the game (most work; tested: GE-Proton11-3) and set the launch options `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
+3. In Steam, select a Proton version for the game (most work; tested: GE-Proton11-3). No launch options are needed: `d4r_boot.dll`, which d4r's `dxgi.dll` loads first, shows the game an NVIDIA GPU itself (what `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100` did before; those options still work and can be removed).
 
-When updating, replace `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together. Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)). The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt).
+When updating, replace `dxgi.dll`, `d4r_boot.dll`, `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together. Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)). The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt).
+
+DLSS Frame Generation (NVIDIA's own, 2x/3x/4x) runs on RDNA3 and RDNA4: `python3 d4r/d4r-features.py . --fg dlssg` with the game closed, then enable it in the game ([docs/frame-generation.md](docs/frame-generation.md)).
 
 Northlight games (Control, Alan Wake 2) keep their original motion vectors by default. Experimental display-resolution motion-vector reconstruction requires `[Interop] NativeMotionVectors = true` in `d4r.ini` and a matching patched driver. It can cause motion artifacts; restart the game after changing it.
 

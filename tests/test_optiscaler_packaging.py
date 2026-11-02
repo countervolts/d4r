@@ -7,6 +7,7 @@ import configparser
 import hashlib
 import itertools
 import os
+import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -92,7 +93,7 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
             for name in ('package_release.sh', 'configure_optiscaler.py', 'stage_optiscaler.py', 'check_glibc_compat.sh',
-                         'check_redistributable.py', 'private_d3d12_core.py', 'stage_engine_kit.sh'):
+                         'check_redistributable.py', 'private_d3d12_core.py', 'stage_engine_kit.sh', 'pe_add_import.py'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
             for name in ('LICENSE', 'NOTICE'):
@@ -139,7 +140,13 @@ class OptiScalerConfigTests(unittest.TestCase):
             fixture(inputs / 'rocm/licenses/runtime.txt')
             for name in ('d3d12.dll', 'd3d12core.dll'):
                 fixture(inputs / 'vkd3d' / name, b'MZ fixture d3d12core.dll\0 then d3d12core.dll\0' if name == 'd3d12.dll' else b'fixture')
-            fixture(inputs / 'opti/OptiScaler.dll')
+            # dxgi.dll gets d4r_boot.dll as its first import, so OptiScaler must be a real PE DLL
+            if not shutil.which('x86_64-w64-mingw32-gcc'):
+                self.skipTest('x86_64-w64-mingw32-gcc not installed')
+            (inputs / 'opti').mkdir()
+            subprocess.run(['x86_64-w64-mingw32-gcc', '-shared', '-x', 'c', '-o', str(inputs / 'opti/OptiScaler.dll'), '-'],
+                           input='__declspec(dllexport) int opti(void) { return 0; }\n', text=True, check=True)
+            fixture(repo / 'build/d4r_boot.dll')
             for name in ('OptiScaler/amd_fidelityfx_loader_dx12.dll', 'OptiScaler/amd_fidelityfx_upscaler_dx12.dll',
                          'Licenses/FidelityFX_v2_LICENSE.md', 'Licenses/XeSS_LICENSE.txt',
                          'OptiScaler/libxell.dll', 'OptiScaler/libxess_fg.dll', 'OptiScaler/libxess.dll',
@@ -208,6 +215,10 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertNotIn('d4r/d4r_nvapi64.dll', archive.namelist())
                             self.assertNotIn('d4r/fakenvapi.dll', archive.namelist())
                             self.assertIn('uninstall.sh', archive.namelist())
+                            self.assertIn('d4r_boot.dll', archive.namelist())
+                            sys.path.insert(0, str(ROOT / 'scripts'))
+                            from pe_add_import import import_names
+                            self.assertEqual(import_names(archive.read('dxgi.dll'))[0], 'd4r_boot.dll')
                             for dependency in ('d4r-features.py', 'licenses/XeSS-LICENSE.txt', 'source/optiscaler.json'):
                                 self.assertIn('d4r/' + dependency, archive.namelist())
                             configs.append(data)
@@ -223,6 +234,7 @@ class OptiScalerConfigTests(unittest.TestCase):
                         else:
                             self.assertNotIn('OptiScaler.ini', archive.namelist())
                             self.assertNotIn('dxgi.dll', archive.namelist())
+                            self.assertNotIn('d4r_boot.dll', archive.namelist())
                             self.assertEqual(archive.read('d4r.asi'), archive.read('d4r/nvngx.dll'))
                             self.assertIn('d4r/d4r-setup.exe', archive.namelist())
                             self.assertEqual('d4r/install.sh' in archive.namelist(), bundled == 'installer')
