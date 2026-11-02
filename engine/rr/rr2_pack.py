@@ -63,6 +63,18 @@ def main():
             e['tanh'] = ('U', np.tanh(x).astype(np.float16).view(np.uint16))
     e['cubic'] = ('U', cubic_table())
     e['act'] = ('Y', act_table())
+    # every binary16 vector and position bias also as float32 ("_f"), for the shaders' f32 accumulators: the same
+    # values without a conversion per element (a bias table as 16 x 16 tiles [key tile][query tile], each column-major:
+    # one accumulator's elements per lane are contiguous)
+    f = {}
+    for name, (kd, a) in e.items():
+        f[name] = (kd, a)
+        if kd == 'H' and name.startswith('bias'):
+            t = np.asarray(a, np.float32).reshape(4, 16, 4, 16).transpose(0, 2, 3, 1)   # [kt][qt][query][key]
+            f[name + '_f'] = ('F', t)
+        elif kd == 'H':
+            f[name + '_f'] = ('F', np.asarray(a, np.float32))
+    e = f
     blob, defines = bytearray(), []
     for name, (kd, a) in e.items():
         while len(blob) % 256:
@@ -76,6 +88,8 @@ def main():
             blob += np.ascontiguousarray(a, np.uint8).tobytes()
         elif kd == 'U':
             blob += np.ascontiguousarray(a, np.uint16).tobytes()
+        elif kd == 'F':
+            blob += np.ascontiguousarray(a, np.float32).tobytes()
         else:
             blob += np.ascontiguousarray(a, np.float16).tobytes()
         defines.append(f'#define W_{name.upper()} {off}u   // {kd} {a.shape}')

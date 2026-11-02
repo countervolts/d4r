@@ -4,10 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/build/wine-nvcuda/generated}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
+source "$ROOT/scripts/hip_windows_env.sh"
 CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "motion kernels need ROCm clang (D4R_ROCM_DIR)" >&2; exit 2; }
 mkdir -p "$OUT"
-for arch in gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201; do
+for arch in gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201; do
     "$CLANG" -x hip -nogpuinc -nogpulib --offload-device-only --offload-arch="$arch" \
         --no-gpu-bundle-output -O3 -mno-wavefrontsize64 -o "$OUT/$arch.hsaco" \
         "$ROOT/kernels/support/motion_dilate.hip"

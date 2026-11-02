@@ -1,0 +1,460 @@
+{
+ "date": "2026-10-29",
+ "gpu": "RX 9070 XT, RADV (Mesa 26.2.5), 330 W cap",
+ "preset": "SR L",
+ "stages": "enc0_l, dec0_l (layer_m.comp KIND 3, 4)",
+ "instruction_counts": {
+  "method": "static VALU per wave of the plane-layout (vkhip) variants from RADV_DEBUG=shaders, tools/radv_isa_mix.py; the stages unroll completely, so static = per wave. [enc0_l, dec0_l]",
+  "variants": {
+   "default": {
+    "defines": "-DM_RELAXED -DWPW=2 -DM_RESIDUAL_F32 (compile_m.py before 2026-10-29)",
+    "valu": [
+     3350,
+     2780
+    ]
+   },
+   "A": {
+    "defines": "+ M_F32ACT",
+    "valu": [
+     3037,
+     2568
+    ],
+    "what": "f32 accumulators into the finite-only FP8 conversion (no v_minimummaximum_f32 clamp per element)"
+   },
+   "A+B": {
+    "defines": "+ M_F32ACT M_RES32",
+    "valu": [
+     2864,
+     2435
+    ],
+    "what": "plus the residual stream f32 for the whole block, norm 2 summed in f32"
+   },
+   "A+B+D": {
+    "defines": "+ M_F32ACT M_RES32 M_PK16",
+    "valu": [
+     2691,
+     2262
+    ],
+    "what": "plus the softmax numerator on packed f16 pairs and no ZLUDA key permutation"
+   },
+   "A+B+D+bias32": {
+    "defines": "+ M_BIAS32",
+    "valu": [
+     2577,
+     2152
+    ],
+    "what": "plus f32 bias tiles in the model (no f16 -> f32 widening per accumulator); byte-identical to A+B+D"
+   },
+   "A+B+D+bias32+ldau (new default)": {
+    "defines": "-DM_RELAXED -DWPW=2 -DM_RESIDUAL_F32 -DM_F32ACT -DM_PK16 -DM_BIAS32 -DM_LDAU -DM_RES32",
+    "valu": [
+     2542,
+     2137
+    ],
+    "what": "plus the weight tiles read as 8 bytes per lane from one precomputed lane offset"
+   },
+   "ldau, lane offset recomputed per load (rejected form)": {
+    "valu": [
+     2607,
+     2207
+    ]
+   },
+   "gain fold on A+B+D": {
+    "valu": [
+     2612,
+     2184
+    ],
+    "what": "norm gains folded into the FP8 Q, V and W1 weights (tools/fold_l_norm_gains.py), requantized; opt-in experiment, not built"
+   },
+   "everything + gain fold": {
+    "valu": [
+     2460,
+     2062
+    ]
+   },
+   "GELU written in dual-issue forms (M_VOPD experiment)": {
+    "valu": [
+     2542,
+     2137
+    ],
+    "what": "identical ISA: NIR/ACO fold it back into v_maxmin and VOP3 FMAs; removed"
+   }
+  }
+ },
+ "timing": {
+  "method": "d4r-m, 1920x1080 -> 3840x2160, vkhip, D4R_M_WARMUP_PASSES=12 D4R_M_TIME_EACH=1, 100 timed evaluations per trial, builds interleaved",
+  "runs": {
+   "final, 3 interleaved trials": {
+    "default": {
+     "trials": [
+      {
+       "whole_us": 4213.6,
+       "enc0_l_us": 895.8,
+       "dec0_l_us": 746.6
+      },
+      {
+       "whole_us": 4219.8,
+       "enc0_l_us": 892.4,
+       "dec0_l_us": 749.6
+      },
+      {
+       "whole_us": 4243.6,
+       "enc0_l_us": 895.9,
+       "dec0_l_us": 750.2
+      }
+     ],
+     "median": {
+      "whole_us": 4219.8,
+      "enc0_l_us": 895.8,
+      "dec0_l_us": 749.6
+     }
+    },
+    "new default (compile_m.py)": {
+     "trials": [
+      {
+       "whole_us": 4000.3,
+       "enc0_l_us": 773.0,
+       "dec0_l_us": 652.8
+      },
+      {
+       "whole_us": 4008.8,
+       "enc0_l_us": 772.2,
+       "dec0_l_us": 652.2
+      },
+      {
+       "whole_us": 4004.8,
+       "enc0_l_us": 770.8,
+       "dec0_l_us": 655.6
+      }
+     ],
+     "median": {
+      "whole_us": 4004.8,
+      "enc0_l_us": 772.2,
+      "dec0_l_us": 652.8
+     }
+    }
+   },
+   "stack, 3 interleaved trials": {
+    "default": {
+     "trials": [
+      {
+       "whole_us": 4241.9,
+       "enc0_l_us": 890.4,
+       "dec0_l_us": 745.7
+      },
+      {
+       "whole_us": 4241.0,
+       "enc0_l_us": 897.3,
+       "dec0_l_us": 750.9
+      },
+      {
+       "whole_us": 4246.6,
+       "enc0_l_us": 899.8,
+       "dec0_l_us": 755.0
+      }
+     ],
+     "median": {
+      "whole_us": 4241.9,
+      "enc0_l_us": 897.3,
+      "dec0_l_us": 750.9
+     }
+    },
+    "A+B+D": {
+     "trials": [
+      {
+       "whole_us": 4057.6,
+       "enc0_l_us": 784.5,
+       "dec0_l_us": 666.1
+      },
+      {
+       "whole_us": 4045.0,
+       "enc0_l_us": 787.6,
+       "dec0_l_us": 669.6
+      },
+      {
+       "whole_us": 4061.7,
+       "enc0_l_us": 790.2,
+       "dec0_l_us": 672.9
+      }
+     ],
+     "median": {
+      "whole_us": 4057.6,
+      "enc0_l_us": 787.6,
+      "dec0_l_us": 669.6
+     }
+    },
+    "A+B+D+bias32+ldau": {
+     "trials": [
+      {
+       "whole_us": 4005.2,
+       "enc0_l_us": 768.7,
+       "dec0_l_us": 655.6
+      },
+      {
+       "whole_us": 4034.4,
+       "enc0_l_us": 773.9,
+       "dec0_l_us": 657.2
+      },
+      {
+       "whole_us": 4037.4,
+       "enc0_l_us": 774.9,
+       "dec0_l_us": 656.8
+      }
+     ],
+     "median": {
+      "whole_us": 4034.4,
+      "enc0_l_us": 773.9,
+      "dec0_l_us": 656.8
+     }
+    },
+    "everything + gain fold": {
+     "trials": [
+      {
+       "whole_us": 3975.8,
+       "enc0_l_us": 755.1,
+       "dec0_l_us": 638.8
+      },
+      {
+       "whole_us": 3984.8,
+       "enc0_l_us": 761.8,
+       "dec0_l_us": 647.4
+      },
+      {
+       "whole_us": 4008.4,
+       "enc0_l_us": 763.1,
+       "dec0_l_us": 646.4
+      }
+     ],
+     "median": {
+      "whole_us": 3984.8,
+      "enc0_l_us": 761.8,
+      "dec0_l_us": 646.4
+     }
+    }
+   },
+   "steps, 2 interleaved trials each": {
+    "A vs default": {
+     "default": {
+      "trials": [
+       {
+        "whole_us": 4214.5,
+        "enc0_l_us": 893.8,
+        "dec0_l_us": 750.9
+       },
+       {
+        "whole_us": 4217.2,
+        "enc0_l_us": 894.5,
+        "dec0_l_us": 750.5
+       }
+      ],
+      "median": {
+       "whole_us": 4215.85,
+       "enc0_l_us": 894.15,
+       "dec0_l_us": 750.7
+      }
+     },
+     "A": {
+      "trials": [
+       {
+        "whole_us": 4134.0,
+        "enc0_l_us": 845.3,
+        "dec0_l_us": 716.8
+       },
+       {
+        "whole_us": 4130.6,
+        "enc0_l_us": 846.9,
+        "dec0_l_us": 719.1
+       }
+      ],
+      "median": {
+       "whole_us": 4132.3,
+       "enc0_l_us": 846.0999999999999,
+       "dec0_l_us": 717.95
+      }
+     }
+    },
+    "A+B vs default": {
+     "default": {
+      "trials": [
+       {
+        "whole_us": 4215.2,
+        "enc0_l_us": 893.2,
+        "dec0_l_us": 748.7
+       },
+       {
+        "whole_us": 4224.9,
+        "enc0_l_us": 896.8,
+        "dec0_l_us": 749.8
+       }
+      ],
+      "median": {
+       "whole_us": 4220.049999999999,
+       "enc0_l_us": 895.0,
+       "dec0_l_us": 749.25
+      }
+     },
+     "A+B": {
+      "trials": [
+       {
+        "whole_us": 4070.5,
+        "enc0_l_us": 820.4,
+        "dec0_l_us": 699.8
+       },
+       {
+        "whole_us": 4094.0,
+        "enc0_l_us": 817.7,
+        "dec0_l_us": 697.6
+       }
+      ],
+      "median": {
+       "whole_us": 4082.25,
+       "enc0_l_us": 819.05,
+       "dec0_l_us": 698.7
+      }
+     }
+    },
+    "bias32 vs A+B+D": {
+     "A+B+D": {
+      "trials": [
+       {
+        "whole_us": 4033.2,
+        "enc0_l_us": 786.1,
+        "dec0_l_us": 671.2
+       },
+       {
+        "whole_us": 4078.6,
+        "enc0_l_us": 791.5,
+        "dec0_l_us": 673.3
+       }
+      ],
+      "median": {
+       "whole_us": 4055.8999999999996,
+       "enc0_l_us": 788.8,
+       "dec0_l_us": 672.25
+      }
+     },
+     "A+B+D+bias32": {
+      "trials": [
+       {
+        "whole_us": 4008.1,
+        "enc0_l_us": 775.1,
+        "dec0_l_us": 654.1
+       },
+       {
+        "whole_us": 4057.4,
+        "enc0_l_us": 778.2,
+        "dec0_l_us": 655.1
+       }
+      ],
+      "median": {
+       "whole_us": 4032.75,
+       "enc0_l_us": 776.6500000000001,
+       "dec0_l_us": 654.6
+      }
+     }
+    },
+    "gain fold vs A+B+D": {
+     "A+B+D": {
+      "trials": [
+       {
+        "whole_us": 4019.4,
+        "enc0_l_us": 781.3,
+        "dec0_l_us": 664.6
+       },
+       {
+        "whole_us": 4028.2,
+        "enc0_l_us": 783.4,
+        "dec0_l_us": 663.3
+       }
+      ],
+      "median": {
+       "whole_us": 4023.8,
+       "enc0_l_us": 782.3499999999999,
+       "dec0_l_us": 663.95
+      }
+     },
+     "gain fold": {
+      "trials": [
+       {
+        "whole_us": 3985.0,
+        "enc0_l_us": 774.4,
+        "dec0_l_us": 652.3
+       },
+       {
+        "whole_us": 4011.0,
+        "enc0_l_us": 778.6,
+        "dec0_l_us": 650.3
+       }
+      ],
+      "median": {
+       "whole_us": 3998.0,
+       "enc0_l_us": 776.5,
+       "dec0_l_us": 651.3
+      }
+     }
+    }
+   }
+  },
+  "nvidia_l_stages_us": {
+   "enc0_l": 503,
+   "dec0_l": 345,
+   "whole": 3161
+  }
+ },
+ "quality": {
+  "against_exact_build": {
+   "method": "whole 4K output of the same 4 frames against the exact build of the two stages (no M_RELAXED, TEXL: the arithmetic of NVIDIA's translated kernels), RGB clipped to [0, 1], peak 1",
+   "db": {
+    "default": [
+     51.93,
+     53.78,
+     52.99,
+     56.56
+    ],
+    "A+B+D, A+B+D+bias32+ldau, new default (byte-identical)": [
+     51.71,
+     54.09,
+     52.02,
+     54.86
+    ],
+    "everything + gain fold": [
+     51.97,
+     53.25,
+     52.96,
+     55.66
+    ]
+   }
+  },
+  "against_zluda_capture": {
+   "method": "build/l-vkhip-20261028: 856x480 -> 2560x1440 captured frames 1-2 against the pure-ZLUDA frames (its psnr_rgb.py); this case is limited outside these stages (the exact build scores the same)",
+   "mean_db": {
+    "default": {
+     "vulkan": 29.56,
+     "vkhip": 29.58
+    },
+    "new default": {
+     "vulkan": 29.57,
+     "vkhip": 29.58
+    },
+    "everything + gain fold": {
+     "vulkan": 29.48,
+     "vkhip": 29.49
+    },
+    "exact build": {
+     "vulkan": 29.56,
+     "vkhip": 29.56
+    }
+   },
+   "valid": false,
+   "correction": "Historical scores used misaligned asynchronous output frames. Input 0 maps to out.raw.frame2, input 1 to out.raw.frame3; input 2 has no saved completed reference. See sr-l-amd-quality.json. These values do not establish a quality limitation outside the outer stages."
+  }
+ },
+ "option_4_native_hip": {
+  "note": "the same ten Swin layers on the Vulkan route (layer_m.comp) and as native HIP code objects (vkhip), suite-sr-4k-330w.json medians",
+  "network_us": {
+   "vulkan": 1752.6,
+   "vkhip": 1678.0
+  },
+  "reading": "about 4%; enc0_l also samples six Vulkan textures, which a HIP kernel on the vkhip route cannot"
+ }
+}

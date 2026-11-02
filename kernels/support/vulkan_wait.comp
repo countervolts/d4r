@@ -1,0 +1,12 @@
+#version 450
+// D4R_SHIM_GPU_COMPLETION: holds the game's queue until DLSS has written this frame's completion word (HIP
+// hipStreamWriteValue32 after the output, or the CPU on every failure path). Bounded: after `limit` polls the
+// shader returns regardless, so a lost write can never hang the GPU (the frame then shows its previous output).
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) coherent volatile readonly buffer Words { uint words[]; };
+layout(push_constant) uniform Wait { uint index; uint value; uint limit; } wait;
+void main() {
+    for (uint poll = 0u; poll < wait.limit; ++poll)
+        if (words[wait.index] == wait.value)
+            return;
+}

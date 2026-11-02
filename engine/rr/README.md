@@ -353,10 +353,10 @@ how the passes were arranged:
   eight slots, 58 MB at 4K) and a group's post passes run without barriers between them, as do its down passes
   together with the next group's post passes on the other half of the slots - what NGX does with two slots and its
   progress counters. `D4R_ENGINE_RR_SKIP=serial` restores the old order.
-- **Pooled histories as real 10:10:10:2 images: withdrawn.** 4 bytes a pixel instead of RGBA32F's 16 saved
-  0.1 ms and was identical at 3x and 2x scaling, but the hardware's bilinear filter rounds a UNORM image differently
-  from a float one: at 1.5x (capFQ) temporal frames came out at 44 - 51 dB. The default is RGBA32F again;
-  `D4R_RR2_POOLED=rgb10_a2` builds the other form.
+- **Pooled histories as real 10:10:10:2 images** (the default since 2026-10-20). 4 bytes a pixel instead of
+  RGBA32F's 16 saved 0.1 ms and was identical at 3x and 2x scaling, but the hardware's bilinear filter rounds a
+  UNORM image differently from a float one: at 1.5x (capFQ) temporal frames came out at 44 - 51 dB (28.8 dB on
+  random-motion noise's history frames, below). `D4R_RR2_POOLED=rgba32f` builds the reference form.
 
 Tried without gain: 32-bit arena accesses for the translated code's paired 16-bit ones (0.01 ms), dropping the
 subgroup shuffles or the depth search (they cost nothing measurable). What is left is NVIDIA's arithmetic: gather
@@ -407,9 +407,9 @@ byte-identical to the previous build, same speed:
   weights go into the command buffer with `vkCmdUpdateBuffer` instead of through a host-visible staging copy that
   stayed allocated.
 
-Through the shim (direct output) the harness process peaks 159 MiB lower (1100 -> 941 MiB). Not exact, so not
-done: the pooled histories as RGB10A2 (`D4R_RR2_POOLED=rgb10_a2`, -70 MB, see above); they hold q / 1023, which
-neither binary16 nor UNORM16 represents exactly. `D4R_ENGINE_RR_ARENA`
+Through the shim (direct output) the harness process peaks 159 MiB lower (1100 -> 941 MiB). Not exact: the pooled
+histories as RGB10A2 (`D4R_RR2_POOLED=rgb10_a2`, -70 MB, now the default, see above) hold q / 1023, which neither
+binary16 nor UNORM16 represents exactly. `D4R_ENGINE_RR_ARENA`
 keeps the old separate layout, so that arena dumps show the network's regions as NGX leaves them.
 
 ## Against a real NVIDIA card: `D4R_RR_FUSE` (2026-10-13)
@@ -485,7 +485,7 @@ wait / delay markers. What was tried on top of level 3, none of it a gain:
 - the clamps removed: -30 us (2.2 ps per instruction and wave), but not usable: without the clamp the hardware
   conversion returns NaN above 464 where the clamp gives 448 (`satprobe.comp`);
 - f32 copies of the biases: 176 fewer conversions and 78 more loads per wave, slightly slower (587-595 us): a load
-  costs about three arithmetic instructions;
+  costs about three arithmetic instructions (on the later shaders they are faster, see 2026-10-20 below);
 - the softmax cubic computed, not read from its table: the same time;
 - no barriers: the same time;
 - one wave per window walking the four token slices, every weight, key and value tile read once
@@ -530,6 +530,65 @@ only; the other stages still use `rr2_m.comp`.
 well 4.98 / 5.59. Decoder 0's second kernel is not converted: it hands r and the MLP sum (8 KiB of binary16) to its
 translated tail through shared memory, which a single wave cannot hold without losing the 4 KiB rate.
 
+Shared memory, later (2026-10-18, RX 9070, RADV, 1280x720 -> 2560x1440, `d4r-rr` with `D4R_RR_TIME_REPEAT=40`
+and `D4R_ENGINE_RR_STAGE_STAMPS=1`, five interleaved runs; every image of six temporal frames byte-identical to the
+previous model, also at 1114x626 -> 1080p, 853x480 -> 1440p and with `D4R_RR_TEST_ROBUST2=1`). ACO sizes a shader's
+registers to the waves its shared memory leaves room for (enc1 needed 97 vector registers before scheduling and got
+240, dec0_1 79 and 192), so a stage that declares less shared memory also gets fewer registers and more waves:
+- **Encoder 0 in one shader again at level 3.** With the one-wave block nothing waits while the gather runs, so
+  `gen_rr2_enc0.py --one-wave` without `--split` runs the gather, the block and the tail in one 32-thread group and
+  hands the features over in shared memory: XF shares its 4 KiB with the block's XT and KVS (`rr2_w.comp`
+  `RR2_XF_SHARED`; every feature tile is in registers before the block first writes either). No gather pass, no
+  record in the arena (76 bytes a render pixel, of which 36 MB lay past the arena at 720p). The gather now runs at the
+  block's 6 waves per SIMD instead of 16 as a pass of its own, which takes back most of the saved traffic:
+  enc0g + enc0 798 -> 772 us. `D4R_RR2_SPLIT=1` builds the gather pass.
+- **enc1's merge input shares its 8 KiB with XT and KVS** (`rr2_m.comp` KIND 1): 17 -> 9 KiB of shared memory, 240 ->
+  144 vector registers, 6 -> 10 waves per SIMD: 286 -> 266 us.
+- **dec0_1 hands r and the MLP sum to its tail in XT and KVS' place** (KIND 5, one window per workgroup): written as
+  binary16 pairs of natural channels after a barrier, read in those pairs by the tail; 14 -> 8 KiB, 192 -> 120 vector
+  registers, 8 -> 12 waves per SIMD: 660 -> 623 us.
+- **Lighter conversion guards in the hybrid stages** (enc0, dec0_1; `ptx2rr.py --exact-convert`): their modules go
+  through `spv_exact_convert.py`, whose NoContraction on every conversion already stops the fold of
+  `float(float16_t(x))`, so a `cvt.rn.f16.f32` keeps only the opaque zero on its f32 bits (against the fused
+  multiply-convert, which `precise` alone does not stop: without it ACO emits `v_fma_mixlo_f16` there). In the ISA the
+  same number of `v_cvt_f16_f32` / `v_cvt_f32_f16` as before and no `v_fma_mix*_f16`; 224 / 153 fewer instructions:
+  enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes (post, down, downp, pooled) now go through
+  `spv_exact_convert.py` too and take the same guard. Their ISA already uses `v_fma_mix*_f16` for plain conversions,
+  so the check there is the whole instruction mix: only `v_and_or_b32` / `v_or` / `v_perm` / shifts go (post -16
+  VALU, down -9, downp -73), every `v_fma_f32` / `v_mul_f32` / `v_add_f32` / conversion / `v_exp` / `v_log` count is
+  unchanged (post moves 5 of its 57 mixes from the low to the high half of their registers). Output 673 -> 665 us.
+- **dec0_1's translated tail on two waves** (`gen_rr2_enc0.py --tail-waves 2`). The tail ran on wave 0 while the
+  block's other three waves had nothing left to do; it is a prologue (y = r + MLP * s2 and the shuffles that give each
+  lane its two pixels) and then the same per-pixel code twice. Each of two waves now runs its own copy of the tail with
+  only one pixel's stores (the first six, the last six), and the compiler drops what a copy's stores do not need:
+  every stored value comes from the same instructions on the same values. 120 -> 96 vector registers, 12 -> 16 waves
+  per SIMD; dec0_1 565 -> 474 us. Four waves (each pixel's stores split in two) is slower, 529 us: the per-pixel work
+  the parts share is then done twice. `D4R_RR2_TAIL_WAVES=1` builds the single-wave tail.
+- **One unsigned comparison per axis in the translation's bounds-checked fetch** (`ptx2rr.py` `fetch0`: a negative
+  coordinate is above every size): 231 instructions fewer in enc0, whose gather fetches 102 times, its scalar spills
+  200 -> 176; enc0 745 -> 738 us.
+- **Hardware saturation for the FP8 conversions of f32 values** (`rr_exact.glsl` `FINITE`). RADV lowers a saturating
+  conversion (`saturatedConvertEXT`) as a NaN-preserving clamp per element (`v_minimummaximum_f32`) and then the
+  conversion, because the hardware's FP16_OVFL saturation turns infinities into NaN instead of +-448 (ACO's comment;
+  confirmed on all 2^32 f32 inputs, RX 9070: FP16_OVFL is identical to the clamp for every finite value and NaN,
+  only +-Inf differ). The values converted here never are infinite: sums of FP8 products (each at most 448^2) and
+  binary16 biases stay far below 3.4e38. Written as "an infinity becomes NaN, then saturate", the conversion is the
+  pattern `nir_opt_algebraic` turns into `f2e4m3fn_satfn` (vkd3d-proton's; Mesa >= 25.2, `has_f2e4m3fn_satfn`):
+  the hardware conversion with FP16_OVFL and no clamp. 168 - 232 clamps fewer per network stage (enc0 960 -> 128);
+  frame 3.92 -> 3.79 ms, every stage faster (dec0_1 607 -> 576 us, enc0 752 -> 727, enc1 262 -> 247). The binary16
+  conversions (the decoders' first kernels' input) keep the clamp: NIR moves the infinity test through the widening
+  and the pattern no longer matches. `RR_SAT_CLAMP=1` builds the old form.
+Frame 4.09 -> 3.84 ms. Tried without gain: the decoders' first kernels' expansion in KVS (16 /
+12 / 8 KiB, but the deep levels have too few windows for the waves to matter and the extra barrier cost 4 - 5 us
+each), all twelve tiles of a 1440p frame in one group (sixteen tile slots: the same), the output passes on 32-wide
+waves (0.67 -> 0.82 ms) and unrolled head / branch loops in the 160-channel stages (+10 - 20 us each). Per stage
+(us): enc0 772, enc1 266, enc2 137, dec1_0 246, dec1_1 208, dec0_0 405, dec0_1 623, levels 3 - 5 (eight stages) 395,
+output 670 (post 490, down 180). Levels 4 and 5 have 15 - 77 windows for 64 compute units.
+Eight waves per window for those levels (each token tile's channel tiles split over two waves, the hidden layer's
+two tiles one each, the halves meeting in shared memory; byte-identical) does not pay: enc4 / dec4_0 / dec4_1 46 / 45 /
+36 -> 49 / 45 / 40 us, enc5 35 -> 31, level 3 64 - 66 -> 78 - 86. A workgroup stays on one compute unit, so the idle
+units stay idle and the extra waves only add the shared work and barriers.
+
 ### Presets D and E against a real NVIDIA card, and level 3 for them (2026-10-14)
 
 NVIDIA's own kernels for presets D and E were replayed on an RTX PRO 4500 Blackwell (drivers 595.91 and 580.178: the
@@ -556,3 +615,228 @@ was measured and not built for D / E (`build/rr/f/nv/dstage.sh`, `dnl.sh`, level
   loads between a window's waves) decoder 0 takes the same time (803-818 us), encoder 1 the same, decoder 1 10% less.
   These windows also have 96 key tokens (3 KiB each for the tokens, the keys and the values at C = 32), which does
   not fit the 4 KiB a single wave can hold at full rate.
+
+### Byte-identical speed-ups (2026-10-19)
+
+RX 9070, RADV 26.2.2, 1280x720 -> 2560x1440 with `D4R_ENGINE_RR_STAGE_STAMPS=1`. Every image of every frame is
+byte-identical to the previous model on the replay and stress inputs, at levels 0 to 3.
+
+- `ptx2rr.py`: OCML's tanh (decoder 0's second kernel) in f32 where f64 was not needed. Exp's error term becomes
+  Dekker's exact product error; the polynomial below 0.625 stays in f64, because the driver folds away the f32
+  rounding between its f64 steps. Identical to the previous function on all 2^32 inputs. dec0_1 475 -> 446 us, frame
+  3.568 -> 3.537 ms.
+- `exposure_f.comp` PASS 2: the exposure in one pass as NGX does it, each block adding its fixed-point sum to a 64-bit
+  total with an atomic add and the last block finishing. It needs `shaderBufferInt64Atomics`, which vkd3d-proton
+  enables; the shim reads the device's features through `GetDeviceFeatures`. Without it, or with a model that has no
+  `exposure_f2.spv`, the two passes run (`D4R_RR_TEST_NO_INT64_ATOMICS=1` forces them). Exposure 25.2 -> 14.9 us.
+
+### Opt-in builds that became defaults (2026-10-20)
+
+Against the previous default build, presented image, RGB, peak 1, 1280x720 -> 1440p. For scale, the exact build
+(`D4R_RR_RELAXED=0 D4R_RR2_POOLED=rgba32f`) is 43.0 - 44.4 dB from that build.
+
+- Unguarded translated code (the default at level 3 since 2026-10-20; `D4R_RR2_UNGUARDED=0` keeps the guards):
+  encoder 0's and decoder 0's per-pixel parts and the output
+  passes without their exactness guards: no `precise`, no opaque zero on binary16 stores, no `spv_exact_convert.py`.
+  56.0 dB on the reset frame, then 43.0 - 45.6 dB, as far from the exact build as the previous default was. Frame
+  3.526 -> 3.501 ms.
+- `D4R_RR2_POOLED=rgb10_a2` (since 2026-10-13, the default since 2026-10-20; `rgba32f` builds the reference form):
+  the pooled histories as UNORM 10:10:10:2 images, 31 MB less at 1440p.
+  Identical at 1280x720 -> 1440p and on reset frames; 43.7 - 47.2 dB on the history frames at 1114x626 -> 1080p and
+  28.8 dB with random motion. Frame 3.526 -> 3.484 ms, 3.456 with the unguarded code as well.
+
+### Byte-identical speed-ups (2026-10-20)
+
+RX 9070, RADV 26.2.2 with the ACO `v_mad_u32_u16` patch, 1280x720 -> 2560x1440 game-like input, median of 6
+interleaved runs. Every image of every frame is byte-identical to the previous model on the replay, odd-size, 540p,
+stress and game-like inputs, at levels 0 and 3 and in the `D4R_RR2_UNGUARDED=1 D4R_RR2_POOLED=rgb10_a2` build.
+
+| Change | Stages (us) | Frame (ms) |
+|---|---|---|
+| `rr_exact.glsl` Q8PAIRS, `rr2_w.comp`: the pair widened into a variable, so binary16 pairs also reach the hardware saturation | dec0_0 372 -> 334, enc0 717 -> 695 | 3.549 -> 3.487 |
+| `rr2_m.comp` KIND 2: x computed once per lane, FP8 decodes and binary16 multiply-adds in pairs | dec1_0 223 -> 203, dec2_0 118 -> 108, dec3_0 62 -> 55, dec4_0 43 -> 39 | 3.487 -> 3.442 |
+| `rr2_m.comp` merge: a wave's channel tiles side by side, sharing each step's loads | enc1 236 -> 228, enc2 123 -> 112, enc3 68 -> 61, enc4 44 -> 40 | 3.442 -> 3.413 |
+| `rr2_m.comp` residual step: FP8 decodes and conversions in pairs | dec0_1 436 -> 430 | 3.413 -> 3.401 |
+| `rr2_pack.py` float32 copies of the biases (tables as column-major tiles), read by both block shaders | dec0_1 430 -> 412, dec1_1 184 -> 171, enc1 227 -> 218, dec1_0 202 -> 194 | 3.401 -> 3.329 |
+
+The build that is now the default: 3.455 -> 3.215 ms, and 3.188 with encoder 0's gather as a pass of its own, which
+the unguarded default selects (`compile_rr2.py`; encoder 0 650 -> 623 us, the same images; in the guarded build
+the two are equally fast).
+
+Tried, no gain: the translated code's texel fetch without its branch (enc0 within noise); the next MLP branch's
+weights or biases prefetched (into L2, or into registers one branch ahead); two MLP branches per loop iteration; V^T
+kept in registers in `rr2_w.comp`; weight loads through buffer device addresses. Not done: decoder 0's second kernel
+on one wave, whose tail would need r and the MLP sum in 8 KiB of shared memory per wave (done later the same day,
+below, by handing them over in two halves).
+
+### Byte-identical speed-ups (2026-10-20, later)
+
+Same setup as above (and the RADV buffer-offset pass), opt-in build (`D4R_RR2_UNGUARDED=1 D4R_RR2_POOLED=rgb10_a2`),
+`D4R_RR_TEST_ROBUST2=1`. Every image of every frame is byte-identical to the previous model on the replay, odd-size,
+540p, stress and game-like inputs, with and without `D4R_RR_TEST_ROBUST2=1`: preset F at levels 0 and 3 and in the
+opt-in build, presets D and E at levels 0 and 3 (they share the translated code), and the RDNA3 builds of D and E
+(`D4R_RR_GFX11=1`, run on the RX 9070).
+
+| Change | Stages (us) | Frame (ms) |
+|---|---|---|
+| `ptx2rr.py` fetch0: with `robustImageAccess2` the translated stages' texel fetches skip their bounds test | enc0 616 -> 600, output passes 607 -> 590 | 3.111 -> 3.082 |
+| `rr2_w.comp` KIND 5: decoder 0's second kernel on one wave (opt-in build only, see below) | dec0_1 393 -> 374 | 3.081 -> 3.062 |
+| `rr2_m.comp`, `rr2_w.comp`: FP8 pairs decoded as halves of `unpack8`, without byte permutes | dec0_0 324 -> 316, dec1_0 183 -> 181 | 3.057 -> 3.041 |
+| `rr2_m.comp`: the stage's output tokens converted two at a time | dec1_1 160 -> 156, enc1 213 -> 211 | 3.049 -> 3.029 |
+| `ptx2rr.py`: 64-bit address arithmetic in 32 bits where only the low 32 bits are used | output passes 592 -> 575 | 3.035 -> 3.014 |
+
+The steps above were measured one after another before the RDNA2 preset E / F change was merged. All of it, against
+models built from the branch these changes sit on, 6 interleaved runs: opt-in build 3.128 -> 3.024 ms, default build
+3.256 -> 3.147, exact build 4.080 -> 4.004 (4 runs); presets D / E at level 3 3.383 -> 3.320 / 3.390 -> 3.287.
+
+- The fetch: the reference reads an integer texel outside the image as zero. With `robustImageAccess2` the image load
+  already returns zero there, except for a w component the format lacks, which comes back as one. The runtime sets
+  specialization constant 0 (`RR_ROBUST_IMAGES`) when the device has the feature enabled: the shim reads it from
+  vkd3d-proton's device features (vkd3d-proton requires robustness2; the shim logs `robustImageAccess2 enabled`),
+  `d4r-rr` with `D4R_RR_TEST_ROBUST2=1`. Otherwise, and with models built before this change, nothing changes.
+- Decoder 0's second kernel on one wave hands r and the MLP sum to the translated tail through 4 KiB of shared
+  memory, half the window's tokens at a time. Only the opt-in build uses it: in the guarded build the tail's `kc[2]`
+  comes out as a NaN of the other sign on the stress inputs, because the sign of a product of two NaNs follows the
+  operand order the compiler picks (`ACO_DEBUG=nosched` alone flips it there). `D4R_RR2_ONE_WAVE_DEC0_1=1` / `0`
+  forces either.
+- Presets D and E at level 3 show the same on the stress inputs: with `ACO_DEBUG=nosched` alone 102 and 100 of 186
+  images change at 720p, and every value that differs is a NaN on both sides, with the other sign. Comparisons that
+  change the compiler or driver therefore hash those images with every NaN replaced by one canonical NaN (0 of 186
+  then differ); the comparisons above are identical without it.
+
+Tried, no gain: the output passes as wave32 (post 112 us slower); r of half the token slices kept in shared memory
+during the MLP, for fewer registers (same time); the image size read once per texture in the gather instead of per
+fetch (within noise); a driver without the RDNA4 hazard waits for SGPRs read by the VALU saves 2 - 4 us per
+translated stage, so avoiding them is not worth much. Not done: the output filter's refinement loop runs until the
+slowest lane of a wave converges; regrouping pixels by iteration count would save an estimated 25 us.
+
+### Where the time of the top stages goes, and the encoder-0 order (2026-10-20, evening)
+
+Same setup (RX 9070, RADV 26.2.2 with the round-5b GL2 change, 1280x720 -> 2560x1440 game-like input, opt-in
+build, `D4R_RR_TEST_ROBUST2=1`, median of 3 - 6 interleaved runs). Before writing more peepholes, each of the top
+stages was timed with stub variants of its shader: stores behind an opaque false, texel fetches or arena reads
+replaced by cheap arithmetic, every weight tile read from one hot 4 KiB (distinct loads, no CSE), the cubic table
+lookups replaced by the value, one head / no MLP branches, extra shared memory to cut the waves per SIMD, the
+shader returning at once. The variants' outputs are wrong, so only the stage's own time counts, and only for stages
+without data-dependent loops (the native blocks, the gather, the decoder tail; not post and down, whose refinement
+loops run longer or shorter with the data they get, see below).
+
+| Stage (us) | Without stores | Without arena / fetches | Weights hot | Without cubic lookups | Half the waves per SIMD | Everything but the arithmetic removed |
+|---|---|---|---|---|---|---|
+| dec0_1 369 | 366 | 337 (tokens) | 344 | 332 | 484 (4 waves) / 882 (2) | 308 |
+| dec0_0 317 | 315 | 308 | 308 | 285 | - | 282 |
+| enc0 block ~339 | ~317 | ~242 (the gather's record) | ~318 | ~308 | +118 (3 waves) | ~215 |
+| enc0 gather ~255 | ~208 | ~161 (fetches) | - | - | +334 (2 waves) | ~150 |
+
+So decoder 0's two kernels and encoder 0's block are bound by their own VALU and WMMA issue (83 - 89% of their time
+is left with every memory access removed; a WMMA 16x16x16 FP8 costs about 16 cycles of the SIMD on this GPU, a
+quarter of the block's instruction time), and lose about a third more with half the waves: more waves would help,
+but shared memory (4 KiB a wave, 32 KiB a SIMD) and 192 - 240 registers cap them at 6 - 8. The gather is VALU and
+SALU issue plus its fetches. The record encoder 0's block reads (73 MB a frame, written by the gather just before)
+is the one stage that reads from DRAM: the block's windows now run in the reverse of the gather's dispatch order
+(`gen_rr2_enc0.py --split block`), so that the records written last are read first while they are still in the
+64 MB last-level cache: encoder 0 597 -> 576 us, frame 2.985 -> 2.961 ms (6 interleaved runs). The levels' kernels are unchanged in what
+they compute; every image of every frame is byte-identical to the previous model on the 7 input sets, with and
+without `D4R_RR_TEST_ROBUST2=1`, for the opt-in, default and exact builds (presets D and E do not use this
+generator; their models are file-identical).
+
+The deep levels (3 - 5, 274 us in 7 dispatches) are not latency-bound in the way assumed: a dispatch of an empty
+shader costs 1 us, and a window's four waves run on one CU with nothing else to do, so level 5's 24 windows use 24
+of 64 CUs at full tilt (its time is the same at 540p, 720p and 1080p). The output filter (post, ~400 us) is where
+the data matters: its refinement loop runs until a wave's slowest lane converges, and a stub that changes the
+half-size history it reads next frame changes its time by up to 100 us, which looked like a store cost until the
+same stores to a buffer, copied to the image by a pass of their own, cost exactly as much once the history was
+right.
+
+Tried, no gain (all byte-identical where they ran): the cubic numerator computed in packed binary16 arithmetic
+instead of looked up (identical on all 65536 inputs; dec0_1 +7 us, dec0_0 +3, enc0 +9: the gathers hit the L0
+cache); the deep levels with their heads and MLP branches on 2 - 4 groups of waves, folded in order through shared
+memory (enc3 55 -> 77 / 103 us: one workgroup stays on one CU); 2 - 4 windows per workgroup for the same reason
+(enc5 29 -> 102 us); the half-size history stored to the arena by the filter and written to its image by a copy
+pass (+23 us for the pass, the filter unchanged); encoder 0's gather and block in 4 - 32 bands of rows with the
+block of a band next to the gather of the next (-15 us with 4 bands, worse beyond: each band's barrier drains the
+GPU); encoder 0 fused into one shader again (607 us against 575). Decoder 0's two kernels in reverse order gain
+nothing (their tokens are still cached).
+
+### The deep stages, and windows split over several workgroups (2026-10-20, night)
+
+The card measured since 2026-10-18 is an RX 9070 (56 compute units). Same setup
+as above, opt-in build. Each window of levels 3 - 5 was timed with the shader clock (start and end per workgroup):
+
+- Between two stages the GPU idles 0.6 - 0.7 us; the barrier is not what costs time. Level 4 and 5 stages start all
+  their windows within 0.4 us, and every window takes 28 - 35 us, so such a stage lasts one window. Inside one (enc5):
+  input 0.8 us, attention 12.8 (eight heads), MLP 16.9 (20 branches); each head's and each branch's loop iteration
+  waits for its weight tiles, with two waves per SIMD and nothing else to hide that.
+- Level 3 has more windows than fit at once (252 for 224 places in enc3 and dec3_1, 240 for 168 in dec3_0), so each
+  of its stages ends with a second, mostly empty round.
+
+One dispatch for levels 3 - 5 with per-window completion counters (a window starts as soon as the windows it reads
+are done) would recover at most 33 us of their 281 (the measured window times replayed with every dependency and
+unlimited compute units), nearly all of it in the level-3 decoders, and it would also need its own arena regions
+(enc4 writes its merge into encoder 3's input region). Not built.
+
+What is built: a stage with fewer windows than the GPU has compute units runs in four dispatches, so that a window's
+heads and MLP branches run on as many workgroups (`rr2_m.comp` `RR2_PHASE`): 1 one head per workgroup, 2 the heads'
+out-projections in head order and r, 3 one MLP branch per workgroup, 4 the up-projections in branch order and the
+rest of the stage. The values handed over are what the whole shader already keeps (Ob, Nb and Hb as FP8 tiles, r as
+it is), through a record per window placed in the arena past the network's regions, so every window computes exactly
+the same values. Phases 2 and 4 load the next head's or branch's tiles while the current one's products run.
+`compile_rr2.py` builds the phases for enc3, enc4, enc5, dec4_1 and dec3_1 (a `phases` line in `rr.txt`;
+`D4R_RR2_PHASES=0` builds none); the runtime uses them for a stage with at most 48 windows (`D4R_RR2_SPLIT_WINDOWS`,
+0 for never). Older runtimes ignore the lines.
+
+| Render size | Stages in phases | Stage times (us) | Frame (ms) |
+|---|---|---|---|
+| 1280x720 | enc5 | enc5 29 -> 19 | 2.954 -> 2.947 |
+| 960x540 | enc4, enc5, dec4_1 | enc5 29 -> 17, enc4 31 -> 28, dec4_1 29 -> 23 | 1.721 -> 1.705 |
+| 1920x1080 | enc5 | enc5 28 -> 23 | within noise |
+
+Every image of every frame is byte-identical to the previous build on the 7 input sets and at 1280x720 -> 3840x2160,
+opt-in, default and exact builds, with and without `D4R_RR_TEST_ROBUST2=1`, and with every stage in phases
+(`D4R_RR2_SPLIT_WINDOWS=100000`); the single-stage shaders are unchanged files. Branch 1's Hb handed to branch 0 changes
+53 of 90 images.
+
+Tried, no gain: phases at 1280x720 for the stages with 66 - 77 windows (enc4 33 -> 38 us, dec4_1 29 -> 32, level 3
+much slower: the extra workgroups only add work there); the next branch's tiles loaded early in the single shader,
+with r kept in the arena meanwhile (enc5 29 -> 24, every other deep stage 2 - 9 us slower); WGP mode, which RADV
+uses only for shaders without shared memory, forced on every stage in a scratch driver (frame 2.955 -> 3.256 ms).
+
+### What the output filter's refinement steps cost (2026-10-20, night)
+
+The output filter alone (`D4R_ENGINE_RR_SKIP=down,pooled`) takes 384 us at 1280x720 -> 1440p and 844 us at 4K. Its
+translated code has no loop besides NGX's progress-counter wait (skipped here): what was called its refinement loop
+is a cascade of up to four steps per row of a pixel pair, each five bilinear history samples, written out twice.
+Counting active lanes on the game-like input, step 1 runs in 86% of the waves with 64% of their lanes, step 2 97% /
+59%, step 3 93% / 56%, step 4 30% / 15%; on the stress input every step runs with about 95% of the lanes. Without
+steps 2 - 4 (wrong images) the filter takes 336 / 742 us, so their idle lanes cost at most about 20 / 45 us: that is
+all that regrouping pixels by step count could recover, and the rest is per-pixel arithmetic that a native rewrite
+would have to repeat to stay exact (1564 VALU and 44 samples per 64-wide wave, of which the steps are 40 samples).
+Not rewritten.
+
+### AMD's own Windows driver (LLPC) and preset F (2026-10-30)
+
+Presets D and E run on AMD's Windows driver unchanged. Preset F did not: `d4r-rr` died with 0xC0000005 inside
+`amdvlk64.dll` while compiling `enc0.spv` and `dec0_1.spv` (found with `D4R_TRACE_STAGES=1`, which prints each shader
+before the driver compiles it; every other stage of the model compiles). The two are the stages that carry translated
+code around a native block (`gen_rr2_enc0.py`); the pure native ones (`rr2_m.comp`, `rr2_w.comp`) and the pure
+translations compile, so it is neither the FP8 cooperative matrices nor the code size alone, and
+`VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` does not avoid it either. The same module through SPIRV-Tools' `-O`
+compiles: `compile_rr2.py` now writes `enc0_llpc.spv` and `dec0_1_llpc.spv` next to the originals, and
+`runtime_rr2.inc` loads those when the physical device reports `VK_DRIVER_ID_AMD_PROPRIETARY` and only then: RADV
+keeps the model's own shaders, byte for byte. The variant's images are the ones the originals produce (55.3 dB
+against the DXIL reference on the 1440p input, presented image, peak over the reference's range, three frames).
+
+On that driver the network stages the model has HIP kernels for (`hip/rr2_*.hsaco`: enc1 - dec0_0, what vkhip
+replaces) are also no longer compiled at model load: a stage recorder that claims one of them means the Vulkan
+pipeline is never built, and an engine that runs them here builds them on the first frame that dispatches them
+(`R2Model::ensureStage`). With vkhip, preset F compiles 10 shaders instead of 24.
+
+RX 9070 XT, Windows 11, AMD's driver 26.10.1 (LLPC; `driverVersion` 2.0.416), 1280x720 -> 1440p,
+`D4R_RR_TIME_REPEAT=5`, median of 140 frames:
+
+| route | ms | against the DXIL network, dB |
+|---|---|---|
+| preset F, Vulkan network | 4.76 | 55.3 |
+| preset F, vkhip network | 3.92 | 55.3 |
+| preset D, Vulkan / vkhip | 5.25 / 4.09 | 52.8 (Vulkan, 1 frame) |
+| preset E, Vulkan / vkhip | 4.97 / 3.78 | — |

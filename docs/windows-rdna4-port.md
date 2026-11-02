@@ -19,7 +19,7 @@ explicit limits; the validated package keeps conservative arithmetic.
 
 ## Milestone and gates
 
-2026-10-03 upstream Windows refresh: imported ayo's `e7e5c44` (LF patch
+2026-10-03 upstream Windows refresh: imported upstream `e7e5c44` (LF patch
 attributes) and `54c201a` (drag-in installation / per-game `d4r.ini`) while
 preserving their authorship. The target-independent NGX loader selects the
 shim using the game's D3D12/HIP LUID. Player mode derives paths and the
@@ -1429,8 +1429,8 @@ Reproduce the actual K layer gate without editing sources:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-k-captures.ps1 `
-  -CaptureDirectory C:\Users\Administrator\d4r\test-results\ngx-k-fp16-fenced-capture\replay `
-  -DlssDll C:\Users\Administrator\d4r\nvngx_dlss.dll
+  -CaptureDirectory <repo>\test-results\ngx-k-fp16-fenced-capture\replay `
+  -DlssDll <repo>\nvngx_dlss.dll
 ```
 
 This is CUDA NGX validation with synthetic image inputs and actual local DLSS
@@ -1560,7 +1560,7 @@ Example focused diagnostic (after the full foundational checks), using the
 user's local DLLs:
 
 ```powershell
-powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxOnly -NgxMode evaluate -Preset 5 -Iterations 4 -NgxCore C:\Users\Administrator\d4r\_nvngx.dll -DlssDll C:\Users\Administrator\d4r\nvngx_dlss.dll
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxOnly -NgxMode evaluate -Preset 5 -Iterations 4 -NgxCore <repo>\_nvngx.dll -DlssDll <repo>\nvngx_dlss.dll
 ```
 
 `-NgxOnly` is for iterative NGX debugging; its summary explicitly says that
@@ -1777,7 +1777,7 @@ the runtime bug. It is expected to return failure at the lifetime gate.
 One command adds the local NGX initialization gate after eight diagnostics:
 
 ```powershell
-powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "C:/Users/Administrator/d4r/_nvngx.dll" -DlssDll "C:/Users/Administrator/d4r/dlss/nvngx_dlss.dll"
+powershell -NoProfile -File scripts/windows/test-windows-rdna4.ps1 -RuntimeProfile therock -NgxCore "<repo>/_nvngx.dll" -DlssDll "<repo>/dlss/nvngx_dlss.dll"
 ```
 
 Success with the two local NGX DLLs requires all eleven tests, including both `PASS K_REFERENCE` checks and

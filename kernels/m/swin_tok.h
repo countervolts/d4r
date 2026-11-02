@@ -1,4 +1,10 @@
-// Token-lane rrlite Swin block for RDNA4 native FP8 (SWIN_A8), selected with SWIN_TOKEN_LANES.
+// Token-lane rrlite Swin block: RDNA4 native FP8 (SWIN_A8), or experimental
+// RDNA3 FP16 WMMA (SWIN_GFX11_TOKEN), selected with SWIN_TOKEN_LANES.
+// L texture tails also use SWIN_GFX11_SCALED: prepared scaled-half operands
+// and permuted A rows avoid per-MMA accumulator shuffles on RDNA3.
+// SWIN_AMD_* options intentionally change arithmetic under a final-reference
+// PSNR budget (docs/l-amd-quality.md); the equivalence notes below describe the
+// default arithmetic/layout rather than those optional approximations.
 //
 // swin_block.h computes every GEMM as activations x weights: the result has lane = channel column and
 // VGPR = token row, so each result is transposed through LDS (byte stores, barriers) before it can be the
@@ -9,7 +15,8 @@
 // roles swapped: bit-identical on an RX 9070 XT for the FP8 and the f16 WMMA).
 //
 // One wave owns one 4x4 window (16 tokens) for the whole block: norms, attention and the MLP need no LDS
-// and no barriers. Only the patch expand (decoders) and the patch merge (encoders) cross windows and go
+// and no barriers. gfx11 duplicates operands and exchanges row fragments in
+// registers. Only patch expand (decoders) and patch merge (encoders) cross windows and go
 // through an e4m3 byte image in LDS.
 //
 // A half-wave owns the channels whose bit 2 equals the half (dword 4 t + 2 g + half of tile t, g = 0, 1):
@@ -22,6 +29,149 @@
 // C inside the first WMMA as that lowering does) accumulates in f32 exactly as ZLUDA's compile of the PTX
 // does, including the rare sums that are not exact in f32 (../tex/enc0l_tail.hip).
 #pragma once
+
+#if defined(SWIN_GFX11_TOKEN) || (defined(SWIN_GFX11_ROW) && !defined(D4R_FP8_WMMA))
+#define SWIN_TOK_WIDE_WEIGHTS
+#endif
+
+#if defined(SWIN_RES32) && (!defined(SWIN_CODES_F32) || defined(SWIN_TOK_WIDE_WEIGHTS) || defined(SWIN_EXACT))
+#error "SWIN_RES32 requires relaxed gfx12 FP8 f32 accumulators"
+#endif
+#if defined(SWIN_TOK_BUFFER_DIRECT) && !defined(SWIN_TOK_BUFFER_WEIGHTS)
+#error "SWIN_TOK_BUFFER_DIRECT requires SWIN_TOK_BUFFER_WEIGHTS"
+#endif
+#if defined(SWIN_AMD_SOFTMAX) || defined(SWIN_AMD_PV8) || defined(SWIN_AMD_GELU) || defined(SWIN_AMD_SAT8)
+#if !defined(SWIN_CODES_F32) || defined(SWIN_TOK_WIDE_WEIGHTS) || defined(SWIN_EXACT)
+#error "AMD quality-budget arithmetic requires relaxed gfx12 native FP8"
+#endif
+#endif
+#ifdef SWIN_AMD_SAT8
+// This also changes binary16 overflow to finite saturation, so validate final
+// temporal PSNR. The mode is local to the wave executing this kernel.
+#define SWIN_AMD_INIT() __builtin_amdgcn_s_setreg(1 | (23 << 6), 1)
+#else
+#define SWIN_AMD_INIT() ((void)0)
+#endif
+#ifndef SWIN_AMD_GELU_SLOPE
+#define SWIN_AMD_GELU_SLOPE 0.28125f
+#endif
+
+#if defined(SWIN_GFX11_TOKEN) || defined(SWIN_GFX11_ROW)
+__device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
+{
+    return pack_codes(direct_codes8x2(a), direct_codes8x2(b));
+}
+#endif
+
+#ifdef SWIN_GFX11_SCALED
+#define TOK_SHIM_OPERAND wm_shim_operand_zluda
+#else
+#define TOK_SHIM_OPERAND wm_shim_operand
+#endif
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+using tok_weight = h16;
+__device__ __forceinline__ f8v tok_acc_load(const T16& acc)
+{
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_F32ACC)
+    return acc.f;
+#else
+    f8v c;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#ifdef SWIN_GFX11_ROW
+        c[i] = (float)acc.get(i);
+#else
+        c[i] = (float)acc.v[i / 2][i & 1];
+#endif
+    return c;
+#endif
+}
+__device__ __forceinline__ void tok_acc_store(T16& acc, f8v c)
+{
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_F32ACC)
+    acc.f = c;
+#else
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#ifdef SWIN_GFX11_ROW
+        acc.set(i, (half_t)c[i]);
+#else
+        acc.v[i / 2][i & 1] = (half_t)c[i];
+#endif
+#endif
+}
+// Prepared weights already contain the complete, duplicated gfx11 operand.
+// Load it directly instead of loading half and broadcasting it on every MMA.
+__device__ __forceinline__ void tok_weight_k32(T16& acc, h16 a0, gop b0, h16 a1, gop b1)
+{
+    f8v c = tok_acc_load(acc);
+#ifdef SWIN_GFX11_SCALED
+    c *= 0x1p-16f;
+#endif
+    c = wm_mma11(__builtin_bit_cast(wm_u8v, a0), TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, b0)), c);
+    c = wm_mma11(__builtin_bit_cast(wm_u8v, a1), TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, b1)), c);
+    tok_acc_store(acc, c
+#ifdef SWIN_GFX11_SCALED
+        * 0x1p16f
+#endif
+    );
+}
+__device__ __forceinline__ void tok_weight_k32(T16& acc, gop a0, h16 b0, gop a1, h16 b1)
+{
+    // Multiplication is commutative per product; swapping operand roles
+    // transposes the result, so retain the original roles here.
+    f8v c = tok_acc_load(acc);
+#ifdef SWIN_GFX11_SCALED
+    c *= 0x1p-16f;
+#endif
+    c = wm_mma11(TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, a0)), __builtin_bit_cast(wm_u8v, b0), c);
+    c = wm_mma11(TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, a1)), __builtin_bit_cast(wm_u8v, b1), c);
+    tok_acc_store(acc, c
+#ifdef SWIN_GFX11_SCALED
+        * 0x1p16f
+#endif
+    );
+}
+#else
+using tok_weight = gop;
+#define tok_weight_k32 k32
+#endif
+
+#ifdef SWIN_L_BUFFER_WEIGHTS
+// The gfx11 L weight image has complete 32-byte operands. Keep the tile offset
+// uniform and the lane offset in the buffer instruction, reducing address VGPRs.
+__device__ __forceinline__ tok_weight tok_weight_image(const tok_weight* wl, int idx, int l16)
+{
+    static_assert(sizeof(tok_weight) == 32, "buffer weights require complete gfx11 operands");
+    const int tile = __builtin_amdgcn_readfirstlane(idx);
+    const __amdgpu_buffer_rsrc_t res = __builtin_amdgcn_make_buffer_rsrc((void*)(wl - l16), (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t vo = (uint32_t)l16 * 32u, so = (uint32_t)tile * 32u;
+    const u4v_t a = __builtin_amdgcn_raw_buffer_load_b128(res, vo, so, 0);
+    const u4v_t b = __builtin_amdgcn_raw_buffer_load_b128(res, vo + 16, so, 0);
+    return __builtin_bit_cast(tok_weight, (wm_u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
+}
+#endif
+
+#ifdef SWIN_TOK_BUFFER_WEIGHTS
+#if !defined(SWIN_A8) || defined(SWIN_TOK_WIDE_WEIGHTS)
+#error "SWIN_TOK_BUFFER_WEIGHTS requires gfx12 native FP8 operands"
+#endif
+// The prepared operand bytes are unchanged. Separate the lane's fixed byte
+// offset from the uniform tile offset instead of forming a 64-bit VGPR address
+// for every weight load.
+__device__ __forceinline__ tok_weight tok_weight_buffer(const tok_weight* wl, int idx, int l16)
+{
+    static_assert(sizeof(tok_weight) == 8, "gfx12 FP8 operand");
+    const unsigned lane_slot = 2u * l16 + (threadIdx.x >> 4);
+    const uint64_t base = (uint64_t)(wl - lane_slot);
+    const uint64_t uniform_base = (uint64_t)__builtin_amdgcn_readfirstlane((uint32_t)base) |
+        ((uint64_t)__builtin_amdgcn_readfirstlane((uint32_t)(base >> 32)) << 32);
+    const __amdgpu_buffer_rsrc_t resource = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)uniform_base, (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t offset = __builtin_amdgcn_readfirstlane(idx) * 8u;
+    return __builtin_bit_cast(tok_weight, __builtin_amdgcn_raw_buffer_load_b64(resource, lane_slot * 8u, offset, 0));
+}
+#endif
 
 enum : int { TOK_ID, TOK_PI, TOK_X, TOK_NU, TOK_PE };
 // A GEMM's weight tiles as in GemmDesc (slot dst + ((kc * 2 + s) * NT + nt) * 16 + r holds the 16 K slots of
@@ -154,7 +304,8 @@ template <int C, int NH, int NPM, int CIN> constexpr TokTables<C, NH, NPM, CIN> 
     return r;
 }
 
-__device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16, const TokDesc* descs, int ndesc, int idx)
+__device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16, const TokDesc* descs, int ndesc, int idx,
+                                                   u4v_t* raw = nullptr)
 {
     int d = 0;
     while (d + 1 < ndesc && idx >= descs[d + 1].dst)
@@ -163,7 +314,12 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
     const int local = idx - g.dst;
     if (local >= g.KC * 2 * g.NT * 16)
         return;
-    const int r = local & 15, rest = local >> 4;
+    const int physical_r = local & 15, rest = local >> 4;
+#ifdef SWIN_GFX11_ROW
+    const int r = (physical_r >> 1) + 8 * (physical_r & 1);
+#else
+    const int r = physical_r;
+#endif
     const int nt = rest % g.NT, s = (rest / g.NT) & 1, kc = rest / g.NT / 2;
     int n = 16 * nt + r, base = g.base;
     if (g.perm == TOK_PI)
@@ -188,7 +344,33 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
             word |= (uint32_t)w[woff(base, g.Ks, g.Ns, 32 * kc + tok_kslot(s, 4 * j + b), n)] << (8 * b);
         v[j] = word;
     }
+#ifdef SWIN_PREP_CONTENT_CACHE
+    const u4v_t old = raw[idx];
+    if (old[0] == v[0] && old[1] == v[1] && old[2] == v[2] && old[3] == v[3])
+        return;
+    raw[idx] = v;
+#endif
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+    h16 expanded;
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+    {
+        const uint32_t code = (v[j / 4] >> (8 * (j % 4))) & 255u;
+#ifdef SWIN_GFX11_SCALED
+        const uint32_t magnitude = (code & 127u) | (((code & 127u) + 1u) & 128u);
+        expanded[j] = __builtin_bit_cast(half_t, (uint16_t)((magnitude << 7) | ((code & 128u) << 8)));
+#else
+        expanded[j] = e4m3_to_half(code);
+#endif
+    }
+#ifdef SWIN_GFX11_SCALED
+    // Match ZLUDA's physical dword order after scaled FP8 widening.
+    expanded = __builtin_shufflevector(expanded, expanded, 0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15);
+#endif
+    w16[idx] = expanded;
+#else
     w16[idx] = v;
+#endif
 }
 
 __device__ __forceinline__ void expand_tok_consts(const uint8_t* w, h8* c16, const TokConst* cs, int ncs, int idx)
@@ -227,16 +409,83 @@ typedef float tok_f2v __attribute__((ext_vector_type(2)));
 // two f32 -> f16 (round to nearest even) packed into one register
 __device__ __forceinline__ hv2 tok_pk16(float a, float b)
 {
-    return (hv2){(half_t)a, (half_t)b};
+    return pk16_f32(a, b);
 }
+
+__device__ __forceinline__ h4 tok_decode4(uint32_t bytes)
+{
+    h4 r = decode4(bytes);
+#if defined(SWIN_GFX11_SCALED)
+    typedef uint16_t u4s __attribute__((ext_vector_type(4)));
+    u4s bits = __builtin_bit_cast(u4s, r);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        if (((bytes >> (8 * i)) & 127u) == 127u) bits[i] = (bits[i] & 0x8000u) | 0x7fffu;
+    r = __builtin_bit_cast(h4, bits);
+#endif
+    return r;
+}
+__device__ __forceinline__ gop tok_scaled_operand(gop r)
+{
+#ifdef SWIN_GFX11_SCALED
+    // The operand quantizer already canonicalizes NaNs as FP8 encode/widen
+    // does. Every finite value scales exactly, including half subnormals.
+    return r * (half_t)0x1p-8f;
+#else
+    return r;
+#endif
+}
+
+#ifdef SWIN_GFX11_SCALED
+__device__ __forceinline__ h4 tok_scaled4(uint32_t bytes)
+{
+    uint32_t m = bytes & 0x7f7f7f7fu, sign = bytes & 0x80808080u;
+    m |= (m + 0x01010101u) & 0x80808080u;
+    const uint32_t lo = (__builtin_amdgcn_perm(0u,m,0x0c010c00u)<<7) |
+                        __builtin_amdgcn_perm(0u,sign,0x010c000cu);
+    const uint32_t hi = (__builtin_amdgcn_perm(0u,m,0x0c030c02u)<<7) |
+                        __builtin_amdgcn_perm(0u,sign,0x030c020cu);
+    return __builtin_bit_cast(h4,(u2v){lo,hi});
+}
+__device__ __forceinline__ hv2 tok_quant_pair(hv2 v)
+{
+    // Reuse the existing NaN branch of the exact quantizer; no separate
+    // per-operand classification/select or FP8 pack/unpack is necessary.
+    return q8x2_exact<0x7f80>(v);
+}
+#else
+#define tok_quant_pair q8x2
+#endif
 
 // two e4m3 codes of a word (bytes 0, 1 or 2, 3) as f16. Equal to e4m3_to_half for every code except the NaN
 // codes 0x7f / 0xff, which the conversion decodes as NaN (e4m3_to_half: +-480). The FP8 WMMAs read the
 // same bytes with the hardware's decoding, and no encoder here stores those codes for a non-NaN value.
 template <bool UPPER> __device__ __forceinline__ hv2 tok_dec2(uint32_t word)
 {
+#if defined(SWIN_GFX11_TOKEN) || defined(SWIN_GFX11_ROW)
+    const h4 h = tok_decode4(word);
+    return UPPER ? (hv2){h[2], h[3]} : (hv2){h[0], h[1]};
+#else
     const tok_f2v f = __builtin_amdgcn_cvt_pk_f32_fp8((int)word, UPPER);
     return tok_pk16(f[0], f[1]);
+#endif
+}
+
+// Storage bytes and matrix operands are distinct on gfx11. Expand only at
+// memory boundaries; internal quantized values can stay in half registers.
+__device__ __forceinline__ gop tok_operand(uint32_t a, uint32_t b)
+{
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+#ifdef SWIN_GFX11_SCALED
+    const h4 lo = tok_scaled4(a), hi = tok_scaled4(b);
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+#else
+    const h4 lo = tok_decode4(a), hi = tok_decode4(b);
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+#endif
+#else
+    return (u2v){a, b};
+#endif
 }
 
 // the same lane of the other half-wave
@@ -244,6 +493,44 @@ __device__ __forceinline__ hv2 tok_other(hv2 v)
 {
     return __builtin_bit_cast(hv2, xor_lane<16>(__builtin_bit_cast(uint32_t, v)));
 }
+
+__device__ __forceinline__ gop tok_arow(gop v)
+{
+#ifdef SWIN_GFX11_ROW
+    typedef uint32_t words __attribute__((ext_vector_type(sizeof(gop) / 4)));
+    const words a = __builtin_bit_cast(words, v);
+    words b;
+    const uint32_t lane = wm_lane(), r = lane & 15u;
+    const uint32_t source = (lane & 16u) | (r >> 1u) | ((r & 1u) << 3u);
+#pragma unroll
+    for (int j = 0; j < sizeof(gop) / 4; ++j)
+        b[j] = __builtin_amdgcn_ds_bpermute(source * 4u, a[j]);
+    return __builtin_bit_cast(gop, b);
+#else
+    return v;
+#endif
+}
+
+#ifdef SWIN_GFX11_SCALED
+// The texture PTX packs Q's pair-order columns as (0,16,2,18,...) in
+// the first k16 and (8,24,10,26,...) in the second. Match both grouping
+// and slot order: summing the same products in another grouping changes
+// rare half ties after adding the position bias.
+__device__ __forceinline__ gop tok_qk_operand(gop q0, gop q1, int step)
+{
+    const u4v_t a = __builtin_bit_cast(u4v_t, q0), b = __builtin_bit_cast(u4v_t, q1);
+    u4v_t aa, bb;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const uint32_t ao = wm_other_half(a[j]), bo = wm_other_half(b[j]);
+        aa[j] = m_half() == step ? a[j] : ao;
+        bb[j] = m_half() == step ? b[j] : bo;
+    }
+    const int k = 2 * m_half();
+    return __builtin_bit_cast(gop, (u4v_t){aa[k], bb[k], aa[k+1], bb[k+1]});
+}
+#endif
 
 __device__ __forceinline__ T16 tok_t16(h8 c)
 {
@@ -255,19 +542,49 @@ __device__ __forceinline__ T16 tok_t16(h8 c)
 }
 
 // the two operands (WMMA s = 0, 1) of a k32 step from the code words [tile][g] of the chunk's two tiles
-__device__ __forceinline__ gop tok_k32_operand(const uint32_t (*c)[2], int s)
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+using tok_quad = h4;
+__device__ __forceinline__ tok_quad tok_quant4(hv2 a, hv2 b)
+{
+    a = tok_quant_pair(a);
+    b = tok_quant_pair(b);
+    return (h4){a[0], a[1], b[0], b[1]};
+}
+__device__ __forceinline__ gop tok_operand(h4 a, h4 b)
+{
+    return tok_scaled_operand(__builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7));
+}
+#else
+using tok_quad = uint32_t;
+__device__ __forceinline__ tok_quad tok_quant4(hv2 a, hv2 b) { return codes4(a, b); }
+#endif
+__device__ __forceinline__ gop tok_k32_operand(const tok_quad (*c)[2], int s)
 {
 #ifdef SWIN_TOK_NATURAL
-    return (u2v){c[s][0], c[s][1]};
+    return tok_operand(c[s][0], c[s][1]);
 #else
-    return (u2v){c[0][s], c[1][s]};
+    return tok_operand(c[0][s], c[1][s]);
 #endif
 }
 
 // e4m3 codes of a tile's 8 rows: this half's 8 K slots of an operand
 __device__ __forceinline__ gop tok_codes(const T16& t)
 {
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+    h8 r;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const hv2 q = tok_quant_pair(t.pair(k));
+        r[2 * k] = q[0];
+        r[2 * k + 1] = q[1];
+    }
+    return tok_scaled_operand(r);
+#elif defined(SWIN_CODES_F32)
+    return (u2v){codes4f(t.f[0], t.f[1], t.f[2], t.f[3]), codes4f(t.f[4], t.f[5], t.f[6], t.f[7])};
+#else
     return (u2v){codes4(t.pair(0), t.pair(1)), codes4(t.pair(2), t.pair(3))};
+#endif
 }
 
 // 1 / sqrt(sum of squares + eps) of a token's C values, with the summation tree of norm1 and norm2 of
@@ -321,14 +638,22 @@ template <int NT> __device__ __forceinline__ half_t tok_rsq(const hv2 (&v)[NT][4
 // and the weight image (row l16 of a tile, this half's 8 K slots). x2 (optional): the output before its e4m3
 // encoding, as f16 pairs like v.
 template <int C, int NH, int NPM, int CIN>
-__device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* const wl, const int l16, hv2 (&v)[C / 16][4],
+__device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* const cf, const tok_weight* const wl, const int l16, hv2 (&v)[C / 16][4],
                                               uint32_t (&co)[C / 16][2], hv2 (*x2)[4] = nullptr)
 {
     using K = TokLayout<C, NH, NPM, CIN>;
     constexpr int NT = C / 16, NKC = C / 32, NC = C / 8;
-    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[2 * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
+    constexpr int weight_stride = sizeof(wslot) / sizeof(tok_weight);
+#ifdef SWIN_L_BUFFER_WEIGHTS
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return tok_weight_image(wl, weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16), l16); };
+#elif defined(SWIN_TOK_BUFFER_WEIGHTS)
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return tok_weight_buffer(wl, weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16), l16); };
+#else
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
+#endif
 
     // residual of the output projection: f16(x0 + b_o)
+#ifndef SWIN_RES32
     hv2 res[NT][4];
 #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -338,20 +663,21 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
         for (int k = 0; k < 4; ++k)
             res[t][k] = v[t][k] + (hv2){bo[2 * k], bo[2 * k + 1]};
     }
+#endif
 
     // ------------------------------------------------ norm1: h1 codes, the K operands of Q and V
     gop hop[NKC][2];
     {
         const half_t rn = tok_rsq<NT>(v);
         const hv2 rn2 = {rn, rn};
-        uint32_t c1[NT][2];
+        tok_quad c1[NT][2];
 #pragma unroll
         for (int t = 0; t < NT; ++t)
         {
             const h8 g1 = ch[K::CG1 + 2 * t];
 #pragma unroll
             for (int g = 0; g < 2; ++g)
-                c1[t][g] = codes4(v[t][2 * g] * (hv2)(rn2 * (hv2){g1[4 * g], g1[4 * g + 1]}),
+                c1[t][g] = tok_quant4(v[t][2 * g] * (hv2)(rn2 * (hv2){g1[4 * g], g1[4 * g + 1]}),
                                   v[t][2 * g + 1] * (hv2)(rn2 * (hv2){g1[4 * g + 2], g1[4 * g + 3]}));
         }
 #pragma unroll
@@ -379,13 +705,34 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                k32(qt[nt], wt(K::qv(hd, 0), 2, kc, 0, nt), hop[kc][0], wt(K::qv(hd, 0), 2, kc, 1, nt), hop[kc][1]);
-                k32(vt[nt], hop[kc][0], wt(K::qv(hd, 1), 2, kc, 0, nt), hop[kc][1], wt(K::qv(hd, 1), 2, kc, 1, nt));
+                tok_weight_k32(qt[nt], wt(K::qv(hd, 0), 2, kc, 0, nt), hop[kc][0], wt(K::qv(hd, 0), 2, kc, 1, nt), hop[kc][1]);
+                tok_weight_k32(vt[nt], tok_arow(hop[kc][0]), wt(K::qv(hd, 1), 2, kc, 0, nt), tok_arow(hop[kc][1]), wt(K::qv(hd, 1), 2, kc, 1, nt));
             }
+#ifdef SWIN_GFX11_SCALED
+        const gop qraw0 = tok_codes(qt[0]), qraw1 = tok_codes(qt[1]);
+        const gop q0 = tok_qk_operand(qraw0, qraw1, 0), q1 = tok_qk_operand(qraw0, qraw1, 1);
+#else
         const gop q0 = tok_codes(qt[0]), q1 = tok_codes(qt[1]);
+#endif
         // S transposed: lane = query token, rows = key tokens
         T16 S = tok_t16(ch[K::CATT + 32 * hd + 2 * l16]);
-        k32(S, q0, q0, q1, q1);
+        k32(S, tok_arow(q0), q0, tok_arow(q1), q1);
+#ifdef SWIN_AMD_SOFTMAX
+        float prob[8], total = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            prob[i] = exp2f(fminf(fmaxf(S.f[i] * 0.510069723f, -16.0f), 16.0f));
+            total += prob[i];
+        }
+        const float other = __builtin_bit_cast(float, xor_lane<16>(__builtin_bit_cast(uint32_t, total)));
+        const float inv = 1.0f / (total + other);
+        hv2 pw[4];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) prob[i] *= inv;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) pw[k] = tok_pk16(prob[2 * k], prob[2 * k + 1]);
+#else
         const half_t cs = f16(0.0972222164273262f / 5.656854152679443f);
         const half_t cl = (half_t)0.55615234375f;
         const half_t p1 = f16(0.92730712890625f), p0 = (half_t)1.375f;
@@ -408,7 +755,8 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
 #pragma unroll
         for (int k = 0; k < 4; ++k)
             pw[k] = wg[k] * (hv2){rinv, rinv};
-#ifdef SWIN_PV_ZLUDA_ORDER
+#endif
+#if defined(SWIN_PV_ZLUDA_ORDER) && !defined(SWIN_AMD_PV8)
         // P V is the block's only product of two f16 operands: its f32 sum over the 16 keys is not exact, so the
         // rounded result depends on which K slot holds which key. Here the slots follow ZLUDA's lowering of
         // NVIDIA's m16n8k16 (dword j of half h = key pair (j & 1) * 4 + 2 h + (j >> 1)) instead of this
@@ -422,10 +770,25 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
         };
         zk(pw);
 #endif
+#ifdef SWIN_AMD_PV8
+#ifndef SWIN_AMD_SOFTMAX
+        float prob[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) prob[i] = (float)pw[i / 2][i & 1];
+#endif
+        const gop pb = {codes4f(prob[0] * 16.0f, prob[1] * 16.0f, prob[2] * 16.0f, prob[3] * 16.0f),
+                        codes4f(prob[4] * 16.0f, prob[5] * 16.0f, prob[6] * 16.0f, prob[7] * 16.0f)};
+#else
         const sop pb = __builtin_bit_cast(sop, pw);
+#endif
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
         {
+#ifdef SWIN_AMD_PV8
+            // Both operands already have the right lane ownership for FP8
+            // WMMA. No LDS transpose or decoded-half matrix operand is needed.
+            const f8v o = wmma8(tok_codes(vt[nt]), pb, splat(0.0f)) * (1.0f / 16.0f);
+#else
             hv2 vp[4];
 #pragma unroll
             for (int k = 0; k < 4; ++k)
@@ -434,7 +797,16 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
             zk(vp);
 #endif
             const f8v o = wmma(__builtin_bit_cast(sop, vp), pb, splat(0.0f));
-            oc[hd][nt] = (u2v){codes4(tok_pk16(o[0], o[1]), tok_pk16(o[2], o[3])), codes4(tok_pk16(o[4], o[5]), tok_pk16(o[6], o[7]))};
+#endif
+#if defined(SWIN_CODES_F32) && !defined(SWIN_TOK_WIDE_WEIGHTS)
+            oc[hd][nt] = (u2v){codes4f(o[0], o[1], o[2], o[3]), codes4f(o[4], o[5], o[6], o[7])};
+#else
+            T16 result;
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                result.set_pair(k, tok_pk16(o[2 * k], o[2 * k + 1]));
+            oc[hd][nt] = tok_codes(result);
+#endif
         }
     }
 
@@ -444,16 +816,50 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
     for (int t = 0; t < NT; ++t)
 #pragma unroll
         for (int k = 0; k < 4; ++k)
+#ifdef SWIN_RES32
+        {
+            x[t].f[2 * k] = (float)v[t][k][0] + cf[K::CBO + 2 * t][2 * k];
+            x[t].f[2 * k + 1] = (float)v[t][k][1] + cf[K::CBO + 2 * t][2 * k + 1];
+        }
+#else
             x[t].set_pair(k, res[t][k]);
+#endif
 #pragma unroll
     for (int kc = 0; kc < NH; ++kc)
 #pragma unroll
         for (int t = 0; t < NT; ++t)
-            k32(x[t], wt(K::WO, NT, kc, 0, t), oc[kc][0], wt(K::WO, NT, kc, 1, t), oc[kc][1]);
+            tok_weight_k32(x[t], wt(K::WO, NT, kc, 0, t), oc[kc][0], wt(K::WO, NT, kc, 1, t), oc[kc][1]);
 
     // ------------------------------------------------ norm2: h2 codes, the K operands of fc1
     gop fop[NKC][2];
     {
+#ifdef SWIN_RES32
+        // Relaxed arithmetic experiment: keep the projection/residual in f32,
+        // normalize it directly, then quantize once to FP8. Each half-wave owns
+        // C/2 channels; exchange only the final sum with its matching token.
+        float ss = 0.0f;
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                ss += x[t].f[i] * x[t].f[i];
+        const float other = __builtin_bit_cast(float, wm_other_half(__builtin_bit_cast(uint32_t, ss)));
+        const float rn = __builtin_amdgcn_rsqf(ss + other + 1.0f / 8192.0f);
+        tok_quad c2[NT][2];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            const f8v gain = cf[K::CG2 + 2 * t], bias = cf[K::CB2 + 2 * t];
+#pragma unroll
+            for (int g = 0; g < 2; ++g)
+                c2[t][g] = codes4f(x[t].f[4 * g] * (rn * gain[4 * g]),
+                                   x[t].f[4 * g + 1] * (rn * gain[4 * g + 1]),
+                                   x[t].f[4 * g + 2] * (rn * gain[4 * g + 2]),
+                                   x[t].f[4 * g + 3] * (rn * gain[4 * g + 3]));
+#pragma unroll
+            for (int i = 0; i < 8; ++i) x[t].f[i] += bias[i];
+        }
+#else
 #pragma unroll
         for (int t = 0; t < NT; ++t)
 #pragma unroll
@@ -461,19 +867,21 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
                 v[t][k] = x[t].pair(k);
         const half_t rn = tok_rsq<NT>(v);
         const hv2 rn2 = {rn, rn};
-        uint32_t c2[NT][2];
+        tok_quad c2[NT][2];
 #pragma unroll
         for (int t = 0; t < NT; ++t)
         {
             const h8 g2 = ch[K::CG2 + 2 * t], b2 = ch[K::CB2 + 2 * t];
 #pragma unroll
             for (int g = 0; g < 2; ++g)
-                c2[t][g] = codes4(v[t][2 * g] * (hv2)(rn2 * (hv2){g2[4 * g], g2[4 * g + 1]}),
+                c2[t][g] = tok_quant4(v[t][2 * g] * (hv2)(rn2 * (hv2){g2[4 * g], g2[4 * g + 1]}),
                                   v[t][2 * g + 1] * (hv2)(rn2 * (hv2){g2[4 * g + 2], g2[4 * g + 3]}));
 #pragma unroll
             for (int k = 0; k < 4; ++k)
                 x[t].set_pair(k, v[t][k] + (hv2){b2[2 * k], b2[2 * k + 1]});
         }
+#endif
+
 #pragma unroll
         for (int kc = 0; kc < NKC; ++kc)
 #pragma unroll
@@ -488,10 +896,13 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
         const int w1 = K::W1 + 4 * C * c;
         // the round's operands first: 2 bias slots, fc1's and fc2's weight tiles
         h8 zb[2];
+#ifndef SWIN_TOK_WIDE_WEIGHTS
         gop wa[NKC][2][2], wb[2][NT];
+#endif
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
             zb[nt] = ch[K::CB1 + 4 * c + 2 * nt];
+#ifndef SWIN_TOK_WIDE_WEIGHTS
 #pragma unroll
         for (int kc = 0; kc < NKC; ++kc)
 #pragma unroll
@@ -508,16 +919,47 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
         // one wait for the whole batch here instead of one before each WMMA
         asm("" : "+v"(wb[1][NT - 1]));
 #endif
+#endif
         T16 z[2];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
+#if defined(SWIN_CODES_F32) && !defined(SWIN_TOK_WIDE_WEIGHTS)
+            z[nt].f = cf[K::CB1 + 4 * c + 2 * nt]; // the bias, widened once by the prep kernel, starts the sum
+#else
             z[nt] = tok_t16(zb[nt]);
+#endif
 #pragma unroll
         for (int kc = 0; kc < NKC; ++kc)
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+                tok_weight_k32(z[nt], wt(w1, 2, kc, 0, nt), fop[kc][0], wt(w1, 2, kc, 1, nt), fop[kc][1]);
+#else
                 k32(z[nt], wa[kc][0][nt], fop[kc][0], wa[kc][1][nt], fop[kc][1]);
+#endif
         gop gz[2];
+#if defined(SWIN_CODES_F32) && !defined(SWIN_TOK_WIDE_WEIGHTS)
+        // fast sets: the bias and GELU in f32 straight from the accumulator (NVIDIA rounds z to f16 and evaluates
+        // the same polynomial, with these f16 constants, in f16), then one e4m3 rounding
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+        {
+            float g[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+            {
+                const float zv = z[nt].f[i];
+#ifdef SWIN_AMD_GELU
+                g[i] = zv * __builtin_amdgcn_fmed3f(__builtin_fmaf(zv, SWIN_AMD_GELU_SLOPE, 0.5f), 0.0f, 1.0f);
+#else
+                const float cz = __builtin_amdgcn_fmed3f(zv, -2.0f, 2.0f);
+                const float inner = __builtin_fmaf(-(float)f16(0.08108133f), __builtin_fabsf(cz), (float)f16(0.41216981f));
+                g[i] = zv * __builtin_fmaf(cz, inner, 0.5f);
+#endif
+            }
+            gz[nt] = (u2v){codes4f(g[0], g[1], g[2], g[3]), codes4f(g[4], g[5], g[6], g[7])};
+        }
+#else
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt)
         {
@@ -535,11 +977,20 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
                                   (hv2)((hv2){f16(0.08108133f), f16(0.08108133f)} * az);
                 gl[k] = zv * (hv2)((hv2){0.5f16, 0.5f16} + (hv2)(cz * inner));
             }
-            gz[nt] = (u2v){codes4(gl[0], gl[1]), codes4(gl[2], gl[3])};
+            T16 gelu;
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                gelu.set_pair(k, gl[k]);
+            gz[nt] = tok_codes(gelu);
         }
+#endif
 #pragma unroll
         for (int t = 0; t < NT; ++t)
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+            tok_weight_k32(x[t], wt(w1 + 2 * C, NT, 0, 0, t), gz[0], wt(w1 + 2 * C, NT, 0, 1, t), gz[1]);
+#else
             k32(x[t], wb[0][t], gz[0], wb[1][t], gz[1]);
+#endif
     }
 
     // ------------------------------------------------ output codes
@@ -547,7 +998,11 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
     for (int t = 0; t < NT; ++t)
 #pragma unroll
         for (int g = 0; g < 2; ++g)
+#ifdef SWIN_CODES_F32
+            co[t][g] = codes4f(x[t].f[4 * g], x[t].f[4 * g + 1], x[t].f[4 * g + 2], x[t].f[4 * g + 3]);
+#else
             co[t][g] = codes4(x[t].pair(2 * g), x[t].pair(2 * g + 1));
+#endif
     if (x2 != nullptr)
     {
 #pragma unroll
@@ -560,8 +1015,9 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const gop* con
 
 template <int C, int NH, int NPM, bool TUBE, int CIN>
 __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const TubeParams* tp, const wslot* w16, const h8* c16,
-                                               const int bx, const int by, const int gx)
+                                               const f8v* c32, const int bx, const int by, const int gx)
 {
+    SWIN_AMD_INIT();
     using K = TokLayout<C, NH, NPM, CIN>;
     constexpr int NT = C / 16, NKC = C / 32, NC = C / 8;
     static_assert(C % 32 == 0, "32-channel groups");
@@ -571,14 +1027,58 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     const int T = 16 * wv + l16; // this lane's token: window wv, position l16
     // The lane's bases into the two images, hidden from constant folding: every tile and constant is then
     // one load at a fixed offset from a register (folded, each load rebuilt the image's address first).
-    uintptr_t chv = (uintptr_t)(c16 + hf), wlv = (uintptr_t)((const gop*)w16 + 2 * l16 + hf);
+    constexpr int weight_stride = sizeof(wslot) / sizeof(tok_weight);
+    uintptr_t chv = (uintptr_t)(c16 + hf), wlv = (uintptr_t)((const tok_weight*)w16 + weight_stride * l16 + (weight_stride == 2 ? hf : 0));
     asm("" : "+v"(chv));
+#ifndef SWIN_TOK_BUFFER_DIRECT
     asm("" : "+v"(wlv));
+#endif
     const h8* const ch = (const h8*)chv;
     // row l16 of a weight tile: this half's 8 K slots
-    const gop* const wl = (const gop*)wlv;
-    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[2 * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
+    const tok_weight* const wl = (const tok_weight*)wlv;
+#ifdef SWIN_L_BUFFER_WEIGHTS
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return tok_weight_image(wl, weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16), l16); };
+#elif defined(SWIN_TOK_BUFFER_WEIGHTS)
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return tok_weight_buffer(wl, weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16), l16); };
+#else
+    auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
+#endif
 
+#ifdef SWIN_DATAFLOW
+    // vkhip's barrier-free chain (every layer): wait for the producer blocks of the previous layer that hold
+    // this block's input. r69, r70: the producer grid; r71, r72 (x, y): bits 0-7 the producer's shift, bits 8-15
+    // the mapping (0 the same token grid, 1 a patch merge: producer tokens 2 t, 2 t + 1, 2 a patch expand: t / 2).
+    // Up to 3x3 producers (a merged block spans 16 producer tokens).
+    if (tp->in_flags != nullptr)
+    {
+        if (lane < 9 && wv == 0)
+        {
+            auto range = [](int c0, int code, int& n0, int& n1) {
+                const int ps = code & 0xff, mode = code >> 8;
+                const int t0 = mode == 1 ? 2 * c0 : mode == 2 ? c0 >> 1 : c0;
+                const int t1 = mode == 1 ? 2 * c0 + 15 : mode == 2 ? (c0 + 7) >> 1 : c0 + 7;
+                n0 = (t0 + ps) >> 3; n1 = (t1 + ps) >> 3;
+            };
+            int x0, x1, y0, y1;
+            range(8 * bx - p.sx, tp->r71, x0, x1);
+            range(8 * by - p.sy, tp->r72, y0, y1);
+            const int nx = x0 + lane % 3, ny = y0 + lane / 3;
+            if (nx <= x1 && ny <= y1 && nx >= 0 && nx < tp->r69 && ny >= 0 && ny < tp->r70)
+            {
+                const uint8_t* f = tp->in_flags + (size_t)(ny * tp->r69 + nx) * 32;
+                // bounded spin: a missing producer must never hang the GPU
+                for (int it = 0; it < (1 << 22); ++it)
+                {
+                    if (__hip_atomic_load(f, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0)
+                        break;
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+        }
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+#else
     if constexpr (TUBE)
     {
         if (tp->in_flags != nullptr)
@@ -602,6 +1102,7 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
     }
+#endif
 
     // ------------------------------------------------ block input x0 (encoders: the fp8 input; decoders: skip)
     const int X = 8 * bx - p.sx + tok_x(T), Y = 8 * by - p.sy + tok_y(T);
@@ -624,7 +1125,11 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     {
         // patch expand: lanes = the block's 16 low-res tokens, wave = quadrant; the codes of q8(expand) go to
         // their child tokens' rows of a byte image, where the windows' waves pick them up
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+        __shared__ __attribute__((aligned(16))) half_t E16[64 * C];
+#else
         __shared__ __attribute__((aligned(16))) uint8_t E8[64 * C];
+#endif
         const int W2 = p.tw / 2, H2 = p.th / 2;
         const int MX = mirror((8 * bx - p.sx) / 2 + (l16 & 3), W2), MY = mirror((8 * by - p.sy) / 2 + (l16 >> 2), H2);
         gop pa[CIN / 32][2];
@@ -635,9 +1140,9 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
 #pragma unroll
             for (int s = 0; s < 2; ++s)
 #ifdef SWIN_TOK_NATURAL
-                pa[kc][s] = (u2v){input_word((const uint32_t*)(b + tok_word(s, 0))), input_word((const uint32_t*)(b + tok_word(s, 1)))};
+                pa[kc][s] = tok_operand(input_word((const uint32_t*)(b + tok_word(s, 0))), input_word((const uint32_t*)(b + tok_word(s, 1))));
 #else
-                pa[kc][s] = (u2v){input_word((const uint32_t*)(b + tok_word(0, s))), input_word((const uint32_t*)(b + tok_word(1, s)))};
+                pa[kc][s] = tok_operand(input_word((const uint32_t*)(b + tok_word(0, s))), input_word((const uint32_t*)(b + tok_word(1, s))));
 #endif
         }
         const int tx = 2 * (l16 & 3) + (wv & 1), ty = 2 * (l16 >> 2) + (wv >> 1);
@@ -649,8 +1154,18 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
             T16 e = tok_t16(ch[K::CPEB + 2 * (NT * wv + ct)]);
 #pragma unroll
             for (int kc = 0; kc < CIN / 32; ++kc)
-                k32(e, wt(pew, NT, kc, 0, ct), pa[kc][0], wt(pew, NT, kc, 1, ct), pa[kc][1]);
-            *(u2v*)(E8 + Tc * C + 16 * ct + 8 * hf) = tok_codes(e);
+                tok_weight_k32(e, wt(pew, NT, kc, 0, ct), pa[kc][0], wt(pew, NT, kc, 1, ct), pa[kc][1]);
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                *(hv2*)(E16 + Tc * C + 16 * ct + 8 * hf + 2 * k) = e.pair(k);
+#else
+#ifdef SWIN_CODES_F32
+            *(u2v*)(E8 + Tc * C + 16 * ct + 8 * hf) = (u2v){codes4f(e.f[0], e.f[1], e.f[2], e.f[3]), codes4f(e.f[4], e.f[5], e.f[6], e.f[7])};
+#else
+            *(u2v*)(E8 + Tc * C + 16 * ct + 8 * hf) = (u2v){codes4(e.pair(0), e.pair(1)), codes4(e.pair(2), e.pair(3))};
+#endif
+#endif
         }
         __syncthreads();
 #pragma unroll
@@ -658,9 +1173,14 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
 #pragma unroll
             for (int g = 0; g < 2; ++g)
             {
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+                v[t][2 * g] = *(const hv2*)(E16 + T * C + tok_word(t, g) + tok_half(hf)) + tok_dec2<false>(inw[t][g]);
+                v[t][2 * g + 1] = *(const hv2*)(E16 + T * C + tok_word(t, g) + tok_half(hf) + 2) + tok_dec2<true>(inw[t][g]);
+#else
                 const uint32_t ew = *(const uint32_t*)(E8 + T * C + tok_word(t, g) + tok_half(hf));
                 v[t][2 * g] = tok_dec2<false>(ew) + tok_dec2<false>(inw[t][g]);
                 v[t][2 * g + 1] = tok_dec2<true>(ew) + tok_dec2<true>(inw[t][g]);
+#endif
             }
     }
     else
@@ -676,7 +1196,12 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     }
 
     uint32_t co[NT][2];
-    swin_tok_core<C, NH, NPM, CIN>(ch, wl, l16, v, co);
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+    hv2 merged_half[NT][4];
+    swin_tok_core<C, NH, NPM, CIN>(ch, c32 + hf, wl, l16, v, co, NPM ? merged_half : nullptr);
+#else
+    swin_tok_core<C, NH, NPM, CIN>(ch, c32 + hf, wl, l16, v, co);
+#endif
     if (X >= 0 && X < p.tw && Y >= 0 && Y < p.th)
     {
 #pragma unroll
@@ -694,12 +1219,23 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     {
         // lanes = the block's 16 merged tokens; the merge reads the output codes from a byte image
         constexpr int XB = C + 4, NTP = NPM / 16;
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+        // Keep the same quantized half values as the block's in-place output
+        // staging, including FP8 subnormals, across window waves.
+        __shared__ __attribute__((aligned(16))) half_t UH[64 * XB];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                *(hv2*)(UH + T * XB + tok_xnat(t, 8 * hf + 2*k)) = q8x2_exact(merged_half[t][k]);
+#else
         __shared__ __attribute__((aligned(16))) uint8_t U[64 * XB];
 #pragma unroll
         for (int t = 0; t < NT; ++t)
 #pragma unroll
             for (int g = 0; g < 2; ++g)
                 *(uint32_t*)(U + T * XB + tok_word(t, g) + tok_half(hf)) = co[t][g];
+#endif
         __syncthreads();
         if (wv < NTP)
         {
@@ -708,22 +1244,41 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
             // token's 4C inputs: channel k % C of its source token k / C. The four source tokens are consecutive
             // in x and 4 apart in y, and 4 half never crosses a token, so every run of four codes is at a fixed
             // offset from the lane's first source token.
+#if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
+            const half_t* const ub = UH + ((2 * mx & 3) + 4 * (2 * my & 3) + 16 * (mx >> 1) + 32 * (my >> 1)) * XB + tok_half(hf);
+            auto merge_operand = [&](int kc, int s) {
+                h4 run[2];
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr)
+                {
+                    const int k0 = tok_merge_k(kc, s, rr), q = k0 / C;
+                    run[rr] = *(const h4*)(ub + ((q & 1) + 4 * (q >> 1)) * XB + k0 % C);
+                }
+                return tok_operand(run[0], run[1]);
+            };
+#else
             const uint8_t* const ub = U + ((2 * mx & 3) + 4 * (2 * my & 3) + 16 * (mx >> 1) + 32 * (my >> 1)) * XB + tok_half(hf);
+            auto merge_operand = [&](int kc, int s) {
+                uint32_t run4[2];
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr)
+                {
+                    const int k0 = tok_merge_k(kc, s, rr), q = k0 / C;
+                    run4[rr] = *(const uint32_t*)(ub + ((q & 1) + 4 * (q >> 1)) * XB + k0 % C);
+                }
+                return tok_operand(run4[0], run4[1]);
+            };
+#endif
+#ifndef SWIN_TOK_WIDE_WEIGHTS
             gop as[C / 8][2];
 #pragma unroll
             for (int kc = 0; kc < C / 8; ++kc)
 #pragma unroll
                 for (int s = 0; s < 2; ++s)
                 {
-                    uint32_t run4[2];
-#pragma unroll
-                    for (int rr = 0; rr < 2; ++rr)
-                    {
-                        const int k0 = tok_merge_k(kc, s, rr), q = k0 / C;
-                        run4[rr] = *(const uint32_t*)(ub + ((q & 1) + 4 * (q >> 1)) * XB + k0 % C);
-                    }
-                    as[kc][s] = (u2v){run4[0], run4[1]};
+                    as[kc][s] = merge_operand(kc, s);
                 }
+#endif
             const int W2 = p.tw / 2, H2 = p.th / 2;
             const int MX = (8 * bx - p.sx) / 2 + mx, MY = (8 * by - p.sy) / 2 + my;
             const bool inside = MX >= 0 && MX < W2 && MY >= 0 && MY < H2;
@@ -737,9 +1292,19 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
                     T16 y = tok_t16(ch[K::CPMB + 2 * u]);
 #pragma unroll
                     for (int kc = 0; kc < C / 8; ++kc)
-                        k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
+#ifdef SWIN_TOK_WIDE_WEIGHTS
+                        tok_weight_k32(y, wt(K::PM, NTP, kc, 0, u), merge_operand(kc, 0),
+                                       wt(K::PM, NTP, kc, 1, u), merge_operand(kc, 1));
+#else
+                        tok_weight_k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
+#endif
+#ifdef SWIN_CODES_F32
+                    constexpr float lim = (float)(half_t)6.2831855f;
+                    const u2v code = {codes4f(y.f[0], y.f[1], y.f[2], y.f[3], lim), codes4f(y.f[4], y.f[5], y.f[6], y.f[7], lim)};
+#else
                     const u2v code = {codes4(merge_clamp(y.pair(0)), merge_clamp(y.pair(1))),
                                       codes4(merge_clamp(y.pair(2)), merge_clamp(y.pair(3)))};
+#endif
                     if (inside)
                         *(u2v*)(p.p48 + ((size_t)((u >> 1) * H2 + MY) * W2 + MX) * 32 + 16 * (u & 1) + 8 * hf) = code;
                 }
@@ -747,7 +1312,11 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
         }
     }
 
+#ifdef SWIN_DATAFLOW
+    if constexpr (true)
+#else
     if constexpr (TUBE)
+#endif
     {
         if (tp->out_flags != nullptr)
         {
@@ -760,6 +1329,22 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     }
 }
 
+// the fast f32 sets keep an f32 copy of the constants (g_c32, written by the prep kernel) for the MLP's bias
+#if defined(SWIN_CODES_F32) && !defined(SWIN_TOK_WIDE_WEIGHTS)
+#define SWIN_TOK_C32 1
+#else
+#define SWIN_TOK_C32 0
+#endif
+
+// SWIN_DATAFLOW (vkhip only): every layer takes TubeParams, whose flags chain the layers without barriers
+#ifdef SWIN_DATAFLOW
+#define SWIN_TOK_PARAMS(PARAMS) TubeParams
+#define SWIN_TOK_DATAFLOW 1
+#else
+#define SWIN_TOK_PARAMS(PARAMS) PARAMS
+#define SWIN_TOK_DATAFLOW 0
+#endif
+
 #if defined(SWIN_TOK_MAX_VGPR)
 #define SWIN_TOK_VGPR_ATTR __attribute__((amdgpu_num_vgpr(SWIN_TOK_MAX_VGPR)))
 #else
@@ -771,7 +1356,9 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
     using NAME##_K = TokLayout<C, NH, NPM, CIN>;                                                                        \
     constexpr int NAME##_S = SWIN_PREP_SLOTS;                                                                           \
     __device__ wslot g_w16[(NAME##_S + 1) * NAME##_K::TOTAL];                                                           \
+    SWIN_RAW_DECLARE((NAME##_S + 1) * NAME##_K::TOTAL)                                                                  \
     __device__ h8 g_c16[(NAME##_S + 1) * NAME##_K::CTOTAL];                                                             \
+    __device__ f8v g_c32[SWIN_TOK_C32 ? (NAME##_S + 1) * NAME##_K::CTOTAL : 1];                                         \
     extern "C" __device__ __attribute__((used)) uint64_t g_prep_keys[NAME##_S + 1] = {};                                \
     __constant__ TokTables<C, NH, NPM, CIN> g_tok = make_tok_tables<C, NH, NPM, CIN>();                                 \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_block_z = 4;                                              \
@@ -786,16 +1373,24 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
         const uint8_t* w = ((const CommonParams*)&p)->w;                                                                \
         const int slot = NAME##_S ? prep_slot_claim<NAME##_S>(g_prep_keys, (uint64_t)w, idx == 0) : 0;                 \
         if (idx < NAME##_K::TOTAL)                                                                                      \
-            expand_tok_weights(w, g_w16 + slot * NAME##_K::TOTAL, g_tok.d, NAME##_K::NDESC, idx);                       \
+            expand_tok_weights(w, g_w16 + slot * NAME##_K::TOTAL, g_tok.d, NAME##_K::NDESC, idx,                       \
+                               SWIN_RAW_PTR(slot * NAME##_K::TOTAL));                                                 \
         if (idx < NAME##_K::CTOTAL)                                                                                     \
+        {                                                                                                               \
             expand_tok_consts(w, g_c16 + slot * NAME##_K::CTOTAL, g_tok.c, NAME##_K::NCONST, idx);                      \
+            if (SWIN_TOK_C32)                                                                                           \
+                for (int i = 0; i < 8; ++i)                                                                             \
+                    g_c32[slot * NAME##_K::CTOTAL + idx][i] = (float)g_c16[slot * NAME##_K::CTOTAL + idx][i];          \
+        }                                                                                                               \
     }                                                                                                                   \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_grid_x = 0;                                               \
-    extern "C" __global__ void __launch_bounds__(128) SWIN_TOK_VGPR_ATTR NAME(PARAMS p)                                 \
+    extern "C" __device__ __attribute__((used)) uint32_t d4r_dataflow = SWIN_TOK_DATAFLOW;                              \
+    extern "C" __global__ void __launch_bounds__(128) SWIN_TOK_VGPR_ATTR NAME(SWIN_TOK_PARAMS(PARAMS) p)                \
     {                                                                                                                   \
         const CommonParams& cp = *(const CommonParams*)&p;                                                              \
         const int slot = NAME##_S ? prep_slot_find<NAME##_S>(g_prep_keys, (uint64_t)cp.w) : 0;                         \
         const int gx = (cp.tw + cp.sx + 7) / 8;                                                                         \
         swin_tok_block<C, NH, NPM, TUBE, CIN>(cp, (const TubeParams*)&p, g_w16 + slot * NAME##_K::TOTAL,                \
-                                             g_c16 + slot * NAME##_K::CTOTAL, blockIdx.x, blockIdx.y, gx);             \
+                                             g_c16 + slot * NAME##_K::CTOTAL,                                          \
+                                             g_c32 + (SWIN_TOK_C32 ? slot * NAME##_K::CTOTAL : 0), blockIdx.x, blockIdx.y, gx); \
     }

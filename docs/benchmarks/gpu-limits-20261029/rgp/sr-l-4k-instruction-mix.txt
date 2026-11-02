@@ -1,0 +1,74 @@
+sr-l-4k-enc0_l-instruction-timing.tsv: 516 sampled waves, 3334 VALU and 160 WMMA per wave (20.8 VALU per WMMA)
+  float                         1226 per wave   36.8% of VALU  cost  22.4%
+  integer/bit/move/compare       734 per wave   22.0% of VALU  cost  22.8%
+  other conversion               606 per wave   18.2% of VALU  cost   7.8%
+  waits/barriers/hints           594 per wave    nan% of VALU  cost  13.3%
+  scalar                         293 per wave    nan% of VALU  cost  10.3%
+  fp8 pack                       276 per wave    8.3% of VALU  cost   3.3%
+  dual issue (VOPD)              225 per wave    6.7% of VALU  cost   7.8%
+  wmma                           160 per wave    4.8% of VALU  cost   4.5%
+  vector memory                  147 per wave    nan% of VALU  cost   2.3%
+  LDS                            108 per wave    nan% of VALU  cost   1.1%
+  packed 16-bit                  108 per wave    3.2% of VALU  cost   1.9%
+  highest-cost opcodes:
+    s_wait_loadcnt                      94 per wave  cost   4.5%
+    v_cndmask_b32_e64                   42 per wave  cost   4.4%
+    v_wmma_f32_16x16x16_fp8_fp8        152 per wave  cost   4.1%
+    v_dual_mul_f32                     102 per wave  cost   3.7%
+    v_mul_f32_e32                       73 per wave  cost   3.6%
+    v_cvt_f16_f32_e32                  186 per wave  cost   3.5%
+    v_cvt_pk_fp8_f32                   276 per wave  cost   3.3%
+    v_cndmask_b32_e32                   26 per wave  cost   3.0%
+    s_wait_samplecnt                     6 per wave  cost   2.9%
+    v_and_b32_e32                       58 per wave  cost   2.5%
+    v_cmp_lt_f32_e32                    15 per wave  cost   2.5%
+    s_wait_kmcnt                        26 per wave  cost   2.4%
+    s_or_b32                            19 per wave  cost   2.3%
+    v_add_nc_u32_e32                    93 per wave  cost   2.0%
+    v_cvt_f32_f16_e32                  227 per wave  cost   1.9%
+  costliest regions (label, first line, cost, iterations per wave, static VALU, static WMMA):
+    _L8                626   47.6%    1.0   2648   144
+    _amdgpu_cs_main      0   21.7%    1.0    112     0
+    _L1                304    4.7%    1.0     22     0
+    BBF0_3             410    3.5%    1.0     21     0
+    BBF0_2             357    3.5%    1.0     20     0
+    BBF0_4             462    2.5%    1.0     20     0
+    _L0                242    2.1%    1.0      6     0
+    BBF0_5             514    1.6%    1.0     20     0
+sr-l-4k-dec0_l-instruction-timing.tsv: 509 sampled waves, 2807 VALU and 144 WMMA per wave (19.5 VALU per WMMA)
+  float                         1129 per wave   40.2% of VALU  cost  12.2%
+  integer/bit/move/compare       664 per wave   23.7% of VALU  cost  42.2%
+  waits/barriers/hints           489 per wave    nan% of VALU  cost  11.7%
+  other conversion               453 per wave   16.1% of VALU  cost   6.9%
+  scalar                         216 per wave    nan% of VALU  cost   5.3%
+  fp8 pack                       176 per wave    6.3% of VALU  cost   3.1%
+  dual issue (VOPD)              149 per wave    5.3% of VALU  cost   1.8%
+  wmma                           144 per wave    5.1% of VALU  cost   4.7%
+  vector memory                  118 per wave    nan% of VALU  cost   1.7%
+  LDS                            115 per wave    nan% of VALU  cost   6.6%
+  packed 16-bit                   92 per wave    3.3% of VALU  cost   1.9%
+  highest-cost opcodes:
+    v_and_b32_e32                       36 per wave  cost   7.9%
+    s_wait_loadcnt                      95 per wave  cost   6.3%
+    v_mul_lo_u32                        35 per wave  cost   5.8%
+    ds_store_b8                         16 per wave  cost   5.6%
+    v_add_nc_u32_e32                   119 per wave  cost   4.8%
+    v_mad_u32_u24                       21 per wave  cost   4.7%
+    v_wmma_f32_16x16x16_fp8_fp8        136 per wave  cost   4.2%
+    v_lshrrev_b32_e32                   42 per wave  cost   4.0%
+    v_add_lshl_u32                      35 per wave  cost   3.1%
+    v_cvt_pk_fp8_f32                   176 per wave  cost   3.1%
+    v_add3_u32                          93 per wave  cost   2.7%
+    v_cvt_f16_f32_e64                   79 per wave  cost   2.1%
+    s_wait_kmcnt                        30 per wave  cost   2.0%
+    v_cvt_f16_f32_e32                  149 per wave  cost   1.9%
+    v_fma_mix_f32                      115 per wave  cost   1.7%
+  costliest regions (label, first line, cost, iterations per wave, static VALU, static WMMA):
+    BBF0_1              98   48.2%    1.0   2369   144
+    _L1                 50   19.3%    8.0      8     0
+    _L3                 77   14.3%    8.0      8     0
+    BBF0_4            3062    6.5%    1.0    271     0
+    _amdgpu_cs_main      0    6.0%    1.0     20     0
+    _L0                 67    1.2%    9.0      1     0
+    _L2                 94    1.2%    9.0      1     0
+    BBF0_0              71    0.7%    1.0      2     0

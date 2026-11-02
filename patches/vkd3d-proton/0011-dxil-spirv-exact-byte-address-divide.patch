@@ -1,0 +1,188 @@
+From: d4r
+Subject: [PATCH] dxil-spirv: divide a sum of aligned byte-address terms exactly
+
+A byte address buffer access needs the element index, byte offset >> 2.
+build_index_divider folds "index * scale + bias" only; for any other offset
+it shifts the final byte address. DXC distributes "(base + i) * 4" into a sum
+of aligned terms ((p >> 2) * 4 becomes p & ~3, the work group term a multiply,
+the lane term a shift), and RADV then computes the byte address, shifts it
+down, masks it and shifts it up again for every access: v_bfe_u32 x, 2, 30
+plus v_lshlrev and the adds before it. RR F's swin stages have 761 such
+sequences (Vulkan: none, its GLSL indexes u32 arrays); vkd3d's F stages had
+80219 instructions to Vulkan's 77772.
+
+When every term of the offset is provably a multiple of the element size
+(constants, shifts and multiplies by constants, masks, sums, disjoint ors),
+divide term by term and mask the sum to the shift's range, so the result is
+the shift's. An or of disjoint terms becomes an add (patch 0009's test), so the
+consecutive offsets stay visible to RADV's load vectorizer.
+
+RX 9070 XT, RADV: F 80219 -> 73879 instructions, no change to VGPRs or spills,
+same output bits for M, L and RR D/E/F; sustained 4K frame RR F 7.10 -> 6.86 ms,
+D -1.7%, E -1.5%, L 1440p/4K -3.4%/-4.2%, M unchanged. Needs 0009.
+
+---
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_common.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_common.cpp
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_common.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_common.cpp
+@@ -26,6 +26,7 @@
+ #include "logging.hpp"
+ #include "opcodes/converter_impl.hpp"
+ #include "spirv_module.hpp"
++#include "opcodes/opcodes_llvm_builtins.hpp"
+ 
+ namespace dxil_spv
+ {
+@@ -183,6 +184,100 @@
+ 	return op->id;
+ }
+ 
++// offset >> shift for an offset that is a sum of terms each divisible by 1 << shift (DXC distributes
++// "(base + i) * 4" into such sums, which the scale + bias split does not see through): the quotient
++// of each term, modulo 2^(32 - shift) as the shift's. 0 if a term is not provably divisible.
++static spv::Id build_exact_index_divider(Converter::Impl &impl, const llvm::Value *offset, unsigned shift, unsigned depth)
++{
++	auto &builder = impl.builder();
++	spv::Id uint_type = builder.makeUintType(32);
++	auto emit = [&](spv::Op opcode, spv::Id a, spv::Id b) {
++		Operation *op = impl.allocate(opcode, uint_type);
++		op->add_id(a);
++		op->add_id(b);
++		impl.add(op);
++		return op->id;
++	};
++
++	if (const auto *c = llvm::dyn_cast<llvm::ConstantInt>(offset))
++	{
++		uint32_t v = uint32_t(c->getUniqueInteger().getZExtValue());
++		return (v & ((1u << shift) - 1u)) == 0 ? builder.makeUintConstant(v >> shift) : 0;
++	}
++
++	if (depth == 0 || !llvm::isa<llvm::BinaryOperator>(offset))
++		return 0;
++
++	auto *binop = llvm::cast<llvm::BinaryOperator>(offset);
++	auto *lhs = binop->getOperand(0);
++	auto *rhs = binop->getOperand(1);
++
++	switch (binop->getOpcode())
++	{
++	case llvm::BinaryOperator::BinaryOps::Shl:
++		if (const auto *k = llvm::dyn_cast<llvm::ConstantInt>(rhs))
++		{
++			uint64_t amount = k->getUniqueInteger().getZExtValue();
++			if (amount < shift || amount >= 32)
++				return 0;
++			spv::Id value = impl.get_id_for_value(lhs);
++			return amount == shift ? value : emit(spv::OpShiftLeftLogical, value, builder.makeUintConstant(amount - shift));
++		}
++		return 0;
++
++	case llvm::BinaryOperator::BinaryOps::Mul:
++	{
++		if (llvm::isa<llvm::ConstantInt>(lhs))
++			std::swap(lhs, rhs);
++		const auto *k = llvm::dyn_cast<llvm::ConstantInt>(rhs);
++		if (!k)
++			return 0;
++		uint32_t factor = uint32_t(k->getUniqueInteger().getZExtValue());
++		if ((factor & ((1u << shift) - 1u)) != 0)
++			return 0;
++		spv::Id value = impl.get_id_for_value(lhs);
++		return (factor >> shift) == 1 ? value : emit(spv::OpIMul, value, builder.makeUintConstant(factor >> shift));
++	}
++
++	case llvm::BinaryOperator::BinaryOps::Add:
++	case llvm::BinaryOperator::BinaryOps::Sub:
++	case llvm::BinaryOperator::BinaryOps::Or:
++	case llvm::BinaryOperator::BinaryOps::Xor:
++	{
++		// Exact term by term: carries and borrows from the low bits are zero.
++		spv::Id a = build_exact_index_divider(impl, lhs, shift, depth - 1);
++		spv::Id b = a ? build_exact_index_divider(impl, rhs, shift, depth - 1) : 0;
++		if (!b)
++			return 0;
++		spv::Op opcode = binop->getOpcode() == llvm::BinaryOperator::BinaryOps::Add ? spv::OpIAdd :
++		                 binop->getOpcode() == llvm::BinaryOperator::BinaryOps::Sub ? spv::OpISub :
++		                 binop->getOpcode() == llvm::BinaryOperator::BinaryOps::Xor ? spv::OpBitwiseXor :
++		                 binary_or_is_disjoint_add(binop) ? spv::OpIAdd : spv::OpBitwiseOr;
++		return emit(opcode, a, b);
++	}
++
++	case llvm::BinaryOperator::BinaryOps::And:
++	{
++		// (x & m) >> s == (x >> s) & (m >> s); divisible when m is.
++		if (llvm::isa<llvm::ConstantInt>(lhs))
++			std::swap(lhs, rhs);
++		const auto *m = llvm::dyn_cast<llvm::ConstantInt>(rhs);
++		if (!m)
++			return 0;
++		uint32_t mask = uint32_t(m->getUniqueInteger().getZExtValue());
++		if ((mask & ((1u << shift) - 1u)) != 0)
++			return 0;
++		spv::Id value = build_exact_index_divider(impl, lhs, shift, depth - 1);
++		if (!value)
++			value = build_index_divider_fallback(impl, lhs, shift);
++		return emit(spv::OpBitwiseAnd, value, builder.makeUintConstant(mask >> shift));
++	}
++
++	default:
++		return 0;
++	}
++}
++
+ bool extract_raw_buffer_access_split(const llvm::Value *index, unsigned stride,
+                                      uint32_t addr_shift_log2, unsigned vecsize,
+                                      RawBufferAccessSplit &split)
+@@ -410,7 +505,22 @@
+ 		// This path implicitly gets the wrapping right since it starts with the final byte address offset,
+ 		// and shifts down. This will always work as intended.
+ 		assert(vecsize == 1);
+-		index_id = build_index_divider_fallback(impl, offset, addr_shift_log2);
++		index_id = 0;
++		if (addr_shift_log2 != 0)
++		{
++			index_id = build_exact_index_divider(impl, offset, addr_shift_log2, 8);
++			// The sum of quotients wraps modulo 2^32, the shift's quotient modulo 2^(32 - shift).
++			if (index_id)
++			{
++				Operation *mask = impl.allocate(spv::OpBitwiseAnd, builder.makeUintType(32));
++				mask->add_id(index_id);
++				mask->add_id(builder.makeUintConstant(UINT32_MAX >> addr_shift_log2));
++				impl.add(mask);
++				index_id = mask->id;
++			}
++		}
++		if (!index_id)
++			index_id = build_index_divider_fallback(impl, offset, addr_shift_log2);
+ 	}
+ 
+ 	return index_id;
+diff --git a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+--- a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
++++ b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+@@ -408,6 +408,11 @@
+ 	return ((known_zero_bits(instruction->getOperand(0)) | known_zero_bits(instruction->getOperand(1))) & mask) == mask;
+ }
+ 
++bool binary_or_is_disjoint_add(const llvm::BinaryOperator *op)
++{
++	return or_is_disjoint_add(op);
++}
++
+ static llvm::Value *get_bitwise_not_from_xor(llvm::Value *a, llvm::Value *b)
+ {
+ 	if (constant_is_all_bits_set(a))
+diff --git a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.hpp b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.hpp
+--- a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.hpp
++++ b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.hpp
+@@ -67,6 +67,9 @@
+ bool can_optimize_to_snegate(const llvm::BinaryOperator *inst);
+ bool can_optimize_to_snegate(const llvm::ConstantExpr *inst);
+ 
++// An or of operands without common set bits (known-zero bits from constants, shifts, multiplies, bitwise ops).
++bool binary_or_is_disjoint_add(const llvm::BinaryOperator *op);
++
+ spv::Id emit_bypass_fp16_trunc(Converter::Impl &impl, const llvm::Instruction *instruction);
+ 
+ void add_nocontract_decoration(Converter::Impl &impl, spv::Id id);

@@ -142,7 +142,7 @@ def main():
     lines += ['template enc0 enc0.args', 'template hkpn hkpn.args']
     for p in (0, 1):
         glsl(HERE / 'exposure_k.comp', a.output / f'exposure_rr{p}.spv', '-DMODE=2', f'-DPASS={p}')
-    (a.output / 'rr.txt').write_text('\n'.join(lines) + '\n')
+    (a.output / 'rr.txt').write_text('\n'.join(lines) + '\n', newline='\n')   # the runtimes read LF (Windows too)
     (a.output / 'model.json').write_text(json.dumps(info, indent=1) + '\n')
     print(f'Ray Reconstruction preset {info["preset"]} model in {a.output}')
 

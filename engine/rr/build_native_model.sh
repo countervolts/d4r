@@ -133,6 +133,11 @@ else
 fi
 python3 "$RR/gen_enc0_m.py" "$OUT/enc0.generated.comp" "$d/enc0_m.comp" > /dev/null
 glsl "$OUT/enc0_m.spv" "$d/enc0_m.comp" "$d" "$RR" $(widen "$OUT/weights-enc0m.bin")
+# and its gather alone (enc0_g.spv) for vkhip, which runs the rest of the stage (kernels/rr/build_vkhip.sh)
+if (( GFX11 == 0 )); then
+    python3 "$RR/gen_enc0_m.py" "$OUT/enc0.generated.comp" "$d/enc0_g.comp" --gather > /dev/null
+    glsl "$OUT/enc0_g.spv" "$d/enc0_g.comp" "$d" "$RR"
+fi
 native enc0 weights-enc0m.bin
 
 # the translated output stage (preset D; preset E's when engine/rr/hkpn.comp is not used) has no subgroup operations

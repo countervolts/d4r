@@ -6,12 +6,36 @@
 // D4R_FP8_WMMA (gfx12 layout only): the GEMMs whose operands are both e4m3 values run as native FP8 WMMAs on
 // e4m3 bytes (weights prepared as bytes, activations encoded when loaded); P V stays f16.
 #pragma once
-#ifdef D4R_DEVICE_ONLY_MINIMAL
-#include "../common/hip_device_minimal.h"
-#else
+// (D4R_NO_HIP_RUNTIME: built without the HIP headers, as part of a ZLUDA-compiled texture kernel; see
+// ../tex/enc0l_tail.hip, which supplies the few runtime names used here)
+#ifndef D4R_NO_HIP_RUNTIME
 #include <hip/hip_runtime.h>
 #endif
 #include <stdint.h>
+#ifdef SWIN_GFX11_ROW
+#if !defined(SWIN_GFX11_SCALED) || !defined(SWIN_EXACT) || defined(D4R_FP8_WMMA)
+#error "SWIN_GFX11_ROW is reserved for the exact scaled-half texture path"
+#endif
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
+#error "SWIN_GFX11_ROW requires RDNA3"
+#endif
+// Permute A rows when preparing/loading operands so gfx11's physical row
+// 2i+h already represents logical row i+8h. No accumulator exchanges per MMA.
+#define D4R_WMMA_LAYOUT 12
+#endif
+#ifdef SWIN_GFX11_TOKEN
+// Token-major execution on gfx11 uses contiguous logical accumulator rows.
+// wmma_layout supplies the register-only gfx11 operand duplication/row exchange.
+// No native FP8 instruction is used; quantized intermediates remain binary16.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
+#error "SWIN_GFX11_TOKEN requires RDNA3"
+#endif
+#if defined(SWIN_NO_TOKEN_LANES)
+#error "SWIN_GFX11_TOKEN cannot be combined with SWIN_NO_TOKEN_LANES"
+#endif
+#define D4R_WMMA_LAYOUT 12
+#define SWIN_EXACT
+#endif
 #include "../common/wmma_layout.h"
 #ifdef D4R_ACCURACY
 #define SWIN_EXACT
@@ -32,11 +56,27 @@
 #undef SWIN_F32ACC
 #endif
 
-// Experimental RDNA4 byte-activation path. Keep disabled unless the caller
-// explicitly builds native FP8 WMMA for gfx12.
+// gfx1101's validated fast-set tuning. Keep accuracy-set selection independent;
+// SWIN_BUFFER_BLOAD can still be requested explicitly for controlled comparisons.
+#if defined(SWIN_BUFFER_BLOAD_FAST) && !defined(SWIN_EXACT) && !defined(SWIN_BUFFER_BLOAD)
+#define SWIN_BUFFER_BLOAD
+#endif
+
+// Dense bank-swizzled MLP scratch on the measured gfx1101 fast tube path.
+// Exact/native-FP8 and other architecture selections retain their original LDS layout.
+#if defined(SWIN_DENSE_G_FAST) && defined(__GFX11__) && !defined(SWIN_EXACT) && !defined(D4R_FP8_WMMA)
+#define SWIN_DENSE_G
+#endif
+
+// SWIN_A8 (RDNA4 native FP8): the e4m3 GEMMs' activations live in LDS as e4m3 bytes, encoded once where they
+// are produced (v_cvt_pk_fp8_f32) instead of as f16 values that every operand load encodes again. The bytes
+// are the codes of the same q8 values, so results are unchanged.
 #if defined(D4R_FP8_WMMA) && defined(__GFX12__) && !defined(SWIN_NO_A8)
 #define SWIN_A8 1
 #endif
+// The exact SWIN_A8 build rounds each k32 step with v_fma_mix (f16(P + C) in one rounding) instead of
+// converting the accumulator to f32 and back: the same codes as the conversion form on the recorded launches
+// and as tools/swin_model.py, at about half the cost. K32_NO_MIX keeps the conversion form.
 #if defined(SWIN_A8) && defined(SWIN_EXACT) && !defined(K32_NO_MIX) && !defined(K32_MIX)
 #define K32_MIX
 #endif
@@ -93,7 +133,8 @@ __device__ __forceinline__ uint32_t half_to_e4m3(half_t h)
     return ((half >> 8) & 0x80u) | code;
 }
 
-// e4m3 RNE satfinite round trip evaluated in the f16 domain (exhaustively equal to decode(encode(h)))
+// e4m3 RNE satfinite round trip evaluated in the f16 domain for finite values
+// and infinities; NaNs retain their half payload instead of becoming a code.
 __device__ __forceinline__ half_t q8_exact(half_t h);
 __device__ __forceinline__ half_t q8(half_t h)
 {
@@ -118,8 +159,21 @@ __device__ __forceinline__ half_t q8_exact(half_t h)
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
 typedef short i16x2 __attribute__((ext_vector_type(2)));
+typedef _Float16 h4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ h4 decode4(uint32_t bytes)
+{
+    uint32_t m = bytes & 0x7f7f7f7fu, sign = bytes & 0x80808080u;
+    uint32_t lo = (__builtin_amdgcn_perm(0u, m, 0x0c010c00u) << 7) |
+                  __builtin_amdgcn_perm(0u, sign, 0x010c000cu);
+    uint32_t hi = (__builtin_amdgcn_perm(0u, m, 0x0c030c02u) << 7) |
+                  __builtin_amdgcn_perm(0u, sign, 0x030c020cu);
+    const hv2 scale = {(half_t)256.0f, (half_t)256.0f};
+    hv2 a = __builtin_bit_cast(hv2, lo) * scale, b = __builtin_bit_cast(hv2, hi) * scale;
+    return (h4){a[0], a[1], b[0], b[1]};
+}
 
 // q8_exact on two halves with packed 16-bit integer / f16 ops (same per-half logic; no carries cross halves)
+template <uint16_t NAN_BITS = 0>
 __device__ __forceinline__ hv2 q8x2_exact(hv2 h)
 {
     const u16x2 u = __builtin_bit_cast(u16x2, h);
@@ -132,7 +186,10 @@ __device__ __forceinline__ hv2 q8x2_exact(hv2 h)
     const u16x2 lt = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)(m - (unsigned short)0x2400)) >> 15));
     r = (sub & lt) | (r & ~lt);
     const u16x2 gt = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
-    r = (m & gt) | (r & ~gt);
+    if constexpr (NAN_BITS != 0)
+        r = ((u16x2){NAN_BITS, NAN_BITS} & gt) | (r & ~gt);
+    else
+        r = (m & gt) | (r & ~gt);
     return __builtin_bit_cast(hv2, (u16x2)(r | (u & (unsigned short)0x8000)));
 }
 
@@ -153,17 +210,33 @@ __device__ __forceinline__ uint32_t enc8x2(hv2 h, hv2& q)
     return codes8x2(q);
 }
 
-// e4m3 byte codes of four f16 values; caller provides exact e4m3 values.
-#ifdef SWIN_A8
-__device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
+// Direct encoder for stores that do not also consume the rounded f16 values.
+// The codes remain in the low byte of each 16-bit half, as codes8x2 expects.
+__device__ __forceinline__ uint32_t direct_codes8x2(hv2 h)
 {
-    const hv2 lim = {(half_t)448.0f, (half_t)448.0f};
-    a = __builtin_elementwise_maximum(__builtin_elementwise_minimum(a, lim), -lim);
-    b = __builtin_elementwise_maximum(__builtin_elementwise_minimum(b, lim), -lim);
-    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
-    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
-}
+    const u16x2 bits = __builtin_bit_cast(u16x2, h), m = bits & (unsigned short)0x7fff;
+    const u16x2 normal = (m + ((m >> 7) & (unsigned short)1) + (unsigned short)0xe03f) >> 7;
+#ifdef SWIN_CODES_SHIFT
+    const u16x2 exp = m >> 10;
+    const u16x2 bounded = __builtin_elementwise_max(__builtin_elementwise_min(exp, (u16x2)8), (u16x2)1);
+    const u16x2 shift = (unsigned short)16 - bounded;
+    const u16x2 sig = (m & (unsigned short)0x3ff) |
+                     (__builtin_elementwise_min(m, (u16x2)0x400) & (unsigned short)0x400);
+    const u16x2 sub = (sig + (((u16x2)1 << (shift - (unsigned short)1)) - (unsigned short)1) +
+                       ((sig >> shift) & (unsigned short)1)) >> shift;
+#else
+    // Below 2^-6, f16(2 + |h|) has the rounded e4m3 subnormal code
+    // directly in its low bits (ULP at 2 is 2^-9). No decode round trip.
+    const hv2 biased = __builtin_bit_cast(hv2, m) + (hv2){(half_t)2.0f, (half_t)2.0f};
+    const u16x2 sub = __builtin_bit_cast(u16x2, biased) - (unsigned short)0x4000;
 #endif
+    const u16x2 tiny = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)(m - (unsigned short)0x2400)) >> 15));
+    u16x2 code = __builtin_elementwise_min((sub & tiny) | (normal & ~tiny), (u16x2)0x7e);
+    const u16x2 nan = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
+    code |= nan & (unsigned short)0x7f;
+    code |= (bits >> 8) & (unsigned short)0x80;
+    return __builtin_bit_cast(uint32_t, code);
+}
 
 // the e4m3 codes of two halves that already hold e4m3 values (q8_exact results), in the low bytes of the
 // 16-bit halves
@@ -183,6 +256,71 @@ __device__ __forceinline__ uint32_t codes8x2(hv2 q)
     code = ((u16x2){0x7f, 0x7f} & gt) | (code & ~gt);
     return __builtin_bit_cast(uint32_t, (u16x2)(((qb >> 8) & (unsigned short)0x80) | code));
 }
+
+// the high half of a pair widened in place (v_fma_mix reads it with op_sel): LLVM without true16 shifts it
+// down first. SWIN_HI_OPSEL (fast sets) only; x * 1 + 0 is exact except that -0 becomes +0.
+__device__ __forceinline__ float hi_f32(hv2 p)
+{
+#ifdef SWIN_HI_OPSEL
+    float r;
+    asm("v_fma_mix_f32 %0, %1, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]" : "=v"(r) : "v"(p));
+    return r;
+#else
+    return (float)p[1];
+#endif
+}
+
+// two f32 -> one f16 pair, round to nearest even, in two v_fma_mix (x * 1 + 0 into either half) instead of two
+// conversions and a pack; as hi_f32, -0 becomes +0
+__device__ __forceinline__ hv2 pk16_f32(float a, float b)
+{
+#ifdef SWIN_HI_OPSEL
+    hv2 r;
+    asm("v_fma_mixlo_f16 %0, %1, 1.0, 0\n\tv_fma_mixhi_f16 %0, %2, 1.0, 0" : "=&v"(r) : "v"(a), "v"(b));
+    return r;
+#else
+    return (hv2){(half_t)a, (half_t)b};
+#endif
+}
+
+#ifdef SWIN_A8
+// e4m3 codes of four halves (RNE, satfinite) in the bytes of one word. The instruction rounds like NVIDIA's
+// conversion but encodes overflow as 0x7f, so the values are clamped to +-448 first, with the NaN-propagating
+// minimum / maximum. Equal to half_to_e4m3 for every non-NaN input; a NaN encodes as the NaN code 0xff (the
+// reference keeps its sign: 0x7f or 0xff).
+__device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
+{
+#ifndef SWIN_AMD_SAT8
+    const hv2 lim = {(half_t)448.0f, (half_t)448.0f};
+    a = __builtin_elementwise_maximum(__builtin_elementwise_minimum(a, lim), -lim);
+    b = __builtin_elementwise_maximum(__builtin_elementwise_minimum(b, lim), -lim);
+#endif
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], hi_f32(a), 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], hi_f32(b), (int)w, true);
+}
+#if defined(SWIN_DIRECT_E4M3) && defined(SWIN_F32ACC)
+// SWIN_DIRECT_E4M3 (fast sets): the codes of f32 accumulators in one rounding, f32 -> e4m3, instead of NVIDIA's
+// f32 -> f16 -> e4m3 (codes4 of the rounded pairs). The two differ only where the f16 rounding lands on an e4m3
+// tie; the clamp (v_med3, one per value) replaces the packed f16 minimum / maximum and the four widenings. A NaN
+// encodes as a clamp bound instead of the NaN code.
+#define SWIN_CODES_F32 1
+__device__ __forceinline__ uint32_t codes4f(float a0, float a1, float b0, float b1, float lim = 448.0f)
+{
+#ifdef SWIN_AMD_SAT8
+    // MODE.FP16_OVFL in the gfx12 prologue makes CVT_PK_FP8_F32 saturate
+    // directly. Preserve smaller explicit limits in merge/expansion paths.
+    if (lim == 448.0f) {
+        const int w = __builtin_amdgcn_cvt_pk_fp8_f32(a0, a1, 0, false);
+        return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(b0, b1, w, true);
+    }
+#endif
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(a0, -lim, lim),
+                                                                 __builtin_amdgcn_fmed3f(a1, -lim, lim), 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(b0, -lim, lim),
+                                                     __builtin_amdgcn_fmed3f(b1, -lim, lim), (int)w, true);
+}
+#endif
+#endif
 
 // four e4m3 codes (a, b from enc8x2) as the bytes of one word in element order
 __device__ __forceinline__ uint32_t pack_codes(uint32_t a, uint32_t b)
@@ -206,49 +344,29 @@ __device__ __forceinline__ half_t f16(float v)
     return (half_t)v;
 }
 
-// FP16 products are exact in FP32. Bound the error of the 16 additions,
-// including the reference's FP64 additions, before accepting an FP16 round.
-// Cancellation and midpoint cases retain the original FP64 summation order.
-template <int VStride = 32>
-__device__ __forceinline__ half_t exact_pv_dot(const half_t* p, const half_t* v)
-{
-#if defined(SWIN_BOUNDED_PV) && !defined(SWIN_EXACT_PV_REFERENCE)
-    float sum = 0.0f, magnitude = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) {
-        const float product = (float)p[k] * (float)v[k * VStride];
-        sum += product;
-        magnitude += __builtin_fabsf(product);
-    }
-    const half_t rounded = (half_t)sum;
-    const uint16_t bits = __builtin_bit_cast(uint16_t, rounded) & 0x7fffu;
-    if (bits < 0x7bffu) {
-        const float center = (float)__builtin_bit_cast(half_t, bits);
-        const float next = (float)__builtin_bit_cast(half_t, (uint16_t)(bits + 1));
-        const float previous = bits ? (float)__builtin_bit_cast(half_t, (uint16_t)(bits - 1)) : -next;
-        const float absolute = __builtin_fabsf(sum);
-        const float distance = __builtin_fminf(absolute - (previous + center) * 0.5f,
-                                               (center + next) * 0.5f - absolute);
-        // 2^-18 exceeds gamma(16) plus the error in the magnitude sum.
-        // The bound is normal FP32 even for the smallest FP16 product.
-        if (distance > magnitude * 0x1p-18f) return rounded;
-    }
-#endif
-    double dot = 0.0;
-    for (int k = 0; k < 16; ++k)
-        dot += (double)p[k] * (double)v[k * VStride];
-    return (half_t)dot;
-}
-
+// SWIN_APPROX_RECIP: the reciprocal square root and the reciprocal as the hardware approximations ZLUDA lowers
+// rsqrt.approx / rcp.approx to (v_rsq_f32, v_rcp_f32) instead of correctly rounded divisions. The two differ in
+// the last f32 bit for some arguments, which changes about one token in 20,000 after the f16 rounding: a kernel
+// that has to reproduce ZLUDA's compile of the PTX byte for byte (../tex/enc0l_tail.hip) needs this form.
 __device__ __forceinline__ half_t rsqrt16(half_t s)
 {
+#ifdef SWIN_APPROX_RECIP
+    return f16(__builtin_amdgcn_rsqf((float)(s + (half_t)(1.0f / 8192.0f))));
+#else
     return f16(1.0f / __builtin_sqrtf((float)(s + (half_t)(1.0f / 8192.0f))));
+#endif
 }
 __device__ __forceinline__ half_t recip16(half_t s)
 {
+#ifdef SWIN_APPROX_RECIP
+    return f16(__builtin_amdgcn_rcpf((float)s));
+#else
     return f16(1.0f / (float)s);
+#endif
 }
 
+// NVIDIA's encoders clamp the patch merge's result to +-2 pi (as f16) before its e4m3 encoding
+// (max.f16x2 / min.f16x2 with 0fC0C90FDB / 0f40C90FDB after the merge's last MMA).
 __device__ __forceinline__ hv2 merge_clamp(hv2 v)
 {
     const hv2 lim = {(half_t)6.2831855f, (half_t)6.2831855f};
@@ -310,6 +428,13 @@ typedef h16 sop;
 #endif
 typedef uint32_t u2v __attribute__((ext_vector_type(2)));
 typedef uint32_t u4v_t __attribute__((ext_vector_type(4)));
+#ifdef SWIN_PREP_CONTENT_CACHE
+#define SWIN_RAW_DECLARE(N) __device__ u4v_t g_prep_raw[N];
+#define SWIN_RAW_PTR(OFFSET) (g_prep_raw + (OFFSET))
+#else
+#define SWIN_RAW_DECLARE(N)
+#define SWIN_RAW_PTR(OFFSET) nullptr
+#endif
 #ifdef D4R_FP8_WMMA
 typedef u2v gop;
 typedef u4v_t wslot; // weight image slot: 16 e4m3 bytes (K slots 0..15)
@@ -321,7 +446,12 @@ typedef h16 wslot; // weight image slot: 16 f16 values
 __device__ __forceinline__ f8v wmma(sop a, sop b, f8v c)
 {
 #if D4R_WMMA_LAYOUT == 12
+#ifdef SWIN_GFX11_ROW
+    return wm_mma11(wm_shim_operand_zluda(__builtin_bit_cast(wm_op, a)),
+                    wm_shim_operand_zluda(__builtin_bit_cast(wm_op, b)), c);
+#else
     return wm_mma(__builtin_bit_cast(wm_op, a), __builtin_bit_cast(wm_op, b), c);
+#endif
 #else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #endif
@@ -342,34 +472,25 @@ __device__ __forceinline__ sop lds16(const half_t* p)
 // e4m3 bytes of an f16 operand whose values are e4m3 values (K order kept: byte j = element j)
 __device__ __forceinline__ gop to_fp8(sop v)
 {
-#if (defined(D4R_FP8_HW_PACK) || defined(SWIN_FP8_HWCVT)) && defined(__GFX12__)
-    // Inputs already contain exact e4m3 values. gfx12's native packed convert
-    // avoids the software subnormal/sign/exponent reconstruction below. Keep
-    // opt-in until all finite encodings and layer/network outputs pass replay.
-    gop result;
+#if defined(SWIN_FP8_HWCVT) && defined(__GFX12__)
+    // Opt-in, UNVERIFIED ON HARDWARE: the values already are e4m3 values (finite, |x| <= 448), so the hardware
+    // conversion has nothing to round or saturate; byte j = element j as below. Open question before enabling
+    // it by default: whether e4m3 subnormals (k * 2^-9) survive the gfx12 denormal mode in effect.
+    uint32_t w[2];
 #pragma unroll
-    for (int word = 0; word < 2; ++word) {
-        int packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * word], (float)v[4 * word + 1], 0, false);
-        packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * word + 2], (float)v[4 * word + 3], packed, true);
-        result[word] = (uint32_t)packed;
+    for (int j = 0; j < 2; ++j)
+    {
+        int packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * j], (float)v[4 * j + 1], 0, false);
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32((float)v[4 * j + 2], (float)v[4 * j + 3], packed, true);
+        w[j] = (uint32_t)packed;
     }
-    return result;
-#else
+    return (u2v){w[0], w[1]};
+#endif
     uint32_t c[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         c[j] = codes8x2((hv2){v[2 * j], v[2 * j + 1]});
     return (u2v){__builtin_amdgcn_perm(c[1], c[0], 0x06040200u), __builtin_amdgcn_perm(c[3], c[2], 0x06040200u)};
-#endif
-}
-
-__device__ __forceinline__ uint32_t input_word(const uint32_t* p)
-{
-#if defined(SWIN_NT_INPUT)
-    return __builtin_nontemporal_load(p);
-#else
-    return *p;
-#endif
 }
 // f32 += A B over 16 K for e4m3 operands
 __device__ __forceinline__ f8v wmma8(gop a, gop b, f8v c)
@@ -392,6 +513,13 @@ __device__ __forceinline__ gop lda(const half_t* p)
 {
     return to_fp8(lds16(p));
 }
+#ifdef SWIN_A8
+// GEMM A operand from an e4m3 byte image in LDS: this half's 8 K values
+__device__ __forceinline__ gop lda(const uint8_t* p)
+{
+    return *(const u2v*)(p + 8 * m_half());
+}
+#endif
 #else
 __device__ __forceinline__ f8v wmma8(gop a, gop b, f8v c)
 {
@@ -428,16 +556,43 @@ struct T16
 {
 #ifdef SWIN_F32ACC
     f8v f;
-    __device__ hv2 pair(int k) const { return (hv2){(half_t)f[2 * k], (half_t)f[2 * k + 1]}; }
-    __device__ void set_pair(int k, hv2 p) { f[2 * k] = (float)p[0]; f[2 * k + 1] = (float)p[1]; }
+    __device__ hv2 pair(int k) const {
+#ifdef SWIN_CVT_ASM
+        return __builtin_bit_cast(hv2, wm_cvt2(f[2 * k], f[2 * k + 1]));
+#else
+        return pk16_f32(f[2 * k], f[2 * k + 1]);
+#endif
+    }
+    __device__ void set_pair(int k, hv2 p) { f[2 * k] = (float)p[0]; f[2 * k + 1] = hi_f32(p); }
     __device__ half_t get(int i) const { return (half_t)f[i]; }
     __device__ void set(int i, half_t h) { f[i] = (float)h; }
 #else
     hv2 v[4];
+#ifdef SWIN_GFX11_TOKEN
+    // Keep chained accumulators in gfx11's physical (even/odd row) layout.
+    // Logical contiguous rows are needed only at norm/activation boundaries.
+    __device__ hv2 pair(int k) const {
+        const hv2 mine = {v[k / 2][k & 1], v[2 + k / 2][k & 1]};
+        const hv2 other = __builtin_bit_cast(hv2, wm_other_half(__builtin_bit_cast(uint32_t, mine)));
+        return m_half() ? (hv2){other[1], mine[1]} : (hv2){mine[0], other[0]};
+    }
+    __device__ void set_pair(int k, hv2 p) {
+        const hv2 other = __builtin_bit_cast(hv2, wm_other_half(__builtin_bit_cast(uint32_t, p)));
+        const half_t lo = m_half() ? other[1] : p[0];
+        const half_t hi = m_half() ? p[1] : other[0];
+        v[k / 2][k & 1] = lo;
+        v[2 + k / 2][k & 1] = hi;
+    }
+    __device__ half_t get(int i) const { return pair(i / 2)[i & 1]; }
+    __device__ void set(int i, half_t h) {
+        hv2 p = pair(i / 2); p[i & 1] = h; set_pair(i / 2, p);
+    }
+#else
     __device__ hv2 pair(int k) const { return v[k]; }
     __device__ void set_pair(int k, hv2 p) { v[k] = p; }
     __device__ half_t get(int i) const { return v[i / 2][i & 1]; }
     __device__ void set(int i, half_t h) { v[i / 2][i & 1] = h; }
+#endif
 #endif
 };
 
@@ -456,10 +611,23 @@ __device__ __forceinline__ T16 t16_splat(half_t h)
 // acc = f16(P + acc), rounded once (v_fma_mix: verified == f16(exact sum) on 8.4M cases)
 __device__ __forceinline__ hv2 mix2(float p0, float p1, hv2 c)
 {
+#if defined(MIX_ONE)
+    // Without inline asm (a texture tail is compiled by ZLUDA's LLVM, which has no assembler): the same two
+    // instructions, selected from fma(P, one, f32(c)) rounded to f16. MIX_ONE must be a float 1.0 the compiler
+    // cannot fold: with a constant the fma becomes an f32 add followed by a second rounding.
+    return (hv2){(half_t)__builtin_fmaf(p0, MIX_ONE, (float)c[0]), (half_t)__builtin_fmaf(p1, MIX_ONE, (float)c[1])};
+#elif defined(MIX_COPY)
     hv2 r = c;
     asm(MIX_PAD "v_fma_mixlo_f16 %0, %1, 1.0, %2 op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p0), "v"(c));
     asm("v_fma_mixhi_f16 %0, %1, 1.0, %2 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(r) : "v"(p1), "v"(c));
     return r;
+#else
+    // in place: mixlo writes only the low half and mixhi reads only the high half of the addend, so the
+    // accumulator is both the addend and the destination (no copy of it per pair)
+    asm(MIX_PAD "v_fma_mixlo_f16 %0, %1, 1.0, %0 op_sel_hi:[0,0,1]" : "+v"(c) : "v"(p0));
+    asm("v_fma_mixhi_f16 %0, %1, 1.0, %0 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(c) : "v"(p1));
+    return c;
+#endif
 }
 __device__ __forceinline__ void mixacc(T16& acc, f8v P)
 {
@@ -474,7 +642,31 @@ __device__ unsigned d4r_k32_bad[4 + 64 * 4];
 // f16 accumulate of one k32 step (NVIDIA m16n8k32 semantics: products summed, one rounding with C)
 __device__ __forceinline__ void k32(T16& acc, gop a0, gop b0, gop a1, gop b1)
 {
-#if defined(SWIN_F32ACC)
+#if defined(SWIN_GFX11_SCALED)
+    // Match the original ZLUDA texture k32 lowering: scaled FP16 operands,
+    // scaled f32 C, two k16 products, then a single half rounding.
+    f8v c;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) c[i] = (float)acc.get(i) * 0x1p-16f;
+    c = wmma8(a1, b1, wmma8(a0, b0, c));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc.set(i, (half_t)(c[i] * 0x1p16f));
+#elif defined(SWIN_GFX11_TOKEN)
+    // Stay in the physical gfx11 accumulator layout across both k16 products.
+    // The generic shim would exchange all eight accumulator registers twice
+    // between them. Norm/activation boundaries use T16::pair for logical rows.
+    f8v c;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        c[i] = (float)acc.v[i / 2][i & 1];
+    c = wm_mma11(wm_shim_operand(__builtin_bit_cast(wm_op, a0)),
+                 wm_shim_operand(__builtin_bit_cast(wm_op, b0)), c);
+    c = wm_mma11(wm_shim_operand(__builtin_bit_cast(wm_op, a1)),
+                 wm_shim_operand(__builtin_bit_cast(wm_op, b1)), c);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        acc.v[i / 2][i & 1] = (half_t)c[i];
+#elif defined(SWIN_F32ACC)
     acc.f = wmma8(a1, b1, wmma8(a0, b0, acc.f));
 #elif defined(K32_MIX)
     f8v P = wmma8(a0, b0, (f8v){0, 0, 0, 0, 0, 0, 0, 0});
@@ -509,7 +701,11 @@ template <int MASK> __device__ __forceinline__ uint32_t xor_lane(uint32_t v)
     else if constexpr (MASK == 8)
         return __builtin_amdgcn_update_dpp(0, (int)v, 0x168, 0xf, 0xf, false);
     else
+#ifdef SWIN_HALF_BPERMUTE
+        return __builtin_amdgcn_ds_bpermute(((int)threadIdx.x ^ 16) * 4, v);
+#else
         return __builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210, 0xfedcba98, false, false);
+#endif
 }
 template <int MASK> __device__ __forceinline__ half_t hxor(half_t v)
 {
@@ -559,6 +755,16 @@ struct GemmDesc
 // is formed in scalar registers and the load uses a scalar base plus the lane's constant offset.
 __device__ __forceinline__ gop bload(const wslot* w16, int gemm_dst, int NT, int kc, int s, int nt, int l16)
 {
+#if defined(SWIN_BUFFER_BLOAD) && D4R_WMMA_LAYOUT == 11
+    // Same 32-byte slot as the original load; only address formation changes.
+    const int tile = __builtin_amdgcn_readfirstlane(gemm_dst + ((kc * 2 + s) * NT + nt) * 16);
+    const __amdgpu_buffer_rsrc_t r = __builtin_amdgcn_make_buffer_rsrc((void*)w16, (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t vo = (uint32_t)l16 * 32u, so = (uint32_t)tile * 32u;
+    const u4v_t a = __builtin_amdgcn_raw_buffer_load_b128(r, vo, so, 0);
+    const u4v_t b = __builtin_amdgcn_raw_buffer_load_b128(r, vo + 16, so, 0);
+    typedef uint32_t u8 __attribute__((ext_vector_type(8)));
+    return __builtin_bit_cast(gop, (u8){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
+#else
 #ifdef SWIN_SCALAR_BLOAD
     const int tile = __builtin_amdgcn_readfirstlane(gemm_dst + ((kc * 2 + s) * NT + nt) * 16);
     const wslot* t = w16 + tile;
@@ -572,9 +778,20 @@ __device__ __forceinline__ gop bload(const wslot* w16, int gemm_dst, int NT, int
 #else
     return t[at];
 #endif
+#endif
 }
 
-__device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, const GemmDesc* descs, int ndesc, int idx)
+__device__ __forceinline__ uint32_t input_word(const uint32_t* p)
+{
+#ifdef SWIN_NT_INPUT
+    return __builtin_nontemporal_load(p);
+#else
+    return *p;
+#endif
+}
+
+__device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, const GemmDesc* descs, int ndesc, int idx,
+                                               u4v_t* raw = nullptr)
 {
     int d = 0;
     while (d + 1 < ndesc && idx >= descs[d + 1].dst)
@@ -586,7 +803,7 @@ __device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, con
     const int l16 = local & 15, rest = local >> 4;
     const int nt = rest % g.NT, s = (rest / g.NT) & 1, kc = rest / g.NT / 2;
     const int n = 16 * nt + l16;
-#ifdef D4R_FP8_WMMA
+#if defined(D4R_FP8_WMMA) || defined(SWIN_PREP_CONTENT_CACHE)
     u4v_t v;
 #pragma unroll
     for (int j = 0; j < 4; ++j)
@@ -597,11 +814,57 @@ __device__ __forceinline__ void expand_weights(const uint8_t* w, wslot* w16, con
             word |= (uint32_t)w[woff(g.base, g.Ks, g.Ns, 32 * kc + kslot(s, 4 * j + b), n)] << (8 * b);
         v[j] = word;
     }
+#ifdef SWIN_PREP_CONTENT_CACHE
+    // Exact content comparison, never pointer identity or a probabilistic hash.
+    // Zero-initialized raw and prepared globals also represent all-zero weights.
+    const u4v_t old = raw[idx];
+    if (old[0] == v[0] && old[1] == v[1] && old[2] == v[2] && old[3] == v[3])
+        return;
+    raw[idx] = v;
+#endif
+#ifndef D4R_FP8_WMMA
+    h16 decoded;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        decoded[i] = e4m3_to_half((v[i / 4] >> (8 * (i % 4))) & 255u);
+    w16[idx] = decoded;
+    return;
+#endif
 #else
     h16 v;
 #pragma unroll
     for (int i = 0; i < 16; ++i)
         v[i] = e4m3_to_half(w[woff(g.base, g.Ks, g.Ns, 32 * kc + kslot(s, i), n)]);
 #endif
+#if defined(D4R_FP8_WMMA) || !defined(SWIN_PREP_CONTENT_CACHE)
     w16[idx] = v;
+#endif
 }
+
+// ---------------------------------------------------------------- weight layout of a block
+// (NVIDIA's weight offsets and the slot layout of the prepared images; used by swin_block.h and swin_tok.h)
+template <int C, int NW, int NPM, int CIN = 0> struct SwinLayout
+{
+    static constexpr int PREB = CIN ? 4 * C * CIN + 8 * C : 0; // patch-expand weights + bias first
+    static constexpr int NTE = CIN ? 4 * C / NW / 16 : 0;
+    static constexpr int NPL = C / 32, NT = C / 16, NT8 = C / 8, INNER = 32 * NW, NC = C / 8;
+    static constexpr int HS = 96 * C + 512;
+    static constexpr int G1 = PREB, E = PREB + 2 * C + NW * HS, BO = E, G2 = E + 2 * C, M0 = E + 4 * C;
+    static constexpr int B2 = M0 + 64 * C + 64;
+    __host__ __device__ static constexpr int head(int h) { return PREB + 2 * C + HS * h; }
+    __host__ __device__ static constexpr int b1(int c) { return c == 0 ? M0 : M0 + 66 * C + 64 + (64 * C + 64) * (c - 1); }
+    static constexpr int PM0 = M0 + 66 * C + 64 + (64 * C + 64) * (NC - 1);
+    static constexpr int PMB = PM0 + 4 * C * NPM;
+    // weight image (slots of 16 K values, see expand_weights)
+    __host__ __device__ static constexpr int qv(int h, int q) { return (2 * h + q) * 2 * C; }
+    static constexpr int WO = 4 * C * NW;
+    static constexpr int W1 = WO + 2 * NW * C;
+    __host__ __device__ static constexpr int w1(int c) { return W1 + 4 * C * c; }
+    __host__ __device__ static constexpr int w2(int c) { return W1 + 4 * C * c + 2 * C; }
+    static constexpr int PM = W1 + 4 * C * NC;
+    __host__ __device__ static constexpr int pm(int g) { return PM + 8 * C * g; }
+    static constexpr int PE = PM + (NPM / 32) * 8 * C;
+    __host__ __device__ static constexpr int pe(int w) { return PE + w * (CIN / 32) * 2 * NTE * 16; }
+    static constexpr int TOTAL = PE + (CIN ? NW * (CIN / 32) * 2 * NTE * 16 : 0);
+    static constexpr int NDESC = 2 * NW + 1 + 2 * NC + NPM / 32 + (CIN ? NW : 0);
+};

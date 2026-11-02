@@ -1,0 +1,480 @@
+#version 460
+// One decoder level of the CNN Ray Reconstruction model (nvngx_dlssd.dll 310.3, presets A-C: the "Dec4" ... "Dec0"
+// and "PDL" kernels, dlss::dec::Kernel) as d4r's own cooperative-matrix shader, bit-exact to NVIDIA's kernel run
+// through ZLUDA.
+//
+// Binding 0 is NVIDIA's argument block byte for byte, its pointers device addresses:
+//   0 the level below's features (8-bit), 8 H W, 16 C row-stride        32 this level's skip tensor (the encoder's)
+//   64 / 80 / 96 / 112 the weights of the 3x3 conv, two 1x1 convs and the 1x1 head (PDL: none, its third conv is
+//   the head); 128 / 144 / 160 / 176 their biases
+//   192 the level's features (8-bit; PDL: 216), 200 H W, 208 C row-stride
+//   240 the level's image (4 halves per pixel), 248 (Dec4) the next image when the filtered colour is split as in
+//   the encoders, 256 the image of the level below, 264 the encoder's filtered image of this level (8 halves per
+//   pixel: low part, high part), 272 H W of the images, 280 their pixel stride
+//
+// The level: the features below, upsampled 2x bilinearly (UPS; Dec4 has none and no skip), plus the skip tensor;
+// conv 3x3 + bias, ReLU; conv 1x1 + bias, ReLU -> the level's features; conv 1x1 + bias, ReLU; the head. Its first
+// nine logits are a softmax 3x3 filter of the level below's image, upsampled bilinearly at each tap (Dec4: of the
+// image itself), and the tenth a sigmoid that blends the filtered colour with the encoder's low part, before the
+// encoder's high part is added back.
+//
+// Arithmetic, channel order and the 8-bit activations: cnn_common.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "cnn_common.glsl"
+
+#ifndef CIN
+#define CIN 64
+#endif
+#ifndef C
+#define C 32
+#endif
+#ifndef TS
+#define TS 4
+#endif
+// UPS: the features below are half size and get upsampled and added to the skip tensor (all but Dec4)
+// PDL: the last level: features at 216, no head weights (the third conv is the head), no ReLU after it
+// SPLITK: the 1x1 convs reduce over 32-channel slices (Dec4-2, as Enc2-4)
+#define NK (CIN / 16)
+#define NK2 (C / 16)
+#define TW 16
+#ifndef TH
+#define TH 8                // tile rows: 8 (two per wave), or 4 (one per wave) where the input is too wide for 8
+#endif
+#define RPW (TH / 4)
+#define PX (TW * TH)
+#define HW (TW + 2)
+#define HH (TH + 2)
+#define CINP (CIN + 8)
+#define CP (C + 8)
+#ifndef KG
+#define KG 1                // K chunks per tap step of the 3x3 conv
+#endif
+#ifdef PDL
+#define OUT 216
+#else
+#define OUT 192
+#endif
+
+layout(local_size_x = 128) in;
+
+#define SIN_SIZE (HH * HW * CINP)
+#define SA_SIZE (PX * CP)
+#define S0_SIZE (SIN_SIZE > SA_SIZE ? SIN_SIZE : SA_SIZE)
+#ifdef PDL
+#define NL C
+#else
+#define NL 16
+#endif
+shared float16_t sm[S0_SIZE + PX * NL + PX * 4];
+#define sIn sm
+#define sA sm
+#define SL0 S0_SIZE
+#define SF0 (S0_SIZE + PX * NL)
+
+HAC conv1x1(uint row, H16 w, uint cout, uint nt, uint nk)
+{
+#ifdef SPLITK
+    HAC tot;
+    for (uint sl = 0u; sl < nk / 2u; ++sl) {
+#ifdef D4R_EMU_CM
+        HAC acc = hac0();
+#else
+        HAC acc = HAC(float16_t(0.0));
+#endif
+        for (uint kc = 2u * sl; kc < 2u * sl + 2u; ++kc) {
+#else
+#ifdef D4R_EMU_CM
+    HAC acc = hac0();
+#else
+    HAC acc = HAC(float16_t(0.0));
+#endif
+    {
+        for (uint kc = 0u; kc < nk; ++kc) {
+#endif
+#ifdef D4R_EMU_CM
+            AH a;
+            LOAD_A(a, sA, row * TW * CP + kc * 16u, CP);
+            acc = mma(acc, a, w, (kc * cout + nt * 16u) * 16u);
+#else
+            AH a; BH b;
+            coopMatLoad(a, sA, row * TW * CP + kc * 16u, CP, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b, w.v, (kc * cout + nt * 16u) * 16u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+            ACC f = ACC(acc);
+            f = coopMatMulAdd(a, b, f);
+            acc = tohalf(f);
+#endif
+        }
+#ifdef SPLITK
+        tot = sl == 0u ? acc : addh(tot, acc);
+    }
+    return tot;
+#else
+    }
+    return acc;
+#endif
+}
+
+// a 1x1 conv of sA in place (each wave its own rows), then bias and (RELU) ReLU
+void conv1x1All(uint wave, H16 w, H16 bias, bool relu)
+{
+#ifdef D4R_EMU_CM
+    // the 1x1 per row pair: shared B tile (mma2) when the wave holds two rows, else store per nt at once
+    #if RPW == 2
+    HAC outs0[C / 16], outs1[C / 16];
+    for (uint nt = 0u; nt < C / 16u; ++nt) {
+        HAC acc0 = hac0(), acc1 = hac0();
+        for (uint kc = 0u; kc < NK2; ++kc) {
+            AH a0, a1;
+            LOAD_A(a0, sA, (wave * 2u) * TW * CP + kc * 16u, CP);
+            LOAD_A(a1, sA, (wave * 2u + 1u) * TW * CP + kc * 16u, CP);
+            mma2(acc0, acc1, a0, a1, w, (kc * C + nt * 16u) * 16u);
+        }
+        outs0[nt] = acc0; outs1[nt] = acc1;
+    }
+    for (uint nt = 0u; nt < C / 16u; ++nt) {
+        STORE(outs0[nt], sA, (wave * 2u) * TW * CP + nt * 16u, CP);
+        STORE(outs1[nt], sA, (wave * 2u + 1u) * TW * CP + nt * 16u, CP);
+    }
+    #else
+    for (uint mi = 0u; mi < RPW; ++mi) {
+        const uint row = wave * RPW + mi;
+        HAC outs[C / 16];
+        for (uint nt = 0u; nt < C / 16u; ++nt) outs[nt] = conv1x1(row, w, C, nt, NK2);
+        for (uint nt = 0u; nt < C / 16u; ++nt)
+            STORE(outs[nt], sA, row * TW * CP + nt * 16u, CP);
+    }
+    #endif
+#else
+    for (uint mi = 0u; mi < RPW; ++mi) {
+        const uint row = wave * RPW + mi;
+        HAC outs[C / 16];
+        for (uint nt = 0u; nt < C / 16u; ++nt) outs[nt] = conv1x1(row, w, C, nt, NK2);
+        for (uint nt = 0u; nt < C / 16u; ++nt)
+            coopMatStore(outs[nt], sA, row * TW * CP + nt * 16u, CP, gl_CooperativeMatrixLayoutRowMajor);
+    }
+#endif
+    barrier();
+    for (uint i = gl_LocalInvocationIndex; i < PX * C; i += 128u) {
+        const uint col = i % C, px = i / C;
+        const float16_t v = sA[px * CP + col] + bias.v[slot(perm(col), 4u)];
+        sA[px * CP + col] = relu ? max(v, float16_t(0.0)) : v;
+    }
+    barrier();
+}
+
+void main()
+{
+    RR_ZERO16 = uint16_t(gl_NumWorkGroups.z - 1u);
+    const uint tid = gl_LocalInvocationIndex, wave = tid >> 5u;
+    const int H = pi(OUT + 8), W = pi(OUT + 12);
+    const int y0 = int(gl_WorkGroupID.y) * TH, x0 = int(gl_WorkGroupID.x) * TW;
+
+    // ---- the conv's input, zero outside the level: the features below upsampled, plus the skip tensor
+    {
+        const int LH = pi(8), LW = pi(12), LC = pi(16), LRS = pi(20);
+        U8 low = U8(ptr(0));
+#ifdef UPS
+        const int SC = pi(48), SRS = pi(52);
+        U8 skp = U8(ptr(32));
+#endif
+        for (uint i = tid; i < HH * HW * CIN; i += 128u) {
+            const uint s = i % CIN, q = i / CIN, hx = q % HW, hy = q / HW;
+            const int y = y0 - 1 + int(hy), x = x0 - 1 + int(hx);
+            const int c = int(perm(s));
+            float16_t v = float16_t(0.0);
+            if (y >= 0 && y < H && x >= 0 && x < W) {
+#ifdef UPS
+                const int iy = y >> 1, ix = x >> 1;
+                const int ny = clamp(iy + ((y & 1) == 0 ? -1 : 1), 0, LH - 1);
+                const int nx = clamp(ix + ((x & 1) == 0 ? -1 : 1), 0, LW - 1);
+                const float16_t a = dec8(uint(low.v[iy * LRS + ix * LC + c])), b = dec8(uint(low.v[iy * LRS + nx * LC + c]));
+                const float16_t a2 = dec8(uint(low.v[ny * LRS + ix * LC + c])), b2 = dec8(uint(low.v[ny * LRS + nx * LC + c]));
+                precise float16_t m0 = float16_t(0.75) * a, m1 = float16_t(0.75) * a2;
+                precise float16_t h0 = fma(float16_t(0.25), b, m0), h1 = fma(float16_t(0.25), b2, m1);
+                precise float16_t m2 = float16_t(0.75) * h0;
+                precise float16_t up = fma(float16_t(0.25), h1, m2);
+                precise float16_t sum = dec8(uint(skp.v[y * SRS + x * SC + c])) + up;
+                v = sum;
+#else
+                v = dec8(uint(low.v[y * LRS + x * LC + c]));
+#endif
+            }
+            sIn[(hy * HW + hx) * CINP + s] = v;
+        }
+    }
+    barrier();
+
+    // ---- conv 3x3: wave w computes rows 2w, 2w + 1 of the tile; results stay in registers until all waves are done
+    H16 w1 = H16(ptr(64));
+    HAC r1[RPW][C / 16];
+#if defined(D4R_EMU_CM) && RPW == 2
+    // m = 32: the wave's two tile rows advance together and share the staged B tile (mma2).
+    // m = 32: the wave's two tile rows advance together and share the staged B tile (mma2)
+    for (uint nt = 0u; nt < C / 16u; ++nt) {
+        HAC acc0 = hac0(), acc1 = hac0();
+        for (uint g = 0u; g < NK / KG; ++g)
+#ifdef D4R_EMU_CM
+        for (uint t = 0u; t < 9u; ++t) {
+#else
+        [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+#endif
+            for (uint kc = g * KG; kc < g * KG + KG; ++kc) {
+                const uint dy = t / 3u, dx = t % 3u;
+                AH a0, a1;
+                LOAD_A(a0, sIn, ((wave * 2u + dy) * HW + dx) * CINP + kc * 16u, CINP);
+                LOAD_A(a1, sIn, ((wave * 2u + 1u + dy) * HW + dx) * CINP + kc * 16u, CINP);
+                mma2(acc0, acc1, a0, a1, w1, ((kc * 9u + t) * C + nt * 16u) * 16u);
+            }
+        }
+        r1[0][nt] = acc0; r1[1][nt] = acc1;
+    }
+#else
+    for (uint mi = 0u; mi < RPW; ++mi) {
+        const uint row = wave * RPW + mi;
+        for (uint nt = 0u; nt < C / 16u; ++nt) {
+#ifdef D4R_EMU_CM
+            HAC acc = hac0();
+#else
+            HAC acc = HAC(float16_t(0.0));
+#endif
+            // K order: groups of KG chunks, within a group tap by tap, both chunks per tap (NVIDIA's loop)
+            for (uint g = 0u; g < NK / KG; ++g)
+#ifdef D4R_EMU_CM
+            for (uint t = 0u; t < 9u; ++t) {
+#else
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+#endif
+                for (uint kc = g * KG; kc < g * KG + KG; ++kc) {
+                    const uint dy = t / 3u, dx = t % 3u;
+#ifdef D4R_EMU_CM
+                    AH a;
+                    LOAD_A(a, sIn, ((row + dy) * HW + dx) * CINP + kc * 16u, CINP);
+                    acc = mma(acc, a, w1, ((kc * 9u + t) * C + nt * 16u) * 16u);
+#else
+                    AH a; BH b;
+                    coopMatLoad(a, sIn, ((row + dy) * HW + dx) * CINP + kc * 16u, CINP, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(b, w1.v, ((kc * 9u + t) * C + nt * 16u) * 16u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+                    ACC f = ACC(acc);
+                    f = coopMatMulAdd(a, b, f);
+                    acc = tohalf(f);
+#endif
+                }
+            }
+            r1[mi][nt] = acc;
+        }
+    }
+#endif
+    barrier();
+    for (uint mi = 0u; mi < RPW; ++mi)
+        for (uint nt = 0u; nt < C / 16u; ++nt)
+#ifdef D4R_EMU_CM
+            STORE(r1[mi][nt], sA, (wave * RPW + mi) * TW * CP + nt * 16u, CP);
+#else
+            coopMatStore(r1[mi][nt], sA, (wave * RPW + mi) * TW * CP + nt * 16u, CP, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+    barrier();
+    {
+        H16 b1 = H16(ptr(128));
+        for (uint i = tid; i < PX * C; i += 128u) {
+            const uint col = i % C, px = i / C;
+            sA[px * CP + col] = max(sA[px * CP + col] + b1.v[slot(perm(col), 4u)], float16_t(0.0));
+        }
+    }
+    barrier();
+
+    // ---- conv 1x1, the level's features (PDL: not stored)
+    conv1x1All(wave, H16(ptr(80)), H16(ptr(144)), true);
+#ifndef PDL
+    {
+        U8 dst = U8(ptr(OUT));
+        const int OC = pi(OUT + 16), ORS = pi(OUT + 20);
+        for (uint i = tid; i < PX * C; i += 128u) {
+            const uint col = i % C, px = i / C;
+            const int y = y0 + int(px / TW), x = x0 + int(px % TW);
+            if (y < H && x < W)
+                dst.v[y * ORS + x * OC + int(slot(perm(col), TS))] = uint8_t(enc8(sA[px * CP + col]));
+        }
+    }
+#endif
+
+    // ---- the head
+#ifdef PDL
+    // the third conv is the head, its bias added, no ReLU: slots 0-11 (stored order) are the logits, slots 16-23
+    // go to 216 (8 halves per pixel, for the output stage)
+#if defined(D4R_EMU_CM) && RPW == 2
+    // the head per row pair (shared B tile), bias applied over the tile below
+    HAC outs0[C / 16], outs1[C / 16];
+    for (uint nt = 0u; nt < C / 16u; ++nt) {
+        HAC acc0 = hac0(), acc1 = hac0();
+        for (uint kc = 0u; kc < NK2; ++kc) {
+            AH a0, a1;
+            LOAD_A(a0, sA, (wave * 2u) * TW * CP + kc * 16u, CP);
+            LOAD_A(a1, sA, (wave * 2u + 1u) * TW * CP + kc * 16u, CP);
+            mma2(acc0, acc1, a0, a1, H16(ptr(96)), (kc * C + nt * 16u) * 16u);
+        }
+        outs0[nt] = acc0; outs1[nt] = acc1;
+    }
+    for (uint nt = 0u; nt < C / 16u; ++nt) {
+        STORE(outs0[nt], sA, (wave * 2u) * TW * CP + nt * 16u, CP);
+        STORE(outs1[nt], sA, (wave * 2u + 1u) * TW * CP + nt * 16u, CP);
+    }
+    {
+        H16 b1 = H16(ptr(160));
+        for (uint i = tid; i < PX * C; i += 128u) {
+            const uint col = i % C, px = i / C;
+            sA[px * CP + col] = sA[px * CP + col] + b1.v[slot(perm(col), 4u)];
+        }
+    }
+#else
+    conv1x1All(wave, H16(ptr(96)), H16(ptr(160)), false);
+#endif
+    {
+        H16 dst = H16(ptr(216));
+        for (uint i = tid; i < PX * C; i += 128u) {
+            const uint col = i % C, px = i / C, s = slot(perm(col), 4u);
+            const int y = y0 + int(px / TW), x = x0 + int(px % TW);
+            if (s >= 16u && s < 24u && y < H && x < W) dst.v[(y * W + x) * 8 + int(s) - 16] = sA[px * CP + col];
+            if (s < 16u) sm[SL0 + px * NL + s] = sA[px * CP + col];
+        }
+    }
+    barrier();
+#else
+    conv1x1All(wave, H16(ptr(96)), H16(ptr(160)), true);
+    H16 w4 = H16(ptr(112));
+#if defined(D4R_EMU_CM) && RPW == 2
+    {
+        HAC acc0 = hac0(), acc1 = hac0();
+        for (uint kc = 0u; kc < NK2; ++kc) {
+            AH a0, a1;
+            LOAD_A(a0, sA, (wave * 2u) * TW * CP + kc * 16u, CP);
+            LOAD_A(a1, sA, (wave * 2u + 1u) * TW * CP + kc * 16u, CP);
+            mma2(acc0, acc1, a0, a1, w4, kc * 16u * 16u);
+        }
+        STORE(acc0, sm, SL0 + (wave * 2u) * TW * 16u, 16u);
+        STORE(acc1, sm, SL0 + (wave * 2u + 1u) * TW * 16u, 16u);
+    }
+#else
+    for (uint mi = 0u; mi < RPW; ++mi) {
+        const uint row = wave * RPW + mi;
+        HAC acc = conv1x1(row, w4, 16u, 0u, NK2);
+#ifdef D4R_EMU_CM
+        STORE(acc, sm, SL0 + row * TW * 16u, 16u);
+#else
+        coopMatStore(acc, sm, SL0 + row * TW * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+    }
+#endif
+    barrier();
+#endif
+
+    // ---- the filter, one pixel per thread
+    const uint px = tid;
+    const int row = y0 + int(px / TW), col = x0 + int(px % TW);
+    const int IH = pi(272), IW = pi(276), IS = pi(280);
+    const bool inside = px < PX && row < IH && col < IW;
+    float16_t lg[12];
+    if (px < PX) {
+#ifdef PDL
+        [[unroll]] for (uint s = 0u; s < 12u; ++s) lg[s] = sm[SL0 + px * NL + s];   // in slot order, bias added
+#else
+        H16 b4 = H16(ptr(176));
+        [[unroll]] for (uint col = 0u; col < 16u; ++col) {
+            const uint s = slot(P16(col), 2u);
+            if (s < 12u) lg[s] = sm[SL0 + px * NL + col] + b4.v[s];
+        }
+#endif
+    }
+#ifndef UPS
+    // Dec4: the encoders' filter (of the image at 256, split when 248 is set)
+    const bool down = ptr(248) != 0ul;
+    float16_t fr = float16_t(0.0), fg = float16_t(0.0), fb = float16_t(0.0);
+    if (inside) {
+        float16_t w[9];
+        softmax9(lg, w);
+        H16 img = H16(ptr(256));
+        int rr[3], cc[3];
+        taps3(row, IH, rr);
+        taps3(col, IW, cc);
+        [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+            const int o = (rr[t / 3u] * IW + cc[t % 3u]) * IS;
+            fr = fma(img.v[o], w[t], fr);
+            fg = fma(img.v[o + 1], w[t], fg);
+            fb = fma(img.v[o + 2], w[t], fb);
+        }
+        H16 dst = H16(ptr(240));
+        if (down) {
+            const float16_t f3[3] = float16_t[3](fr, fg, fb);
+            float16_t hp[3], lo[3];
+            [[unroll]] for (uint c = 0u; c < 3u; ++c) {
+                hp[c] = sigm(lg[9u + c]) * f3[c];
+                lo[c] = f3[c] + hp[c] * float16_t(-1.0);
+            }
+            const int o = (row * IW + col) * 8;
+            dst.v[o] = lo[0]; dst.v[o + 1] = lo[1]; dst.v[o + 2] = lo[2]; dst.v[o + 3] = hp[0];
+            dst.v[o + 4] = hp[1]; dst.v[o + 5] = hp[2];
+            fr = lo[0]; fg = lo[1]; fb = lo[2];
+        } else {
+            const int o = (row * IW + col) * 4;
+            dst.v[o] = fr; dst.v[o + 1] = fg; dst.v[o + 2] = fb; dst.v[o + 3] = float16_t(0.0);
+        }
+    }
+    if (down && px < PX) {
+        sm[SF0 + px * 4u] = fr * float16_t(0.25);
+        sm[SF0 + px * 4u + 1u] = fg * float16_t(0.25);
+        sm[SF0 + px * 4u + 2u] = fb * float16_t(0.25);
+    }
+    barrier();
+    if (down && inside && (px & 1u) == 0u && ((px / TW) & 1u) == 0u) {
+        H16 nxt = H16(ptr(248));
+        const int o = ((IW / 2) * (row / 2) + col / 2) * 4;
+        [[unroll]] for (uint c = 0u; c < 3u; ++c) {
+            const float16_t a = sm[SF0 + px * 4u + c] + sm[SF0 + (px + 1u) * 4u + c];
+            const float16_t b = sm[SF0 + (px + TW) * 4u + c] + sm[SF0 + (px + TW + 1u) * 4u + c];
+            nxt.v[o + int(c)] = a + b;
+        }
+        nxt.v[o + 3] = float16_t(0.0);
+    }
+#else
+    if (!inside) return;
+    float16_t w[9];
+    softmax9(lg, w);
+    H16 low = H16(ptr(256));
+    const int LW = IW / 2;
+    int rr[3], cc[3];
+    taps3(row, IH, rr);
+    taps3(col, IW, cc);
+    float16_t f[3] = float16_t[3](float16_t(0.0), float16_t(0.0), float16_t(0.0));
+    [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+        // the level below's image upsampled bilinearly at the tap
+        const int r = rr[t / 3u], c = cc[t % 3u];
+        const int ri0 = (r - 1) / 2, ci0 = (c - 1) / 2;
+        const int ri1 = ri0 + ((r != 0 && r != IH - 1) ? 1 : 0), ci1 = ci0 + ((c != 0 && c != IW - 1) ? 1 : 0);
+        const float16_t wx0 = (c % 2) == 1 ? float16_t(0.75) : float16_t(0.25), wx1 = (c % 2) == 1 ? float16_t(0.25) : float16_t(0.75);
+        const float16_t wy0 = (r % 2) == 1 ? float16_t(0.75) : float16_t(0.25), wy1 = (r % 2) == 1 ? float16_t(0.25) : float16_t(0.75);
+        precise float16_t wA = wx0 * wy0, wB = wx1 * wy0, wC = wx0 * wy1, wD = wx1 * wy1;
+        const int oA = (ri0 * LW + ci0) * 4, oB = (ri0 * LW + ci1) * 4, oC = (ri1 * LW + ci0) * 4, oD = (ri1 * LW + ci1) * 4;
+        [[unroll]] for (uint ch = 0u; ch < 3u; ++ch) {
+            precise float16_t u0 = low.v[oD + int(ch)] * wD;
+            precise float16_t u1 = fma(low.v[oC + int(ch)], wC, u0);
+            precise float16_t u2 = fma(low.v[oB + int(ch)], wB, u1);
+            precise float16_t u3 = fma(low.v[oA + int(ch)], wA, u2);
+            precise float16_t fc = fma(u3, w[t], f[ch]);
+            f[ch] = fc;
+        }
+    }
+    H16 det = H16(ptr(264));
+    const int od = (row * IW + col) * 8;
+    const float16_t al = sigm(lg[9]);
+    const float16_t om = fma(float16_t(-1.0), al, float16_t(1.0));
+    H16 dst = H16(ptr(240));
+    const int o = (row * IW + col) * 4;
+    [[unroll]] for (uint ch = 0u; ch < 3u; ++ch) {
+        precise float16_t fa = f[ch] * al;
+        precise float16_t v = fma(det.v[od + int(ch)], om, fa);
+        const float16_t hi = det.v[od + 3 + int(ch)];
+        precise float16_t vh = v + hi;
+        dst.v[o + int(ch)] = isnan(hi) ? v : vh;
+    }
+    dst.v[o + 3] = float16_t(0.0);
+#endif
+}

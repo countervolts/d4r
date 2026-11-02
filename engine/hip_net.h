@@ -21,13 +21,18 @@
 #include <string>
 #include <vector>
 namespace d4r {
+#ifdef _WIN32
+using ExternalMemoryHandle = void*; // an opaque NT handle (HANDLE) of a Vulkan allocation
+#else
+using ExternalMemoryHandle = int;   // an opaque file descriptor of a Vulkan allocation
+#endif
 class HipNetwork {
 public:
-    // tokensFd, outputFd: opaque file descriptors (Linux) or Win32 NT handles (Windows; the caller keeps ownership) of the two shared Vulkan allocations (ownership passes to HIP);
-    // allocationBytes: the size of each allocation; the buffers start at offset 0. width/height are preset
-    // dependent, as above.
-    HipNetwork(const std::string& modelDirectory, uint32_t width, uint32_t height, intptr_t tokensFd, intptr_t outputFd,
-               uint64_t tokensAllocationBytes, uint64_t outputAllocationBytes);
+    // tokens, output: the exported handles of the two shared Vulkan allocations (vk_external.h; ownership passes
+    // to HipNetwork); allocationBytes: the size of each allocation; the buffers start at offset 0. width/height
+    // are preset dependent, as above.
+    HipNetwork(const std::string& modelDirectory, uint32_t width, uint32_t height, ExternalMemoryHandle tokens,
+               ExternalMemoryHandle output, uint64_t tokensAllocationBytes, uint64_t outputAllocationBytes);
     ~HipNetwork();
     HipNetwork(const HipNetwork&) = delete;
     HipNetwork& operator=(const HipNetwork&) = delete;

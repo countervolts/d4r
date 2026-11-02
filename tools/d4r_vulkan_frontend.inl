@@ -1,0 +1,1763 @@
+// Native Vulkan NGX frontend. Included after the shared CUDA NGX implementation.
+// Resource ABI follows NVIDIA/DLSS include/nvsdk_ngx_defs_vk.h. No SDK dependency.
+// CPU staging is intentionally conservative: events keep the result in the
+// evaluating command buffer without ending/submitting an application-owned list.
+#include "d4r_vulkan_ngx.h"
+#include "d4r_vulkan_depth.h"
+#include "d4r_vulkan_staging.h"
+
+struct NativeVkApi
+{
+    VkDevice device = VK_NULL_HANDLE;
+    // The game's instance and adapter: d4r's engine (engine/) loads its entry points on this device.
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    PFN_vkGetInstanceProcAddr instanceProc = nullptr;
+    PFN_vkCreateImageView createView = nullptr;
+    PFN_vkDestroyImageView destroyView = nullptr;
+    VkPhysicalDeviceMemoryProperties memory = {};
+    PFN_vkCreateBuffer createBuffer = nullptr;
+    PFN_vkDestroyBuffer destroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements requirements = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    PFN_vkBindBufferMemory bind = nullptr;
+    PFN_vkMapMemory map = nullptr;
+    PFN_vkUnmapMemory unmap = nullptr;
+    PFN_vkCreateEvent createEvent = nullptr;
+    PFN_vkDestroyEvent destroyEvent = nullptr;
+    PFN_vkGetEventStatus eventStatus = nullptr;
+    PFN_vkSetEvent setEvent = nullptr;
+    PFN_vkResetEvent resetEvent = nullptr;
+    PFN_vkCmdSetEvent cmdSetEvent = nullptr;
+    PFN_vkCmdWaitEvents waitEvents = nullptr;
+    PFN_vkCmdPipelineBarrier barrier = nullptr;
+    PFN_vkCmdFillBuffer fill = nullptr;
+    PFN_vkDeviceWaitIdle idle = nullptr;
+    int(WINAPI* import)(VkDevice, uint64_t, uint64_t, CudaDevicePtr*, void**) = nullptr;
+    int(WINAPI* release)(void*) = nullptr;
+    uint32_t queueFamily = UINT32_MAX; // exclusive owner when the device has one compute-capable family
+    // Every compute-capable family: shared buffers are CONCURRENT across them, since a game may record
+    // DLSS on its async compute queue (Indiana Jones) as well as on the graphics queue (DOOM Eternal).
+    uint32_t families[8] = {};
+    uint32_t familyCount = 0;
+    bool external = false;
+};
+static NativeVkApi g_nativeVk;
+static D4rVkStaging g_nativeVkStaging;
+static std::mutex g_nativeVkMutex; // all native API calls, including init/teardown
+
+struct NativeVkPlane
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint8_t* mapped = nullptr;
+    NgxVkImage image = {};
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    size_t rowBytes = 0;
+    size_t capacity = 0;
+    CudaDevicePtr cuda = 0;
+    void* external = nullptr;
+    bool externalOwned = false;
+    D4rVkStagingSet staging;
+    // Pitch-linear texture on `cuda`, handed to NGX without a buffer->array copy
+    // (worker only). Pooled buffers keep it; the key detects a geometry change.
+    CudaObject texture = 0;
+    uint64_t textureKey = 0;
+};
+struct NativeVkFrame
+{
+    NativeVkPlane planes[5]; // color, depth, motion, optional exposure, output
+    VkEvent inputReady = VK_NULL_HANDLE, outputReady = VK_NULL_HANDLE, consumed = VK_NULL_HANDLE;
+    std::atomic<bool> cancel{false}, done{false};
+    std::atomic<NgxResult> result{NGX_SUCCESS};
+    std::thread waiter; // submission waits must not serialize across command buffers
+    FrameParams params;
+    uint32_t number = 0;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+};
+// The engine path (D4R_ENGINE): d4r's own network recorded straight into the game's command buffer, no staging.
+// Each recorded evaluation sets an event at its end, so the engine objects are destroyed only after the GPU has
+// finished every submitted recording (or at shutdown, after the application's device idle).
+struct NativeVkEngineView
+{
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspect = 0;
+    VkImageView view = VK_NULL_HANDLE;
+};
+struct NativeVkEngineState
+{
+    std::unique_ptr<d4r::GameUpscaler> k;
+    std::unique_ptr<vkhip::MNetwork> mVkHip; // m's network when vkhip took it (outlives m, which uses its buffers)
+    uint32_t mVkHipWidth = 0, mVkHipHeight = 0; // its fixed grid
+    std::unique_ptr<d4r::GameUpscalerM> m, mDynamic;
+    std::vector<VkEvent> pending, idle; // set at the end of a recording / reusable after it was set
+    std::vector<NativeVkEngineView> views; // depth-only views the engine samples where the game's view has stencil
+    // Ray Reconstruction (engine/game_rr.cpp) for a fixed render size; its vkhip stages outlive the denoiser. The
+    // denoiser stores RGBA16F only: any other output format is stored into `rImage`, copied into `rBuffer` and packed
+    // into the game's output by the staging write shader (one descriptor set per output view the game passes).
+    std::unique_ptr<vkhip::RRStages> rVkHip;
+    std::unique_ptr<d4r::GameDenoiser> r;
+    uint32_t rWidth = 0, rHeight = 0;
+    VkImage rImage = VK_NULL_HANDLE;
+    VkImageView rView = VK_NULL_HANDLE;
+    VkBuffer rBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory rImageMemory = VK_NULL_HANDLE, rBufferMemory = VK_NULL_HANDLE;
+    std::vector<std::pair<VkImageView, D4rVkStagingSet>> rOutputs;
+};
+struct NativeVkFeature
+{
+    Feature* feature;
+    std::vector<NativeVkFrame*> frames;
+    std::vector<NativeVkFrame*> reusable;
+    std::shared_ptr<NativeVkEngineState> engine; // null until the engine records a frame
+};
+static std::vector<std::shared_ptr<NativeVkEngineState>> g_nativeVkEngineRetired;
+static std::vector<NativeVkFeature> g_nativeVkFeatures;
+// Release can happen while recordings are still pending. Their GPU objects
+// outlive CUDA feature state and are reclaimed at completion or shutdown.
+static std::vector<NativeVkFrame*> g_nativeVkRetired;
+// ROCm retains imported mappings; reuse across feature recreation rather than
+// exporting and importing the same-sized allocations again on each mode change.
+static std::vector<NativeVkPlane> g_nativeVkBufferPool;
+static unsigned g_nativeVkExternalAllocations = 0;
+
+static DXGI_FORMAT native_vk_format(VkFormat format, size_t& bytes)
+{
+    bytes = 4;
+    switch (format)
+    {
+    case VK_FORMAT_R16G16B16A16_SFLOAT: bytes = 8; return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: bytes = 16; return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case VK_FORMAT_R16G16_SFLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+    case VK_FORMAT_R32G32_SFLOAT: bytes = 8; return DXGI_FORMAT_R32G32_FLOAT;
+    case VK_FORMAT_R32_SFLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return DXGI_FORMAT_D32_FLOAT; // depth-only buffer copy is 4 bytes
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case VK_FORMAT_R16_SFLOAT: bytes = 2; return DXGI_FORMAT_R16_FLOAT;
+    case VK_FORMAT_R16_UNORM: bytes = 2; return DXGI_FORMAT_R16_UNORM;
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_D16_UNORM_S8_UINT: bytes = 2; return DXGI_FORMAT_D16_UNORM;
+    case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    default: bytes = 0; return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static void native_vk_free_plane(NativeVkPlane& p, bool final = false)
+{
+    g_nativeVkStaging.free(p.staging);
+    if (p.external && !final) {
+        g_nativeVkBufferPool.push_back(p); p = {}; return;
+    }
+    if (p.external) g.worker.call([&] {
+        if (p.texture) g.cu.texObjectDestroy(p.texture);
+        g.cu.memFree(p.cuda); return g_nativeVk.release(p.external);
+    });
+    if (p.mapped) g_nativeVk.unmap(g_nativeVk.device, p.memory);
+    if (p.buffer) g_nativeVk.destroyBuffer(g_nativeVk.device, p.buffer, nullptr);
+    if (p.memory) g_nativeVk.free(g_nativeVk.device, p.memory, nullptr);
+    p = {};
+}
+
+// Exports a new device-local buffer and imports it into CUDA. The import can block on GPU work of
+// the game's queues, which may in turn wait for one of our pending frames: callers make sure none is.
+static bool native_vk_import(NativeVkPlane& p, VkDeviceSize bytes)
+{
+    if (g_nativeVkExternalAllocations >= 64) return false;
+    VkExternalMemoryBufferCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    info.size = bytes; info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = g_nativeVk.familyCount > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    info.queueFamilyIndexCount = g_nativeVk.familyCount > 1 ? g_nativeVk.familyCount : 0;
+    info.pQueueFamilyIndices = g_nativeVk.familyCount > 1 ? g_nativeVk.families : nullptr;
+    VkResult result = g_nativeVk.createBuffer(g_nativeVk.device, &info, nullptr, &p.buffer);
+    VkMemoryRequirements requirements = {};
+    if (result == VK_SUCCESS) g_nativeVk.requirements(g_nativeVk.device, p.buffer, &requirements);
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 2 && type == UINT32_MAX; ++pass)
+        for (uint32_t i = 0; i < g_nativeVk.memory.memoryTypeCount; ++i) {
+            const auto flags = g_nativeVk.memory.memoryTypes[i].propertyFlags;
+            if ((requirements.memoryTypeBits & (1u << i)) && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                (pass || !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) { type = i; break; }
+        }
+    VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.buffer = p.buffer;
+    VkExportMemoryAllocateInfo exportInfo = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &dedicated};
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkMemoryAllocateInfo allocation = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exportInfo};
+    allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
+    if (result == VK_SUCCESS && type != UINT32_MAX) result = g_nativeVk.allocate(g_nativeVk.device, &allocation, nullptr, &p.memory);
+    else result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (result == VK_SUCCESS) result = g_nativeVk.bind(g_nativeVk.device, p.buffer, p.memory, 0);
+    int imported = -1;
+    if (result == VK_SUCCESS) imported = g.worker.call([&] {
+        return g_nativeVk.import(g_nativeVk.device, reinterpret_cast<uint64_t>(p.memory), requirements.size, &p.cuda, &p.external);
+    });
+    if (result == VK_SUCCESS && imported == 0) {
+        p.capacity = bytes; ++g_nativeVkExternalAllocations;
+        logf("native Vulkan VRAM buffer: %llu bytes, type=%u", static_cast<unsigned long long>(bytes), type);
+        return true;
+    }
+    logf("native Vulkan VRAM export/import unavailable: Vulkan=%d CUDA=%d; using host staging", result, imported);
+    const auto image = p.image; const auto format = p.format; const auto row = p.rowBytes;
+    native_vk_free_plane(p, true); p.image = image; p.format = format; p.rowBytes = row;
+    // Avoid repeating an unsupported import for every subsequent plane/frame.
+    g_nativeVk.external = false;
+    return false;
+}
+
+static bool native_vk_vram_plane(NativeVkPlane& p, VkDeviceSize bytes, bool allowImport)
+{
+    if (!g_nativeVk.external) return false;
+    auto best = g_nativeVkBufferPool.end();
+    for (auto it = g_nativeVkBufferPool.begin(); it != g_nativeVkBufferPool.end(); ++it)
+        if (it->capacity >= bytes && (best == g_nativeVkBufferPool.end() || it->capacity < best->capacity)) best = it;
+    if (best != g_nativeVkBufferPool.end()) {
+        const auto image = p.image; const auto format = p.format; const auto row = p.rowBytes;
+        p = *best; p.image = image; p.format = format; p.rowBytes = row;
+        g_nativeVkBufferPool.erase(best); return true;
+    }
+    return allowImport && native_vk_import(p, bytes); // otherwise host staging for this frame
+}
+
+// With no frame pending, import spare buffers for the frames that will be in flight later
+// (D4R_VULKAN_SPARE_SETS, default 3), so steady state never imports while the GPU waits on us.
+static void native_vk_prefill(const NativeVkFrame& frame)
+{
+    static const unsigned spares = env_uint("D4R_VULKAN_SPARE_SETS", 3);
+    std::vector<VkDeviceSize> sizes;
+    for (const auto& p : frame.planes) if (p.cuda) sizes.push_back(p.rowBytes * p.image.height);
+    std::sort(sizes.begin(), sizes.end(), std::greater<>());
+    std::vector<bool> claimed(g_nativeVkBufferPool.size(), false);
+    for (const auto bytes : sizes)
+        for (unsigned k = 0; k < spares && g_nativeVk.external; ++k) {
+            size_t best = claimed.size();
+            for (size_t i = 0; i < claimed.size(); ++i)
+                if (!claimed[i] && g_nativeVkBufferPool[i].capacity >= bytes &&
+                    (best == claimed.size() || g_nativeVkBufferPool[i].capacity < g_nativeVkBufferPool[best].capacity)) best = i;
+            if (best != claimed.size()) { claimed[best] = true; continue; }
+            NativeVkPlane spare;
+            if (!native_vk_import(spare, bytes)) return;
+            g_nativeVkBufferPool.push_back(spare); claimed.push_back(true);
+        }
+}
+
+static void native_vk_free_frame(NativeVkFrame* frame)
+{
+    if (frame->waiter.joinable()) frame->waiter.join();
+    for (auto& p : frame->planes)
+    {
+        native_vk_free_plane(p);
+    }
+    if (frame->inputReady) g_nativeVk.destroyEvent(g_nativeVk.device, frame->inputReady, nullptr);
+    if (frame->outputReady) g_nativeVk.destroyEvent(g_nativeVk.device, frame->outputReady, nullptr);
+    if (frame->consumed) g_nativeVk.destroyEvent(g_nativeVk.device, frame->consumed, nullptr);
+    delete frame;
+}
+
+static bool native_vk_plane(NativeVkPlane& plane, const NgxVkResource* resource, int index, bool allowImport)
+{
+    if (!resource || resource->type != 0) return false;
+    plane.image = resource->resource.image;
+    const auto& image = plane.image;
+    const VkImageAspectFlags aspect = image.range.aspectMask;
+    if (!image.image || !image.view || !image.width || !image.height ||
+        image.width > 16384 || image.height > 16384 || image.range.levelCount != 1 ||
+        image.range.layerCount != 1 || !d4r_vk_copy_aspect(image.format, aspect))
+        return false;
+    if (d4r_vk_depth_bytes(image.format) && aspect != VK_IMAGE_ASPECT_DEPTH_BIT)
+        return false; // a sampled depth view must not include the stencil aspect
+    size_t bytes;
+    plane.format = native_vk_format(image.format, bytes);
+    if (!bytes || (index == 4 ? !D4rVkStaging::supported_output(image.format) :
+                                !supported_input(static_cast<Plane>(index), plane.format))) return false;
+    // Pack directly into CUDA's canonical layouts on the GPU. Sampling still
+    // avoids packed depth/stencil copies and requires no transfer image usage.
+    plane.format = index == 0 || index == 4 ? DXGI_FORMAT_R16G16B16A16_FLOAT :
+                   index == 2 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+    plane.rowBytes = (index == 0 || index == 4 ? 8 : 4) * image.width;
+    VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = plane.rowBytes * image.height;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const auto inputLayout = env_uint("D4R_VULKAN_INPUT_GENERAL", 0) != 0
+        ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (plane.buffer && plane.capacity >= info.size)
+        return g_nativeVkStaging.set(plane.staging, image.view, image.format, plane.buffer,
+                                    info.size, index == 4, inputLayout);
+    if (plane.buffer)
+    {
+        const auto descriptor = plane.image;
+        const auto format = plane.format;
+        const auto pitch = plane.rowBytes;
+        native_vk_free_plane(plane);
+        plane.image = descriptor; plane.format = format; plane.rowBytes = pitch;
+    }
+    if (native_vk_vram_plane(plane, info.size, allowImport))
+        return g_nativeVkStaging.set(plane.staging, image.view, image.format, plane.buffer,
+                                    info.size, index == 4, inputLayout);
+    if (g_nativeVk.createBuffer(g_nativeVk.device, &info, nullptr, &plane.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements;
+    g_nativeVk.requirements(g_nativeVk.device, plane.buffer, &requirements);
+    uint32_t type = UINT32_MAX;
+    const auto flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // Reading float4 pixels from uncached mapped GTT/BAR memory makes every
+    // scalar conversion pay uncached access latency. Prefer cached, coherent
+    // host memory, retaining the coherent fallback on devices without it.
+    for (int cached = 1; cached >= 0 && type == UINT32_MAX; --cached)
+        for (uint32_t i = 0; i < g_nativeVk.memory.memoryTypeCount; ++i)
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (g_nativeVk.memory.memoryTypes[i].propertyFlags & flags) == flags &&
+                (!cached || (g_nativeVk.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)))
+            { type = i; break; }
+    if (type == UINT32_MAX) return false;
+    VkMemoryAllocateInfo allocation = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = type;
+    static unsigned memoryReports = 0;
+    if ((index == 0 || index == 4) && memoryReports < 6)
+    {
+        ++memoryReports;
+        logf("Vulkan staging %s memory: type=%u flags=0x%x bytes=%llu",
+             index == 4 ? "output" : "input", type,
+             g_nativeVk.memory.memoryTypes[type].propertyFlags,
+             static_cast<unsigned long long>(info.size));
+    }
+    if (!(g_nativeVk.allocate(g_nativeVk.device, &allocation, nullptr, &plane.memory) == VK_SUCCESS &&
+           g_nativeVk.bind(g_nativeVk.device, plane.buffer, plane.memory, 0) == VK_SUCCESS &&
+           g_nativeVk.map(g_nativeVk.device, plane.memory, 0, VK_WHOLE_SIZE, 0,
+                          reinterpret_cast<void**>(&plane.mapped)) == VK_SUCCESS)) return false;
+    plane.capacity = info.size;
+    return g_nativeVkStaging.set(plane.staging, image.view, image.format, plane.buffer,
+                                info.size, index == 4, inputLayout);
+}
+
+static bool native_vk_consumed(const NativeVkFrame& frame)
+{
+    return frame.done.load() && g_nativeVk.eventStatus(g_nativeVk.device, frame.consumed) == VK_EVENT_SET;
+}
+
+static void native_vk_reap(std::vector<NativeVkFrame*>& frames)
+{
+    for (auto it = frames.begin(); it != frames.end();)
+        if (native_vk_consumed(**it)) { native_vk_free_frame(*it); it = frames.erase(it); }
+        else ++it;
+}
+
+static NativeVkFrame* native_vk_reuse(NativeVkFeature& owner, VkCommandBuffer cmd)
+{
+    for (auto it = owner.frames.begin(); it != owner.frames.end();)
+        if (native_vk_consumed(**it)) {
+            if ((*it)->waiter.joinable()) (*it)->waiter.join();
+            owner.reusable.push_back(*it); it = owner.frames.erase(it);
+        } else ++it;
+    if (owner.frames.size() >= 8) return nullptr;
+    // Re-recording this same command buffer proves its previous recording was
+    // reset. Reuse only after CPU production AND GPU consumption completed.
+    for (auto it = owner.reusable.begin(); it != owner.reusable.end(); ++it)
+        if ((*it)->commandBuffer == cmd) {
+            auto* frame = *it; owner.reusable.erase(it);
+            if (g_nativeVk.resetEvent(g_nativeVk.device, frame->inputReady) != VK_SUCCESS ||
+                g_nativeVk.resetEvent(g_nativeVk.device, frame->outputReady) != VK_SUCCESS ||
+                g_nativeVk.resetEvent(g_nativeVk.device, frame->consumed) != VK_SUCCESS) {
+                native_vk_free_frame(frame); return nullptr;
+            }
+            frame->cancel = false; frame->done = false; frame->result = NGX_SUCCESS; frame->params = {};
+            return frame;
+        }
+    while (owner.reusable.size() > 8) {
+        native_vk_free_frame(owner.reusable.front()); owner.reusable.erase(owner.reusable.begin());
+    }
+    return nullptr;
+}
+
+// Worker only. D4R_SHIM_LINEAR_INPUTS: NGX samples the shared VRAM buffer through a
+// pitch-linear texture (reported to NGX as an array by the bridge), skipping the
+// buffer->array copy. Rows must meet the texture pitch alignment; others copy.
+static CudaObject native_vk_linear_texture(NativeVkPlane& plane, int index)
+{
+    static const bool enabled = env_uint("D4R_SHIM_LINEAR_INPUTS", 0) != 0;
+    if (!enabled || !plane.cuda || g.cu.registerLinearTexture == nullptr || plane.rowBytes % 256 != 0)
+        return 0;
+    const uint64_t key = (static_cast<uint64_t>(index) << 60) ^ (static_cast<uint64_t>(plane.rowBytes) << 32) ^
+                         (static_cast<uint64_t>(plane.image.width) << 16) ^ plane.image.height;
+    if (plane.texture && plane.textureKey == key) return plane.texture;
+    if (plane.texture) g.cu.texObjectDestroy(plane.texture);
+    plane.texture = 0;
+    const Plane kind = static_cast<Plane>(index);
+    struct Pitch2D { CudaDevicePtr pointer; uint32_t format, channels; size_t width, height, pitch; } pitch2D =
+        {plane.cuda, plane_format(kind), plane_channels(kind), plane.image.width, plane.image.height, plane.rowBytes};
+    static_assert(sizeof(Pitch2D) == 40, "CUDA_RESOURCE_DESC pitch2D");
+    CudaResourceDesc resource = {};
+    resource.resType = 3; // CU_RESOURCE_TYPE_PITCH2D
+    memcpy(&resource.res, &pitch2D, sizeof(pitch2D));
+    const CudaTextureDesc sampler = input_sampler(plane.image.width, pitch2D.channels, kind == Plane::Color);
+    CudaObject object = 0;
+    int result = g.cu.texObjectCreate(&object, &resource, &sampler, nullptr);
+    if (result == 0)
+        result = g.cu.registerLinearTexture(object, plane.image.width, plane.image.height, pitch2D.format, pitch2D.channels);
+    if (result != 0) {
+        logf("Vulkan linear input %d (%ux%u, pitch %zu) failed: %d; copying", index, plane.image.width,
+             plane.image.height, plane.rowBytes, result);
+        if (object) g.cu.texObjectDestroy(object);
+        return 0;
+    }
+    plane.texture = object; plane.textureKey = key;
+    return object;
+}
+
+// Polls the input event. D4R_VULKAN_INPUT_POLL_US=N polls every N us; unset is
+// adaptive like the shim's output wait: sleep in chunks until shortly before the
+// predicted readiness (smoothed over earlier frames), then yield, backing off
+// when the game runs late. Detection latency is on the frame's critical path.
+static VkResult native_vk_wait_input(Feature* feature, NativeVkFrame* frame)
+{
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(env_uint("D4R_VULKAN_SUBMIT_TIMEOUT_MS", 30000));
+    static const int fixedPoll = [] {
+        const char* v = std::getenv("D4R_VULKAN_INPUT_POLL_US");
+        return v != nullptr && *v != '\0' ? static_cast<int>(env_uint("D4R_VULKAN_INPUT_POLL_US", 200)) : -1;
+    }();
+    constexpr double kMarginUs = 120.0, kStepUs = 20.0, kChunkUs = 200.0, kSpinAfterUs = 150.0;
+    const double predicted = feature->vkInputWaitEmaUs.load();
+    double lastNotReadyUs = -1.0;
+    VkResult ready = VK_EVENT_RESET;
+    while (!frame->cancel && (ready = g_nativeVk.eventStatus(g_nativeVk.device, frame->inputReady)) == VK_EVENT_RESET &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        if (fixedPoll >= 0) { d4r_sleep_us(static_cast<unsigned>(fixedPoll)); continue; }
+        const double elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        lastNotReadyUs = elapsed;
+        const double remaining = predicted - kMarginUs - elapsed;
+        if (remaining > kStepUs) d4r_sleep_us(static_cast<unsigned>(std::min(remaining, kChunkUs)));
+        else if (elapsed < predicted + kSpinAfterUs) d4r_sleep_us(0);
+        else d4r_sleep_us(static_cast<unsigned>(std::min(kStepUs * (1.0 + (elapsed - predicted - kSpinAfterUs) / 160.0), kChunkUs)));
+    }
+    if (ready == VK_EVENT_SET && fixedPoll < 0) {
+        const double waited = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        // Learn the readiness time (between the last NOT_READY and the successful query), not our own wait.
+        double sample = std::min(lastNotReadyUs >= 0.0 ? 0.5 * (lastNotReadyUs + waited) : waited, 20000.0);
+        feature->vkInputWaitEmaUs.store(predicted == 0.0 ? sample : 0.8 * predicted + 0.2 * sample);
+    }
+    return ready;
+}
+
+static void native_vk_run(Feature* feature, NativeVkFrame* frame)
+{
+    const auto waitStarted = ProfileClock::now();
+    // Independent submission waiter: recording order need not match submit
+    // order. Never block the CUDA worker on an unsubmitted command buffer.
+    const VkResult ready = native_vk_wait_input(feature, frame);
+    NgxResult result = NGX_FAIL_PLATFORM_ERROR;
+    const auto inputsReadyAt = ProfileClock::now();
+    if (!frame->cancel && ready == VK_EVENT_SET)
+    {
+        result = g.worker.call([&]() -> NgxResult {
+            const auto stageStart = ProfileClock::now();
+            InputSlot& slot = feature->inputs[0];
+            for (int i = 0; i < 4; ++i)
+            {
+                auto& p = frame->planes[i];
+                if (!p.buffer) continue;
+                if (p.cuda) {
+                    slot.host[i].width = p.image.width; slot.host[i].height = p.image.height;
+                    slot.host[i].rowBytes = p.rowBytes;
+                    continue;
+                }
+                Staging staging;
+                staging.mapped = p.mapped;
+                staging.width = p.image.width; staging.height = p.image.height;
+                staging.format = p.format;
+                staging.layout.Footprint.RowPitch = static_cast<UINT>(p.rowBytes);
+                stage_plane(static_cast<Plane>(i), staging, slot.host[i], nullptr, i, 0);
+            }
+            auto& p = frame->params;
+            const auto staged = ProfileClock::now();
+            bool ok = true, copied = false;
+            CudaImage* images[] = {&feature->color, &feature->depth, &feature->motion, &feature->exposure};
+            CudaObject linear[4] = {};
+            for (int i = 0; i < 4 && ok; ++i) {
+                auto& plane = frame->planes[i];
+                if (!plane.buffer) continue;
+                copied = copied || !(linear[i] = native_vk_linear_texture(plane, i));
+                if (linear[i]) continue;
+                if (!plane.cuda) {
+                    ok = upload_plane(static_cast<Plane>(i), slot.host[i], *images[i], frame->number, nullptr, i);
+                    continue;
+                }
+                ok = ensure_cuda_image(*images[i], plane.image.width, plane.image.height,
+                                       plane_format(static_cast<Plane>(i)), plane_channels(static_cast<Plane>(i)), false, i == 0);
+                CudaMemcpy2D copy = {};
+                copy.srcMemoryType = CUDA_MEMORY_DEVICE; copy.srcDevice = plane.cuda; copy.srcPitch = plane.rowBytes;
+                copy.dstMemoryType = CUDA_MEMORY_ARRAY; copy.dstArray = images[i]->array;
+                copy.WidthInBytes = plane.rowBytes; copy.Height = plane.image.height;
+                if (ok) ok = copy_2d(copy) == 0;
+            }
+            ok = ok && ensure_cuda_image(feature->output, feature->outWidth, feature->outHeight, CUDA_FORMAT_HALF, 4, true, false);
+            CudaObject dilated = ok ? prepare_dilated_motion(*feature, slot, p) : 0;
+            // NGX does not evaluate on the copies' stream: they must finish first. Linear
+            // inputs were completed by the game's GPU before the input event.
+            if (!ok || ((copied || dilated) && g.cu.ctxSynchronize() != 0)) return NGX_FAIL_PLATFORM_ERROR;
+            const auto uploaded = ProfileClock::now();
+            if (feature->evaluatedFrames++ == 0) p.reset = 1;
+            set_evaluation_parameters(*feature, p);
+            CudaObject* handles[] = {&feature->colorHandle, &feature->depthHandle, &feature->motionHandle, &feature->exposureHandle};
+            for (int i = 0; i < 4; ++i)
+                if (linear[i]) *handles[i] = linear[i]; // the parameters point at these variables
+            if (dilated) feature->motionHandle = dilated;
+            const auto& destination = frame->planes[4];
+            // D4R_SHIM_OUTPUT_DIRECT: the native output kernel stores straight into the
+            // shared output buffer. Set while the previous output kernel was native,
+            // undone below when this frame's was not (it then wrote the array).
+            static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
+            const bool nativeOutput = g.cu.outputKernelNative == nullptr || g.cu.outputKernelNative() == 1;
+            if (outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr &&
+                feature->output.array != nullptr && (nativeOutput || feature->outputRedirected)) {
+                const bool redirect = nativeOutput && destination.cuda &&
+                    g.cu.setArrayRedirect(feature->output.array, destination.cuda, static_cast<uint32_t>(destination.rowBytes)) == 0;
+                if (!redirect && feature->outputRedirected) g.cu.setArrayRedirect(feature->output.array, 0, 0);
+                static bool logged = false;
+                if (redirect && !logged) { logf("Vulkan frame %u: direct output (no array copy)", frame->number); logged = true; }
+                feature->outputRedirected = redirect;
+            }
+            NgxResult evaluated = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
+            if (evaluated == NGX_FAIL_INVALID_PARAMETER && recreate_for_render_size(*feature, p, frame->number))
+                evaluated = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
+            if (feature->outputRedirected && g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1) {
+                g.cu.setArrayRedirect(feature->output.array, 0, 0);
+                feature->outputRedirected = false;
+            }
+            if (synchronize_default_stream(*feature, nullptr, &feature->evalWaitEmaUs) != 0) return NGX_FAIL_PLATFORM_ERROR;
+            if (evaluated != NGX_SUCCESS) return evaluated;
+            const auto evaluatedAt = ProfileClock::now();
+            if (destination.cuda && feature->outputRedirected) {
+                // already in the shared buffer
+            } else if (destination.cuda) {
+                CudaMemcpy2D copy = {};
+                copy.srcMemoryType = CUDA_MEMORY_ARRAY; copy.srcArray = feature->output.array;
+                copy.dstMemoryType = CUDA_MEMORY_DEVICE; copy.dstDevice = destination.cuda; copy.dstPitch = destination.rowBytes;
+                copy.WidthInBytes = destination.rowBytes; copy.Height = destination.image.height;
+                if (copy_2d(copy) != 0 || g.cu.ctxSynchronize() != 0) return NGX_FAIL_PLATFORM_ERROR;
+            } else if (!download_output(*feature, feature->outputHost[0], frame->number, nullptr)) return NGX_FAIL_PLATFORM_ERROR;
+            const auto downloaded = ProfileClock::now();
+            if (!destination.cuda) std::memcpy(destination.mapped, feature->outputHost[0].bytes, feature->outputHost[0].size());
+            feature->completedFrames++;
+            if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
+                logf("D4R_VULKAN_PROFILE frame=%u stage=%.3f upload=%.3f evaluate=%.3f download=%.3f encode=%.3f ms",
+                     frame->number, profile_ms(stageStart, staged), profile_ms(staged, uploaded),
+                     profile_ms(uploaded, evaluatedAt), profile_ms(evaluatedAt, downloaded),
+                     profile_ms(downloaded, ProfileClock::now()));
+            if (frame->number <= 3) logf("native Vulkan frame %u CUDA output ready (%ux%u)",
+                                         frame->number, destination.image.width, destination.image.height);
+            return NGX_SUCCESS;
+        });
+    }
+    if (result != NGX_SUCCESS)
+    {
+        // Never leave the GPU permanently waiting on an abandoned/failed job.
+        // Signal a cleared output and expose failure on the next API call.
+        auto& output = frame->planes[4];
+        if (output.mapped) std::memset(output.mapped, 0, output.rowBytes * output.image.height);
+        // VRAM output is cleared by the recorded GPU commands before releasing
+        // it to CUDA. A cancelled, unsubmitted job must not write unowned memory.
+        logf("Vulkan frame %u failed/cancelled (0x%08x, input event %d)", frame->number, result, ready);
+    }
+    frame->result = result;
+    const auto signalStarted = ProfileClock::now();
+    if (g_nativeVk.setEvent(g_nativeVk.device, frame->outputReady) != VK_SUCCESS)
+        frame->result = NGX_FAIL_PLATFORM_ERROR;
+    frame->done = true;
+    if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
+        logf("D4R_VULKAN_WAIT frame=%u input_ready=%.3f signal=%.3f total=%.3f ms",
+             frame->number, profile_ms(waitStarted, inputsReadyAt),
+             profile_ms(signalStarted, ProfileClock::now()), profile_ms(waitStarted, ProfileClock::now()));
+}
+
+static void native_vk_process_exit();
+static void WINAPI native_vk_shutdown_hook() { native_vk_process_exit(); }
+
+static NgxResult native_vk_init(unsigned long long id, const wchar_t* path, VkInstance instance,
+                               VkPhysicalDevice physical, VkDevice device, PFN_vkGetInstanceProcAddr instanceProc,
+                               PFN_vkGetDeviceProcAddr deviceProc, const NgxFeatureCommonInfo* info,
+                               unsigned int version, const ProjectIdentity* project = nullptr)
+{
+    std::lock_guard<std::mutex> lock(g_nativeVkMutex);
+    if (!instance || !physical || !device || g.device) return NGX_FAIL_INVALID_PARAMETER;
+    if (g_nativeVk.device) return g_nativeVk.device == device ? NGX_SUCCESS : NGX_FAIL_INVALID_PARAMETER;
+    if (!instanceProc)
+    {
+        HMODULE module = LoadLibraryA("vulkan-1.dll");
+        if (!module || !load_export(module, "vkGetInstanceProcAddr", instanceProc)) return NGX_FAIL_PLATFORM_ERROR;
+    }
+    if (!deviceProc) deviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instanceProc(instance, "vkGetDeviceProcAddr"));
+    auto memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(instanceProc(instance, "vkGetPhysicalDeviceMemoryProperties"));
+    if (!deviceProc || !memory) return NGX_FAIL_PLATFORM_ERROR;
+    NativeVkApi api;
+    api.device = device;
+    api.instance = instance;
+    api.physical = physical;
+    api.instanceProc = instanceProc;
+    memory(physical, &api.memory);
+    bool ok = true;
+    auto load = [&](auto& fn, const char* name) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(deviceProc(device, name));
+        ok &= fn != nullptr;
+    };
+    load(api.createBuffer, "vkCreateBuffer"); load(api.destroyBuffer, "vkDestroyBuffer");
+    load(api.requirements, "vkGetBufferMemoryRequirements"); load(api.allocate, "vkAllocateMemory");
+    load(api.free, "vkFreeMemory"); load(api.bind, "vkBindBufferMemory");
+    load(api.map, "vkMapMemory"); load(api.unmap, "vkUnmapMemory");
+    load(api.createEvent, "vkCreateEvent"); load(api.destroyEvent, "vkDestroyEvent");
+    load(api.eventStatus, "vkGetEventStatus"); load(api.setEvent, "vkSetEvent");
+    load(api.resetEvent, "vkResetEvent");
+    load(api.cmdSetEvent, "vkCmdSetEvent"); load(api.waitEvents, "vkCmdWaitEvents");
+    load(api.barrier, "vkCmdPipelineBarrier"); load(api.idle, "vkDeviceWaitIdle");
+    load(api.fill, "vkCmdFillBuffer");
+    load(api.createView, "vkCreateImageView"); load(api.destroyView, "vkDestroyImageView");
+    if (!ok) return NGX_FAIL_PLATFORM_ERROR;
+    // Match NGX's CUDA adapter identity to the supplied Vulkan physical device.
+    auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(instanceProc(instance, "vkGetPhysicalDeviceProperties2"));
+    if (!properties2) properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(instanceProc(instance, "vkGetPhysicalDeviceProperties2KHR"));
+    if (properties2)
+    {
+        VkPhysicalDeviceIDProperties identity = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &identity};
+        properties2(physical, &properties);
+        VkPhysicalDevicePCIBusInfoPropertiesEXT bus = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+        properties.pNext = &bus;
+        properties2(physical, &properties);
+        char pci[32] = {};
+        if (bus.pciDomain || bus.pciBus || bus.pciDevice || bus.pciFunction)
+            std::snprintf(pci, sizeof(pci), "%04x:%02x:%02x.%x", bus.pciDomain, bus.pciBus, bus.pciDevice, bus.pciFunction);
+        SetEnvironmentVariableA("D4R_RENDER_PCI", pci[0] ? pci : nullptr);
+        if (identity.deviceLUIDValid)
+        {
+            uint32_t low, high;
+            std::memcpy(&low, identity.deviceLUID, 4); std::memcpy(&high, identity.deviceLUID + 4, 4);
+            char value[24];
+            std::snprintf(value, sizeof(value), "0x%08x", low); SetEnvironmentVariableA("D4R_CUDA_LUID_LOW", value);
+            std::snprintf(value, sizeof(value), "0x%08x", high); SetEnvironmentVariableA("D4R_CUDA_LUID_HIGH", value);
+            std::snprintf(value, sizeof(value), "%u", identity.deviceNodeMask); SetEnvironmentVariableA("D4R_CUDA_NODE_MASK", value);
+        }
+    }
+    D4rVkStaging staging;
+    if (!staging.init(device, deviceProc)) { staging.destroy(); return NGX_FAIL_PLATFORM_ERROR; }
+    const auto result = initialize(id, path, nullptr, info, version, project);
+    if (result == NGX_SUCCESS)
+    {
+        auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(instanceProc(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+        if (families) {
+            uint32_t count = 0; families(physical, &count, nullptr);
+            std::vector<VkQueueFamilyProperties> properties(count); families(physical, &count, properties.data());
+            for (uint32_t i = 0; i < count && api.familyCount < 8; ++i)
+                if (properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) api.families[api.familyCount++] = i;
+            if (api.familyCount == 1) api.queueFamily = api.families[0];
+        }
+        load_export(g.cuda, "d4rImportVulkanMemory", api.import);
+        load_export(g.cuda, "d4rReleaseVulkanMemory", api.release);
+        // NGX's own detach tears CUDA down before ours runs; the bridge calls this first.
+        void(WINAPI* setShutdownHook)(void(WINAPI*)()) = nullptr;
+        if (load_export(g.cuda, "d4rSetShutdownHook", setShutdownHook)) setShutdownHook(native_vk_shutdown_hook);
+        else logf("CUDA bridge lacks d4rSetShutdownHook: a game exit during DLSS can still reset the GPU ring");
+        api.external = env_uint("D4R_VULKAN_VRAM_INTEROP", 0) != 0 && api.import && api.release &&
+                       api.familyCount > 0 && deviceProc(device, "vkGetMemoryWin32HandleKHR") != nullptr;
+        g_nativeVk = api;
+        g_nativeVkStaging = staging;
+        g.nativeVulkan = true;
+        logf("native Vulkan NGX ready: device=%p, sampled/storage compute staging (experimental), VRAM interop=%d, "
+             "%u compute-capable queue famil%s", static_cast<void*>(device), api.external, api.familyCount,
+             api.familyCount == 1 ? "y" : "ies (concurrent sharing)");
+    }
+    else staging.destroy();
+    return result;
+}
+
+static void native_vk_ownership(VkCommandBuffer cmd, NativeVkPlane& p, bool external)
+{
+    if (!p.cuda || p.externalOwned == external) return;
+    VkBufferMemoryBarrier b = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    b.buffer = p.buffer; b.offset = 0; b.size = VK_WHOLE_SIZE;
+    // Concurrent buffers are shared by every family the game may record on (RADV keeps buffers
+    // uncompressed, so CUDA's view needs no transfer); an exclusive one moves to/from EXTERNAL.
+    const bool concurrent = g_nativeVk.familyCount > 1;
+    b.srcQueueFamilyIndex = concurrent ? VK_QUEUE_FAMILY_IGNORED : external ? g_nativeVk.queueFamily : VK_QUEUE_FAMILY_EXTERNAL;
+    b.dstQueueFamilyIndex = concurrent ? VK_QUEUE_FAMILY_IGNORED : external ? VK_QUEUE_FAMILY_EXTERNAL : g_nativeVk.queueFamily;
+    b.srcAccessMask = external ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT : 0;
+    b.dstAccessMask = external ? 0 : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    g_nativeVk.barrier(cmd, external ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       external ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       0, 0, nullptr, 1, &b, 0, nullptr);
+    p.externalOwned = external;
+}
+
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init(unsigned long long id, const wchar_t* path, VkInstance instance,
+    VkPhysicalDevice physical, VkDevice device, PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp,
+    const NgxFeatureCommonInfo* info, unsigned int version)
+{ return native_vk_init(id, path, instance, physical, device, ip, dp, info, version); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init_Ext(unsigned long long id, const wchar_t* path, VkInstance instance,
+    VkPhysicalDevice physical, VkDevice device, unsigned int version, const NgxFeatureCommonInfo* info)
+{ return native_vk_init(id, path, instance, physical, device, nullptr, nullptr, info, version); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init_Ext2(unsigned long long id, const wchar_t* path, VkInstance instance,
+    VkPhysicalDevice physical, VkDevice device, PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp,
+    unsigned int version, const NgxFeatureCommonInfo* info)
+{ return native_vk_init(id, path, instance, physical, device, ip, dp, info, version); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init_with_ProjectID(const char* id, int engine, const char* engineVersion,
+    const wchar_t* path, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+    PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp, const NgxFeatureCommonInfo* info, unsigned int version)
+{
+    ProjectIdentity project{id ? id : "", engine, engineVersion ? engineVersion : ""};
+    return native_vk_init(0, path, instance, physical, device, ip, dp, info, version, &project);
+}
+// The NGX core/OptiScaler project-ID exports put SDKVersion before FeatureInfo.
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init_ProjectID(const char* id, int engine, const char* engineVersion,
+    const wchar_t* path, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+    PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp, unsigned int version, const NgxFeatureCommonInfo* info)
+{ return NVSDK_NGX_VULKAN_Init_with_ProjectID(id, engine, engineVersion, path, instance, physical, device, ip, dp, info, version); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Init_ProjectID_Ext(const char* id, int engine, const char* engineVersion,
+    const wchar_t* path, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+    PFN_vkGetInstanceProcAddr ip, PFN_vkGetDeviceProcAddr dp, unsigned int version, const NgxFeatureCommonInfo* info)
+{ return NVSDK_NGX_VULKAN_Init_ProjectID(id, engine, engineVersion, path, instance, physical, device, ip, dp, version, info); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetParameters(void** p)
+{ return p ? NVSDK_NGX_D3D12_GetParameters(p) : NGX_FAIL_INVALID_PARAMETER; }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_AllocateParameters(void** p)
+{ return p ? NVSDK_NGX_D3D12_AllocateParameters(p) : NGX_FAIL_INVALID_PARAMETER; }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetCapabilityParameters(void** p)
+{ return p ? NVSDK_NGX_D3D12_GetCapabilityParameters(p) : NGX_FAIL_INVALID_PARAMETER; }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_DestroyParameters(void* p)
+{ return NVSDK_NGX_D3D12_DestroyParameters(p); }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetScratchBufferSize(unsigned int feature, const void* p, size_t* size)
+{ return size ? NVSDK_NGX_D3D12_GetScratchBufferSize(feature, p, size) : NGX_FAIL_INVALID_PARAMETER; }
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_RequiredExtensions(unsigned int* ic, const char*** ie, unsigned int* dc, const char*** de)
+{
+    if (!ic || !ie || !dc || !de) return NGX_FAIL_INVALID_PARAMETER;
+    *ic = *dc = 0; *ie = *de = nullptr;
+    return NGX_SUCCESS; // CPU staging requires no NVIDIA or external-memory extensions
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(const void*, uint32_t* count, VkExtensionProperties** p)
+{
+    // Callers query the count with a null list first (Streamline does).
+    if (!count) return NGX_FAIL_INVALID_PARAMETER;
+    *count = 0;
+    if (p) *p = nullptr;
+    return NGX_SUCCESS;
+}
+// With the engine on, ask for the extensions its shaders use (VK_KHR_cooperative_matrix, VK_EXT_shader_float8), where
+// the adapter has them: a game enables what NGX asks for. Their feature bits still need a layer (RADV compiles and runs
+// the shaders without them; the harness's D4R_HARNESS_ENGINE_DEVICE enables them properly. With vkhip enabled
+// (D4R_ENGINE_VKHIP, on by default) also VK_KHR_pipeline_binary and VK_KHR_maintenance5, which it injects through on
+// AMD's driver.
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(VkInstance instance, VkPhysicalDevice physical,
+    const void* info, uint32_t* count, VkExtensionProperties** p)
+{
+    if (!count) return NGX_FAIL_INVALID_PARAMETER;
+    static VkExtensionProperties wanted[4] = {};
+    static uint32_t wantedCount = 0;
+    static std::once_flag once;
+    // Games ask before NGX init: d4r.ini (which sets D4R_ENGINE) must be applied first, or engine_requested()
+    // caches "off" for the whole process.
+    ensure_portable_config();
+    if (engine_requested() && env_uint("D4R_VULKAN_ENGINE", 1) != 0 && instance && physical)
+        std::call_once(once, [&] {
+            HMODULE module = LoadLibraryA("vulkan-1.dll");
+            PFN_vkGetInstanceProcAddr instanceProc = nullptr;
+            if (!module || !load_export(module, "vkGetInstanceProcAddr", instanceProc)) return;
+            auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                instanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
+            uint32_t n = 0;
+            if (!enumerate || enumerate(physical, nullptr, &n, nullptr) != VK_SUCCESS) return;
+            std::vector<VkExtensionProperties> available(n);
+            if (enumerate(physical, nullptr, &n, available.data()) != VK_SUCCESS) return;
+            std::vector<const char*> names = {"VK_KHR_cooperative_matrix", "VK_EXT_shader_float8"};
+            if (env_uint("D4R_ENGINE_VKHIP", 1) != 0)
+                names.insert(names.end(), {"VK_KHR_pipeline_binary", "VK_KHR_maintenance5"});
+            for (const char* name : names)
+                for (const auto& extension : available)
+                    if (std::strcmp(extension.extensionName, name) == 0) wanted[wantedCount++] = extension;
+            logf("native Vulkan engine: device extension requirements: %u", wantedCount);
+        });
+    *count = wantedCount;
+    if (p) *p = wantedCount ? wanted : nullptr;
+    (void)info;
+    return NGX_SUCCESS;
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_GetFeatureRequirements(VkInstance, VkPhysicalDevice, const void*, NgxFeatureRequirement* p)
+{ return p ? NVSDK_NGX_D3D12_GetFeatureRequirements(nullptr, nullptr, p) : NGX_FAIL_INVALID_PARAMETER; }
+
+static void native_vk_engine_start_rr(const Feature& feature);
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_CreateFeature(VkCommandBuffer, unsigned int id, void* p, NgxHandle** handle)
+{
+    std::lock_guard<std::mutex> lock(g_nativeVkMutex);
+    if (!g_nativeVk.device) return NGX_FAIL_NOT_INITIALIZED;
+    const auto result = create_feature(id, p, handle, true);
+    if (result == NGX_SUCCESS) g_nativeVkFeatures.push_back({find_feature(*handle), {}});
+    if (result == NGX_SUCCESS && g_nativeVkFeatures.back().feature->rayReconstruction)
+        native_vk_engine_start_rr(*g_nativeVkFeatures.back().feature);
+    return result;
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_CreateFeature1(VkDevice device, VkCommandBuffer cmd, unsigned int id, void* p, NgxHandle** handle)
+{
+    if (device != g_nativeVk.device) return NGX_FAIL_INVALID_PARAMETER;
+    return NVSDK_NGX_VULKAN_CreateFeature(cmd, id, p, handle);
+}
+
+static void native_vk_read_params(const Feature* feature, void* p, FrameParams& params)
+{
+    params.jitterX = get_float_or(p, "Jitter.Offset.X", 0); params.jitterY = get_float_or(p, "Jitter.Offset.Y", 0);
+    params.mvScaleX = get_float_or(p, "MV.Scale.X", 1); params.mvScaleY = get_float_or(p, "MV.Scale.Y", 1);
+    params.sharpness = get_float_or(p, "Sharpness", 0); params.reset = get_int_or(p, "Reset", 0);
+    params.preExposure = get_float_or(p, "DLSS.Pre.Exposure", 1); params.exposureScale = get_float_or(p, "DLSS.Exposure.Scale", 1);
+    params.frameTime = get_float_or(p, "FrameTimeDeltaInMsec", 16.6f);
+    params.renderWidth = get_uint_or(p, "DLSS.Render.Subrect.Dimensions.Width", feature->width);
+    params.renderHeight = get_uint_or(p, "DLSS.Render.Subrect.Dimensions.Height", feature->height);
+    if (!params.renderWidth) params.renderWidth = feature->width;
+    if (!params.renderHeight) params.renderHeight = feature->height;
+    params.colorBaseX = get_uint_or(p, "DLSS.Input.Color.Subrect.Base.X", 0);
+    params.colorBaseY = get_uint_or(p, "DLSS.Input.Color.Subrect.Base.Y", 0);
+    params.depthBaseX = get_uint_or(p, "DLSS.Input.Depth.Subrect.Base.X", 0);
+    params.depthBaseY = get_uint_or(p, "DLSS.Input.Depth.Subrect.Base.Y", 0);
+    params.mvBaseX = get_uint_or(p, "DLSS.Input.MV.Subrect.Base.X", 0);
+    params.mvBaseY = get_uint_or(p, "DLSS.Input.MV.Subrect.Base.Y", 0);
+    params.outputBaseX = get_uint_or(p, "DLSS.Output.Subrect.Base.X", 0);
+    params.outputBaseY = get_uint_or(p, "DLSS.Output.Subrect.Base.Y", 0);
+    params.invertX = get_int_or(p, "DLSS.Indicator.Invert.X.Axis", 0);
+    params.invertY = get_int_or(p, "DLSS.Indicator.Invert.Y.Axis", 0);
+}
+
+// --- Engine path: d4r's Vulkan network on the game's device, recorded into the game's command buffer ----------
+// D4R_ENGINE (d4r.ini [Engine]) selects it; D4R_VULKAN_ENGINE=0 keeps the staging path. It needs the engine's
+// device features on the game's device (cooperative matrix, and shader float8 for M/L): a game does not enable
+// those itself, so a layer or the harness (D4R_HARNESS_ENGINE_DEVICE) must. Frames the engine does not cover
+// return false and take the CUDA staging path.
+static std::once_flag g_nativeVkEngineOnce;
+static bool g_nativeVkEngineReady = false;
+// AMD's own driver (LLPC, native Windows) crashes compiling the engine's FP8 cooperative-matrix network, so M and L
+// run there only with their network on vkhip, never on the engine's Vulkan network
+static bool g_nativeVkLlpc = false;
+
+static void native_vk_engine_init()
+{
+    if (!d4r::loadVulkan(g_nativeVk.instanceProc, g_nativeVk.instance, g_nativeVk.device))
+    {
+        logf("native Vulkan engine: Vulkan entry points are unavailable");
+        return;
+    }
+    g_vk.native = true;
+    g_vk.physical = g_nativeVk.physical;
+    g_vk.device = g_nativeVk.device;
+    // the entry points vkhip creates its pipelines and buffers with (VRAM interop sets the same when it is on)
+    if (!g_vk.deviceProc)
+    {
+        g_vk.instance = g_nativeVk.instance;
+        g_vk.instanceProc = g_nativeVk.instanceProc;
+        g_vk.deviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            g_nativeVk.instanceProc(g_nativeVk.instance, "vkGetDeviceProcAddr"));
+        g_vk.memory = g_nativeVk.memory;
+    }
+    auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        g_nativeVk.instanceProc(g_nativeVk.instance, "vkEnumerateDeviceExtensionProperties"));
+    uint32_t count = 0;
+    bool cooperative = false, binaries = false, maintenance5 = false;
+    if (enumerate && enumerate(g_nativeVk.physical, nullptr, &count, nullptr) == VK_SUCCESS)
+    {
+        std::vector<VkExtensionProperties> extensions(count);
+        if (enumerate(g_nativeVk.physical, nullptr, &count, extensions.data()) == VK_SUCCESS)
+            for (const auto& extension : extensions)
+            {
+                g_vk.float8 |= std::strcmp(extension.extensionName, "VK_EXT_shader_float8") == 0;
+                cooperative |= std::strcmp(extension.extensionName, "VK_KHR_cooperative_matrix") == 0;
+                binaries |= std::strcmp(extension.extensionName, "VK_KHR_pipeline_binary") == 0;
+                maintenance5 |= std::strcmp(extension.extensionName, "VK_KHR_maintenance5") == 0;
+            }
+    }
+    // The game enabled what GetFeatureDeviceExtensionRequirements asked for (D4R_ENGINE_VKHIP) if the device
+    // resolves the extension's commands; a game that ignored the request leaves the network on the engine's shaders.
+    g_vk.pipelineBinary = binaries && maintenance5 && env_uint("D4R_ENGINE_VKHIP", 1) != 0 &&
+        g_vk.deviceProc(g_nativeVk.device, "vkCreatePipelineBinariesKHR") != nullptr;
+    // VkPhysicalDeviceVulkan12Properties: OptiScaler's Vulkan spoofing reports NVIDIA's driver in the driver struct
+    if (auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            g_nativeVk.instanceProc(g_nativeVk.instance, "vkGetPhysicalDeviceProperties2")))
+    {
+        VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties(g_nativeVk.physical, &props);
+        VkPhysicalDeviceVulkan12Properties v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        if (props.properties.apiVersion >= VK_API_VERSION_1_2)
+        {
+            props.pNext = &v12;
+            properties(g_nativeVk.physical, &props);
+            g_nativeVkLlpc = v12.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+            logf("native Vulkan engine: driver %s %s", v12.driverName, v12.driverInfo);
+        }
+    }
+    if (!cooperative)
+    {
+        logf("native Vulkan engine: the GPU has no VK_KHR_cooperative_matrix");
+        return;
+    }
+    // without the f16 matrix tuple (RDNA2) the K network runs its v_dot2 shaders, as on the vkd3d-proton route
+    detect_engine_matrices(g_nativeVk.instanceProc, g_nativeVk.instance, g_nativeVk.physical);
+    logf("native Vulkan engine: f16 matrix tuple %s; FP8 matrix tuple %s; pipeline binaries %s",
+         g_vk.matrixF16 ? "supported" : "unsupported", g_vk.float8 ? "supported" : "unsupported",
+         g_vk.pipelineBinary ? "enabled (vkhip on AMD's driver)" : "not enabled");
+    g_nativeVkEngineReady = true;
+    logf("native Vulkan engine: ready on device %p (VK_EXT_shader_float8 %s); the device must have the engine's "
+         "features enabled", static_cast<void*>(g_nativeVk.device), g_vk.float8 ? "present" : "absent");
+}
+
+// Ray Reconstruction's model loads on a thread of its own from feature creation, once the engine is initialised on
+// the game's device, so it is usually ready by the first frame
+static void native_vk_engine_start_rr(const Feature& feature)
+{
+    std::call_once(g_nativeVkEngineOnce, native_vk_engine_init);
+    if (g_nativeVkEngineReady) start_engine_model_rr(feature);
+}
+
+static bool native_vk_engine_idle(NativeVkEngineState& state)
+{
+    for (auto it = state.pending.begin(); it != state.pending.end();)
+        if (g_nativeVk.eventStatus(g_nativeVk.device, *it) == VK_EVENT_SET &&
+            g_nativeVk.resetEvent(g_nativeVk.device, *it) == VK_SUCCESS)
+        { state.idle.push_back(*it); it = state.pending.erase(it); }
+        else ++it;
+    return state.pending.empty();
+}
+
+static void native_vk_engine_destroy(NativeVkEngineState& state)
+{
+    state.k.reset(); state.m.reset(); state.mDynamic.reset(); state.mVkHip.reset(); // after m, which uses its buffers
+    state.r.reset(); state.rVkHip.reset(); // after the denoiser, which records its stages
+    for (auto& output : state.rOutputs) g_nativeVkStaging.free(output.second);
+    if (state.rView) g_nativeVk.destroyView(g_nativeVk.device, state.rView, nullptr);
+    if (state.rImage) d4r::vkTable.DestroyImage(g_nativeVk.device, state.rImage, nullptr);
+    if (state.rBuffer) g_nativeVk.destroyBuffer(g_nativeVk.device, state.rBuffer, nullptr);
+    if (state.rImageMemory) g_nativeVk.free(g_nativeVk.device, state.rImageMemory, nullptr);
+    if (state.rBufferMemory) g_nativeVk.free(g_nativeVk.device, state.rBufferMemory, nullptr);
+    state.rOutputs.clear(); state.rView = VK_NULL_HANDLE; state.rImage = VK_NULL_HANDLE; state.rBuffer = VK_NULL_HANDLE;
+    state.rImageMemory = state.rBufferMemory = VK_NULL_HANDLE;
+    for (auto& view : state.views) g_nativeVk.destroyView(g_nativeVk.device, view.view, nullptr);
+    for (VkEvent event : state.pending) g_nativeVk.destroyEvent(g_nativeVk.device, event, nullptr);
+    for (VkEvent event : state.idle) g_nativeVk.destroyEvent(g_nativeVk.device, event, nullptr);
+    state.views.clear(); state.pending.clear(); state.idle.clear();
+}
+
+static void native_vk_engine_reap()
+{
+    for (auto it = g_nativeVkEngineRetired.begin(); it != g_nativeVkEngineRetired.end();)
+        if (native_vk_engine_idle(**it)) { native_vk_engine_destroy(**it); it = g_nativeVkEngineRetired.erase(it); }
+        else ++it;
+}
+
+// A sampled view of `resource` the engine can read: the game's own, or a depth-only one for depth/stencil views.
+static bool native_vk_engine_image(NativeVkEngineState& state, const NgxVkResource* resource, bool output,
+                                   d4r::GameImage& image)
+{
+    if (!resource || resource->type != 0) return false;
+    const NgxVkImage& source = resource->resource.image;
+    if (!source.image || !source.view || source.range.levelCount > 1 || source.range.layerCount > 1) return false;
+    image.image = source.image;
+    image.format = source.format;
+    image.view = source.view;
+    image.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    static const bool generalInputs = env_uint("D4R_VULKAN_INPUT_GENERAL", 0) != 0;
+    image.layout = output || generalInputs ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const bool depth = source.format == VK_FORMAT_D32_SFLOAT || source.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                       source.format == VK_FORMAT_D16_UNORM || source.format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                       source.format == VK_FORMAT_X8_D24_UNORM_PACK32 || source.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    if (!depth) return true;
+    image.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (source.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) return true;
+    auto found = std::find_if(state.views.begin(), state.views.end(), [&](const auto& view) {
+        return view.image == source.image && view.format == source.format;
+    });
+    if (found == state.views.end())
+    {
+        if (state.views.size() >= 16) return false;
+        VkImageViewCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = source.image; info.viewType = VK_IMAGE_VIEW_TYPE_2D; info.format = source.format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, source.range.baseMipLevel, 1, source.range.baseArrayLayer, 1};
+        NativeVkEngineView view{source.image, source.format, VK_IMAGE_ASPECT_DEPTH_BIT};
+        if (g_nativeVk.createView(g_nativeVk.device, &info, nullptr, &view.view) != VK_SUCCESS) return false;
+        state.views.push_back(view);
+        found = state.views.end() - 1;
+    }
+    image.view = found->view;
+    return true;
+}
+
+// Device-local memory for `requirements`; null when there is none
+static VkDeviceMemory native_vk_device_memory(const VkMemoryRequirements& requirements)
+{
+    for (uint32_t i = 0; i < g_nativeVk.memory.memoryTypeCount; ++i)
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (g_nativeVk.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        {
+            VkMemoryAllocateInfo info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            info.allocationSize = requirements.size; info.memoryTypeIndex = i;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            return g_nativeVk.allocate(g_nativeVk.device, &info, nullptr, &memory) == VK_SUCCESS ? memory : VK_NULL_HANDLE;
+        }
+    return VK_NULL_HANDLE;
+}
+
+// The RGBA16F image the denoiser stores into and the buffer it is copied into, for an output format it cannot store
+static bool native_vk_engine_rr_staging(NativeVkEngineState& state, uint32_t width, uint32_t height)
+{
+    if (state.rImage) return true;
+    VkImageCreateInfo image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image.imageType = VK_IMAGE_TYPE_2D; image.format = VK_FORMAT_R16G16B16A16_SFLOAT; image.extent = {width, height, 1};
+    image.mipLevels = image.arrayLayers = 1; image.samples = VK_SAMPLE_COUNT_1_BIT; image.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (d4r::vkTable.CreateImage(g_nativeVk.device, &image, nullptr, &state.rImage) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements;
+    d4r::vkTable.GetImageMemoryRequirements(g_nativeVk.device, state.rImage, &requirements);
+    state.rImageMemory = native_vk_device_memory(requirements);
+    if (!state.rImageMemory || d4r::vkTable.BindImageMemory(g_nativeVk.device, state.rImage, state.rImageMemory, 0) != VK_SUCCESS)
+        return false;
+    VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = state.rImage; view.viewType = VK_IMAGE_VIEW_TYPE_2D; view.format = image.format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (g_nativeVk.createView(g_nativeVk.device, &view, nullptr, &state.rView) != VK_SUCCESS) return false;
+    VkBufferCreateInfo buffer = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    buffer.size = VkDeviceSize(width) * height * 8;
+    buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (g_nativeVk.createBuffer(g_nativeVk.device, &buffer, nullptr, &state.rBuffer) != VK_SUCCESS) return false;
+    g_nativeVk.requirements(g_nativeVk.device, state.rBuffer, &requirements);
+    state.rBufferMemory = native_vk_device_memory(requirements);
+    return state.rBufferMemory && g_nativeVk.bind(g_nativeVk.device, state.rBuffer, state.rBufferMemory, 0) == VK_SUCCESS;
+}
+
+// Ray Reconstruction on the engine: the denoiser's stages in the game's command buffer, sampling the game's views
+// (SHADER_READ_ONLY_OPTIMAL, as the NGX Vulkan contract has them). True: the engine took this evaluation (result
+// says how it went). False: refused (logged); the staging path has no denoiser, so the evaluation fails.
+static bool native_vk_engine_rr(NativeVkFeature& owner, VkCommandBuffer cmd, void* p, NgxResult& result)
+{
+    Feature& feature = *owner.feature;
+    const uint32_t frame = feature.frame + 1;
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("native Vulkan engine (Ray Reconstruction): %s; feature %u fails from frame %u (the staging path has "
+             "no denoiser)", reason, feature.handle.Id, frame);
+        return false;
+    };
+    const int slot = start_engine_model_rr(feature);
+    int modelState = g_engineR.state[slot].load();
+    if (modelState == 1)
+    {
+        logf("native Vulkan engine (Ray Reconstruction %c): frame %u waits for the model", g_rrLetter[slot], frame);
+        while ((modelState = g_engineR.state[slot].load()) == 1)
+            d4r_sleep_us(1000);
+    }
+    d4r::RModel* const model = g_engineR.models[slot].get();
+    if (modelState != 2 || model == nullptr)
+        return refuse(slot == 1 ? "no preset E model (engine\\rr-e)" : slot == 2 ? "no preset F model (engine\\rr-f)" :
+                      slot >= 3 ? "no preset A - C model (engine\\rr-a, rr-b, rr-c)" : "no preset D model (engine\\rr-d)");
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
+    if ((feature.flags & 0x3) != 0x3)
+        return refuse("needs the HDR flag and render-resolution motion vectors");
+    if ((feature.flags & 0x4) != 0)
+        return refuse("jittered motion vectors are not implemented");
+    FrameParams params;
+    native_vk_read_params(&feature, p, params);
+    read_rr_params(feature, p, params);
+    if (!params.auxMatrixSet[0] || !params.auxMatrixSet[1])
+        return refuse("the camera matrices are missing");
+    const uint32_t rw = params.renderWidth, rh = params.renderHeight;
+    // NGX runs another output filter below 4/3 scaling (rr2_post_kernel_3_2), which the preset F model does not have
+    if (slot == 2 && (3ull * feature.outWidth < 4ull * rw || 3ull * feature.outHeight < 4ull * rh))
+        return refuse("preset F below 4/3 scaling uses an output filter the engine does not have (rr2_post_kernel_3_2)");
+    for (const auto& origin : params.auxSubrect)
+        if (origin[0] != 0 || origin[1] != 0)
+            return refuse("guide subrect origins are not implemented");
+    // a new render size: a new denoiser (the engine's is fixed-size), starting without history
+    if (owner.engine && owner.engine->r && (rw != owner.engine->rWidth || rh != owner.engine->rHeight))
+    {
+        logf("native Vulkan engine (Ray Reconstruction %c): render size %ux%u -> %ux%u; rebuilding the denoiser",
+             g_rrLetter[slot], owner.engine->rWidth, owner.engine->rHeight, rw, rh);
+        g_nativeVkEngineRetired.push_back(std::move(owner.engine));
+    }
+    if (!owner.engine) owner.engine = std::make_shared<NativeVkEngineState>();
+    NativeVkEngineState& state = *owner.engine;
+    auto resource = [&](const char* name, const char* alternative = nullptr) {
+        void* value = nullptr;
+        d4r_ngx_get_void(p, name, &value);
+        if (value == nullptr && alternative != nullptr) d4r_ngx_get_void(p, alternative, &value);
+        return static_cast<const NgxVkResource*>(value);
+    };
+    // DLSS.Roughness.Mode 1 (packed): the roughness is the normals' w; preset F follows the mode also when a
+    // roughness texture is bound, D and E use the bound texture (as engine_evaluate_rr)
+    const bool roughnessPacked = params.auxScalar[AuxRoughnessMode] == 1 &&
+        (slot == 2 || resource("GBuffer.Roughness") == nullptr);
+    d4r::GameFrameR game;
+    game.profile = engine_stage_profile(frame, slot == 2 ? "RR_F" : slot == 1 ? "RR_E" : "RR_D");
+    const NgxVkResource* const normals = resource("GBuffer.Normals");
+    struct Input { const NgxVkResource* resource; d4r::GameImage* image; bool required; };
+    const Input inputs[] = {
+        {resource("Color"), &game.color, true}, {resource("Depth"), &game.depth, true},
+        {resource("MotionVectors"), &game.motion, true}, {normals, &game.normals, true},
+        {roughnessPacked ? normals : resource("GBuffer.Roughness"), &game.roughness, true},
+        {resource("DLSS.Input.DiffuseAlbedo", "GBuffer.DiffuseAlbedo"), &game.diffuseAlbedo, true},
+        {resource("DLSS.Input.SpecularAlbedo", "GBuffer.SpecularAlbedo"), &game.specularAlbedo, true},
+        {resource("DLSSD.SpecularHitDistance"), &game.specularHitDistance, false},
+        {resource("DLSS.DisocclusionMask"), &game.disocclusionMask, false},
+        {resource("DLSSD.ScreenSpaceSubsurfaceScatteringGuide"), &game.subsurfaceGuide, false},
+        {resource("DLSSD.ColorBeforeParticles"), &game.colorBeforeParticles, false},
+    };
+    for (const Input& input : inputs)
+    {
+        if (input.resource == nullptr && !input.required) continue;
+        if (input.resource == nullptr)
+            return refuse("an input the engine needs (colour, depth, motion, normals, roughness, diffuse or specular "
+                          "albedo) is missing");
+        if (!native_vk_engine_image(state, input.resource, false, *input.image))
+            return refuse("an input is not a single-mip, single-layer 2D image view");
+    }
+    game.color.x = params.colorBaseX; game.color.y = params.colorBaseY;
+    game.depth.x = params.depthBaseX; game.depth.y = params.depthBaseY;
+    game.motion.x = params.mvBaseX; game.motion.y = params.mvBaseY;
+    if (game.color.x || game.color.y || game.depth.x || game.depth.y || game.motion.x || game.motion.y ||
+        params.outputBaseX || params.outputBaseY)
+        return refuse("texture rectangles must start at the origin");
+    d4r::GameImage output;
+    const NgxVkResource* const outputResource = resource("Output");
+    if (!native_vk_engine_image(state, outputResource, true, output))
+        return refuse("the output is not a single-mip, single-layer 2D image view");
+    for (const Input& input : inputs)
+        if (input.resource != nullptr && input.image->image == output.image)
+            return refuse("input/output texture aliasing is not supported");
+    if (outputResource->resource.image.width != feature.outWidth || outputResource->resource.image.height != feature.outHeight)
+        return refuse("the output does not match the feature's output size");
+    if (!d4r::gameColorFormat(game.color.format) || !d4r::gameMotionFormat(game.motion.format) ||
+        !d4r::gameDepthFormat(game.depth.format, game.depth.aspect) || !D4rVkStaging::supported_output(output.format))
+    {
+        logf("native Vulkan engine (Ray Reconstruction): formats colour %d, depth %d, motion %d, output %d",
+             game.color.format, game.depth.format, game.motion.format, output.format);
+        return refuse("a texture format is not implemented");
+    }
+    // RGBA16F: the denoiser stores into the game's output; any other format goes through rImage and rBuffer
+    const bool direct = output.format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    D4rVkStagingSet* pack = nullptr;
+    if (!direct)
+    {
+        if (!native_vk_engine_rr_staging(state, feature.outWidth, feature.outHeight))
+            return refuse("the output conversion's image and buffer could not be created");
+        auto found = std::find_if(state.rOutputs.begin(), state.rOutputs.end(),
+                                  [&](const auto& item) { return item.first == output.view; });
+        if (found == state.rOutputs.end())
+        {
+            if (state.rOutputs.size() >= 8)
+                return refuse("the game rotates more than eight output views");
+            state.rOutputs.push_back({output.view, {}});
+            found = state.rOutputs.end() - 1;
+            if (!g_nativeVkStaging.set(found->second, output.view, output.format, state.rBuffer,
+                                       VkDeviceSize(feature.outWidth) * feature.outHeight * 8, true))
+                return refuse("the output conversion's descriptor set could not be created");
+        }
+        pack = &found->second;
+        game.output.image = state.rImage; game.output.view = state.rView;
+        game.output.format = VK_FORMAT_R16G16B16A16_SFLOAT; game.output.layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    else
+        game.output = output;
+    auto& settings = game.settings;
+    settings.jitter[0] = params.jitterX; settings.jitter[1] = params.jitterY;
+    settings.motionScale[0] = params.mvScaleX; settings.motionScale[1] = params.mvScaleY;
+    settings.preExposure = params.preExposure;
+    settings.frameTimeMs = params.frameTime;
+    settings.reset = params.reset != 0 || !state.r;
+    settings.depthInverted = (feature.flags & 0x8) != 0;
+    settings.hardwareDepth = params.auxScalar[AuxHardwareDepth] != 0;
+    settings.roughnessPacked = roughnessPacked;
+    std::copy(std::begin(params.auxMatrix[0]), std::end(params.auxMatrix[0]), settings.worldToView);
+    std::copy(std::begin(params.auxMatrix[1]), std::end(params.auxMatrix[1]), settings.viewToClip);
+    if (frame <= 2)
+        logf("native Vulkan engine (Ray Reconstruction): formats colour %d, depth %d (aspect %u), motion %d, normals %d, "
+             "roughness %d (%s), diffuse %d, specular %d, output %d (%s); specular hit distance %s, disocclusion mask %s, "
+             "subsurface guide %s, colour before particles %s, hardware depth %d",
+             game.color.format, game.depth.format, game.depth.aspect, game.motion.format, game.normals.format,
+             game.roughness.format, roughnessPacked ? "packed in the normals' w" : "texture", game.diffuseAlbedo.format,
+             game.specularAlbedo.format, output.format, direct ? "stored directly" : "packed from RGBA16F",
+             game.specularHitDistance.image ? "bound" : "none", game.disocclusionMask.image ? "bound" : "none",
+             game.subsurfaceGuide.image ? "bound" : "none", game.colorBeforeParticles.image ? "bound" : "none",
+             settings.hardwareDepth ? 1 : 0);
+
+    native_vk_engine_idle(state);
+    VkEvent done = VK_NULL_HANDLE;
+    if (!state.idle.empty()) { done = state.idle.back(); state.idle.pop_back(); }
+    else
+    {
+        if (state.pending.size() >= 16) { result = NGX_FAIL_PLATFORM_ERROR; return true; }
+        VkEventCreateInfo info = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        if (g_nativeVk.createEvent(g_nativeVk.device, &info, nullptr, &done) != VK_SUCCESS)
+        { result = NGX_FAIL_PLATFORM_ERROR; return true; }
+    }
+    VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    try
+    {
+        if (!state.r)
+        {
+            const bool rrVkHip = engine_rr_vkhip_capable(slot);
+            state.r = std::make_unique<d4r::GameDenoiser>(*model, g_vk.physical, g_vk.device, feature.outWidth,
+                                                          feature.outHeight, rw, rh, rrVkHip);
+            if (rrVkHip)
+                state.rVkHip = create_engine_rr_vkhip(rr_model_directory(slot), state.r->networkEngine(), slot);
+            state.rWidth = rw; state.rHeight = rh;
+            logf("native Vulkan engine (Ray Reconstruction %c): feature %u runs in the game's command buffer "
+                 "(%ux%u -> %ux%u), network on %s", g_rrLetter[slot], feature.handle.Id, rw, rh, feature.outWidth,
+                 feature.outHeight, state.rVkHip ? "vkhip" : "Vulkan");
+        }
+        d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                        0, 1, &before, 0, nullptr, 0, nullptr);
+        if (!direct)
+        {
+            // every pixel is stored each frame: the previous contents need not survive
+            VkImageMemoryBarrier layout = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            layout.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; layout.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            layout.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; layout.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            layout.srcQueueFamilyIndex = layout.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            layout.image = state.rImage; layout.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                            0, 0, nullptr, 0, nullptr, 1, &layout);
+        }
+        state.r->record(cmd, game);
+        if (!direct)
+        {
+            VkMemoryBarrier stored = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            stored.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; stored.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                            0, 1, &stored, 0, nullptr, 0, nullptr);
+            VkBufferImageCopy copy = {};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {feature.outWidth, feature.outHeight, 1};
+            d4r::vkTable.CmdCopyImageToBuffer(cmd, state.rImage, VK_IMAGE_LAYOUT_GENERAL, state.rBuffer, 1, &copy);
+            VkMemoryBarrier copied = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                            0, 1, &copied, 0, nullptr, 0, nullptr);
+            g_nativeVkStaging.record(cmd, *pack, feature.outWidth, feature.outHeight);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        // Something may already be in the command buffer: the caller must not submit a half recording.
+        logf("native Vulkan engine (Ray Reconstruction): %s", error.what());
+        state.idle.push_back(done);
+        feature.engineRefused = true;
+        result = NGX_FAIL_PLATFORM_ERROR;
+        return true;
+    }
+    d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                    0, 1, &after, 0, nullptr, 0, nullptr);
+    g_nativeVk.cmdSetEvent(cmd, done, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    state.pending.push_back(done);
+    if (frame <= 3 || frame % 600 == 0)
+        logf("native Vulkan engine frame %u recorded, Ray Reconstruction %c (jitter %.6f,%.6f, reset %d, mvScale "
+             "%.3f,%.3f, render %ux%u)", frame, g_rrLetter[slot], params.jitterX, params.jitterY, settings.reset,
+             params.mvScaleX, params.mvScaleY, rw, rh);
+    feature.frame = frame;
+    result = NGX_SUCCESS;
+    return true;
+}
+
+// True: the engine took this evaluation (result says how it went). False: use the staging path.
+static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* p, NgxResult& result)
+{
+    ensure_portable_config();
+    static const bool enabled = engine_requested() && env_uint("D4R_VULKAN_ENGINE", 1) != 0;
+    Feature& feature = *owner.feature;
+    if (!enabled || feature.engineRefused) return false;
+    const uint32_t frame = feature.frame + 1;
+    const bool presetM = feature.preset == 13 || feature.preset == 12, presetL = feature.preset == 12;
+    const char* const name = feature.preset == 12 ? "L" : feature.preset == 13 ? "M" : "K";
+    auto refuse = [&](const char* reason) {
+        feature.engineRefused = true;
+        logf("native Vulkan engine (%s): %s; feature %u uses the staging path from frame %u", name, reason,
+             feature.handle.Id, frame);
+        return false;
+    };
+    std::call_once(g_nativeVkEngineOnce, native_vk_engine_init);
+    if (!g_nativeVkEngineReady) return refuse("unavailable");
+    if (feature.rayReconstruction) return native_vk_engine_rr(owner, cmd, p, result);
+    if (!presetM && feature.preset != 11) return refuse("only presets K, L and M are implemented");
+    // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
+    const bool ldr = (feature.flags & 0x1) == 0;
+    const bool displayMotion = (feature.flags & 0x2) == 0;
+    const bool autoExposure = (feature.flags & 0x40) != 0;
+    d4r::Model* model = nullptr;
+    d4r::MModel* modelM = nullptr;
+    if (presetM)
+    {
+        if (!g_vk.float8) return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
+        std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
+        modelM = g_engineM.models[presetL][ldr].get();
+        if (!modelM) return refuse(ldr ? "no LDR model for a game without the HDR flag" : "no model");
+        if (displayMotion) return refuse("needs render-resolution motion vectors");
+    }
+    else
+    {
+        if (ldr) std::call_once(g_engine.ldrOnce, init_engine_backend_ldr);
+        else std::call_once(g_engine.once, init_engine_backend);
+        model = ldr ? g_engine.modelLdr.get() : g_engine.model.get();
+        if (!model) return refuse(ldr ? "no LDR model (engine\\k-ldr) for a game without the HDR flag" : "no model");
+        if (displayMotion && !model->hasDisplayMotion()) return refuse("display-resolution motion needs a newer model");
+        if ((feature.flags & 0x8) == 0 && !model->hasRegularDepth()) return refuse("regular depth needs a newer model");
+        if (!ldr && autoExposure && !model->hasAutoExposure()) return refuse("automatic exposure needs exposure shaders");
+    }
+    FrameParams params;
+    native_vk_read_params(&feature, p, params);
+    void* mask = nullptr; d4r_ngx_get_void(p, "DLSS.Input.Bias.Current.Color.Mask", &mask);
+    void* transparency = nullptr; d4r_ngx_get_void(p, "TransparencyMask", &transparency);
+    if (mask || transparency) return refuse("bias colour and transparency masks are not implemented");
+
+    // On AMD's driver a new render size cannot go to the Vulkan network: retire this engine (it is destroyed once its
+    // recordings have run) and build vkhip for the new size, starting without history
+    if (owner.engine && g_nativeVkLlpc && owner.engine->mVkHip &&
+        (params.renderWidth != owner.engine->mVkHipWidth || params.renderHeight != owner.engine->mVkHipHeight))
+    {
+        logf("native Vulkan engine (%s): render size %ux%u -> %ux%u; rebuilding vkhip for the new size", name,
+             owner.engine->mVkHipWidth, owner.engine->mVkHipHeight, params.renderWidth, params.renderHeight);
+        g_nativeVkEngineRetired.push_back(std::move(owner.engine));
+    }
+    if (!owner.engine) owner.engine = std::make_shared<NativeVkEngineState>();
+    NativeVkEngineState& state = *owner.engine;
+    const char* names[] = {"Color", "Depth", "MotionVectors", "ExposureTexture", "Output"};
+    const NgxVkResource* resources[5] = {};
+    for (int i = 0; i < 5; ++i)
+    {
+        void* resource = nullptr;
+        d4r_ngx_get_void(p, names[i], &resource);
+        resources[i] = static_cast<const NgxVkResource*>(resource);
+    }
+    d4r::GameImage color, depth, motion, exposure, output;
+    if (!native_vk_engine_image(state, resources[0], false, color) || !native_vk_engine_image(state, resources[1], false, depth) ||
+        !native_vk_engine_image(state, resources[2], false, motion) || !native_vk_engine_image(state, resources[4], true, output))
+        return refuse("a resource is not a single-mip, single-layer 2D image view");
+    const bool gameExposure = !presetM && !ldr && !autoExposure;
+    if (gameExposure && !native_vk_engine_image(state, resources[3], false, exposure))
+        return refuse("exposure without AutoExposure needs an exposure texture");
+    color.x = params.colorBaseX; color.y = params.colorBaseY;
+    depth.x = params.depthBaseX; depth.y = params.depthBaseY;
+    motion.x = params.mvBaseX; motion.y = params.mvBaseY;
+    output.x = params.outputBaseX; output.y = params.outputBaseY;
+    if (output.image == color.image || output.image == depth.image || output.image == motion.image)
+        return refuse("input/output texture aliasing is not supported");
+    if (!d4r::gameColorFormat(color.format) || !d4r::gameMotionFormat(motion.format) ||
+        !d4r::gameDepthFormat(depth.format, depth.aspect) || !d4r::gameOutputFormat(output.format))
+    {
+        logf("native Vulkan engine (%s): formats colour %d, depth %d, motion %d, output %d", name, color.format,
+             depth.format, motion.format, output.format);
+        return refuse("a texture format is not implemented");
+    }
+    // The Vulkan resource contract gives the output STORAGE usage only: the engine's store must write it directly.
+    const bool rgb10 = presetM ? modelM->hasRgb10Output() : model->hasRgb10Output();
+    const bool r11 = presetM && modelM->hasR11G11B10Output(); // M's and L's down_m_r11g11b10 (Indiana Jones)
+    const bool direct = output.view != VK_NULL_HANDLE && output.layout == VK_IMAGE_LAYOUT_GENERAL &&
+        (output.format == VK_FORMAT_R16G16B16A16_SFLOAT || (rgb10 && output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) ||
+         (r11 && output.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32));
+    if (!direct)
+        return refuse("the output must be an RGBA16F (or RGB10A2, or for M and L R11G11B10F) storage image the "
+                      "engine writes directly");
+    if (resources[4]->resource.image.width != feature.outWidth || resources[4]->resource.image.height != feature.outHeight)
+        return refuse("the output does not match the feature's output size");
+
+    // An event per recording marks GPU completion; reclaim the ones that have fired.
+    native_vk_engine_idle(state);
+    VkEvent done = VK_NULL_HANDLE;
+    if (!state.idle.empty()) { done = state.idle.back(); state.idle.pop_back(); }
+    else
+    {
+        if (state.pending.size() >= 16) { result = NGX_FAIL_PLATFORM_ERROR; return true; }
+        VkEventCreateInfo info = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        if (g_nativeVk.createEvent(g_nativeVk.device, &info, nullptr, &done) != VK_SUCCESS)
+        { result = NGX_FAIL_PLATFORM_ERROR; return true; }
+    }
+    auto releaseEvent = [&] { state.idle.push_back(done); };
+
+    VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    try
+    {
+        if (presetM)
+        {
+            d4r::GameFrameM game;
+            game.profile = engine_stage_profile(frame, name);
+            game.color = color; game.depth = depth; game.motion = motion; game.output = output;
+            if (color.x || color.y || depth.x || depth.y || motion.x || motion.y)
+                return releaseEvent(), refuse("input rectangles must start at the origin");
+            game.jitter[0] = params.jitterX; game.jitter[1] = params.jitterY;
+            game.motionToRender[0] = params.mvScaleX; game.motionToRender[1] = params.mvScaleY;
+            if ((feature.flags & 0x4) != 0 && params.mvScaleX != 0.0f && params.mvScaleY != 0.0f)
+            {
+                game.motionOffset[0] = (params.jitterX - feature.engineJitter[0]) / params.mvScaleX;
+                game.motionOffset[1] = (params.jitterY - feature.engineJitter[1]) / params.mvScaleY;
+            }
+            game.renderWidth = params.renderWidth; game.renderHeight = params.renderHeight;
+            game.reset = params.reset != 0 || !state.m || params.renderWidth != feature.engineMLastWidth ||
+                params.renderHeight != feature.engineMLastHeight;
+            game.depthInverted = (feature.flags & 0x8) != 0;
+            if (!state.m)
+            {
+                const bool dynamic = modelM->hasDynamicResolution();
+                const uint32_t width = dynamic ? std::min(feature.outWidth, std::max(feature.width, params.renderWidth)) : params.renderWidth;
+                const uint32_t height = dynamic ? std::min(feature.outHeight, std::max(feature.height, params.renderHeight)) : params.renderHeight;
+                // vkhip (D4R_ENGINE_VKHIP): M's and L's native layers in this command buffer, on a fixed grid of
+                // this frame's render size; other sizes go to the Vulkan network of mDynamic
+                if (modelM->hasExternalNetworkStages())
+                {
+                    const uint64_t bytes = d4r::MEngine::networkBufferBytes(params.renderWidth, params.renderHeight);
+                    state.mVkHip = create_engine_vkhip_net(g_engineM.directories[presetL][ldr], params.renderWidth,
+                                                           params.renderHeight, bytes);
+                }
+                if (state.mVkHip)
+                {
+                    const d4r::ExternalNetwork external = {state.mVkHip->tokens(), state.mVkHip->head()};
+                    state.mVkHipWidth = params.renderWidth; state.mVkHipHeight = params.renderHeight;
+                    state.m = std::make_unique<d4r::GameUpscalerM>(*modelM, g_vk.physical, g_vk.device, feature.outWidth,
+                                                                   feature.outHeight, params.renderWidth,
+                                                                   params.renderHeight, &external);
+                    feature.engineMRenderWidth = params.renderWidth; feature.engineMRenderHeight = params.renderHeight;
+                }
+                else if (g_nativeVkLlpc)
+                    return releaseEvent(), refuse("AMD's Windows driver needs the vkhip network (the engine's Vulkan "
+                                                  "network does not compile there); see the vkhip line above");
+                else
+                {
+                    state.m = std::make_unique<d4r::GameUpscalerM>(*modelM, g_vk.physical, g_vk.device, feature.outWidth,
+                                                                   feature.outHeight, width, height);
+                    feature.engineMRenderWidth = width; feature.engineMRenderHeight = height;
+                }
+                logf("native Vulkan engine (%s): feature %u runs preset %s in the game's command buffer (%ux%u -> %ux%u), network on %s",
+                     name, feature.handle.Id, name, params.renderWidth, params.renderHeight, feature.outWidth, feature.outHeight,
+                     state.mVkHip ? "vkhip" : "Vulkan");
+            }
+            d4r::GameUpscalerM* adapter = state.m.get();
+            const bool vkhipFrame = state.mVkHip && params.renderWidth == state.mVkHipWidth &&
+                params.renderHeight == state.mVkHipHeight;
+            if (state.mVkHip ? !vkhipFrame :
+                params.renderWidth > feature.engineMRenderWidth || params.renderHeight > feature.engineMRenderHeight)
+            {
+                if (!state.mDynamic)
+                    state.mDynamic = std::make_unique<d4r::GameUpscalerM>(*modelM, g_vk.physical, g_vk.device,
+                        feature.outWidth, feature.outHeight, feature.outWidth, feature.outHeight);
+                adapter = state.mDynamic.get();
+            }
+            d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                            0, 1, &before, 0, nullptr, 0, nullptr);
+            if (vkhipFrame)
+            {
+                adapter->recordFront(cmd, game);
+                state.mVkHip->record(cmd);
+                adapter->recordBack(cmd, game);
+            }
+            else
+                adapter->record(cmd, game);
+            feature.engineMLastWidth = params.renderWidth; feature.engineMLastHeight = params.renderHeight;
+            if (frame <= 3 || frame % 600 == 0)
+                logf("native Vulkan engine frame %u recorded, preset %s (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)",
+                     frame, name, params.jitterX, params.jitterY, game.reset, params.mvScaleX, params.mvScaleY,
+                     params.renderWidth, params.renderHeight);
+        }
+        else
+        {
+            if (gameExposure && (exposure.format != VK_FORMAT_R32_SFLOAT && exposure.format != VK_FORMAT_R16_SFLOAT &&
+                                 exposure.format != VK_FORMAT_R32G32B32A32_SFLOAT && exposure.format != VK_FORMAT_R16G16B16A16_SFLOAT))
+                return releaseEvent(), refuse("the exposure texture must be a float texture");
+            if (!ldr && !(std::isfinite(params.exposureScale) && params.exposureScale > 0.0f))
+                return releaseEvent(), refuse("the exposure scale is not a positive number");
+            if (!ldr && !(std::isfinite(params.preExposure) && params.preExposure > 0.0f))
+                return releaseEvent(), refuse("the pre-exposure is not a positive number");
+            if ((color.x || color.y || depth.x || depth.y || motion.x || motion.y || output.x || output.y) &&
+                !model->hasDirectOrigins())
+                return releaseEvent(), refuse("texture rectangles need a model with direct origins");
+            d4r::GameFrame game;
+            game.profile = engine_stage_profile(frame, "K");
+            game.color = color; game.depth = depth; game.motion = motion; game.output = output;
+            if (gameExposure) game.exposure = exposure;
+            auto& settings = game.settings;
+            settings.renderWidth = params.renderWidth; settings.renderHeight = params.renderHeight;
+            settings.jitter[0] = params.jitterX; settings.jitter[1] = params.jitterY;
+            settings.displayMotion = displayMotion;
+            const float toOutput = displayMotion ? 1.0f : float(feature.outWidth) / float(params.renderWidth);
+            const float toOutputY = displayMotion ? 1.0f : float(feature.outHeight) / float(params.renderHeight);
+            settings.motionScale[0] = params.mvScaleX * toOutput; settings.motionScale[1] = params.mvScaleY * toOutputY;
+            if ((feature.flags & 0x4) != 0 && params.mvScaleX != 0.0f && params.mvScaleY != 0.0f)
+            {
+                settings.motionOffset[0] = (params.jitterX - feature.engineJitter[0]) / params.mvScaleX;
+                settings.motionOffset[1] = (params.jitterY - feature.engineJitter[1]) / params.mvScaleY;
+            }
+            settings.reset = params.reset != 0 || !state.k;
+            settings.depthInverted = (feature.flags & 0x8) != 0;
+            settings.autoExposure = !ldr && autoExposure;
+            settings.exposureScale = ldr ? 1.0f : params.exposureScale;
+            settings.preExposure = ldr ? 1.0f : params.preExposure;
+            if (!state.k)
+            {
+                state.k = std::make_unique<d4r::GameUpscaler>(*model, g_vk.physical, g_vk.device, feature.outWidth,
+                                                              feature.outHeight, feature.outWidth, feature.outHeight);
+                logf("native Vulkan engine (K): feature %u runs preset K in the game's command buffer (%ux%u -> %ux%u)",
+                     feature.handle.Id, params.renderWidth, params.renderHeight, feature.outWidth, feature.outHeight);
+            }
+            d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                            0, 1, &before, 0, nullptr, 0, nullptr);
+            state.k->record(cmd, game);
+            if (frame <= 3 || frame % 600 == 0)
+                logf("native Vulkan engine frame %u recorded, preset K (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)",
+                     frame, params.jitterX, params.jitterY, settings.reset, params.mvScaleX, params.mvScaleY,
+                     params.renderWidth, params.renderHeight);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        // Something may already be in the command buffer: the caller must not submit a half recording.
+        logf("native Vulkan engine (%s): %s", name, error.what());
+        releaseEvent();
+        feature.engineRefused = true;
+        result = NGX_FAIL_PLATFORM_ERROR;
+        return true;
+    }
+    d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                    0, 1, &after, 0, nullptr, 0, nullptr);
+    g_nativeVk.cmdSetEvent(cmd, done, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    state.pending.push_back(done);
+    feature.engineJitter[0] = params.jitterX; feature.engineJitter[1] = params.jitterY;
+    feature.frame = frame;
+    result = NGX_SUCCESS;
+    return true;
+}
+
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd, const NgxHandle* handle, void* p, void*)
+{
+    std::lock_guard<std::mutex> lock(g_nativeVkMutex);
+    const auto apiStarted = ProfileClock::now();
+    if (!g_nativeVk.device || !g.ngxInitialized) return NGX_FAIL_NOT_INITIALIZED;
+    auto it = std::find_if(g_nativeVkFeatures.begin(), g_nativeVkFeatures.end(),
+                           [&](const auto& f) { return &f.feature->handle == handle; });
+    if (!cmd || !p || it == g_nativeVkFeatures.end()) return NGX_FAIL_INVALID_PARAMETER;
+    auto& owner = *it;
+    if (owner.feature->retiring) return NGX_FAIL_INVALID_PARAMETER;
+    native_vk_engine_reap();
+    if (NgxResult engineResult; owner.frames.empty() && native_vk_engine(owner, cmd, p, engineResult))
+        return engineResult;
+    if (owner.feature->rayReconstruction) return NGX_FAIL_FEATURE_NOT_SUPPORTED; // the engine's alone (logged)
+    if (owner.feature->cudaCreationDeferred)
+    {
+        // the engine did not take this frame: the staging path needs NGX's CUDA feature, created here as at
+        // CreateFeature before (before anything is recorded, so the GPU never waits on the compile)
+        logf("engine backend: creating CUDA fallback for feature %u at frame %u", owner.feature->handle.Id,
+             owner.feature->frame + 1);
+        if (const NgxResult created = create_cuda_feature(*owner.feature); created != NGX_SUCCESS) return created;
+        logf("engine backend: CUDA fallback initialized; the staging path starts without history");
+    }
+    for (auto* frame : owner.frames)
+        if (frame->done && frame->result != NGX_SUCCESS) return frame->result;
+    native_vk_reap(g_nativeVkRetired);
+    auto* reusable = native_vk_reuse(owner, cmd);
+    const auto reapedAt = ProfileClock::now();
+    if (owner.frames.size() >= 8) return NGX_FAIL_PLATFORM_ERROR;
+    auto* frame = reusable ? reusable : new NativeVkFrame;
+    frame->commandBuffer = cmd;
+    // An import while any recording of ours may be waiting on the GPU can deadlock against it
+    // (Indiana Jones: 10 s compute ring timeout). Then only pooled buffers or host staging are used.
+    bool pending = !g_nativeVkRetired.empty();
+    for (const auto& f : g_nativeVkFeatures)
+        for (const auto* other : f.frames) pending = pending || !native_vk_consumed(*other);
+    const char* names[] = {"Color", "Depth", "MotionVectors", "ExposureTexture", "Output"};
+    for (int i = 0; i < 5; ++i)
+    {
+        void* resource = nullptr;
+        d4r_ngx_get_void(p, names[i], &resource);
+        if (i == 3 && !resource) { native_vk_free_plane(frame->planes[3]); continue; }
+        if (!native_vk_plane(frame->planes[i], static_cast<NgxVkResource*>(resource), i, !pending))
+        {
+            if (resource)
+            {
+                const auto* descriptor = static_cast<NgxVkResource*>(resource);
+                const auto& image = descriptor->resource.image;
+                logf("Vulkan rejected resource %s: type=%d image=%p view=%p format=%d "
+                     "size=%ux%u aspect=0x%x mip=%u+%u layer=%u+%u", names[i], descriptor->type,
+                     reinterpret_cast<void*>(image.image), reinterpret_cast<void*>(image.view), image.format,
+                     image.width, image.height, image.range.aspectMask, image.range.baseMipLevel,
+                     image.range.levelCount, image.range.baseArrayLayer, image.range.layerCount);
+            }
+            else logf("Vulkan missing resource %s", names[i]);
+            native_vk_free_frame(frame); return NGX_FAIL_UNSUPPORTED_FORMAT;
+        }
+    }
+    if (!pending && g_nativeVk.external) native_vk_prefill(*frame);
+    auto* feature = owner.feature;
+    const auto allocatedAt = ProfileClock::now();
+    if (feature->frame == 0)
+        for (int i = 0; i < 5; ++i)
+        {
+            const auto& plane = frame->planes[i];
+            if (plane.buffer) logf("Vulkan resource %s: format=%d size=%ux%u aspect=0x%x copyAspect=0x%x rowBytes=%zu",
+                                   names[i], plane.image.format, plane.image.width, plane.image.height,
+                                   plane.image.range.aspectMask, d4r_vk_copy_aspect(plane.image.format, plane.image.range.aspectMask),
+                                   plane.rowBytes);
+        }
+    if (frame->planes[4].image.width != feature->outWidth || frame->planes[4].image.height != feature->outHeight)
+    { native_vk_free_frame(frame); return NGX_FAIL_INVALID_PARAMETER; }
+    auto& params = frame->params;
+    native_vk_read_params(feature, p, params);
+    params.hasExposure = frame->planes[3].buffer != VK_NULL_HANDLE;
+    // Output subrect conversion and auxiliary masks are not implemented yet.
+    void* mask = nullptr;
+    d4r_ngx_get_void(p, "DLSS.Input.Bias.Current.Color.Mask", &mask);
+    void* transparency = nullptr; d4r_ngx_get_void(p, "TransparencyMask", &transparency);
+    if (params.outputBaseX || params.outputBaseY || mask || transparency ||
+        params.colorBaseX > frame->planes[0].image.width || params.colorBaseY > frame->planes[0].image.height ||
+        params.renderWidth > frame->planes[0].image.width - params.colorBaseX ||
+        params.renderHeight > frame->planes[0].image.height - params.colorBaseY)
+    { native_vk_free_frame(frame); return NGX_FAIL_INVALID_PARAMETER; }
+    VkEventCreateInfo event = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    if (!frame->inputReady && (g_nativeVk.createEvent(g_nativeVk.device, &event, nullptr, &frame->inputReady) != VK_SUCCESS ||
+        g_nativeVk.createEvent(g_nativeVk.device, &event, nullptr, &frame->outputReady) != VK_SUCCESS ||
+        g_nativeVk.createEvent(g_nativeVk.device, &event, nullptr, &frame->consumed) != VK_SUCCESS))
+    { native_vk_free_frame(frame); return NGX_FAIL_PLATFORM_ERROR; }
+    frame->number = ++feature->frame;
+    try { frame->waiter = std::thread([feature, frame] { native_vk_run(feature, frame); }); }
+    catch (...) { native_vk_free_frame(frame); return NGX_FAIL_PLATFORM_ERROR; }
+    // All validation/allocation precedes the first recorded command.
+    VkMemoryBarrier readable = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readable.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    readable.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    g_nativeVk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       0, 1, &readable, 0, nullptr, 0, nullptr);
+    for (int i = 0; i < 4; ++i)
+    {
+        auto& plane = frame->planes[i];
+        if (!plane.buffer) continue;
+        native_vk_ownership(cmd, plane, false);
+        g_nativeVkStaging.record(cmd, plane.staging, plane.image.width, plane.image.height, i + 1);
+    }
+    auto& resultPlane = frame->planes[4];
+    if (resultPlane.cuda) {
+        native_vk_ownership(cmd, resultPlane, false);
+        g_nativeVk.fill(cmd, resultPlane.buffer, 0, resultPlane.rowBytes * resultPlane.image.height, 0);
+    }
+    for (auto& plane : frame->planes) native_vk_ownership(cmd, plane, true);
+    VkMemoryBarrier readback = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    g_nativeVk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &readback, 0, nullptr, 0, nullptr);
+    g_nativeVk.cmdSetEvent(cmd, frame->inputReady, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkMemoryBarrier upload = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    upload.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT; upload.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    g_nativeVk.waitEvents(cmd, 1, &frame->outputReady, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          1, &upload, 0, nullptr, 0, nullptr);
+    auto& output = frame->planes[4];
+    native_vk_ownership(cmd, output, false);
+    g_nativeVkStaging.record(cmd, output.staging, output.image.width, output.image.height);
+    VkMemoryBarrier visible = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    visible.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    visible.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    g_nativeVk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       0, 1, &visible, 0, nullptr, 0, nullptr);
+    // CPU production is not GPU consumption. This marker follows the image
+    // write and all earlier commands which reference the staging objects.
+    g_nativeVk.cmdSetEvent(cmd, frame->consumed, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    owner.frames.push_back(frame);
+    if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
+        logf("D4R_VULKAN_API frame=%u reclaim=%.3f allocate=%.3f record=%.3f total=%.3f ms",
+             frame->number, profile_ms(apiStarted, reapedAt), profile_ms(reapedAt, allocatedAt),
+             profile_ms(allocatedAt, ProfileClock::now()), profile_ms(apiStarted, ProfileClock::now()));
+    return NGX_SUCCESS;
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature_C(VkCommandBuffer cmd, const NgxHandle* handle, void* p, void* callback)
+{ return NVSDK_NGX_VULKAN_EvaluateFeature(cmd, handle, p, callback); }
+
+static NgxResult native_vk_release(std::vector<NativeVkFeature>::iterator it)
+{
+    for (auto* frame : it->frames) frame->cancel = true;
+    // Every waiter signals output before CUDA state disappears.
+    for (auto* frame : it->frames)
+        if (frame->waiter.joinable()) frame->waiter.join();
+    for (auto* frame : it->frames)
+        if (native_vk_consumed(*frame)) native_vk_free_frame(frame);
+        else g_nativeVkRetired.push_back(frame);
+    for (auto* frame : it->reusable) native_vk_free_frame(frame);
+    if (it->engine)
+    {
+        if (native_vk_engine_idle(*it->engine)) native_vk_engine_destroy(*it->engine);
+        else g_nativeVkEngineRetired.push_back(it->engine);
+        it->engine.reset();
+    }
+    logf("native Vulkan feature %u released after %u completed frames",
+         it->feature->handle.Id, it->feature->completedFrames.load());
+    it->feature->retiring = true;
+    release_feature(it->feature);
+    g_nativeVkFeatures.erase(it);
+    return NGX_SUCCESS;
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_ReleaseFeature(NgxHandle* handle)
+{
+    std::lock_guard<std::mutex> lock(g_nativeVkMutex);
+    auto it = std::find_if(g_nativeVkFeatures.begin(), g_nativeVkFeatures.end(),
+                           [&](const auto& f) { return &f.feature->handle == handle; });
+    return it == g_nativeVkFeatures.end() ? NGX_FAIL_INVALID_PARAMETER : native_vk_release(it);
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Shutdown()
+{
+    std::lock_guard<std::mutex> lock(g_nativeVkMutex);
+    NgxResult result = NGX_SUCCESS;
+    while (!g_nativeVkFeatures.empty())
+        if (native_vk_release(g_nativeVkFeatures.begin()) != NGX_SUCCESS) result = NGX_FAIL_PLATFORM_ERROR;
+    if (g_nativeVk.device)
+    {
+        // Shutdown is the application's teardown boundary: it must externally
+        // synchronize its queues and discard unsubmitted recordings first.
+        if (g_nativeVk.idle(g_nativeVk.device) != VK_SUCCESS) return NGX_FAIL_PLATFORM_ERROR;
+        for (auto* frame : g_nativeVkRetired) native_vk_free_frame(frame);
+        g_nativeVkRetired.clear();
+        for (auto& state : g_nativeVkEngineRetired) native_vk_engine_destroy(*state);
+        g_nativeVkEngineRetired.clear();
+        for (auto& plane : g_nativeVkBufferPool) native_vk_free_plane(plane, true);
+        g_nativeVkBufferPool.clear(); g_nativeVkExternalAllocations = 0;
+        g_nativeVkStaging.destroy();
+        NVSDK_NGX_D3D12_Shutdown();
+        g_nativeVk = {};
+        g.nativeVulkan = false;
+    }
+    return result;
+}
+// DLL_PROCESS_DETACH. A game may exit without NGX shutdown while a submitted
+// command buffer still waits in vkCmdWaitEvents for an output event that only the
+// (now killed) waiter thread would set. The wait sits inside the GPU ring, so the
+// kernel cannot cancel it: the ring times out and resets 10 s after the exit.
+// Release every such wait. No locking: other threads are gone, and one may have
+// died holding the mutex.
+static void native_vk_process_exit()
+{
+    static std::atomic<bool> ran{false}; // the bridge's hook, then DLL_PROCESS_DETACH
+    if (!g_nativeVk.device || !g_nativeVk.setEvent || ran.exchange(true)) return;
+    unsigned released = 0;
+    auto release = [&](NativeVkFrame* frame) {
+        if (frame && !frame->done.load() && frame->outputReady &&
+            g_nativeVk.setEvent(g_nativeVk.device, frame->outputReady) == VK_SUCCESS) ++released;
+    };
+    for (auto& owner : g_nativeVkFeatures)
+        for (auto* frame : owner.frames) release(frame);
+    for (auto* frame : g_nativeVkRetired) release(frame);
+    if (released) logf("process exit: released %u pending Vulkan output wait(s)", released);
+}
+D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_Shutdown1(VkDevice device)
+{
+    if (device != g_nativeVk.device) return NGX_FAIL_INVALID_PARAMETER;
+    return NVSDK_NGX_VULKAN_Shutdown();
+}

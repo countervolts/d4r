@@ -1,0 +1,40 @@
+#version 460
+// L reconstruction surfaces from the C32 WMMA block's binary16 pixel output.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "normalized_store.glsl"
+#include "round_half.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+    ivec2 size; int tokW; uint reset;
+    vec2 rndOffs, rnd2hi, hiSize, histOffs;
+    float sigma, rho; vec2 renderInv;
+} p;
+layout(set = 0, binding = 1, std430) readonly buffer Head { uint a[]; } head;
+layout(set = 0, binding = 2, rgba8_snorm) uniform writeonly image2D featOut;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D gateOut;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D mixOut;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D covOut;
+float sigmoidL(float v) { return roundHalfValue(1.0 / (exp2(v * -1.442695) + 1.0)); }
+float tanhL(float t)
+{
+    const float m = abs(t), s = t * t;
+    const float big = m >= 9.0109138 ? 1.0 : fma(1.0 / (exp2(m * 2.88539) + 1.0), -2.0, 1.0);
+    return m >= 0.6 ? (t < 0.0 ? -big : big) :
+        fma(fma(fma(fma(fma(0.01573968306183815, s, -0.05230396240949631), s, 0.13315297663211823), s, -0.33332768082618713), s, 0.0), t, t);
+}
+
+float value(uint at, uint c) { const f16vec2 v = unpackFloat2x16(head.a[at + c / 2u]); return float((c & 1u) == 0u ? v.x : v.y); }
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= p.size.x || pixel.y >= p.size.y) return;
+    const uint at = uint(pixel.y * (2 * p.tokW) + pixel.x) * 16u;
+#define V(c) value(at, uint(c))
+    imageStore(gateOut, pixel, unorm8Value(vec4(sigmoidL(V(0)), sigmoidL(V(1)), sigmoidL(V(12)), 0.0)));
+    const vec3 m = vec3(V(13), V(16), V(17)), ex = exp2((m - max(max(m.x, m.y), m.z)) * 1.442695);
+    imageStore(mixOut, pixel, unorm8Value(vec4(ex * (1.0 / (ex.z + (ex.x + ex.y))), 0.0)));
+    const float a = p.sigma * sigmoidL(clamp(V(20), -20.0, 20.0)), b = p.sigma * sigmoidL(clamp(V(21), -20.0, 20.0));
+    imageStore(covOut, pixel, vec4(a * a, b * b, a * b * tanhL(V(24) * p.rho), 0.0));
+    imageStore(featOut, pixel, snorm8Value(vec4(tanhL(V(4)), tanhL(V(5)), tanhL(V(8)), tanhL(V(9)))));
+#undef V
+}

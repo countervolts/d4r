@@ -12,6 +12,7 @@ class MotionGeometryTests(unittest.TestCase):
         source = r'''
 #include "d4r_motion_dilation.h"
 #include <cassert>
+#include <initializer_list>
 int main() {
     D4rMotionDilationParams p = {};
     p.render_width = 854; p.render_height = 480;
@@ -21,6 +22,18 @@ int main() {
     assert(d4r_motion_dilation_geometry(&low, 0xb, 2560, 1440));
     assert(low.motion_width == 854 && low.motion_height == 480);
     assert(low.motion_pitch == 4096 && low.jitter_x == 0 && low.jitter_y == 0);
+    for (unsigned radius : {1u, 2u}) {
+        low.radius = radius;
+        assert(d4r_motion_dilation_lds_eligible(&low));
+        auto fallback = low; fallback.jitter_x = 0.25f;
+        assert(!d4r_motion_dilation_lds_eligible(&fallback));
+        fallback = low; ++fallback.motion_height;
+        assert(!d4r_motion_dilation_lds_eligible(&fallback));
+        fallback = low; ++fallback.motion_width;
+        assert(!d4r_motion_dilation_lds_eligible(&fallback));
+    }
+    low.radius = 0; assert(!d4r_motion_dilation_lds_eligible(&low));
+    low.radius = 3; assert(!d4r_motion_dilation_lds_eligible(&low));
     low = p;
     assert(d4r_motion_dilation_geometry(&low, 0x4b, 2560, 1440));
     low = p; low.motion_width = 853;

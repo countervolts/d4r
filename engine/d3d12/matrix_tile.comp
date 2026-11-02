@@ -1,0 +1,22 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x=32) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint data[]; } src;
+layout(set=0,binding=1,std430) buffer Output { float data[]; } dst;
+#ifndef MATRIX_STEPS
+#define MATRIX_STEPS 1
+#endif
+void main()
+{
+    const uint base = gl_WorkGroupID.x * 512u;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopMatLoad(a, src.data, base, 8u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b, src.data, base+128u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(c, src.data, base+256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint i=0; i<MATRIX_STEPS; ++i) c=coopMatMulAdd(a,b,c);
+    coopMatStore(c,dst.data,gl_WorkGroupID.x*256u,16u,gl_CooperativeMatrixLayoutRowMajor);
+}

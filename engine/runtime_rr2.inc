@@ -38,15 +38,66 @@ struct R2Stage {
     uint32_t group = 1;    // "xN": a workgroup holds N windows along x (the stages generated around translated code)
     uint32_t record = 0;   // R2Gather, "rN": 32-bit words per window in the arena
     bool ranges = false;   // R2Gather, "s3": the records' rows lie in three ranges (six words end enc0's block; else one address)
+    // "phases": the stage split over several workgroups per window (engine/rr/rr2_m.comp RR2_PHASE 1 - 4): one head per
+    // workgroup, the heads' sum and r, one MLP branch per workgroup, the rest; a window's values pass through a record
+    // of recordWords 32-bit words in the arena. Null pipelines: the model has none (or not all four files)
+    std::array<Pipeline, 4> phases;
+    uint32_t heads = 0, branches = 0, recordWords = 0;
+    // AMD's Windows driver (LLPC) crashes on some of preset F's stage shaders and compiles the network's FP8
+    // cooperative-matrix ones slowly, so on that driver a stage a stage recorder runs (vkhip: the model has the
+    // stage's HIP kernel) is compiled on the first frame that runs it here instead of at load (R2Model::ensureStage).
+    // Linux keeps the model's stages exactly as they are.
+    std::string file, phaseFile[4];   // the shaders to build, after the _llpc variant choice
+    std::vector<VkDescriptorType> types;
+    uint32_t subgroup = 32;
+    bool deferred = false;
+    std::once_flag once;
 };
 struct R2Model {
     std::array<R2Stage, R2Stages> stages;
     Buffer aux;                   // encoder 0's second table (argument 104)
     std::vector<char> auxPending;
     std::array<Pipeline, 2> exposure;
+    Pipeline exposureOne;         // both exposure passes in one (exposure_f2.spv, 64-bit atomics); else null
     bool particles = false;       // the model has R2DownP
     bool gather = false;          // the model has R2Gather
-    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache) {
+    // AMD's own Windows driver (LLPC) crashes on preset F's encoder 0 and decoder 0 kernel 1 shaders (the translated
+    // code around the native block: a null read in the driver's compiler) and compiles the network's FP8
+    // cooperative-matrix stages slowly. compile_rr2.py writes <shader>_llpc.spv, the same shaders with SPIRV-Tools'
+    // -O applied, next to the originals; on that driver (and only there) the runtime loads those. RADV keeps the
+    // model's own files: the images are the same (54.9 dB against the DXIL reference, engine/rr/README.md).
+    bool llpc = false;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    const VkSpecializationInfo* specialization = nullptr;
+    // the shader to load for FILE: FILE's _llpc.spv variant on AMD's Windows driver when the model has it
+    std::string shaderFile(const std::string& directory, const std::string& file) const {
+        if (!llpc || file.size() < 5 || file.compare(file.size() - 4, 4, ".spv") != 0) return file;
+        const std::string variant = file.substr(0, file.size() - 4) + "_llpc.spv";
+        return exists(directory + "/" + variant) ? variant : file;
+    }
+    // the pipeline(s) of a stage on first use (deferred stages: see R2Stage::deferred)
+    void ensureStage(unsigned stage) {
+        auto& st = stages[stage];
+        std::call_once(st.once, [&] {
+            const VkDevice dev = deviceHandle;
+            traceStage(directory + "/" + st.file);
+            st.pipeline.create(dev, directory + "/" + st.file, st.types, st.subgroup, cache, 0, specialization);
+            for (int k = 0; k < 4; ++k)
+                if (!st.phaseFile[k].empty()) {
+                    traceStage(directory + "/" + st.phaseFile[k]);
+                    st.phases[k].create(dev, directory + "/" + st.phaseFile[k], {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, 32, cache, 0, specialization);
+                }
+        });
+    }
+    VkDevice deviceHandle = VK_NULL_HANDLE;
+    std::string directory;
+    void load(const Device& d, const std::string& directory, std::istringstream& lines, VkPipelineCache cache, bool int64Atomics,
+              const VkSpecializationInfo* specialization, bool amdProprietary) {
+        llpc = amdProprietary;
+        this->cache = cache;
+        this->specialization = specialization;
+        this->directory = directory;
+        deviceHandle = d.handle;
         const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         auto split = [](const std::string& list) {
             std::vector<std::string> items;
@@ -65,6 +116,27 @@ struct R2Model {
         while (std::getline(lines, line)) {
             std::istringstream f(line);
             std::string key; f >> key;
+            if (key == "phases") {   // "phases STAGE P1 P2 P3 P4 HEADS BRANCHES WORDS" (after the stage's own line)
+                std::string name, files[4];
+                uint32_t heads = 0, branches = 0, words = 0;
+                f >> name >> files[0] >> files[1] >> files[2] >> files[3] >> heads >> branches >> words;
+                unsigned stage = 0;
+                while (stage < R2Network && name != R2Names[stage]) ++stage;
+                if (stage >= R2Network || !seen[stage] || !heads || !branches || !words)
+                    throw std::runtime_error("rr.txt: invalid phases line: " + line);
+                bool all = true;
+                for (const auto& file : files) all = all && exists(directory + "/" + file);
+                if (!all) continue;   // a model packaged without them runs the stage's own shader
+                auto& st = stages[stage];
+                for (int k = 0; k < 4; ++k) {
+                    st.phaseFile[k] = shaderFile(directory, files[k]);
+                    if (st.deferred) continue;   // with the stage (ensureStage)
+                    traceStage(directory + "/" + st.phaseFile[k]);
+                    st.phases[k].create(d.handle, directory + "/" + st.phaseFile[k], {b, b, b}, 32, cache, 0, specialization);
+                }
+                st.heads = heads; st.branches = branches; st.recordWords = words;
+                continue;
+            }
             if (key != "stage") continue;
             // "stage NAME SHADER.spv SUBGROUP WEIGHTS|- ARGS TEXTURES SURFACES BUFFERS POINTERS": the lists are
             // comma-separated argument offsets ("-": none), surfaces OFFSET:FORMAT, pointers OFFSET:UNITS; an optional "xN"
@@ -95,7 +167,15 @@ struct R2Model {
             types.insert(types.end(), st.textures.size(), t);
             types.insert(types.end(), st.surfaces.size(), s);
             types.insert(types.end(), st.buffers.size(), b);
-            st.pipeline.create(d.handle, directory + "/" + shader, types, subgroup, cache);
+            st.file = shaderFile(directory, shader);
+            st.types = types; st.subgroup = subgroup;
+            // a network stage the model has a HIP kernel for runs on a stage recorder (vkhip) on AMD's Windows
+            // driver: it is compiled on the first frame that runs it here, not at load
+            st.deferred = llpc && stage < R2Network && exists(directory + "/hip/rr2_" + name + ".hsaco");
+            if (!st.deferred) {
+                traceStage(directory + "/" + st.file);
+                st.pipeline.create(d.handle, directory + "/" + st.file, types, subgroup, cache, 0, specialization);
+            }
             { const auto bytes = read(directory + "/" + argsFile); st.args.assign(bytes.begin(), bytes.end()); }
             blob(st.weights, st.pending, weightFile == "-" ? std::vector<char>(16) : read(directory + "/" + weightFile));
         }
@@ -106,8 +186,14 @@ struct R2Model {
         for (unsigned stage : {R2DownP, R2Gather})
             if (!seen[stage]) blob(stages[stage].weights, stages[stage].pending, std::vector<char>(16));
         blob(aux, auxPending, read(directory + "/enc0-aux.bin"));
+        traceStage(directory + "/exposure_f0.spv");
         exposure[0].create(d.handle, directory + "/exposure_f0.spv", {b, t, b}, 64, cache);
+        traceStage(directory + "/exposure_f1.spv");
         exposure[1].create(d.handle, directory + "/exposure_f1.spv", {b, b, b, t, s}, 64, cache);
+        if (int64Atomics && exists(directory + "/exposure_f2.spv")) {
+            traceStage(directory + "/exposure_f2.spv");
+            exposureOne.create(d.handle, directory + "/exposure_f2.spv", {b, t, b, b, t, s}, 64, cache);
+        }
     }
     void recordUpload(VkCommandBuffer cb) {   // the weights into the command buffer (recordContents)
         for (auto& st : stages) recordContents(cb, st.weights, st.pending);
@@ -117,6 +203,7 @@ struct R2Model {
 struct R2ExposureParams { int32_t last[2]; uint32_t blocksX, blocks; float invCount; uint32_t reset; };
 
 struct R2Engine {
+    RStageRecorder* recorder = nullptr;
     const Device& d;
     R2Model& model;
     uint32_t rw, rh, ow, oh, w0, h0;
@@ -133,6 +220,16 @@ struct R2Engine {
     uint32_t tileGroup = 1;
     // the gather pass's records (R2Gather): byte address of range 0, its rows of windows, range 1, its rows, range 2
     std::array<uint32_t, 5> gatherWords{};
+    // the network stages that run in phases (R2Stage::phases) at this render size: those with at most D4R_RR2_SPLIT_WINDOWS
+    // windows (default 48, a little under the compute units of the GPUs that run preset F: with fewer windows than
+    // compute units a window has one to itself and its heads and MLP branches wait on one another; with more, the
+    // extra workgroups only add work. RX 9070, 1280x720: enc5's 18 - 24 windows run in phases, level 4's 66 - 77 do
+    // not). Their records start at recordsAt
+    std::array<bool, R2Network> split{};
+    // the stages whose records exist (argument 104): the split ones, and with arena addresses (vkhip, whose kernels for
+    // the levels 3 - 5 keep per-thread arrays in their window's record) every one at a level with phases
+    std::array<bool, R2Network> records{};
+    uint64_t recordsAt = 0;
     struct Rect { uint32_t x0, y0, x1, y1; };
     std::vector<Rect> src, dst;               // per tile: intermediate rectangle (with overlap), output rectangle
     std::vector<VkDeviceSize> downPAt;
@@ -166,16 +263,17 @@ struct R2Engine {
         RFrameImages images{};
         FrameOutput finalOutput{};
         VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkImageView output = VK_NULL_HANDLE;   // the frame's output (a deferred stage's sets are made on first use)
         std::array<std::array<VkDescriptorSet, 2>, R2Network> network{};
         std::array<VkDescriptorSet, 2> gather{};
         std::vector<std::array<VkDescriptorSet, 2>> post;
         std::vector<VkDescriptorSet> down;
         std::vector<std::array<VkDescriptorSet, 2>> downP;
         VkDescriptorSet pooled = VK_NULL_HANDLE, exposure0 = VK_NULL_HANDLE;
-        std::array<VkDescriptorSet, 2> exposure1{};
+        std::array<VkDescriptorSet, 2> exposure1{}, exposureOne{};
     };
     std::vector<Bindings> bindings;
-    const Bindings* bound = nullptr;
+    Bindings* bound = nullptr;
     float prevJitter[2] = {0, 0};
     uint32_t frame = 0;
     bool reset = true;
@@ -251,7 +349,7 @@ struct R2Engine {
         return {};
     }
 
-    R2Engine(const Device& device, R2Model& m, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight)
+    R2Engine(const Device& device, R2Model& m, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, bool arenaAddress = false)
         : d(device), model(m), rw(renderWidth), rh(renderHeight), ow(outputWidth), oh(outputHeight) {
         w0 = (rw + 31) & ~31u; h0 = (rh + 31) & ~31u;
         iw = (ow * 3 + 1) / 2; ih = (oh * 3 + 1) / 2;
@@ -329,18 +427,47 @@ struct R2Engine {
         gatherWords = {static_cast<uint32_t>(ranges[0].first), ranges[0].second, static_cast<uint32_t>(ranges[1].first),
                        ranges[1].second, static_cast<uint32_t>(tail)};
         const uint64_t gatherTail = placed >= rows ? 0 : (rows - placed) * rowBytes;
-        const uint64_t arenaTotal = std::max({tileEnd, model.gather ? tail + gatherTail : 0});
+        // the phases' records: past the network's regions, where only the tile slots (live in the output stage) and the
+        // gather records' last rows (live in encoder 0) lie
+        const char* splitEnv = std::getenv("D4R_RR2_SPLIT_WINDOWS");
+        const uint32_t splitWindows = splitEnv ? static_cast<uint32_t>(std::strtoul(splitEnv, nullptr, 10)) : 48u;
+        uint64_t recordBytes = 0;
+        recordsAt = (arenaBytes + 255) & ~uint64_t(255);
+        for (unsigned stage = 0; stage < R2Network; ++stage) {
+            const auto& st = model.stages[stage];
+            if (st.phaseFile[0].empty()) continue;   // the model has no four-phase form of this stage
+            const int l = R2Level[stage];
+            uint32_t windows = 0;
+            for (uint32_t f = 0; f < 2; ++f) {
+                const uint32_t shift = r2Shift(stage, f), sx = shift & 0xffffu, sy = shift >> 16;
+                windows = std::max(windows, ((lw(l) + sx + 7) / 8) * ((lh(l) + sy + 7) / 8));
+            }
+            split[stage] = windows <= splitWindows;
+            records[stage] = split[stage] || arenaAddress;
+            if (records[stage]) recordBytes = std::max(recordBytes, uint64_t(windows) * st.recordWords * 4);
+        }
+        // and the stages without phases there (dec4_0, dec3_0; kernels/rr/glsl2hip.py --record): their level's records,
+        // laid out for a stage with the same heads, branches and channels
+        if (arenaAddress)
+            for (unsigned stage = 0; stage < R2Network; ++stage)
+                for (unsigned other = 0; other < R2Network && !records[stage]; ++other)
+                    records[stage] = records[other] && R2Level[other] == R2Level[stage];
+        const uint64_t arenaTotal = std::max({tileEnd, model.gather ? tail + gatherTail : 0, recordsAt + recordBytes});
         if (arenaTotal > 0xffffffffull) throw std::runtime_error("Ray Reconstruction: the render size is too large for the arena");
-        arena.create(d, arenaTotal, storage, debug);
+        arena.create(d, arenaTotal, storage, debug, arenaAddress);
         values.create(d, 16, storage, debug);
         dummy.create(d, 4096, storage);
         exposure.blocksX = (rw + 15) / 16; exposure.blocks = exposure.blocksX * ((rh + 15) / 16);
         exposure.last[0] = static_cast<int32_t>(rw - 1); exposure.last[1] = static_cast<int32_t>(rh - 1);
         exposure.invCount = static_cast<float>(10000.0 / (4294967296.0 * rw * rh));
-        sums.create(d, exposure.blocks * 8, storage);
+        sums.create(d, std::max(exposure.blocks, 2u) * 8, storage);   // the one-pass exposure: the total and the count
         const size_t tiles = src.size();
         auto place = [&](size_t bytes) { const VkDeviceSize at = paramBytes; paramBytes += (bytes + 255) & ~VkDeviceSize(255); return at; };
-        for (unsigned i = 0; i < R2Network; ++i) { blocks[i] = model.stages[i].args; paramAt[i] = place(blocks[i].size()); }
+        for (unsigned i = 0; i < R2Network; ++i) {
+            blocks[i] = model.stages[i].args;
+            if (records[i]) blocks[i].resize(std::max<size_t>(blocks[i].size(), 108));   // argument 104: the phases' records
+            paramAt[i] = place(blocks[i].size());
+        }
         postBlocks.assign(tiles, model.stages[R2Post].args); downBlocks.assign(tiles, model.stages[R2Down].args);
         if (model.particles) downPBlocks.assign(tiles, model.stages[R2DownP].args);
         for (size_t i = 0; i < tiles; ++i) {
@@ -350,7 +477,7 @@ struct R2Engine {
         pooledBlock = model.stages[R2Pooled].args;
         pooledAt = place(pooledBlock.size());
         expAt = place(sizeof(R2ExposureParams));
-        paramAll.create(d, paramBytes, storage);
+        paramAll.create(d, paramBytes, storage, false, arenaAddress);
         const VkFormat half4 = VK_FORMAT_R16G16B16A16_SFLOAT;
         for (int i = 0; i < 2; ++i) {
             feat[i].create(d, rw, rh, half4); hist[i].create(d, iw, ih, half4);
@@ -372,6 +499,7 @@ struct R2Engine {
         for (unsigned stage = 0; stage < R2Network; ++stage) {
             auto& p = blocks[stage];
             const int l = R2Level[stage];
+            if (records[stage]) put32(p, 104, static_cast<uint32_t>(recordsAt));
             put32(p, 0, lw(l)); put32(p, 4, lh(l));
             putF(p, 84, 1.0f / static_cast<float>(lw(l))); putF(p, 88, 1.0f / static_cast<float>(lh(l)));
             for (const auto& [offset, units] : model.stages[stage].pointers)
@@ -561,12 +689,7 @@ struct R2Engine {
         };
         auto found = std::find_if(bindings.begin(), bindings.end(), same);
         if (found == bindings.end()) {
-            // Evict the oldest set rather than failing (see runtime_rr.inc); drain its in-flight uses first.
-            if (bindings.size() >= 16) {
-                VKCHECK(vkDeviceWaitIdle(d.handle));
-                vkDestroyDescriptorPool(d.handle, bindings.front().pool, nullptr);
-                bindings.erase(bindings.begin());
-            }
+            if (bindings.size() >= kRRMaxBindings) throw std::runtime_error("too many distinct Ray Reconstruction input view sets");
             Bindings b;
             b.images = images; b.finalOutput = finalOutput;
             const uint32_t tiles = static_cast<uint32_t>(src.size());
@@ -587,8 +710,11 @@ struct R2Engine {
             pi.maxSets = sets; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
             VKCHECK(vkCreateDescriptorPool(d.handle, &pi, nullptr, &b.pool));
             const VkImageView output = finalOutput.view ? finalOutput.view : out.view;
-            for (unsigned stage = 0; stage < R2Network; ++stage)
+            b.output = output;
+            for (unsigned stage = 0; stage < R2Network; ++stage) {
+                if (model.stages[stage].deferred) continue;   // on the first frame that runs it (recordFrame)
                 for (uint32_t par = 0; par < 2; ++par) b.network[stage][par] = stageSet(b, stage, paramAt[stage], par, output);
+            }
             if (model.gather)
                 for (uint32_t par = 0; par < 2; ++par) b.gather[par] = stageSet(b, R2Gather, paramAt[R2Enc0], par, output);
             for (uint32_t i = 0; i < tiles; ++i) {
@@ -598,17 +724,29 @@ struct R2Engine {
                     b.downP.push_back({stageSet(b, R2DownP, downPAt[i], 0, output), stageSet(b, R2DownP, downPAt[i], 1, output)});
             }
             b.pooled = stageSet(b, R2Pooled, pooledAt, 0, output);
-            b.exposure0 = descriptorSet(d.handle, b.pool, model.exposure[0].descriptors);
-            bindRange(d.handle, b.exposure0, 0, paramAll, expAt);
-            bindImage(d.handle, b.exposure0, 1, images.color, nearest, images.layout);
-            bindBuffer(d.handle, b.exposure0, 2, sums);
-            for (uint32_t par = 0; par < 2; ++par) {
-                VkDescriptorSet set = b.exposure1[par] = descriptorSet(d.handle, b.pool, model.exposure[1].descriptors);
-                bindRange(d.handle, set, 0, paramAll, expAt);
-                bindBuffer(d.handle, set, 1, sums);
-                bindBuffer(d.handle, set, 2, values);
-                bindImage(d.handle, set, 3, e[par ^ 1].view, nearest);
-                bindImage(d.handle, set, 4, e[par].view);
+            if (model.exposureOne.handle)
+                for (uint32_t par = 0; par < 2; ++par) {
+                    VkDescriptorSet set = b.exposureOne[par] = descriptorSet(d.handle, b.pool, model.exposureOne.descriptors);
+                    bindRange(d.handle, set, 0, paramAll, expAt);
+                    bindImage(d.handle, set, 1, images.color, nearest, images.layout);
+                    bindBuffer(d.handle, set, 2, sums);
+                    bindBuffer(d.handle, set, 3, values);
+                    bindImage(d.handle, set, 4, e[par ^ 1].view, nearest);
+                    bindImage(d.handle, set, 5, e[par].view);
+                }
+            else {
+                b.exposure0 = descriptorSet(d.handle, b.pool, model.exposure[0].descriptors);
+                bindRange(d.handle, b.exposure0, 0, paramAll, expAt);
+                bindImage(d.handle, b.exposure0, 1, images.color, nearest, images.layout);
+                bindBuffer(d.handle, b.exposure0, 2, sums);
+                for (uint32_t par = 0; par < 2; ++par) {
+                    VkDescriptorSet set = b.exposure1[par] = descriptorSet(d.handle, b.pool, model.exposure[1].descriptors);
+                    bindRange(d.handle, set, 0, paramAll, expAt);
+                    bindBuffer(d.handle, set, 1, sums);
+                    bindBuffer(d.handle, set, 2, values);
+                    bindImage(d.handle, set, 3, e[par ^ 1].view, nearest);
+                    bindImage(d.handle, set, 4, e[par].view);
+                }
             }
             bindings.push_back(std::move(b));
             found = bindings.end() - 1;
@@ -640,9 +778,14 @@ struct R2Engine {
     }
     void recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) {
         if (!bound) throw std::runtime_error("REngine::setFrame was not called");
-        const auto& b = *bound;
+        auto& b = *bound;
         const uint32_t f = frame, cur = f & 1u;
         auto stamp = [&](uint32_t n) { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stamps, first + n); };
+        // timing only: D4R_ENGINE_RR_STAGE_STAMPS=1 also stamps after every network stage and output group, from query
+        // first + 4 on (the caller's pool needs 32 queries)
+        static const bool stageStamps = std::getenv("D4R_ENGINE_RR_STAGE_STAMPS") != nullptr;
+        uint32_t extra = 4;
+        auto stageStamp = [&] { if (stageStamps) stamp(extra++); };
         auto step = [&] {
             memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -675,9 +818,15 @@ struct R2Engine {
             vkCmdUpdateBuffer(cb, paramAll.handle, at, std::min<VkDeviceSize>(65536, paramBytes - at), all.data() + at);
         memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        dispatch(cb, model.exposure[0], b.exposure0, exposure.blocksX, exposure.blocks / exposure.blocksX);
-        step();
-        dispatch(cb, model.exposure[1], b.exposure1[cur], 1, 1);
+        // the exposure: one pass with 64-bit atomics (the last block finishes, as NGX's kernel), or the block sums and
+        // one workgroup that adds them
+        if (model.exposureOne.handle)
+            dispatch(cb, model.exposureOne, b.exposureOne[cur], exposure.blocksX, exposure.blocks / exposure.blocksX);
+        else {
+            dispatch(cb, model.exposure[0], b.exposure0, exposure.blocksX, exposure.blocks / exposure.blocksX);
+            step();
+            dispatch(cb, model.exposure[1], b.exposure1[cur], 1, 1);
+        }
         step();
         stamp(1);
         for (unsigned stage = 0; stage < R2Network; ++stage) {
@@ -688,8 +837,28 @@ struct R2Engine {
                 dispatch(cb, model.stages[R2Gather].pipeline, b.gather[cur], gx, (lh(l) + sy + 7) / 8);
                 step();
             }
-            dispatch(cb, model.stages[stage].pipeline, b.network[stage][cur], (gx + model.stages[stage].group - 1) / model.stages[stage].group, (lh(l) + sy + 7) / 8);
-            step();
+            const auto& st = model.stages[stage];
+            const uint32_t gy = (lh(l) + sy + 7) / 8;
+            if (recorder && recorder->recordStage(cb, stage, gx, gy, shift)) {
+                step();
+                stageStamp();
+                continue;
+            }
+            if (st.deferred && !b.network[stage][cur]) {   // the first frame (and input set) that runs this stage here
+                model.ensureStage(stage);
+                for (uint32_t par = 0; par < 2; ++par) b.network[stage][par] = stageSet(b, stage, paramAt[stage], par, b.output);
+            }
+            if (split[stage]) {   // the phases: heads, their sum and r, MLP branches, the rest
+                const uint32_t parts[4] = {st.heads, 1, st.branches, 1};
+                for (int k = 0; k < 4; ++k) {
+                    dispatch(cb, st.phases[k], b.network[stage][cur], gx * parts[k], gy);
+                    step();
+                }
+            } else {
+                dispatch(cb, st.pipeline, b.network[stage][cur], (gx + st.group - 1) / st.group, gy);
+                step();
+            }
+            stageStamp();
         }
         stamp(2);
         // timing only: D4R_ENGINE_RR_SKIP=post,down,pooled leaves those passes out (the picture is wrong then)
@@ -711,6 +880,7 @@ struct R2Engine {
                 if (serial) step();
             }
             if (g < groups) step();
+            stageStamp();
         }
         // (the pooling pass reads what the post passes wrote: the last group's down passes do not touch it)
         if (!noPooled) dispatch(cb, model.stages[R2Pooled].pipeline, b.pooled, (qw + 15) / 16, (qh + 15) / 16);

@@ -5,6 +5,8 @@
 //          [0, 10000], 0.005).
 //   MODE 2 (Ray Reconstruction, the same cuda_dldn_engine_* kernels): MODE 1's measurement, written to two 1x1
 //          images instead of stage parameter blocks.
+//   MODE 3 (presets E and F, NGX's cuda_luma_convert / auto_exposure_copy kernels): MODE 0's measurement, written to
+//          the 1x1 image the input and reconstruction kernels sample as the exposure.
 // Both modes measure the same grid: the colour rectangle sampled at half the output size with an
 // endpoint-aligned nearest-texel lookup (the reference's cuda_luma_convert_kernel; the grid equals the
 // rectangle itself only when the render size is half the output size).
@@ -14,11 +16,27 @@
 //           input and output stages' parameter blocks. It also runs on frames that do not measure.
 //           With flag 4 (MODE 0) the game's 1x1 exposure texture replaces the measurement; nothing is measured then.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "input_quant.glsl"
+// Specialization constant 7 (set by the runtime per pipeline): the frame's colour take the CUDA backend's
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
+// pipeline without it carries no conversion code for games whose textures are already in binary16.
+#ifdef D4R_HLSL
+#define CANONICAL_INPUT false   // no specialization constants: the D3D12 build reads the game's textures as they are
+#else
+layout(constant_id = 7) const bool CANONICAL_INPUT = true;
+#endif
 #ifndef MODE
 #define MODE 0
 #endif
+#define LOG_MEAN (MODE == 0 || MODE == 3)   // key * exp(-mean of the log luma)
 layout(local_size_x = 64) in;
+// D4R_HLSL: the D3D12 build of this file (hlsl_build.py, dialect_hlsl.h); binding N is register tN/uN/sN there
+#ifdef D4R_HLSL
+struct Params
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Params
+#endif
 {
     ivec2 origin, size;     // rectangle of the colour texture; the grid maps onto it
     float invCount;         // 1 / (sampleSize.x * sampleSize.y)
@@ -33,7 +51,15 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     // The game's exposure scale and 1 / pre-exposure (MODE 0). NGX keeps the measured exposure unscaled and
     // applies both when it fills the stages' parameters, in this order: (1 / pre) * (scale * exposure).
     float gameScale, invPre;
-} p;
+}
+#ifdef D4R_HLSL
+;
+RWStructuredBuffer<Params> p_buf : register(u0);
+static Params p;
+#define D4R_HLSL_INIT_CALL p = p_buf[0];
+#else
+p;
+#endif
 shared float part[64];
 // The half surface the reference's auto_exposure_copy_kernel writes truncates toward zero. An explicit
 // float16_t cast rounds to nearest instead and lands on the next code whenever the exact value sits below
@@ -45,8 +71,15 @@ float truncatedHalf(float v)
     return unpackHalf2x16(bits).x;
 }
 #if PASS == 0
+#ifdef D4R_HLSL
+D4R_SAMPLER(colorTex, t1, s1)
+RWStructuredBuffer<float> sums_v : register(u2);
+struct Sums { RWStructuredBuffer<float> v; };
+static Sums sums = { sums_v };
+#else
 layout(set = 0, binding = 1) uniform sampler2D colorTex;
 layout(set = 0, binding = 2, std430) writeonly buffer Sums { float v[]; } sums;
+#endif
 void main()
 {
     const uint t = gl_LocalInvocationID.x;
@@ -60,10 +93,16 @@ void main()
             if (at.x >= grid.x || at.y >= grid.y) continue;
             // endpoint-aligned nearest-texel lookup from the grid to the colour rectangle
             const ivec2 sampleAt = ivec2(floor(fma(vec2(at) / vec2(grid - 1), vec2(p.size - 1), vec2(0.5))));
+            #if MODE == 0
+            // K: the CUDA backend's canonical binary16 colour (input_quant.glsl)
+            const vec3 t = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+            const vec3 c = CANONICAL_INPUT ? canonicalHalf(t) : t;
+#else
             const vec3 c = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+#endif
             // the reference accumulates the logarithm of the exposed luma (cuda_luma_convert_kernel). The
             // constant is applied to Y = fma(b, 0.25, fma(r, 0.25, g * 0.5)); MODE 1 keeps its own expression.
-#if MODE == 0
+#if LOG_MEAN
             precise const float luma = p.scale * fma(c.b, 0.25, fma(c.r, 0.25, 0.5 * c.g));
             // log(luma + 1e-6) as lg2(x) * ln2, and a non-finite or non-positive luma contributes nothing
             if (luma > 0.0 && !isinf(luma))
@@ -83,6 +122,31 @@ void main()
     }
 }
 #else
+#ifdef D4R_HLSL
+RWStructuredBuffer<float> sums_v : register(u1);
+struct Sums { RWStructuredBuffer<float> v; };
+static Sums sums = { sums_v };
+struct State { float current, previous; };
+RWStructuredBuffer<State> state_buf : register(u2);
+#define state state_buf[0]
+struct Words { RWStructuredBuffer<float> w; };
+#if MODE == 0
+RWStructuredBuffer<float> inp_w : register(u3);
+RWStructuredBuffer<float> outp_w : register(u4);
+static Words inp = { inp_w }, outp = { outp_w };
+D4R_SAMPLER(gameExposure, t5, s5)
+#elif MODE == 1
+RWStructuredBuffer<float> inp_w : register(u3);
+RWStructuredBuffer<float> post_w : register(u4);
+RWStructuredBuffer<float> down_w : register(u5);
+static Words inp = { inp_w }, post = { post_w }, down = { down_w };
+#elif MODE == 3
+RWTexture2D<float4> exposureOut : register(u3);
+#else
+RWTexture2D<float4> exposureOut : register(u3);
+RWTexture2D<float4> previousOut : register(u4);
+#endif
+#else
 layout(set = 0, binding = 1, std430) readonly buffer Sums { float v[]; } sums;
 layout(set = 0, binding = 2, std430) buffer State { float current, previous; } state;
 #if MODE == 0
@@ -93,11 +157,14 @@ layout(set = 0, binding = 5) uniform sampler2D gameExposure;                    
 layout(set = 0, binding = 3, std430) buffer InputParams { float w[]; } inp;     // enc0_m: expo, expoPrev at words 25, 26
 layout(set = 0, binding = 4, std430) buffer PostParams { float w[]; } post;     // post_m: words 14, 15
 layout(set = 0, binding = 5, std430) buffer DownParams { float w[]; } down;     // down_m: word 12
+#elif MODE == 3
+layout(set = 0, binding = 3, r16f) uniform writeonly image2D exposureOut;
 #else
 // MODE 2 (Ray Reconstruction): the denoiser's stages sample the exposure as two 1x1 textures, this frame's and
 // the previous frame's (zero on the first frame and after a reset)
 layout(set = 0, binding = 3, r16f) uniform writeonly image2D exposureOut;
 layout(set = 0, binding = 4, r16f) uniform writeonly image2D previousOut;
+#endif
 #endif
 void main()
 {
@@ -124,7 +191,7 @@ void main()
     {
         float mean = 0.0;
         for (uint i = 0u; i < 64u; ++i) mean += part[i];
-#if MODE == 0
+#if LOG_MEAN
         // auto_exposure_copy_kernel: key * exp2(-log2e * sum), written to a half surface. The formatted
         // store truncates toward zero, as in MODE 1 (measured on the captured K exposure: the store lands
         // one binary16 code below the correctly rounded value).
@@ -136,7 +203,7 @@ void main()
         float measured = truncatedHalf(full);
 #endif
         if (!(measured > 0.0) || isinf(measured)) measured = 1.0;
-#if MODE == 0
+#if LOG_MEAN
         previous = (p.flags & 2u) != 0u ? measured : current;
 #else
         previous = (p.flags & 2u) != 0u ? 0.0 : current;       // 0: no earlier exposure (the stages read it as 1)
@@ -148,12 +215,21 @@ void main()
     precise const float scaled = p.gameScale * current, scaledPrevious = p.gameScale * previous;
     precise const float exposure = p.invPre * scaled;
     precise const float ratio = scaled / scaledPrevious;
+#ifdef D4R_ACCURACY
+    // The input stage's luma scale: the reference divides the scaled exposure by itself, (scale * exposure) *
+    // rcp(scale * exposure), which is one ulp below 1 for some exposures (0.987305: 0x3F7FFFFF).
+    precise const float lumaScale = scaled / scaled;
+    inp.w[28] = exposure; inp.w[29] = lumaScale; inp.w[30] = ratio;
+#else
     inp.w[28] = exposure; inp.w[29] = 1.0; inp.w[30] = ratio;
+#endif
     outp.w[37] = exposure; outp.w[38] = ratio;
 #elif MODE == 1
     inp.w[25] = current; inp.w[26] = previous;
     post.w[14] = current; post.w[15] = previous;
     down.w[12] = current;
+#elif MODE == 3
+    imageStore(exposureOut, ivec2(0), vec4(current));
 #else
     imageStore(exposureOut, ivec2(0), vec4(current));
     imageStore(previousOut, ivec2(0), vec4(previous));

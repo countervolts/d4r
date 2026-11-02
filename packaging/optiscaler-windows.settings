@@ -1,0 +1,8 @@
+# OptiScaler.ini values the native Windows release sets after optiscaler.settings
+# (scripts/package_release_windows.sh). AMD's Windows driver has no nvapi64.dll (Proton brings its own), and
+# without an NVAPI games such as Cyberpunk 2077 offer FSR instead of DLSS: OptiScaler's integrated fakenvapi
+# answers the game's NVAPI calls. NGX keeps d4r's own d4r\nvapi\nvapi64.dll, which the shim loads.
+fakenvapi.UseFakenvapi=true
+# Under Proton the GPU is reported as NVIDIA; natively, upstream OptiScaler treats it as not DLSS capable and
+# silently uses FSR 2.1.2. patches/optiscaler-windows adds this key.
+Spoofing.ForceNvidia=true

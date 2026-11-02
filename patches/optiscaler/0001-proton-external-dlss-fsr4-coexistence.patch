@@ -1,0 +1,205 @@
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index a9b7a88..adbb206 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -612,6 +612,11 @@ FsrAgilitySDKUpgrade=auto
+ ; true or false - Default (auto) is true
+ Enabled=auto
+ 
++; Permit an explicitly configured external NGX shim on non-Nvidia hardware.
++; NvngxPath must name an existing DLL file; keep physical GPU identity for FSR4.
++; false by default; this does not make Nvidia's driver NGX core work on AMD.
++AllowExternalBackend=false
++
+ ; Set this to true to enable custom render preset overrides
+ ; true or false - Default (auto) is false
+ RenderPresetOverride=auto
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index d0265c4..5403430 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -263,6 +263,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         {
+             // Don't enable again if set false because of no nvngx found
+             DLSSEnabled.set_from_config(readBool("DLSS", "Enabled"));
++            DLSSAllowExternalBackend.set_from_config(readBool("DLSS", "AllowExternalBackend"));
+             UseGenericAppIdWithDlss.set_from_config(readBool("DLSS", "UseGenericAppIdWithDlss"));
+ 
+             RenderPresetOverride.set_from_config(readBool("DLSS", "RenderPresetOverride"));
+@@ -998,6 +999,8 @@ bool Config::SaveIni()
+     // DLSS
+     {
+         ini.SetValue("DLSS", "Enabled", GetBoolValue(Instance()->DLSSEnabled.value_for_config()).c_str());
++        ini.SetValue("DLSS", "AllowExternalBackend",
++                     GetBoolValue(Instance()->DLSSAllowExternalBackend.value_for_config()).c_str());
+         ini.SetValue("DLSS", "RenderPresetOverride",
+                      GetBoolValue(Instance()->RenderPresetOverride.value_for_config()).c_str());
+         ini.SetValue("DLSS", "RenderPresetForAll",
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index d7909b7..0225c87 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -218,6 +218,7 @@ class Config
+ 
+     // DLSS
+     CustomOptional<bool> DLSSEnabled { true };
++    CustomOptional<bool> DLSSAllowExternalBackend { false };
+     CustomOptional<bool> RenderPresetOverride { false };
+     CustomOptional<uint32_t> RenderPresetForAll { 0 };
+     CustomOptional<uint32_t> RenderPresetDLAA { 0 };
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index 7580c65..e5f047c 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "spoofing/BackendIdentity.h"
+ #include "dllmain.h"
+ 
+ #include "Util.h"
+@@ -1977,9 +1978,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             spdlog::info("");
+             State::Instance().isRunningOnNvidia = isNvidia();
+ 
+-            if (State::Instance().isRunningOnNvidia)
++            // External NGX backends (e.g. d4r) do not require a physical Nvidia GPU.
++            // Keep isRunningOnNvidia truthful so FSR4 and other hardware checks remain valid.
++            bool externalBackendFile = false;
++            if (Config::Instance()->DLSSAllowExternalBackend.value_or_default() &&
++                Config::Instance()->NvngxPath.has_value())
++            {
++                auto backendPath = std::filesystem::path(Config::Instance()->NvngxPath.value());
++                if (backendPath.is_relative())
++                    backendPath = Util::ExePath().parent_path() / backendPath;
++                std::error_code error;
++                externalBackendFile = std::filesystem::is_regular_file(backendPath, error);
++                if (externalBackendFile)
++                    Config::Instance()->NvngxPath.set_volatile_value(backendPath.wstring());
++                else
++                    spdlog::warn("External DLSS requires NvngxPath to name an existing shim DLL file");
++            }
++
++            if (BackendIdentity::AllowDlss(State::Instance().isRunningOnNvidia,
++                                           Config::Instance()->DLSSAllowExternalBackend.value_or_default(),
++                                           externalBackendFile))
+             {
+-                spdlog::info("Running on Nvidia");
++                spdlog::info(State::Instance().isRunningOnNvidia ? "Running on Nvidia" :
++                             "External DLSS backend enabled; preserving physical GPU identity for FSR4");
+ 
+                 if (!State::Instance().NVNGX_DLSS_Path.has_value() &&
+                     Config::Instance()->NVNGX_DLSS_Library.has_value())
+@@ -2020,7 +2041,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+                     Config::Instance()->DLSSEnabled.set_volatile_value(false);
+                 }
+ 
+-                if (!Config::Instance()->DxgiSpoofing.has_value())
++                if (State::Instance().isRunningOnNvidia && !Config::Instance()->DxgiSpoofing.has_value())
+                 {
+                     spdlog::info("Disabling DxgiSpoofing");
+                     Config::Instance()->DxgiSpoofing.set_volatile_value(false);
+diff --git a/OptiScaler/spoofing/BackendIdentity.h b/OptiScaler/spoofing/BackendIdentity.h
+new file mode 100644
+index 0000000..c0e6a19
+--- /dev/null
++++ b/OptiScaler/spoofing/BackendIdentity.h
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <string_view>
++
++// Physical hardware identity is independent of external DLSS availability.
++namespace BackendIdentity
++{
++inline bool AllowDlss(bool isNvidia, bool allowExternalBackend, bool explicitBackendFile)
++{
++    return isNvidia || (allowExternalBackend && explicitBackendFile);
++}
++
++inline bool IsAmdFsrCaller(std::string_view caller)
++{
++    constexpr std::string_view modules[] = {
++        "amdxc64.dll", "amdxcffx64.dll", "amd_fidelityfx_dx12.dll",
++        "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll",
++        "amd_fidelityfx_framegeneration_dx12.dll", "amd_fidelityfx_denoiser_dx12.dll",
++        "amd_fidelityfx_radiancecache_dx12.dll"
++    };
++    for (auto module : modules)
++    {
++        if (caller.size() != module.size())
++            continue;
++        bool match = true;
++        for (size_t index = 0; index < caller.size(); ++index)
++        {
++            const char c = caller[index];
++            const char lower = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
++            if (lower != module[index])
++            {
++                match = false;
++                break;
++            }
++        }
++        if (match)
++            return true;
++    }
++    return false;
++}
++}
+diff --git a/OptiScaler/spoofing/Dxgi_Spoofing.cpp b/OptiScaler/spoofing/Dxgi_Spoofing.cpp
+index 41b61b6..bd98862 100644
+--- a/OptiScaler/spoofing/Dxgi_Spoofing.cpp
++++ b/OptiScaler/spoofing/Dxgi_Spoofing.cpp
+@@ -1,5 +1,6 @@
+ #include "pch.h"
+ #include "Dxgi_Spoofing.h"
++#include "BackendIdentity.h"
+ 
+ #include <Config.h>
+ 
+@@ -48,7 +49,7 @@ HRESULT DxgiSpoofing::hkGetDesc3(IDXGIAdapter4* This, DXGI_ADAPTER_DESC3* pDesc)
+ 
+     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+ 
+-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
++    if (BackendIdentity::IsAmdFsrCaller(caller) || iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
+         iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+     {
+         return result;
+@@ -109,7 +110,7 @@ HRESULT DxgiSpoofing::hkGetDesc2(IDXGIAdapter2* This, DXGI_ADAPTER_DESC2* pDesc)
+ 
+     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+ 
+-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
++    if (BackendIdentity::IsAmdFsrCaller(caller) || iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
+         iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+     {
+         return result;
+@@ -170,7 +171,7 @@ HRESULT DxgiSpoofing::hkGetDesc1(IDXGIAdapter1* This, DXGI_ADAPTER_DESC1* pDesc)
+ 
+     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+ 
+-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
++    if (BackendIdentity::IsAmdFsrCaller(caller) || iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
+         iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+     {
+         return result;
+@@ -231,7 +232,7 @@ HRESULT DxgiSpoofing::hkGetDesc(IDXGIAdapter* This, DXGI_ADAPTER_DESC* pDesc)
+ 
+     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+ 
+-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
++    if (BackendIdentity::IsAmdFsrCaller(caller) || iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
+         iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+     {
+         return result;
+diff --git a/OptiScaler/upscalers/fsr31/FSR31Feature_Dx12.cpp b/OptiScaler/upscalers/fsr31/FSR31Feature_Dx12.cpp
+--- a/OptiScaler/upscalers/fsr31/FSR31Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/fsr31/FSR31Feature_Dx12.cpp
+@@ -848,6 +848,7 @@
+             State::Instance().ffxUpscalerVersionNames[Config::Instance()->FfxUpscalerIndex.value_or_default()];
+         _name = "FSR";
+         parse_version(version);
++        LOG_INFO("FSR context initialized: provider {}, versionId {:#x}", version, override.versionId);
+     }
+ 
+     SetInit(true);

@@ -4,15 +4,58 @@
 // feature, a motion-change measure), rounds them to FP8 with NGX's dither, and embeds each 2x2-pixel token
 // (128 feature slots) into 64 channels with one matrix product per 4x4-token block. It also writes the three
 // motion candidates the reconstruction uses.
+// DOT2: the same stage for GPUs without cooperative matrices or FP8 (RDNA2): the product on v_dot2_f32_f16 with the
+// same binary16 rounding after every 32 products, FP8 in binary16 and integer arithmetic (fp8_soft.glsl); binding 10
+// holds the matrix widened to binary16 pairs [64][64] by the runtime. A workgroup is four of the blocks (2x2), so the
+// product runs with a token per lane and wave-uniform weights (one block: per-lane weights, 3.4x the product's time).
+// It skips the slot pairs that are always zero (6 of a pixel's 16, enc0_features.glsl: their products add +0, the
+// output is the same) and reuses the previous result's sample of candidates along the same vector (ENC0_DEDUP):
+// Steam Deck 720p 917 -> 763 us.
+#ifndef D4R_M_INPUT_WMMA
+#define D4R_M_INPUT_WMMA 0
+#endif
+#ifndef DOT2
+#define DOT2 0
+#endif
+#if DOT2
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_GOOGLE_include_directive : require
+#include "fp8_soft.glsl"
+#define ENC0_DEDUP 1
+#define F8T float16_t
+#define F8OF(h) e4m3Round(float(h))
+#elif defined(D4R_HLSL)
+// D4R_HLSL: the D3D12 build (hlsl_build.py, dialect_hlsl.h; binding N is register tN/uN/sN): the product on AGS WMMA
+// (d3d12/m_wmma.hlsli); the feature slots stay binary16 (dither clamps them to +-448) and become FP8 codes eight at a
+// time on the hardware's conversion (gatherPixel), which rounds as fp8_soft.glsl's e4m3Code
+#include "fp8_soft.glsl"
+#define F8T float16_t
+#define F8OF(h) (h)
+#ifndef L_FEATURES
+#define L_FEATURES 0
+#endif
+#else
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_float_e4m3 : require
 #extension GL_GOOGLE_include_directive : require
+#endif
 #include "round_half.glsl"
+#if DOT2
+layout(local_size_x = 128) in;      // four waves: 2x2 blocks of 16 tokens = 8x8 render pixels, two pixels per lane
+#else
 layout(local_size_x = 32) in;       // one wave: 16 tokens = 8x8 render pixels, two pixels per lane
+#endif
+#ifdef D4R_HLSL
+struct Params
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Params
+#endif
 {
     ivec2 size;             // render size
     ivec2 shift;            // pixels the block grid is shifted by
@@ -25,7 +68,37 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     uint depthFlag, reset, frame;
     float expo, expoPrev;
     float halfInvX, halfInvY, renderInvX, renderInvY; // host-rounded CUDA texture coordinates
-} p;
+    // display-resolution motion (MVLowRes clear: NGX's rrlite_enc0_4x4_mvhi_*): a pixel's one vector is the motion
+    // texel at floor((pixel + 0.5 - jitter) * mvPix), clamped to [0, mvMax]; it serves all three candidates
+    uint displayMv;
+    ivec2 mvMax;
+    vec2 mvPix;             // output / render
+}
+#ifdef D4R_HLSL
+;
+ByteAddressBuffer p_buf : register(t0);       // read-only: scalar loads (post_m.comp)
+static Params p;
+#define D4R_HLSL_INIT_CALL p = p_buf.Load<Params>(0);
+#else
+p;
+#endif
+#define ENC0_DISPLAY_MV 1
+#ifdef D4R_HLSL
+D4R_SAMPLER(colorTex, t1, s1)
+D4R_SAMPLER(motionTex, t2, s2)
+D4R_SAMPLER(depthTex, t3, s3)
+D4R_SAMPLER(prevMvTex, t4, s4)
+D4R_SAMPLER(halfTex, t5, s5)
+D4R_SAMPLER(featTex, t6, s6)
+RWTexture2D<float4> mvAOut : register(u7);
+RWTexture2D<float4> mvBOut : register(u8);
+RWTexture2D<float4> mvCOut : register(u9);
+ByteAddressBuffer w8 : register(t10);       // [64][2][4][8] FP8, the matrix channel-major (replay_m_d3d12.cpp)
+ByteAddressBuffer w16 : register(t11);      // bias, 16 equal rows of 64
+ByteAddressBuffer noise_b : register(t12);  // 8 x 16 x 16 binary16 bits
+RWByteAddressBuffer outb : register(u13);   // [tok.y][tok.x][64] FP8
+#define ENC0_NOISE(i) ((noise_b.Load(((i) * 2u) & ~3u) >> (16u * ((i) & 1u))) & 0xffffu)
+#else
 layout(set = 0, binding = 1) uniform sampler2D colorTex;
 layout(set = 0, binding = 2) uniform sampler2D motionTex;
 layout(set = 0, binding = 3) uniform sampler2D depthTex;
@@ -35,10 +108,207 @@ layout(set = 0, binding = 6) uniform sampler2D featTex;        // recurrent feat
 layout(set = 0, binding = 7, rg16f) uniform writeonly image2D mvAOut;
 layout(set = 0, binding = 8, rg16f) uniform writeonly image2D mvBOut;
 layout(set = 0, binding = 9, rg16f) uniform writeonly image2D mvCOut;
+#if DOT2
+#if D4R_M_INPUT_WMMA
+layout(set = 0, binding = 10, std430) readonly buffer W8 { uint16_t w[]; } w8;
+layout(set = 0, binding = 11, std430) readonly buffer W16 { uint16_t w[]; } w16;
+#else
+layout(set = 0, binding = 10, std430) readonly buffer W8 { uint w[]; } w8;             // [64][64] binary16 pairs
+layout(set = 0, binding = 11, std430) readonly buffer W16 { uint w[]; } w16;           // bias (its first row of 64)
+#endif
+layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
+layout(set = 0, binding = 13, std430) writeonly buffer Out { uint a[]; } outb;         // [tok.y][tok.x][64] FP8
+#else
 layout(set = 0, binding = 10, std430) readonly buffer W8 { floate4m3_t w[]; } w8;      // [128][64]
 layout(set = 0, binding = 11, std430) readonly buffer W16 { f16vec4 w[]; } w16;        // bias, 16 equal rows of 64
 layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
 layout(set = 0, binding = 13, std430) writeonly buffer Out { floate4m3_t a[]; } outb;  // [tok.y][tok.x][64]
+#endif
+#endif
+#ifndef PLANES
+#define PLANES 0
+#endif
+#if DOT2
+#if PLANES
+#error "the plane layout is for the HIP network, which needs FP8"
+#endif
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+// the workgroup's 64 tokens (four blocks of 16, block-major) as 128 feature slots in binary16 pairs, rows of 64 + 4
+#if D4R_M_INPUT_WMMA
+#define D4R_WMMA_SHARED_WORDS (64 * 68)
+#include "d3d12/ags_wmma.hlsli"
+#define FE matrixShared
+#else
+shared uint FE[64 * 68];
+#endif
+#include "enc0_features.glsl"
+void gatherPixel(uint pi, ivec2 block, uint first, float e1, float e2, bool fusedFourth)
+{
+    float16_t fe[32];
+    gatherFeatures(pi, block, e1, e2, fusedFourth, fe);
+    const uint px = pi & 7u, py = pi >> 3;
+    const uint at = (first + (py >> 1) * 4u + (px >> 1)) * 68u + ((py & 1u) * 2u + (px & 1u)) * 16u;
+    for (uint k = 0u; k < 32u; k += 2u) FE[at + k / 2u] = packFloat2x16(f16vec2(fe[k], fe[k + 1u]));
+}
+uvec4 fe4(uint i) { return uvec4(FE[i], FE[i + 1u], FE[i + 2u], FE[i + 3u]); }
+// the block of token b (0..63) of this workgroup: 2x2 blocks of 8x8 pixels
+#if !D4R_M_INPUT_WMMA
+ivec2 blockOf(uint b) { return 8 * (2 * ivec2(gl_WorkGroupID.xy) + ivec2(b & 1u, b >> 1)) - p.shift; }
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    // wave w gathers block w's 64 pixels (16 tokens), two per lane
+    gatherPixel(lane, blockOf(wave), 16u * wave, e1, e2, true);
+    gatherPixel(lane + 32u, blockOf(wave), 16u * wave, e1, e2, false);
+    memoryBarrierShared(); barrier();
+    // a lane computes channels 16 w .. 16 w + 15 of tokens lane and lane + 32 (wave-uniform weights): the bias, then
+    // 32 products at a time summed in f32 and added to the binary16 accumulator with one rounding (NVIDIA's chained
+    // k32 steps)
+    const uint c0 = 16u * wave;
+    float a[2][16];
+    [[unroll]] for (uint n = 0u; n < 16u; n += 2u)
+    {
+        const vec2 b = vec2(unpackFloat2x16(w16.w[(c0 + n) / 2u]));
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) { a[t][n] = b.x; a[t][n + 1u] = b.y; }
+    }
+    for (uint k0 = 0u; k0 < 64u; k0 += 16u)
+    {
+        float s[2][16];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n) s[t][n] = 0.0;
+        [[unroll]] for (uint kr = 0u; kr < 16u; kr += 4u)
+        {
+            const uint kp = k0 + kr;
+            const uvec4 f0 = fe4(lane * 68u + kp), f1 = fe4((lane + 32u) * 68u + kp);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) [[unroll]] for (uint n = 0u; n < 16u; ++n)
+            {
+                // a pixel's slot pairs 5, 7, ..., 15 are always zero
+                if (kr + j >= 5u && ((kr + j) & 1u) != 0u) continue;
+                const uint w = w8.w[(kp + j) * 64u + c0 + n];
+                s[0][n] = d2(f0[j], w, s[0][n]); s[1][n] = d2(f1[j], w, s[1][n]);
+            }
+        }
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n) a[t][n] = roundHalfSat(s[t][n] + a[t][n]);
+    }
+    // token r of a block is (r & 3, r >> 2) from the block's first token; FP8 codes of the clamped values, four channels a word
+    const float16_t CL = float16_t(6.2831855);
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        const uint tr = lane + 32u * t, r = tr & 15u;
+        const ivec2 tk = (blockOf(tr >> 4) >> 1) + ivec2(int(r & 3u), int(r >> 2));
+        if (tk.x < 0 || tk.y < 0 || tk.x >= p.tok.x || tk.y >= p.tok.y) continue;
+        [[unroll]] for (uint n = 0u; n < 16u; n += 4u)
+        {
+            const uint w01 = e4m3RoundHalf2(clamp(f16vec2(a[t][n], a[t][n + 1u]), -CL, CL));
+            const uint w23 = e4m3RoundHalf2(clamp(f16vec2(a[t][n + 2u], a[t][n + 3u]), -CL, CL));
+            outb.a[uint(tk.y * p.tok.x + tk.x) * 16u + (c0 + n) / 4u] = e4m3CodesHalf2(w01) | (e4m3CodesHalf2(w23) << 16);
+        }
+    }
+}
+#else
+#include "d3d12/enc0_m_wmma.hlsli"
+#endif
+#elif defined(D4R_HLSL)
+// FE: the block's 16 tokens' 128 FP8 feature slots, rows of 136 bytes (the shared array of ags_wmma.hlsli)
+#define D4R_WMMA_SHARED_WORDS (16 * 136 / 4)
+#include "ags_wmma.hlsli"
+#include "m_wmma.hlsli"
+#include "enc0_features.glsl"
+void gatherPixel(uint pi, ivec2 block, float e1, float e2, bool fusedFourth)
+{
+    float16_t fe[32];
+    gatherFeatures(pi, block, e1, e2, fusedFourth, fe);
+    const uint px = pi & 7u, py = pi >> 3;
+    const uint at = (((py >> 1) * 4u + (px >> 1)) * 136u + ((py & 1u) * 2u + (px & 1u)) * 32u) / 4u;
+    // eight slots a conversion (m_wmma.hlsli fp8Of: a lane's eight binary16 accumulator elements to its eight FP8
+    // bytes, element i to byte i); every lane converts. The software codes (e4m3Code, one per slot) took longer:
+    // RX 9070 XT, 854x480 -> 2560x1440, the input stage 80 -> 67 us, the same output
+    [unroll] for (uint k = 0u; k < 4u; ++k)
+    {
+        uint4 h;
+        [unroll] for (uint i = 0u; i < 4u; ++i) h[i] = packFloat2x16(f16vec2(fe[8u * k + 2u * i], fe[8u * k + 2u * i + 1u]));
+        const uint2 c = fp8Of(h);
+#if L_FEATURES
+        // preset L: the block's 64 pixels' slots to the buffer, 32 bytes a pixel (d3d12/layer_m.hlsl KIND 3 reads them)
+        const uint g = gl_WorkGroupID.y * uint((2 * p.tok.x + 9) / 8) + gl_WorkGroupID.x;
+        outb.Store2((g * 64u + pi) * 32u + 8u * k, c);
+#else
+        matrixShared[at + 2u * k] = c.x; matrixShared[at + 2u * k + 1u] = c.y;
+#endif
+    }
+}
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;
+    const ivec2 block = 8 * ivec2(gl_WorkGroupID.xy) - p.shift;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    gatherPixel(lane, block, e1, e2, true);
+    gatherPixel(lane + 32u, block, e1, e2, false);
+#if L_FEATURES
+    // preset L (L_FEATURES): only the feature slots, per 8x8-pixel block of L's input stage (its grid and shift: the
+    // block of workgroup g at 8 g - shift, rows of (2 tok.x + 9) / 8 blocks); the motion surfaces as M's
+    return;
+#endif
+    barrier();
+    // The product transposed, W^T FE^T (rows are the 64 channels, columns the 16 tokens), so that a lane holds eight
+    // channels of one token. As the GLSL: each k32 step's two k16 products from zero, then the previous binary16
+    // accumulator added with one rounding.
+    uint4 acc[4];
+    [unroll] for (uint n = 0u; n < 4u; ++n)
+    {
+        const Matrix16 b = matrixLoad(MatrixAcc16 | 0x80, w16, 32u * n, 128u);   // the bias in every column
+        acc[n] = uint4(b.reg[0], b.reg[1], b.reg[2], b.reg[3]);
+    }
+    [unroll] for (uint kt = 0u; kt < 8u; kt += 2u)
+    {
+        const uint2 b0 = ldsB8(kt * 16u, 136u), b1 = ldsB8((kt + 1u) * 16u, 136u);
+        // the A operands (channel 16 n + row, k = 16 kt + 8 hf + i and the same in k16 step kt + 1): one load
+        uint2 a0[4], a1[4];
+        [unroll] for (uint n = 0u; n < 4u; ++n)
+        {
+            const uint4 m = w8.Load4((16u * n + row) * 128u + 64u * hf + 8u * kt);
+            a0[n] = m.xy; a1[n] = m.zw;
+        }
+        [unroll] for (uint n = 0u; n < 4u; ++n)
+        {
+            const Matrix16 pr = mma8(a1[n], b1, mma8(a0[n], b0, zero32())), c = f32of(acc[n]);
+            float v[8];
+            [unroll] for (uint i = 0u; i < 8u; ++i) v[i] = asfloat(pr.reg[i]) + asfloat(c.reg[i]);
+            acc[n] = halfOf(f32m(v));
+        }
+    }
+    // clamped to +-2 pi, FP8; every lane stores (AGS conversions run on the whole wave), the ones outside the token
+    // grid out of bounds
+    const ivec2 t = (block >> 1) + ivec2(int(row & 3u), int(row >> 2));
+    const bool ok = t.x >= 0 && t.y >= 0 && t.x < p.tok.x && t.y < p.tok.y;
+#if PLANES
+    // NGX's layout, two planes of 32 channels ([2][tok.y][tok.x][32]), for the HIP network: the lane's four k-tiles
+    // are channels 16 n + 8 hf + i, so n < 2 stays in the first plane and n >= 2 is 32 channels further
+    const uint plane = uint(p.tok.x * p.tok.y) * 32u;
+    const uint dst = ok ? uint(t.y * p.tok.x + t.x) * 32u + 8u * hf : 0xffff0000u;
+#else
+    const uint dst = ok ? uint(t.y * p.tok.x + t.x) * 64u + 8u * hf : 0xffff0000u;
+#endif
+    const float16_t mcl = float16_t(6.2831855);
+    [unroll] for (uint n = 0u; n < 4u; ++n)
+    {
+        uint4 c;
+        [unroll] for (uint i = 0u; i < 4u; ++i)
+        {
+            const f16vec2 v = clamp(asfloat16(uint16_t2(uint16_t(acc[n][i] & 0xffffu), uint16_t(acc[n][i] >> 16))), -mcl, mcl);
+            c[i] = uint(asuint16(v.x)) | (uint(asuint16(v.y)) << 16);
+        }
+#if PLANES
+        // an out-of-grid lane's sentinel address must not wrap into the first plane (it is 2^32 - 65536)
+        outb.Store2(ok ? (n < 2u ? dst + 16u * n : dst + plane + 16u * (n - 2u)) : 0xffff0000u, fp8Of(c));
+#else
+        outb.Store2(dst + 16u * n, fp8Of(c));
+#endif
+    }
+}
+#else
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define HACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -59,9 +329,6 @@ layout(set = 0, binding = 13, std430) writeonly buffer Out { floate4m3_t a[]; } 
 shared floate4m3_t FE[16 * 136];
 shared float16_t RS[gl_WorkGroupSize.x * 8u];
 // PLANES: the tokens in NGX's layout, two planes of 32 channels ([2][tok.y][tok.x][32]), for the HIP network
-#ifndef PLANES
-#define PLANES 0
-#endif
 #include "enc0_features.glsl"
 void gatherPixel(uint pi, ivec2 block, float e1, float e2, bool fusedFourth)
 {
@@ -158,3 +425,4 @@ void main()
 #undef ROW_OFF
 #undef TOK_STRIDE
 }
+#endif

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run the engine's own preset K layers on a captured frame and compare with what NGX's pipeline produced.
 
-usage: test_k.py CAPTURE_DIR MODEL_PREFIX WORK_DIR [--chain] [--time N] [layer ...]
+usage: test_k.py CAPTURE_DIR MODEL_PREFIX WORK_DIR [--chain] [--dot2] [--time N] [layer ...]
   CAPTURE_DIR/replay: layer launches before they ran (inputs, parameters); CAPTURE_DIR/dump: buffers after each launch.
   --chain feeds each layer the engine's own previous outputs instead of the captured inputs.
+  --dot2 runs layer_dot2.comp (no cooperative matrices: RDNA2) on the pair-interleaved weights.
 """
 import glob, json, os, re, struct, subprocess, sys
 import numpy as np
@@ -31,6 +32,26 @@ def params(P, e):
     if k == 'dec0':
         o[106], o[107] = e['head_w'], e['head_b']
     return struct.pack('<4i108I', W, H, sx, sy, *o), (W, H)
+
+def dot2_matrices(e):
+    """(offset, K, N) of every matrix of a layer: the tensors layer_dot2.comp reads as [K/2][N] binary16 pairs."""
+    c, x = e['C'], e['X']
+    yield from ((o, c, 32) for o in e['qkv'])
+    yield from ((o, 32, c) for o in e['wo'])
+    yield from ((o, c, 32) for o in e['w1'])
+    yield from ((o, 32, c) for o in e['w2'])
+    for key, k, n in (('embed_w', 16, c), ('merge_w', 4 * c, e.get('merge_n', 0)), ('expand_w', x, 4 * c), ('head_w', c, 48)):
+        if key in e:
+            yield e[key], k, n
+
+def dot2_weights(index, w):
+    """The model's weights for layer_dot2.comp: every matrix W[K][N] with each pair of rows interleaved (element
+    (k, n) at 2 (k / 2 N + n) + k % 2), so a 32-bit word holds W[2i][n], W[2i+1][n]. Offsets and sizes are unchanged."""
+    w = np.array(w, dtype=F16)
+    for e in index.values():
+        for o, k, n in dot2_matrices(e):
+            w[o:o + k * n] = w[o:o + k * n].reshape(k // 2, 2, n).transpose(0, 2, 1).ravel()
+    return w
 
 def defines(e, extra=()):
     k = e['kind']
@@ -63,6 +84,8 @@ def main():
     a = sys.argv[1:]
     chain = '--chain' in a
     if chain: a.remove('--chain')
+    dot2 = '--dot2' in a
+    if dot2: a.remove('--dot2')
     reps = 1
     if '--time' in a:
         i = a.index('--time'); reps = int(a[i + 1]); del a[i:i + 2]
@@ -71,6 +94,10 @@ def main():
     os.makedirs(work, exist_ok=True)
     index = json.load(open(prefix + '.json'))
     open(f'{work}/dummy.bin', 'wb').write(b'\0' * 16)
+    weights = prefix + '.bin'
+    if dot2:
+        weights = f'{work}/weights_dot2.bin'
+        dot2_weights(index, np.fromfile(prefix + '.bin', dtype=F16)).tofile(weights)
     prev = {}        # (kind of buffer, layer) -> file of the engine's own output
     total = 0.0
     for name in layers:
@@ -81,7 +108,7 @@ def main():
         pb, (W, H) = params(P, e)
         open(f'{work}/{name}.params', 'wb').write(pb)
         spv = f'{work}/{name}.spv'
-        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e), f'{HERE}/layer.comp', '-o', spv], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e), f'{HERE}/' + ('layer_dot2.comp' if dot2 else 'layer.comp'), '-o', spv], check=True, stdout=subprocess.DEVNULL)
         def slice_in(off, fn):
             buf, o = P.ptr(off); buf[o:].tofile(fn); return fn
         k, C, X = e['kind'], e['C'], e['X']
@@ -102,7 +129,7 @@ def main():
             outs = [(4, 24, H * W * 40 * 2, 'head')]
         else:
             outs = [(4, 24, H * W * C * 2, 'full')]
-        cmd = [f'{work}/evk', spv, str(P.grid[0]), str(P.grid[1]), str(reps), f'in:0={work}/{name}.params', f'in:1={prefix}.bin', f'in:2={fin}', f'in:3={fskip}']
+        cmd = [f'{work}/evk', spv, str(P.grid[0]), str(P.grid[1]), str(reps), f'in:0={work}/{name}.params', f'in:1={weights}', f'in:2={fin}', f'in:3={fskip}']
         got = {}
         for b, off, n, tag in outs:
             cmd.append(f'out:{b}={work}/{name}.{tag}:{n}'); got[tag] = (off, n)

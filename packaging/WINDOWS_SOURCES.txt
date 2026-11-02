@@ -1,0 +1,72 @@
+Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
+
+d4r @VERSION@ (native Windows): where every file in this release comes from
+=========================================================================
+
+Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt), d4r commit @D4R_COMMIT@:
+  d4r/nvngx.dll          NGX shim and native D3D12 engine   tools/d4r_nvngx_shim.cpp, engine/ and engine/d3d12/
+  d4r/nvcuda.dll         CUDA bridge         tools/wine_nvcuda_bridge.c (native Windows build)
+  d4r/nvapi/nvapi64.dll  NVAPI for NGX       tools/d4r_nvapi_windows.c
+  d4r/kernels/           native RDNA2/RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m,
+                         for the CUDA path (ZLUDA) that runs what the engine does not cover
+                         (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code),
+                         built with AMD's HIP SDK @ROCM_VERSION@ (clang @ROCM_CLANG@)
+  d4r/d4r.ini, d4r/d4r-check.cmd, d4r/d4r-check.ps1, D4R_README.txt
+  install.cmd, install.ps1
+                         downloads and verifies NVIDIA DLLs; no driver installation. Then builds the engine's models
+                         from them with d4r/tools/build-engine-models.py
+  d4r/tools/models/      d4r's engine-model compilers and shader sources (engine/, engine/d3d12, kernels/tools,
+                         kernels/rr, vulkan/ptx2glsl.py) and the Vulkan test app (tools/vulkan_dlss_harness.cpp)
+  d4r/tools/models/bin/glslangValidator.exe
+                         Khronos glslang @GLSLANG_VERSION@ (unmodified release build), https://github.com/KhronosGroup/glslang
+                         License: d4r/licenses/glslang-LICENSE.txt
+  d4r/tools/models/bin/dxc.exe, dxcompiler.dll, dxil.dll
+                         Microsoft DirectX Shader Compiler @DXC_VERSION@ (unmodified release build),
+                         https://github.com/microsoft/DirectXShaderCompiler
+                         Licenses: d4r/licenses/dxc-LICENSE-*.txt, d4r/licenses/dxc-LICENCE-MIT.txt
+  d4r/tools/models/bin/msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll
+                         Microsoft Visual C++ runtime @VCRUNTIME_VERSION@ (unmodified, from Visual Studio's redistributable
+                         folder), which glslangValidator.exe needs; app-local, as Visual Studio's license allows
+
+Third-party software, unmodified or patched by d4r:
+  OptiScaler/            OptiScaler v10's complete unmodified dependency folder, including:
+                         Intel XeSS/XeLL/XeFG (XeSS license), AMD FidelityFX loader/upscaler/FG (MIT),
+                         dlssg_to_fsr3_amd_is_better.dll (Nukem9, GPL-3.0,
+                         https://github.com/Nukem9/dlssg-to-fsr3), and Microsoft's private D3D12
+                         interop core (DirectX license). Upstream license texts are preserved under
+                         d4r/licenses/OptiScaler/. No NVIDIA DLSSG or Streamline DLLs are added.
+                         Fakenvapi is integrated in OptiScaler v10; no separate DLL is needed.
+  d4r/zluda/nvcuda.dll   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/@ZLUDA_PATCHES@ and then
+                         d4r/source/patches/zluda-windows applied, its ptx/lib/zluda_ptx_impl*.bc rebuilt with
+                         d4r's scripts/build_zluda_ptx_helpers.sh, built for Windows (cargo build --release).
+                         It contains LLVM (Apache License 2.0 with LLVM exceptions).
+                         Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
+  dxgi.dll               OptiScaler @OPTISCALER_VERSION@ (GNU GPL 3.0), OptiScaler.dll renamed: built by d4r from the
+                         release's source commit @OPTISCALER_COMMIT@
+                         (https://github.com/optiscaler/OptiScaler) with d4r/source/patches/optiscaler-windows
+                         applied, which adds Spoofing.ForceNvidia: upstream turns DLSS off on non-NVIDIA GPUs under
+                         native Windows. Built with Visual Studio 2022 (scripts/build_optiscaler_windows.sh).
+                         Pinned @OPTISCALER_TAG@. Exact source, archive digest and per-file hashes:
+                         d4r/source/optiscaler.json.
+                         @OPTISCALER_RELEASE@
+                         License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
+  OptiScaler.ini         The patched v10 INI with packaging/optiscaler.settings and optiscaler-windows.settings
+                         applied.
+                         NvngxPath selects d4r; OptiDllPath selects the OptiScaler/ dependency folder.
+                         FG is bundled but disabled by default.
+
+AMD's HIP runtime (amdhip64_7.dll), which ZLUDA runs on, is not bundled: AMD's Windows driver installs it.
+NVIDIA DLLs are not bundled. install.ps1 downloads DLSS 310.7.0 from NVIDIA/DLSS
+commit a291cc7d2cc642a51566f3dfd5376f635cd1b284, DLSS Ray Reconstruction 310.9.1 from commit
+374959484e79a640feaba44c93ac8cfb0a03f5b5 and _nvngx.dll from NVIDIA driver 596.36.
+URLs and SHA-256 hashes are pinned in install.ps1. NVIDIA license terms apply. The engine models
+install.ps1 builds in d4r/engine hold values read from those DLLs: they are not part of this zip.
+Included NVIDIA PTX-derived kernels (not covered by d4r licenses):
+  d4r/kernels/*/hiluma_engine_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+                         NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code (kernels/tex) or translated
+                         to HIP (kernels/native), compiled by ZLUDA or the HIP SDK's clang.
+  d4r/kernels/*/cuda_dldn_engine_hkpn_output_kernel_*
+                         NVIDIA's PTX from nvngx_dlssd.dll with parts replaced by d4r code (kernels/rr), compiled by
+                         ZLUDA.
+d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.

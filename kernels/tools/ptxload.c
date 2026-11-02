@@ -1,5 +1,5 @@
 // usage: ptxload FILE.ptx... : cuModuleLoadData + cuModuleGetFunction for every .entry
-#include <dlfcn.h>
+#include "../../tools/d4r_dlfcn.h" /* dlfcn.h, or LoadLibrary("nvcuda.dll") on Windows */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

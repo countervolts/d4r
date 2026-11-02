@@ -14,6 +14,7 @@ _B (K x N codes), _C (M x N f16 of the first k-step), _D (M x N f16 of the last)
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -126,12 +127,14 @@ def main():
     pad = 4 * T * len(slots)
     env = dict(os.environ, D4R_ZLUDA_WMMA='1', D4R_ZLUDA_WMMA_FP8='1', D4R_ZLUDA_WMMA_FP8_NATIVE='1',
                D4R_ZLUDA_IMPLICIT_MAX_BLOCK='256')
-    cmd = ['systemd-run', '--user', '--scope', '-q', '-p', 'MemoryMax=24G', '-p', 'MemorySwapMax=0']
-    cmd += [f'--setenv={k_}={v_}' for k_, v_ in env.items() if k_.startswith('D4R_ZLUDA')]
+    cmd = []
+    if shutil.which('systemd-run'):   # a memory-capped scope where systemd provides one (not on Windows)
+        cmd = ['systemd-run', '--user', '--scope', '-q', '-p', 'MemoryMax=24G', '-p', 'MemorySwapMax=0']
+        cmd += [f'--setenv={k_}={v_}' for k_, v_ in env.items() if k_.startswith('D4R_ZLUDA')]
     r = subprocess.run(cmd + [sys.executable, str(HERE / 'zluda_replay.py'), os.path.expanduser(o.capture),
                               kernel if rr2 else f'swin_{o.stage}' + ('_diamond' if 'diamond' in kernel else ''), str(o.frame), str(work),
                               '--ptx', str(work / 'probe.ptx'),
-                              '--pad', str(pad)], capture_output=True, text=True)
+                              '--pad', str(pad)], env=env, capture_output=True, text=True)
     if 'failed' in r.stdout + r.stderr:
         sys.exit(r.stdout[-2000:] + r.stderr[-3000:])
     raw = np.frombuffer((work / 'arena.out.bin').read_bytes()[arena_bytes:], np.uint32).reshape(len(slots), T)

@@ -7,128 +7,163 @@
 // output channel wm_acc_row(i) of the 16-channel tile ("D^T"); ../common/wmma_layout.h has the per-target
 // register layouts (gfx11: channel 2i + (l >> 4); gfx12: channel i + 8 (l >> 4)).
 #pragma once
-#ifdef D4R_DEVICE_ONLY_MINIMAL
-#include "../common/hip_device_minimal.h"
-#else
 #include <hip/hip_runtime.h>
-#endif
 #include <stdint.h>
+// The accuracy set rounds every k16 step to f16 and widens it again (mma16); the inline-asm pair conversion hides
+// the last step's f16 from the compiler, which then converts it a third time. Without it the extra conversions
+// fold away (enc0 2739 -> 2147, dec0 3011 -> 2355; gfx1101 vkhip 1080p 181 -> 170 and 185 -> 174 us, byte-identical).
+#if defined(D4R_ACCURACY) && defined(WM_CVT_ASM)
+#undef WM_CVT_ASM
+#endif
 #include "../common/wmma_layout.h"
 #if defined(D4R_ACCURACY) && defined(PWIN_F32ACC)
 #undef PWIN_F32ACC
 #endif
+// D4R_FAST_MATH: the opt-in approximate variant (FMA contraction allowed; not bit-identical to NVIDIA's rounding)
+#ifndef D4R_FAST_MATH
 #pragma clang fp contract(off)
-// LDS row padding in halves (port of the K-race research): activation rows of N halves are stored N + PWIN_PAD
-// apart so the 16 token rows a WMMA operand load touches start on distinct banks. Layout only; values unchanged.
-#ifndef PWIN_PAD
-#define PWIN_PAD 8
 #endif
-#define LDSR(N) ((N) + PWIN_PAD)
 
 typedef _Float16 half_t;
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8v __attribute__((ext_vector_type(8)));
-#ifdef D4R_K_PACKED_ACC
-#if !defined(__GFX12__) || !defined(D4R_K_FP16_BASELINE) || defined(D4R_K_F16_WMMA)
-#error "packed accumulator storage requires gfx12 strict F32 WMMA baseline"
-#endif
-// Keep already-rounded values packed between steps. Every matrix instruction
-// still uses F32 C/D and rounds once to half afterwards, like the baseline.
-typedef _Float16 acc8v __attribute__((ext_vector_type(8)));
-#else
-typedef f8v acc8v;
-#endif
 typedef uint32_t u8v __attribute__((ext_vector_type(8)));
 typedef uint32_t u4v __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ half_t half_reciprocal(half_t h)
+{
+#ifdef PWIN_NATIVE_HRECIP
+    return __builtin_amdgcn_rcph(h);
+#else
+    return (half_t)__builtin_amdgcn_rcpf((float)h);
+#endif
+}
+
+__device__ __forceinline__ half_t half_rsqrt(half_t h)
+{
+#ifdef PWIN_NATIVE_HRECIP
+    return __builtin_amdgcn_rsqh(h);
+#else
+    return (half_t)__builtin_amdgcn_rsqf((float)h);
+#endif
+}
+
+#ifdef D4R_ACCURACY
+// The reference kernel's L2 norm and softmax row sum use a fixed f16 tree: four lanes t take channel pairs
+// t + 4k as f16x2 words; each sums its even and its odd words
+// (pairs of neighbours, then a balanced tree, the words past the largest power of two added last) and adds the two;
+// the lanes combine through two butterflies as (L0 + L1) + (L2 + L3); the result is the low half plus the high half.
+// pair(p) returns the bits of channels 2p, 2p + 1. One lane computes the whole token (the same values).
+template <int B, int N, int S, class F> __device__ __forceinline__ hv2 ptx_tree_sum(const F& word)
+{
+    if constexpr (N == 1)
+        return word(B);
+    else
+    {
+        constexpr int P = (N & (N - 1)) == 0 ? N / 2 : 1 << (31 - __builtin_clz(N));
+        return ptx_tree_sum<B, P, S>(word) + ptx_tree_sum<B + S * P, N - P, S>(word);
+    }
+}
+template <int C, bool SQUARE, class F> __device__ __forceinline__ half_t ptx_reduce(const F& pair)
+{
+    constexpr int KW = C / 8; // words per lane
+    static_assert(C % 16 == 0 && KW % 2 == 0, "rows of whole words per lane, split into even and odd");
+    hv2 lane[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+    {
+        const auto word = [&](int k) {
+            const hv2 v = __builtin_bit_cast(hv2, (uint32_t)pair(t + 4 * k));
+            if constexpr (SQUARE)
+                return v * v;
+            else
+                return v;
+        };
+        lane[t] = ptx_tree_sum<0, KW / 2, 2>(word) + ptx_tree_sum<1, KW / 2, 2>(word);
+    }
+    const hv2 s = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    return s[0] + s[1];
+}
+template <int C, class F> __device__ __forceinline__ half_t ptx_sumsq(const F& pair)
+{
+    return ptx_reduce<C, true>(pair);
+}
+template <int C> __device__ __forceinline__ half_t ptx_sumsq_row(const half_t* row)
+{
+    return ptx_sumsq<C>([&](int p) { return *(const uint32_t*)(row + 2 * p); });
+}
+// The norm's reciprocal square root follows the reference order only in accuracy builds.
+#define PWIN_NORM_R16(ss, C, row) half_rsqrt(ptx_sumsq_row<C>(row))
+#else
+#define PWIN_NORM_R16(ss, C, row) half_rsqrt((half_t)(ss))
+#endif
+
+// LDS row padding in halves: activation rows of N halves are stored N + PWIN_PAD apart, so the 16 token rows a
+// WMMA operand load (op_lds / lds_row16) touches start on distinct banks (row stride = 16 mod 32 bytes). With
+// unpadded 128- or 256-byte rows every lane hits the same banks (measured: 6x slower WMMA feed). 0 = old layout.
+#ifndef PWIN_PAD
+#define PWIN_PAD 8
+#endif
+#define LDSR(N) ((N) + PWIN_PAD)
 
 __device__ __forceinline__ uint32_t lane_id()
 {
     return __builtin_amdgcn_mbcnt_lo(~0u, 0u);
 }
 
-typedef wm_op op_t; // WMMA operand: u8v (gfx11) or u4v (gfx12)
-
-// The CUDA fragment reduction rounds products and every tree node to f16.
-// A float sum of the squared halves changes rsqrt and can amplify differences
-// through attention. The strict baseline preserves its channel grouping.
-template <int C>
-__device__ __forceinline__ half_t l2_sum(const half_t* row)
-{
-#ifdef D4R_K_FP16_BASELINE
-    static_assert(C % 32 == 0 && C <= 160, "audited K channel counts");
-    hv2 partial[4];
-#pragma unroll
-    for (int t = 0; t < 4; ++t)
-    {
-        hv2 halves[2];
-#pragma unroll
-        for (int parity = 0; parity < 2; ++parity)
-        {
-            hv2 pairs[C / 32];
-#pragma unroll
-            for (int group = 0; group < C / 32; ++group)
-            {
-                const hv2 a = *(const hv2*)(row + 2 * t + 8 * parity + 32 * group);
-                const hv2 b = *(const hv2*)(row + 2 * t + 8 * parity + 32 * group + 16);
-                pairs[group] = (a * a) + (b * b);
-            }
-            hv2 value = pairs[0];
-            if constexpr (C >= 64) value = value + pairs[1];
-            if constexpr (C == 96) value = value + pairs[2];
-            if constexpr (C >= 128) value = value + (pairs[2] + pairs[3]);
-            if constexpr (C == 160) value = value + pairs[4];
-            halves[parity] = value;
-        }
-        partial[t] = halves[0] + halves[1];
-    }
-    const hv2 sum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
-    return sum[0] + sum[1];
-#else
-    float sum = 0;
-#pragma unroll
-    for (int c = 0; c < C; ++c) sum += (float)(half_t)(row[c] * row[c]);
-    return (half_t)sum;
+// RDNA2: the f16-accumulator WMMA variants need the instruction; the f32 path (software products) serves them
+#ifdef __GFX10__
+#undef PWIN_NATIVE_F16ACC
+#undef PWIN_F16ACC_NATIVE
 #endif
-}
+// RDNA2: the weight images use plain global loads. The raw-buffer path below builds its resource with gfx11's
+// dword3 (0x31004000: unified format 4, 8_SSCALED), which gfx11 ignores for untyped loads; gfx10 descriptors want
+// a 32-bit format there (AMD's own libraries use 0x31014000 on gfx103x), and no gfx10 encoding has been validated
+// on RDNA2 hardware, so RDNA2 takes no descriptor at all. Keyed on D4R_WMMA_SOFT (always set on gfx10) so that the
+// RDNA3 validation build of the RDNA2 kernels runs the same loads.
+#ifdef D4R_WMMA_SOFT
+#ifndef PWIN_NO_BUFFER_IMG
+#define PWIN_NO_BUFFER_IMG
+#endif
+#undef PWIN_GELU_LUT_BUFFER
+#endif
+typedef wm_op op_t; // WMMA operand: u8v (gfx11) or u4v (gfx12)
 
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)
 // PWIN_F32ACC: keep the accumulator in f32 through the chain (rounded to f16 where the values are used)
-__device__ __forceinline__ acc8v mma16(const op_t& a, const op_t& b, acc8v c)
+__device__ __forceinline__ f8v mma16(const op_t& a, const op_t& b, f8v c)
 {
-#ifdef D4R_K_PACKED_ACC
-    const f8v fc = __builtin_convertvector(c, f8v);
-    const f8v d = wm_mma(a, b, fc);
-    return __builtin_convertvector(d, acc8v);
-#elif defined(D4R_K_F16_WMMA)
-#if !defined(__GFX12__) || D4R_WMMA_LAYOUT != 12 || !defined(D4R_K_FP16_BASELINE)
-#error "experimental packed F16 WMMA requires gfx12 native layout and strict K baseline"
-#endif
-    return wm_mma_f16_step(a, b, c);
+#if defined(PWIN_NATIVE_F16ACC) && !defined(PWIN_F32ACC) && D4R_WMMA_LAYOUT == 11
+    h16 hc = {};
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        hc[2 * i] = (half_t)c[i];
+    const h16 hd = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(
+        __builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), hc, false);
+    f8v d;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        d[i] = (float)hd[2 * i];
 #else
     f8v d = wm_mma(a, b, c);
-#if !defined(PWIN_F32ACC) || defined(D4R_K_FP16_BASELINE)
+#ifndef PWIN_F32ACC
 #pragma unroll
     for (int i = 0; i < 8; ++i)
         d[i] = (float)(half_t)d[i];
 #endif
-    return d;
 #endif
+    return d;
 }
 
-__device__ __forceinline__ acc8v splat8(float v)
+__device__ __forceinline__ f8v splat8(float v)
 {
-#ifdef D4R_K_PACKED_ACC
-    const half_t h = (half_t)v;
-    return (acc8v){h, h, h, h, h, h, h, h};
-#else
-    return (acc8v){v, v, v, v, v, v, v, v};
-#endif
+    return (f8v){v, v, v, v, v, v, v, v};
 }
 
 __device__ __forceinline__ uint32_t other_half(uint32_t v)
 {
-    return wm_other_half(v);
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
 }
 
 __device__ __forceinline__ uint32_t pack2(half_t lo, half_t hi)
@@ -152,14 +187,9 @@ __device__ __forceinline__ op_t operand_from_dt(const half_t own[8])
     return wm_op_from_acc(own);
 }
 
-__device__ __forceinline__ op_t operand_from_f8(acc8v d)
+__device__ __forceinline__ op_t operand_from_f8(f8v d)
 {
-#ifdef D4R_K_PACKED_ACC
-    const half_t h[8] = {d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]};
-    return wm_op_from_acc(h);
-#else
     return wm_op_from_f8(d);
-#endif
 }
 
 // element c (0..15) of a row of 16 halves (VALU code; not a WMMA operand)
@@ -220,22 +250,44 @@ __device__ __forceinline__ op_t op_img(const u8v* __restrict__ img, int idx)
 {
     return wm_op_image(img, idx);
 }
-// wave index (threadIdx.z) as a wave-uniform scalar, so op_imgt's tile stays in SGPRs. PWIN_PLAIN_WV: the old
-// per-lane read (with PWIN_NO_IMGT the layer compiles as before the port; enc0/enc4 are faster that way)
-#ifdef PWIN_PLAIN_WV
-#define PWIN_WAVE_INDEX threadIdx.z
+// 8 floats of image slot `slot` + this lane's half (f32 accumulator-init vectors the prep kernel stores after the
+// operand tiles: slot pair (2 v, 2 v + 1) = rows wm_acc_row_h(., h) of vector v), slot uniform
+__device__ __forceinline__ f8v img_vec(const u8v* __restrict__ img, int slot)
+{
+    const uint32_t h = lane_id() >> 4;
+#if defined(PWIN_VEC_SCALAR) // both layouts: slot pair (2 v, 2 v + 1) = the two halves' rows
+    // both halves' slots with wave-uniform (scalar) loads, then one select per value (instead of a per-lane
+    // vector load, or 8 shifts + 8 f16 -> f32 conversions from the weights); the same f32 values
+    const u8v x0 = img[slot], x1 = img[slot + 1];
+    u8v x;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        x[i] = h ? x1[i] : x0[i];
+    return __builtin_bit_cast(f8v, x);
+#elif D4R_WMMA_LAYOUT == 12 || defined(PWIN_NO_BUFFER_IMG)
+    const u8v x = img[slot + (int)h];
+    return __builtin_bit_cast(f8v, x);
 #else
-#define PWIN_WAVE_INDEX __builtin_amdgcn_readfirstlane(threadIdx.z)
+    const __amdgpu_buffer_rsrc_t r = __builtin_amdgcn_make_buffer_rsrc((void*)img, (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t vo = h * 32u, so = 32u * (uint32_t)slot;
+    const u4v a = __builtin_amdgcn_raw_buffer_load_b128(r, vo, so, 0), b = __builtin_amdgcn_raw_buffer_load_b128(r, vo + 16, so, 0);
+    return __builtin_bit_cast(f8v, (u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
 #endif
-// slot (tile, lane l & 15) of an operand image in global memory (port of K-race E14 step 1): the tile is
-// wave-uniform, so the row address stays a scalar base and only the lane indexes it. Reads exactly the slot
-// op_img(img, tile * 16 + m) reads; only the address arithmetic differs. PWIN_NO_IMGT: the old form.
+}
+// slot (tile, lane l & 15) of an operand image in global memory: tile is wave-uniform, so the row address stays a
+// scalar base and only the lane indexes it (global loads with an SGPR base and a VGPR offset; written as one
+// index tile * 16 + m every load paid 64-bit VALU address arithmetic)
 __device__ __forceinline__ op_t op_imgt(const u8v* __restrict__ img, int tile)
 {
-#ifdef PWIN_NO_IMGT
-    return wm_op_image(img, tile * 16 + (lane_id() & 15)); // unsigned sum, exactly the old index expression
-#else
+#if D4R_WMMA_LAYOUT == 12 || defined(PWIN_NO_BUFFER_IMG)
     return wm_op_image(img + 16 * tile, (int)(lane_id() & 15));
+#else
+    // gfx11: a raw buffer load (resource from img: base in SGPRs, 0x31004000 = gfx11 raw dword3, validated), the
+    // tile offset as the scalar offset and the lane's 32-byte slot as the vector offset: no VALU address math
+    const __amdgpu_buffer_rsrc_t r = __builtin_amdgcn_make_buffer_rsrc((void*)img, (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t vo = (lane_id() & 15) * 32u, so = 512u * (uint32_t)tile;
+    const u4v a = __builtin_amdgcn_raw_buffer_load_b128(r, vo, so, 0), b = __builtin_amdgcn_raw_buffer_load_b128(r, vo + 16, so, 0);
+    return (u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]};
 #endif
 }
 // operand -> slot idx of an operand image in LDS (read back with op_img)
@@ -286,3 +338,25 @@ __device__ __forceinline__ int frag_offset(int k, int n)
 {
     return 64 * (n & 7) + 16 * ((k & 7) >> 1) + 8 * (n >> 3) + 4 * (k >> 3) + 2 * (k & 1);
 }
+
+// Diagnostic phase stamps (-DPWIN_PROF): per-wave SHADER_CYCLES deltas summed into d4r_dbg[k], wave counts into
+// d4r_dbg[32 + k] (read back by bench/native/pwbench). Region k ends at PROF(k). Off: no code.
+#ifdef PWIN_PROF
+__device__ unsigned long long d4r_dbg[64];
+#define PROF_INIT uint32_t prof_last_ = (uint32_t)__builtin_readcyclecounter()
+#define PROF(k)                                                                                                    \
+    do                                                                                                             \
+    {                                                                                                              \
+        const uint32_t n_ = (uint32_t)__builtin_readcyclecounter();                                                \
+        if (lane_id() == 0)                                                                                        \
+        {                                                                                                          \
+            __hip_atomic_fetch_add(&d4r_dbg[k], (unsigned long long)((n_ - prof_last_) & 0xfffffu), __ATOMIC_RELAXED, \
+                                   __HIP_MEMORY_SCOPE_AGENT);                                                      \
+            __hip_atomic_fetch_add(&d4r_dbg[32 + (k)], 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);          \
+        }                                                                                                          \
+        prof_last_ = n_;                                                                                           \
+    } while (0)
+#else
+#define PROF_INIT do {} while (0)
+#define PROF(k) do {} while (0)
+#endif

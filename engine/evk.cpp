@@ -1,6 +1,7 @@
 // Minimal Vulkan compute runner for the engine's kernels.
 //   evk SHADER.spv GX GY REPEATS in:BINDING=FILE ... out:BINDING=FILE:BYTES[:INITFILE] ...
 // Every binding is a storage buffer in VRAM. Outputs are zero-filled (or INITFILE), and written back after one dispatch.
+// D4R_EVK_GPU_TIMING=1 uses GPU timestamps and orders repeated storage-buffer writes.
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <chrono>
@@ -18,6 +19,13 @@ static std::vector<char> slurp(const std::string& p)
     return std::vector<char>((std::istreambuf_iterator<char>(f)), {});
 }
 struct B { uint32_t binding; std::string file, out; VkDeviceSize size; VkBuffer b; void* map; };
+// the ':' that ends a path field: a Windows drive letter's (C:\ or C:/) belongs to the path
+static size_t pathEnd(const std::string& s)
+{
+    const bool drive = s.size() > 2 && ((s[0] | 0x20) >= 'a' && (s[0] | 0x20) <= 'z') && s[1] == ':' &&
+                       (s[2] == '\\' || s[2] == '/');
+    return s.find(':', drive ? 2 : 0);
+}
 int main(int argc, char** argv)
 {
     if (argc < 6) return 1;
@@ -30,7 +38,7 @@ int main(int argc, char** argv)
         b.binding = atoi(a.substr(0, a.find('=')).c_str()); a = a.substr(a.find('=') + 1);
         if (out)
         {
-            b.out = a.substr(0, a.find(':')); a = a.substr(a.find(':') + 1);
+            b.out = a.substr(0, pathEnd(a)); a = a.substr(pathEnd(a) + 1);
             b.size = strtoull(a.c_str(), nullptr, 10);
             if (a.find(':') != std::string::npos) b.file = a.substr(a.find(':') + 1);
         }
@@ -116,15 +124,50 @@ int main(int argc, char** argv)
     VkCommandPool cp; CK(vkCreateCommandPool(dev, &cpci, nullptr, &cp));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = cp; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
     VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &cai, &cb));
+    const bool gpuTiming = std::getenv("D4R_EVK_GPU_TIMING") && strcmp(std::getenv("D4R_EVK_GPU_TIMING"), "1") == 0;
+    VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(pd, &properties);
+    VkQueryPool timer = VK_NULL_HANDLE;
+    if (gpuTiming) {
+        if (!qf[qi].timestampValidBits) { fprintf(stderr, "queue does not support GPU timestamps\n"); return 1; }
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP; info.queryCount = 2;
+        CK(vkCreateQueryPool(dev, &info, nullptr, &timer));
+    }
     auto submit = [&](int n) {
         VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CK(vkBeginCommandBuffer(cb, &cbi));
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
-        for (int r = 0; r < n; ++r) vkCmdDispatch(cb, gx, gy, 1);
+        if (gpuTiming) {
+            vkCmdResetQueryPool(cb, timer, 0, 2);
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timer, 0);
+        }
+        for (int r = 0; r < n; ++r) {
+            vkCmdDispatch(cb, gx, gy, 1);
+            if (gpuTiming) {
+                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+            }
+        }
+        if (gpuTiming) {
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timer, 1);
+            VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                 0, 1, &host, 0, nullptr, 0, nullptr);
+        }
         CK(vkEndCommandBuffer(cb));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
         auto t0 = std::chrono::steady_clock::now();
         CK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CK(vkQueueWaitIdle(q));
+        if (gpuTiming) {
+            uint64_t ticks[2];
+            CK(vkGetQueryPoolResults(dev, timer, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT));
+            const uint64_t mask = qf[qi].timestampValidBits == 64 ? ~uint64_t(0) : (uint64_t(1) << qf[qi].timestampValidBits) - 1;
+            return double((ticks[1] - ticks[0]) & mask) * properties.limits.timestampPeriod / 1000.0;
+        }
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     };
     submit(1);
@@ -134,7 +177,9 @@ int main(int argc, char** argv)
         std::vector<double> t;
         for (int it = 0; it < 12; ++it) { double us = submit(repeats) / repeats; if (it >= 3) t.push_back(us); }
         std::sort(t.begin(), t.end());
-        printf("%s: %.1f us per dispatch (median, min %.1f)\n", argv[1], t[t.size() / 2], t[0]);
+        printf("%s: %.3f us per dispatch (%s, median, min %.3f)\n", argv[1], t[t.size() / 2],
+               gpuTiming ? "GPU timestamps; includes storage-buffer ordering" : "wall clock", t[0]);
     }
+    if (timer) vkDestroyQueryPool(dev, timer, nullptr);
     return 0;
 }

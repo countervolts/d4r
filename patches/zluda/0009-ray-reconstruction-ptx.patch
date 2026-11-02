@@ -1,0 +1,716 @@
+From: d4r
+Subject: [PATCH] Real DLSS-Denoiser PTX and AMDGPU compiler fixes
+
+Apply after 0002-0007, with the LLVM submodule initialized. Adds the denoiser
+surface stores, floating-coordinate half texture sampling, finite-saturating
+half conversion, typed half exponentiation, wide-register byte stores,
+half unordered comparison and atomic reduction. CUDA block barriers release
+writes before the hardware barrier and acquire visibility after it.
+Fixes strict division operand selection in AMDGPU and quadratic instruction-order
+rebuilding in CodeGenPrepare operand sinking. Scalar sinking checks for a viable
+target before scanning memory dependencies, retaining write tracking for reads.
+Device helper bitcode must be regenerated before building ZLUDA.
+
+---
+--- a/llvm_zluda/build.rs
++++ b/llvm_zluda/build.rs
+@@ -116,15 +116,24 @@
+ // We resort to this garbage because Cargo is ideologically opposed to
+ // being useful, see here: https://github.com/rust-lang/cargo/issues/11054
+ fn try_get_build_profile_name() -> String {
++    // Walk up from OUT_DIR until a directory naming a build profile turns up, rather than popping
++    // a fixed number of times. Cargo has added levels to the target/<profile>/build/<crate>/<hash>
++    // /out layout more than once (current Cargo emits build/<crate>/<hash>/out), and each time it
++    // does, the fixed count lands on "build" rather than the profile and panics with
++    // "Unknown build profile: build". Stopping at the first ancestor whose name is a profile this
++    // script knows survives that.
++    const PROFILES: [&str; 4] = ["debug", "dev-llvm", "release", "release-lto"];
+     let mut path = PathBuf::from(env::var("OUT_DIR").unwrap());
+-    path.pop();
+-    path.pop();
+-    path.pop();
+-    let name = path.file_name().unwrap().to_str().unwrap();
+-    if !["debug", "dev-llvm", "release", "release-lto"].contains(&name) {
+-        panic!("Unknown build profile: {}", name);
+-    }
+-    name.to_string()
++    loop {
++        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
++            if PROFILES.contains(&name) {
++                return name.to_string();
++            }
++        }
++        if !path.pop() {
++            panic!("no build profile directory above OUT_DIR");
++        }
++    }
+ }
+ 
+ fn get_llvm_build_path(llvm_build_dir: &PathBuf, cmake_profile: &str) -> PathBuf {
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -96,6 +96,8 @@
+ typedef int s32;
+ typedef int v1s32 __attribute__((ext_vector_type(1)));
+ typedef short v2s16 __attribute__((ext_vector_type(2)));
++typedef short v4s16 __attribute__((ext_vector_type(4)));
++typedef unsigned char v4u8 __attribute__((ext_vector_type(4)));
+ typedef int v2s32 __attribute__((ext_vector_type(2)));
+ typedef int v4s32 __attribute__((ext_vector_type(4)));
+ typedef int v8s32 __attribute__((ext_vector_type(8)));
+@@ -125,6 +127,8 @@
+ 
+ extern "C"
+ {
++    __device__ int __ockl_image_width_2D(unsigned int ADDRESS_SPACE_CONSTANT* image);
++    __device__ int __ockl_image_height_2D(unsigned int ADDRESS_SPACE_CONSTANT* image);
+     extern "C" __attribute__((constant)) uint32_t __oclc_ISA_version __device__;
+ 
+     // d4r: kernels may be compiled as wave64 (D4R_ZLUDA_WAVE64, offline texture-kernel builds, linked with
+@@ -312,8 +316,9 @@
+ 
+     void FUNC(bar_sync)(uint32_t)
+     {
+-        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup");
++        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+         __builtin_amdgcn_s_barrier();
++        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+     }
+ 
+     int32_t __ockl_wgred_and_i32(int32_t) __device__;
+@@ -729,6 +734,22 @@
+     Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f32)(float a, float b)
+     {
+         return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
++    }
++
++    // cvt.rn.satfinite.f16.f32. Round to nearest even first, then clamp: a plain
++    // f32->f16 conversion turns an out-of-range magnitude into infinity, while
++    // .satfinite wants the largest finite half (65504) with the input's sign. A
++    // NaN input stays NaN rather than being clamped, which is the point of the
++    // .satfinite qualifier. Rounding before clamping is what the ISA specifies,
++    // so 65520 (which rounds to 65536) still ends at 65504.
++    f16 FUNC(cvt_rn_satfinite_f16_f32)(float a)
++    {
++        if (__builtin_isnan(a))
++            return f16(__builtin_nanf(""));
++        f16 rounded = f16(a);
++        if (__builtin_isinf(static_cast<float>(rounded)))
++            return f16(__builtin_copysignf(65504.0f, a));
++        return rounded;
+     }
+ 
+     // .relu clamps negative results (including -0) to +0 and keeps NaN.
+@@ -2231,6 +2252,17 @@
+         return FUNC_CALL(texobj_2d_v4_f16_s32)(uint64_t(texref->textureObject), coord);
+     }
+ 
++    v4f16 FUNC(texobj_2d_v4_f16_f32)(uint64_t texobj, v2f32 coord)
++    {
++        auto [i, s] = get_image_and_sampler(texobj);
++        auto result = sample_or_fetch_2D(i, s, coord);
++        return {f16(result.x), f16(result.y), f16(result.z), f16(result.w)};
++    }
++    v4f16 FUNC(texref_2d_v4_f16_f32)(struct textureReference GLOBAL_SPACE *texref, v2f32 coord)
++    {
++        return FUNC_CALL(texobj_2d_v4_f16_f32)(uint64_t(texref->textureObject), coord);
++    }
++
+ #define tex_2d_level(RETURN_TYPE, COORD_TYPE)                                                                                                                                           \
+     v4##RETURN_TYPE FUNC(texobj_level_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t texobj, v2##COORD_TYPE coord, float lod)                                                           \
+     {                                                                                                                                                                                   \
+@@ -2612,7 +2644,7 @@
+     }
+ 
+     // Replaces the bytes of one channel that overlap the stored bytes.
+-    static uint32_t surface_merge_channel(uint32_t bits, int channel, int channel_bytes, uint32_t data,
++    static uint32_t surface_merge_channel(uint32_t bits, int channel, int channel_bytes, uint64_t data,
+                                           int byte_offset, int byte_count) __device__
+     {
+         for (int b = 0; b < 4; b++)
+@@ -2636,10 +2668,11 @@
+         return surface_decode_channel(surface_select_channel(c0, c1, c2, c3, channel), data_type);
+     }
+ 
+-    // Stores byte_count (at most 4) little-endian bytes of data at the byte
+-    // offset coord.x of row coord.y.
++    // Stores byte_count (at most 8) little-endian bytes of data at the byte
++    // offset coord.x of row coord.y. 64 bits wide, because a v4 packed-half
++    // store writes four halves in one go.
+     static void surface_store_raw_2d(unsigned int ADDRESS_SPACE_CONSTANT *image, v2s32 coord,
+-                                     uint32_t data, int byte_count) __device__
++                                     uint64_t data, int byte_count) __device__
+     {
+         int data_type = __ockl_image_channel_data_type_2D(image);
+         int order = __ockl_image_channel_order_2D(image);
+@@ -2659,7 +2692,7 @@
+             int chunk_bytes = pixel_bytes - byte_offset;
+             if (chunk_bytes > byte_count - consumed)
+                 chunk_bytes = byte_count - consumed;
+-            uint32_t fragment = data >> (8 * consumed);
++            uint64_t fragment = data >> (8 * consumed);
+             int2 coordinates{pixel_x, coord.y};
+             auto native_coordinates = get_native_vector(coordinates);
+             uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+@@ -2694,6 +2727,41 @@
+         surface_store_raw_2d(image, coord, data, 4);
+     }
+ 
++    // Four packed halves are one 64-bit texel write. The lanes go out in
++    // increasing address order, matching the v2 form.
++    void FUNC(surfobj_b_2d_v4_b16_zero)(uint64_t surface_object, v2s32 coord, v4s16 value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto image = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(
++            static_cast<uintptr_t>(wrapper.native));
++        uint64_t data = uint64_t(uint16_t(value.x))
++            | (uint64_t(uint16_t(value.y)) << 16)
++            | (uint64_t(uint16_t(value.z)) << 32)
++            | (uint64_t(uint16_t(value.w)) << 48);
++        surface_store_raw_2d(image, coord, data, 8);
++    }
++
++    // A .trap store must fault instead of dropping an out-of-range write.
++    void FUNC(surfobj_b_2d_v4_b8_trap)(uint64_t surface_object, v2s32 coord, v4u8 value)
++    {
++        auto wrapper = load_surface_handle(surface_object);
++        auto image = reinterpret_cast<unsigned int ADDRESS_SPACE_CONSTANT *>(
++            static_cast<uintptr_t>(wrapper.native));
++        const int channel_bytes = surface_channel_bytes(__ockl_image_channel_data_type_2D(image));
++        const int channels = surface_channel_count(__ockl_image_channel_order_2D(image));
++        const uint64_t row_bytes = static_cast<uint64_t>(__ockl_image_width_2D(image)) *
++                                   static_cast<uint64_t>(channel_bytes * channels);
++        if (channel_bytes == 0 || coord.x < 0 || coord.y < 0 ||
++            coord.y >= __ockl_image_height_2D(image) ||
++            static_cast<uint64_t>(coord.x) + sizeof(uint32_t) > row_bytes)
++            __builtin_trap();
++        uint32_t data = uint32_t(value.x)
++            | (uint32_t(value.y) << 8)
++            | (uint32_t(value.z) << 16)
++            | (uint32_t(value.w) << 24);
++        surface_store_raw_2d(image, coord, data, 4);
++    }
++
+     void FUNC(surfobj_b_2d_b32_zero)(uint64_t surface_object, v2s32 coord, uint32_t value)
+     {
+         auto wrapper = load_surface_handle(surface_object);
+--- a/ptx/src/pass/insert_post_saturation.rs
++++ b/ptx/src/pass/insert_post_saturation.rs
+@@ -76,6 +76,7 @@
+         | ast::Instruction::MadExtended { .. }
+         | ast::Instruction::And { .. }
+         | ast::Instruction::Atom { .. }
++        | ast::Instruction::Red { .. }
+         | ast::Instruction::AtomCas { .. }
+         | ast::Instruction::BarWarp { .. }
+         | ast::Instruction::Bar { .. }
+--- a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
++++ b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+@@ -2210,6 +2210,7 @@
+         | ast::Instruction::CvtPack { .. }
+         | ast::Instruction::Cvta { .. }
+         | ast::Instruction::Atom { .. }
++        | ast::Instruction::Red { .. }
+         | ast::Instruction::Mul24 { .. }
+         | ast::Instruction::Nanosleep { .. }
+         | ast::Instruction::AtomCas { .. }
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -683,6 +683,9 @@
+             ast::Instruction::Rsqrt { data, arguments } => self.emit_rsqrt(data, arguments),
+             ast::Instruction::Selp { data, arguments } => self.emit_selp(data, arguments),
+             ast::Instruction::Atom { data, arguments } => self.emit_atom(data, arguments),
++            ast::Instruction::Red { data, arguments } => {
++                self.emit_atomic_rmw(data, arguments.src1, arguments.src2).map(|_| ())
++            }
+             ast::Instruction::AtomCas { data, arguments } => self.emit_atom_cas(data, arguments),
+             ast::Instruction::Div { data, arguments } => self.emit_div(data, arguments),
+             ast::Instruction::Neg { data, arguments } => self.emit_neg(data, arguments),
+@@ -1321,9 +1324,20 @@
+         data: ast::AtomDetails,
+         arguments: ast::AtomArgs<SpirvWord>,
+     ) -> Result<(), TranslateError> {
++        let value = self.emit_atomic_rmw(data, arguments.src1, arguments.src2)?;
++        self.resolver.register(arguments.dst, value);
++        Ok(())
++    }
++
++    fn emit_atomic_rmw(
++        &mut self,
++        data: ast::AtomDetails,
++        src1: SpirvWord,
++        src2: SpirvWord,
++    ) -> Result<LLVMValueRef, TranslateError> {
+         let builder = self.builder;
+-        let src1 = self.resolver.value(arguments.src1)?;
+-        let src2 = self.resolver.value(arguments.src2)?;
++        let src1 = self.resolver.value(src1)?;
++        let src2 = self.resolver.value(src2)?;
+         let op = match data.op {
+             ast::AtomicOp::And => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAnd,
+             ast::AtomicOp::Or => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpOr,
+@@ -1344,7 +1358,7 @@
+             ast::AtomicOp::FloatMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMin,
+             ast::AtomicOp::FloatMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMax,
+         };
+-        self.resolver.register(arguments.dst, unsafe {
++        Ok(unsafe {
+             LLVMZludaBuildAtomicRMW(
+                 builder,
+                 op,
+@@ -1353,8 +1367,7 @@
+                 get_scope(data.scope)?,
+                 get_ordering(data.semantics),
+             )
+-        });
+-        Ok(())
++        })
+     }
+ 
+     fn emit_atom_cas(
+--- a/ptx/src/pass/replace_instructions_with_functions.rs
++++ b/ptx/src/pass/replace_instructions_with_functions.rs
+@@ -191,7 +191,8 @@
+                                     data: ast::CvtDetails {
+                                         from: ast::ScalarType::U32,
+                                         to: ast::ScalarType::Pred,
+-                                        mode: ast::CvtMode::Truncate
++                                        mode: ast::CvtMode::Truncate,
++                                        satfinite: false
+                                     },
+                                     arguments: ast::CvtArgs {
+                                         dst: dst_pred,
+@@ -241,7 +242,8 @@
+                                     data: ast::CvtDetails {
+                                         from: ast::ScalarType::U32,
+                                         to: ast::ScalarType::Pred,
+-                                        mode: ast::CvtMode::Truncate
++                                        mode: ast::CvtMode::Truncate,
++                                        satfinite: false
+                                     },
+                                     arguments: ast::CvtArgs {
+                                         dst: dst_pred,
+@@ -259,6 +261,7 @@
+                             from: from @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                             to: ast::ScalarType::F16x2,
+                             mode: _,
++                            satfinite: _,
+                         },
+                     arguments:
+                         ast::CvtArgs {
+@@ -310,7 +313,8 @@
+                             data: ast::CvtDetails {
+                                 from: ast::ScalarType::B32,
+                                 to: ast::ScalarType::F16x2,
+-                                mode: ast::CvtMode::Bitcast
++                                mode: ast::CvtMode::Bitcast,
++                                satfinite: false
+                             },
+                             arguments: ast::CvtArgs {
+                                 dst,
+@@ -449,6 +453,14 @@
+         } => to_call(resolver, fn_declarations, "surfobj_p_2d_v4_b32_zero".into(), i)?,
+         i @ ptx_parser::Instruction::Sust {
+             data: ast::SustData {
++                vector_width: Some(4),
++                scalar_type: ast::ScalarType::B16,
++                formatted: false,
++            },
++            ..
++        } => to_call(resolver, fn_declarations, "surfobj_b_2d_v4_b16_zero".into(), i)?,
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
+                 vector_width: Some(2),
+                 scalar_type: ast::ScalarType::B16,
+                 formatted: false,
+@@ -696,6 +708,7 @@
+                     from: ast::ScalarType::F16x2,
+                     to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                     mode,
++                    satfinite: _,
+                 },
+             arguments: _,
+         } => {
+@@ -718,6 +731,7 @@
+                     from: ast::ScalarType::F32,
+                     to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                     mode,
++                    satfinite: _,
+                 },
+             arguments: _,
+         } => {
+@@ -733,6 +747,57 @@
+                 resolver,
+                 fn_declarations,
+                 format!("cvt_rn_satfinite{}_{}_f32", relu, to).into(),
++                i,
++            )?
++        }
++        // sust.b.2d.v4.b8.trap. In-bounds this is exactly the v4 packed store; only the
++        // out-of-range behaviour differs from .zero, and AMD image stores cannot trap on
++        // an out-of-range coordinate. The helper drops an out-of-range write instead of
++        // trapping, which is what the .zero path already does - so this is correct for
++        // every in-bounds store and differs only where the program would have faulted.
++        i @ ptx_parser::Instruction::Sust {
++            data: ast::SustData {
++                vector_width: Some(4),
++                scalar_type: ast::ScalarType::B8,
++                formatted: false,
++            },
++            ..
++        } => to_call(
++            resolver,
++            fn_declarations,
++            "surfobj_b_2d_v4_b8_trap".into(),
++            i,
++        )?,
++        // cvt.satfinite.f16.f32: finite saturation to half. A plain f32->f16
++        // conversion turns an out-of-range magnitude into infinity; .satfinite
++        // clamps to +/-65504 instead and leaves a NaN input as NaN. Rounding is
++        // applied before clamping, so 65520 - which would round up past the
++        // largest finite half - still ends at 65504.
++        //
++        // Only .rn is implemented: the helper rounds with the hardware's
++        // round-to-nearest-even and then clamps. Accepting .rz/.rm/.rp and
++        // quietly rounding the other way would miscompute, so they are rejected
++        // rather than silently mistranslated.
++        i @ ptx_parser::Instruction::Cvt {
++            data:
++                ptx_parser::CvtDetails {
++                    from: ast::ScalarType::F32,
++                    to: ast::ScalarType::F16,
++                    satfinite: true,
++                    mode: ast::CvtMode::FPTruncate { rounding, .. },
++                    ..
++                },
++            arguments: _,
++        } => {
++            if rounding != ast::RoundingMode::NearestEven {
++                return Err(error_todo_msg(
++                    "cvt.satfinite.f16.f32 is only implemented with .rn rounding",
++                ));
++            }
++            to_call(
++                resolver,
++                fn_declarations,
++                "cvt_rn_satfinite_f16_f32".into(),
+                 i,
+             )?
+         }
+--- a/ptx_parser/src/ast.rs
++++ b/ptx_parser/src/ast.rs
+@@ -108,6 +108,17 @@
+                 src2: T,
+             }
+         },
++        Red {
++            type: &data.type_,
++            data: AtomDetails,
++            arguments<T>: {
++                src1: {
++                    repr: T,
++                    space: { data.space },
++                },
++                src2: T,
++            }
++        },
+         AtomCas {
+             type: Type::Scalar(data.type_),
+             data: AtomCasDetails,
+@@ -350,8 +361,12 @@
+                 },
+             }
+         },
++        // ex2.approx is typed by the instruction suffix (.f32, .f16, .f16x2,
++        // .bf16, .bf16x2). Hardcoding .f32 made the operand check compare a
++        // 16-bit register against a 32-bit instruction type, which rejects
++        // `ex2.approx.f16` outright.
+         Ex2 {
+-            type: Type::Scalar(ScalarType::F32),
++            type: Type::Scalar(data.type_.clone()),
+             data: TypeFtz,
+             arguments<T>: {
+                 dst: T,
+@@ -1035,6 +1050,13 @@
+                             None => Type::Scalar(data.scalar_type),
+                         }
+                     },
++                    // PTX has no 8-bit registers: a `.b8` operand lives in the
++                    // low bits of a wider register, and the upper bits are
++                    // undefined. DLSS emits `ld.local.v4.u8` into `.b16`
++                    // registers and feeds the same registers to
++                    // `sust.b.2d.v4.b8`, so the source must be allowed to be
++                    // wider than the instruction type.
++                    relaxed_type_check: true,
+                 },
+             }
+         },
+@@ -2475,6 +2497,11 @@
+     pub from: ScalarType,
+     pub to: ScalarType,
+     pub mode: CvtMode,
++    /// `.satfinite`: out-of-range results saturate to the largest finite value
++    /// of the destination rather than to infinity, and a NaN input stays NaN.
++    /// Distinct from `.sat`, the integer saturation modifier, and meaningful
++    /// only where the destination is a float type.
++    pub satfinite: bool,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -2530,6 +2557,7 @@
+         rnd: Option<RawRoundingMode>,
+         ftz: bool,
+         saturate: bool,
++        satfinite: bool,
+         relu: bool,
+         dst: ScalarType,
+         src: ScalarType,
+@@ -2660,6 +2688,7 @@
+             mode,
+             to: dst,
+             from: src,
++            satfinite,
+         }
+     }
+ }
+--- a/ptx_parser/src/lib.rs
++++ b/ptx_parser/src/lib.rs
+@@ -2607,6 +2607,7 @@
+         }
+     }
+ 
++
+     set.CmpOp.BoolOp{.ftz}.dtype.stype  d, a, b, {!}c => {
+         let (negate_src3, c) = c;
+         let base = ast::SetpData::try_parse(state, cmpop, ftz, stype);
+@@ -2628,7 +2629,10 @@
+                                   .lo, .ls, .hi, .hs, // signed
+                                   .equ, .neu, .ltu, .leu, .gtu, .geu, .num, .nan }; // float-only
+     .BoolOp: SetpBoolPostOp = { .and, .or, .xor };
+-    .dtype: ScalarType = { .u32, .s32, .f32 };
++    // .dtype is the type of the compared operands. The denoiser compares halves with
++    // set.nan.f16.f16, which needs .f16 here; .bf16 is the other narrow float the ISA
++    // allows and comes along for free because the compare itself is type-generic.
++    .dtype: ScalarType = { .u32, .s32, .f32, .f16, .bf16 };
+     .dtype_f16x2: ScalarType = { .u32, .f16x2 };
+     .stype: ScalarType = { .b16, .b32, .b64, .u16, .u32, .u64, .s16, .s32, .s64, .f16, .f32, .f64 };
+ 
+@@ -2703,10 +2707,15 @@
+         if satfinite && !matches!(
+             (dtype, atype),
+             (ScalarType::E4m3x2 | ScalarType::E5m2x2, ScalarType::F32 | ScalarType::F16x2)
++                // Finite saturation to a narrow float: out-of-range results become the
++                // largest finite value of the destination (f16: +/-65504) instead of
++                // infinity, and a NaN input stays NaN. The denoiser's encoder uses this
++                // on the way down to f16.
++                | (ScalarType::F16, ScalarType::F32)
+         ) {
+-            state.errors.push(PtxError::Todo("cvt.satfinite is only implemented for E4M3/E5M2 destinations".to_string()));
+-        }
+-        let data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, false, dtype, atype);
++            state.errors.push(PtxError::Todo("cvt.satfinite is only implemented for E4M3/E5M2/F16 destinations".to_string()));
++        }
++        let data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, satfinite, false, dtype, atype);
+         let arguments = ast::CvtArgs { dst: d, src: a, src2: b };
+         ast::Instruction::Cvt {
+             data, arguments
+@@ -2719,7 +2728,7 @@
+         if satfinite {
+             state.errors.push(PtxError::Todo("cvt.frnd2 instruction with satfinite modifier".to_string()));
+         }
+-        let data = ast::CvtDetails::new(&mut state.errors, Some(frnd2), false, false, relu, x2_to_type, x2_from_type);
++        let data = ast::CvtDetails::new(&mut state.errors, Some(frnd2), false, false, satfinite, relu, x2_to_type, x2_from_type);
+         ast::Instruction::Cvt {
+             data,
+             arguments:  ast::CvtArgs { dst: d, src: a, src2: b }
+@@ -2729,7 +2738,7 @@
+     // cvt.rn.satfinite{.relu}.f8x2type.f16x2     d, a;
+     // The form without .relu is handled by the generic rule above.
+     cvt.f8rnd.satfinite.relu.f8x2type.f8_from_type    d, a {, b} => {
+-        let data = ast::CvtDetails::new(&mut state.errors, Some(f8rnd), false, false, true, f8x2type, f8_from_type);
++        let data = ast::CvtDetails::new(&mut state.errors, Some(f8rnd), false, false, true, true, f8x2type, f8_from_type);
+         ast::Instruction::Cvt {
+             data,
+             arguments:  ast::CvtArgs { dst: d, src: a, src2: b }
+@@ -3654,6 +3663,25 @@
+     ScalarType =                    { .b16, .b128, .f32 };
+     StateSpace =                    { .global };
+     RawAtomicOp =                   { .exch };
++    // A reduction preserves atomic ordering and scope, but does not return the old value.
++    red{.sem}{.scope}{.space}.op.type [a], b => {
++        ast::Instruction::Red {
++            data: AtomDetails {
++                semantics: sem.unwrap_or(AtomSemantics::Relaxed),
++                scope: scope.unwrap_or(MemScope::Gpu),
++                space: space.unwrap_or(StateSpace::Generic),
++                op: ast::AtomicOp::new(op, type_.kind()),
++                type_: type_.into()
++            },
++            arguments: RedArgs { src1: a, src2: b }
++        }
++    }
++    .sem: AtomSemantics = { .relaxed, .release };
++    .scope: MemScope = { .cta, .cluster, .gpu, .sys };
++    .space: StateSpace = { .global, .shared };
++    .op: RawAtomicOp = { .and, .or, .xor, .add, .inc, .dec, .min, .max };
++    .type: ScalarType = { .b32, .b64, .u32, .u64, .s32, .s64 };
++
+ 
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-div
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-div
+@@ -4571,6 +4599,42 @@
+     sust.b.2d.v2.b16.zero [a, b], c => {
+         Instruction::Sust {
+             data: SustData { vector_width: Some(2), scalar_type: ScalarType::B16, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    // Unformatted packed-half store of a whole 64-bit word. The denoiser's swin kernels write
++    // four halves per texel, so this is not a spelling of the v2 form.
++    sust.b.2d.v4.b16.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(4), scalar_type: ScalarType::B16, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    // `.cs` is the streaming cache policy. It is a hint about how the write is cached, not about
++    // what is written: the stored bytes and the zero-extension are identical to the default
++    // (`.wb`) spelling, so these lower to the same helper rather than carrying a cache-policy
++    // field that nothing would consume.
++    sust.b.2d.cs.v2.b16.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(2), scalar_type: ScalarType::B16, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++
++    sust.b.2d.cs.v4.b16.zero [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(4), scalar_type: ScalarType::B16, formatted: false },
++            arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
++        }
++    }
++    // sust.b.2d.v4.b8.trap: four bytes written as one 32-bit texel store. Same store as
++    // the .zero forms; only the out-of-range behaviour differs, and that is handled by the
++    // lowering rather than by the parser.
++    sust.b.2d.v4.b8.trap [a, b], c => {
++        Instruction::Sust {
++            data: SustData { vector_width: Some(4), scalar_type: ScalarType::B8, formatted: false },
+             arguments: SustArgs { src_surf: a, src_coord: b, src_value: c }
+         }
+     }
+--- a/ext/llvm-project/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/ext/llvm-project/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -12501,8 +12501,13 @@
+ 
+   SDLoc SL(Op);
+   EVT VT = Op.getValueType();
+-  SDValue LHS = Op.getOperand(0);
+-  SDValue RHS = Op.getOperand(1);
++  // ZLUDA changes start
++  // A strict node carries the chain in operand 0, so the value operands are
++  // shifted by one (see FPExpansionBuilder).
++  FPExpansionBuilder B(Op, DAG);
++  SDValue LHS = B.getOperand(0);
++  SDValue RHS = B.getOperand(1);
++  // ZLUDA changes end
+ 
+   SDValue LHSExt = DAG.getNode(ISD::FP_EXTEND, SL, MVT::f32, LHS);
+   SDValue RHSExt = DAG.getNode(ISD::FP_EXTEND, SL, MVT::f32, RHS);
+@@ -12611,8 +12616,13 @@
+   Flags.setNoFPExcept(true);
+ 
+   SDLoc SL(Op);
+-  SDValue LHS = Op.getOperand(0);
+-  SDValue RHS = Op.getOperand(1);
++  // ZLUDA changes start
++  // A strict node carries the chain in operand 0, so the value operands are
++  // shifted by one (see FPExpansionBuilder).
++  FPExpansionBuilder B(Op, DAG);
++  SDValue LHS = B.getOperand(0);
++  SDValue RHS = B.getOperand(1);
++  // ZLUDA changes end
+ 
+   const SDValue One = DAG.getConstantFP(1.0, SL, MVT::f32);
+ 
+@@ -12741,8 +12751,13 @@
+     return FastLowered;
+ 
+   SDLoc SL(Op);
+-  SDValue X = Op.getOperand(0);
+-  SDValue Y = Op.getOperand(1);
++  // ZLUDA changes start
++  // A strict node carries the chain in operand 0, so the value operands are
++  // shifted by one (see FPExpansionBuilder).
++  FPExpansionBuilder B(Op, DAG);
++  SDValue X = B.getOperand(0);
++  SDValue Y = B.getOperand(1);
++  // ZLUDA changes end
+ 
+   const SDValue One = DAG.getConstantFP(1.0, SL, MVT::f64);
+ 
+--- a/ext/llvm-project/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/ext/llvm-project/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -7815,17 +7815,13 @@
+   bool Changed = false;
+   SmallVector<Use *, 4> ToReplace;
+   Instruction *InsertPoint = I;
+-  DenseMap<const Instruction *, unsigned long> InstOrdering;
+-  unsigned long InstNumber = 0;
+-  for (const auto &I : *TargetBB)
+-    InstOrdering[&I] = InstNumber++;
+ 
+   for (Use *U : reverse(OpsToSink)) {
+     auto *UI = cast<Instruction>(U->get());
+     if (isa<PHINode>(UI))
+       continue;
+     if (UI->getParent() == TargetBB) {
+-      if (InstOrdering[UI] < InstOrdering[InsertPoint])
++      if (UI->comesBefore(InsertPoint))
+         InsertPoint = UI;
+       continue;
+     }
+--- a/ext/llvm-project/llvm/lib/Transforms/Scalar/Sink.cpp
++++ b/ext/llvm-project/llvm/lib/Transforms/Scalar/Sink.cpp
+@@ -30,11 +30,6 @@
+ static bool isSafeToMove(Instruction *Inst, AliasAnalysis &AA,
+                          SmallPtrSetImpl<Instruction *> &Stores) {
+ 
+-  if (Inst->mayWriteToMemory()) {
+-    Stores.insert(Inst);
+-    return false;
+-  }
+-
+   // Don't sink static alloca instructions.  CodeGen assumes allocas outside the
+   // entry block are dynamically sized stack objects.
+   if (AllocaInst *AI = dyn_cast<AllocaInst>(Inst))
+@@ -104,9 +99,12 @@
+                             SmallPtrSetImpl<Instruction *> &Stores,
+                             DominatorTree &DT, LoopInfo &LI, AAResults &AA) {
+ 
+-  // Check if it's safe to move the instruction.
+-  if (!isSafeToMove(Inst, AA, Stores))
+-    return false;
++  // Record writes even when this instruction has no sink target: preceding
++  // reads must not be moved across them.
++  if (Inst->mayWriteToMemory()) {
++    Stores.insert(Inst);
++    return false;
++  }
+ 
+   // FIXME: This should include support for sinking instructions within the
+   // block they are currently in to shorten the live ranges.  We often get
+@@ -155,6 +153,11 @@
+   if (!SuccToSinkTo)
+     return false;
+ 
++  // Alias checks can scan every following write. Avoid doing that work for
++  // instructions whose uses already rule out sinking.
++  if (!isSafeToMove(Inst, AA, Stores))
++    return false;
++
+   LLVM_DEBUG(dbgs() << "Sink" << *Inst << " (";
+              Inst->getParent()->printAsOperand(dbgs(), false); dbgs() << " -> ";
+              SuccToSinkTo->printAsOperand(dbgs(), false); dbgs() << ")\n");

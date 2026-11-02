@@ -94,8 +94,8 @@ Per pixel: exposures tex112 (e1) / tex120 ; colour tex80 texel (origin P88, max 
 neighbourhood (origin P144), keeping the positions of the smallest and largest depth (the byte at P216 swaps their
 roles) ; motion tex96 at those two positions and at the pixel -> the three candidates written to surfaces
 280 / 288 / 296 (two f16 each; post's mvA / mvB / mvC).
-Motion: mv = P200 * (P208 + tex96 texel) (P200 = 3: hi-res pixels). A = at the 3x3 neighbour with the smallest depth
-when the P216 byte is set (largest otherwise), B = at the other extreme, C = at the pixel. Strict comparisons, the
+Motion: mv = P200 * (P208 + tex96 texel) (P200 = 3: hi-res pixels). A = at the 3x3 neighbour with the largest depth
+when the P216 byte is set (smallest otherwise; the nearest surface), B = at the other extreme, C = at the pixel. Strict comparisons, the
 centre first, then (-1,-1) (0,-1) (1,-1) (-1,0) (1,0) (-1,1) (0,1) (1,1).
 32 feature slots per pixel, FP8, two planes of 16 bytes:
  plane 0: R' G' | f.x f.y | B' h1.R | f.z f.w | h1.G h1.B | 0 0 | h2.R h2.G | 0 0

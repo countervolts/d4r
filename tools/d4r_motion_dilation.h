@@ -11,6 +11,13 @@ typedef struct D4rMotionDilationParams
     uint32_t radius, reversed_depth;
 } D4rMotionDilationParams;
 
+/* Exact LDS specialization; allocation padding is outside this active grid. */
+static inline int d4r_motion_dilation_lds_eligible(const D4rMotionDilationParams* p)
+{
+    return p->motion_width == p->render_width && p->motion_height == p->render_height &&
+           p->jitter_x == 0 && p->jitter_y == 0 && p->radius >= 1 && p->radius <= 2;
+}
+
 /* Low-resolution velocity and depth share the render raster grid. Allocation
    padding is not part of that grid; retain the original NGX flags and MV scale.
    Display-resolution velocity still needs the jittered depth-grid mapping. */

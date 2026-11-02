@@ -1,0 +1,170 @@
+From: d4r
+Subject: [PATCH] dxil-spirv: a word packed from two 16-bit values as a vector bitcast
+
+DXIL has no vector bitcasts, so two binary16 values go into a 32-bit word as
+"zext(lo) | (zext(hi) << 16)", and the AGS element reads of a binary16 matrix
+(the scalar register layout of d4r's ags_wmma.hlsli) as
+"(e0 & 0xffff) | (e1 << 16)". RADV keeps those as 16 -> 32-bit conversions,
+masks and shifts: v_cvt_u32_u16 twice and v_lshl_add_u32 for each pair, where
+the Vulkan build's f16vec2 packing is one pack_32_2x16 (v_perm_b32). Emit such
+an or (or add) as an OpCompositeConstruct of the two 16-bit values and an
+OpBitcast to the word, and "trunc(w >> 16)" as a component of the word's
+bitcast, when the shader has native 16-bit types.
+
+RX 9070 XT, RADV, preset L: 43452 -> 41970 instructions (v_cvt_u32_u16 824 ->
+44), same output bits for M, L and RR D/E/F; L 1440p/4K -2.3%/-2.1%,
+M 4K -0.9%. Applies after 0011.
+
+---
+diff --git a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+--- a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
++++ b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+@@ -635,8 +635,123 @@
+ 	return op->id;
+ }
+ 
++static bool is_int_of_width(const llvm::Type *type, unsigned width)
++{
++	return type->isIntegerTy() && type->getIntegerBitWidth() == width;
++}
++
++// v's low 16 bits as a 16-bit SPIR-V value, for v a zero extension of a 16-bit value or "x & 0xffff" (x 32-bit, as
++// the AGS element reads give binary16 elements, ags_wmma.hlsli matrixScalarUnpack); 0 otherwise
++static spv::Id low_half_id(Converter::Impl &impl, const llvm::Value *v, spv::Id type16)
++{
++	if (const auto *cast = llvm::dyn_cast<llvm::CastInst>(v))
++	{
++		if (cast->getOpcode() == llvm::Instruction::CastOps::ZExt && is_int_of_width(cast->getOperand(0)->getType(), 16))
++			return impl.get_id_for_value(cast->getOperand(0));
++		return 0;
++	}
++	const auto *op = llvm::dyn_cast<llvm::BinaryOperator>(v);
++	if (!op || op->getOpcode() != llvm::BinaryOperator::BinaryOps::And || !is_int_of_width(op->getType(), 32))
++		return 0;
++	for (unsigned i = 0; i < 2; i++)
++	{
++		const auto *k = llvm::dyn_cast<llvm::ConstantInt>(op->getOperand(i));
++		if (k && k->getUniqueInteger().getZExtValue() == 0xffffu)
++		{
++			Operation *narrow = impl.allocate(spv::OpUConvert, type16);
++			narrow->add_id(impl.get_id_for_value(op->getOperand(1 - i)));
++			impl.add(narrow);
++			return narrow->id;
++		}
++	}
++	return 0;
++}
++
++static bool is_low_half_form(const llvm::Value *v)
++{
++	if (const auto *cast = llvm::dyn_cast<llvm::CastInst>(v))
++		return cast->getOpcode() == llvm::Instruction::CastOps::ZExt && is_int_of_width(cast->getOperand(0)->getType(), 16);
++	const auto *op = llvm::dyn_cast<llvm::BinaryOperator>(v);
++	if (!op || op->getOpcode() != llvm::BinaryOperator::BinaryOps::And || !is_int_of_width(op->getType(), 32))
++		return false;
++	for (unsigned i = 0; i < 2; i++)
++	{
++		const auto *k = llvm::dyn_cast<llvm::ConstantInt>(op->getOperand(i));
++		if (k && k->getUniqueInteger().getZExtValue() == 0xffffu)
++			return true;
++	}
++	return false;
++}
++
++// x if v is "y >> 16" (logical), y 32-bit
++static const llvm::Value *high_half_of(const llvm::Value *v)
++{
++	const auto *op = llvm::dyn_cast<llvm::BinaryOperator>(v);
++	if (!op || op->getOpcode() != llvm::BinaryOperator::BinaryOps::LShr || !is_int_of_width(op->getType(), 32))
++		return nullptr;
++	const auto *k = llvm::dyn_cast<llvm::ConstantInt>(op->getOperand(1));
++	return k && k->getUniqueInteger().getZExtValue() == 16 ? op->getOperand(0) : nullptr;
++}
++
++// DXIL has no vector bitcasts: two 16-bit values go into a word as "zext(lo) | (zext(hi) << 16)" (DXC also gives
++// the "+" form) and come out as "trunc(w)" and "trunc(w >> 16)". RADV keeps those as shifts, masks and 16 -> 32-bit
++// conversions (v_cvt_u32_u16 twice and v_lshl_add_u32 a pair) where the Vulkan build's f16vec2 packing is one
++// pack_32_2x16. Emitted as a bitcast of a two-component 16-bit vector (and a component of the word's bitcast), the
++// driver sees the pack and unpack.
++static bool emit_pack_16x2(Converter::Impl &impl, const llvm::BinaryOperator *instruction)
++{
++	if ((instruction->getOpcode() != llvm::BinaryOperator::BinaryOps::Or &&
++	     instruction->getOpcode() != llvm::BinaryOperator::BinaryOps::Add) ||
++	    !is_int_of_width(instruction->getType(), 32) || !impl.execution_mode_meta.native_16bit_operations)
++		return false;
++
++	for (unsigned i = 0; i < 2; i++)
++	{
++		const llvm::Value *lo = instruction->getOperand(i);
++		const auto *shl = llvm::dyn_cast<llvm::BinaryOperator>(instruction->getOperand(1 - i));
++		if (!is_low_half_form(lo) || !shl || shl->getOpcode() != llvm::BinaryOperator::BinaryOps::Shl)
++			continue;
++		const auto *k = llvm::dyn_cast<llvm::ConstantInt>(shl->getOperand(1));
++		// the shift drops the high operand's upper bits: any 32-bit value
++		const llvm::Value *hi = shl->getOperand(0);
++		if (!k || k->getUniqueInteger().getZExtValue() != 16 || !(is_low_half_form(hi) || is_int_of_width(hi->getType(), 32)))
++			continue;
++
++		auto &builder = impl.builder();
++		spv::Id u16 = builder.makeUintType(16);
++		spv::Id lo_id = low_half_id(impl, lo, u16), hi_id = is_low_half_form(hi) ? low_half_id(impl, hi, u16) : 0;
++		if (!hi_id)
++		{
++			Operation *narrow = impl.allocate(spv::OpUConvert, u16);
++			narrow->add_id(impl.get_id_for_value(hi));
++			impl.add(narrow);
++			hi_id = narrow->id;
++		}
++		// a zero-extended value's own 16-bit type may be signed: OpBitcast to the unsigned one
++		auto as_u16 = [&](spv::Id id) {
++			if (impl.get_type_id(id) == u16)
++				return id;
++			Operation *cast = impl.allocate(spv::OpBitcast, u16);
++			cast->add_id(id);
++			impl.add(cast);
++			return cast->id;
++		};
++		Operation *pair = impl.allocate(spv::OpCompositeConstruct, builder.makeVectorType(u16, 2));
++		pair->add_id(as_u16(lo_id));
++		pair->add_id(as_u16(hi_id));
++		impl.add(pair);
++		Operation *op = impl.allocate(spv::OpBitcast, instruction);
++		op->add_id(pair->id);
++		impl.add(op);
++		return true;
++	}
++	return false;
++}
++
+ bool emit_binary_instruction(Converter::Impl &impl, const llvm::BinaryOperator *instruction)
+ {
++	if (emit_pack_16x2(impl, instruction))
++		return true;
+ 	return emit_binary_instruction_impl(impl, instruction) != 0;
+ }
+ 
+@@ -1441,6 +1556,24 @@
+ 	if (cast_instruction_is_ignored(impl, instruction))
+ 		return true;
+ 
++	// the high half of a word (emit_pack_16x2)
++	if (instruction->getOpcode() == llvm::Instruction::CastOps::Trunc && is_int_of_width(instruction->getType(), 16) &&
++	    impl.execution_mode_meta.native_16bit_operations)
++	{
++		if (const llvm::Value *word = high_half_of(instruction->getOperand(0)))
++		{
++			auto &builder = impl.builder();
++			Operation *pair = impl.allocate(spv::OpBitcast, builder.makeVectorType(impl.get_type_id(instruction->getType()), 2));
++			pair->add_id(impl.get_id_for_value(word));
++			impl.add(pair);
++			Operation *op = impl.allocate(spv::OpCompositeExtract, instruction);
++			op->add_id(pair->id);
++			op->add_literal(1);
++			impl.add(op);
++			return true;
++		}
++	}
++
+ 	return emit_cast_instruction_impl(impl, instruction) != 0;
+ }
+ 

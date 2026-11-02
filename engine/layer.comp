@@ -32,6 +32,9 @@
 #ifndef PADS
 #define PADS 8
 #endif
+#ifndef PAD4
+#define PAD4 8
+#endif
 #ifndef ABL_HEADS
 #define ABL_HEADS uint(NH)
 #endif
@@ -44,7 +47,37 @@
 #ifndef TPW
 #define TPW 1
 #endif
+// Independent weight tiles to request before their matrix products. Keep the
+// historical Vulkan schedule unless a backend explicitly selects another one.
+#ifndef PREFETCH_K
+#define PREFETCH_K 2
+#endif
+#ifndef PREFETCH_N
+#define PREFETCH_N 2
+#endif
 layout(local_size_x = 128 / TPW) in;
+// D4R_HLSL: the D3D12 build of this file (hlsl_build.py, dialect_hlsl.h): the cooperative matrices are AMD's WMMA
+// (d3d12/coopmat_ags.hlsli) and the shared arrays regions of its word array; binding N is register tN/uN there
+#ifdef D4R_HLSL
+struct Pb { int W; int Hh; int sx; int sy; uint o[108]; };
+#if D4R_LAYER_CBV
+struct LayerConstants { int4 shape; uint4 offsets[27]; };
+ConstantBuffer<LayerConstants> layerConstants : register(b0);
+static Pb p;
+#define D4R_HLSL_INIT_CALL p.W = layerConstants.shape.x; p.Hh = layerConstants.shape.y; p.sx = layerConstants.shape.z; p.sy = layerConstants.shape.w;
+#define WEIGHT_OFFSET(i) layerConstants.offsets[(i) / 4u][(i) % 4u]
+#else
+RWStructuredBuffer<Pb> p_buf : register(u0);
+#define p p_buf[0]
+#endif
+ByteAddressBuffer wb_w : register(t1);
+RWStructuredBuffer<float16_t4> inb_a : register(u2);
+RWStructuredBuffer<float16_t4> skb_a : register(u3);
+RWStructuredBuffer<float16_t4> out0_a : register(u4);
+RWStructuredBuffer<float16_t4> out1_a : register(u5);
+#define RM 0u
+#define CMJ 1u
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx; int sy; uint o[108]; } p;
 layout(set = 0, binding = 1, std430) readonly buffer Wb { f16vec4 w[]; } wb;
 layout(set = 0, binding = 2, std430) readonly buffer Ib { f16vec4 a[]; } inb;
@@ -57,12 +90,23 @@ layout(set = 0, binding = 5, std430) buffer O1 { f16vec4 a[]; } out1;
 #define MB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define RM gl_CooperativeMatrixLayoutRowMajor
 #define CMJ gl_CooperativeMatrixLayoutColumnMajor
+#endif
+#ifndef WEIGHT_OFFSET
+#define WEIGHT_OFFSET(i) p.o[i]
+#endif
 #define LD(m, arr, off, stride) coopMatLoad(m, arr, (off) / 4u, (stride) / 4u, RM)
+// The D3D12 fast package transposes each 16x16 weight tile in a separate
+// weight file. Column-major loads reconstruct the same logical B operand.
+#if D4R_HLSL && D4R_WEIGHT_TILES_COLMAJOR
+#define LDW(m, off, stride) coopMatLoad(m, wb.w, (off) / 4u, (stride) / 4u, CMJ)
+#else
+#define LDW(m, off, stride) LD(m, wb.w, off, stride)
+#endif
 #define ST(m, arr, off, stride) coopMatStore(HACC(m), arr, (off) / 4u, (stride) / 4u, RM)
 #define SYNC memoryBarrierShared(); barrier();
 const uint UC = uint(C), NT = uint(C) / 16u, HC = uint(C) / 2u;
 const uint SX = UC + uint(PADX);            // row stride of the token layout (64 rows of C)
-const uint S4 = 4u * UC + 8u;               // row stride of the 16 x 4C layout (patch expand / merge)
+const uint S4 = 4u * UC + uint(PAD4);       // row stride of the 16 x 4C layout (patch expand / merge)
 const uint SQ = 32u + uint(PADT);           // row stride of Q, K, V, attention output and MLP hidden (64 rows each)
 const uint RQ = 64u * SQ;                   // one such region
 const uint SLO = uint(XC) + 8u, SEM = 24u, SHD = 56u, SMG = uint(MERGE_N) + 8u;   // low-res input, embedding input, head, merged
@@ -77,7 +121,7 @@ const uint SLO = uint(XC) + 8u, SEM = 24u, SHD = 56u, SMG = uint(MERGE_N) + 8u; 
 #if KIND == 2
 #define TT_ALT (16 * (C + PADX))
 #elif KIND == 1
-#define TT_ALT (4 * (4 * C + 8))
+#define TT_ALT (4 * (4 * C + PAD4))
 #else
 #define TT_ALT 0
 #endif
@@ -115,6 +159,36 @@ f16vec4 readBPatch(uint r,uint c,uint stride) {uint i=c*16u+r;return f16vec4(BF[
 void writeBToken(uint r,uint c,f16vec4 v) {uint i=c*SP+r;BF[i]=v.x;BF[i+SP]=v.y;BF[i+2u*SP]=v.z;BF[i+3u*SP]=v.w;}
 void writeTToken(uint r,uint c,uint stride,f16vec4 v) {uint i=c*SP+r;TT[i]=v.x;TT[i+SP]=v.y;TT[i+2u*SP]=v.z;TT[i+3u*SP]=v.w;}
 void writeTRaw(uint off,f16vec4 v) {TT[off]=v.x;TT[off+1u]=v.y;TT[off+2u]=v.z;TT[off+3u]=v.w;}
+#elif defined(D4R_HLSL)
+// BF, then TT, in AGS's matrixShared words (two per f16vec4)
+#define BF_WORDS (2 * 16 * (C + PADX))
+#define D4R_WMMA_SHARED_WORDS (BF_WORDS + 2 * MAX2(TT_REG, MAX2(TT_ALT, TT_HEAD)))
+#include "coopmat_ags.hlsli"
+static const D4rLds4 BF = { 0u }, TT = { uint(BF_WORDS) };
+struct Wb { D4rBuf4 w; };
+struct Ib { RWStructuredBuffer<float16_t4> a; };
+struct Ob { RWStructuredBuffer<float16_t4> a; };
+static const Wb wb = { { wb_w } };     // from the resource itself: see coopmat_ags.hlsli
+static const Ib inb = { inb_a }, skb = { skb_a };
+static const Ob out0 = { out0_a }, out1 = { out1_a };
+typedef D4rAcc ACC;
+typedef D4rAcc HACC;
+typedef D4rMatA MA;
+typedef D4rMatB MB;
+#define ACC(x) d4r_acc(x)
+#define HACC(x) d4r_hacc(x)
+#define LOAD_B_TOKEN(m,r,c) LD(m,BF,(r)*SX+(c),SX)
+#define STORE_B_TOKEN(m,r,c) ST(m,BF,(r)*SX+(c),SX)
+#define LOAD_T_TOKEN(m,r,c,s) LD(m,TT,(r)*(s)+(c),s)
+#define STORE_T_TOKEN(m,r,c,s) ST(m,TT,(r)*(s)+(c),s)
+#define STORE_B_PATCH(m,r,c,s) ST(m,BF,(r)*(s)+(c),s)
+#define LOAD_T_RAW(m,off,s) LD(m,TT,off,s)
+f16vec4 readBToken(uint r,uint c) {return d4rLdsRead4(BF.b+(r*SX+c)/2u);}
+f16vec4 readTToken(uint r,uint c,uint stride) {return d4rLdsRead4(TT.b+(r*stride+c)/2u);}
+f16vec4 readBPatch(uint r,uint c,uint stride) {return d4rLdsRead4(BF.b+(r*stride+c)/2u);}
+void writeBToken(uint r,uint c,f16vec4 v) {d4rLdsWrite4(BF.b+(r*SX+c)/2u,v);}
+void writeTToken(uint r,uint c,uint stride,f16vec4 v) {d4rLdsWrite4(TT.b+(r*stride+c)/2u,v);}
+void writeTRaw(uint off,f16vec4 v) {d4rLdsWrite4(TT.b+off/2u,v);}
 #else
 shared f16vec4 BF[16 * (C + PADX)];
 shared f16vec4 TT[MAX2(TT_REG, MAX2(TT_ALT, TT_HEAD))];
@@ -158,10 +232,19 @@ void main()
     // per tile w of this wave (FORW): its index mt in the window and this lane's token (WINV)
 #define FORW [[unroll]] for (uint w = 0u; w < uint(TPW); ++w)
 #define WINV const uint mt = mt0 + w, tok = 16u * mt + row; const int ty = Y0 + int(tok >> 3), tx = X0 + int(tok & 7u);
-    ACC ACC_[TPW][C / 16];                          // the residual stream of each tile
-    HACC RES_[TPW][C / 16];                         // x0, added back at the MLP boundary as one f16 add
-#define acc ACC_[w]
-#define residual RES_[w]
+    // Per-tile values are declared NAME TILES and used as NAME TILE. With one tile they are not arrays: AMD's Windows
+    // compiler (26.9.1) crashes on one-element outer arrays of cooperative matrices, which TPW 1 would otherwise make.
+#if TPW == 1
+#define TILES
+#define TILE
+#else
+#define TILES [TPW]
+#define TILE [w]
+#endif
+    ACC ACC_ TILES[C / 16];                          // the residual stream of each tile
+    HACC RES_ TILES[C / 16];                         // x0, added back at the MLP boundary as one f16 add
+#define acc ACC_ TILE
+#define residual RES_ TILE
     // ------------------------------------------------------------ input: x0 into acc, x0 * rsqrt(sum x0^2) into BF
 #if KIND == 2
     {
@@ -172,18 +255,18 @@ void main()
         FORW {
             WINV
             const uint c0 = (mt * 2u + hf) * part;
-            for (uint c = c0; c < c0 + part; c += 4u) writeTRaw(row*SLO+c,inb.a[(src+c)/4u]);
+            for (uint c = c0; c < c0 + part; c += 4u) writeTRaw(row*SLO+c,inb.a[(src+c)/4u]);   // rolled
         }
         SYNC
         // expand: tile mt computes quarter mt of the 4C columns
         FORW {
             WINV
-            for (uint nt = 0u; nt < NT; ++nt) acc[nt] = bias_tile(p.o[105] + mt * UC + nt * 16u, 4u * UC);
+            for (uint nt = 0u; nt < NT; ++nt) acc[nt] = bias_tile(WEIGHT_OFFSET(105) + mt * UC + nt * 16u, 4u * UC);
             for (uint kt = 0u; kt < uint(XC) / 16u; ++kt)
             {
                 MA a; LOAD_T_RAW(a,kt*16u,SLO);
                 MB b[C / 16];
-                for (uint nt = 0u; nt < NT; ++nt) LD(b[nt], wb.w, p.o[104] + kt * 16u * 4u * UC + mt * UC + nt * 16u, 4u * UC);
+                for (uint nt = 0u; nt < NT; ++nt) LD(b[nt], wb.w, WEIGHT_OFFSET(104) + kt * 16u * 4u * UC + mt * UC + nt * 16u, 4u * UC);
                 for (uint nt = 0u; nt < NT; ++nt) acc[nt] = coopMatMulAdd(a, b[nt], acc[nt]);
             }
         }
@@ -202,17 +285,17 @@ void main()
 #define READ_X0(r,c) readTToken(r,c,SX)
 #elif EMBED
     {
-        MA EA_[TPW];
+        MA EA_ TILES;
         FORW {
             WINV
             const uint src = uint(mirror(ty, p.Hh) * p.W + mirror(tx, p.W)) * 16u + hf * 8u;
             for (uint c = 0u; c < 8u; c += 4u) writeTRaw(tok*SEM+hf*8u+c,inb.a[(src+c)/4u]);
-            LOAD_T_RAW(EA_[w],mt*16u*SEM,SEM);
+            LOAD_T_RAW(EA_ TILE,mt*16u*SEM,SEM);
         }
         for (uint nt = 0u; nt < NT; ++nt)
         {
-            MB b; LD(b, wb.w, p.o[106] + nt * 16u, UC);
-            FORW { WINV STORE_B_TOKEN(coopMatMulAdd(EA_[w],b,bias_tile(p.o[107]+nt*16u,UC)),mt*16u,nt*16u); }
+            MB b; LD(b, wb.w, WEIGHT_OFFSET(106) + nt * 16u, UC);
+            FORW { WINV STORE_B_TOKEN(coopMatMulAdd(EA_ TILE,b,bias_tile(WEIGHT_OFFSET(107)+nt*16u,UC)),mt*16u,nt*16u); }
         }
         FORW { WINV for (uint c = 0u; c < HC; c += 4u) writeBToken(tok,ch0+c,max(readBToken(tok,ch0+c),f16vec4(0.0))); }
         SYNC      // TT is laid out differently from here on
@@ -234,7 +317,7 @@ void main()
         for (uint nt = 0u; nt < NT; ++nt) {
             HACC x; LOAD_X0(x,nt*16u);
             residual[nt] = x;
-            acc[nt] = bias_tile(p.o[1] + nt * 16u, UC);
+            acc[nt] = bias_tile(WEIGHT_OFFSET(1) + nt * 16u, UC);
         }
         vec4 s4 = vec4(0.0);
         f16vec4 x[C / 8];
@@ -253,43 +336,43 @@ void main()
 #if FOLD_GAINS
             writeBToken(tok,ch0+c,x[c/4u]*r);
 #else
-            writeBToken(tok,ch0+c,x[c/4u]*(r*wb.w[(p.o[0]+ch0+c)/4u]));
+            writeBToken(tok,ch0+c,x[c/4u]*(r*wb.w[(WEIGHT_OFFSET(0)+ch0+c)/4u]));
 #endif
         }
     }
 #if KIND == 2
     SYNC      // x0 lived in TT; the heads overwrite it
 #endif
-    MA XN_[TPW][C / 16];                            // the normalised input of each tile, for every head's Q, K, V
-#define xn XN_[w]
+    MA XN_ TILES[C / 16];                            // the normalised input of each tile, for every head's Q, K, V
+#define xn XN_ TILE
     FORW { WINV for (uint kt = 0u; kt < NT; ++kt) LOAD_B_TOKEN(xn[kt],mt*16u,kt*16u); }
     // ------------------------------------------------------------ attention, one head at a time
-    for (uint h = 0u; h < ABL_HEADS; ++h)
+    for (uint h = 0u; h < ABL_HEADS; ++h)   // rolled
     {
-        const uint otab = p.o[7u + 5u * h], owo = p.o[8u + 5u * h];
+        const uint otab = WEIGHT_OFFSET(7u + 5u * h), owo = WEIGHT_OFFSET(8u + 5u * h);
         // Q, K, V of every tile, two K steps at a time: their weight tiles are requested before the first product,
         // and each is loaded once for the wave's tiles (one projection at a time: fewer live accumulators)
 #define PROJ(WOFF, STORE0, STORE1) { \
-            ACC P0_[TPW], P1_[TPW]; \
-            FORW { P0_[w] = ACC(0.0); P1_[w] = ACC(0.0); } \
-            for (uint kt = 0u; kt < NT; kt += 2u) \
+            ACC P0_ TILES, P1_ TILES; \
+            FORW { P0_ TILE = ACC(0.0); P1_ TILE = ACC(0.0); } \
+            for (uint kt = 0u; kt < NT; kt += uint(PREFETCH_K)) \
             { \
-                MB bw[4]; \
-                for (uint i = 0u; i < 2u; ++i) \
+                MB bw[2 * PREFETCH_K]; \
+                for (uint i = 0u; i < uint(PREFETCH_K) && kt + i < NT; ++i) \
                 { \
-                    LD(bw[2u * i], wb.w, (WOFF) + (kt + i) * 512u, 32u); \
-                    LD(bw[2u * i + 1u], wb.w, (WOFF) + (kt + i) * 512u + 16u, 32u); \
+                    LDW(bw[2u * i], (WOFF) + (kt + i) * 512u, 32u); \
+                    LDW(bw[2u * i + 1u], (WOFF) + (kt + i) * 512u + 16u, 32u); \
                 } \
-                FORW { for (uint i = 0u; i < 2u; ++i) { P0_[w] = coopMatMulAdd(xn[kt + i], bw[2u * i], P0_[w]); P1_[w] = coopMatMulAdd(xn[kt + i], bw[2u * i + 1u], P1_[w]); } } \
+                FORW { for (uint i = 0u; i < uint(PREFETCH_K) && kt + i < NT; ++i) { P0_ TILE = coopMatMulAdd(xn[kt + i], bw[2u * i], P0_ TILE); P1_ TILE = coopMatMulAdd(xn[kt + i], bw[2u * i + 1u], P1_ TILE); } } \
             } \
             FORW { WINV STORE0; STORE1; } }
 #if !POSATTN
-        PROJ(p.o[4u + 5u * h], STORE_B_TOKEN(P0_[w],mt*16u,0u), STORE_B_TOKEN(P1_[w],mt*16u,16u))       // Q: this tile's own rows
-        PROJ(p.o[5u + 5u * h], STORE_T_TOKEN(P0_[w],mt*16u,0u,SQ), STORE_T_TOKEN(P1_[w],mt*16u,16u,SQ))
+        PROJ(WEIGHT_OFFSET(4u + 5u * h), STORE_B_TOKEN(P0_ TILE,mt*16u,0u), STORE_B_TOKEN(P1_ TILE,mt*16u,16u))       // Q: this tile's own rows
+        PROJ(WEIGHT_OFFSET(5u + 5u * h), STORE_T_TOKEN(P0_ TILE,mt*16u,0u,SQ), STORE_T_TOKEN(P1_ TILE,mt*16u,16u,SQ))
 #endif
-        PROJ(p.o[6u + 5u * h], STORE_T_TOKEN(P0_[w],VOFF/SQ+mt*16u,0u,SQ), STORE_T_TOKEN(P1_[w],VOFF/SQ+mt*16u,16u,SQ))
+        PROJ(WEIGHT_OFFSET(6u + 5u * h), STORE_T_TOKEN(P0_ TILE,VOFF/SQ+mt*16u,0u,SQ), STORE_T_TOKEN(P1_ TILE,VOFF/SQ+mt*16u,16u,SQ))
         SYNC
-        MA OA0_[TPW], OA1_[TPW];
+        MA OA0_ TILES, OA1_ TILES;
         FORW {
         WINV
 #if !POSATTN
@@ -334,61 +417,61 @@ void main()
             }
             // the two K tiles of this head for the output projection: through memory, to become A operands
             STORE_B_TOKEN(o0,mt*16u,0u); STORE_B_TOKEN(o1,mt*16u,16u);
-            LOAD_B_TOKEN(OA0_[w],mt*16u,0u); LOAD_B_TOKEN(OA1_[w],mt*16u,16u);
+            LOAD_B_TOKEN(OA0_ TILE,mt*16u,0u); LOAD_B_TOKEN(OA1_ TILE,mt*16u,16u);
         }
         }
-        for (uint n0 = 0u; n0 < NT; n0 += 2u)
+        for (uint n0 = 0u; n0 < NT; n0 += uint(PREFETCH_N))
         {
-            MB b0[2], b1[2];
-            for (uint i = 0u; i < 2u; ++i) { LD(b0[i], wb.w, owo + (n0 + i) * 16u, UC); LD(b1[i], wb.w, owo + 16u * UC + (n0 + i) * 16u, UC); }
-            FORW { for (uint i = 0u; i < 2u; ++i) {
-                acc[n0 + i] = coopMatMulAdd(OA1_[w], b1[i], coopMatMulAdd(OA0_[w], b0[i], acc[n0 + i]));
+            MB b0[PREFETCH_N], b1[PREFETCH_N];
+            for (uint i = 0u; i < uint(PREFETCH_N) && n0 + i < NT; ++i) { LDW(b0[i], owo + (n0 + i) * 16u, UC); LDW(b1[i], owo + 16u * UC + (n0 + i) * 16u, UC); }
+            FORW { for (uint i = 0u; i < uint(PREFETCH_N) && n0 + i < NT; ++i) {
+                acc[n0 + i] = coopMatMulAdd(OA1_ TILE, b1[i], coopMatMulAdd(OA0_ TILE, b0[i], acc[n0 + i]));
             } }
         }
         SYNC      // every wave is done with K and V before the next head overwrites them
     }
     // ------------------------------------------------------------ MLP: its input is the stream itself (gain folded into fc1)
     {
-        MA M_[TPW][C / 16];
-#define m M_[w]
+        MA M_ TILES[C / 16];
+#define m M_ TILE
         FORW {
         WINV
         for (uint nt = 0u; nt < NT; ++nt) acc[nt] = ACC(HACC(acc[nt]) + residual[nt]);
         for (uint nt = 0u; nt < NT; ++nt) STORE_B_TOKEN(acc[nt],mt*16u,nt*16u);
 #if !FOLD_GAINS
-        for (uint c = 0u; c < HC; c += 4u) writeBToken(tok,ch0+c,readBToken(tok,ch0+c)*wb.w[(p.o[2]+ch0+c)/4u]);
+        for (uint c = 0u; c < HC; c += 4u) writeBToken(tok,ch0+c,readBToken(tok,ch0+c)*wb.w[(WEIGHT_OFFSET(2)+ch0+c)/4u]);
 #endif
         for (uint kt = 0u; kt < NT; ++kt) LOAD_B_TOKEN(m[kt],mt*16u,kt*16u);
         for (uint nt = 0u; nt < NT; ++nt) {
-            acc[nt] = ACC(HACC(acc[nt]) + HACC(bias_tile(p.o[3] + nt * 16u, UC)));
+            acc[nt] = ACC(HACC(acc[nt]) + HACC(bias_tile(WEIGHT_OFFSET(3) + nt * 16u, UC)));
         }
         }
-        for (uint ch = 0u; ch < ABL_CHUNKS; ++ch)
+        for (uint ch = 0u; ch < ABL_CHUNKS; ++ch)   // rolled
         {
-            const uint ow1 = p.o[44u + 3u * ch], ob1 = p.o[45u + 3u * ch], ow2 = p.o[46u + 3u * ch];
-            ACC H0_[TPW], H1_[TPW];
-            FORW { H0_[w] = bias_tile(ob1, 32u); H1_[w] = bias_tile(ob1 + 16u, 32u); }
-            for (uint kt = 0u; kt < NT; kt += 2u)
+            const uint ow1 = WEIGHT_OFFSET(44u + 3u * ch), ob1 = WEIGHT_OFFSET(45u + 3u * ch), ow2 = WEIGHT_OFFSET(46u + 3u * ch);
+            ACC H0_ TILES, H1_ TILES;
+            FORW { H0_ TILE = bias_tile(ob1, 32u); H1_ TILE = bias_tile(ob1 + 16u, 32u); }
+            for (uint kt = 0u; kt < NT; kt += uint(PREFETCH_K))
             {
-                MB b[4];
-                for (uint i = 0u; i < 2u; ++i) { LD(b[2u * i], wb.w, ow1 + (kt + i) * 512u, 32u); LD(b[2u * i + 1u], wb.w, ow1 + (kt + i) * 512u + 16u, 32u); }
-                FORW { for (uint i = 0u; i < 2u; ++i) { H0_[w] = coopMatMulAdd(m[kt + i], b[2u * i], H0_[w]); H1_[w] = coopMatMulAdd(m[kt + i], b[2u * i + 1u], H1_[w]); } }
+                MB b[2 * PREFETCH_K];
+                for (uint i = 0u; i < uint(PREFETCH_K) && kt + i < NT; ++i) { LDW(b[2u * i], ow1 + (kt + i) * 512u, 32u); LDW(b[2u * i + 1u], ow1 + (kt + i) * 512u + 16u, 32u); }
+                FORW { for (uint i = 0u; i < uint(PREFETCH_K) && kt + i < NT; ++i) { H0_ TILE = coopMatMulAdd(m[kt + i], b[2u * i], H0_ TILE); H1_ TILE = coopMatMulAdd(m[kt + i], b[2u * i + 1u], H1_ TILE); } }
             }
-            FORW { WINV STORE_T_TOKEN(H0_[w],mt*16u,0u,SQ); STORE_T_TOKEN(H1_[w],mt*16u,16u,SQ); }
+            FORW { WINV STORE_T_TOKEN(H0_ TILE,mt*16u,0u,SQ); STORE_T_TOKEN(H1_ TILE,mt*16u,16u,SQ); }
             // fc2's first weight tiles are requested before the activation pass, so they arrive while it runs
-            MB w2a[2], w2b[2];
-            for (uint i = 0u; i < 2u; ++i) { LD(w2a[i], wb.w, ow2 + i * 16u, UC); LD(w2b[i], wb.w, ow2 + 16u * UC + i * 16u, UC); }
-            MA GA0_[TPW], GA1_[TPW];
+            MB w2a[PREFETCH_N], w2b[PREFETCH_N];
+            for (uint i = 0u; i < uint(PREFETCH_N) && i < NT; ++i) { LDW(w2a[i], ow2 + i * 16u, UC); LDW(w2b[i], ow2 + 16u * UC + i * 16u, UC); }
+            MA GA0_ TILES, GA1_ TILES;
             FORW {
                 WINV
                 for (uint j = 0u; j < 4u; ++j) writeTToken(tok,hf*16u+j*4u,SQ,gelu(readTToken(tok,hf*16u+j*4u,SQ)));
-                LOAD_T_TOKEN(GA0_[w],mt*16u,0u,SQ); LOAD_T_TOKEN(GA1_[w],mt*16u,16u,SQ);
+                LOAD_T_TOKEN(GA0_ TILE,mt*16u,0u,SQ); LOAD_T_TOKEN(GA1_ TILE,mt*16u,16u,SQ);
             }
-            FORW { for (uint i = 0u; i < 2u; ++i) acc[i] = coopMatMulAdd(GA1_[w], w2b[i], coopMatMulAdd(GA0_[w], w2a[i], acc[i])); }
-            for (uint n0 = 2u; n0 < NT; n0 += 2u)
+            FORW { for (uint i = 0u; i < uint(PREFETCH_N) && i < NT; ++i) acc[i] = coopMatMulAdd(GA1_ TILE, w2b[i], coopMatMulAdd(GA0_ TILE, w2a[i], acc[i])); }
+            for (uint n0 = uint(PREFETCH_N); n0 < NT; n0 += uint(PREFETCH_N))
             {
-                for (uint i = 0u; i < 2u; ++i) { LD(w2a[i], wb.w, ow2 + (n0 + i) * 16u, UC); LD(w2b[i], wb.w, ow2 + 16u * UC + (n0 + i) * 16u, UC); }
-                FORW { for (uint i = 0u; i < 2u; ++i) acc[n0 + i] = coopMatMulAdd(GA1_[w], w2b[i], coopMatMulAdd(GA0_[w], w2a[i], acc[n0 + i])); }
+                for (uint i = 0u; i < uint(PREFETCH_N) && n0 + i < NT; ++i) { LDW(w2a[i], ow2 + (n0 + i) * 16u, UC); LDW(w2b[i], ow2 + 16u * UC + (n0 + i) * 16u, UC); }
+                FORW { for (uint i = 0u; i < uint(PREFETCH_N) && n0 + i < NT; ++i) acc[n0 + i] = coopMatMulAdd(GA1_ TILE, w2b[i], coopMatMulAdd(GA0_ TILE, w2a[i], acc[n0 + i])); }
             }
         }
         FORW { WINV for (uint nt = 0u; nt < NT; ++nt) STORE_B_TOKEN(acc[nt],mt*16u,nt*16u); }
@@ -399,23 +482,23 @@ void main()
 #if HEAD
     SYNC          // the head's rows of TT overlap other tiles' MLP rows
     {
-        ACC HO_[TPW][3];
-        FORW { for (uint nt = 0u; nt < 3u; ++nt) HO_[w][nt] = bias_tile(p.o[107] + nt * 16u, 48u); }
+        ACC HO_ TILES[3];
+        FORW { for (uint nt = 0u; nt < 3u; ++nt) HO_ TILE[nt] = bias_tile(WEIGHT_OFFSET(107) + nt * 16u, 48u); }
         for (uint kt = 0u; kt < NT; ++kt)
         {
             MB b[3];
-            for (uint nt = 0u; nt < 3u; ++nt) LD(b[nt], wb.w, p.o[106] + kt * 16u * 48u + nt * 16u, 48u);
+            for (uint nt = 0u; nt < 3u; ++nt) LD(b[nt], wb.w, WEIGHT_OFFSET(106) + kt * 16u * 48u + nt * 16u, 48u);
             FORW {
                 WINV
                 MA a; LOAD_B_TOKEN(a,mt*16u,kt*16u);
-                for (uint nt = 0u; nt < 3u; ++nt) HO_[w][nt] = coopMatMulAdd(a, b[nt], HO_[w][nt]);
+                for (uint nt = 0u; nt < 3u; ++nt) HO_ TILE[nt] = coopMatMulAdd(a, b[nt], HO_ TILE[nt]);
             }
         }
         FORW {
             WINV OUTV
-            for (uint nt = 0u; nt < 3u; ++nt) STORE_T_TOKEN(HO_[w][nt],mt*16u,nt*16u,SHD);
+            for (uint nt = 0u; nt < 3u; ++nt) STORE_T_TOKEN(HO_ TILE[nt],mt*16u,nt*16u,SHD);
             if (inside)
-                for (uint c = hf * 20u; c < hf * 20u + 20u; c += 4u) out0.a[(dst * 40u + c) / 4u] = readTToken(tok,c,SHD);
+                for (uint c = hf * 20u; c < hf * 20u + 20u; c += 4u) out0.a[(dst * 40u + c) / 4u] = readTToken(tok,c,SHD);   // rolled
         }
     }
 #elif KIND == 1
@@ -443,20 +526,20 @@ void main()
         }
         SYNC
         const uint MN = uint(MERGE_N), NI = (MN / 16u + 3u) / 4u;
-        ACC MG_[TPW][(MERGE_N / 16 + 3) / 4];
+        ACC MG_ TILES[(MERGE_N / 16 + 3) / 4];
         FORW {
             WINV
-            for (uint i = 0u; i < NI; ++i) MG_[w][i] = bias_tile(p.o[105] + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
+            for (uint i = 0u; i < NI; ++i) MG_ TILE[i] = bias_tile(WEIGHT_OFFSET(105) + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
             for (uint kt = 0u; kt < 4u * UC / 16u; kt += 2u)
             {
                 MA a[2]; MB b[2 * ((MERGE_N / 16 + 3) / 4)];
                 for (uint j = 0u; j < 2u; ++j)
                 {
                     LOAD_T_RAW(a[j],(kt+j)*16u,S4);
-                    for (uint i = 0u; i < NI; ++i) LD(b[j * NI + i], wb.w, p.o[104] + (kt + j) * 16u * MN + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
+                    for (uint i = 0u; i < NI; ++i) LD(b[j * NI + i], wb.w, WEIGHT_OFFSET(104) + (kt + j) * 16u * MN + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
                 }
                 for (uint j = 0u; j < 2u; ++j)
-                    for (uint i = 0u; i < NI; ++i) MG_[w][i] = coopMatMulAdd(a[j], b[j * NI + i], MG_[w][i]);
+                    for (uint i = 0u; i < NI; ++i) MG_ TILE[i] = coopMatMulAdd(a[j], b[j * NI + i], MG_ TILE[i]);
             }
         }
         // BF is free (every wave gathered before the barrier above, and every tile's products are done): the merged
@@ -465,7 +548,7 @@ void main()
             WINV
             const uint ntn = (MN / 16u + 3u - mt) / 4u;
             for (uint i = 0u; i < NI; ++i)
-                if (i < ntn) STORE_B_PATCH(MG_[w][i],0u,(mt+4u*i)*16u,SMG);
+                if (i < ntn) STORE_B_PATCH(MG_ TILE[i],0u,(mt+4u*i)*16u,SMG);
         }
         SYNC
         const int ym = tdiv2(Y0) + int(row >> 2), xm = tdiv2(X0) + int(row & 3u);
@@ -474,7 +557,7 @@ void main()
             WINV
             const uint c0 = (mt * 2u + hf) * part;
             if (ym >= 0 && ym < p.Hh / 2 && xm >= 0 && xm < p.W / 2)
-                for (uint c = c0; c < c0 + part; c += 4u) out0.a[(uint(ym * (p.W / 2) + xm) * uint(XC) + c) / 4u] = readBPatch(row,c,SMG);
+                for (uint c = c0; c < c0 + part; c += 4u) out0.a[(uint(ym * (p.W / 2) + xm) * uint(XC) + c) / 4u] = readBPatch(row,c,SMG);   // rolled
         }
     }
 #endif

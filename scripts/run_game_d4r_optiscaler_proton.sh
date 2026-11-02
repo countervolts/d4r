@@ -41,6 +41,8 @@ if [[ "${D4R_NO_CONFIG:-0}" != 1 ]]; then
   eval "$D4R_CONFIG_EXPORTS"
 fi
 source "$ROOT/scripts/d4r_proton_env.sh"
+# [Engine] ModelDir = auto: the model scripts/install_d4r_runtime.sh staged
+export D4R_ENGINE_MODEL_DIR="${D4R_ENGINE_MODEL_DIR:-$D4R_RUNTIME_DIR/engine/k}"
 
 PREFIX="$COMPAT_DIR/pfx"
 UMU="$PREFIX/drive_c/windows/system32/umu"

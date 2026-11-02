@@ -1,0 +1,43 @@
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
+index ee03238c..3419ceb4 100644
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
+@@ -263,15 +263,17 @@ static bool validate_wmma_io_registers(Converter::Impl &impl, uint32_t base_argu
+ 		spv::Id coopmat_id = impl.get_id_for_value(impl.ags.backdoor_instructions[base_argument]->getOperand(5));
+ 
+ 		// If the matrix is PHI or loaded from alloca, we only check component mapping.
+-		bool all_phi_or_load = true;
+-		for (uint32_t i = 0; i < 4 && all_phi_or_load; i++)
++		// DXC may also forward some registers of a matrix held in an array straight from the AGS result
++		// while loading the others from the array (partial SROA), so one PHI or load is enough.
++		bool any_phi_or_load = false;
++		for (uint32_t i = 0; i < 4 && !any_phi_or_load; i++)
+ 		{
+ 			uint32_t inst_index = base_argument + i;
+ 			const auto *value0 = impl.ags.backdoor_instructions[inst_index]->getOperand(5);
+ 			const auto *value1 = impl.ags.backdoor_instructions[inst_index]->getOperand(6);
+-			all_phi_or_load =
+-				(llvm::isa<llvm::PHINode>(value0) || llvm::isa<llvm::LoadInst>(value0)) &&
+-				(llvm::isa<llvm::PHINode>(value1) || llvm::isa<llvm::LoadInst>(value1));
++			any_phi_or_load =
++				llvm::isa<llvm::PHINode>(value0) || llvm::isa<llvm::LoadInst>(value0) ||
++				llvm::isa<llvm::PHINode>(value1) || llvm::isa<llvm::LoadInst>(value1);
+ 		}
+ 
+ 		// 4x2 inputs.
+@@ -288,13 +290,13 @@ static bool validate_wmma_io_registers(Converter::Impl &impl, uint32_t base_argu
+ 
+ 			// Don't accept any weird shuffle.
+ 			if (itr0 == impl.ags.coopmat_component_mapping.end() || itr0->second.component != 2 * i + 0 ||
+-			    (!all_phi_or_load && impl.get_id_for_value(value0) != coopmat_id))
++			    (!any_phi_or_load && impl.get_id_for_value(value0) != coopmat_id))
+ 			{
+ 				return false;
+ 			}
+ 
+ 			if (itr1 == impl.ags.coopmat_component_mapping.end() || itr1->second.component != 2 * i + 1 ||
+-			    (!all_phi_or_load && impl.get_id_for_value(value1) != coopmat_id))
++			    (!any_phi_or_load && impl.get_id_for_value(value1) != coopmat_id))
+ 			{
+ 				return false;
+ 			}

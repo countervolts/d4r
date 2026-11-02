@@ -1,0 +1,32 @@
+From: d4r
+Subject: [PATCH] dxil-spirv: AGS B-to-C binary16 transfer without LDS on gfx12
+
+An AGS conversion from an FP8 B matrix to a binary16 accumulator (the RR
+stages' FP8 decodes) converts in B, then changes the use through an LDS
+round trip with two subgroup barriers, as only FP8 took the element-wise
+copy. With wmma_fp8 (gfx12), B and C keep a lane's column with rows
+i + 8 * half-wave for 16-bit elements too, so binary16 takes the copy as
+well. The round trip's 4 KiB of LDS halved the RR decoders' occupancy; the
+outputs are bit-identical.
+
+---
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp	2026-10-26 14:36:39.896352288 +0100
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp	2026-10-26 14:36:39.901325940 +0100
+@@ -534,11 +534,15 @@
+ 	{
+ 		if (get_matrix_type(input_imm) != AmdExtD3DShaderIntrinsicsWaveMatrixType_A &&
+ 		    get_matrix_type(output_imm) != AmdExtD3DShaderIntrinsicsWaveMatrixType_A &&
+-		    get_type_data_format(input_imm) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8)
++		    (get_type_data_format(input_imm) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8 ||
++		     get_type_data_format(input_imm) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_F16))
+ 		{
+ 			// It appears that in the cases we care about, layout of B and C are the same.
+ 			// Just do element-wise copy here to avoid the bad roundtrip.
+ 			// This assumption only seems to hold for FP8, but that's the only case we care about.
++			// d4r: also binary16 on gfx12 (wmma_fp8), where B and C keep a lane's column with
++			// rows i + 8 * half-wave for 16-bit elements too: the FP8 -> F16 B-to-C conversion
++			// (an FP8 decode) converts in B, then took this LDS round trip and its barriers.
+ 			return emit_coopmat_transfer(impl, v, input_imm, output_imm);
+ 		}
+ 	}

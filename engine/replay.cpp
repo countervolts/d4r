@@ -1,18 +1,12 @@
 // Full-frame native K validation and GPU timing. No CUDA/NGX/PTX execution.
 // With the optional trailing `hip` argument (and a model built by compile_k.py --hip) the eleven layers run on
 // the native HIP kernels (hip_net.h) between the engine's Vulkan stages, whose command buffer is split around
-// them through two buffers shared by file descriptor. The engine's own Vulkan network is the default.
+// them through two buffers shared by file descriptor (an NT handle on Windows). The engine's own Vulkan network is
+// the default.
 #include "runtime.h"
 #ifdef D4R_ENGINE_HIP
 #include "hip_net.h"
-#endif
-// Opaque memory handle shared with HIP: a file descriptor on Linux, a Win32 NT handle on Windows.
-#ifdef _WIN32
-#define D4R_EXT_MEMORY_EXTENSION "VK_KHR_external_memory_win32"
-#define D4R_EXT_MEMORY_HANDLE VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
-#else
-#define D4R_EXT_MEMORY_EXTENSION VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
-#define D4R_EXT_MEMORY_HANDLE VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+#include "vk_external.h"
 #endif
 #include <algorithm>
 #include <chrono>
@@ -26,6 +20,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+
+// the device extension that exports memory to HIP (vk_external.h)
+#ifdef _WIN32
+#define D4R_EXTERNAL_MEMORY_EXTENSION "VK_KHR_external_memory_win32"
+#else
+#define D4R_EXTERNAL_MEMORY_EXTENSION VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+#endif
 
 namespace {
 void check(VkResult r, const char* operation) {
@@ -41,11 +42,6 @@ std::vector<char> read(const std::string& file) {
     if (!stream.read(data.data(), bytes)) throw std::runtime_error("truncated file: " + file);
     return data;
 }
-template<class T> T structure(const std::string& file) {
-    auto data = read(file);
-    if (data.size() != sizeof(T)) throw std::runtime_error("invalid structure size: " + file);
-    T result; std::memcpy(&result, data.data(), sizeof(result)); return result;
-}
 struct Context {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -59,6 +55,7 @@ struct Context {
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory{};
     uint32_t timestampBits = 64;
+    bool matrices = false;      // VK_KHR_cooperative_matrix is enabled (K takes layer.comp, else layer_dot2.comp)
     ~Context() {
         if (device) vkDeviceWaitIdle(device);
         if (cache) vkDestroyPipelineCache(device, cache, nullptr);
@@ -91,33 +88,37 @@ struct Context {
         uint32_t extensionCount = 0; CK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr));
         std::vector<VkExtensionProperties> extensions(extensionCount);
         CK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, extensions.data()));
-        if (std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); }))
+        // K runs without cooperative matrices (KNetwork::Dot2: RDNA2); M needs them
+        matrices = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); });
+        if (!matrices && fp8)
             throw std::runtime_error("VK_KHR_cooperative_matrix required");
         if (fp8 && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME); }))
             throw std::runtime_error("VK_EXT_shader_float8 required for M");
-        if (externalMemory && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, D4R_EXT_MEMORY_EXTENSION); }))
-            throw std::runtime_error("external memory extension required for the native HIP network");
+        if (externalMemory && std::none_of(extensions.begin(), extensions.end(), [](const auto& e) { return !std::strcmp(e.extensionName, D4R_EXTERNAL_MEMORY_EXTENSION); }))
+            throw std::runtime_error(D4R_EXTERNAL_MEMORY_EXTENSION " required for the native HIP network");
         VkPhysicalDeviceShaderFloat8FeaturesEXT float8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR matrix{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr};
-        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &matrix};
+        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, matrices ? &matrix : nullptr};
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
         VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
         vkGetPhysicalDeviceFeatures2(physical, &features);
         if (fp8 && (!float8.shaderFloat8 || !float8.shaderFloat8CooperativeMatrix))
             throw std::runtime_error("GPU lacks FP8 cooperative matrices");
-        if (!matrix.cooperativeMatrix || !features.features.shaderInt16 || !features.features.shaderStorageImageExtendedFormats || !f11.storageBuffer16BitAccess || !f12.shaderFloat16 || !f13.subgroupSizeControl || !f13.computeFullSubgroups)
+        if ((matrices && !matrix.cooperativeMatrix) || !features.features.shaderInt16 || !features.features.shaderStorageImageExtendedFormats || !f11.storageBuffer16BitAccess || !f12.shaderFloat16 || !f12.vulkanMemoryModel || !f13.subgroupSizeControl || !f13.computeFullSubgroups)
             throw std::runtime_error("GPU lacks f16 storage/arithmetic, cooperative matrix or subgroup control");
-        auto matrixProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-        if (!matrixProperties) throw std::runtime_error("cooperative matrix query unavailable");
-        uint32_t matrixCount = 0; CK(matrixProperties(physical, &matrixCount, nullptr));
-        std::vector<VkCooperativeMatrixPropertiesKHR> matrices(matrixCount, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-        CK(matrixProperties(physical, &matrixCount, matrices.data()));
-        if (std::none_of(matrices.begin(), matrices.end(), [](const auto& p) {
-            return p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.scope == VK_SCOPE_SUBGROUP_KHR &&
-                   p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                   p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR;
-        })) throw std::runtime_error("16x16x16 f16 -> f32 cooperative matrices required");
+        if (matrices) {
+            auto matrixProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+            if (!matrixProperties) throw std::runtime_error("cooperative matrix query unavailable");
+            uint32_t matrixCount = 0; CK(matrixProperties(physical, &matrixCount, nullptr));
+            std::vector<VkCooperativeMatrixPropertiesKHR> tuples(matrixCount, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            CK(matrixProperties(physical, &matrixCount, tuples.data()));
+            if (std::none_of(tuples.begin(), tuples.end(), [](const auto& p) {
+                return p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.scope == VK_SCOPE_SUBGROUP_KHR &&
+                       p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR;
+            })) throw std::runtime_error("16x16x16 f16 -> f32 cooperative matrices required");
+        }
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         vkGetPhysicalDeviceProperties2(physical, &p2);
@@ -125,10 +126,15 @@ struct Context {
             throw std::runtime_error("32/64-lane compute subgroups required");
         // Enable only the features this engine needs, rather than every supported feature.
         features.features = {}; features.features.shaderInt16 = VK_TRUE;
+        // Optional native vkhip regression runner; ordinary replay needs neither.
+        const bool vkhipTest = std::getenv("D4R_TEST_VKHIP") != nullptr;
+        features.features.shaderInt64 = vkhipTest ? VK_TRUE : VK_FALSE;
         features.features.shaderStorageImageExtendedFormats = VK_TRUE;
         f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12}; f11.storageBuffer16BitAccess = VK_TRUE;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13}; f12.shaderFloat16 = VK_TRUE;
-        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &matrix}; f13.subgroupSizeControl = f13.computeFullSubgroups = VK_TRUE;
+        f12.bufferDeviceAddress = vkhipTest ? VK_TRUE : VK_FALSE;
+        f12.vulkanMemoryModel = VK_TRUE;    // the layer shaders' scoped barriers (GL_KHR_memory_scope_semantics)
+        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, matrices ? &matrix : nullptr}; f13.subgroupSizeControl = f13.computeFullSubgroups = VK_TRUE;
         matrix = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, fp8 ? &float8 : nullptr}; matrix.cooperativeMatrix = VK_TRUE;
         if (fp8) {
             float8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
@@ -142,10 +148,11 @@ struct Context {
         timestampBits = families[family].timestampValidBits;
         float priority = 1;
         VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueFamilyIndex = family; qi.queueCount = 1; qi.pQueuePriorities = &priority;
-        const char* enabled[3] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
-        uint32_t enabledCount = 1;
+        const char* enabled[3] = {};
+        uint32_t enabledCount = 0;
+        if (matrices) enabled[enabledCount++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
         if (fp8) enabled[enabledCount++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
-        if (externalMemory) enabled[enabledCount++] = D4R_EXT_MEMORY_EXTENSION;
+        if (externalMemory) enabled[enabledCount++] = D4R_EXTERNAL_MEMORY_EXTENSION;
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features};
         di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi; di.enabledExtensionCount = enabledCount;
         di.ppEnabledExtensionNames = enabled;
@@ -219,17 +226,17 @@ struct Buffer {
     }
 };
 #ifdef D4R_ENGINE_HIP
-// A storage buffer whose memory another API (HIP) imports through a file descriptor, for the native network.
-struct Shared { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize allocation = 0; intptr_t fd = -1; };
+// A storage buffer whose memory another API (HIP) imports through an exported handle, for the native network.
+struct Shared { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize allocation = 0; d4r::ExternalMemoryHandle fd{}; };
 static Shared shared(const Context& c, VkDeviceSize size) {
     Shared s;
     VkExternalMemoryBufferCreateInfo ei{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
-    ei.handleTypes = D4R_EXT_MEMORY_HANDLE;
+    ei.handleTypes = d4r::ExternalMemoryHandleType;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ei}; bi.size = size; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     CK(vkCreateBuffer(c.device, &bi, nullptr, &s.buffer));
     VkMemoryRequirements r; vkGetBufferMemoryRequirements(c.device, s.buffer, &r);
     VkExportMemoryAllocateInfo xi{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
-    xi.handleTypes = D4R_EXT_MEMORY_HANDLE;
+    xi.handleTypes = d4r::ExternalMemoryHandleType;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &xi}; ai.allocationSize = s.allocation = r.size;
     uint32_t index = c.memory.memoryTypeCount;
     for (uint32_t i = 0; i < c.memory.memoryTypeCount; ++i)
@@ -237,19 +244,7 @@ static Shared shared(const Context& c, VkDeviceSize size) {
     if (index == c.memory.memoryTypeCount) throw std::runtime_error("no device-local memory type");
     ai.memoryTypeIndex = index;
     CK(vkAllocateMemory(c.device, &ai, nullptr, &s.memory)); CK(vkBindBufferMemory(c.device, s.buffer, s.memory, 0));
-#ifdef _WIN32
-    VkMemoryGetWin32HandleInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR};
-    gi.memory = s.memory; gi.handleType = D4R_EXT_MEMORY_HANDLE;
-    const auto getHandle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(vkGetDeviceProcAddr(c.device, "vkGetMemoryWin32HandleKHR"));
-    if (!getHandle) throw std::runtime_error("vkGetMemoryWin32HandleKHR is unavailable");
-    HANDLE handle = nullptr; CK(getHandle(c.device, &gi, &handle)); s.fd = reinterpret_cast<intptr_t>(handle);
-#else
-    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
-    gi.memory = s.memory; gi.handleType = D4R_EXT_MEMORY_HANDLE;
-    const auto getFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(c.device, "vkGetMemoryFdKHR"));
-    if (!getFd) throw std::runtime_error("vkGetMemoryFdKHR is unavailable");
-    int fd = -1; CK(getFd(c.device, &gi, &fd)); s.fd = fd;
-#endif
+    s.fd = d4r::exportMemory(c.device, s.memory);
     return s;
 }
 #endif
@@ -296,7 +291,7 @@ struct Image {
         auto r = region(w,h); vkCmdCopyBufferToImage(context.command, upload.handle, handle, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     }
 };
-struct Frame { d4r::InputParams input; d4r::OutputParams output; std::array<d4r::LayerShape,d4r::KLayers> windows; unsigned color, motion, depth;; bool autoWindows = false; };
+using Frame = d4r::KCaseFrame;
 
 int run(const std::string& modelDir, const std::string& caseFile, const std::string& outputDir, int repeats, bool hip) {
 #ifndef D4R_ENGINE_HIP
@@ -315,48 +310,17 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m.pool, m.first + boundary);
     }, &marks};
 
-    d4r::Shape shape{};
-    std::array<std::string,3> historyFiles;
+    auto kcase = d4r::loadKCase(caseFile);
+    d4r::Shape shape = kcase.shape;
+    const auto& historyFiles = kcase.history;
     std::vector<std::unique_ptr<Image>> images;
-    std::vector<Frame> frames;
-    std::ifstream manifest(caseFile);
-    if (!manifest) throw std::runtime_error("cannot open case manifest");
-    std::string line;
-    while (std::getline(manifest,line)) {
-        std::istringstream s(line); std::string kind; s >> kind;
-        if (kind == "shape") {
-            std::string file; s >> std::quoted(file); shape = structure<d4r::Shape>(file);
-        } else if (kind == "output") {
-            uint32_t w,h; s >> w >> h;
-            if (!s) throw std::runtime_error("malformed output dimensions");
-            shape = d4r::makeKShape(w,h);
-        } else if (kind == "history") {
-            for (auto& file : historyFiles) s >> std::quoted(file);
-        } else if (kind == "image") {
-            unsigned id, w, h; int channels, bits; std::string file;
-            s >> id >> std::quoted(file) >> w >> h >> channels >> bits;
-            if (!s || id != images.size()) throw std::runtime_error("malformed image declaration");
-            images.push_back(std::make_unique<Image>(context,file,w,h,channels,bits));
-        } else if (kind == "frame") {
-            Frame f{}; std::string input,output,windows; s >> std::quoted(input) >> std::quoted(output) >> std::quoted(windows) >> f.color >> f.motion >> f.depth;
-            if (!s) throw std::runtime_error("malformed frame declaration");
-            f.input = structure<d4r::InputParams>(input); f.output = structure<d4r::OutputParams>(output);
-            f.windows = structure<std::array<d4r::LayerShape,d4r::KLayers>>(windows); frames.push_back(f);
-        } else if (kind == "frame_auto") {
-            Frame f{}; d4r::FrameSettings settings{}; unsigned reset;
-            s >> f.color >> f.motion >> f.depth >> settings.colorExposure >> settings.historyExposureRatio >> settings.networkExposureScale >> reset
-              >> settings.jitter[0] >> settings.jitter[1] >> settings.motionScale[0] >> settings.motionScale[1]
-              >> settings.motionOffset[0] >> settings.motionOffset[1] >> settings.sharpness;
-            if (!s || f.color >= images.size() || reset > 1) throw std::runtime_error("malformed standard frame declaration");
-            settings.renderWidth = images[f.color]->w; settings.renderHeight = images[f.color]->h; settings.reset = reset != 0;
-            auto params = d4r::makeKFrameParams(shape,settings); f.input = params.input; f.output = params.output; f.windows = shape.layers; f.autoWindows = true;
-            frames.push_back(f);
-        } else if (!kind.empty()) throw std::runtime_error("unknown case declaration " + kind);
+    for (auto& image : kcase.images) {
+        if (image.w > context.properties.limits.maxImageDimension2D || image.h > context.properties.limits.maxImageDimension2D)
+            throw std::runtime_error("unsupported frame image dimensions");
+        images.push_back(std::make_unique<Image>(context, image.file, image.w, image.h, image.channels, image.bits));
     }
-    if (frames.empty() || !shape.outputWidth) throw std::runtime_error("incomplete case manifest");
+    auto& frames = kcase.frames;
     const bool seedHistory = !historyFiles[0].empty();
-    if (!seedHistory && !(frames[0].input.flags & d4r::FrameFlagReset)) throw std::runtime_error("the first frame must reset or provide history");
-    for (auto& f : frames) if (f.color >= images.size() || f.motion >= images.size() || f.depth >= images.size()) throw std::runtime_error("invalid frame image id");
     if (hip) {
         for (size_t i = 0; i < frames.size(); ++i) {
             const auto expected = d4r::makeKWindows(shape, uint32_t(i));
@@ -370,7 +334,8 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         }
     }
     const auto start = std::chrono::steady_clock::now();
-    d4r::Model model(context.physical,context.device,modelDir,context.cache);
+    d4r::Model model(context.physical,context.device,modelDir,context.cache,context.matrices ? d4r::KNetwork::Auto : d4r::KNetwork::Dot2);
+    if (model.dot2Network()) std::cerr << "network: layer_dot2 (no cooperative matrices)\n";
     d4r::ExternalNetwork external{};
 #ifdef D4R_ENGINE_HIP
     std::unique_ptr<d4r::HipNetwork> network;
@@ -407,7 +372,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
     if (seedHistory) { seedColor.load(historyFiles[0]); seedLuma.load(historyFiles[1]); seedFeature.load(historyFiles[2]); }
     Buffer result(context,readback ? VkDeviceSize(w)*h*8 : 16), color(context,readback ? VkDeviceSize(w)*h*8 : 16),
            luma(context,readback ? VkDeviceSize(w)*h*8 : 16), feature(context,readback ? VkDeviceSize(base.w)*base.h*8 : 16),
-           head(context,readback ? engine.headBytes() : 16);
+           head(context,readback ? engine.headBytes() : 16), tokens(context,readback ? VkDeviceSize(base.w)*base.h*16*2 : 16);
     context.begin(); model.recordUpload(context.command); engine.recordInitialize(context.command);
     for (auto& image : images) image->recordUpload();
     // Seed copies overwrite the initialization clears, so order transfer writes explicitly.
@@ -479,6 +444,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
             r = region(w*2,h*2); vkCmdCopyImageToBuffer(context.command,history.luma,VK_IMAGE_LAYOUT_GENERAL,luma.handle,1,&r);
             r = region(base.w,base.h); vkCmdCopyImageToBuffer(context.command,history.feature,VK_IMAGE_LAYOUT_GENERAL,feature.handle,1,&r);
             VkBufferCopy copy{0,0,head.size}; vkCmdCopyBuffer(context.command,engine.headBuffer(),head.handle,1,&copy);
+            copy.size = tokens.size; vkCmdCopyBuffer(context.command,engine.tokenBuffer(),tokens.handle,1,&copy);
             barrier(context.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT);
         }
         context.submit();
@@ -493,7 +459,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
                   << (hip ? " (Vulkan front + HIP network + Vulkan back)" : "") << '\n';
         if (readback) {
             const std::string prefix = outputDir+"/frame-"+std::to_string(i);
-            result.save(prefix+".312.bin"); color.save(prefix+".288.bin"); luma.save(prefix+".296.bin"); feature.save(prefix+".304.bin"); head.save(prefix+".head.bin");
+            result.save(prefix+".312.bin"); color.save(prefix+".288.bin"); luma.save(prefix+".296.bin"); feature.save(prefix+".304.bin"); head.save(prefix+".head.bin"); tokens.save(prefix+".tokens.bin");
         }
     }
     std::array<std::vector<double>, d4r::KTimingStages> stageTrials;

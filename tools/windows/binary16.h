@@ -1,5 +1,5 @@
 #pragma once
-// Adapted from realdody/d4r ae530b0 (MIT), realdody <dodobozicek@gmail.com>.
+// Adapted from realdody/d4r ae530b0 (MIT), realdody.
 #include <cstdint>
 #include <cstring>
 #include <cmath>

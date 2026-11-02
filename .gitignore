@@ -1,44 +1,50 @@
-# Generated artifacts and machine-local dependencies
-/build/
-/dist/
+# Local proprietary/runtime inputs and outputs
 *.dll
 *.exe
-*.hsaco
+*.asi
+*.pth
+*.safetensors
+*.onnx
 *.cubin
 *.fatbin
-*.obj
-*.o
-*.log
+*.nvngx
+# NVIDIA's NGX/DLSS SDK headers (the probes in tools/ build against the user's own copy)
+nvsdk_ngx*.h
+
+# Local captures, dumps, traces, and build products
+/captures/
+/dumps/
+/traces/
+/build/
+/dist/
 *.trace
 *.dump
+*.log
 __pycache__/
 .venv/
-.tools/
-/external/MinHook/
-/external/ZLUDA/
+/Archive.zip
+/vkd3d-proton.cache*
 .vscode/
-/windows/m11/build/
-/windows/m11/.tools/
-/windows/m11/results/**/*.log
+videos/
+.tools/
 
-# Local agent configuration, instructions, and conversation state (any directory)
-.agents/
-.codex/
-.claude/
-.cursor/
-.gemini/
-AGENTS.md
-AGENTS.override.md
-CLAUDE.md
-GEMINI.md
-
-# Windows development
-/windows/
-docs/archive
-docs/windows-parity-checklist.md
-test-results/
-
-# Additional compiler, Python, and editor output
+# Machine-specific notes, CI runner setup, local experiments, benchmark automation (kept locally, never published)
+/private/
+/external/
+# Native kernel build products and inputs extracted from NVIDIA's DLL at build time
+/kernels/out/
+*.hsaco
+*.ptx
+/kernels/extracted/
+# Native engine models: weights and tables read from NVIDIA's DLSS, and shaders compiled next to them
+weights.bin
+offsets.bin
+lut.bin
+hipnet.bin
+model.json
+*.spv
+*.obj
+*.o
 *.pdb
 *.ilk
 *.exp
@@ -47,3 +53,19 @@ test-results/
 .vs/
 Thumbs.db
 .DS_Store
+/windows/
+test-results/
+docs/archive
+
+# Local agent configuration, instructions, and conversation state (any directory)
+.agents/
+.claude/
+.cursor/
+.gemini/
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+GEMINI.md
+
+# Local working notes
+/todo.md

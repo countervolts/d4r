@@ -1,0 +1,72 @@
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -974,6 +974,24 @@
+ unsigned LLVMZludaRewriteMmaF16Wmma(LLVMModuleRef ModuleRef, unsigned Flags)
+ {
+     Module *M = unwrap(ModuleRef);
++    if ((Flags & 6) == 6)
++    {
++        for (const char *Name : {"cvt_rn_satfinite_e4m3x2_f16x2",
++                                "cvt_rn_satfinite_relu_e4m3x2_f16x2"})
++        {
++            Function *Original = M->getFunction(std::string("__zluda_ptx_impl_") + Name);
++            if (Original == nullptr)
++                continue;
++            FunctionCallee Native = M->getOrInsertFunction(
++                std::string("__zluda_ptx_impl_d4r_") + Name, Original->getFunctionType());
++            SmallVector<CallInst *, 32> Calls;
++            for (User *U : Original->users())
++                if (auto *Call = dyn_cast<CallInst>(U))
++                    Calls.push_back(Call);
++            for (CallInst *Call : Calls)
++                Call->setCalledFunction(Native);
++        }
++    }
+     // D4R_ZLUDA_WMMA_K8=0 keeps m16n8k8 on the dot-product fallback
+     if (const char *K8Env = getenv("D4R_ZLUDA_WMMA_K8"); K8Env == nullptr || K8Env[0] != '0')
+         widenMmaK8(M);
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -866,6 +866,40 @@
+         return FUNC_CALL(cvt_rn_satfinite_e4m3x2_f16x2)(relu_keep_nan_halves(input));
+     }
+ 
++    // Selected only for gfx12 native-FP8 modules by the WMMA rewrite. This
++    // declaration leaves the architecture-specific intrinsic dormant in the
++    // shared gfx1030-built device library on other targets.
++    __device__ uint32_t d4r_cvt_pk_fp8_f32(float, float, uint32_t, bool)
++        __asm("llvm.amdgcn.cvt.pk.fp8.f32");
++
++    Fp8x2 FUNC(d4r_cvt_rn_satfinite_e4m3x2_f16x2)(__half2 input)
++    {
++        typedef _Float16 half_vector __attribute__((ext_vector_type(2)));
++        typedef uint16_t magnitude_vector __attribute__((ext_vector_type(2)));
++        const uint32_t bits = std::bit_cast<uint32_t>(input);
++        // Positive half encodings are ordered by magnitude. Clamp both lanes
++        // with one packed integer min, then retain NaNs as positive quiet NaNs.
++        // Restore original signs after conversion, including negative zero.
++        const magnitude_vector magnitude = std::bit_cast<magnitude_vector>(bits & 0x7fff7fffu);
++        const magnitude_vector saturated =
++            __builtin_elementwise_min(magnitude, magnitude_vector{0x5f00u, 0x5f00u});
++        const magnitude_vector kept{
++            magnitude[0] > 0x7c00u ? uint16_t(0x7e00u) : saturated[0],
++            magnitude[1] > 0x7c00u ? uint16_t(0x7e00u) : saturated[1]};
++        const half_vector halves = std::bit_cast<half_vector>(kept);
++        const float x = float(halves[0]), y = float(halves[1]);
++        const uint32_t encoded = d4r_cvt_pk_fp8_f32(x, y, 0, false);
++        // AMD canonicalizes NaNs to 0xff. PTX retains each input's sign.
++        const uint16_t packed = uint16_t((encoded & 0x7f7fu) |
++                                        ((bits >> 8) & 0x80u) | ((bits >> 16) & 0x8000u));
++        return std::bit_cast<Fp8x2>(packed);
++    }
++
++    Fp8x2 FUNC(d4r_cvt_rn_satfinite_relu_e4m3x2_f16x2)(__half2 input)
++    {
++        return FUNC_CALL(d4r_cvt_rn_satfinite_e4m3x2_f16x2)(relu_keep_nan_halves(input));
++    }
++
+     Fp8x2 FUNC(cvt_rn_satfinite_relu_e5m2x2_f16x2)(__half2 input)
+     {
+         return FUNC_CALL(cvt_rn_satfinite_e5m2x2_f16x2)(relu_keep_nan_halves(input));

@@ -1,0 +1,31 @@
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a7684464..29285e19 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -735,7 +735,25 @@ static bool d4r_linear_texture_candidate(const D3D12_HEAP_PROPERTIES *heap_prope
+             desc->DepthOrArraySize != 1 || desc->SampleDesc.Count != 1 ||
+             (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+         return false;
+-    return format->vk_format == VK_FORMAT_R16G16B16A16_SFLOAT || format->vk_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++    if (format->vk_format == VK_FORMAT_R16G16B16A16_SFLOAT || format->vk_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
++        return true;
++    /* VKD3D_D4R_LINEAR_RGBA8=WxH (opt-in, with VKD3D_D4R_LINEAR_TEXTURES=1): also RGBA8 UNORM textures of exactly
++     * that size with unordered access, the shape of a DLSS output, so the shim can write DLSS's packed RGBA8 result
++     * in place. Other RGBA8 targets keep optimal tiling. Every selected texture is logged. */
++    if (format->vk_format == VK_FORMAT_R8G8B8A8_UNORM && (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
++    {
++        static unsigned int selected;
++        unsigned int width = 0, height = 0;
++        char size[32];
++        if (vkd3d_get_env_var("VKD3D_D4R_LINEAR_RGBA8", size, sizeof(size)) &&
++                sscanf(size, "%ux%u", &width, &height) == 2 && desc->Width == width && desc->Height == height)
++        {
++            WARN("d4r: linear exportable RGBA8 texture #%u (%ux%u, flags %#x).\n", ++selected, width, height,
++                    desc->Flags);
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,

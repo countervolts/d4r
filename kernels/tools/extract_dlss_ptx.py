@@ -48,6 +48,28 @@ def lz4_block(src: bytes, size: int) -> bytes:
     return bytes(dst[:size])
 
 
+ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+
+
+def zstd_frame(src: bytes) -> bytes:
+    """One zstd frame, through Python's own zstd (3.14), the zstandard module or the zstd tool."""
+    try:
+        from compression import zstd   # Python 3.14
+        return zstd.ZstdDecompressor().decompress(src)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(src)
+    except ImportError:
+        import subprocess
+        # the entry is padded: the tool decodes the frame and then complains about the bytes after it
+        out = subprocess.run(['zstd', '-dqc'], input=src, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        if not out:
+            raise RuntimeError('zstd could not decode a PTX entry')
+        return out
+
+
 def fatbins(data: bytes):
     """Yields (offset, bytes) of every fatbin container (magic, version 1) in file order."""
     magic = struct.pack('<I', FATBIN_MAGIC)
@@ -71,7 +93,10 @@ def ptx_entries(fatbin: bytes):
         decompressed = struct.unpack_from('<Q', fatbin, offset + 56)[0] if entry_header >= 64 else 0
         payload = fatbin[offset + entry_header:offset + entry_header + entry_size]
         if kind == 1:  # PTX
-            yield lz4_block(payload, decompressed) if (flags & 0x2000 and decompressed) else payload
+            if payload[:4] == ZSTD_MAGIC:   # nvngx_dlssd.dll 310.9 stores its rr2_* modules as zstd frames
+                yield zstd_frame(payload)
+            else:
+                yield lz4_block(payload, decompressed) if (flags & 0x2000 and decompressed) else payload
         offset += entry_header + entry_size
 
 

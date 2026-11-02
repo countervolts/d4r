@@ -1,0 +1,24 @@
+NVIDIA RTX PRO 4500 Blackwell, 595.91.07, 200.00 W
+    234 HFMA2
+    232 FFMA
+     84 IADD3
+     67 LOP3.LUT
+     56 LEA.HI
+     41 NOP
+     16 FADD
+     14 ISETP.NE.AND
+     12 LDC
+     11 MOV
+     10 F2FP.F16.F32.PACK
+      9 I2FP.F32.U32
+NVIDIA RTX PRO 4500 Blackwell units=82
+fp32 fma                27.25 T ops/s
+fp32 fma                28.07 T ops/s
+fp32 fma                28.12 T ops/s
+int32 xor/shift/add     19.44 T ops/s
+int32 xor/shift/add     19.40 T ops/s
+int32 xor/shift/add     19.39 T ops/s
+packed f16x2 fma        29.13 T ops/s
+packed f16x2 fma        29.35 T ops/s
+packed f16x2 fma        29.36 T ops/s
+      1 180 MHz, 11.54 W

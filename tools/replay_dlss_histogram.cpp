@@ -1,4 +1,4 @@
-#include <dlfcn.h>
+#include "d4r_dlfcn.h"
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>

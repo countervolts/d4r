@@ -87,12 +87,21 @@ DEV void d4r_dec0_head(uint32_t smem, uint64_t wp, uint64_t inp, uint32_t dimx, 
             for (int i = 0; i < 8; ++i)
                 cf[i] = (float)acc[i];
         }
+#ifdef D4R_TEX_HW_E4M3
+        // cf holds the f16 results as f32. A NaN becomes -448 here (e4m3x2: the NaN code).
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            cf[i] = __builtin_amdgcn_fmed3f(cf[i], -448.0f, 448.0f);
+        E[p][0] = e4m3x4_f32(cf[0], cf[1], cf[2], cf[3]);
+        E[p][1] = e4m3x4_f32(cf[4], cf[5], cf[6], cf[7]);
+#else
         uint32_t codes[4];
 #pragma unroll
         for (int k = 0; k < 4; ++k)
             codes[k] = e4m3x2(pack2(acc[2 * k], acc[2 * k + 1]));
         E[p][0] = codes[0] | (codes[1] << 16);
         E[p][1] = codes[2] | (codes[3] << 16);
+#endif
     }
 
     // staging (layout as below): this lane holds tiles 4G + hf and 4G + 2 + hf (channels 16p + 8hf ..), so it

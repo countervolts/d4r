@@ -31,6 +31,19 @@ uint inter(uint j) { return (j & ~31u) | (((j & 31u) >> 2u) << 1u) | (j & 1u) | 
 uint uninter(uint c) { return (c & ~31u) | (((c & 15u) >> 1u) << 2u) | (c & 1u) | (((c >> 4u) & 1u) << 1u); }
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 
+// FINITE(v): v, but an infinity (which these f32 values never are: sums of FP8 products and binary16 biases stay far
+// below 3.4e38) becomes NaN. Written so, a saturating FP8 conversion is RADV's f2e4m3fn_satfn (nir_opt_algebraic's
+// vkd3d-proton pattern): the hardware conversion with FP16_OVFL, which saturates every finite value the same way,
+// instead of a NaN-preserving clamp per element and then the conversion. RR_SAT_CLAMP=1 keeps the clamp, and so does
+// RR_MIX, whose binary16 accumulators can overflow.
+#if defined(RR_SAT_CLAMP) || defined(RR_MIX)
+#define FINITE(v) (v)
+#define FINITE2(v) (v)
+#else
+#define FINITE(v) (isinf(v) ? uintBitsToFloat(0x7fc00000u) : (v))
+#define FINITE2(v) vec2(FINITE((v).x), FINITE((v).y))
+#endif
+
 #ifdef RR_GFX11
 #include "rr_gfx11.glsl"
 #define F8 uint
@@ -52,7 +65,7 @@ floate4m3_t q8(float16_t h)
 }
 // the same from f32 / f16 values in one saturating hardware conversion (satfinite; for an f32 value that is a binary16
 // number the result equals the f16 conversion's)
-floate4m3_t q8s(float x) { floate4m3_t r; saturatedConvertEXT(r, x); return r; }
+floate4m3_t q8s(float x) { floate4m3_t r; saturatedConvertEXT(r, FINITE(x)); return r; }
 floate4m3_t q8h(float16_t x) { floate4m3_t r; saturatedConvertEXT(r, x); return r; }
 
 uint code(floate4m3_t v) { return uint(floate4m3BitsToUintEXT(v)); }
@@ -123,14 +136,16 @@ float16_t fma16q(float16_t a, float16_t b, float16_t c, inout bool mid)
 #endif
 }
 #ifndef RR_GFX11
-// The saturating FP8 conversion of a whole accumulator, two elements per conversion instruction
-#define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { fe4m3vec2 t_; saturatedConvertEXT(t_, vec2((src)[i_], (src)[i_ + 1])); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+// The saturating FP8 conversion of a whole accumulator, two elements per conversion instruction. The pair is widened
+// into a variable first: written inline, binary16 sources (decoder 0's x) reached NIR with one element's infinity test
+// inverted, which the FINITE pattern does not match, and each element took a clamp, a compare and a select as well
+#define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 v_ = vec2((src)[i_], (src)[i_ + 1]); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(v_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 // q8(act(h)) from the packed table (enc1_pack.act_table; the weight buffer's W8U view at W_ACT)
 #define ACTQ(h) uintBitsToFloate4m3EXT(w8u.w[W_ACT + bh(h)])
 // the activation of a whole accumulator into FP8. RR_NATIVE (D4R_RR_RELAXED=3): in f32, two elements per
 // instruction, straight into FP8 - no binary16 in between and no table (not the reference's roundings)
 #ifdef RR_NATIVE
-#define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 #else
 #define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
 #endif

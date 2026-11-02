@@ -1,0 +1,104 @@
+From: d4r
+Subject: [PATCH] dxil-spirv: AGS WMMA element operations and float LDS arrays
+
+Three translator fixes the D3D12 M/L/RR D/E/F shaders need under vkd3d-proton
+(RADV), none of which changes arithmetic:
+
+- WMMA LDS arrays are padded to 512 bytes by their element width, read through
+  getIntegerBitWidth(), which asserts/crashes on half/float LDS arrays (RR D/E
+  shared tiles). Use the floating-point type's width.
+- WaveMatrixElementFill with a constant index on an F32 matrix bitcast the
+  32-bit scalar to a 16-bit float (invalid SPIR-V); bitcast to float32 as the
+  dynamic-index path does.
+- glslang's findCompositeConstant matched cooperative-matrix (and other
+  composite) constants by their constituents only, so a zero fill of matrix B
+  reused the zero constant of matrix A's type and OpCompositeInsert received a
+  composite of the wrong type. Compare the result type as well.
+
+---
+diff --git a/subprojects/dxil-spirv/dxil_converter.cpp b/subprojects/dxil-spirv/dxil_converter.cpp
+index 8862e51..9dd342b 100644
+--- a/subprojects/dxil-spirv/dxil_converter.cpp
++++ b/subprojects/dxil-spirv/dxil_converter.cpp
+@@ -5513,7 +5513,13 @@ bool Converter::Impl::emit_global_variables()
+ 			{
+ 				scalar_type_id = get_type_id(array_type->getArrayElementType());
+ 				uint32_t elem_count = array_type->getArrayNumElements();
+-				uint32_t alignment = (512 * 8) / array_type->getArrayElementType()->getIntegerBitWidth();
++				// Floating-point LDS arrays (FP8 packed words are integers, f16/f32 tiles are not) pad by their width.
++				auto *element_type = array_type->getArrayElementType();
++				uint32_t element_bits = element_type->getTypeID() == llvm::Type::TypeID::HalfTyID ? 16 :
++				                        element_type->getTypeID() == llvm::Type::TypeID::FloatTyID ? 32 :
++				                        element_type->getTypeID() == llvm::Type::TypeID::DoubleTyID ? 64 :
++				                        element_type->getIntegerBitWidth();
++				uint32_t alignment = (512 * 8) / element_bits;
+ 				elem_count = (elem_count + alignment - 1) & ~(alignment - 1);
+ 				pointee_type_id = builder().makeArrayType(
+ 					scalar_type_id, builder().makeUintConstant(elem_count), false);
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
+index 3419ceb..b7a3a1b 100644
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_ags.cpp
+@@ -846,7 +846,7 @@ static bool emit_wmma_element_insert(Converter::Impl &impl)
+ 
+ 		case AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_F32:
+ 		{
+-			auto *bitcast = impl.allocate(spv::OpBitcast, builder.makeFloatType(16));
++			auto *bitcast = impl.allocate(spv::OpBitcast, builder.makeFloatType(32));
+ 			bitcast->add_id(data_id);
+ 			impl.add(bitcast);
+ 
+diff --git a/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.cpp b/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.cpp
+index 711e585..27578a4 100644
+--- a/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.cpp
++++ b/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.cpp
+@@ -1004,7 +1004,7 @@ Id Builder::makeFloat8Constant(uint8_t f8, int encoding, bool specConstant)
+ }
+ #endif
+ 
+-Id Builder::findCompositeConstant(Op typeClass, const dxil_spv::Vector<Id>& comps) const
++Id Builder::findCompositeConstant(Op typeClass, Id typeId, const dxil_spv::Vector<Id>& comps) const
+ {
+     Instruction* constant = 0;
+     bool found = false;
+@@ -1012,15 +1012,15 @@ Id Builder::findCompositeConstant(Op typeClass, const dxil_spv::Vector<Id>& comp
+     if (typeClass == spv::OpTypeCooperativeMatrixKHR) {
+         for (int i = 0; i < (int)coopmatConstants.size() && !found; ++i) {
+             constant = coopmatConstants[i];
+-            if (constant->getIdOperand(0) == comps[0])
++            if (constant->getTypeId() == typeId && constant->getIdOperand(0) == comps[0])
+                 found = true;
+         }
+     } else {
+         for (int i = 0; i < (int) groupedConstants[typeClass].size(); ++i) {
+             constant = groupedConstants[typeClass][i];
+ 
+-            // same shape?
+-            if (constant->getNumOperands() != (int) comps.size())
++            // same type and shape?
++            if (constant->getTypeId() != typeId || constant->getNumOperands() != (int) comps.size())
+                 continue;
+ 
+             // same contents?
+@@ -1064,7 +1064,7 @@ Id Builder::makeCompositeConstant(Id typeId, const dxil_spv::Vector<Id>& members
+     }
+ 
+     if (! specConstant) {
+-        Id existing = findCompositeConstant(typeClass, members);
++        Id existing = findCompositeConstant(typeClass, typeId, members);
+         if (existing)
+             return existing;
+     }
+diff --git a/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.h b/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.h
+index 7efd8df..9f27ee1 100755
+--- a/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.h
++++ b/subprojects/dxil-spirv/third_party/glslang-spirv/SpvBuilder.h
+@@ -643,7 +643,7 @@ protected:
+     Id makeInt64Constant(Id typeId, unsigned long long value, bool specConstant);
+     Id findScalarConstant(Op typeClass, Op opcode, Id typeId, unsigned value) const;
+     Id findScalarConstant(Op typeClass, Op opcode, Id typeId, unsigned v1, unsigned v2) const;
+-    Id findCompositeConstant(Op typeClass, const dxil_spv::Vector<Id>& comps) const;
++    Id findCompositeConstant(Op typeClass, Id typeId, const dxil_spv::Vector<Id>& comps) const;
+     Id collapseAccessChain();
+     void transferAccessChainSwizzle(bool dynamic);
+     void simplifyAccessChainSwizzle();

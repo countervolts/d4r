@@ -1,0 +1,94 @@
+{
+  "gpu": "NVIDIA RTX PRO 4500 Blackwell (200 W)",
+  "driver": "595.91.07",
+  "dlss": "310.9.16 official Linux library",
+  "timing": "CUDA events around each evaluation, 40 warmup + 100 measured frames per process, 3 alternating M/L trials",
+  "flags": "0x4b: HDR, low-resolution motion, inverted depth, auto exposure; synthetic patterned color, zero motion, alternating jitter",
+  "quality": "MaxPerf for all runs; auxiliary 1280x720->3840x2160 is a ratio-3 test with MaxPerf and is not a standard UltraPerformance-mode measurement",
+  "results": {
+    "1280x720->2560x1440": {
+      "trial_medians_ms": {
+        "12": [
+          1.405152,
+          1.413184,
+          1.415168
+        ],
+        "13": [
+          1.081472,
+          1.045728,
+          1.086336
+        ]
+      },
+      "median_of_trial_medians_ms": {
+        "12": 1.413184,
+        "13": 1.081472
+      },
+      "L_over_M_percent": 30.672268907563026
+    },
+    "1280x720->3840x2160": {
+      "trial_medians_ms": {
+        "12": [
+          2.013088,
+          2.0144,
+          2.00928
+        ],
+        "13": [
+          1.716384,
+          1.720672,
+          1.72464
+        ]
+      },
+      "median_of_trial_medians_ms": {
+        "12": 2.013088,
+        "13": 1.720672
+      },
+      "L_over_M_percent": 16.99429060274127
+    },
+    "1920x1080->3840x2160": {
+      "trial_medians_ms": {
+        "12": [
+          3.14688,
+          3.160704,
+          3.168192
+        ],
+        "13": [
+          2.55216,
+          2.553312,
+          2.555104
+        ]
+      },
+      "median_of_trial_medians_ms": {
+        "12": 3.160704,
+        "13": 2.553312
+      },
+      "L_over_M_percent": 23.788397187652734
+    }
+  },
+  "profile_4k_warmed_stage_medians_ms": {
+    "12": {
+      "exposure": 0.037344,
+      "input": 0.503442,
+      "network": 1.091685,
+      "expansion": 0.3446415,
+      "reconstruction": 0.9165479999999999,
+      "downsample": 0.249505
+    },
+    "13": {
+      "exposure": 0.037616,
+      "input": 0.2140175,
+      "network": 1.077973,
+      "expansion": 0.116881,
+      "reconstruction": 0.836356,
+      "downsample": 0.25435300000000005
+    }
+  },
+  "cost": {
+    "hourly_usd": 0.72,
+    "elapsed_seconds": 288.640086,
+    "estimated_usd": 0.0577280172,
+    "note": "Estimate from creation to termination at quoted rate, not a billing receipt"
+  },
+  "terminated": true,
+  "source_sha256": "9eb1e3cad5308620f0d9926c60487d40efc434a4c525b26ab79ba57f66c68e73",
+  "library_sha256": "30982c937afed85c96b8d313323de9a650a2eec6de1bb0f714b21750f4ce98f6"
+}

@@ -2,10 +2,13 @@
 """Run the engine's own preset M layers (layer_m.comp) on a captured frame and compare with the captured outputs and
 with the plain numpy model (m_model.py).
 
-usage: test_m.py CAPTURE_DIR WORK_DIR EVK [--frame N] [--time N] [--model] [--chain] [layer index ...]
+usage: test_m.py CAPTURE_DIR WORK_DIR EVK [--frame N] [--time N] [--model] [--chain] [--dot2] [layer index ...]
   CAPTURE_DIR/replay: layer launches before they ran; CAPTURE_DIR/dump: buffers after each launch.
   --model also runs the numpy model (slow) and reports the shader against it.
   --chain feeds each layer the engine's own previous outputs instead of the captured inputs.
+  --dot2 runs layer_m_dot2.comp (no cooperative matrices or FP8: RDNA2) on the matrices widened to binary16 pairs
+  (the output projection's, MLP's and patch merge's int8, as engine/runtime_m.inc widenM), and the encoders' patch
+  merge as merge_m_dot2.comp after the block.
 
 The layers' FP8 matrices are exported in the shader's blocked fixed-16 tile layout (pack8 below); the front-end
 embedding/expansion weights that compile_m.py packages for enc0_m/dec0_m stay in NGX's own plain layout.
@@ -81,6 +84,16 @@ def pack_layer(t, name):
         assert t['emb_w1'].shape == (32, 32) and t['emb_w2'].shape == (32, C), (t['emb_w1'].shape, t['emb_w2'].shape)
         o[60], o[61] = b8.add(pack8(t['emb_w1'])), b16.add(tile(t['emb_b1']))
         o[62], o[63] = b8.add(pack8(t['emb_w2'])), b16.add(tile(t['emb_b2']))
+    if name in ('enc0l', 'dec0l'):
+        # preset L's input and expansion stages also carry f32 copies of the bias tiles their f32 accumulators start
+        # from (layer_m.comp M_BIAS32): o[32 + c] the MLP chunks, o[36 + h] the heads' position biases, o[38] the merge or
+        # expansion, o[39], o[40] the embedding; in floats (two binary16 slots each)
+        assert C == 32, C
+        f32 = lambda v: b16.add(np.asarray(v, np.float32).view(F16)) // 2
+        for c in range(C // 8): o[32 + c] = f32(tile(t['b1'][c]))
+        for h in range(heads): o[36 + h] = f32(t['bias'][h])
+        o[38] = f32(tile(t['merge_b'] if NPM else t['expand_b']))
+        if 'emb_w1' in t: o[39], o[40] = f32(tile(t['emb_b1'])), f32(tile(t['emb_b2']))
     return o, b8.data(), b16.data()
 
 
@@ -90,9 +103,67 @@ def defines(name):
     # compile_m.py's arithmetic (ZLUDA's lowering); M_TEXL=0 gives the native accuracy kernels' for the network layers.
     # M_DEFS: extra defines for every layer_m.comp stage; M_DEFS_ENC1, M_DEFS_ENC3_TUBE, ...: for one layer
     texl = ['-DTEXL=1'] if kind >= 3 or os.environ.get('M_TEXL', '1') != '0' else []
-    # M_WPW=2: two 4x4-token windows per wave in the network layers (layer_m.comp WPW; not L's input / expansion)
+    # M_WPW=2: two 4x4-token windows per wave in the network layers (layer_m.comp WPW; L's input / expansion: M_DEFS_*)
     wpw = [f"-DWPW={os.environ['M_WPW']}"] if kind < 3 and os.environ.get('M_WPW') else []
     return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}'] + texl + wpw + os.environ.get('M_DEFS', '').split() + os.environ.get('M_DEFS_' + name.upper(), '').split()
+
+
+# layer_m_dot2.comp MLP_PAIR_SCALE: one int8 scale for a pair of MLP chunks, whose w2 blocks then share their column
+# scales (widen)
+DOT2_PAIR = int(os.environ.get('M_DOT2_PAIR', '1'))   # compile_m.py's D4RM0006 packages: 1
+# layer_m_dot2.comp EXPAND_INT8 (D4RM0007): the decoders' expansion on int8 (widen packs its matrix so)
+DOT2_EXPAND_INT8 = int(os.environ.get('M_DOT2_EXPAND_INT8', '1'))
+
+
+def dot2_defines(name):
+    """layer_m_dot2.comp's build of a network layer: KIND 2 expands from XC channels, 0 not (an encoder's patch merge
+    is merge_m_dot2.comp's, dot2_merge_defines)"""
+    C, heads, NPM, CIN = mm.LAYERS[name]
+    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={2 if CIN else 0}', f'-DXC={CIN or 16}', f'-DMLP_PAIR_SCALE={DOT2_PAIR}',
+            f'-DEXPAND_INT8={DOT2_EXPAND_INT8}']
+
+
+def dot2_merge_defines(name):
+    """merge_m_dot2.comp's build of an encoder's patch merge: channels, merged channels, waves per 8x8 merged tokens
+    (the faster count on the Steam Deck)"""
+    C, heads, NPM, CIN = mm.LAYERS[name]
+    return [f'-DC={C}', f'-DXC={NPM}', f'-DNW={ {"enc1": 4, "enc2": 8}[name]}']
+
+
+def widen(b8, o, name):
+    """a layer's FP8 bytes (pack_layer) as the dot2 stages read them (engine/runtime_m.inc widenM): every blocked matrix
+    W[K][N] at byte offset off as [K/2][N] binary16 pairs (W[2i][n], W[2i+1][n]) at dword off / 2; the MLP's as int8
+    [K/4][N] words (W[4i + j][n] in byte j), each column scaled by its largest magnitude / 127, then N f32 scales, and
+    the output projection's (all heads as one [32 NH][C] matrix), the patch merge's and (DOT2_EXPAND_INT8) the
+    decoders' expansion's too"""
+    C, heads, NPM, CIN = mm.LAYERS[name]
+    h16 = me.E4M3.astype(F16).view(np.uint16).astype(np.uint32)
+    out = np.zeros(b8.size // 2 + 64, np.uint32)
+    blocked = lambda off, K, N: b8[off + 256 * ((np.arange(K)[:, None] // 16) * (N // 16) + np.arange(N)[None, :] // 16)
+                                     + (np.arange(N)[None, :] % 16) * 16 + np.arange(K)[:, None] % 16]
+    mats = [(o[68], CIN, 4 * C)] if CIN and not DOT2_EXPAND_INT8 else []
+    for off, K, N in mats:
+        vals = h16[blocked(off, K, N)]
+        out[off // 2:off // 2 + K * N // 2] = (vals[0::2] | (vals[1::2] << 16)).ravel()
+    i8 = [m for h in range(heads) for m in ((o[4 + 4 * h], C, 32), (o[5 + 4 * h], C, 32))]
+    i8 += [m for c in range(C // 8) for m in ((o[20 + 3 * c], C, 32), (o[22 + 3 * c], 32, C))]
+    i8 += [(o[68], 4 * C, NPM)] if NPM else []
+    i8 += [(o[68], CIN, 4 * C)] if CIN and DOT2_EXPAND_INT8 else []
+    assert all(o[7 + 4 * h] == o[7] + h * 32 * C for h in range(heads)), 'the output projections are not consecutive'
+    i8.append((o[7], 32 * heads, C))     # the heads' output projections as one [NA][C] matrix
+    groups = [[m] for m in i8]
+    if DOT2_PAIR:   # the MLP's w2 blocks in pairs (c, c + 1) with shared column scales
+        w2 = {o[22 + 3 * c] for c in range(C // 8)}
+        groups = [g for g in groups if g[0][0] not in w2] + [[(o[22 + 3 * c], 32, C), (o[22 + 3 * (c + 1)], 32, C)] for c in range(0, C // 8, 2)]
+    for group in groups:
+        Ws = [me.E4M3.astype(np.float64)[blocked(off, K, N)] for off, K, N in group]
+        scale = np.max([np.abs(W).max(0) for W in Ws], 0) / 127.0
+        scale[scale == 0] = 1.0
+        for (off, K, N), W in zip(group, Ws):
+            q = np.clip(np.round(W / scale), -127, 127).astype(np.int8).view(np.uint8).astype(np.uint32)
+            out[off // 2:off // 2 + K * N // 4] = (q[0::4] | (q[1::4] << 8) | (q[2::4] << 16) | (q[3::4] << 24)).ravel()
+            out[off // 2 + K * N // 4:off // 2 + K * N // 4 + N] = scale.astype(np.float32).view(np.uint32)
+    return out
 
 
 def token_codes(buf, off, W, H, C):
@@ -118,6 +189,8 @@ def main():
     if model: a.remove('--model')
     chain = '--chain' in a
     if chain: a.remove('--chain')
+    dot2 = '--dot2' in a
+    if dot2: a.remove('--dot2')
     own = {}    # arena address -> the engine's own tokens there
     cap, work, evk = a[:3]
     only = [int(x) for x in a[3:]]
@@ -135,6 +208,7 @@ def main():
         pre = f'{work}/{i}-{name}'
         open(pre + '.params', 'wb').write(struct.pack('<4i72I', W, H, P.sx, P.sy, *o))
         b8.tofile(pre + '.w8'); b16.tofile(pre + '.w16')
+        if dot2: widen(b8, o, name).tofile(pre + '.w8')
         def source(ptr, w, h_, c):
             return own[ptr] if chain and ptr in own else token_codes(P.arena, ptr - P.abase, w, h_, c)
         if CIN:
@@ -144,7 +218,8 @@ def main():
             source(P.inp, W, H, C).tofile(pre + '.in')
             np.zeros(64, np.uint8).tofile(pre + '.skip')
         spv = pre + '.spv'
-        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(name), f'{HERE}/layer_m.comp', '-o', spv], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(dot2_defines(name) if dot2 else defines(name)),
+                        f'{HERE}/layer_m_dot2.comp' if dot2 else f'{HERE}/layer_m.comp', '-o', spv], check=True, stdout=subprocess.DEVNULL)
         gx, gy = (W + P.sx + 7) // 8, (H + P.sy + 7) // 8
         msize = (H // 2) * (W // 2) * NPM if NPM else 64
         r = subprocess.run([evk, spv, str(gx), str(gy), reps, f'in:0={pre}.params', f'in:1={pre}.w8', f'in:2={pre}.w16', f'in:3={pre}.in',
@@ -152,6 +227,15 @@ def main():
         if r.returncode:
             print(name, 'FAILED', r.stderr[-600:]); sys.exit(1)
         us = [float(l.split(':')[1].split()[0]) for l in r.stdout.split('\n') if 'us per dispatch' in l]
+        if dot2 and NPM:
+            mspv = pre + '.merge.spv'
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *dot2_merge_defines(name), f'{HERE}/merge_m_dot2.comp',
+                            '-o', mspv], check=True, stdout=subprocess.DEVNULL)
+            r = subprocess.run([evk, mspv, str((W // 2 + 7) // 8), str((H // 2 + 7) // 8), reps, f'in:0={pre}.params', f'in:1={pre}.w8',
+                                f'in:2={pre}.w16', f'in:3={pre}.out', f'out:4={pre}.merged:{msize}'], capture_output=True, text=True)
+            if r.returncode:
+                print(name, 'merge FAILED', r.stderr[-600:]); sys.exit(1)
+            us = [sum(us + [float(l.split(':')[1].split()[0]) for l in r.stdout.split('\n') if 'us per dispatch' in l])]
         total += us[0] if us else 0
         got = np.fromfile(pre + '.out', np.uint8).reshape(H, W, C)
         own[P.out] = got

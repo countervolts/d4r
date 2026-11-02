@@ -62,3 +62,11 @@ void d4r_motion_dilate(D4rMotionDilationParams p)
     }
     *(uint32_t*)(output + (uint64_t)y * p.motion_pitch + 4 * x) = value;
 }
+
+#include "motion_dilate_lds.hip"
+
+#include "native_motion_compose.hip"
+
+#include "wire_history.hip"
+
+#include "native_motion_prepared.hip"

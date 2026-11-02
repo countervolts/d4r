@@ -1,5 +1,5 @@
 From 33bbac250ac7e2ca4eff67e8817ada9dad578208 Mon Sep 17 00:00:00 2001
-From: Codex <codex@localhost>
+From: ayo <93222141+countervolts@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 16:10:08 +0300
 Subject: [PATCH] Support explicitly selected Windows d4r DLSS backend on
  physical AMD adapters

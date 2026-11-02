@@ -1,5 +1,5 @@
 From a1c506fc956cfc347c56c44311669700c0d500ac Mon Sep 17 00:00:00 2001
-From: Codex <codex@localhost>
+From: ayo <93222141+countervolts@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 22:16:19 +0300
 Subject: [PATCH] Profile CUDA host API duration without serializing GPU
  launches

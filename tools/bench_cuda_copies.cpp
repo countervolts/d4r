@@ -1,7 +1,7 @@
 // Measures host<->array and host<->linear copy bandwidth through the CUDA
 // driver API (ZLUDA), for the staging sizes the NGX shim moves per frame.
 // usage: bench_cuda_copies [WIDTH HEIGHT CHANNELS]  (half-float texels)
-#include <dlfcn.h>
+#include "d4r_dlfcn.h"
 
 #include <chrono>
 #include <cstdint>

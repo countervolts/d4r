@@ -1,0 +1,109 @@
+From: d4r
+Subject: [PATCH] dxil-spirv: an or of disjoint operands as an addition
+
+LLVM (DXC's instcombine) rewrites an addition whose operands have no common
+set bits as an or: base + 1 becomes base | 1 for an even base, the usual form
+of consecutive array and buffer offsets in unrolled code. RADV's
+nir_opt_load_store_vectorize follows iadd chains, not ior, so the consecutive
+16- and 32-bit LDS accesses of the RR decoders stayed scalar (ds_load_u16_d16
+where the Vulkan build of the same source gets ds_load_b64) with an extra
+shift/or per value. Emit such an or as OpIAdd: identical bits, the offset
+stays visible. Known-zero bits come from constants, shifts by constants,
+multiplies by constants and bitwise operations.
+
+---
+diff --git a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+--- a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp	2026-10-26 14:15:58.473428228 +0100
++++ b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp	2026-10-26 14:37:55.859847041 +0100
+@@ -332,6 +332,82 @@
+ 		return false;
+ }
+ 
++// The bits of an integer value known to be zero (a conservative subset), from
++// constants, shifts and multiplies by constants and bitwise operations.
++static uint64_t known_zero_bits(const llvm::Value *v, unsigned depth = 0)
++{
++	const auto *int_type = llvm::dyn_cast<llvm::IntegerType>(v->getType());
++	if (!int_type || int_type->getBitWidth() > 64)
++		return 0;
++	const unsigned width = int_type->getBitWidth();
++	const uint64_t mask = width == 64 ? UINT64_MAX : (1ull << width) - 1ull;
++
++	if (const auto *c = llvm::dyn_cast<llvm::ConstantInt>(v))
++		return ~c->getUniqueInteger().getZExtValue() & mask;
++	const auto *op = llvm::dyn_cast<llvm::BinaryOperator>(v);
++	if (!op || depth > 8)
++		return 0;
++	const auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(op->getOperand(1));
++	const uint64_t c = rhs ? rhs->getUniqueInteger().getZExtValue() & mask : 0;
++
++	switch (op->getOpcode())
++	{
++	case llvm::BinaryOperator::BinaryOps::Shl:
++		if (rhs && c < width)
++			return ((known_zero_bits(op->getOperand(0), depth + 1) << c) | ((1ull << c) - 1ull)) & mask;
++		return 0;
++	case llvm::BinaryOperator::BinaryOps::LShr:
++		if (rhs && c < width)
++			return ((known_zero_bits(op->getOperand(0), depth + 1) >> c) | ~(mask >> c)) & mask;
++		return 0;
++	case llvm::BinaryOperator::BinaryOps::Mul:
++		// a multiple of 2^n has n low zero bits
++		if (rhs && c != 0)
++		{
++			unsigned n = 0;
++			while (!((c >> n) & 1ull))
++				n++;
++			uint64_t low = known_zero_bits(op->getOperand(0), depth + 1);
++			unsigned m = 0;
++			while (m < width && ((low >> m) & 1ull))
++				m++;
++			n += m;
++			return n >= width ? mask : (1ull << n) - 1ull;
++		}
++		return 0;
++	case llvm::BinaryOperator::BinaryOps::Add:
++	{
++		// trailing zero bits common to both terms
++		uint64_t a = known_zero_bits(op->getOperand(0), depth + 1), b = known_zero_bits(op->getOperand(1), depth + 1);
++		unsigned n = 0;
++		while (n < width && ((a >> n) & (b >> n) & 1ull))
++			n++;
++		return n >= width ? mask : (1ull << n) - 1ull;
++	}
++	case llvm::BinaryOperator::BinaryOps::And:
++		return known_zero_bits(op->getOperand(0), depth + 1) | known_zero_bits(op->getOperand(1), depth + 1);
++	case llvm::BinaryOperator::BinaryOps::Or:
++		return known_zero_bits(op->getOperand(0), depth + 1) & known_zero_bits(op->getOperand(1), depth + 1);
++	default:
++		return 0;
++	}
++}
++
++// An `or` of operands without common set bits is an addition. LLVM rewrites
++// additions so (base + 1 as base | 1 for an even base); emitted as an add, the
++// offset stays visible to the driver's load/store vectorization (RADV's
++// nir_opt_load_store_vectorize follows iadd, not ior).
++template <typename InstructionType>
++static bool or_is_disjoint_add(const InstructionType *instruction)
++{
++	const auto *int_type = llvm::dyn_cast<llvm::IntegerType>(instruction->getType());
++	if (!int_type || int_type->getBitWidth() < 16 || int_type->getBitWidth() > 64)
++		return false;
++	const unsigned width = int_type->getBitWidth();
++	const uint64_t mask = width == 64 ? UINT64_MAX : (1ull << width) - 1ull;
++	return ((known_zero_bits(instruction->getOperand(0)) | known_zero_bits(instruction->getOperand(1))) & mask) == mask;
++}
++
+ static llvm::Value *get_bitwise_not_from_xor(llvm::Value *a, llvm::Value *b)
+ {
+ 	if (constant_is_all_bits_set(a))
+@@ -487,6 +563,8 @@
+ 	case llvm::BinaryOperator::BinaryOps::Or:
+ 		if (type->getIntegerBitWidth() == 1)
+ 			opcode = spv::OpLogicalOr;
++		else if (or_is_disjoint_add(instruction))
++			opcode = spv::OpIAdd;
+ 		else
+ 			opcode = spv::OpBitwiseOr;
+ 		break;

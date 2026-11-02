@@ -1,0 +1,9 @@
+FP8 WMMA dense: 403.4 TFLOPS
+FP8 WMMA dense: 391.9 TFLOPS
+FP8 WMMA dense: 392.2 TFLOPS
+read: 324 GB/s
+read: 368 GB/s
+read: 426 GB/s
+copy: 416 GB/s
+copy: 412 GB/s
+copy: 415 GB/s

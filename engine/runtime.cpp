@@ -1,4 +1,6 @@
 #include "runtime.h"
+#include "rr_binding_cache.h"
+#include "m_shared.h"
 #include "vk_dispatch.h"
 #include "rr_camera.h"
 #include <algorithm>
@@ -7,43 +9,65 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
 namespace d4r {
-static_assert(sizeof(InputParams) == 128);
-static_assert(sizeof(OutputParams) == 188);
-static_assert(offsetof(OutputParams, expo) == 148);
-static_assert(sizeof(LayerShape) == 16);
-static_assert(sizeof(Shape) == 184);
 namespace {
+bool noBufferRobustness = false;
 void check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + ": VkResult " + std::to_string(result));
 }
 #define VKCHECK(call) check((call), #call)
-std::vector<char> read(const std::string& file) {
-    std::ifstream stream(file, std::ios::binary | std::ios::ate);
-    if (!stream) throw std::runtime_error("cannot open " + file);
-    auto size = stream.tellg();
-    if (size <= 0 || size > 256 * 1024 * 1024) throw std::runtime_error("invalid size: " + file);
-    std::vector<char> data(static_cast<size_t>(size));
-    stream.seekg(0);
-    if (!stream.read(data.data(), size)) throw std::runtime_error("cannot read " + file);
-    return data;
+std::vector<char> read(const std::string& file) { return readFile(file); }
+bool exists(const std::string& file) { return fileExists(file); }
+// The driver, from VkPhysicalDeviceVulkan12Properties on a Vulkan 1.2 device: OptiScaler's Vulkan spoofing rewrites
+// VkPhysicalDeviceDriverProperties to NVIDIA's for every caller in the game's process, the 1.2 core struct it leaves.
+VkDriverId driverId(VkPhysicalDevice physical) {
+    VkPhysicalDeviceProperties base{};
+    vkGetPhysicalDeviceProperties(physical, &base);
+    VkPhysicalDeviceVulkan12Properties v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    const bool core = base.apiVersion >= VK_API_VERSION_1_2;
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = core ? static_cast<void*>(&v12) : static_cast<void*>(&driver);
+    vkGetPhysicalDeviceProperties2(physical, &properties);
+    return core ? v12.driverID : driver.driverID;
 }
+using LayerParams = KLayerParams;
+constexpr const auto& Names = KLayerNames;
+constexpr const auto& Channels = KChannels;
 struct Device {
     VkDevice handle;
     VkPhysicalDeviceMemoryProperties memory;
     VkPhysicalDeviceProperties properties;
+    bool coopmat = false;
     Device(VkPhysicalDevice physical, VkDevice device) : handle(device) {
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
         vkGetPhysicalDeviceProperties(physical, &properties);
+#ifndef D4R_ENGINE_VK_TABLE
+        uint32_t count = 0;
+        VKCHECK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr));
+        std::vector<VkExtensionProperties> extensions(count);
+        VKCHECK(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data()));
+        coopmat = std::any_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
+        });
+        if (const char* force = std::getenv("D4R_RR_TEST_NO_COOPMAT"))
+            if (std::strcmp(force, "1") == 0) coopmat = false;
+#endif
+        // The shim borrows a device whose enabled feature chain is unavailable here.
+        // CNN stages use the extension-free flavor instead of assuming physical support
+        // means VK_KHR_cooperative_matrix was enabled by the application.
     }
-    VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags) const {
+    VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags, bool address = false) const {
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags) {
-                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+                addressFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &addressFlags : nullptr};
                 info.allocationSize = requirements.size; info.memoryTypeIndex = i;
                 VkDeviceMemory result;
                 VKCHECK(vkAllocateMemory(handle, &info, nullptr, &result));
@@ -68,14 +92,15 @@ struct Buffer {
         if (handle) vkDestroyBuffer(device->handle, handle, nullptr);
         if (memory) vkFreeMemory(device->handle, memory, nullptr);
     }
-    void create(const Device& d, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false) {
+    // address: the buffer has a device address (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    void create(const Device& d, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false, bool address = false) {
         device = &d; size = std::max<VkDeviceSize>(16, (bytes + 3) & ~VkDeviceSize(3));
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = size; info.usage = usage;
+        info.size = size; info.usage = usage | (address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         VKCHECK(vkCreateBuffer(d.handle, &info, nullptr, &handle));
         VkMemoryRequirements requirements; vkGetBufferMemoryRequirements(d.handle, handle, &requirements);
         memory = d.allocate(requirements, host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, address);
         VKCHECK(vkBindBufferMemory(d.handle, handle, memory, 0));
         if (host) VKCHECK(vkMapMemory(d.handle, memory, 0, VK_WHOLE_SIZE, 0, &mapped));
     }
@@ -154,13 +179,18 @@ struct Pipeline {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline handle = VK_NULL_HANDLE;
+    // K's input, output and exposure stages: the same shader with CANONICAL_INPUT (specialization constant 7)
+    // false, for frames whose colour and motion are already exact in binary16 (no conversion code at all)
+    VkPipeline f16Inputs = VK_NULL_HANDLE;
     ~Pipeline() {
+        if (f16Inputs) vkDestroyPipeline(device, f16Inputs, nullptr);
         if (handle) vkDestroyPipeline(device, handle, nullptr);
         if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
     }
     void create(VkDevice dev, const std::string& file, const std::vector<VkDescriptorType>& types,
-                uint32_t subgroup, VkPipelineCache cache, VkPipelineCreateFlags flags = 0) {
+                uint32_t subgroup, VkPipelineCache cache, VkPipelineCreateFlags flags = 0,
+                const VkSpecializationInfo* specialization = nullptr, bool f16InputVariant = false) {
         device = dev;
         std::vector<VkDescriptorSetLayoutBinding> bindings;
         for (uint32_t i = 0; i < types.size(); ++i)
@@ -181,13 +211,37 @@ struct Pipeline {
         VKCHECK(vkCreateShaderModule(dev, &si, nullptr, &shader));
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         required.requiredSubgroupSize = subgroup;
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        VkPipelineRobustnessCreateInfoEXT robustness{VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
+        robustness.storageBuffers = robustness.uniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, noBufferRobustness ? &robustness : nullptr};
         ci.layout = layout; ci.flags = flags;
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &required,
-                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", nullptr};
+                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", specialization};
         VkResult result = vkCreateComputePipelines(dev, cache, 1, &ci, nullptr, &handle);
+        if (result == VK_SUCCESS && f16InputVariant) {
+            const VkBool32 canonical = VK_FALSE;
+            const VkSpecializationMapEntry entry{7, 0, sizeof(canonical)};
+            const VkSpecializationInfo variant{1, &entry, sizeof(canonical), &canonical};
+            ci.stage.pSpecializationInfo = &variant;
+            result = vkCreateComputePipelines(dev, cache, 1, &ci, nullptr, &f16Inputs);
+        }
         vkDestroyShaderModule(dev, shader, nullptr);
         check(result, "vkCreateComputePipelines");
+        if (const char* isaDir = std::getenv("D4R_TMP_ISA_DIR")) {   // TEMP diagnostic
+            auto info = reinterpret_cast<PFN_vkGetShaderInfoAMD>(vkGetDeviceProcAddr(dev, "vkGetShaderInfoAMD"));
+            size_t size = 0;
+            if (info && info(dev, handle, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS) {
+                std::vector<char> text(size);
+                info(dev, handle, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
+                std::string name = file.substr(file.find_last_of("/\\") + 1);
+                std::ofstream(std::string(isaDir) + "/" + name + ".isa", std::ios::binary).write(text.data(), size);
+            }
+            VkShaderStatisticsInfoAMD st{};
+            size = sizeof(st);
+            if (info && info(dev, handle, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &st) == VK_SUCCESS)
+                std::fprintf(stderr, "ISA %s vgpr %u sgpr %u lds %u isa %zu\n", file.c_str(), st.resourceUsage.numUsedVgprs,
+                             st.resourceUsage.numUsedSgprs, st.resourceUsage.ldsUsageSizeInBytes, st.resourceUsage.scratchMemUsageInBytes);
+        }
     }
 };
 VkDescriptorSet descriptorSet(VkDevice device, VkDescriptorPool pool, VkDescriptorSetLayout layout) {
@@ -213,82 +267,14 @@ void bindImage(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageVi
     write.pImageInfo = &info;
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
-void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y) {
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f16Inputs && pipeline.f16Inputs ? pipeline.f16Inputs : pipeline.handle);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
     vkCmdDispatch(cb, x, y, 1);
 }
-constexpr const char* Names[KLayers] = {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"};
-constexpr uint32_t Channels[KLayers] = {32, 64, 64, 96, 128, 160, 128, 96, 64, 64, 32};
-constexpr uint32_t Heads[KLayers] = {2, 2, 2, 4, 4, 8, 4, 4, 2, 2, 2};
-constexpr uint32_t Merged[5] = {64, 64, 96, 128, 160};
-struct LayerParams { LayerShape shape; std::array<uint32_t, 108> offsets; };
-struct ExposureParams { int32_t origin[2], size[2]; float invCount, scale, key; uint32_t flags, blocks, blocksX; int32_t sampleSize[2];
-                        float gameScale = 1, invPre = 1; }; // the last two: preset K, shader revision 2
-static_assert(sizeof(ExposureParams) == 56);
-bool exists(const std::string& file) { return bool(std::ifstream(file, std::ios::binary)); }
-static_assert(sizeof(LayerParams) == 448);
 } // namespace
+void setBufferRobustnessDisabled(bool disabled) { noBufferRobustness = disabled; }
 
-Shape makeKShape(uint32_t width, uint32_t height) {
-    if (width < 256 || height < 256 || width > 8192 || height > 8192)
-        throw std::runtime_error("standard K output dimensions must be 256..8192");
-    Shape shape{}; shape.outputWidth = width; shape.outputHeight = height;
-    uint32_t tw = std::max(256u, ((width + 3) / 4 + 31) / 32 * 32);
-    uint32_t th = std::max(256u, ((height + 3) / 4 + 31) / 32 * 32);
-    for (unsigned i = 0; i < KLayers; ++i) {
-        unsigned scale = i <= 5 ? i : 10 - i;
-        shape.layers[i] = {int32_t(tw >> scale), int32_t(th >> scale), 4, 4};
-    }
-    return shape;
-}
-std::array<LayerShape, KLayers> makeKWindows(const Shape& shape, uint32_t frameIndex) {
-    auto windows = shape.layers;
-    // Observed over 64 consecutive NGX evaluations: an eight-frame cycle that visits every shift once per axis.
-    static constexpr int32_t Cycle[8][2] = {{0, 2}, {5, 6}, {4, 0}, {1, 4}, {7, 5}, {2, 1}, {3, 7}, {6, 3}};
-    int32_t x = Cycle[frameIndex % 8][0], y = Cycle[frameIndex % 8][1];
-    for (unsigned depth = 0; depth < 3; ++depth) { // dec5, then enc4/dec4, then enc3/dec3
-        windows[5 - depth].sx = windows[5 + depth].sx = x; windows[5 - depth].sy = windows[5 + depth].sy = y;
-        x = (2 * x + 4) & 7; y = (2 * y + 4) & 7;
-    }
-    return windows;
-}
-uint32_t kReconstructionTable(uint32_t outputWidth, uint32_t outputHeight, uint32_t renderWidth, uint32_t renderHeight) {
-    const double ratio = std::sqrt(double(outputWidth) * outputHeight / (double(renderWidth) * renderHeight));
-    const double position = (ratio - 0.5) * 28.0 / 3.0;                 // table index on NGX's ratio grid
-    const double even = 2.0 * std::floor(position * 0.5 + 0.5);         // nearest even table; a tie takes the upper
-    return uint32_t(std::clamp(even, 0.0, 14.0));
-}
-FrameParams makeKFrameParams(const Shape& shape, const FrameSettings& settings) {
-    if (!settings.renderWidth || !settings.renderHeight || settings.renderWidth > shape.outputWidth || settings.renderHeight > shape.outputHeight)
-        throw std::runtime_error("render dimensions must be positive and no larger than the output");
-    FrameParams params{}; auto& in = params.input; auto& out = params.output;
-    auto base = shape.layers[0];
-    in.tokW = out.tokW = base.w; out.tokH = base.h;
-    in.flags = out.flags = (settings.reset ? FrameFlagReset : 0) | (settings.depthInverted ? 0 : FrameFlagRegularDepth) | (settings.displayMotion ? FrameFlagDisplayMotion : 0);
-    out.flags |= kReconstructionTable(shape.outputWidth, shape.outputHeight, settings.renderWidth, settings.renderHeight) << FrameFlagTableShift;
-    in.expo = out.expo = settings.colorExposure;
-    in.expoRatio = out.expoRatio = settings.historyExposureRatio;
-    in.expoIn = settings.networkExposureScale; in.minW = 1e-4f;
-    out.sharp = settings.sharpness; out.minAlpha = .02f; out.alphaThr = .0200042724609375f;
-    out.lutScale = 8; out.c184 = .040008544921875f; out.c186 = 1.0419921875f;
-    for (unsigned axis = 0; axis < 2; ++axis) {
-        float render = axis ? settings.renderHeight : settings.renderWidth, output = axis ? shape.outputHeight : shape.outputWidth;
-        float tokens = axis ? base.h : base.w;
-        (axis ? out.kB : out.kA) = -16.f * output / render;
-        in.out2rnd[axis] = out.out2rnd[axis] = out.near2rnd[axis] = render / output;
-        out.sub2rnd[axis] = .5f * render / output; out.out2tok[axis] = .5f;
-        in.rndOffs[axis] = settings.jitter[axis]; out.rndOffs[axis] = settings.jitter[axis] - .5f;
-        in.mvScale[axis] = out.mvScale[axis] = settings.motionScale[0] == 0 && settings.motionScale[1] == 0 ? (settings.displayMotion ? 1.f : output / render) : settings.motionScale[axis];
-        in.mvOffs[axis] = out.mvOffs[axis] = settings.motionOffset[axis];
-        in.invHist[axis] = in.invValid[axis] = out.invOut[axis] = out.invOutValid[axis] = 1.f / output;
-        in.tok2uv[axis] = 1.f / (tokens * 4.f);
-        in.colSize[axis] = in.depSize[axis] = out.colMax[axis] = out.depMax[axis] = int32_t(render) - 1;
-        in.mvSize[axis] = out.mvMax[axis] = int32_t(settings.displayMotion ? output : render) - 1;
-        out.outSize[axis] = int32_t(output);
-    }
-    return params;
-}
 
 struct Model::Impl {
     Device device;
@@ -296,71 +282,77 @@ struct Model::Impl {
     std::vector<char> weightBytes, lutBytes;   // until recordUpload
     std::array<std::array<uint32_t, 108>, KLayers> offsets{};
     std::array<Pipeline, KLayers> network;
-    Pipeline input, output, outputRgb10;
+    Pipeline input, output, outputRgb10, outputRgba8, outputR11;
+    // the final-store pipeline for a borrowed output texture of this format; null when none is packaged
+    const Pipeline* outputFor(VkFormat format) const {
+        const Pipeline* p = format == VK_FORMAT_R16G16B16A16_SFLOAT ? &output :
+            format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? &outputRgb10 : format == VK_FORMAT_R8G8B8A8_UNORM ? &outputRgba8 :
+            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : nullptr;
+        return p && p->handle ? p : nullptr;
+    }
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
-         hasGameExposure = false, hasRatioTables = false;
+         hasGameExposure = false, hasRatioTables = false, accuracyStages = false, dot2 = false;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
-Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
+Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network,
+             bool accuracy)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
-    if (exists(directory + "/direct_origins.bin")) {
-        auto marker = read(directory + "/direct_origins.bin");
-        // Shader revision: 1 has the corrected motion origins; 2 also reads the frame flags (regular depth);
-        // 3 also reads the display-motion flag and the game's exposure texture.
-        if (marker.size() != 8 || std::memcmp(marker.data(), "D4RO000", 7) || marker[7] < '1' || marker[7] > '3')
-            throw std::runtime_error("incompatible direct-origin shader marker");
-        m.hasDirectOrigins = true;
-        m.hasRegularDepth = marker[7] >= '2';
-        m.hasDisplayMotion = m.hasGameExposure = marker[7] == '3';
+    if (const char* force = std::getenv("D4R_ENGINE_K_NETWORK")) {
+        if (!std::strcmp(force, "dot2")) network = KNetwork::Dot2;
+        else if (!std::strcmp(force, "matrix")) network = KNetwork::Matrix;
     }
-    auto offsets = read(directory + "/offsets.bin");
-    uint32_t count = 0, weightSize = 0;
-    if (offsets.size() != 16 + KLayers * 108 * 4 || std::memcmp(offsets.data(), "D4RK0002", 8))
-        throw std::runtime_error("incompatible K model metadata");
-    std::memcpy(&count, offsets.data() + 8, 4); std::memcpy(&weightSize, offsets.data() + 12, 4);
-    auto weights = read(directory + "/weights.bin"), lut = read(directory + "/lut.bin");
-    // One reconstruction table (older packages: the ratio it was captured at serves every ratio) or all sixteen.
-    if (count != KLayers || weights.size() != weightSize || weights.size() % 2 ||
-        (lut.size() != KTableBytes && lut.size() != size_t(KTableBytes) * KTableCount))
-        throw std::runtime_error("invalid K model sizes");
-    m.hasRatioTables = lut.size() != KTableBytes;
-    std::memcpy(m.offsets.data(), offsets.data() + 16, sizeof(m.offsets));
-    for (unsigned i = 0; i < KLayers; ++i) {
-        const auto& layer = m.offsets[i]; uint32_t c = Channels[i];
-        auto span = [&](unsigned slot, uint64_t elements) {
-            uint32_t offset = layer[slot];
-            if (offset % 16 || (uint64_t(offset) + elements) * 2 > weights.size())
-                throw std::runtime_error(std::string("invalid tensor span in ") + Names[i]);
-        };
-        for (unsigned j = 0; j < 4; ++j) span(j, 16 * c);
-        for (unsigned h = 0; h < Heads[i]; ++h) {
-            for (unsigned j = 0; j < 3; ++j) span(4 + 5 * h + j, c * 32);
-            span(7 + 5 * h, 4096); span(8 + 5 * h, 32 * c);
-        }
-        for (unsigned ch = 0; ch < c / 8; ++ch) {
-            span(44 + 3 * ch, c * 32); span(45 + 3 * ch, 512); span(46 + 3 * ch, 32 * c);
-        }
-        if (i < 5) { span(104, 4 * c * Merged[i]); span(105, 16 * Merged[i]); }
-        if (i >= 6) { span(104, Channels[i - 1] * 4 * c); span(105, 16 * 4 * c); }
-        if (i == 0) { span(106, 16 * c); span(107, 16 * c); }
-        if (i == 10) { span(106, c * 48); span(107, 16 * 48); }
-    }
+#ifdef D4R_ENGINE_VK_TABLE
+    if (network == KNetwork::Auto) network = KNetwork::Matrix;
+#else
+    if (network == KNetwork::Auto) network = m.device.coopmat ? KNetwork::Matrix : KNetwork::Dot2;
+#endif
+    m.dot2 = network == KNetwork::Dot2;
+    auto data = loadKModel(directory, m.dot2);
+    m.hasDirectOrigins = data.hasDirectOrigins; m.hasRegularDepth = data.hasRegularDepth;
+    m.hasDisplayMotion = data.hasDisplayMotion; m.hasGameExposure = data.hasGameExposure;
+    m.hasRatioTables = data.hasRatioTables; m.offsets = data.offsets;
+    auto& weights = data.weights; auto& lut = data.lut;
     if (weights.size() > m.device.properties.limits.maxStorageBufferRange)
         throw std::runtime_error("model weights exceed the device's storage buffer range");
     m.weights.create(m.device, weights.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     m.lut.create(m.device, lut.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     m.weightBytes = std::move(weights); m.lutBytes = std::move(lut);
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    for (unsigned i = 0; i < KLayers; ++i) m.network[i].create(device, directory + "/" + Names[i] + ".spv", {b,b,b,b,b,b}, 32, cache);
-    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, 64, cache);
-    m.output.create(device, directory + "/output_k.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, 64, cache);
-    if (exists(directory + "/output_k_rgb10.spv"))
-        m.outputRgb10.create(device, directory + "/output_k_rgb10.spv", {b,t,t,t,t,t,s,s,s,s,b,b}, 64, cache);
+    for (unsigned i = 0; i < KLayers; ++i) {
+        const std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : ".spv");
+        if (m.dot2 && !exists(spv))
+            throw std::runtime_error("the model has no network shaders for GPUs without cooperative matrices (" + spv +
+                                     "): rebuild it with the current compile_k.py");
+        m.network[i].create(device, spv, {b,b,b,b,b,b}, 32, cache);
+    }
+    // The stages around the network run as wave64 (D4R_ENGINE_K_STAGE_WAVE=32|64 forces one size; the outputs are
+    // identical). Without cooperative matrices (RDNA2, which issues wave64 in two passes) the input stage and the
+    // reconstruction run as wave32: Steam Deck, 640x360 -> 1280x720, input 615 -> 494 us, reconstruction
+    // 1805 -> 1729 us (with the single-pass fallback of output_k.comp; before it wave64 was faster, 1898 vs 2021 us).
+    const char* waveEnv = std::getenv("D4R_ENGINE_K_STAGE_WAVE");
+    const uint32_t wave = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : 64;
+    const uint32_t stageWave = waveEnv ? wave : m.dot2 ? 32 : 64;
+    m.input.create(device, directory + "/input_k.spv", {b,t,t,t,t,t,b}, stageWave, cache, 0, nullptr, true);
+    // Older packages retain their existing stage. New accuracy packages provide a separate shader for each
+    // final-store format; the fast paths continue to load exactly their original files.
+    m.accuracyStages = accuracy && exists(directory + "/output_k_accuracy.spv");
+    const auto outputFile = [&](const char* name) {
+        return directory + "/" + name + (m.accuracyStages ? "_accuracy.spv" : ".spv");
+    };
+    m.output.create(device, outputFile("output_k"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_rgb10")))
+        m.outputRgb10.create(device, outputFile("output_k_rgb10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_store_rgba8")))
+        m.outputRgba8.create(device, outputFile("output_k_store_rgba8"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    if (exists(outputFile("output_k_store_r11g11b10")))
+        m.outputR11.create(device, outputFile("output_k_store_r11g11b10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
-        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, 64, cache);
-        m.exposure[1].create(device, directory + "/exposure_k1.spv", {b,b,b,b,b,t}, 64, cache);
+        m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache, 0, nullptr, true);
+        const std::string update = directory + (m.accuracyStages && exists(directory + "/exposure_k1_accuracy.spv")
+                                                    ? "/exposure_k1_accuracy.spv" : "/exposure_k1.spv");
+        m.exposure[1].create(device, update, {b,b,b,b,b,t}, wave, cache);
         m.hasExposure = true;
     }
 }
@@ -370,7 +362,10 @@ bool Model::hasRegularDepth() const { return impl->hasRegularDepth; }
 bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
+bool Model::hasAccuracyStages() const { return impl->accuracyStages; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
+bool Model::hasDirectOutput(VkFormat format) const { return impl->outputFor(format) != nullptr; }
+bool Model::dot2Network() const { return impl->dot2; }
 Model::~Model() = default;
 bool Model::uploadRecorded() const { return impl->uploaded; }
 void Model::recordUpload(VkCommandBuffer cb) {
@@ -401,8 +396,11 @@ struct Engine::Impl {
     std::array<VkDescriptorSet, 2> inputSets{}, outputSets{};
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     unsigned previous = 0;
-    bool initialized = false, frameSet = false, reset = false, windowsChanged = false, rgb10Output = false;
+    bool initialized = false, frameSet = false, reset = false, windowsChanged = false;
+    const Pipeline* finalStore = nullptr; // setFrame: the final-store pipeline for the frame's output
+    bool f16Inputs = false;  // the frame's colour and motion are exact in binary16: the stages without the conversion
     bool external = false;   // the caller owns the token and head buffers; the layers run outside
+    bool trim = true;        // only the windows the results depend on (kLayerGroups)
     bool frontDone = false;  // recordFront has run and recordBack is due
     // Recorded into each frame's command buffer, so a frame still queued on the GPU keeps its own values.
     InputParams input{}; OutputParams output{};
@@ -431,15 +429,12 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
     if (!shape.outputWidth || !shape.outputHeight || shape.outputWidth > d.properties.limits.maxImageDimension2D / 2 ||
         shape.outputHeight > d.properties.limits.maxImageDimension2D / 2) throw std::runtime_error("unsupported output dimensions");
     auto base = shape.layers[0];
-    if (base.w < 256 || base.h < 256 || base.w % 32 || base.h % 32 || uint64_t(base.w) * 4 < shape.outputWidth || uint64_t(base.h) * 4 < shape.outputHeight ||
-        uint32_t(base.w) > shape.outputWidth || uint32_t(base.h) > shape.outputHeight)
-        throw std::runtime_error("K token grid must be a multiple of 32, at least 256x256, and cover the output");
+    validateKShape(shape);
     e.external = external != nullptr;
+    if (const char* trim = std::getenv("D4R_ENGINE_K_TRIM")) e.trim = std::strcmp(trim, "0") != 0;
     if (e.external && (!external->tokens || !external->head)) throw std::runtime_error("external network without its buffers");
     for (unsigned i = 0; i < KLayers; ++i) {
-        auto layer = shape.layers[i]; unsigned scale = i <= 5 ? i : 10 - i;
-        if (layer.w != base.w / (1 << scale) || layer.h != base.h / (1 << scale) || layer.sx < 0 || layer.sx > 7 || layer.sy < 0 || layer.sy > 7 || (i != 5 && (layer.sx % 2 || layer.sy % 2)))
-            throw std::runtime_error(std::string("invalid geometry for ") + Names[i]);
+        auto layer = shape.layers[i];
         if (e.external) continue; // the layers run outside; their buffer geometry is not this engine's concern
         uint32_t gx = (layer.w + layer.sx + 7) / 8, gy = (layer.h + layer.sy + 7) / 8;
         if (gx > d.properties.limits.maxComputeWorkGroupCount[0] || gy > d.properties.limits.maxComputeWorkGroupCount[1])
@@ -448,12 +443,7 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
     e.inParams.create(d, sizeof(InputParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     e.outParams.create(d, sizeof(OutputParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (!e.external) e.dummy.create(d, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::array<VkDeviceSize, 2> capacity{VkDeviceSize(base.w) * base.h * 16 * 2, 16};
-    for (unsigned i = 0; i < KLayers && !e.external; ++i) {
-        const auto& ls = shape.layers[i];
-        VkDeviceSize bytes = VkDeviceSize(ls.w) * ls.h * (i < 5 ? Merged[i] / 4 : i == 10 ? 40 : Channels[i]) * 2;
-        capacity[(i + 1) % 2] = std::max(capacity[(i + 1) % 2], bytes);
-    }
+    const auto capacity = kActivationBytes(shape);
     for (unsigned i = 0; i < 2; ++i) {
         if (e.external) { // the caller's buffers: main[0] holds the tokens, main[1] the head the final store reads
             e.main[i].handle = i ? external->head : external->tokens;
@@ -465,7 +455,7 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         e.activations += e.main[i].size;
     }
     for (unsigned i = 0; i < 5 && !e.external; ++i) {
-        auto ls = shape.layers[i]; VkDeviceSize bytes = VkDeviceSize(ls.w) * ls.h * Channels[i] * 2;
+        VkDeviceSize bytes = kSkipBytes(shape, i);
         if (bytes > d.properties.limits.maxStorageBufferRange) throw std::runtime_error("skip buffer exceeds device range");
         e.skip[i].create(d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         e.activations += e.skip[i].size;
@@ -492,8 +482,11 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
     VKCHECK(vkCreateSampler(dev, &si, nullptr, &e.linear));
     for (unsigned i = 0; i < 2; ++i) {
         auto& h = e.history[i];
-        h.color.create(d, shape.outputWidth, shape.outputHeight);
-        h.luma.create(d, shape.outputWidth * 2, shape.outputHeight * 2, true);
+        // NGX's histories cover the output padded to 16 pixels (its output kernel's 16x16 blocks write the padding,
+        // and the bilinear history fetches near the last row and column read it)
+        const uint32_t hw = (shape.outputWidth + 15) / 16 * 16, hh = (shape.outputHeight + 15) / 16 * 16;
+        h.color.create(d, hw, hh);
+        h.luma.create(d, hw * 2, hh * 2, true);
         h.feature.create(d, base.w, base.h);
     }
     if (e.model.hasExposure) {
@@ -546,59 +539,26 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                       const std::array<LayerShape, KLayers>* windows, const ExposureControl* exposure,
                       FrameOutput finalOutput) {
     auto& e = *impl;
-    if (finalOutput.view && finalOutput.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
-        (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.outputRgb10.handle))
-        throw std::runtime_error("unsupported borrowed output format or missing RGB10A2 shader");
+    if (finalOutput.view && !e.model.outputFor(finalOutput.format))
+        throw std::runtime_error("unsupported borrowed output format or missing final-store shader for it");
+    ExposureParams exposureParams{};
     if (exposure) {
         if (!e.model.hasExposure) throw std::runtime_error("the model has no exposure shaders (recompile it with compile_k.py)");
         if (exposure->game && (!e.model.hasGameExposure || !images.exposure)) throw std::runtime_error("game exposure needs recompiled K shaders and an exposure view");
-        if (exposure->size[0] <= 0 || exposure->size[1] <= 0 || exposure->origin[0] < 0 || exposure->origin[1] < 0 ||
-            uint32_t(exposure->size[0]) > e.shape.outputWidth || uint32_t(exposure->size[1]) > e.shape.outputHeight ||
-            !(exposure->scale > 0) || !(exposure->key > 0) || !std::isfinite(exposure->scale) || !std::isfinite(exposure->key) ||
-            !(exposure->exposureScale > 0) || !(exposure->preExposure > 0) || !std::isfinite(exposure->exposureScale) ||
-            !std::isfinite(exposure->preExposure))
-            throw std::runtime_error("unsupported exposure rectangle or scale");
+        exposureParams = makeKExposureParams(e.shape, *exposure);
     }
     if (!images.color || !images.motion || !images.depth) throw std::runtime_error("frame has a null image view");
-    if (input.tokW != e.shape.layers[0].w || output.tokW != input.tokW || output.tokH != e.shape.layers[0].h ||
-        input.flags != (output.flags & ~FrameFlagTableMask) || (input.flags & ~(FrameFlagReset | FrameFlagRegularDepth | FrameFlagDisplayMotion)) || output.outSize[0] != int32_t(e.shape.outputWidth) || output.outSize[1] != int32_t(e.shape.outputHeight) ||
-        (finalOutput.view ? output.outOrigin[0] < 0 || output.outOrigin[1] < 0 : output.outOrigin[0] || output.outOrigin[1]) || output.out2tok[0] != .5f || output.out2tok[1] != .5f)
-        throw std::runtime_error("frame parameters do not match engine dimensions");
-    if ((input.flags & FrameFlagRegularDepth) && !e.model.hasRegularDepth)
-        throw std::runtime_error("regular depth needs a model compiled by the current compile_k.py");
-    if ((input.flags & FrameFlagDisplayMotion) && !e.model.hasDisplayMotion)
-        throw std::runtime_error("display-resolution motion needs a model compiled by the current compile_k.py");
-    if (!(output.out2rnd[0] > 0 && output.out2rnd[0] <= 1 && output.out2rnd[1] > 0 && output.out2rnd[1] <= 1) ||
-        // Display-resolution motion bypasses the depth-neighbour lookup. NGX
-        // uses (1,1) for its unused nearest scale in that variant; standard
-        // frame construction uses the render ratio. Both are valid there.
-        (!(input.flags & FrameFlagDisplayMotion) &&
-            (output.near2rnd[0] != output.out2rnd[0] || output.near2rnd[1] != output.out2rnd[1])) ||
-        !(output.near2rnd[0] > 0 && output.near2rnd[0] <= 1 && output.near2rnd[1] > 0 && output.near2rnd[1] <= 1) ||
-        !std::isfinite(output.sharp) ||
-        !(std::isfinite(input.expo) && input.expo > 0 && std::isfinite(input.expoIn) && input.expoIn > 0 &&
-          std::isfinite(output.expo) && output.expo > 0 && std::isfinite(input.expoRatio) && input.expoRatio > 0 &&
-          std::isfinite(output.expoRatio) && output.expoRatio > 0)) throw std::runtime_error("unsupported scale or exposure");
+    KModelData capabilities;
+    capabilities.hasRegularDepth = e.model.hasRegularDepth; capabilities.hasDisplayMotion = e.model.hasDisplayMotion;
+    validateKFrame(e.shape, capabilities, input, output, windows, finalOutput.view != VK_NULL_HANDLE);
     if (windows) {
-        for (unsigned i = 0; i < KLayers; ++i) {
-            auto old = e.shape.layers[i], ls = (*windows)[i];
-            if (ls.w != old.w || ls.h != old.h || ls.sx < 0 || ls.sx > 7 || ls.sy < 0 || ls.sy > 7 || (i != 5 && (ls.sx % 2 || ls.sy % 2)))
-                throw std::runtime_error(std::string("unsupported frame window geometry: ") + Names[i]);
-        }
         e.shape.layers = *windows; e.windowsChanged = true;
     }
     e.input = input; e.output = output;
     // A single-table package has only table 0, and its shaders may predate the table bits.
     if (!e.model.hasRatioTables) e.output.flags &= ~FrameFlagTableMask;
     e.exposureOn = exposure != nullptr;
-    if (exposure) {
-        const uint32_t sw = e.shape.outputWidth / 2, sh = e.shape.outputHeight / 2;
-        const uint32_t bx = (sw + 31) / 32, by = (sh + 31) / 32;
-        e.exposure = {{exposure->origin[0], exposure->origin[1]}, {exposure->size[0], exposure->size[1]},
-                      1.f / (float(sw) * float(sh)), exposure->scale / exposure->preExposure, exposure->key,
-                      (exposure->measure && !exposure->game ? 1u : 0u) | (exposure->reset ? 2u : 0u) | (exposure->game ? 4u : 0u), bx * by, bx,
-                      {int32_t(sw), int32_t(sh)}, exposure->exposureScale, 1.f / exposure->preExposure};
-    }
+    if (exposure) e.exposure = exposureParams;
     auto dev = e.model.device.handle;
     auto sameImages = [&](const FrameImages& b) {
         return images.color == b.color && images.motion == b.motion && images.depth == b.depth &&
@@ -676,8 +636,9 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     e.inputSets = found->input; e.outputSets = found->output;
     e.exposureSets[0] = found->exposure;
     e.exposureSets[1] = found->exposureUpdate;
-    e.rgb10Output = finalOutput.view && finalOutput.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : &e.model.output;
     e.reset = (input.flags & FrameFlagReset) != 0; e.frameSet = true;
+    e.f16Inputs = (input.flags & (FrameFlagCanonicalColor | FrameFlagCanonicalMotion)) == 0;
 }
 void Engine::recordFrame(VkCommandBuffer cb) {
     recordFrame(cb, {});
@@ -709,7 +670,7 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     if (e.exposureOn) {
         const auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         if (e.exposure.flags & 1u) {
-            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
+            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX, e.f16Inputs);
             memoryBarrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
         dispatch(cb, e.model.exposure[1], e.exposureSets[1], 1, 1);
@@ -717,18 +678,19 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     }
     mark(2);
     auto base = e.shape.layers[0];
-    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8);
+    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8, e.f16Inputs);
     mark(3);
-    for (unsigned i = 0; i < KLayers; ++i) {
+    const auto groups = kLayerGroups(e.shape, e.trim);
+    const unsigned layers = kRecordedLayers();
+    for (unsigned i = 0; i < layers; ++i) {
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        auto ls = e.shape.layers[i];
-        dispatch(cb, e.model.network[i], e.layerSets[i], (ls.w + ls.sx + 7) / 8, (ls.h + ls.sy + 7) / 8);
+        dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
         mark(4 + i);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    dispatch(cb, e.rgb10Output ? e.model.outputRgb10 : e.model.output, e.outputSets[e.previous],
-             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+    dispatch(cb, *e.finalStore, e.outputSets[e.previous],
+             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16, e.f16Inputs);
     mark(4 + KLayers);
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -758,7 +720,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     stamp(); // setup
     if (e.exposureOn) {
         if (e.exposure.flags & 1u) {
-            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
+            dispatch(cb, e.model.exposure[0], e.exposureSets[0], e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX, e.f16Inputs);
             memoryBarrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
         dispatch(cb, e.model.exposure[1], e.exposureSets[1], 1, 1);
@@ -766,7 +728,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     }
     stamp(); // exposure
     auto base = e.shape.layers[0];
-    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8);
+    dispatch(cb, e.model.input, e.inputSets[e.previous], uint32_t(base.w) / 8, uint32_t(base.h) / 8, e.f16Inputs);
     stamp(); // input
     memoryBarrier(cb, compute, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     e.frontDone = true;
@@ -781,8 +743,8 @@ void Engine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) 
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
     stamp(); // before the final store
-    dispatch(cb, e.rgb10Output ? e.model.outputRgb10 : e.model.output, e.outputSets[e.previous],
-             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+    dispatch(cb, *e.finalStore, e.outputSets[e.previous],
+             (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16, e.f16Inputs);
     memoryBarrier(cb, compute, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     stamp(); // after the final store
     e.previous = 1 - e.previous; e.frameSet = false; e.frontDone = false;
@@ -795,6 +757,7 @@ HistoryImages Engine::initialHistoryImages() const {
     auto& h = impl->history[0]; return {h.color.handle, h.luma.handle, h.feature.handle};
 }
 VkBuffer Engine::headBuffer() const { return impl->main[1].handle; }
+VkBuffer Engine::tokenBuffer() const { return impl->main[0].handle; }
 VkDeviceSize Engine::headBytes() const { auto s = impl->shape.layers[0]; return VkDeviceSize(s.w) * s.h * 40 * 2; }
 // The external network's buffers: the input stage's 16 f16 per token, the head's 40 f16 per token, both at the
 // token grid makeKShape derives from the output.
@@ -809,4 +772,5 @@ VkDeviceSize Engine::networkHeadBytes(uint32_t outputWidth, uint32_t outputHeigh
 VkDeviceSize Engine::activationBytes() const { return impl->activations; }
 #include "runtime_m.inc"
 #include "runtime_rr.inc"
+#include "runtime_e.inc"
 } // namespace d4r

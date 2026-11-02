@@ -2,7 +2,11 @@
 """Generate engine/rr/enc0_m.comp's source: encoder 0 with ptx2rr.py's translation of NVIDIA's per-pixel feature gather
 (run by wave 0, as NVIDIA runs it in one warp) and the native rest (engine/rr/enc0_m_decl.glsl, enc0_m_tail.glsl).
 
-usage: gen_enc0_m.py ENC0.generated.comp OUT.comp
+usage: gen_enc0_m.py ENC0.generated.comp OUT.comp [--gather]
+
+--gather: the feature gather alone (enc0_g.spv, for vkhip's encoder 0: kernels/rr/build_vkhip.sh), which writes sh to
+the scratch after the arena, window i (row-major) at the arena's end - (i + 1) x 4000 bytes (engine/runtime.h
+RGatherBytes)
 
 The translation's main is cut at its first workgroup barrier: by then the 10 x 10 pixels' features and the noise grid
 are in its shared buffer sh and the state surfaces 304 / 1016 are written. Model data derived from the user's DLL is in
@@ -12,8 +16,17 @@ import re
 import sys
 
 
+GATHER_TAIL = '''    memoryBarrierShared(); barrier();
+    {   // sh (noise grid, feature planes) to this window's scratch
+        const uint at = arena.w.length() - (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x + 1u) * 1000u;
+        for (uint i = gl_LocalInvocationIndex; i < 1000u; i += 128u) arena.w[at + i] = sh[i];
+    }
+'''
+
+
 def main():
     src, out = sys.argv[1:3]
+    gather = '--gather' in sys.argv[3:]
     lines = open(src).read().split('\n')
     m = next(i for i, l in enumerate(lines) if l.startswith('void main()'))
     head = '\n'.join(lines[:m]).replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
@@ -36,7 +49,7 @@ def main():
     text = (head + '\n#extension GL_GOOGLE_include_directive : require\n#include "enc0_m_decl.glsl"\n\nvoid main()\n{\n' +
             '\n'.join(decls) + '\n    // the translated feature gather (NVIDIA\'s one warp, its pixel loop split over the waves)\n' +
             '\n'.join(pre) + '\n    if (gl_SubgroupID < 3u) {\n' + loop + '\n    }\n    if (gl_SubgroupID == 0u) {\n' +
-            '\n'.join(post) + '\n    }\n#include "enc0_m_tail.glsl"\n}\n')
+            '\n'.join(post) + '\n    }\n' + (GATHER_TAIL if gather else '#include "enc0_m_tail.glsl"\n') + '}\n')
     open(out, 'w').write(text)
     print(f'{out}: {len(decls)} declaration lines, {len(prologue)} prologue lines')
 

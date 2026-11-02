@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 """Translate d4r.ini (see config/d4r.ini.default) into shell exports for the game launcher.
 
 usage: d4r_config.py [--config PATH] [--print | --launch]
@@ -42,10 +43,10 @@ def config_path(argv):
 
 def main(argv):
     path = config_path(argv)
-    ini = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None)
+    ini = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None, strict=False)
     ini.optionxform = str  # keep [Env] variable names as written
     if path.exists():
-        ini.read(path)
+        ini.read(path, encoding="utf-8-sig")
 
     def get(section, key):
         value = ini.get(section, key, fallback="").strip()
@@ -85,6 +86,54 @@ def main(argv):
             env["D4R_DLSS_PRESET"] = str(PRESETS[MODEL_ALIASES.get(model.upper(), model.upper())])
         else:
             fail(f"[DLSS] Model {model!r}: use one of {', '.join(list(PRESETS) + list(MODEL_ALIASES))} or a preset number")
+
+    if flag("OptiScaler", "FollowPresets") is False:
+        env["D4R_FOLLOW_OPTISCALER"] = "0"
+    if flag("OptiScaler", "Fsr4") is False:
+        env["D4R_FSR4_IDENTITY"] = "0"
+
+    rr_enabled = flag("RayReconstruction", "Enable")
+    if rr_enabled is not None:
+        env["D4R_RR_ENABLE"] = "1" if rr_enabled else "0"
+    rr_model = get("RayReconstruction", "Model")
+    if rr_model is not None:
+        # F: DLSS 4.5, nvngx_dlssd.dll 310.9 or later; A - C: the retired CNN, engine\rr-a/b/c only
+        rr_presets = {"DEFAULT": 0, "A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+        rr_model = rr_model.upper()
+        if rr_model in rr_presets:
+            env["D4R_RR_PRESET"] = str(rr_presets[rr_model])
+        elif rr_model in ("0", "4", "5", "6"):
+            env["D4R_RR_PRESET"] = rr_model
+        else:
+            fail(f"[RayReconstruction] Model {rr_model!r}: use auto, default, A, B, C, D, E or F")
+    # Backend: which denoiser serves a game's Ray Reconstruction request. dlss (the default) is
+    # NVIDIA's model (Model above); fsr is AMD's FSR Ray Regeneration, followed by Super Sampling.
+    rr_backend = get("RayReconstruction", "Backend")
+    if rr_backend is not None:
+        if rr_backend.lower() not in ("dlss", "fsr"):
+            fail(f"[RayReconstruction] Backend {rr_backend!r}: use dlss or fsr")
+        env["D4R_RR_BACKEND"] = rr_backend.lower()
+    # FSR denoiser tuning: FsrStabilityBias (auto = AMD's default, or a number >= 0) and FsrDetail (the share,
+    # 0-1, of the colour that goes around the denoiser; 0 = off).
+    fsr_stability = get("RayReconstruction", "FsrStabilityBias")
+    if fsr_stability is not None and fsr_stability.lower() != "auto":
+        try:
+            if float(fsr_stability) < 0:
+                raise ValueError
+        except ValueError:
+            fail(f"[RayReconstruction] FsrStabilityBias {fsr_stability!r}: use auto or a number >= 0")
+        env["D4R_FSR_RR_STABILITY_BIAS"] = fsr_stability
+    fsr_detail = get("RayReconstruction", "FsrDetail")
+    if fsr_detail is not None:
+        try:
+            if not 0 <= float(fsr_detail) <= 1:
+                raise ValueError
+        except ValueError:
+            fail(f"[RayReconstruction] FsrDetail {fsr_detail!r}: use a number from 0 to 1")
+        env["D4R_FSR_RR_DETAIL"] = fsr_detail
+    fsr_denoiser = path_value("RayReconstruction", "FsrDenoiser")
+    if fsr_denoiser:
+        env["D4R_FSR_RR_DLL"] = fsr_denoiser
 
     age = get("Latency", "FrameAge")
     if age is not None:
@@ -147,6 +196,7 @@ def main(argv):
         if value is not None:
             env[var] = "1" if value else "0"
     value = get("Interop", "MarkerPollUs")
+    env["D4R_MOTION_THIN_SKY"] = "1" if flag("Interop", "MotionDilationThinSky") else "0"
     dilation = get("Interop", "MotionVectorDilation")
     if dilation is not None and dilation not in ("0", "1", "2"):
         fail("[Interop] MotionVectorDilation must be 0, 1 or 2")
@@ -155,6 +205,29 @@ def main(argv):
         if not value.isdigit():
             fail(f"[Interop] MarkerPollUs must be a number of microseconds, not {value!r}")
         env["D4R_SHIM_MARKER_POLL_US"] = value
+
+    value = flag("Engine", "Enabled")
+    if value is None:
+        models = Path(os.environ.get("D4R_RUNTIME_DIR", path.parent)) / "engine"
+        value = any((models / model).is_dir() for model in
+                    ("k", "k-ldr", "m", "m-ldr", "l", "l-ldr", "rr-d", "rr-e", "rr-f",
+                     "rr-d-gfx11", "rr-e-gfx11"))
+        env["D4R_ENGINE_K"] = "0"
+    env["D4R_ENGINE"] = "1" if value else "0"
+    if path_value("Engine", "ModelDir"):
+        env["D4R_ENGINE_MODEL_DIR"] = path_value("Engine", "ModelDir")
+    network = get("Engine", "Network")
+    if network is not None and network not in ("auto", "hip", "vulkan"):
+        fail("[Engine] Network must be auto, hip or vulkan")
+    if network in ("hip", "vulkan"):
+        env["D4R_ENGINE_NETWORK"] = network
+    # vkhip is on unless disabled; under Enabled = auto the shim keeps K on the native kernels when it cannot load
+    env["D4R_ENGINE_VKHIP"] = "0" if flag("Engine", "ExperimentalVkHip") is False else "1"
+    # Ray Reconstruction's native stages: auto = A - C and D - E on, F off (the shim's own default); an explicit
+    # true or false forces every preset. ExperimentalVkHip = false turns it off with everything else.
+    rr_vkhip = flag("Engine", "ExperimentalRrVkHip")
+    if rr_vkhip is not None:
+        env["D4R_ENGINE_RR_VKHIP"] = "1" if rr_vkhip else "0"
 
     engine = path_value("Game", "EngineIni")
     cvars = get("Game", "Cvars")
@@ -188,11 +261,18 @@ def main(argv):
 
     if flag("Debug", "Profile"):
         env["D4R_PROFILE"] = "1"
+    every = get("Debug", "ProfileLogEvery")
+    if every is not None:
+        if not every.isascii() or not every.isdecimal() or not 1 <= int(every) <= 4294967295:
+            fail(f"[Debug] ProfileLogEvery must be 1-4294967295, not {every!r}")
+        env["D4R_PROFILE_LOG_EVERY"] = str(int(every))
     if path_value("Debug", "LogDir"):
         env["D4R_GAME_LOG_DIR"] = path_value("Debug", "LogDir")
 
     if ini.has_section("Env"):
         for key, value in ini.items("Env"):
+            if not (key.isascii() and key.isidentifier()):
+                fail(f"[Env] key {key!r} must be an ASCII identifier")
             env[key] = value.strip()
 
     final = {key: value for key, value in env.items() if key not in os.environ}

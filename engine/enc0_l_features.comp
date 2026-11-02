@@ -1,0 +1,56 @@
+#version 460
+// L feature gathering, separated from the C32 embedding/Swin block so native
+// D3D12 can run every matrix product on WMMA. A two-pixel halo preserves the
+// shifted input block's feature/dither coordinates at the padded-grid edges.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "fp8_soft.glsl"
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 size;             // render size
+    ivec2 shift;            // pixels the block grid is shifted by
+    ivec2 tok;              // token grid
+    vec2 jitter, prevJitter;
+    vec2 mvScale, mvOffs;   // motion texel -> pixels of the 3x image
+    vec2 rnd2hi, hi2rnd;
+    vec2 hiSize;
+    float changeScale, changeGain;
+    uint depthFlag, reset, frame;
+    float expo, expoPrev;
+    float halfInvX, halfInvY, renderInvX, renderInvY; // host-rounded CUDA texture coordinates
+    // display-resolution motion (MVLowRes clear: NGX's rrlite_enc0_4x4_mvhi_*): a pixel's one vector is the motion
+    // texel at floor((pixel + 0.5 - jitter) * mvPix), clamped to [0, mvMax]; it serves all three candidates
+    uint displayMv;
+    ivec2 mvMax;
+    vec2 mvPix;             // output / render
+} p;
+#define ENC0_DISPLAY_MV 1
+layout(set = 0, binding = 1) uniform sampler2D colorTex;
+layout(set = 0, binding = 2) uniform sampler2D motionTex;
+layout(set = 0, binding = 3) uniform sampler2D depthTex;
+layout(set = 0, binding = 4) uniform sampler2D prevMvTex;      // candidate A of the previous frame, bilinear
+layout(set = 0, binding = 5) uniform sampler2D halfTex;        // half-resolution previous result, bilinear
+layout(set = 0, binding = 6) uniform sampler2D featTex;        // recurrent feature, bilinear
+layout(set = 0, binding = 7, rg16f) uniform writeonly image2D mvAOut;
+layout(set = 0, binding = 8, rg16f) uniform writeonly image2D mvBOut;
+layout(set = 0, binding = 9, rg16f) uniform writeonly image2D mvCOut;
+
+layout(set = 0, binding = 10, std430) readonly buffer Noise { uint16_t n[]; } noise;
+layout(set = 0, binding = 11, std430) writeonly buffer Features { uint a[]; } features;
+#define F8T float16_t
+#define F8OF(h) e4m3Round(float(h))
+#define ENC0_DISPLAY_MV 1
+#define ENC0_DEDUP 1
+#include "enc0_features.glsl"
+void main() {
+    const uint pi = gl_LocalInvocationID.x;
+    const ivec2 block = 8 * ivec2(gl_WorkGroupID.xy) - p.shift;
+    const ivec2 raw = block + ivec2(pi & 7u, pi >> 3);
+    const ivec2 grid = 2 * p.tok;
+    if (raw.x < -2 || raw.y < -2 || raw.x >= grid.x + 2 || raw.y >= grid.y + 2) return;
+    float16_t fe[32];
+    gatherFeatures(pi, block, p.expo == 0.0 ? 1.0 : p.expo, p.expoPrev == 0.0 ? 1.0 : p.expoPrev, (pi >> 3) < 4u, fe);
+    const uint at = uint((raw.y + 2) * (grid.x + 4) + raw.x + 2) * 16u;
+    for (uint d = 0u; d < 16u; ++d) features.a[at + d] = packFloat2x16(f16vec2(fe[2u * d], fe[2u * d + 1u]));
+}

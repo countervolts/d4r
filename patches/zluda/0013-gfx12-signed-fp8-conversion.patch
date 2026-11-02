@@ -1,0 +1,34 @@
+diff --git a/ptx/lib/zluda_ptx_impl.cpp b/ptx/lib/zluda_ptx_impl.cpp
+--- a/ptx/lib/zluda_ptx_impl.cpp
++++ b/ptx/lib/zluda_ptx_impl.cpp
+@@ -877,21 +877,18 @@
+         typedef _Float16 half_vector __attribute__((ext_vector_type(2)));
+         typedef uint16_t magnitude_vector __attribute__((ext_vector_type(2)));
+         const uint32_t bits = std::bit_cast<uint32_t>(input);
+-        // Positive half encodings are ordered by magnitude. Clamp both lanes
+-        // with one packed integer min, then retain NaNs as positive quiet NaNs.
+-        // Restore original signs after conversion, including negative zero.
+         const magnitude_vector magnitude = std::bit_cast<magnitude_vector>(bits & 0x7fff7fffu);
+-        const magnitude_vector saturated =
++        // Clamp finite overflow and infinities explicitly. Map NaNs to signed
++        // infinity: native infinity encodes as 0x7f/0xff, whereas native NaN is
++        // always 0xff. This preserves the sign without post-conversion masks.
++        const magnitude_vector bounded =
+             __builtin_elementwise_min(magnitude, magnitude_vector{0x5f00u, 0x5f00u});
+         const magnitude_vector kept{
+-            magnitude[0] > 0x7c00u ? uint16_t(0x7e00u) : saturated[0],
+-            magnitude[1] > 0x7c00u ? uint16_t(0x7e00u) : saturated[1]};
+-        const half_vector halves = std::bit_cast<half_vector>(kept);
+-        const float x = float(halves[0]), y = float(halves[1]);
+-        const uint32_t encoded = d4r_cvt_pk_fp8_f32(x, y, 0, false);
+-        // AMD canonicalizes NaNs to 0xff. PTX retains each input's sign.
+-        const uint16_t packed = uint16_t((encoded & 0x7f7fu) |
+-                                        ((bits >> 8) & 0x80u) | ((bits >> 16) & 0x8000u));
++            magnitude[0] > 0x7c00u ? uint16_t(0x7c00u) : bounded[0],
++            magnitude[1] > 0x7c00u ? uint16_t(0x7c00u) : bounded[1]};
++        const uint32_t signed_bits = std::bit_cast<uint32_t>(kept) | (bits & 0x80008000u);
++        const half_vector halves = std::bit_cast<half_vector>(signed_bits);
++        const uint16_t packed = uint16_t(d4r_cvt_pk_fp8_f32(float(halves[0]), float(halves[1]), 0, false));
+         return std::bit_cast<Fp8x2>(packed);
+     }
+ 

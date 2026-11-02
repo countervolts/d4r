@@ -4,10 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZLUDA_SOURCE_ROOT="${ZLUDA_SOURCE_ROOT:-}"
 ROCM_ROOT="${ROCM_ROOT:-/opt/rocm}"
+source "$ROOT/scripts/hip_windows_env.sh"
 HIPCC="${HIPCC:-$ROCM_ROOT/bin/hipcc}"
 LLVM_DIS="${LLVM_DIS:-$ROCM_ROOT/lib/llvm/bin/llvm-dis}"
 LLVM_AS="${LLVM_AS:-$ROCM_ROOT/lib/llvm/bin/llvm-as}"
 OCML="${OCML:-$ROCM_ROOT/amdgcn/bitcode/ocml.bc}"
+# AMD's Windows HIP SDK keeps the device libraries under lib/llvm
+[[ -e "$OCML" || ! -e "$ROCM_ROOT/lib/llvm/amdgcn/bitcode/ocml.bc" ]] || OCML="$ROCM_ROOT/lib/llvm/amdgcn/bitcode/ocml.bc"
 WORK_ROOT="${D4R_ZLUDA_PTX_HELPER_WORK:-${TMPDIR:-/tmp}/d4r-zluda-ptx-helpers}"
 # D4R_ZLUDA_HELPER_FLAGS: extra compiler flags, e.g. -DD4R_WMMA12_SHIM for the gfx12-layout test build (never
 # ship it: its gfx12 helpers use gfx11 WMMAs)
@@ -32,6 +35,10 @@ COMMON_FLAGS=(-DHIP_ENABLE_WARP_SYNC_BUILTINS -std=c++20 -Xclang -fdenormal-fp-m
   -Wall -Wextra -Wsign-compare -Wconversion -x hip "$SOURCE" -nogpulib -O3
   -mno-wavefrontsize64 --offload-device-only --offload-arch=gfx1030 -emit-llvm -c
   -Xclang -mlink-bitcode-file -Xclang "$OCML" "${EXTRA_FLAGS[@]}")
+# The Windows HIP SDK (run from MSYS2) has no glibc __assert_fail for device code
+case "$(uname -s)" in
+  MINGW*|MSYS*) COMMON_FLAGS+=(-include "$ROOT/scripts/zluda_ptx_helpers_windows.h") ;;
+esac
 
 build_one() {
   local suffix="$1"
@@ -43,7 +50,13 @@ build_one() {
 
   "$HIPCC" "${COMMON_FLAGS[@]}" "$@" -o "$raw"
   "$LLVM_DIS" "$raw" -o "$ll"
+  # LLVM_AS may be older than the compiler (the Windows HIP SDK's LLVM 23 against ZLUDA's LLVM 22): the first
+  # three expressions write LLVM 23's attributes the way LLVM 22 does, or drop them (only hints), and change
+  # nothing in an older compiler's output.
   sed -E \
+      -e 's/denormal_fpenv\(dynamic\)/"denormal-fp-math"="dynamic,dynamic"/g' \
+      -e 's/ nocreateundeforpoison//g' \
+      -e 's/, target_mem[a-z0-9_]*: none//g' \
       -e '/@llvm.used/d' \
       -e '/wchar_size/d' \
       -e '/llvm.module.flags/d' \

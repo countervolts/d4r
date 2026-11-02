@@ -64,6 +64,38 @@ def preset_f(cap, o):
     print(f'{o.frames} preset F frames of {o.capture} in {o.out}')
 
 
+# presets A - C (the CNN of 310.3, cuda_dldn_engine_hkpn_input_kernel[_preset_1]): encoder 0's fields 144 bytes earlier
+INPUTS_CNN = {'color': 16, 'motion': 24, 'normals': 40, 'roughness': 48, 'diffuse': 88, 'specular': 96, 'depth': 368}
+OPTIONAL_CNN = {'hitdistance': 104, 'disocclusion': 152}
+
+
+def preset_cnn(cap, o):
+    lines = []
+    for f in range(1, o.frames + 1):
+        a = cap.find('hkpn_input', f).args
+        images = {i.offset: i for i in cap.find('hkpn_input', f).images}
+        u32 = lambda off: struct.unpack_from('<I', a, off)[0]
+        f32 = lambda off: struct.unpack_from('<f', a, off)[0]
+        mat = lambda off: np.array(struct.unpack_from('<16f', a, off), np.float64).reshape(4, 4)
+        rw, rh, ow, oh = u32(0), u32(4), u32(328), u32(332)
+        if f == 1:
+            lines.append(f'size {rw} {rh} {ow} {oh}')
+        for name, off in INPUTS_CNN.items():
+            (o.out / f'{f}-{name}.bin').write_bytes(images[off].path.read_bytes())
+        for name, off in OPTIONAL_CNN.items():
+            if off in images:
+                (o.out / f'{f}-{name}.bin').write_bytes(images[off].path.read_bytes())
+        clip = mat(516)
+        view = mat(452) @ np.linalg.inv(clip)
+        view[3, :3] = 0.0
+        reset = 1 if f == 1 or not o.no_reset else 0
+        values = ' '.join(f'{v:.9g}' for v in list(view.flatten()) + list(clip.flatten()))
+        flags = u32(384) | (a[836] << 1) | (a[222] << 2)   # inverted depth, hardware depth, packed roughness
+        lines.append(f'frame {f} {f32(176):.9g} {f32(180):.9g} {f32(200) * rw / ow:.9g} {f32(204) * rh / oh:.9g} 1 {reset} {flags} {values}')
+    (o.out / 'frames.txt').write_text('\n'.join(lines) + '\n')
+    print(f'{o.frames} preset A - C frames of {o.capture} in {o.out}')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('capture')
@@ -76,6 +108,8 @@ def main():
     lines = []
     if any(l.kernel == 'rr2_enc0_kernel' for l in cap.launches):
         return preset_f(cap, o)
+    if any('hkpn_input_kernel' in l.kernel for l in cap.launches):
+        return preset_cnn(cap, o)
     for f in range(1, o.frames + 1):
         enc0 = cap.find('swin_enc0', f)
         a = enc0.args

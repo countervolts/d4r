@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Replay one captured denoiser launch through ZLUDA on Linux (tools/replay_rr_launch.cpp) and compare it with the
-capture, like test_layer.py does for a stage shader.
+"""Replay one captured denoiser launch through ZLUDA (tools/replay_rr_launch.cpp) and compare it with the
+capture, like test_layer.py does for a stage shader. Linux loads ZLUDA's libcuda.so from --zluda and ROCm from
+--rocm; Windows loads ZLUDA's nvcuda.dll from --zluda and HIP from the AMD driver.
 
-usage: zluda_replay.py CAPTURE KERNEL FRAME WORK [--ptx MODULE] [--zluda DIR]
+usage: zluda_replay.py CAPTURE KERNEL FRAME WORK [--ptx MODULE] [--zluda DIR] [--runner REPLAY_RR_LAUNCH]
 
 KERNEL and FRAME select the launch as in test_layer.py. MODULE defaults to the corpus module holding the kernel
 (~/.cache/d4r-rr-corpus); pass an edited copy to add debug stores. ZLUDA's own settings (D4R_ZLUDA_WMMA,
@@ -20,6 +21,9 @@ from rr_capture import Capture  # noqa: E402
 from test_layer import compare_arena, compare_image  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
+EXE = '.exe' if os.name == 'nt' else ''
+# scripts/build_*.sh output, then the CMake tools build (tools/CMakeLists.txt)
+RUNNERS = [ROOT / f'build/replay_rr_launch{EXE}', ROOT / f'build/tools/replay_rr_launch{EXE}']
 
 
 def main():
@@ -30,7 +34,8 @@ def main():
     ap.add_argument('work')
     ap.add_argument('--ptx')
     ap.add_argument('--zluda', default=os.path.expanduser('~/.cache/d4r-zluda-rr'))
-    ap.add_argument('--rocm', default='/opt/rocm/lib')
+    ap.add_argument('--rocm', default='/opt/rocm/lib', help='ROCm libraries (Linux only)')
+    ap.add_argument('--runner', type=Path, default=next((r for r in RUNNERS if r.exists()), RUNNERS[0]))
     ap.add_argument('--tex', action='append', default=[], metavar='OFFSET=FILE:W:H',
                     help='an RGBA32F texture for a handle the capture has no dump of (preset F pooled histories)')
     ap.add_argument('--pad', type=int, default=0, help='bytes of zeros appended to the arena (debug stores)')
@@ -82,9 +87,12 @@ def main():
             lines.append(f'surf {image.offset} {image.width} {image.height} {image.channels} {fmt} '
                          f'{work}/surf{image.offset}.bin')
     (work / 'manifest').write_text('\n'.join(lines) + '\n')
-    env = dict(os.environ, LD_LIBRARY_PATH=f'{o.zluda}:{o.rocm}:' + os.environ.get('LD_LIBRARY_PATH', ''))
+    if os.name == 'nt':
+        env = dict(os.environ, PATH=o.zluda + os.pathsep + os.environ.get('PATH', ''))
+    else:
+        env = dict(os.environ, LD_LIBRARY_PATH=f'{o.zluda}:{o.rocm}:' + os.environ.get('LD_LIBRARY_PATH', ''))
     print(f'{launch.kernel} (launch {launch.sequence}) through ZLUDA {o.zluda}')
-    r = subprocess.run([str(ROOT / 'build/replay_rr_launch'), module, launch.kernel, str(work / 'manifest')],
+    r = subprocess.run([str(o.runner), module, launch.kernel, str(work / 'manifest')],
                        env=env, capture_output=True, text=True)
     sys.stdout.write(r.stdout)
     if r.returncode:

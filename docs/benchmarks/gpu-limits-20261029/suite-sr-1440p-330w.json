@@ -1,0 +1,899 @@
+{
+ "geometry": [
+  1280,
+  720,
+  2560,
+  1440
+ ],
+ "group": "sr",
+ "cadence": {
+  "sr": {
+   "frames": 4,
+   "warmup_evaluations": 48,
+   "timed_evaluations": 100
+  },
+  "rr": {
+   "entries": 140,
+   "warmup": 40,
+   "measured": 100
+  }
+ },
+ "runs": [
+  {
+   "case": "sr-m",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 1.34402,
+   "min_ms": 1.301,
+   "p10_ms": 1.3146,
+   "p90_ms": 1.37344,
+   "stages_us": {
+    "exposure": 15.9,
+    "input": 88.1,
+    "network": 857.4,
+    "expansion": 65.5,
+    "reconstruction": 245.5,
+    "downsample": 72.2
+   },
+   "wall_s": 0.95,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1653.0,
+     "min": 1590.0,
+     "max": 3088.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 61.0,
+     "min": 53.0,
+     "max": 303.0
+    },
+    "junction_c": {
+     "median": 40.0,
+     "min": 39.0,
+     "max": 59.0
+    },
+    "busy_percent": {
+     "median": 15,
+     "min": 11,
+     "max": 85
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 1.2642,
+   "min_ms": 1.23652,
+   "p10_ms": 1.24572,
+   "p90_ms": 1.28696,
+   "stages_us": {
+    "exposure": 15.8,
+    "input": 87.8,
+    "network": 780.4,
+    "expansion": 64.8,
+    "reconstruction": 243.5,
+    "downsample": 71.4
+   },
+   "wall_s": 0.92,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1615.0,
+     "min": 1591.0,
+     "max": 3056.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 55.0,
+     "min": 53.0,
+     "max": 315.0
+    },
+    "junction_c": {
+     "median": 40.0,
+     "min": 39.0,
+     "max": 57.0
+    },
+    "busy_percent": {
+     "median": 15,
+     "min": 11,
+     "max": 82
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "hip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 1.513805,
+   "min_ms": 1.43514,
+   "p10_ms": 1.4857,
+   "p90_ms": 1.61868,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 90.0,
+    "network": 954.3,
+    "expansion": 68.0,
+    "reconstruction": 246.8,
+    "downsample": 72.8
+   },
+   "wall_s": 0.99,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2345.0,
+     "min": 1667.0,
+     "max": 3103.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 59.0,
+     "min": 53.0,
+     "max": 290.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 39.0,
+     "max": 58.0
+    },
+    "busy_percent": {
+     "median": 13,
+     "min": 10,
+     "max": 84
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 1.95488,
+   "min_ms": 1.90344,
+   "p10_ms": 1.93372,
+   "p90_ms": 1.99044,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 395.2,
+    "network": 850.1,
+    "expansion": 330.3,
+    "reconstruction": 292.7,
+    "downsample": 71.6
+   },
+   "wall_s": 1.03,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1940.5,
+     "min": 1617.0,
+     "max": 3087.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 111.5,
+     "min": 54.0,
+     "max": 345.0
+    },
+    "junction_c": {
+     "median": 43.0,
+     "min": 38.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 37.5,
+     "min": 14,
+     "max": 89
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 1.91104,
+   "min_ms": 1.84728,
+   "p10_ms": 1.88124,
+   "p90_ms": 1.93984,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 408.8,
+    "network": 779.8,
+    "expansion": 340.4,
+    "reconstruction": 295.2,
+    "downsample": 72.0
+   },
+   "wall_s": 1.03,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1667.5,
+     "min": 1624.0,
+     "max": 3023.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 63.5,
+     "min": 53.0,
+     "max": 357.0
+    },
+    "junction_c": {
+     "median": 40.0,
+     "min": 38.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 20.5,
+     "min": 11,
+     "max": 88
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "hip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 2.145885,
+   "min_ms": 2.08936,
+   "p10_ms": 2.10903,
+   "p90_ms": 2.27609,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 406.1,
+    "network": 954.4,
+    "expansion": 338.6,
+    "reconstruction": 292.3,
+    "downsample": 71.6
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2547.0,
+     "min": 1663.0,
+     "max": 3095.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 124.0,
+     "min": 53.0,
+     "max": 339.0
+    },
+    "junction_c": {
+     "median": 40.5,
+     "min": 39.0,
+     "max": 67.0
+    },
+    "busy_percent": {
+     "median": 40.5,
+     "min": 9,
+     "max": 87
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 1.33372,
+   "min_ms": 1.29368,
+   "p10_ms": 1.31172,
+   "p90_ms": 1.36428,
+   "stages_us": {
+    "exposure": 16.0,
+    "input": 87.9,
+    "network": 847.2,
+    "expansion": 65.5,
+    "reconstruction": 243.8,
+    "downsample": 72.6
+   },
+   "wall_s": 0.91,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1511.0,
+     "min": 1490.0,
+     "max": 3076.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 55.0,
+     "min": 53.0,
+     "max": 306.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 38.0,
+     "max": 60.0
+    },
+    "busy_percent": {
+     "median": 15,
+     "min": 13,
+     "max": 85
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vulkan-trial1 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "hip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 2.21732,
+   "min_ms": 2.09348,
+   "p10_ms": 2.1304,
+   "p90_ms": 3.44568,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 406.4,
+    "network": 1020.7,
+    "expansion": 341.9,
+    "reconstruction": 294.7,
+    "downsample": 71.4
+   },
+   "wall_s": 1.23,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2686.0,
+     "min": 2074.0,
+     "max": 3123.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 225.0,
+     "min": 63.0,
+     "max": 297.0
+    },
+    "junction_c": {
+     "median": 48.0,
+     "min": 39.0,
+     "max": 65.0
+    },
+    "busy_percent": {
+     "median": 81,
+     "min": 13,
+     "max": 92
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-hip-trial1 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 1.90868,
+   "min_ms": 1.87132,
+   "p10_ms": 1.88308,
+   "p90_ms": 1.93204,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 406.5,
+    "network": 778.6,
+    "expansion": 340.2,
+    "reconstruction": 294.0,
+    "downsample": 71.2
+   },
+   "wall_s": 1.05,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1757.0,
+     "min": 1696.0,
+     "max": 3079.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 77.0,
+     "min": 57.0,
+     "max": 343.0
+    },
+    "junction_c": {
+     "median": 39.5,
+     "min": 39.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 33.0,
+     "min": 19,
+     "max": 91
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vkhip-trial1 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 1.9519,
+   "min_ms": 1.90952,
+   "p10_ms": 1.92564,
+   "p90_ms": 2.00312,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 398.0,
+    "network": 843.8,
+    "expansion": 331.5,
+    "reconstruction": 293.7,
+    "downsample": 71.0
+   },
+   "wall_s": 1.07,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1704.5,
+     "min": 1691.0,
+     "max": 3073.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 66.5,
+     "min": 57.0,
+     "max": 325.0
+    },
+    "junction_c": {
+     "median": 40.0,
+     "min": 39.0,
+     "max": 65.0
+    },
+    "busy_percent": {
+     "median": 31.0,
+     "min": 19,
+     "max": 92
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vulkan-trial1 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "hip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 1.52894,
+   "min_ms": 1.44146,
+   "p10_ms": 1.48999,
+   "p90_ms": 2.68134,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 90.0,
+    "network": 961.1,
+    "expansion": 68.2,
+    "reconstruction": 246.7,
+    "downsample": 73.9
+   },
+   "wall_s": 1.04,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2791.5,
+     "min": 2138.0,
+     "max": 3099.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 101.5,
+     "min": 66.0,
+     "max": 284.0
+    },
+    "junction_c": {
+     "median": 44.0,
+     "min": 39.0,
+     "max": 59.0
+    },
+    "busy_percent": {
+     "median": 33.0,
+     "min": 19,
+     "max": 86
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-hip-trial1 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 1.26702,
+   "min_ms": 1.24264,
+   "p10_ms": 1.25368,
+   "p90_ms": 1.28796,
+   "stages_us": {
+    "exposure": 16.2,
+    "input": 89.8,
+    "network": 778.3,
+    "expansion": 65.6,
+    "reconstruction": 244.3,
+    "downsample": 72.1
+   },
+   "wall_s": 0.94,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1925.0,
+     "min": 1852.0,
+     "max": 3067.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 62.0,
+     "min": 57.0,
+     "max": 301.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 38.0,
+     "max": 60.0
+    },
+    "busy_percent": {
+     "median": 26,
+     "min": 16,
+     "max": 89
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vkhip-trial1 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "hip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 1.554185,
+   "min_ms": 1.46874,
+   "p10_ms": 1.48814,
+   "p90_ms": 2.70457,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 89.8,
+    "network": 987.8,
+    "expansion": 68.1,
+    "reconstruction": 247.2,
+    "downsample": 73.5
+   },
+   "wall_s": 1.39,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2803.0,
+     "min": 1857.0,
+     "max": 3110.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 67.0,
+     "min": 58.0,
+     "max": 284.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 38.0,
+     "max": 57.0
+    },
+    "busy_percent": {
+     "median": 20,
+     "min": 16,
+     "max": 86
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-hip-trial2 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 1.96282,
+   "min_ms": 1.91528,
+   "p10_ms": 1.93472,
+   "p90_ms": 2.01016,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 396.0,
+    "network": 864.1,
+    "expansion": 327.3,
+    "reconstruction": 290.4,
+    "downsample": 71.3
+   },
+   "wall_s": 1.12,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1857.0,
+     "min": 1852.0,
+     "max": 3106.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 61.0,
+     "min": 57.0,
+     "max": 340.0
+    },
+    "junction_c": {
+     "median": 39.5,
+     "min": 38.0,
+     "max": 67.0
+    },
+    "busy_percent": {
+     "median": 24.5,
+     "min": 20,
+     "max": 92
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vulkan-trial2 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 1.90518,
+   "min_ms": 1.87328,
+   "p10_ms": 1.88544,
+   "p90_ms": 1.93044,
+   "stages_us": {
+    "exposure": 16.3,
+    "input": 405.8,
+    "network": 779.2,
+    "expansion": 340.2,
+    "reconstruction": 294.1,
+    "downsample": 72.3
+   },
+   "wall_s": 1.07,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1974.5,
+     "min": 1849.0,
+     "max": 3088.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 114.0,
+     "min": 58.0,
+     "max": 343.0
+    },
+    "junction_c": {
+     "median": 41.0,
+     "min": 39.0,
+     "max": 67.0
+    },
+    "busy_percent": {
+     "median": 58.5,
+     "min": 20,
+     "max": 93
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-vkhip-trial2 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-l",
+   "backend": "hip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 2.1361,
+   "min_ms": 2.07494,
+   "p10_ms": 2.10602,
+   "p90_ms": 3.23651,
+   "stages_us": {
+    "exposure": 16.4,
+    "input": 405.2,
+    "network": 949.6,
+    "expansion": 339.0,
+    "reconstruction": 292.1,
+    "downsample": 71.4
+   },
+   "wall_s": 1.12,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2747.0,
+     "min": 1993.0,
+     "max": 3114.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 89.0,
+     "min": 60.0,
+     "max": 326.0
+    },
+    "junction_c": {
+     "median": 42.0,
+     "min": 39.0,
+     "max": 65.0
+    },
+    "busy_percent": {
+     "median": 36.0,
+     "min": 16,
+     "max": 88
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-l-hip-trial2 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 1.3221,
+   "min_ms": 1.29596,
+   "p10_ms": 1.30252,
+   "p90_ms": 1.3572,
+   "stages_us": {
+    "exposure": 15.9,
+    "input": 89.2,
+    "network": 833.1,
+    "expansion": 66.4,
+    "reconstruction": 244.8,
+    "downsample": 72.0
+   },
+   "wall_s": 0.94,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1708.0,
+     "min": 1693.0,
+     "max": 3070.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 66.0,
+     "min": 52.0,
+     "max": 285.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 38.0,
+     "max": 55.0
+    },
+    "busy_percent": {
+     "median": 30,
+     "min": 14,
+     "max": 86
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vulkan-trial2 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  },
+  {
+   "case": "sr-m",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 1.26348,
+   "min_ms": 1.24216,
+   "p10_ms": 1.24892,
+   "p90_ms": 1.28928,
+   "stages_us": {
+    "exposure": 16.1,
+    "input": 89.4,
+    "network": 777.0,
+    "expansion": 65.7,
+    "reconstruction": 244.2,
+    "downsample": 71.0
+   },
+   "wall_s": 0.93,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 1709.0,
+     "min": 1705.0,
+     "max": 3060.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 57.0,
+     "min": 52.0,
+     "max": 299.0
+    },
+    "junction_c": {
+     "median": 39.0,
+     "min": 38.0,
+     "max": 59.0
+    },
+    "busy_percent": {
+     "median": 25,
+     "min": 10,
+     "max": 89
+    }
+   },
+   "note": [
+    "vkhip native layers"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs-330w/sr-m-vkhip-trial2 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+  }
+ ]
+}

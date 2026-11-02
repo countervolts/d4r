@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Tue, 27 Oct 2026 15:57:44 +0100
+Subject: [PATCH] Add Spoofing.ForceNvidia: DLSS through a replacement nvngx on
+ any GPU
+
+On native Windows, OptiScaler v10 asks NVAPI for the GPU architecture only
+when DXGI reports an NVIDIA adapter, and treats every other GPU as not DLSS
+capable: DLSS requests silently fall back to FSR 2.1.2 and Ray Reconstruction
+is rejected. Under Proton the GPU is reported as NVIDIA, so this only shows up
+natively.
+
+ForceNvidia=true (default false) keeps DLSS enabled at startup and marks the
+GPU as DLSS capable, so an explicitly configured NvngxPath (d4r's nvngx.dll)
+serves DLSS and DLSSD. Game quirks keep the real vendor, so AMD-only
+workarounds still apply.
+---
+ OptiScaler.ini                  | 4 ++++
+ OptiScaler/Config.cpp           | 2 ++
+ OptiScaler/Config.h             | 1 +
+ OptiScaler/dllmain.cpp          | 3 ++-
+ OptiScaler/misc/IdentifyGpu.cpp | 3 +++
+ 5 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index 9d044430..f204ecab 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -979,6 +979,10 @@ BlurStrength=auto
+ ; -------------------------------------------------------
+ [Spoofing]
+ ; -------------------------------------------------------
++; Treat the GPU as DLSS capable, for a replacement nvngx.dll that provides DLSS on other GPUs
++; true or false - Default (auto) is false
++ForceNvidia=auto
++
+ ; VendorID to spoof 
+ ; 0x10de = Nvidia | 0x8086 = Intel | 0x1002 = AMD
+ ; Integer value - Default (auto) is 0x10de 
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 224f3573..931ccbe2 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -694,6 +694,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         // Spoofing
+         {
+             DxgiSpoofing.set_from_config(readBool("Spoofing", "Dxgi"));
++            ForceNvidia.set_from_config(readBool("Spoofing", "ForceNvidia"));
+             DxgiFactoryWrapping.set_from_config(readBool("Spoofing", "DxgiFactoryWrapping"));
+             DxgiBlacklist.set_from_config(readString("Spoofing", "DxgiBlacklist"));
+             DxgiVRAM.set_from_config(readInt("Spoofing", "DxgiVRAM"));
+@@ -1514,6 +1515,7 @@ bool Config::SaveIni()
+     // Spoofing
+     {
+         ini.SetValue("Spoofing", "Dxgi", GetBoolValue(Instance()->DxgiSpoofing.value_for_config()).c_str());
++        ini.SetValue("Spoofing", "ForceNvidia", GetBoolValue(Instance()->ForceNvidia.value_for_config()).c_str());
+         ini.SetValue("Spoofing", "DxgiFactoryWrapping",
+                      GetBoolValue(Instance()->DxgiFactoryWrapping.value_for_config()).c_str());
+         ini.SetValue("Spoofing", "DxgiBlacklist", Instance()->DxgiBlacklist.value_for_config_or("auto").c_str());
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 87072dbf..872da43e 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -520,6 +520,7 @@ class Config
+ 
+     // Spoofing
+     CustomOptional<bool, SoftDefault> DxgiSpoofing { true };
++    CustomOptional<bool> ForceNvidia { false }; // treat the GPU as DLSS capable (DLSS through a replacement nvngx)
+     CustomOptional<bool> DxgiFactoryWrapping { false };
+     CustomOptional<bool, SoftDefault> StreamlineSpoofing { true };
+     CustomOptional<std::string, NoDefault> DxgiBlacklist; // disabled by default
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index c738e4e6..dc8817e3 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1756,7 +1756,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             State::Instance().NVNGX_DLSSG_Path = Util::FindFilePath(exePath, "nvngx_dlssg.dll");
+ 
+         // Not 100% accurate for Nvidia cards without DLSS
+-        if (Config::Instance()->DLSSEnabled.value_or_default() && possibleNvidia)
++        if (Config::Instance()->DLSSEnabled.value_or_default() &&
++            (possibleNvidia || Config::Instance()->ForceNvidia.value_or_default()))
+         {
+             if (State::Instance().NVNGX_DLSS_Path.has_value())
+             {
+diff --git a/OptiScaler/misc/IdentifyGpu.cpp b/OptiScaler/misc/IdentifyGpu.cpp
+index 25d2d19e..927e604d 100644
+--- a/OptiScaler/misc/IdentifyGpu.cpp
++++ b/OptiScaler/misc/IdentifyGpu.cpp
+@@ -185,6 +185,9 @@ std::vector<GpuInformation> IdentifyGpu::checkGpuInfo()
+                     State::Instance().activeFgNvngx = FGNvngxReplacement::None;
+             }
+         }
++
++        if (Config::Instance()->ForceNvidia.value_or_default() && Config::Instance()->DLSSEnabled.value_or_default())
++            gpuInfo.dlssCapable = true;
+     }
+ 
+     return localCachedInfo;

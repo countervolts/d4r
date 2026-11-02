@@ -88,6 +88,16 @@ DEV void d4r_enc0_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint32_t dimx,
             for (int i = 0; i < 8; ++i)
                 cf[i] = (float)acc[i];
         }
+#ifdef D4R_TEX_HW_E4M3
+        // cf holds the f16 results as f32; the clamp to the f16 +-2pi bounds is the same in f32 (median of
+        // three: a NaN gives the lower bound, as maximumnum / minimumnum do), and keeps the conversion in range
+        const float bound = (float)hi[0];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            cf[i] = __builtin_amdgcn_fmed3f(cf[i], -bound, bound);
+        E[p][0] = e4m3x4_f32(cf[0], cf[1], cf[2], cf[3]);
+        E[p][1] = e4m3x4_f32(cf[4], cf[5], cf[6], cf[7]);
+#else
         uint32_t codes[4];
 #pragma unroll
         for (int k = 0; k < 4; ++k)
@@ -98,6 +108,7 @@ DEV void d4r_enc0_tail(uint32_t smem, uint64_t wp, uint64_t outp, uint32_t dimx,
         }
         E[p][0] = codes[0] | (codes[1] << 16);
         E[p][1] = codes[2] | (codes[3] << 16);
+#endif
     }
 
     // plane pl, word 4 j + q = columns 2q, 2q + 1 of tile (2 pl, j) then of tile (2 pl + 1, j) (tile (p, j) =

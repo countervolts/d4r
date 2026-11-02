@@ -6,8 +6,13 @@
 // Shared memory stays at 4 KiB, above which this GPU runs fewer waves (engine/rr/README.md). The arithmetic is
 // rr2_m.comp's with -DRR_RELAXED=2 -DRR_NATIVE and the arena comes out byte-identical to that build
 // (build/rr/f/nv/invest-20261013/REPORT.md: 453 us against 581 us at 1280x720). compile_rr2.py uses it for dec0_0.
-// KIND 4 is encoder 0's block the same way (the embedding of the gather pass's record, the tokens, the guide head to
-// HD), included with RR2_EMBED and RR2_XF_ARENA by the shader engine/rr/gen_rr2_enc0.py --one-wave generates.
+// KIND 4 is encoder 0's block the same way (the embedding of the gather's features, the tokens, the guide head to
+// HD), included with RR2_EMBED by the shader engine/rr/gen_rr2_enc0.py --one-wave generates: with RR2_XF_SHARED the
+// gather runs in the same shader and leaves the features in XF (the default), with RR2_XF_ARENA they come from the
+// gather pass's record in the arena (--split block).
+// KIND 5 is decoder 0's second kernel the same way (gen_rr2_enc0.py --dec0_1 --one-wave): its tokens from the arena,
+// the block, and r and the MLP sum handed to the translated tail on the same wave through shared memory, half the
+// window's tokens at a time (rr2_handoff), so that the shader still declares 4 KiB.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -23,11 +28,14 @@ layout(local_size_x = 32) in;
 #endif
 #include "rr2_stage.h"
 #include "rr_exact.glsl"
-#if !(KIND == 2 || KIND == 4) || CM != 0 || GUIDE != 0 || C != 32
-#error rr2_w.comp: a 32-channel decoder's first kernel, or encoder 0's block
+#if !(KIND == 2 || KIND == 4 || KIND == 5) || CM != 0 || GUIDE != 0 || C != 32
+#error rr2_w.comp: a 32-channel decoder's first kernel, encoder 0's block or decoder 0's second kernel
 #endif
-#if KIND == 4 && !(defined(RR2_EMBED) && defined(RR2_XF_ARENA))
-#error rr2_w.comp: encoder 0's block reads the gather pass's record (gen_rr2_enc0.py --split block --one-wave)
+#if KIND == 5 && !defined(RR2_EMBED)
+#error rr2_w.comp: decoder 0's second kernel hands r and the MLP sum to the translated tail (gen_rr2_enc0.py --dec0_1)
+#endif
+#if KIND == 4 && !(defined(RR2_EMBED) && (defined(RR2_XF_ARENA) || defined(RR2_XF_SHARED)))
+#error rr2_w.comp: encoder 0's block reads the gather's features (gen_rr2_enc0.py --one-wave)
 #endif
 #define MT (C / 16)
 #ifdef RR2_EMBED
@@ -41,6 +49,7 @@ layout(set = 0, binding = 0, std430) readonly buffer ParamBlock { uint p[]; } pa
 layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
 layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
 layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
+layout(set = 0, binding = 1, std430) readonly buffer W32F { float w[]; } w32f;   // the biases' float32 copies ("_f")
 layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -53,11 +62,31 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); }
 #define Q8(dst, src) Q8PAIRS(dst, src)
-#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
+// The block is one wave: its lanes hand values to one another through shared memory (stores by some lanes, loads by
+// others). The memory model needs a subgroup barrier between them; RADV keeps a wave's shared-memory accesses in order
+// and emits nothing for it (aco_insert_waitcnt.cpp setup_barrier), other compilers may reorder without it.
+#define WAVE_SYNC subgroupMemoryBarrierShared();
 
+#if KIND == 4 && defined(RR2_XF_SHARED)
+// the gather's features (XF, [token slot][64 FP8 feature slots], 4 KiB) are all in registers before the block first
+// writes XT or KVS, so the three share 4 KiB: KVS words 0 - 511, XT words 512 - 1023
+shared uint XF[64 * 16];
+#define KVS XF
+#define XT XF
+#define XTA(o) (512u + (o))
+#elif KIND == 5
+// KVS words 0 - 511, XT words 512 - 1023; after the block the 4 KiB hold r and the MLP sum for half the tokens
+shared uint SM[1024];
+#define KVS SM
+#define XT SM
+#define XTA(o) (512u + (o))
+#else
 shared uint XT[16 * C];
 shared uint KVS[512];          // the expansion (input phase), then per head V^T, then QK
+#define XTA(o) (o)
+#endif
 // Shared memory is what limits how many waves this GPU keeps running: above about 4 KiB per wave the rate falls in
 // proportion (build/rr/f/nv/cost/occ2.py). So the input phase borrows KVS, which the attention only needs later
 // (LOW at word 0, EX at word 512), and the block's unquantised input stays in registers (xr), not in memory.
@@ -68,16 +97,28 @@ shared uint KVS[512];          // the expansion (input phase), then per head V^T
 #endif
 #define EX_AT 0u
 #if KIND == 4
+#ifdef RR2_XF_ARENA
 uint rr2_xf;                     // the window's record from the gather pass: the index of its first arena word
+#define XF_SRC arena.w
+#define XF_AT rr2_xf
+#else
+#define XF_SRC XF
+#define XF_AT 0u
+#endif
 shared float16_t HD[64 * 4];     // the guide head per token (raster order), for the translated tail
 const uint EBRANCH = W_EWD1 - W_EWD0;
+#endif
+
+#if KIND == 5
+uint rr2_r16[4][MT][4], rr2_m16[4][MT][4];   // r and the MLP sum as binary16 pairs per token slice and channel tile (rr2_handoff)
 #endif
 
 uint pack4(floate4m3_t a, floate4m3_t b, floate4m3_t c, floate4m3_t d)
 {
     return code(a) | (code(b) << 8u) | (code(c) << 16u) | (code(d) << 24u);
 }
-f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(u8vec2(uint8_t(w >> (16u*h)), uint8_t(w >> (16u*h+8u))))); }
+// (a half of unpack8(w): converted in place, see rr2_m.comp)
+f16vec2 e4pair(uint w, uint h) { return f16vec2(uintBitsToFloate4m3EXT(h == 0u ? unpack8(w).xy : unpack8(w).zw)); }
 float16_t e4(uint w, uint b) { return float16_t(uintBitsToFloate4m3EXT(uint8_t((w >> (8u * b)) & 0xffu))); }
 
 #ifdef RR2_EMBED
@@ -103,10 +144,13 @@ void main()
         B8 fb[4][4];
         ACC X[4][MT];
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
-            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], arena.w, rr2_xf + wv * 256u + 4u * kt, 16u, CMJ);
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], XF_SRC, XF_AT + wv * 256u + 4u * kt, 16u, CMJ);
             [[unroll]] for (uint m = 0u; m < MT; ++m)
-                [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = float(w16.w[W_EBU / 2u + 16u * m + 8u * hl + uint(i)]);
+                [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = w32f.w[W_EBU_F / 4u + 16u * m + 8u * hl + uint(i)];
         }
+#ifdef RR2_XF_SHARED
+        barrier();   // XF is read: XT and KVS take its place
+#endif
         [[unroll]] for (uint br = 0u; br < 2u; ++br) {
             A8 ewd[2][4], ewu0[MT], ewu1[MT];
             [[unroll]] for (uint c = 0u; c < 2u; ++c)
@@ -118,7 +162,7 @@ void main()
                 B8 Hb[2];
                 [[unroll]] for (uint c = 0u; c < 2u; ++c) {
                     ACC h;
-                    [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[(W_EBD0 + EBRANCH * br) / 2u + 16u * c + 8u * hl + uint(i)]);
+                    [[unroll]] for (int i = 0; i < 8; ++i) h[i] = w32f.w[(W_EBD0_F + EBRANCH * br) / 4u + 16u * c + 8u * hl + uint(i)];
                     [[unroll]] for (uint kt = 0u; kt < 4u; kt += 2u) K32(h, ewd[c][kt], fb[wv][kt], ewd[c][kt + 1u], fb[wv][kt + 1u])
                     ACT8(Hb[c], h)
                 }
@@ -128,9 +172,20 @@ void main()
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
             [[unroll]] for (uint m = 0u; m < MT; ++m) {
                 Q8(qx[wv][m], X[wv][m])
-                coopMatStore(qx[wv][m], XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
+                coopMatStore(qx[wv][m], XT, XTA(wv * 4u * C + 4u * m), C / 4u, CMJ);
             }
+        WAVE_SYNC
     }
+#elif KIND == 5
+    // ---------------------------------------------------------------- the block's input: the window's 64 tokens from the
+    // arena, two per lane ([token slot][C FP8 channels in slot order], as rr2_m.comp's XT)
+    for (uint tk = lane; tk < 64u; tk += 32u) {
+        const uint k = inter(tk);
+        const int xx = mirror(x0 + int(k & 7u), ex), yy = mirror(y0 + int(k >> 3u), ey);
+        const uint tb = (inOff + uint(yy * ex + xx) * 32u) / 4u;
+        [[unroll]] for (uint wd = 0u; wd < C / 4u; ++wd) XT[XTA(tk * (C / 4u) + wd)] = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
+    }
+    barrier();
 #else
     // ---------------------------------------------------------------- the block's input: expansion plus skip
     float16_t xr[4][MT][8];   // this lane's part of x for each token slice: [slice][channel tile][element]
@@ -141,11 +196,12 @@ void main()
             const int X = mirror(X0 + int(r & 3u), hx), Y = mirror(Y0 + int(r >> 2u), hy);
             XT[i] = arena.w[(inOff + (wd >> 3u) * lplane + uint(Y * hx + X) * 32u) / 4u + (wd & 7u)];
         }
+        WAVE_SYNC
         B8 lb[CL / 16];
         [[unroll]] for (uint kt = 0u; kt < CL / 16; ++kt) coopMatLoad(lb[kt], XT, 4u * kt, CL / 4u, CMJ);
         for (uint m = 0u; m < 4u * MT; ++m) {
             ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = w32f.w[W_BE_F / 4u + 16u * m + 8u * hl + uint(i)];
             [[unroll]] for (uint kt = 0u; kt < CL / 16; kt += 2u) {
                 A8 w0, w1;
                 LDA(w0, W_WE, CL, m, kt); LDA(w1, W_WE, CL, m, kt + 1u);
@@ -155,6 +211,7 @@ void main()
             Q8(q, a)
             coopMatStore(q, KVS, EX_AT + 4u * m, C, CMJ);
         }
+        WAVE_SYNC
         // the same x for the residual step, in this lane's own layout (token slot 16 wv + col, channel slots
         // 16 m + 8 hl + i = bytes of the words 4 m + 2 hl and 4 m + 2 hl + 1)
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
@@ -180,6 +237,7 @@ void main()
                 coopMatStore(q, XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
             }
         }
+        WAVE_SYNC
     }
 #endif
 
@@ -187,8 +245,9 @@ void main()
     ACC AT[4][MT];
     [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
         [[unroll]] for (uint m = 0u; m < MT; ++m)
-            [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = float(w16.w[W_BO / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) AT[wv][m][i] = w32f.w[W_BO_F / 4u + 16u * m + 8u * hl + uint(i)];
     [[unroll]] for (uint hd = 0u; hd < NH; ++hd) {
+        WAVE_SYNC
         // V^T of every token tile first: stored, read back as the product's A operands, then QK takes its place
         A8 kt0[4], kt1[4], v0[2][2], v1[2][2], wo0[MT], wo1[MT];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
@@ -198,8 +257,8 @@ void main()
                 ACC v = ACC(0.0);
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                     A8 xa0, xa1;
-                    coopMatLoad(xa0, XT, n * 4u * C + 4u * kt, C / 4u, RM);
-                    coopMatLoad(xa1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, RM);
+                    coopMatLoad(xa0, XT, XTA(n * 4u * C + 4u * kt), C / 4u, RM);
+                    coopMatLoad(xa1, XT, XTA(n * 4u * C + 4u * kt + 4u), C / 4u, RM);
                     K32(v, xa0, wvt[kt], xa1, wvt[kt + 1u])
                 }
                 A8 va;
@@ -207,11 +266,13 @@ void main()
                 coopMatStore(va, KVS, c * 256u + 4u * n, 16u, RM);
             }
         }
+        WAVE_SYNC
         [[unroll]] for (uint c = 0u; c < 2u; ++c)
             [[unroll]] for (uint ks = 0u; ks < 2u; ++ks) {
                 coopMatLoad(v0[c][ks], KVS, c * 256u + 8u * ks, 16u, RM);
                 coopMatLoad(v1[c][ks], KVS, c * 256u + 8u * ks + 4u, 16u, RM);
             }
+        WAVE_SYNC
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
             A8 wk[MT];
             [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wk[kt], W_WQK0 + HEAD * hd, C, c, kt);
@@ -219,8 +280,8 @@ void main()
                 ACC a = ACC(0.0);
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                     B8 xb0, xb1;
-                    coopMatLoad(xb0, XT, n * 4u * C + 4u * kt, C / 4u, CMJ);
-                    coopMatLoad(xb1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, CMJ);
+                    coopMatLoad(xb0, XT, XTA(n * 4u * C + 4u * kt), C / 4u, CMJ);
+                    coopMatLoad(xb1, XT, XTA(n * 4u * C + 4u * kt + 4u), C / 4u, CMJ);
                     K32(a, wk[kt], xb0, wk[kt + 1u], xb1)
                 }
                 A8 ka;
@@ -228,6 +289,7 @@ void main()
                 coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
             }
         }
+        WAVE_SYNC
         [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
             coopMatLoad(kt0[kt], KVS, kt * 128u, 8u, RM);
             coopMatLoad(kt1[kt], KVS, kt * 128u + 4u, 8u, RM);
@@ -239,8 +301,9 @@ void main()
         B8 allQ[4][2];
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
             [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(allQ[wv][c], KVS, wv * 128u + 4u * c, 8u, CMJ);
+        WAVE_SYNC
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
-            if (wv == 2u) memoryBarrierShared();
+            if (wv == 2u) { memoryBarrierShared(); WAVE_SYNC }
             B8 Pb[4];
             {
                 float16_t e[4][8];
@@ -251,9 +314,9 @@ void main()
                         coopMatLoad(cached, KVS, (wv - 2u) * 256u + kt * 8u, 16u, CMJ);
                         [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = cached[i];
                     } else {
-                        HAC c;
-                        coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
-                        ACC p_ = coopMatMulAdd(kt1[kt], allQ[wv][1], coopMatMulAdd(kt0[kt], allQ[wv][0], ACC(c)));
+                        ACC c;   // the bias tile's float32 copy, [key tile][query tile] column-major (rr2_pack.py)
+                        coopMatLoad(c, w32f.w, (W_BIAS0_F + HEAD * hd) / 4u + (kt * 4u + wv) * 256u, 16u, CMJ);
+                        ACC p_ = coopMatMulAdd(kt1[kt], allQ[wv][1], coopMatMulAdd(kt0[kt], allQ[wv][0], c));
                         [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(float16_t(p_[i]))]));
                         if (wv < 2u && kt >= 2u) {
                             HAC cached;
@@ -304,18 +367,26 @@ void main()
             [[unroll]] for (int i = 0; i < 8; ++i) {
 #if KIND == 4
                 const float xb = float(qx[wv][m][i]);
+#elif KIND == 5
+                const uint xw = XT[XTA((16u * wv + col) * (C / 4u) + 4u * m + 2u * hl + (uint(i) >> 2u))];
+                const float xb = float(uintBitsToFloate4m3EXT(((uint(i) & 2u) == 0u ? unpack8(xw).xy : unpack8(xw).zw)[uint(i) & 1u]));
 #else
                 const float xb = float(xr[wv][m][i]);
 #endif
                 const float r = fma(AT[wv][m][i], f1, xb);
                 rv[wv][m][i] = r;
                 
-                ML[wv][m][i] = float(w16.w[W_BU / 2u + 16u * m + 8u * hl + uint(i)]);
+                ML[wv][m][i] = w32f.w[W_BU_F / 4u + 16u * m + 8u * hl + uint(i)];
             }
             Q8(Nb[wv][m], rv[wv][m])
+#if KIND == 5
+            // the tail takes r as binary16: converted here, so that the f32 values are not live across the MLP
+            [[unroll]] for (int i = 0; i < 8; i += 2)
+                rr2_r16[wv][m][i >> 1] = packFloat2x16(f16vec2(float16_t(rv[wv][m][i]), float16_t(rv[wv][m][i + 1])));
+#endif
         }
     [[unroll]] for (uint br = 0u; br < NB; ++br) {
-        const uint w1 = W_WD0 + BRANCH * br, b1 = W_BD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
+        const uint w1 = W_WD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
         A8 wd[2][MT], wu0[MT], wu1[MT];
         [[unroll]] for (uint c = 0u; c < 2u; ++c)
             [[unroll]] for (uint kt = 0u; kt < MT; ++kt) LDA(wd[c][kt], w1, C, c, kt);
@@ -324,7 +395,7 @@ void main()
             B8 Hb[2];
             [[unroll]] for (uint c = 0u; c < 2u; ++c) {
                 ACC h;
-                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = w32f.w[(W_BD0_F + BRANCH * br) / 4u + 16u * c + 8u * hl + uint(i)];
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(h, wd[c][kt], Nb[wv][kt], wd[c][kt + 1u], Nb[wv][kt + 1u])
                 ACT8(Hb[c], h)
             }
@@ -332,6 +403,14 @@ void main()
         }
     }
 
+#if KIND == 5
+    // ---------------------------------------------------------------- r and the MLP sum for the translated tail, which
+    // forms y = r + MLP * s2 itself (rr2_handoff)
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
+        [[unroll]] for (uint m = 0u; m < MT; ++m)
+            [[unroll]] for (int i = 0; i < 8; i += 2)
+                rr2_m16[wv][m][i >> 1] = packFloat2x16(f16vec2(float16_t(ML[wv][m][i]), float16_t(ML[wv][m][i + 1])));
+#else
     // ---------------------------------------------------------------- y = r + MLP * s2: the stage's tokens
 #if KIND == 4
     A8 wh[MT];
@@ -348,7 +427,8 @@ void main()
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             floate4m3_t Tb[8];
             [[unroll]] for (int i = 0; i < 8; i += 2) {
-                fe4m3vec2 q; saturatedConvertEXT(q, vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1])));
+                const vec2 y_ = vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]));
+                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(y_));
                 Tb[i] = q.x; Tb[i+1] = q.y;
             }
 #if KIND == 4
@@ -361,10 +441,37 @@ void main()
 #if KIND == 4
         {   // the guide head (rows 0-3 on lanes 0-15), for the translated tail
             ACC hv;
-            [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = float(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = w32f.w[W_BH_F / 4u + 8u * hl + uint(i)];
             [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) K32(hv, wh[kt], Tm[kt], wh[kt + 1u], Tm[kt + 1u])
             if (hl == 0u) [[unroll]] for (uint c = 0u; c < 4u; ++c) HD[t * 4u + c] = float16_t(hv[c]);
         }
 #endif
     }
+#endif
 }
+#if KIND == 5
+// r and the MLP sum of the window's tokens 32 phase ... 32 phase + 31 for the translated tail, as binary16 pairs of
+// natural channels 2k, 2k + 1 per token (r at word 0, the MLP sum at word 512): the layout rr2_m.comp KIND 5 hands all
+// 64 tokens over in, 8 KiB, which one wave cannot hold at the full rate (above). The tail takes the rows of each half
+// in turn (gen_rr2_enc0.py).
+void rr2_handoff(uint phase)
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint hl = lane >> 4u, col = lane & 15u;
+    barrier();   // the block, or the tail's reads of the previous half, are done with SM
+    [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
+        const uint t = inter(16u * wv + col);
+        if ((t >> 5u) == phase)
+            [[unroll]] for (uint m = 0u; m < MT; ++m)
+                [[unroll]] for (int i = 0; i < 8; i += 2) {
+                    const uint w = ((t & 31u) * 32u + inter(16u * m + 8u * hl + uint(i))) >> 1u;
+                    SM[w] = rr2_r16[wv][m][i >> 1];
+                    SM[512u + w] = rr2_m16[wv][m][i >> 1];
+                }
+    }
+    barrier();
+}
+// r and the MLP sum of token row, natural channel col (row in the half rr2_handoff wrote last)
+float16_t rr2_rsh(uint row, uint col) { return unpackFloat2x16(SM[(row & 31u) * 16u + (col >> 1u)])[col & 1u]; }
+float16_t rr2_msh(uint row, uint col) { return unpackFloat2x16(SM[512u + (row & 31u) * 16u + (col >> 1u)])[col & 1u]; }
+#endif

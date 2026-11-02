@@ -1,0 +1,28 @@
+diff --git a/libs/vkd3d-shader/vkd3d_shader_main.c b/libs/vkd3d-shader/vkd3d_shader_main.c
+index 39971d79..b24002b7 100644
+--- a/libs/vkd3d-shader/vkd3d_shader_main.c
++++ b/libs/vkd3d-shader/vkd3d_shader_main.c
+@@ -487,6 +487,13 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
+ 
+     pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+ 
++    /* d4r's engine shaders (entry point d4r_entry, built by its engine/hlsl_build.py from the GLSL that the
++     * Vulkan engine also compiles) use precise as GLSL does: it forbids contracting other arithmetic, while an
++     * explicit fma() (mad) stays fused. Splitting precise mad into mul + add would round differently from the
++     * Vulkan kernels and costs preset K's output stage about 80 us at 4K. */
++    if (entry && !strcmp(entry, "d4r_entry"))
++        quirks |= VKD3D_SHADER_QUIRK_PRECISE_FMA;
++
+     for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
+     {
+         if (vkd3d_shader_quirk_entries[i].lo <= shader_hash && vkd3d_shader_quirk_entries[i].hi >= shader_hash)
+@@ -542,7 +549,8 @@ uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
+     if (aux_quirks)
+         *aux_quirks = quirks;
+ 
+-    return quirk_hash ^ 1;
++    /* 2: d4r's d4r_entry PRECISE_FMA rule; caches from earlier builds hold split precise mad. */
++    return quirk_hash ^ 2;
+ }
+ 
+ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,

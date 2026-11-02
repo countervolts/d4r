@@ -13,11 +13,26 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
 #extension GL_GOOGLE_include_directive : require
 #include "output_store.glsl"
 #include "round_half.glsl"
+#include "input_quant.glsl"
+// Specialization constant 7 (set by the runtime per pipeline): the frame's colour and motion take the CUDA backend's
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
+// pipeline without it carries no conversion code for games whose textures are already in binary16.
+#ifdef D4R_HLSL
+#define CANONICAL_INPUT false   // no specialization constants: the D3D12 build reads the game's textures as they are
+#else
+layout(constant_id = 7) const bool CANONICAL_INPUT = true;
+#endif
 layout(local_size_x = 16, local_size_y = 16) in;
+// D4R_HLSL: the D3D12 build of this file (hlsl_build.py, dialect_hlsl.h); binding N is register tN/uN/sN there
+#ifdef D4R_HLSL
+struct Params
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Params
+#endif
 {
     vec2 out2rnd, rndOffs;          // render position = (pixel + .5) * out2rnd + rndOffs
     vec2 near2rnd, sub2rnd;         // the same scale for the nearest-texel lookup; for 2x sub-pixels
@@ -28,11 +43,35 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     int tokW, tokH;
     uint flags;                     // bit 0: reset; bit 1: regular depth (larger is farther), otherwise inverted;
                                     // bit 2: display-resolution motion (one vector per output pixel, no depth);
+                                    // bits 4, 5: canonical binary16 colour, motion (the pipeline's CANONICAL_INPUT);
                                     // bits 8..11: which of the model's reconstruction tables this frame uses
     float expo, expoRatio;          // exposure scale of this frame; previous / current
     float sharp, minAlpha, alphaThr;
     float lutScale, kA, kB, c184, c186;
-} p;
+}
+#ifdef D4R_HLSL
+;
+RWStructuredBuffer<Params> p_buf : register(u0);
+static Params p;
+#define D4R_HLSL_INIT_CALL p = p_buf[0];
+D4R_SAMPLER(colorTex, t1, s1)
+D4R_SAMPLER(histTex, t2, s2)
+D4R_SAMPLER(hiresTex, t3, s3)
+D4R_SAMPLER(motionTex, t4, s4)
+D4R_SAMPLER(depthTex, t5, s5)
+RWTexture2D<float4> histOut : register(u6);
+RWTexture2D<uint> hiresOut : register(u7);
+RWTexture2D<float4> tokOut : register(u8);
+RWTexture2D<FINAL_OUTPUT_TYPE> finalOut : register(u9);
+RWByteAddressBuffer head_b : register(u10);
+StructuredBuffer<uint4> lut_e : register(t11);
+struct HeadWords { RWByteAddressBuffer b; float16_t operator[](uint i) { return b.Load<float16_t>(i * 2u); } };
+struct Head { HeadWords h; };
+struct Lut { StructuredBuffer<uint4> e; };
+static const Head head = { { head_b } };    // from the resource itself: see coopmat_ags.hlsli
+static Lut lut = { lut_e };
+#else
+p;
 layout(set = 0, binding = 1) uniform sampler2D colorTex;      // render resolution, linear RGB + alpha
 layout(set = 0, binding = 2) uniform sampler2D histTex;       // output resolution: compressed Y, Co, Cg, alpha (bilinear)
 layout(set = 0, binding = 3) uniform sampler2D hiresTex;      // 2x output resolution: compressed luma
@@ -44,8 +83,12 @@ layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D tokOut;
 layout(set = 0, binding = 9, FINAL_OUTPUT_FORMAT) uniform writeonly image2D finalOut;
 layout(set = 0, binding = 10, std430) readonly buffer Head { float16_t h[]; } head;       // 40 values per token: 4 sub-blocks x 10
 layout(set = 0, binding = 11, std430) readonly buffer Lut { uvec4 e[]; } lut;
+#endif
 shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
 shared float tileD[576];
+#ifdef D4R_HLSL
+shared uint brightQuad[256];  // one flag per pixel of the 16x16 group (see "bright" below)
+#endif
 
 // LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no range compression
 #ifndef LDR
@@ -58,7 +101,7 @@ float expandK(float v) { return 1.0; }
 // The reference's constants and association (output_color_pack): rcp.approx(y + 1), or above 1000
 // rcp.approx(y) * (lg2.approx(fma(y, 9, 1)) * ln2 / 9 + 0xBC4FAE29). Its offset differs by 1.7e-5
 // relative from 0.012676, and folding ln2/9 into one constant moves the result a further ulp.
-float compressK(float L)       // L * compressK(L) maps [0, inf) to [0, 1): Reinhard below 1000, logarithmic above
+float compressKAny(float L)    // L * compressK(L) maps [0, inf) to [0, 1): Reinhard below 1000, logarithmic above
 {
     if (L < 1000.0)
         return 1.0 / (L + 1.0);
@@ -66,12 +109,26 @@ float compressK(float L)       // L * compressK(L) maps [0, inf) to [0, 1): Rein
                           + uintBitsToFloat(0xBC4FAE29u);
     return t / L;
 }
-float expandK(float v)         // v * expandK(v) is the inverse
+float expandKAny(float v)      // v * expandK(v) is the inverse
 {
     if (v < uintBitsToFloat(0x3F7FBE88u))
         return 1.0 / (1.0 - v);
     precise const float y = (v + uintBitsToFloat(0x3C4FAE29u)) * 9.0;
     return (exp2(y * uintBitsToFloat(0x3FB8AA3Bu)) - 1.0) / (9.0 * v);
+}
+// The compiler evaluates both sides of the functions above for every lane; the logarithmic side is for luma of
+// 1000 and above, so a wave whose lanes are all below it takes the Reinhard side alone (the same value per lane).
+float compressK(float L)
+{
+    if (subgroupAll(L < 1000.0))
+        return 1.0 / (L + 1.0);
+    return compressKAny(L);
+}
+float expandK(float v)
+{
+    if (subgroupAll(v < uintBitsToFloat(0x3F7FBE88u)))
+        return 1.0 / (1.0 - v);
+    return expandKAny(v);
 }
 #endif
 float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
@@ -81,9 +138,17 @@ ivec2 clampOrigin(ivec2 v, ivec2 origin, ivec2 hi)      // the reference's clamp
 }
 vec4 softIn(vec4 v) { return mix(0.99 + (v - 0.99) * 0.001, v, lessThan(v, vec4(0.99))); }      // stored luma -> working luma
 // Catmull-Rom weights of the four taps around a fraction t
+#ifdef D4R_ACCURACY
+// The PTX rounds the coefficient products and differences separately. Fusing them changes a filtered
+// history sample by a few f32 ulps, enough to cross a half-store boundary and feed subsequent frames.
+void crWeights(float t, precise out float w0, precise out float w1, precise out float w2, precise out float w3)
+{
+    precise const float t2 = t * t, t3 = t2 * t;
+#else
 void crWeights(float t, out float w0, out float w1, out float w2, out float w3)
 {
     const float t2 = t * t, t3 = t2 * t;
+#endif
     w0 = t2 - 0.5 * (t + t3);
     w1 = 1.5 * t3 - 2.5 * t2 + 1.0;
     w3 = 0.5 * (t3 - t2);
@@ -96,13 +161,26 @@ void crWeights(float t, out float w0, out float w1, out float w2, out float w3)
 struct CrAxis { float mid, split, s0, s1, s2, s3; };
 CrAxis crAxis(float w0, float w1, float w2, float w3, float mid)
 {
+#ifdef D4R_HLSL
+    const CrAxis c = {mid, 1.0 - mid, p.sharp * w0, p.sharp * (w1 - mid), p.sharp * (w2 - (1.0 - mid)), p.sharp * w3};
+    return c;
+#elif defined(D4R_ACCURACY)
+    precise const float split = 1.0 - mid, s0 = p.sharp * w0, s1 = p.sharp * (w1 - mid),
+                        s2 = p.sharp * (w2 - split), s3 = p.sharp * w3;
+    return CrAxis(mid, split, s0, s1, s2, s3);
+#else
     return CrAxis(mid, 1.0 - mid, p.sharp * w0, p.sharp * (w1 - mid), p.sharp * (w2 - (1.0 - mid)), p.sharp * w3);
+#endif
 }
 // One pass along one axis: the two middle taps are bilinear, the four sharpened taps are saturated, and
 // every term is the reference's own rounded product/fma.
 float crPass(float t0, float t1, float t2, float t3, CrAxis c)
 {
+#ifdef D4R_ACCURACY
+    precise float t = c.split * t2;
+#else
     float t = c.split * t2;
+#endif
     t = fma(c.mid, t1, t);
     t = fma(c.s0, clamp(t0, 0.0, 1.0), t);
     t = fma(c.s1, clamp(t1, 0.0, 1.0), t);
@@ -121,10 +199,11 @@ void main()
     const ivec2 t0 = ivec2(vec2(roundHalfAway(b0.x), roundHalfAway(b0.y)) - 4.0);
     const ivec2 t1 = ivec2(vec2(roundHalfAway(b1.x), roundHalfAway(b1.y)) + 4.0);
     const int tw = t1.x - t0.x + 1, th = t1.y - t0.y + 1;
-    for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256)
+    for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256) // rolled: the staged footprint varies per group
     {
         const ivec2 t = ivec2(i % tw, i / tw), g = t + t0;
-        const vec4 c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
+        const vec4 t0c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
+        const vec4 c = CANONICAL_INPUT ? canonicalHalf(t0c) : t0c;
         const vec3 rgb = max(c.rgb, 0.0);
         const float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
         const float L = p.expo * Y;
@@ -166,7 +245,8 @@ void main()
         }
         mvAt = ni + dsel;
     }
-    const vec2 mv = texelFetch(motionTex, clampOrigin(mvAt, p.mvOrigin, p.mvMax), 0).xy;
+    const vec2 mvt = texelFetch(motionTex, clampOrigin(mvAt, p.mvOrigin, p.mvMax), 0).xy;
+    const vec2 mv = CANONICAL_INPUT ? canonicalHalf(mvt) : mvt;
     const vec2 q = pc + p.mvScale * (mv + p.mvOffs);          // where this pixel was, in output pixels
     const vec2 qv = q * p.invOutValid;
     bool noHist = (p.flags & 1u) != 0u || qv.x < 0.0 || qv.x > 1.0 || qv.y < 0.0 || qv.y > 1.0;
@@ -179,7 +259,11 @@ void main()
         const vec2 fr = clamp(h - base, 0.0, 1.0);
         float x0, x1, x2, x3, y0, y1, y2, y3;
         crWeights(fr.x, x0, x1, x2, x3); crWeights(fr.y, y0, y1, y2, y3);
+#ifdef D4R_ACCURACY
+        precise const float mx = x1 / (x1 + x2), my = y1 / (y1 + y2);
+#else
         const float mx = x1 / (x1 + x2), my = y1 / (y1 + y2);
+#endif
         const vec2 ts = p.invOut * 0.5;
         // 5x5 texels T[col][row] from nine gathers (gather: x = (0,1), y = (1,1), z = (1,0), w = (0,0))
         vec4 g00 = textureGather(hiresTex, ts * (base + vec2(-0.5, -0.5)), 0);
@@ -242,7 +326,15 @@ void main()
     // ---------------------------------------------------------------- current colour, bilinear from the tile
     // Positions, weights and sums of this part are half floats, as in the reference: the filter below is sensitive
     // to where the samples sit, and half precision moves them by up to 1/64 texel.
+#ifdef D4R_ACCURACY
+    // As with the sub-pixel filter positions below, the reference rounds the global fma before subtracting
+    // the tile origin. Moving that subtraction into the fma changes columns on binary16 rounding ties.
+    precise const vec2 currentPos = fma(pc, p.out2rnd, p.rndOffs);
+    precise const vec2 currentLocal = currentPos - vec2(t0);
+    const f16vec2 u = f16vec2(currentLocal);
+#else
     const f16vec2 u = f16vec2(pc * p.out2rnd + p.rndOffs - vec2(t0));
+#endif
     const ivec2 ui = ivec2(floor(vec2(u)));
     const f16vec2 uf = clamp(u - f16vec2(ui), float16_t(0.0), float16_t(1.0)), ug = float16_t(1.0) - uf;
     const int ci = ui.y * 24 + ui.x;
@@ -253,8 +345,21 @@ void main()
     vec4 cur = vec4(curh);
     // "bright" over the 2x2 pixel quad: the lanes of a subgroup are the pixels of two rows, x + 16 * (y & 1)
     uint bright = cur.x > 0.8 ? 1u : 0u;
+    // RADV's vkd3d path uses the same linear 16x16 subgroup layout as GLSL.
+    // The builder enables its wave exchange explicitly; the Windows driver
+    // retains the shared-memory exchange below.
+#if defined(D4R_HLSL) && !D4R_OUTPUT_WAVE_BRIGHT
+    // Through shared memory instead: AMD's D3D12 compiler does not give WaveReadLaneAt with a per-lane index
+    // (subgroupShuffleXor in dialect_hlsl.h) the quad's lanes here, which left bright highlights on the
+    // non-bright reconstruction table (about twice as bright as NGX at HDR highlights, RX 9070 XT, 2026-10-23).
+    brightQuad[gl_LocalInvocationIndex] = bright;
+    barrier();
+    const uint qx = gl_LocalInvocationID.x, qy = gl_LocalInvocationID.y;
+    bright |= brightQuad[qy * 16u + (qx ^ 1u)] | brightQuad[(qy ^ 1u) * 16u + qx] | brightQuad[(qy ^ 1u) * 16u + (qx ^ 1u)];
+#else
     bright |= subgroupShuffleXor(bright, 16u);
     bright |= subgroupShuffleXor(bright, 1u);
+#endif
     // ---------------------------------------------------------------- 4. kernel-predicted luma filter
     const f16vec2 hm = f16vec2(head.h[hbase], head.h[hbase + 1u]);
     const f16vec2 m = f16vec2(vec2(hm) / vec2(float16_t(1.0) + abs(hm)));
@@ -277,11 +382,53 @@ void main()
     const float16_t cA = alongX ? u.y : u.x, cB = alongX ? u.x : u.y;
     const int stepB = alongX ? 1 : 24, stepA = alongX ? 24 : 1;
     const int a0 = int(floor(float(cA))) - 1;
-    // Every product and sum of the filter is rounded to half precision, as in the reference: with single precision
-    // the result differs visibly more (49 dB against 116 dB on the luma history of the test frames).
+    // The reference rounds each filter operation to half precision. Windows keeps
+    // the sums in f32: native half accumulation changes under AMD's Cyberpunk
+    // application profile and produces black speckles. Keeping f32 sums also avoids
+    // per-tap software half rounding; the final filtered luma is still rounded below.
+    // Geometry, exponents, weights and confidence retain their half precision.
+    // Where every exponent is below -12 the result is the tap with the largest exponent instead. The loop tracks
+    // that tap as it goes: a second pass over the taps, run only where the sum of weights allowed it, ran for most
+    // waves on a Steam Deck (one such pixel suffices) and cost 0.2 ms of 4.3 at 1080p.
+#if D4R_GAUSSIAN_CENTER
+    // D3D12 reconstruction: share one twelve-tap estimate at the centre of
+    // the four subpixels. The network, confidence and history remain per-subpixel.
+    const float16_t partA = float16_t(0.5 * (float(subA.x) + float(subA.w)));
+    const float16_t partB = float16_t(0.5 * (float(subB.x) + float(subB.w)));
+    float16_t sumY = float16_t(0.0), sumW = float16_t(0.0), eMax = float16_t(-60000.0), yMax = float16_t(0.0);
+    float16_t line = cB + (float16_t(a0) - cA) * slope;
+    for (int r = 0; r < 4; ++r)
+    {
+        const int bs = int(roundEven(float(line))) - 1;
+        const float16_t dA = float16_t(a0 + r) - partA;
+        float16_t db = float16_t(bs) - partB;
+        const float16_t cross = dA * e2;
+        float16_t lin = fma(db, cross, (dA * dA) * e0);
+        const int ti = (a0 + r) * stepA + bs * stepB;
+        for (int j = 0; j < 3; ++j)
+        {
+            // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
+            const float16_t E = fma(db * db, float16_t(e1), lin);
+            const float16_t w = exp2(E), Y = float16_t(tileC[ti + j * stepB].x);
+            sumY = fma(w, Y, sumY); sumW += w;
+            const bool gt = !(eMax > E);      // a later tap wins ties
+            eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
+            db += float16_t(1.0); lin += cross;
+        }
+        line += slope;
+    }
+    const float filtered = float(sumY) / float(sumW);
+    const float estimate = mix(filtered, float(yMax), (eMax < float16_t(-12.0)));
+    vec4 F = vec4(estimate);
+#else
+#if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
+    // Profile-independent sums; see the explanation above.
+    vec4 sumY = vec4(0.0), sumW = vec4(0.0);
+#else
     f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0);
-    const float16_t line0 = cB + (float16_t(a0) - cA) * slope;
-    float16_t line = line0;
+#endif
+    f16vec4 eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
+    float16_t line = cB + (float16_t(a0) - cA) * slope;
     for (int r = 0; r < 4; ++r)
     {
         const int bs = int(roundEven(float(line))) - 1;
@@ -293,38 +440,23 @@ void main()
         for (int j = 0; j < 3; ++j)
         {
             // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
-            const f16vec4 w = exp2(fma(db * db, f16vec4(e1), lin));
-            sumY = fma(w, f16vec4(tileC[ti + j * stepB].x), sumY); sumW += w;
+            const f16vec4 E = fma(db * db, f16vec4(e1), lin);
+            const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + j * stepB].x);
+#if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
+            sumY = fma(vec4(w), vec4(Y), sumY);
+            sumW += vec4(w);
+#else
+            sumY = fma(w, Y, sumY); sumW += w;
+#endif
+            const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
+            eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
             db += float16_t(1.0); lin += cross;
         }
         line += slope;
     }
     vec4 F = vec4(sumY) / vec4(sumW);
-    // Where every exponent is below -12 the result is the tap with the largest exponent instead. That needs all
-    // twelve weights below 2^-12, so the sum of weights rules it out for almost every pixel.
-    if (any(lessThan(sumW, f16vec4(12.5 / 4096.0))))
-    {
-        f16vec4 eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
-        line = line0;
-        for (int r = 0; r < 4; ++r)
-        {
-            const int bs = int(roundEven(float(line))) - 1;
-            const f16vec4 dA = float16_t(a0 + r) - subA;
-            f16vec4 db = float16_t(bs) - subB;
-            const f16vec4 cross = dA * e2;
-            f16vec4 lin = fma(db, cross, (dA * dA) * e0);
-            const int ti = (a0 + r) * stepA + bs * stepB;
-            for (int j = 0; j < 3; ++j)
-            {
-                const f16vec4 E = fma(db * db, f16vec4(e1), lin);
-                const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
-                eMax = mix(eMax, E, gt); yMax = mix(yMax, f16vec4(tileC[ti + j * stepB].x), gt);
-                db += float16_t(1.0); lin += cross;
-            }
-            line += slope;
-        }
-        F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
-    }
+    F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
+#endif
     // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads
     // it as an f16 value widened to f32 (dlss-0046 converts every lane with cvt.rn.f16.f32 before the
     // `fma bl, F - Hq, Hq` that forms N), and the normalisation and the low-exponent fallback also produce
@@ -342,9 +474,12 @@ void main()
         const f16vec4 sB = clamp(fma(dB, f16vec4(kB), f16vec4(4.5)), float16_t(0.0), float16_t(1.0));
         conf = fma(sA, f16vec4(e5), f16vec4(e6)) * sB;
     }
-    const float16_t hv = float16_t(f343), hv2 = float16_t(0.1) + float16_t(0.9) * hv;
+    // the reference rounds 0.9 * hv before adding 0.1 (mul.f16, add.f16): never fused
+    const float16_t hv = float16_t(f343);
+    precise const float16_t hv2 = float16_t(0.1) + float16_t(0.9) * hv;
     const float16_t lo = (hv - float16_t(p.c184)) * float16_t(p.c186), hi = (hv2 - float16_t(p.c184)) * float16_t(p.c186);
-    const float16_t avg = float16_t(0.25) * ((conf.x + conf.y) + (conf.z + conf.w));
+    // its packed halves add pairwise first: (c0 + c2) + (c1 + c3)
+    precise const float16_t avg = float16_t(0.25) * ((conf.x + conf.z) + (conf.y + conf.w));
     const float alphaC = float(clamp(fma(avg, hv2 - hi, hi), float16_t(0.0), float16_t(1.0)));
     const vec4 bl = vec4(clamp(fma(conf, f16vec4(hv - lo), f16vec4(lo)), float16_t(0.0), float16_t(1.0)));
     if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
@@ -360,7 +495,9 @@ void main()
     // the reference fuses the history product: fma(hc, 1 - alphaC, alphaC * cur)
     precise const vec3 C = fma(hc, vec3(1.0 - alphaC), alphaC * cur.xyz);
     precise const float Nm = 0.25 * (((N.x + N.y) + N.z) + N.w);
-    const vec2 chroma = C.yz / max(C.x, 1e-5) * Nm;
+    // the reference's association: (C.Co * rcp(max(C.Y, 1e-5))) * Nm
+    precise const float rY = 1.0 / max(C.x, 1e-5);
+    precise const vec2 chroma = (C.yz * rY) * Nm;
     {
         // history colour: chroma limited so that the RGB it stands for stays non-negative
         const float Y = max(Nm, 0.0);
@@ -375,17 +512,22 @@ void main()
     {
         // the reference multiplies by ginv(Nm) first and divides by the exposure afterwards; the other
         // association (ginv / exposure first) rounds differently before the RGB reconstruction
-        const vec3 ycc = vec3(Nm, chroma) * expandK(Nm) / p.expo;
-        imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(ycc.x + ycc.y - ycc.z, ycc.x + ycc.z, ycc.x - ycc.y - ycc.z, cur.a)));
+        // as the reference: rcp(exposure) * (v * ginv), then (Y + Co) - Cg, Y + Cg (its fma(Co, 0, Y) + Cg), (Y - Co) - Cg
+        precise const vec3 yg = vec3(Nm, chroma) * expandK(Nm);
+        precise const vec3 ycc = (1.0 / p.expo) * yg;
+        precise const vec3 rgb = vec3((ycc.x + ycc.y) - ycc.z, ycc.z + fma(ycc.y, 0.0, ycc.x), (ycc.x - ycc.y) - ycc.z);
+        imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(rgb, cur.a)));
     }
     // ---------------------------------------------------------------- per-token feature for the next frame's input stage
     if (pix.x < p.tokW && pix.y < p.tokH)
     {
         const uint tb = uint(pix.y * p.tokW + pix.x) * 40u;
-        precise vec4 ms;
-        for (uint s = 0u; s < 4u; ++s)
-            ms[s] = 0.2 * (float(head.h[tb + s * 10u + 3u]) + float(head.h[tb + s * 10u + 4u]) + float(head.h[tb + s * 10u + 5u])
-                         + float(head.h[tb + s * 10u + 6u]) + float(head.h[tb + s * 10u + 7u]));
+        // one precise vector, not filled per component: DXC (1.9, Shader Model 6.9) rejects a precise vector
+        // assigned element by element
+#define TOKEN_MEAN(s) 0.2 * (float(head.h[tb + s * 10u + 3u]) + float(head.h[tb + s * 10u + 4u]) + float(head.h[tb + s * 10u + 5u]) \
+                            + float(head.h[tb + s * 10u + 6u]) + float(head.h[tb + s * 10u + 7u]))
+        precise const vec4 ms = vec4(TOKEN_MEAN(0u), TOKEN_MEAN(1u), TOKEN_MEAN(2u), TOKEN_MEAN(3u));
+#undef TOKEN_MEAN
         // Match the native scalar FMA chain; dot() permits a different association at half-store boundaries.
         precise float norm = fma(ms.x, ms.x, ms.y * ms.y);
         norm = fma(ms.z, ms.z, norm);

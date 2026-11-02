@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Builds the drag-in release: a zip whose contents are extracted into the folder that holds a game's
 # main .exe, like an OptiScaler release. packaging/D4R_README.txt describes the result.
 #
 # usage: scripts/package_release.sh [OUT_DIR]          (default: dist/)
 #
 # Inputs (environment):
-#   D4R_OPTISCALER   OptiScaler release archive (.7z or .zip) or extracted folder (required; 0.9.4 tested)
+#   D4R_OPTISCALER   OptiScaler v10 archive (.7z/.zip) or extracted folder;
+#                    default: checksum-pinned packaging/optiscaler-release.json
+#   D4R_INSTALL_MODE proxy (default), or asi: add-on for an existing OptiScaler install
 #   D4R_DLSS_DLLS    colon-separated nvngx_dlss.dll files whose kernel code the native kernels accept
 #                    (required; only hashes of their PTX go into the release)
 #   D4R_ZLUDA_DIR    ZLUDA build with patches/zluda applied (libnvcuda.so)   default ~/.cache/d4r-zluda-current
@@ -14,44 +17,69 @@
 #   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
 #                                                                           default ~/.cache/d4r-rocm-runtime
 #   D4R_MAX_GLIBC     highest GLIBC ABI the Linux libraries may require     default 2.41
-#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201
+#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1030-gfx1036 (K and its hiluma kernels only),
+#                    gfx1100-gfx1103, gfx1200, gfx1201
 #                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
-#   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
+#   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: system SPDX or common-licenses copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
 #   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
 #   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
 #   D4R_BUILD_INFO    optional build-toolchain/provenance text to include in d4r/source/
+#   D4R_VERSION       optional nightly artifact version; stable packaging/VERSION is unchanged
 #   D4R_PACKAGE_KERNEL_JOBS  independent target builds at once (default 1)
-# The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
+# The zip contains texture kernels built from NVIDIA's PTX; redistributing
 # those is up to whoever publishes it (they are not covered by d4r's license):
-#   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
+#   D4R_BUNDLE_DLSS  local nvngx_dlss.dll for texture builds (pinned by install.sh in installer mode)
+#   D4R_BUNDLE_NGX   local _nvngx.dll (only required for D4R_BUNDLE_NVIDIA=1)
+#   D4R_BUNDLE_DLSSD optional nvngx_dlssd.dll to include for Ray Reconstruction (full variant only)
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
 #                    older builds
 #                    Accuracy texture sets go in accuracy/<target>/, built with D4R_PREFER_ACCURACY=1.
 #   D4R_ZLUDA_EMIT  d4r_emit from the patched ZLUDA build; required in full builds when an accuracy
 #                    texture set or L's unfolded texture variants are not supplied in D4R_BUNDLE_TEX.
-# D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
+#   D4R_BUNDLE_ENGINE  optional: the native engine's preset K model (the folder engine/compile_k.py wrote),
+#                    packaged as d4r/engine/k for d4r.ini [Engine]. Only d4r's shaders are taken from it: the
+#                    weights and reconstruction table are values read from NVIDIA's DLSS and are never packaged,
+#                    in any variant. Users produce them from their own nvngx_dlss.dll (engine/README.md).
+# D4R_BUNDLE_NVIDIA=installer (default) ships install.sh instead of NVIDIA DLLs, retaining texture kernels.
+# D4R_BUNDLE_NVIDIA=1 bundles both DLLs; =0 omits DLLs and texture kernels (nonvidia ZIP).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(realpath -m "${1:-$ROOT/dist}")"
-VERSION="$(cat "$ROOT/packaging/VERSION")"
-VARIANT=full
-[[ "${D4R_BUNDLE_NVIDIA:-1}" == 0 ]] && VARIANT=clean
+VERSION="${D4R_VERSION:-$(cat "$ROOT/packaging/VERSION")}"
+[[ "$VERSION" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo 'invalid D4R_VERSION' >&2; exit 2; }
+case "${D4R_BUNDLE_NVIDIA:-installer}" in
+  installer) VARIANT=installer ;;
+  1) VARIANT=full ;;
+  0) VARIANT=clean ;;
+  *) echo "D4R_BUNDLE_NVIDIA must be installer, 1 or 0" >&2; exit 2 ;;
+esac
 NAME="d4r-$VERSION"
 [[ "$VARIANT" == clean ]] && NAME="$NAME-nonvidia"
+INSTALL_MODE="${D4R_INSTALL_MODE:-proxy}"
+case "$INSTALL_MODE" in
+  proxy) ;;
+  asi) NAME="$NAME-asi" ;;
+  *) echo "D4R_INSTALL_MODE must be proxy or asi" >&2; exit 2 ;;
+esac
 STAGE="$OUT/$NAME"
 ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
 VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
-ARCHS="${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
-: "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
+ARCHS="${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
+if [[ "$INSTALL_MODE" == proxy ]]; then
+  D4R_OPTISCALER="${D4R_OPTISCALER:-$(python3 "$ROOT/scripts/fetch_optiscaler.py")}"
+fi
 : "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
 for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
   [[ -f "$f" ]] || { echo "missing $f (the ROCm runtime comes from scripts/fetch_rocm_runtime.sh)" >&2; exit 2; }
 done
+OPTISCALER_LICENSE="${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}"
+[[ -n "${D4R_OPTISCALER_LICENSE:-}" || -f "$OPTISCALER_LICENSE" ]] || OPTISCALER_LICENSE=/usr/share/common-licenses/GPL-3
+[[ -f "$OPTISCALER_LICENSE" ]] || { echo "missing OptiScaler GPL-3.0 license; set D4R_OPTISCALER_LICENSE to an existing file" >&2; exit 2; }
 
 # D4R_SKIP_BUILD=1 packages the shim and bridge already in build/ (e.g. the binaries that were tested)
 if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
@@ -65,6 +93,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # OptiScaler, as dxgi.dll with its INI preconfigured for d4r
+if [[ "$INSTALL_MODE" == proxy ]]; then
 if [[ -d "$D4R_OPTISCALER" ]]; then
   OPTI="$D4R_OPTISCALER"
 else
@@ -76,31 +105,21 @@ else
     *) echo "D4R_OPTISCALER must be a .7z, a .zip or a folder" >&2; exit 2 ;;
   esac
 fi
-cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
-python3 - "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini" <<'PY'
-import re, sys
-lines = open(sys.argv[1], encoding="utf-8", newline="").read().split("\n")  # keeps the file's line endings
-for setting in open(sys.argv[2], encoding="utf-8"):
-    setting = setting.strip()
-    if not setting or setting.startswith("#"):
-        continue
-    path, value = setting.split("=", 1)
-    section, key = path.split(".", 1)
-    start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
-    if start is None:
-        sys.exit(f"OptiScaler.ini has no [{section}]")
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
-    for i in range(start + 1, end):
-        if re.match(rf"{re.escape(key)}\s*=", lines[i]):
-            lines[i] = f"{key}={value}" + ("\r" if lines[i].endswith("\r") else "")
-            break
-    else:
-        sys.exit(f"OptiScaler.ini has no {key} in [{section}]")
-open(sys.argv[3], "w", encoding="utf-8", newline="").write("\n".join(lines))
-PY
+python3 "$ROOT/scripts/stage_optiscaler.py" "$OPTI" "$STAGE"
+else
+  cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
+  # Same NGX exports and implementation, delivered through the ASI loader.
+  # A custom plugin path requires placing this file in that existing folder.
+  cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r.asi"
+fi
 
 # d4r-patched vkd3d-proton: same-frame DLSS results
-cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
+if [[ "$INSTALL_MODE" == asi ]]; then
+  python3 "$ROOT/scripts/private_d3d12_core.py" "$VKD3D/d3d12.dll" "$STAGE/d4r/d3d12.dll"
+  cp "$VKD3D/d3d12core.dll" "$STAGE/d4r/d4r12core.dll"
+else
+  cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
+fi
 
 # d4r itself
 cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
@@ -111,107 +130,56 @@ cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
   "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
-if [[ "$VARIANT" == full ]]; then
-  : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
-  cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
-  cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+cp "$ROOT/packaging/d4r-features.py" "$STAGE/d4r/d4r-features.py"
+# Legacy ASI installs may still use OptiScaler 0.9's external latency router.
+if [[ "$INSTALL_MODE" == asi ]]; then
+  cp "$ROOT/build/d4r_nvapi64.dll" "$STAGE/d4r/d4r_nvapi64.dll"
+fi
+# AMD FSR Ray Regeneration 1.2 for [RayReconstruction] Backend = fsr: AMD's unmodified denoiser DLL (MIT)
+if [[ -n "${D4R_BUNDLE_FSR_RR_DLL:-}" ]]; then
+  cp "$D4R_BUNDLE_FSR_RR_DLL" "$STAGE/d4r/amd_fidelityfx_denoiser_dx12.dll"
+  cp "$ROOT/third_party/fidelityfx/LICENSE.txt" "$STAGE/d4r/licenses/FidelityFX-LICENSE.txt"
+fi
+if [[ "$VARIANT" != clean ]]; then
+  : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
+  if [[ "$VARIANT" == full ]]; then
+    cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
+    : "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}"
+    cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+    [[ -z "${D4R_BUNDLE_DLSSD:-}" ]] || cp "$D4R_BUNDLE_DLSSD" "$STAGE/d4r/nvngx_dlssd.dll"
+  else
+    installer_dir="$STAGE"
+    [[ "$INSTALL_MODE" != asi ]] || installer_dir="$STAGE/d4r"
+    cp "$ROOT/install.sh" "$installer_dir/install.sh"
+    chmod +x "$installer_dir/install.sh"
+    # install.sh builds the engine's models from the downloaded DLLs (D4R_GLSLANG, D4R_GLSLANG_LICENSE)
+    "$ROOT/scripts/stage_engine_kit.sh" "$STAGE/d4r"
+    # The downloader is pinned to DLSS 310.7.0: refuse mismatched release inputs.
+    expected=$(sed -n "s/^DLSS_SHA256=//p" "$ROOT/install.sh")
+    # hashed from stdin: sha256sum escapes a file name with a backslash (a Windows path) by prefixing the hash with "\"
+    [[ "$(sha256sum < "$D4R_BUNDLE_DLSS" | cut -d' ' -f1)" == "$expected" ]] || {
+      echo "installer package requires the DLSS DLL pinned in install.sh" >&2; exit 2;
+    }
+  fi
 else
   printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
 fi
-IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
-# one folder per target; RDNA4 targets also get <target>-fp8 (native FP8 WMMA, d4r.ini NativeFp8), which the
-# bridge serves instead when that setting is on
-folders=()
-for arch in $ARCHS; do
-  folders+=("$arch")
-  [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
-done
-# Older texture bundles predate L. Complete them from the user's DLSS DLL rather
-# than silently shipping only M's folded variants under the new L support claim.
-ensure_l_textures() {
-  local dir="$1" accuracy="$2" missing=0 mv range v name
-  local names=(rrlite_dec0_4x4)
-  for mv in mvhi mvlo; do
-    for range in hdr ldr; do
-      names+=("rrlite_enc0_4x4_${mv}_${range}")
-      for v in 3_1 3_2; do names+=("rrlite_post_${v}_${mv}_${range}"); done
-    done
+# every variant: uninstall.sh where install.sh goes (the game folder; ASI: the plugin's d4r folder)
+uninstaller_dir="$STAGE"
+[[ "$INSTALL_MODE" != asi ]] || uninstaller_dir="$STAGE/d4r"
+cp "$ROOT/uninstall.sh" "$uninstaller_dir/uninstall.sh"
+chmod +x "$uninstaller_dir/uninstall.sh"
+if [[ -n "${D4R_BUNDLE_ENGINE:-}" ]]; then
+  for f in input_k.spv output_k.spv exposure_k0.spv exposure_k1.spv; do
+    [[ -f "$D4R_BUNDLE_ENGINE/$f" ]] || { echo "D4R_BUNDLE_ENGINE lacks $f (run engine/compile_k.py)" >&2; exit 2; }
   done
-  for name in "${names[@]}"; do [[ -f "$dir/$name.hsaco" ]] || missing=1; done
-  if [[ "$missing" == 1 ]]; then
-    : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply the unfolded L texture variants in D4R_BUNDLE_TEX}"
-    D4R_PREFER_ACCURACY="$accuracy" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
-      D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" l "$dir" >/dev/null
-  fi
-}
-build_target() {
-  local folder="$1" arch fp8 tex_dir accurate accurate_tex f
-  arch="${folder%-fp8}"
-  fp8=0
-  [[ "$folder" == *-fp8 ]] && fp8=1
-  D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
-  D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
-  rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt  # empty LTO notes from clang's -save-temps
-  if [[ "$VARIANT" == full ]]; then
-    tex_dir=""
-    if [[ -d "$D4R_BUNDLE_TEX/$folder" ]]; then
-      tex_dir="$D4R_BUNDLE_TEX/$folder"
-    elif [[ "$folder" == gfx1101 ]]; then
-      tex_dir="$D4R_BUNDLE_TEX"  # older, flat gfx1101 texture-kernel builds
-    fi
-    if [[ -n "$tex_dir" ]]; then
-      for f in "$tex_dir"/*.hsaco; do  # texture kernels only; the layers above are built from source
-        [[ -f "$f" ]] || continue
-        [[ -e "$STAGE/d4r/kernels/$folder/$(basename "$f")" ]] || cp "$f" "$STAGE/d4r/kernels/$folder/"
-      done
-    fi
-  fi
-  [[ "$VARIANT" != full ]] || ensure_l_textures "$STAGE/d4r/kernels/$folder" 0
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}"
-
-  # Every release target also gets conservative network and texture variants. Do not copy fast
-  # texture objects into this set: their compiler policy is fixed inside the binary.
-  accurate="$STAGE/d4r/kernels/accuracy/$folder"
-  D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$accurate" >/dev/null
-  D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$accurate" >/dev/null
-  if [[ "$VARIANT" == full ]]; then
-    accurate_tex="$D4R_BUNDLE_TEX/accuracy/$folder"
-    if [[ -f "$accurate_tex/d4r-accuracy.txt" && "$(cat "$accurate_tex/d4r-accuracy.txt")" == 1 ]]; then
-      for f in "$accurate_tex"/*.hsaco; do
-        [[ -f "$f" ]] || continue
-        [[ -e "$accurate/$(basename "$f")" ]] || cp "$f" "$accurate/"
-      done
-    else
-      : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT or supply D4R_BUNDLE_TEX/accuracy/$folder}"
-      D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
-        D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" tex "$accurate" >/dev/null
-    fi
-  fi
-  if [[ "$VARIANT" == full ]]; then
-    ensure_l_textures "$accurate" 1
-    for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
-      [[ -f "$accurate/$(basename "$f")" ]] || {
-        echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
-      }
-    done
-  fi
-  rm -f "$accurate"/*.resolution.txt
-  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$accurate" "${DLLS[@]}"
-}
-kernel_jobs="${D4R_PACKAGE_KERNEL_JOBS:-1}"
-[[ "$kernel_jobs" =~ ^[1-9][0-9]*$ ]] || { echo "D4R_PACKAGE_KERNEL_JOBS must be positive" >&2; exit 2; }
-pending=()
-kernel_failed=0
-for folder in "${folders[@]}"; do
-  build_target "$folder" &
-  pending+=("$!")
-  if (( ${#pending[@]} >= kernel_jobs )); then
-    wait "${pending[0]}" || kernel_failed=1
-    pending=("${pending[@]:1}")
-  fi
-done
-for pid in "${pending[@]}"; do wait "$pid" || kernel_failed=1; done
-[[ "$kernel_failed" == 0 ]] || { echo "native target build failed; no release ZIP created" >&2; exit 1; }
+  mkdir -p "$STAGE/d4r/engine/k"
+  cp "$D4R_BUNDLE_ENGINE"/*.spv "$STAGE/d4r/engine/k/"
+  # d4r's own shader-revision marker; every other .bin in the model holds values read from NVIDIA's DLSS
+  [[ ! -f "$D4R_BUNDLE_ENGINE/direct_origins.bin" ]] || cp "$D4R_BUNDLE_ENGINE/direct_origins.bin" "$STAGE/d4r/engine/k/"
+  printf 'The native engine needs weights.bin, offsets.bin and lut.bin here (see D4R_README.txt).\r\n' > "$STAGE/d4r/engine/k/README.txt"
+fi
+D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCHS="$ARCHS" "$ROOT/scripts/stage_native_kernels.sh" "$STAGE/d4r" "$VARIANT"
 
 # licenses and sources
 ZLUDA_SRC="${D4R_ZLUDA_SRC:-$(dirname "$ZLUDA")/d4r-zluda-upstream}"
@@ -224,13 +192,13 @@ cp "$ZLUDA_SRC/LICENSE-MIT" "$L/ZLUDA-LICENSE-MIT.txt"
 cp "$ZLUDA_SRC/ext/llvm-project/llvm/LICENSE.TXT" "$L/LLVM-LICENSE.txt"
 cp "$VKD3D_SRC/LICENSE" "$L/vkd3d-proton-LICENSE.txt"
 cp "$VKD3D_SRC/COPYING" "$L/vkd3d-proton-COPYING.txt"
-cp "${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
+cp "$OPTISCALER_LICENSE" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
 for f in "$ROCM_RUNTIME"/licenses/*; do cp "$f" "$L/ROCm-$(basename "$f")"; done
 mkdir -p "$STAGE/d4r/source/patches"
 cp -r "$ROOT/patches/zluda" "$ROOT/patches/vkd3d-proton" "$STAGE/d4r/source/patches/"
 ZLUDA_COMMIT="$(git -C "$ZLUDA_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
 VKD3D_COMMIT="$(git -C "$VKD3D_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
-# "@clean " / "@full " lines belong to one variant only
+# "@clean " / "@full " / "@installer " lines belong to one variant only
 variant() { sed -n -e "s/^@$VARIANT //" -e '/^@[a-z]* /d' -e p; }
 file_version() { [[ -f "$1" ]] && strings -el "$1" | grep -A1 '^FileVersion$' | sed -n 2p | tr ',' '.' | tr -d ' '; }
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@ZLUDA_COMMIT@/$ZLUDA_COMMIT/g" -e "s/@VKD3D_COMMIT@/$VKD3D_COMMIT/g" \
@@ -240,6 +208,15 @@ if [[ -n "${D4R_BUILD_INFO:-}" ]]; then
   cp "$D4R_BUILD_INFO" "$STAGE/d4r/source/BUILD_INFO.txt"
 fi
 sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
+if [[ "$INSTALL_MODE" == asi ]]; then
+  rm "$STAGE/D4R_README.txt"
+  cp "$ROOT/packaging/ASI_README.txt" "$STAGE/d4r/README.txt"
+  printf '\nASI delivery: drop d4r.asi and d4r/ into the existing plugin folder.\nd4r.asi is d4r/nvngx.dll renamed; d4r/d4r-setup.exe (tools/d4r_asi_setup.cpp) installs the D3D12 pair and configures its route automatically after the game closes.\nThe dxgi.dll / OptiScaler.ini entries above apply only to proxy packages.\nIn ASI mode install.sh, d3d12.dll and the private d4r12core.dll are inside d4r/. The forwarder loader strings are retargeted by scripts/private_d3d12_core.py without changing code addresses.\n' >> "$STAGE/d4r/source/SOURCES.txt"
+fi
+
+# Last line of defence for the published zip: only what this variant contains, never values read from DLSS.
+python3 "$ROOT/scripts/check_redistributable.py" release "$VARIANT" "$STAGE" ||
+  { echo "refusing to build $NAME.zip" >&2; exit 2; }
 
 # One timestamp for every file (SOURCE_DATE_EPOCH, default the last commit): ZLUDA's kernel cache is keyed on
 # its library's size and mtime, so every extraction of the zip shares one cache.
@@ -250,3 +227,6 @@ rm -f "$OUT/$NAME.zip"
 (cd "$STAGE" && find . -type f | LC_ALL=C sort | sed 's|^\./||' | zip -q -X -9 "$OUT/$NAME.zip" -@)
 (cd "$OUT" && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
 printf 'Built %s (%s)\n' "$OUT/$NAME.zip" "$(du -h "$OUT/$NAME.zip" | cut -f1)"
+if [[ "$VARIANT" == full ]]; then
+  echo "This zip contains NVIDIA's DLLs and kernels built from NVIDIA's code. Do not publish or share it." >&2
+fi

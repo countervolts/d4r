@@ -1,0 +1,12 @@
+enc0   164.7 GFLOP  local  2393 us   69 TF  18%   nv  1021 us  161 TF  37%
+enc1   103.7 GFLOP  local   658 us  158 TF  41%   nv   315 us  329 TF  75%
+enc2    71.0 GFLOP  local   353 us  201 TF  53%
+enc3    24.7 GFLOP  local   133 us  186 TF  49%
+enc4    14.1 GFLOP  local    74 us  191 TF  50%
+enc5     3.1 GFLOP  local    37 us   84 TF  22%
+dec4    14.1 GFLOP  local    81 us  175 TF  46%
+dec3    24.7 GFLOP  local   172 us  144 TF  38%
+dec2    71.0 GFLOP  local   410 us  173 TF  46%
+dec1   103.7 GFLOP  local   796 us  130 TF  34%   nv   404 us  257 TF  58%
+dec0   154.0 GFLOP  local  1740 us   89 TF  23%   nv   717 us  215 TF  49%
+network 749 GFLOP: local 109 TF (29%), nv 232 TF (53%)

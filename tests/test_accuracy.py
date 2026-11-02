@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import unittest
 
+from platform_support import WINDOWS, bash
+
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ("D4R_ZLUDA_IGNORE_DENORMAL", "D4R_ZLUDA_WMMA_F32ACC", "D4R_ZLUDA_FAST_MATH",
           "D4R_ZLUDA_WAVE64", "D4R_ELIDE_NGX_SYNC")
@@ -41,7 +43,10 @@ int main(int argc, char** argv) {
     return 0;
 }
 '''
-        subprocess.run(["cc", "-x", "c", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+        # natively on Windows the selection code is the bridge's (build_windows_nvcuda_bridge.sh): its host layer
+        # supplies setenv/unsetenv first (and helpers this program does not call)
+        host = ["-DD4R_NATIVE_WINDOWS", "-include", "d4r_bridge_host.h", "-Wno-unused-function"] if WINDOWS else []
+        subprocess.run(["cc", "-x", "c", "-std=gnu11", "-Wall", "-Wextra", "-Werror", *host,
                         "-I", str(ROOT / "tools"), "-o", str(cls.runner), "-"],
                        input=source, text=True, check=True, capture_output=True)
 
@@ -174,6 +179,17 @@ int main(int argc, char** argv) {
                          self.config("[Interop]\nMotionVectorDilation = 2\n",
                                      {"D4R_MOTION_DILATION": "0"}).stdout)
 
+    def test_thin_sky_opt_in_and_environment_precedence(self):
+        for value, expected in (("false","0"),("true","1"),("auto","0")):
+            self.assertIn(f"export D4R_MOTION_THIN_SKY={expected}",
+                          self.config(f"[Interop]\nMotionDilationThinSky = {value}\n").stdout)
+        self.config("[Interop]\nMotionDilationThinSky = maybe\n", expected=2)
+        self.assertNotIn("export D4R_MOTION_THIN_SKY",
+                         self.config("[Interop]\nMotionDilationThinSky = true\n",
+                                     {"D4R_MOTION_THIN_SKY":"0"}).stdout)
+        for file in ("config/d4r.ini.default", "packaging/d4r.ini"):
+            self.assertRegex((ROOT/file).read_text(), r"(?m)^MotionDilationThinSky\s*=\s*false$")
+
     def test_shipped_configs_default_off(self):
         for file in ("config/d4r.ini.default", "packaging/d4r.ini"):
             self.assertRegex((ROOT / file).read_text(), r"(?m)^PreferAccuracy\s*=\s*false$")
@@ -189,7 +205,7 @@ int main(int argc, char** argv) {
         for marker in (None, "0\n"):
             if marker is not None:
                 (output / "d4r-accuracy.txt").write_text(marker)
-            result = subprocess.run(["bash", str(ROOT / "kernels/build.sh"), "k", str(output)],
+            result = subprocess.run(bash(ROOT / "kernels/build.sh", "k", output),
                                     env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn("accuracy kernels need an empty output directory", result.stderr)

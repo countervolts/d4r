@@ -18,7 +18,6 @@
 // Only clang builtins are used (the texture tails compile with -nogpuinc -nogpulib).
 #pragma once
 #include <stdint.h>
-#include "wave32_exchange.h"
 
 #ifndef D4R_WMMA_LAYOUT
 #if defined(__GFX12__)
@@ -32,6 +31,17 @@
 #endif
 #if D4R_WMMA_LAYOUT == 11 && defined(__GFX12__)
 #error "the gfx11 WMMA layout does not exist on gfx12"
+#endif
+// RDNA2 (gfx10.3): no WMMA instruction; the gfx11 layout with the products done in software (wm_mma below).
+// The gfx11 true16 assembly (v_cvt_f16_f32 %0.l/.h) does not exist there either; the C conversions replace it.
+#if defined(__GFX10__) && !defined(D4R_WMMA_SOFT)
+#define D4R_WMMA_SOFT 1
+#endif
+#ifdef __GFX10__
+#undef WM_CVT_ASM
+#endif
+#if defined(__GFX10__) && D4R_WMMA_LAYOUT != 11
+#error "RDNA2 kernels use the gfx11 WMMA layout"
 #endif
 
 #define WM_FN __attribute__((device, always_inline)) static inline
@@ -57,7 +67,21 @@ WM_FN uint32_t wm_half()
 // value of the lane with the same index in the other half of the wave
 WM_FN uint32_t wm_other_half(uint32_t v)
 {
-    return d4r_wave32_other_half(v);
+#ifdef WM_HALF_SWIZZLE
+    // Bit-mode AND=31, OR=0, XOR=16: the same half-wave partner, no address VGPR.
+    return (uint32_t)__builtin_amdgcn_ds_swizzle((int)v, 0x401f);
+#elif defined(WM_HALF_BPERMUTE)
+    // through the LDS crossbar (no VALU issue; the same value)
+    return (uint32_t)__builtin_amdgcn_ds_bpermute((int)((__builtin_amdgcn_mbcnt_lo(~0u, 0u) ^ 16u) << 2), (int)v);
+#elif defined(WM_PERMLANE_ASM)
+    // the builtin ties the destination to an "old" input (unused here: all lanes active, every select valid), which
+    // costs a v_mov per exchange; a write-only asm output avoids it. Same instruction, same result.
+    uint32_t r;
+    __asm__("v_permlanex16_b32 %0, %1, %2, %3" : "=&v"(r) : "v"(v), "s"(0x76543210u), "s"(0xfedcba98u));
+    return r;
+#else
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
+#endif
 }
 WM_FN float wm_other_half_f(float v)
 {
@@ -135,8 +159,9 @@ WM_FN wm_f16 wm_op_acc_elem(const wm_op& v, int i)
 #if D4R_WMMA_LAYOUT == 12
     return (i & 1) ? wm_hi16(v[i >> 1]) : wm_lo16(v[i >> 1]);
 #else
-    const int c = 2 * i + (int)wm_half();
-    return (c & 1) ? wm_hi16(v[c >> 1]) : wm_lo16(v[c >> 1]);
+    // element 2 i + h is half h of dword i: one shift by 16 h (written as v[(2 i + h) >> 1] the compiler could not
+    // see that the dword index is the constant i and indexed the operand dynamically, ~9 VALU per element)
+    return __builtin_bit_cast(wm_f16, (uint16_t)(v[i] >> (wm_half() << 4)));
 #endif
 }
 
@@ -147,6 +172,24 @@ WM_FN wm_op wm_op_from_acc(const wm_f16 own[8])
 #if D4R_WMMA_LAYOUT == 12
     return (wm_u4v){wm_pack2(own[0], own[1]), wm_pack2(own[2], own[3]), wm_pack2(own[4], own[5]), wm_pack2(own[6], own[7])};
 #else
+#ifdef WM_OP_VIA_LDS
+    // Through a per-wave LDS row buffer (WM_OP_VIA_LDS = waves per block, wave index = work-item z): every lane
+    // stores its 8 rows of its token's row, then loads the whole 16-value row. 8 VALU conversions + 10 LDS
+    // instructions instead of ~20 VALU (pack, exchange, perm). The same values. Rows 48 bytes apart (16 mod 32).
+    // A wave's LDS instructions complete in order, so the loads see all lanes' stores and the next call's stores
+    // cannot overtake these loads.
+    __shared__ __attribute__((aligned(16))) wm_f16 wm_xbuf[WM_OP_VIA_LDS][16][24];
+    {
+        const uint32_t ln = __builtin_amdgcn_mbcnt_lo(~0u, 0u);
+        wm_f16* row = wm_xbuf[__builtin_amdgcn_workitem_id_z()][ln & 15];
+        const uint32_t h = ln >> 4;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            row[2 * i + h] = own[i];
+        const wm_u4v a = *(const wm_u4v*)row, b = *(const wm_u4v*)(row + 8);
+        return (wm_u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]};
+    }
+#endif
     const uint32_t hf = wm_half();
     uint32_t mine[4], theirs[4];
 #pragma unroll
@@ -178,6 +221,66 @@ WM_FN wm_op wm_op_from_acc(const wm_f16 own[8])
 #endif
 }
 
+// two f32 -> f16 conversions (round to nearest even) packed into one register (low = a, high = b). WM_CVT_ASM: the
+// same v_cvt_f16_f32 instructions as inline asm writing %0.l then %0.h; the compiler otherwise re-packs the halves
+// with v_pack_b32_f16 copies
+WM_FN uint32_t wm_cvt2(float a, float b)
+{
+#ifdef WM_CVT_ASM
+    uint32_t r;
+    asm("v_cvt_f16_f32 %0.l, %1" : "=v"(r) : "v"(a));       // r may reuse a's register (a is read first)
+    asm("v_cvt_f16_f32 %0.h, %1" : "+v"(r) : "v"(b));       // keeps the low half
+    return r;
+#else
+    return wm_pack2((wm_f16)a, (wm_f16)b);
+#endif
+}
+#if D4R_WMMA_LAYOUT == 12
+// gfx12: an operand is this half's 8 K values in 4 dwords, accumulator VGPR i = row (K) 8 h + i: the packed pairs
+// ARE the operand (no exchange, no byte permutation)
+WM_FN wm_op wm_op_from_mine(const uint32_t mine[4])
+{
+    return (wm_u4v){mine[0], mine[1], mine[2], mine[3]};
+}
+// the pair (element 2 j, 2 j + 1) of wm_op_acc_elem(v, .): operand dword j
+WM_FN uint32_t wm_op_acc_pair(const wm_op& v, int j)
+{
+    return v[j];
+}
+#else
+// operand from this lane's 8 accumulator-row halves already packed in pairs (mine[j] = own[2 j], own[2 j + 1]);
+// the same exchange + byte permutation as wm_op_from_acc
+WM_FN wm_op wm_op_from_mine(const uint32_t mine[4])
+{
+    const uint32_t hf = wm_half();
+    uint32_t theirs[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        theirs[j] = wm_other_half(mine[j]);
+    const uint32_t sel_lo = hf ? 0x01000504u : 0x05040100u, sel_hi = hf ? 0x03020706u : 0x07060302u;
+    wm_u8v r;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        r[j] = __builtin_amdgcn_perm(theirs[j >> 1], mine[j >> 1], (j & 1) ? sel_hi : sel_lo);
+    return r;
+}
+// the pair (element 2 j, 2 j + 1) of wm_op_acc_elem(v, .) as one packed register (one byte permutation)
+WM_FN uint32_t wm_op_acc_pair(const wm_op& v, int j)
+{
+    return __builtin_amdgcn_perm(v[2 * j + 1], v[2 * j], wm_half() ? 0x07060302u : 0x05040100u);
+}
+#endif
+#if defined(WM_CVT_ASM) && (D4R_WMMA_LAYOUT == 12 || (!defined(WM_OP_VIA_LDS) && !defined(PWIN_NO_PERM)))
+#define WM_HAVE_FROM_MINE 1
+WM_FN wm_op wm_op_from_f8(wm_f8v d)
+{
+    uint32_t mine[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        mine[j] = wm_cvt2(d[2 * j], d[2 * j + 1]);
+    return wm_op_from_mine(mine);
+}
+#else
 WM_FN wm_op wm_op_from_f8(wm_f8v d)
 {
     wm_f16 h[8];
@@ -186,6 +289,7 @@ WM_FN wm_op wm_op_from_f8(wm_f8v d)
         h[i] = (wm_f16)d[i];
     return wm_op_from_acc(h);
 }
+#endif
 
 // Stores an operand back as a row of 16 halves (K 0..15). In gfx11 both halves hold the whole row and the
 // lanes of half 0 store it; in gfx12 each half stores its 8 values. `count` (8 or 16) limits the row to its
@@ -220,7 +324,7 @@ WM_FN void wm_acc_vec_load(const wm_f16* p, wm_f16 out[8])
     const wm_u8v v = (wm_u8v){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]};
 #pragma unroll
     for (int i = 0; i < 8; ++i)
-        out[i] = hf ? wm_hi16(v[i]) : wm_lo16(v[i]);
+        out[i] = __builtin_bit_cast(wm_f16, (uint16_t)(v[i] >> (hf << 4)));
 #endif
 }
 
@@ -230,25 +334,13 @@ WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
 {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(wm_h8, a), __builtin_bit_cast(wm_h8, b), c);
 }
-#ifdef D4R_K_F16_WMMA
-// Rejected K experiment: direct packed F16 changes the arithmetic on gfx1201.
-// The public WMMA reproducer and enc1 replay are in tools/windows and docs.
-// Experimental gfx12 packed FP16 C/D. K's strict baseline enters each K16
-// step with an already FP16-rounded accumulator. Keep the existing logical
-// eight-row contract; only this instruction/register representation changes.
-WM_FN wm_f8v wm_mma_f16_step(const wm_op& a, const wm_op& b, wm_f8v c)
-{
-    const wm_h8 hc = __builtin_convertvector(c, wm_h8);
-    const wm_h8 hd = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
-        __builtin_bit_cast(wm_h8, a), __builtin_bit_cast(wm_h8, b), hc);
-    return __builtin_convertvector(hd, wm_f8v);
-}
-#endif
 #else
+#ifndef __GFX10__
 WM_FN wm_f8v wm_mma11(const wm_u8v& a, const wm_u8v& b, wm_f8v c)
 {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(wm_h16, a), __builtin_bit_cast(wm_h16, b), c);
 }
+#endif
 #if D4R_WMMA_LAYOUT == 12
 // layout shim: gfx12 operand halves -> one gfx11 operand in K order (half 0's 8 K, then half 1's)
 WM_FN wm_u8v wm_shim_operand(const wm_u4v& v)
@@ -325,6 +417,49 @@ WM_FN wm_f8v wm_mma_zluda(const wm_op& a, const wm_op& b, wm_f8v c)
 {
     return wm_shim_acc_to12(wm_mma11(wm_shim_operand_zluda(a), wm_shim_operand_zluda(b), wm_shim_acc_to11(c)));
 }
+#elif defined(D4R_WMMA_SOFT)
+// RDNA2 (gfx103x) has no WMMA: the same gfx11 register layout, multiplied with v_dot2_f32_f16. Lane (r, h) holds
+// column r of B and needs rows 2i + h of A, which lanes 2i + h (any half) hold. Half 1's A is rotated by one row
+// first (row_ror:15 on DPP row 1 only), so that one row_share:2i broadcast gives half 0 row 2i and half 1 row
+// 2i + 1. 8 + 64 DPP moves and 64 dot2 per 16x16x16 product, f32 accumulation in K order (two products per step).
+// D4R_WMMA_SOFT on gfx11 runs this path on RDNA3 hardware for validation: there it is bit-identical to the WMMA
+// instruction (random 64-step chains with denormals, and K's whole network over a moving 24-frame sequence).
+WM_FN uint32_t wm_dpp_rot_half1(uint32_t v)
+{
+    // DPP control 0x12f = row_ror:15 (lane j of a 16-lane row reads lane (j + 1) & 15); row mask 2 = half 1 only
+    return (uint32_t)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x12f, 0x2, 0xf, false);
+}
+// One dot2 per A row with the row_share broadcast folded into the instruction (VOP2 DPP: v_dot2c_f32_f16 on gfx10,
+// v_dot2acc_f32_f16 on gfx11). LLVM's DPP combiner does not fold a v_mov_b32_dpp into these, and a separate move
+// per row doubled the instruction count and kept 64 broadcast values live (spills). gfx10 and gfx11 resolve the
+// VALU -> DPP read dependency in hardware, so no wait states are needed around the assembly.
+#ifdef __GFX10__
+#define WM_DOT2_DPP "v_dot2c_f32_f16_dpp"
+#else
+#define WM_DOT2_DPP "v_dot2acc_f32_f16_dpp"
+#endif
+#define WM_SOFT_ROW(I, LANE)                                                                                       \
+    asm(WM_DOT2_DPP " %0, %1, %2 row_share:" #LANE " row_mask:0xf bank_mask:0xf" : "+v"(c[I]) : "v"(x), "v"(column))
+WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
+{
+    // Each accumulator sums its K pairs in order 0..7, as the WMMA instruction does on gfx11 (bit-identical there).
+#pragma unroll
+    for (int d = 0; d < 8; ++d)
+    {
+        const uint32_t x = wm_dpp_rot_half1(a[d]);
+        const uint32_t column = b[d];
+        WM_SOFT_ROW(0, 0);
+        WM_SOFT_ROW(1, 2);
+        WM_SOFT_ROW(2, 4);
+        WM_SOFT_ROW(3, 6);
+        WM_SOFT_ROW(4, 8);
+        WM_SOFT_ROW(5, 10);
+        WM_SOFT_ROW(6, 12);
+        WM_SOFT_ROW(7, 14);
+    }
+    return c;
+}
+#undef WM_SOFT_ROW
 #else
 WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
 {

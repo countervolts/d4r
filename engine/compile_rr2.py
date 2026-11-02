@@ -12,7 +12,9 @@ D4R_CUDA_REPLAY_DUMP_FILTER=rr2 D4R_CUDA_LAUNCH_STATS_FILTER=rr2 and preset hint
                        table of its PTX module; enc0-aux.bin is encoder 0's second table (argument 104)
   <stage>.args         the argument block of the capture's frame, pointers and handles cleared: the runtime keeps its
                        constants and fills what depends on the frame or the geometry (engine/runtime_rr2.inc)
-  exposure_f0.spv, exposure_f1.spv   engine/rr/exposure_f.comp
+  enc0_llpc.spv, dec0_1_llpc.spv   enc0.spv and dec0_1.spv through spirv-opt -O: AMD's Windows driver (LLPC)
+                       crashes compiling the originals, so runtime_rr2.inc loads these there and only there
+  exposure_f0.spv, exposure_f1.spv   engine/rr/exposure_f.comp (exposure_f2.spv: both in one, 64-bit atomics)
   rr.txt               the manifest RModel reads ("D4RR0002")
 With --native, the stages engine/rr/rr2_m.comp implements (enc1 ... enc5, dec4 ... dec1, dec0's first kernel) are that
 shader with weights read from the DLL itself (engine/rr/rr2_pack.py) instead of the translation: bit-identical to
@@ -25,6 +27,7 @@ Everything but the exposure shader is derived from NVIDIA's DLL: it stays on the
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,21 +69,46 @@ BUFFERS = {'enc0': [104, 256], 'post': [16, 256, 264], 'down': [72, 168, 176]}
 # NVIDIA; the reference this engine is checked against (ZLUDA) backs them with RGBA32F, and so does the engine.
 NATIVE = ['enc1', 'enc2', 'enc3', 'enc4', 'enc5', 'dec4_0', 'dec4_1', 'dec3_0', 'dec3_1', 'dec2_0', 'dec2_1', 'dec1_0',
           'dec1_1', 'dec0_0']
+# The deep stages that can also run split over several workgroups per window (rr2_m.comp RR2_PHASE 1 - 4, KIND 0 and 3):
+# <stage>_p1.spv ... _p4.spv and a "phases" line in rr.txt; the runtime uses them for a stage with fewer windows than
+# the GPU has compute units (enc5 at 1280x720) and the single shader otherwise. D4R_RR2_PHASES=0 builds none.
+PHASED = [] if os.environ.get('D4R_RR2_PHASES') == '0' else ['enc3', 'enc4', 'enc5', 'dec4_1', 'dec3_1']
 # --particles: the downsample kernel with the particle layer
 KERNEL['downp'] = 'rr2_downsample_kernel_static_hdr'
 BLOCK['downp'] = '16,16,1'
 BUFFERS['downp'] = [72, 168, 176]
-# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py)
-HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1']}
+# with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py);
+# D4R_RR2_TAIL_WAVES: dec0_1's tail on that many of the four-wave block's waves (the one-wave block ignores it)
+HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1', '--tail-waves', os.environ.get('D4R_RR2_TAIL_WAVES', '2')]}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
-# encoder 0's gather as a pass of its own (D4R_RR2_SPLIT=0: one shader, the gather on one wave of the block's four)
-SPLIT = os.environ.get('D4R_RR2_SPLIT', '1') != '0'
-# The pooled histories as RGBA32F holding q / 1023, as ZLUDA backs them (16 bytes a pixel). D4R_RR2_POOLED=rgb10_a2
-# makes them real UNORM 10:10:10:2 images (0.1 ms faster at 4K), but the hardware's bilinear filter then rounds
-# differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13)
-POOLED = os.environ.get('D4R_RR2_POOLED', 'rgba32f')
+# The pooled histories as real UNORM 10:10:10:2 images (4 bytes a pixel; 0.1 ms faster at 4K, 70 MB less). The hardware's
+# bilinear filter then rounds differently from the RGBA32F form ZLUDA backs them with (16 bytes a pixel):
+# identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13); on random-motion noise
+# also at 2x (29 dB on the history frames, engine/rr/README.md). D4R_RR2_POOLED=rgba32f builds that reference form.
+POOLED = os.environ.get('D4R_RR2_POOLED', 'rgb10_a2')
 SURFACES = {'dec0_1': {176: 'rgba8_snorm', 184: 'rgba8', 192: 'rgba8'}, 'post': {120: POOLED}, 'pooled': {8: POOLED}}
+# D4R_RR2_UNGUARDED (on by default, D4R_RR_RELAXED=3 only; D4R_RR2_UNGUARDED=0 keeps the guards): the translated code
+# (encoder 0's and decoder 0's per-pixel parts, the output passes) without its exactness guards: no `precise` registers, no
+# opaque zero OR-ed into binary16 stores and conversions (ptx2rr.py --unguarded) and no NoContraction pass
+# (spv_exact_convert.py) on those modules, so the driver may contract, fold and fuse there as it does in the relaxed
+# native stages (engine/rr/README.md)
+UNGUARDED = os.environ.get('D4R_RR2_UNGUARDED', '1' if RELAXED >= 3 else '0') == '1'
+if UNGUARDED and RELAXED < 3:
+    raise SystemExit('D4R_RR2_UNGUARDED=1 is for D4R_RR_RELAXED=3')
+# decoder 0's second kernel on one wave (rr2_w.comp KIND 5, the translated tail on the same wave), which the
+# D4R_RR2_UNGUARDED=1 build uses: dec0_1 393 -> 374 us at 1280x720 -> 1440p, the same images. In the guarded build its
+# tail's channel kc[2] comes out as a NaN of the other sign on the stress inputs (a product of two NaNs, whose sign
+# follows the compiler's operand order), so that build keeps the four-wave block. D4R_RR2_ONE_WAVE_DEC0_1=1 / 0 forces it.
+if os.environ.get('D4R_RR2_ONE_WAVE_DEC0_1', '1' if UNGUARDED else '0') != '0' and RELAXED >= 3:
+    ONE_WAVE.add('dec0_1')
+# encoder 0's gather as a pass of its own, which pays with the four-wave block (one shader would run the gather on one
+# wave of the four). With the one-wave block (level 3) the gather runs in the block's own shader and hands its
+# features over in shared memory instead (rr2_w.comp RR2_XF_SHARED): no record in the arena, one dispatch less. Without
+# the guards (D4R_RR2_UNGUARDED=1) the gather pass is faster again: encoder 0 650 -> 623 us at 1280x720 -> 1440p
+# (2026-10-20; the guarded build is the same either way), so that build splits.
+# D4R_RR2_SPLIT=1 / 0 forces the gather pass / the single shader.
+SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WAVE and not UNGUARDED else '1') != '0'
 
 
 def find_module(ptx_dir, kernel):
@@ -117,8 +145,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     capped = ['systemd-run', '--user', '--scope', '-q', '-p', 'MemoryMax=24G', '-p', 'MemorySwapMax=0']
     # each compiler job in a memory-capped scope where systemd provides one (D4R_NO_SCOPE=1: none)
-    if os.environ.get('D4R_NO_SCOPE') == '1' or subprocess.run(capped[:4] + ['true'], stderr=subprocess.DEVNULL,
-                                                                 stdout=subprocess.DEVNULL).returncode:
+    if os.environ.get('D4R_NO_SCOPE') == '1' or not shutil.which(capped[0]) or             subprocess.run(capped[:4] + ['true'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL).returncode:
         capped = []
     lines = ['D4RR0002', 'preset 6']
     pcap = Capture(a.particles) if a.particles else None
@@ -142,12 +169,16 @@ def main():
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
             defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
-            subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
-                                     f'-I{HERE / "rr"}', str(HERE / 'rr' / ('rr2_w.comp' if RELAXED >= 3 and stage in ONE_WAVE else 'rr2_m.comp')), '-o', str(out / f'{stage}_m.spv')],
-                           check=True, stdout=subprocess.DEVNULL)
-            if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
-                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}_m.spv')],
+            phased = stage in PHASED and not (RELAXED >= 3 and stage in ONE_WAVE)
+            for phase in [0] + ([1, 2, 3, 4] if phased else []):
+                spv = out / (f'{stage}_m.spv' if phase == 0 else f'{stage}_p{phase}.spv')
+                subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs] +
+                               ([f'-DRR2_PHASE={phase}'] if phase else []) + [f'-I{work}', f'-I{HERE / "rr"}',
+                               str(HERE / 'rr' / ('rr2_w.comp' if RELAXED >= 3 and stage in ONE_WAVE else 'rr2_m.comp')), '-o', str(spv)],
                                check=True, stdout=subprocess.DEVNULL)
+                if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
+                    subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(spv)],
+                                   check=True, stdout=subprocess.DEVNULL)
             if launch is None:
                 (out / f'{stage}.args').write_bytes(blocks[stage])
                 ptrs = [ARENA[stage]]
@@ -157,7 +188,12 @@ def main():
                 unit = launch.allocs[arena][1] / 3152
                 ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers if p.alloc == arena and p.offset != 24]
             lines.append(f'stage {stage} {stage}_m.spv 32 {weights} {stage}.args - - - {",".join(ptrs)}')
-            print(f'{stage}: native (engine/rr/rr2_m.comp)')
+            if phased:   # "phases STAGE P1 P2 P3 P4 HEADS BRANCHES WORDS": the shaders, the grid's parts and a window's record
+                shape = dict(l.split()[1:3] for l in (work / 'rr2_stage.h').read_text().splitlines() if l.startswith('#define ') and len(l.split()) >= 3)
+                c, nh, nb = (int(shape[k].rstrip('u')) for k in ('C', 'NH', 'NB'))
+                words = nh * 512 + (c // 16) * 256 + (c // 16) * 1024 + nb * 512   # rr2_m.comp SC_WIN
+                lines.append(f'phases {stage} ' + ' '.join(f'{stage}_p{k}.spv' for k in (1, 2, 3, 4)) + f' {nh} {nb} {words}')
+            print(f'{stage}: native (engine/rr/rr2_m.comp)' + (', also in four phases' if phased else ''))
             continue
         generated = out / f'{stage}.generated.comp'
         cmd = [sys.executable, str(HERE / 'rr' / 'ptx2rr.py'), str(find_module(a.ptx_dir, kernel)), kernel, str(generated),
@@ -165,6 +201,10 @@ def main():
         cmd += [f'--buffer={off}' for off in BUFFERS.get(stage, [])]
         cmd += [f'--snorm16={off}' for off in SNORM16.get(stage, [])]
         cmd += [f'--surface={off}={fmt}' for off, fmt in SURFACES.get(stage, {}).items()]
+        # the hybrid stages' and the output passes' modules go through spv_exact_convert.py, so their conversions need
+        # only the lighter guard (ptx2rr.py --exact-convert)
+        exact = ((bool(a.native) and stage in HYBRID) or not network) and not UNGUARDED
+        cmd += ['--exact-convert'] if exact else ['--unguarded'] if UNGUARDED else []
         subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
         info = json.loads(generated.with_suffix('.json').read_text())
         weights = '-'
@@ -188,24 +228,42 @@ def main():
                 subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
                                          f'-I{HERE / "rr"}', str(work / 'enc0_g.comp'), '-o', str(out / 'enc0g.spv')],
                                check=True, stdout=subprocess.DEVNULL)
-                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
-                               check=True, stdout=subprocess.DEVNULL)
+                if not UNGUARDED:
+                    subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
+                                   check=True, stdout=subprocess.DEVNULL)
                 record = int((work / 'enc0_g.record').read_text())
-            if RELAXED >= 3 and stage in ONE_WAVE and split:
+            hybrid_args = HYBRID[stage]
+            if RELAXED >= 3 and stage in ONE_WAVE and (split or GROUP == 1):
                 how = how + ['--one-wave']
+                if stage == 'dec0_1':   # the tail runs on the block's one wave
+                    hybrid_args = ['--dec0_1', '--tail-waves', '1']
             subprocess.run([sys.executable, str(HERE / 'rr' / 'gen_rr2_enc0.py'), str(find_module(a.ptx_dir, kernel)),
-                            str(generated), str(work / f'{stage}_m.comp'), *HYBRID[stage], *how],
+                            str(generated), str(work / f'{stage}_m.comp'), *hybrid_args, *how],
                            check=True, stdout=subprocess.DEVNULL)
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
                                      f'-I{HERE / "rr"}', str(work / f'{stage}_m.comp'), '-o', str(out / f'{stage}.spv')],
                            check=True, stdout=subprocess.DEVNULL)
-            subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
-                           check=True, stdout=subprocess.DEVNULL)
+            if not UNGUARDED:
+                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
         else:
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', str(generated), '-o',
                                      str(out / f'{stage}.spv')], check=True, stdout=subprocess.DEVNULL)
+            if exact:
+                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
         if hybrid:
-            pass
+            # AMD's own Windows driver (LLPC) crashes compiling these two shaders (the translated code around the
+            # native block: a null read in the driver's compiler, engine/rr/README.md). SPIRV-Tools' -O on the same
+            # module compiles there and reproduces the images (54.9 dB against the DXIL reference), so the model
+            # carries <stage>_llpc.spv as well; runtime_rr2.inc loads it only on that driver.
+            opt = os.environ.get('D4R_SPIRV_OPT') or shutil.which('spirv-opt') or shutil.which('spirv-opt.exe')
+            if opt:
+                subprocess.run([opt, '-O', str(out / f'{stage}.spv'), '-o', str(out / f'{stage}_llpc.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
+                print(f'{stage}: {stage}_llpc.spv (for AMD\'s Windows driver)')
+            else:
+                print(f'{stage}: no spirv-opt: AMD\'s Windows driver cannot compile this stage (D4R_SPIRV_OPT)')
         elif network:
             weights = f'weights-{stage}.bin'
             (out / weights).write_bytes(launch.weights_at(24))
@@ -239,7 +297,7 @@ def main():
         if hybrid and split:   # the same block, bindings and regions; "rN": N words per window record, "s3": in three ranges
             lines.append(f'stage enc0g enc0g.spv 32 - {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"} r{record} s3')
         print(f'{stage}: {kernel}, {len(args)} argument bytes' + (' (native block)' if hybrid else ''))
-    for p in (0, 1):
+    for p in (0, 1, 2):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-DPASS={p}',
                         str(HERE / 'rr' / 'exposure_f.comp'), '-o', str(out / f'exposure_f{p}.spv')],
                        check=True, stdout=subprocess.DEVNULL)
@@ -247,7 +305,7 @@ def main():
         # the kernel truncates the exposure to binary16
         subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'exposure_f{p}.spv')],
                        check=True, stdout=subprocess.DEVNULL)
-    (out / 'rr.txt').write_text('\n'.join(lines) + '\n')
+    (out / 'rr.txt').write_text('\n'.join(lines) + '\n', newline='\n')   # the runtimes read LF (Windows too)
     print(f'Ray Reconstruction preset F model in {out}')
 
 

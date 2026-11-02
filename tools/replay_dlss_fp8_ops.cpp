@@ -9,7 +9,7 @@
 //   movmatrix.sync.aligned.m8n8.trans.b16
 // Matrix inputs are small values whose products and sums are exact in f16,
 // so results must match bit for bit regardless of accumulation order.
-#include <dlfcn.h>
+#include "d4r_dlfcn.h"
 
 #include <cmath>
 #include <cstdint>

@@ -1,0 +1,1607 @@
+{
+ "geometry": [
+  1920,
+  1080,
+  3840,
+  2160
+ ],
+ "group": "rr",
+ "cadence": {
+  "sr": {
+   "frames": 4,
+   "warmup_evaluations": 48,
+   "timed_evaluations": 100
+  },
+  "rr": {
+   "entries": 140,
+   "warmup": 40,
+   "measured": 100
+  }
+ },
+ "runs": [
+  {
+   "case": "rr-a",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 19.2546,
+   "min_ms": 18.9412,
+   "p10_ms": 19.0422,
+   "p90_ms": 19.416,
+   "stages_us": {
+    "output": 0.99482
+   },
+   "wall_s": 2.93,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3178.0,
+     "min": 182.0,
+     "max": 3185.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 772.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 254.0,
+     "min": 33.0,
+     "max": 260.0
+    },
+    "junction_c": {
+     "median": 60.0,
+     "min": 34.0,
+     "max": 61.0
+    },
+    "busy_percent": {
+     "median": 100,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vulkan-trial0"
+  },
+  {
+   "case": "rr-a",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 4.19824,
+   "min_ms": 4.02592,
+   "p10_ms": 4.16332,
+   "p90_ms": 4.21404,
+   "stages_us": {
+    "output": 1.10228
+   },
+   "wall_s": 0.64,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2791.5,
+     "min": 1640.0,
+     "max": 2931.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 331.5,
+     "min": 50.0,
+     "max": 396.0
+    },
+    "junction_c": {
+     "median": 66.0,
+     "min": 39.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 7,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vkhip-trial0"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 19.27335,
+   "min_ms": 18.936,
+   "p10_ms": 19.0947,
+   "p90_ms": 19.4272,
+   "stages_us": {
+    "output": 0.99848
+   },
+   "wall_s": 2.79,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3175.5,
+     "min": 1862.0,
+     "max": 3197.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 255.0,
+     "min": 84.0,
+     "max": 265.0
+    },
+    "junction_c": {
+     "median": 61.0,
+     "min": 47.0,
+     "max": 61.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 20,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vulkan-trial0"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 4.19786,
+   "min_ms": 4.01076,
+   "p10_ms": 4.14684,
+   "p90_ms": 4.21816,
+   "stages_us": {
+    "output": 1.1018599999999998
+   },
+   "wall_s": 0.65,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2801.0,
+     "min": 2332.0,
+     "max": 2959.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 332.5,
+     "min": 133.0,
+     "max": 395.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 50.0,
+     "max": 69.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 46,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vkhip-trial0"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 19.2688,
+   "min_ms": 18.9643,
+   "p10_ms": 19.0814,
+   "p90_ms": 19.3985,
+   "stages_us": {
+    "output": 0.99944
+   },
+   "wall_s": 2.78,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3178.0,
+     "min": 1892.0,
+     "max": 3182.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 256.0,
+     "min": 89.0,
+     "max": 262.0
+    },
+    "junction_c": {
+     "median": 61.0,
+     "min": 48.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 21,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vulkan-trial0"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 4.19774,
+   "min_ms": 4.03144,
+   "p10_ms": 4.13656,
+   "p90_ms": 4.21644,
+   "stages_us": {
+    "output": 1.1022
+   },
+   "wall_s": 0.64,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2797.5,
+     "min": 2240.0,
+     "max": 2957.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 332.5,
+     "min": 121.0,
+     "max": 397.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 49.0,
+     "max": 71.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 40,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vkhip-trial0"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.8622,
+   "min_ms": 7.57444,
+   "p10_ms": 7.82296,
+   "p90_ms": 7.89784,
+   "stages_us": {
+    "output": 0.9370799999999999
+   },
+   "wall_s": 1.18,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2779.5,
+     "min": 1798.0,
+     "max": 2787.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.5,
+     "min": 65.0,
+     "max": 332.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 46.0,
+     "max": 69.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 12,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vulkan-trial0"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.30904,
+   "min_ms": 7.04148,
+   "p10_ms": 7.2832,
+   "p90_ms": 7.33916,
+   "stages_us": {
+    "output": 0.95662
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2722.0,
+     "min": 181.0,
+     "max": 2729.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.5,
+     "min": 49.0,
+     "max": 329.0
+    },
+    "junction_c": {
+     "median": 69.5,
+     "min": 42.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vkhip-trial0"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.80354,
+   "min_ms": 7.62076,
+   "p10_ms": 7.7706,
+   "p90_ms": 7.84044,
+   "stages_us": {
+    "output": 0.75196
+   },
+   "wall_s": 1.18,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2777.5,
+     "min": 1641.0,
+     "max": 2813.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 50.0,
+     "max": 344.0
+    },
+    "junction_c": {
+     "median": 69.0,
+     "min": 41.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 6,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vulkan-trial0"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.26196,
+   "min_ms": 7.15156,
+   "p10_ms": 7.23152,
+   "p90_ms": 7.28364,
+   "stages_us": {
+    "output": 0.76568
+   },
+   "wall_s": 1.08,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2724.0,
+     "min": 2148.0,
+     "max": 2880.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 162.0,
+     "max": 394.0
+    },
+    "junction_c": {
+     "median": 70.0,
+     "min": 55.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 45,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vkhip-trial0"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vulkan",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.08422,
+   "min_ms": 6.90944,
+   "p10_ms": 7.0428,
+   "p90_ms": 7.15292,
+   "stages_us": {
+    "output": 1.31114
+   },
+   "wall_s": 1.13,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2595.0,
+     "min": 1680.0,
+     "max": 2665.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.5,
+     "min": 50.0,
+     "max": 353.0
+    },
+    "junction_c": {
+     "median": 67.5,
+     "min": 44.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 7,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vulkan-trial0"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vkhip",
+   "trial": 0,
+   "frames": 100,
+   "median_ms": 7.12476,
+   "min_ms": 6.86604,
+   "p10_ms": 7.06344,
+   "p90_ms": 7.17976,
+   "stages_us": {
+    "output": 1.30776
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2607.5,
+     "min": 186.0,
+     "max": 2695.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 319.0,
+     "min": 49.0,
+     "max": 332.0
+    },
+    "junction_c": {
+     "median": 67.0,
+     "min": 42.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "14 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vkhip-trial0"
+  },
+  {
+   "case": "rr-a",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 19.18855,
+   "min_ms": 18.8268,
+   "p10_ms": 18.9705,
+   "p90_ms": 19.3229,
+   "stages_us": {
+    "output": 0.9916400000000001
+   },
+   "wall_s": 2.82,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3185.0,
+     "min": 1941.0,
+     "max": 3210.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 256.0,
+     "min": 114.0,
+     "max": 268.0
+    },
+    "junction_c": {
+     "median": 61.0,
+     "min": 50.0,
+     "max": 63.0
+    },
+    "busy_percent": {
+     "median": 100,
+     "min": 30,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vulkan-trial1"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.1293,
+   "min_ms": 6.93128,
+   "p10_ms": 7.06052,
+   "p90_ms": 7.17668,
+   "stages_us": {
+    "output": 1.30582
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2611.0,
+     "min": 200.0,
+     "max": 2641.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 327.5,
+     "min": 49.0,
+     "max": 338.0
+    },
+    "junction_c": {
+     "median": 67.0,
+     "min": 40.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "14 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vkhip-trial1"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.09046,
+   "min_ms": 6.96256,
+   "p10_ms": 7.0338,
+   "p90_ms": 7.15732,
+   "stages_us": {
+    "output": 1.3091
+   },
+   "wall_s": 1.07,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2610.0,
+     "min": 1939.0,
+     "max": 2807.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 330.0,
+     "min": 114.0,
+     "max": 397.0
+    },
+    "junction_c": {
+     "median": 67.5,
+     "min": 50.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 30,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vulkan-trial1"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.27188,
+   "min_ms": 6.92792,
+   "p10_ms": 7.241,
+   "p90_ms": 7.30148,
+   "stages_us": {
+    "output": 0.76778
+   },
+   "wall_s": 1.08,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2713.0,
+     "min": 184.0,
+     "max": 2721.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.0,
+     "min": 49.0,
+     "max": 330.0
+    },
+    "junction_c": {
+     "median": 70.0,
+     "min": 42.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vkhip-trial1"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.80326,
+   "min_ms": 7.63716,
+   "p10_ms": 7.7614,
+   "p90_ms": 7.83212,
+   "stages_us": {
+    "output": 0.75206
+   },
+   "wall_s": 1.15,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2776.0,
+     "min": 192.0,
+     "max": 2785.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.5,
+     "min": 50.0,
+     "max": 332.0
+    },
+    "junction_c": {
+     "median": 69.0,
+     "min": 41.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vulkan-trial1"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.31988,
+   "min_ms": 7.2328,
+   "p10_ms": 7.27768,
+   "p90_ms": 7.34864,
+   "stages_us": {
+    "output": 0.95806
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2729.0,
+     "min": 2100.0,
+     "max": 2928.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 149.0,
+     "max": 395.0
+    },
+    "junction_c": {
+     "median": 70.0,
+     "min": 54.0,
+     "max": 71.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 41,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vkhip-trial1"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 7.86238,
+   "min_ms": 7.58872,
+   "p10_ms": 7.82024,
+   "p90_ms": 7.89648,
+   "stages_us": {
+    "output": 0.9390000000000001
+   },
+   "wall_s": 1.15,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2778.5,
+     "min": 1652.0,
+     "max": 2835.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 50.0,
+     "max": 336.0
+    },
+    "junction_c": {
+     "median": 69.0,
+     "min": 44.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 6,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vulkan-trial1"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 4.19856,
+   "min_ms": 4.0406,
+   "p10_ms": 4.15868,
+   "p90_ms": 4.21728,
+   "stages_us": {
+    "output": 1.1034000000000002
+   },
+   "wall_s": 0.65,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2673.5,
+     "min": 190.0,
+     "max": 2783.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 319.0,
+     "min": 49.0,
+     "max": 330.0
+    },
+    "junction_c": {
+     "median": 63.5,
+     "min": 42.0,
+     "max": 69.0
+    },
+    "busy_percent": {
+     "median": 93.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vkhip-trial1"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 19.2273,
+   "min_ms": 18.9482,
+   "p10_ms": 19.035,
+   "p90_ms": 19.3934,
+   "stages_us": {
+    "output": 0.9953000000000001
+   },
+   "wall_s": 2.77,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3183.5,
+     "min": 1641.0,
+     "max": 3190.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 259.5,
+     "min": 50.0,
+     "max": 270.0
+    },
+    "junction_c": {
+     "median": 62.0,
+     "min": 41.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 8,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vulkan-trial1"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 4.19918,
+   "min_ms": 4.02692,
+   "p10_ms": 4.135,
+   "p90_ms": 4.21684,
+   "stages_us": {
+    "output": 1.1032600000000001
+   },
+   "wall_s": 0.65,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2678.5,
+     "min": 1638.0,
+     "max": 2814.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 321.0,
+     "min": 50.0,
+     "max": 334.0
+    },
+    "junction_c": {
+     "median": 63.0,
+     "min": 40.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 93.5,
+     "min": 7,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vkhip-trial1"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vulkan",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 19.26335,
+   "min_ms": 18.9193,
+   "p10_ms": 19.0733,
+   "p90_ms": 19.4184,
+   "stages_us": {
+    "output": 0.99956
+   },
+   "wall_s": 2.77,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3182.5,
+     "min": 1880.0,
+     "max": 3190.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 257.5,
+     "min": 89.0,
+     "max": 293.0
+    },
+    "junction_c": {
+     "median": 61.5,
+     "min": 48.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 21,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vulkan-trial1"
+  },
+  {
+   "case": "rr-a",
+   "backend": "vkhip",
+   "trial": 1,
+   "frames": 100,
+   "median_ms": 4.19744,
+   "min_ms": 4.11432,
+   "p10_ms": 4.15324,
+   "p90_ms": 4.21572,
+   "stages_us": {
+    "output": 1.1014
+   },
+   "wall_s": 0.65,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2796.5,
+     "min": 2318.0,
+     "max": 2989.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.0,
+     "min": 133.0,
+     "max": 396.0
+    },
+    "junction_c": {
+     "median": 67.0,
+     "min": 51.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 45,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vkhip-trial1"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 19.29605,
+   "min_ms": 18.9633,
+   "p10_ms": 19.0546,
+   "p90_ms": 19.4259,
+   "stages_us": {
+    "output": 1.00068
+   },
+   "wall_s": 2.77,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3178.5,
+     "min": 1898.0,
+     "max": 3183.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 258.0,
+     "min": 93.0,
+     "max": 274.0
+    },
+    "junction_c": {
+     "median": 61.0,
+     "min": 48.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 21,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vulkan-trial2"
+  },
+  {
+   "case": "rr-b",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 4.20154,
+   "min_ms": 4.04616,
+   "p10_ms": 4.16284,
+   "p90_ms": 4.222,
+   "stages_us": {
+    "output": 1.1023399999999999
+   },
+   "wall_s": 0.64,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2790.5,
+     "min": 2067.0,
+     "max": 2955.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 332.0,
+     "min": 96.0,
+     "max": 397.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 47.0,
+     "max": 71.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 29,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-b-vkhip-trial2"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 19.28565,
+   "min_ms": 18.9326,
+   "p10_ms": 19.0964,
+   "p90_ms": 19.4514,
+   "stages_us": {
+    "output": 0.9996400000000001
+   },
+   "wall_s": 2.78,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3178.0,
+     "min": 185.0,
+     "max": 3183.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 256.5,
+     "min": 49.0,
+     "max": 283.0
+    },
+    "junction_c": {
+     "median": 61.0,
+     "min": 43.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 4,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vulkan-trial2"
+  },
+  {
+   "case": "rr-c",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 4.20092,
+   "min_ms": 4.00912,
+   "p10_ms": 4.16372,
+   "p90_ms": 4.22204,
+   "stages_us": {
+    "output": 1.10264
+   },
+   "wall_s": 0.64,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2786.5,
+     "min": 193.0,
+     "max": 2949.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.5,
+     "min": 49.0,
+     "max": 394.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 42.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-c-vkhip-trial2"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.86416,
+   "min_ms": 7.59424,
+   "p10_ms": 7.81376,
+   "p90_ms": 7.90204,
+   "stages_us": {
+    "output": 0.9376800000000001
+   },
+   "wall_s": 1.15,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2779.5,
+     "min": 193.0,
+     "max": 2783.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.0,
+     "min": 49.0,
+     "max": 330.0
+    },
+    "junction_c": {
+     "median": 68.5,
+     "min": 41.0,
+     "max": 69.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vulkan-trial2"
+  },
+  {
+   "case": "rr-d",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.31576,
+   "min_ms": 7.06836,
+   "p10_ms": 7.27064,
+   "p90_ms": 7.34068,
+   "stages_us": {
+    "output": 0.95626
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2726.5,
+     "min": 1639.0,
+     "max": 2740.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 328.5,
+     "min": 50.0,
+     "max": 336.0
+    },
+    "junction_c": {
+     "median": 70.0,
+     "min": 41.0,
+     "max": 70.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 8,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-d-vkhip-trial2"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.80444,
+   "min_ms": 7.75448,
+   "p10_ms": 7.7786,
+   "p90_ms": 7.84728,
+   "stages_us": {
+    "output": 0.7522
+   },
+   "wall_s": 1.15,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2777.0,
+     "min": 1967.0,
+     "max": 2940.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.5,
+     "min": 118.0,
+     "max": 382.0
+    },
+    "junction_c": {
+     "median": 69.0,
+     "min": 51.0,
+     "max": 71.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 30,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vulkan-trial2"
+  },
+  {
+   "case": "rr-e",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.27412,
+   "min_ms": 7.03536,
+   "p10_ms": 7.24252,
+   "p90_ms": 7.30628,
+   "stages_us": {
+    "output": 0.76814
+   },
+   "wall_s": 1.08,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2714.0,
+     "min": 1699.0,
+     "max": 2878.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 50.0,
+     "max": 397.0
+    },
+    "junction_c": {
+     "median": 70.0,
+     "min": 44.0,
+     "max": 71.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 6,
+     "max": 100
+    }
+   },
+   "note": [
+    "10 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-e-vkhip-trial2"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.10976,
+   "min_ms": 6.8898,
+   "p10_ms": 7.05448,
+   "p90_ms": 7.14384,
+   "stages_us": {
+    "output": 1.3118400000000001
+   },
+   "wall_s": 1.07,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2586.5,
+     "min": 188.0,
+     "max": 2628.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 329.0,
+     "min": 49.0,
+     "max": 332.0
+    },
+    "junction_c": {
+     "median": 67.0,
+     "min": 42.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vulkan-trial2"
+  },
+  {
+   "case": "rr-f",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 7.15408,
+   "min_ms": 6.98232,
+   "p10_ms": 7.08396,
+   "p90_ms": 7.19892,
+   "stages_us": {
+    "output": 1.30612
+   },
+   "wall_s": 1.09,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2627.5,
+     "min": 1937.0,
+     "max": 2815.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 330.0,
+     "min": 109.0,
+     "max": 394.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 50.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 30,
+     "max": 100
+    }
+   },
+   "note": [
+    "14 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-f-vkhip-trial2"
+  },
+  {
+   "case": "rr-a",
+   "backend": "vulkan",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 19.25535,
+   "min_ms": 18.908,
+   "p10_ms": 19.0638,
+   "p90_ms": 19.3969,
+   "stages_us": {
+    "output": 0.99914
+   },
+   "wall_s": 2.77,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 3182.5,
+     "min": 182.0,
+     "max": 3194.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 259.5,
+     "min": 49.0,
+     "max": 278.0
+    },
+    "junction_c": {
+     "median": 62.0,
+     "min": 43.0,
+     "max": 62.0
+    },
+    "busy_percent": {
+     "median": 100.0,
+     "min": 4,
+     "max": 100
+    }
+   },
+   "note": [],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vulkan-trial2"
+  },
+  {
+   "case": "rr-a",
+   "backend": "vkhip",
+   "trial": 2,
+   "frames": 100,
+   "median_ms": 4.20188,
+   "min_ms": 4.0244,
+   "p10_ms": 4.14772,
+   "p90_ms": 4.21904,
+   "stages_us": {
+    "output": 1.1025
+   },
+   "wall_s": 0.64,
+   "gpu": {
+    "sclk_mhz": {
+     "median": 2794.0,
+     "min": 182.0,
+     "max": 2946.0
+    },
+    "mclk_mhz": {
+     "median": 1349.0,
+     "min": 1349.0,
+     "max": 1349.0
+    },
+    "ppt_w": {
+     "median": 330.0,
+     "min": 49.0,
+     "max": 396.0
+    },
+    "junction_c": {
+     "median": 68.0,
+     "min": 42.0,
+     "max": 68.0
+    },
+    "busy_percent": {
+     "median": 99.5,
+     "min": 5,
+     "max": 100
+    }
+   },
+   "note": [
+    "11 vkhip stages"
+   ],
+   "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs-330w/rr-a-vkhip-trial2"
+  }
+ ]
+}

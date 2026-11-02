@@ -15,12 +15,19 @@
 // (11, 12, 16), and the history is blended in linear light: each candidate's bicubic sample is expanded and divided by
 // the previous exposure on its own, a candidate off screen (or after a reset) takes the linear colour texel, and the
 // blend is scaled by the current exposure.
+// DISPLAY_MV (default: not PRESET_L): the game's display-resolution motion texture (binding 12) is read when mvSize is
+// set; preset L's dot2 build (post_l_dot2) takes it as M does, NVIDIA's L kernels have no such variant in the capture.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
 #include "normalized_store.glsl"
 // One invocation owns a vertical pixel pair; the dispatch still covers 16x16 reconstruction pixels.
 layout(local_size_x = 16, local_size_y = 8) in;
+// D4R_HLSL: the D3D12 build of this file (hlsl_build.py, dialect_hlsl.h); binding N is register tN/uN/sN there
+#ifdef D4R_HLSL
+struct Params
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Params
+#endif
 {
     ivec2 colOrigin;
     ivec2 hiSize, rndSize;
@@ -29,7 +36,58 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     float gain;             // of the first gate
     uint reset;
     float expo, expoPrev;
-} p;
+    // display-resolution motion (MVLowRes clear: NGX's rrlite_post_3_*_mvhi_*): the game's motion texture's size,
+    // zero for render-resolution motion; a pixel's vector is mvScale * (texel + mvOffs)
+    ivec2 mvSize;
+    vec2 mvScale, mvOffs;
+}
+#ifdef D4R_HLSL
+;
+// a read-only view: the driver loads it into scalar registers (from a UAV every lane loads its own copy into vector
+// registers, 22 of them for the whole shader)
+ByteAddressBuffer p_buf : register(t0);
+static Params p;
+#define D4R_HLSL_INIT_CALL p = p_buf.Load<Params>(0);
+#else
+p;
+#endif
+#ifndef HALF_RGB10
+#define HALF_RGB10 0
+#endif
+#ifndef PRESET_L
+#define PRESET_L 0
+#endif
+#if defined(D4R_HLSL) && !defined(M_EXACT)
+#define M_EXACT 0
+#endif
+// D4R_AMD_DXC: the workarounds below for AMD's D3D12 compiler. vkd3d-proton (D4R_VKD3D, compile_m.py --d3d12-target
+// vkd3d) compiles through RADV's, as the Vulkan backend does, so it takes the GLSL code and arithmetic instead
+#if defined(D4R_HLSL) && !D4R_VKD3D
+#define D4R_AMD_DXC 1
+#else
+#define D4R_AMD_DXC 0
+#endif
+#ifndef DISPLAY_MV
+#define DISPLAY_MV (!PRESET_L)
+#endif
+#ifdef D4R_HLSL
+D4R_SAMPLER(colorTex, t1, s1)
+D4R_SAMPLER(mixTex, t2, s2)
+D4R_SAMPLER(gateTex, t3, s3)
+D4R_SAMPLER(covTex, t4, s4)
+D4R_SAMPLER(histTex, t5, s5)
+D4R_SAMPLER(mvATex, t6, s6)
+D4R_SAMPLER(mvBTex, t7, s7)
+D4R_SAMPLER(mvCTex, t8, s8)
+RWTexture2D<float4> histOut : register(u9);
+RWTexture2D<float4> halfOut : register(u10);
+RWStructuredBuffer<uint> packed_w : register(u11);
+struct Packed { RWStructuredBuffer<uint> w; };
+static Packed packed = { packed_w };
+#if DISPLAY_MV
+D4R_SAMPLER(motionTex, t12, s12)
+#endif
+#else
 layout(set = 0, binding = 1) uniform sampler2D colorTex;        // render resolution, linear HDR
 layout(set = 0, binding = 2) uniform sampler2D mixTex;          // three candidate weights
 layout(set = 0, binding = 3) uniform sampler2D gateTex;         // three gates
@@ -39,8 +97,19 @@ layout(set = 0, binding = 6) uniform sampler2D mvATex;
 layout(set = 0, binding = 7) uniform sampler2D mvBTex;
 layout(set = 0, binding = 8) uniform sampler2D mvCTex;          // bilinear
 layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D histOut;
+// HALF_RGB10: the half-resolution mean in an RGB10A2 image (4 bytes instead of 16; its codes are 10-bit unorm), for
+// the dot2 stages (RDNA2), which do not reproduce NGX's arithmetic anyway: the hardware's filtering of the unorm codes
+// differs from the RGBA32F backing's by up to three float ulps
+#if HALF_RGB10
+layout(set = 0, binding = 10, rgb10_a2) uniform writeonly image2D halfOut;
+#else
 layout(set = 0, binding = 10, rgba32f) uniform writeonly image2D halfOut;
+#endif
 layout(set = 0, binding = 11, std430) writeonly buffer Packed { uint w[]; } packed;
+#if DISPLAY_MV
+layout(set = 0, binding = 12) uniform sampler2D motionTex;     // the game's display-resolution motion, nearest
+#endif
+#endif
 // the render-texel tile around the block; the taps of every pixel stay inside it (see the file comment)
 #ifndef TILE_W
 #define TILE_W 10
@@ -48,16 +117,43 @@ layout(set = 0, binding = 11, std430) writeonly buffer Packed { uint w[]; } pack
 #ifndef TILE_H
 #define TILE_H 10
 #endif
-#ifndef PRESET_L
-#define PRESET_L 0
-#endif
 #if PRESET_L
 const int TAP_LO = -1, TAP_HI = 2;
 #else
 const int TAP_LO = -1, TAP_HI = 1;
 #endif
+#if D4R_AMD_DXC
+// AMD's D3D12 compiler reads a shared f16vec4 one 16-bit element at a time (twelve LDS loads per tap): the tile as
+// packed binary16 pairs instead, tile0 and tile1 in one 16-byte entry (three loads a tap; the accumulation reads the
+// words, PACKED_ACC)
+shared uvec4 tile01[TILE_W * TILE_H];
+shared uvec2 tile2w[TILE_W * TILE_H];
+uvec2 packTile(f16vec4 v) { return uvec2(packFloat2x16(v.xy), packFloat2x16(v.zw)); }
+f16vec4 unpackTile(uvec2 v) { return f16vec4(unpackFloat2x16(v.x), unpackFloat2x16(v.y)); }
+#define TILE_GET(k) const uvec4 w01 = tile01[k]; \
+    const f16vec4 t0 = unpackTile(w01.xy), t1 = unpackTile(w01.zw), t2 = unpackTile(tile2w[k]);
+#else
+#ifndef D4R_POST_PACKED_TILES
+#define D4R_POST_PACKED_TILES 0
+#endif
+#if D4R_POST_PACKED_TILES
+// The RDNA 3 D3D12 build (m_hlsl_build.py preprocesses with glslang, so D4R_HLSL is unset above): DWORD-owned tile
+// storage avoids component-wise native-half LDS accesses (rare first-frame blue patches, 2026-10-23).
+shared uvec2 tile0[TILE_W * TILE_H], tile1[TILE_W * TILE_H], tile2[TILE_W * TILE_H];
+uvec2 packTile(f16vec4 value) {
+    const u16vec4 bits = float16BitsToUint16(value);
+    return uvec2(uint(bits.x) | (uint(bits.y) << 16), uint(bits.z) | (uint(bits.w) << 16));
+}
+f16vec4 unpackTile(uvec2 value) {
+    return uint16BitsToFloat16(u16vec4(uint16_t(value.x), uint16_t(value.x >> 16), uint16_t(value.y), uint16_t(value.y >> 16)));
+}
+#else
 shared f16vec4 tile0[TILE_W * TILE_H], tile1[TILE_W * TILE_H], tile2[TILE_W * TILE_H];
-shared vec3 colSum[128];           // vertical pair first, then the neighbouring column
+f16vec4 packTile(f16vec4 value) { return value; }
+f16vec4 unpackTile(f16vec4 value) { return value; }
+#endif
+#endif
+shared vec3 colSum[128];          // vertical pair first, then the neighbouring column
 const float L10 = 3.3219281;        // log2(10)
 // LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no exposure and no
 // range compression anywhere.
@@ -71,16 +167,24 @@ const float PACK = 1.0;
 #else
 vec3 compress(vec3 v)
 {
+#ifdef M_AMD_POST_MATH
+    return log2(max(fma(v, vec3(100.0), vec3(1.0)), vec3(1e-4))) * (0.30103 * 0.36);
+#else
     precise vec3 mapped = fma(v, vec3(100.0), vec3(1.0));
     precise vec3 log10 = log2(max(mapped, vec3(1e-4))) * 0.30103;
     precise vec3 compressed = log10 * 0.36;
     return compressed;
+#endif
 }
 vec3 expand(vec3 v)
 {
+#ifdef M_AMD_POST_MATH
+    return (exp2(clamp(v, 1e-4, 3.0) * (L10 / 0.36)) - 1.0) * (1.0 / 100.0);
+#else
     precise vec3 scaled = clamp(v, 1e-4, 3.0) * (1.0 / 0.36);
     precise vec3 exponent = scaled * L10;
     return (exp2(exponent) - 1.0) * (1.0 / 100.0);
+#endif
 }
 const float PACK = 0.4081632490158081;
 #endif
@@ -93,6 +197,11 @@ ivec2 colourTexel(ivec2 t)
 vec3 history(vec2 q)
 {
     const vec2 inv = 1.0 / vec2(p.hiSize);
+#ifdef M_AMD_HISTORY_BILINEAR
+    // Quality-budget option: use the texture unit's bilinear reconstruction
+    // directly, saving four taps and the Catmull-Rom coefficient arithmetic.
+    return textureLod(histTex, q * inv, 0.0).rgb;
+#else
     const vec2 base = floor(q - 0.5) + 0.5, t = clamp(q - base, 0.0, 1.0), t2 = t * t, t3 = t * t2;
     const vec2 w0 = t2 - (t + t3) * 0.5, w1 = (t3 * 1.5 - t2 * 2.5) + 1.0, w3 = (t3 - t2) * 0.5, w2 = ((1.0 - w0) - w1) - w3;
     const vec2 w12 = w1 + w2, mid = inv * (base + w2 / w12), lo = inv * (base - 1.0), hi = inv * (base + 2.0);
@@ -101,6 +210,7 @@ vec3 history(vec2 q)
                    fma(textureLod(histTex, mid, 0.0).rgb, vec3(c), fma(textureLod(histTex, vec2(mid.x, lo.y), 0.0).rgb, vec3(b),
                    textureLod(histTex, vec2(lo.x, mid.y), 0.0).rgb * a))));
     return s * (1.0 / (e + (d + (c + (b + a)))));
+#endif
 }
 #if PRESET_L
 vec3 historyLinear(vec2 q, float e2)
@@ -138,15 +248,27 @@ void main()
             for (int k = 0; k < 3; ++k) l[k] = max(isinf(c[k]) || isnan(c[k]) ? 1.0 : fma(min(c[k], 32752.0), 100.0, 1.0), 1e-4);
 #endif
             const vec4 m = texelFetch(mixTex, t, 0), g = texelFetch(gateTex, t, 0), cov = texelFetch(covTex, t, 0);
+#if D4R_AMD_DXC
 #if LDR
-            tile0[te] = f16vec4(vec4(l, m.x));
+            const f16vec4 v0 = f16vec4(vec4(l, m.x));
 #else
             precise vec3 log10 = log2(l) * 0.30103;
             precise vec3 compressed = log10 * 0.36;
-            tile0[te] = f16vec4(vec4(compressed, m.x));
+            const f16vec4 v0 = f16vec4(vec4(compressed, m.x));
 #endif
-            tile1[te] = f16vec4(m.y, m.z, g.x, g.y);
-            tile2[te] = f16vec4(vec4(g.z, cov.x * -0.721325, cov.y * -0.721325, cov.z * -1.44265));
+            tile01[te] = uvec4(packTile(v0), packTile(f16vec4(m.y, m.z, g.x, g.y)));
+            tile2w[te] = packTile(f16vec4(vec4(g.z, cov.x * -0.721325, cov.y * -0.721325, cov.z * -1.44265)));
+#else
+#if LDR
+            tile0[te] = packTile(f16vec4(vec4(l, m.x)));
+#else
+            precise vec3 log10 = log2(l) * 0.30103;
+            precise vec3 compressed = log10 * 0.36;
+            tile0[te] = packTile(f16vec4(vec4(compressed, m.x)));
+#endif
+            tile1[te] = packTile(f16vec4(m.y, m.z, g.x, g.y));
+            tile2[te] = packTile(f16vec4(vec4(g.z, cov.x * -0.721325, cov.y * -0.721325, cov.z * -1.44265)));
+#endif
         }
     }
     memoryBarrierShared(); barrier();
@@ -154,6 +276,89 @@ void main()
     // three render texel rows and its own-cell residual rounding exactly as in the 16x16 shader
     const int y0 = 2 * gid.y;
     const bool inside0 = gid.x < p.hiSize.x && y0 < p.hiSize.y;
+    const vec2 pos0 = fma(vec2(gid.x, y0) + 0.5, p.hi2rnd, p.rndOffs), pos1 = fma(vec2(gid.x, y0 + 1) + 0.5, p.hi2rnd, p.rndOffs);
+    // The Gaussians of both rows at once: they have the same column (dx) and texels and differ only in dy, so one set
+    // of tile reads serves both, and each row's operations are the ones it had on its own, lane by lane (dy, the
+    // exponents and the third accumulator are binary16 pairs, element 0 the even row).
+    f16vec4 a0[2] = {f16vec4(0.0), f16vec4(0.0)}, a1[2] = {f16vec4(0.0), f16vec4(0.0)};
+    f16vec2 a2 = f16vec2(0.0);
+    float W[2] = {0.0, 0.0};
+#if D4R_AMD_DXC && !M_EXACT
+#define PACKED_ACC 1
+    // the accumulators as words of binary16 pairs, from the tile's words: the same operations (AMD's D3D12 compiler
+    // still issues them as scalar v_fma_f16 in wave64), better scheduled (RX 9070 XT, 854x480 -> 2560x1440: 333 ->
+    // 326 us). acc[4 r + c]: pair c of row r's a0, a1; acc[8]: a2
+    uint acc[9] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+#else
+#define PACKED_ACC 0
+#endif
+    if (inside0)
+    {
+        // NVIDIA's kernel handles rows in pairs and gives the odd row the even row's three texel rows
+        const ivec2 base = ivec2(floor(pos0 - 0.5));
+        const f16vec2 d0 = f16vec2((vec2(base) + 0.5) - pos0);
+        // Native paired rows round the odd row's own-cell residual first, then adjust it in f16.
+        // Casting the even-cell residual once changes Gaussian weights at half-rounding boundaries.
+        const int ownBaseY = int(floor(pos1.y - 0.5));
+        const float16_t d1y = ownBaseY != base.y ? float16_t((float(ownBaseY) + 0.5) - pos1.y) - float16_t(1.0)
+                                                 : float16_t((float(base.y) + 0.5) - pos1.y);
+        const f16vec2 dy0 = f16vec2(d0.y, d1y);
+        for (int i = TAP_LO; i <= TAP_HI; ++i)
+        {
+            const float16_t dx = d0.x + float16_t(i), sq = dx * dx;
+            for (int j = TAP_LO; j <= TAP_HI; ++j)
+            {
+                const int k = (base.y - origin.y + j) * TILE_W + (base.x - origin.x + i);
+#if D4R_AMD_DXC
+                TILE_GET(k)
+#else
+                const f16vec4 t0 = unpackTile(tile0[k]), t1 = unpackTile(tile1[k]), t2 = unpackTile(tile2[k]);
+#endif
+                const f16vec2 dy = dy0 + float16_t(j);
+#if D4R_AMD_DXC && M_EXACT
+                // M_EXACT (compile_m.py): AMD's D3D12 compiler fuses binary16 arithmetic even when precise, so each
+                // operation in f32 (exact for binary16 operands), rounded to binary16. 47 us at 1280x720 for 0.02 dB
+                // from the ZLUDA capture in the relaxed build, which keeps the fused form
+                const vec2 dyf = vec2(dy), dxf = vec2(float(dx));
+                const f16vec2 e = f16vec2(d4rRne16(d4rRne16(vec2(d4rRne16(float(sq) * float(t2.y))) + d4rRne16(d4rRne16(dyf * dyf) * float(t2.z))) +
+                                                   d4rRne16(d4rRne16(dxf * dyf) * float(t2.w))));
+#else
+                precise f16vec2 e = (f16vec2(sq * t2.y) + (dy * dy) * t2.z) + (dx * dy) * t2.w;
+#endif
+#if D4R_AMD_DXC && !M_EXACT
+                // the relaxed build takes the weights in binary16 (v_exp_f16) and sums them as such
+                const f16vec2 wh = exp2(e);
+                const float16_t wh0 = wh.x, wh1 = wh.y;
+                const float w0 = float(wh0), w1 = float(wh1);
+#else
+                const float w0 = exp2(float(e.x)), w1 = exp2(float(e.y));
+                const float16_t wh0 = float16_t(w0), wh1 = float16_t(w1);
+#endif
+                W[0] += w0; W[1] += w1;
+#if PACKED_ACC
+                const uint tw[4] = {w01.x, w01.y, w01.z, w01.w};
+                [[unroll]] for (int c = 0; c < 4; ++c)
+                {
+                    acc[c] = packFloat2x16(fma(f16vec2(wh0, wh0), unpackFloat2x16(tw[c]), unpackFloat2x16(acc[c])));
+                    acc[4 + c] = packFloat2x16(fma(f16vec2(wh1, wh1), unpackFloat2x16(tw[c]), unpackFloat2x16(acc[4 + c])));
+                }
+                acc[8] = packFloat2x16(fma(wh, f16vec2(t2.x, t2.x), unpackFloat2x16(acc[8])));
+#else
+                a0[0] = fma(f16vec4(wh0), t0, a0[0]); a1[0] = fma(f16vec4(wh0), t1, a1[0]);
+                a0[1] = fma(f16vec4(wh1), t0, a0[1]); a1[1] = fma(f16vec4(wh1), t1, a1[1]);
+                a2 = fma(f16vec2(wh0, wh1), f16vec2(t2.x), a2);
+#endif
+            }
+        }
+    }
+#if PACKED_ACC
+    [[unroll]] for (int r = 0; r < 2; ++r)
+    {
+        a0[r] = f16vec4(unpackFloat2x16(acc[4 * r]), unpackFloat2x16(acc[4 * r + 1]));
+        a1[r] = f16vec4(unpackFloat2x16(acc[4 * r + 2]), unpackFloat2x16(acc[4 * r + 3]));
+    }
+    a2 = unpackFloat2x16(acc[8]);
+#endif
     vec3 outA0 = vec3(0.0), outA1 = vec3(0.0);
     for (int r = 0; r < 2; ++r)
     {
@@ -163,44 +368,45 @@ void main()
         if (inside)
         {
             const vec2 centre = vec2(pix) + 0.5;
-            const vec2 pos = fma(centre, p.hi2rnd, p.rndOffs);
-            // NVIDIA's kernel handles rows in pairs and gives the odd row the even row's three texel rows
-            const float evenY = fma(float(pix.y & ~1) + 0.5, p.hi2rnd.y, p.rndOffs.y);
-            const ivec2 near = ivec2(floor(pos)), base = ivec2(floor(pos.x - 0.5), floor(evenY - 0.5));
-            f16vec2 d0 = f16vec2((vec2(base) + 0.5) - pos);
-            if ((pix.y & 1) != 0)
-            {
-                // Native paired rows round the odd row's own-cell residual first, then adjust it in f16.
-                // Casting the even-cell residual once changes Gaussian weights at half-rounding boundaries.
-                const int ownBaseY = int(floor(pos.y - 0.5));
-                if (ownBaseY != base.y)
-                    d0.y = float16_t((float(ownBaseY) + 0.5) - pos.y) - float16_t(1.0);
-            }
-            f16vec4 a0 = f16vec4(0.0), a1 = f16vec4(0.0);
-            float16_t a2 = float16_t(0.0);
-            float W = 0.0;
-            for (int i = TAP_LO; i <= TAP_HI; ++i)
-            {
-                const float16_t dx = d0.x + float16_t(i), sq = dx * dx;
-                for (int j = TAP_LO; j <= TAP_HI; ++j)
-                {
-                    const int k = (base.y - origin.y + j) * TILE_W + (base.x - origin.x + i);
-                    const f16vec4 t2 = tile2[k];
-                    const float16_t dy = d0.y + float16_t(j);
-                    precise float16_t e = (sq * t2.y + (dy * dy) * t2.z) + (dx * dy) * t2.w;
-                    const float w = exp2(float(e));
-                    const float16_t wh = float16_t(w);
-                    W += w;
-                    a0 = fma(f16vec4(wh), tile0[k], a0); a1 = fma(f16vec4(wh), tile1[k], a1); a2 = fma(wh, t2.x, a2);
-                }
-            }
-            const float inv = 1.0 / W;
-            const vec3 cur = inv * vec3(a0.rgb), m = inv * vec3(a0.w, a1.x, a1.y), g = inv * vec3(a1.z, a1.w, a2);
+            const vec2 pos = r == 0 ? pos0 : pos1;
+            const ivec2 near = ivec2(floor(pos));
+#if D4R_AMD_DXC
+            // the row's sums selected rather than indexed: AMD's D3D12 compiler then schedules the two rows' history
+            // samples apart (88 vector registers in wave64 instead of 120 with the parameters in vector registers as
+            // well; RX 9070 XT, 854x480 -> 2560x1440: 365 -> 336 us)
+            const float Wr = r == 0 ? W[0] : W[1];
+            const f16vec4 a0r = r == 0 ? a0[0] : a0[1], a1r = r == 0 ? a1[0] : a1[1];
+            const float16_t a2r = r == 0 ? a2.x : a2.y;
+#else
+#define Wr W[r]
+#define a0r a0[r]
+#define a1r a1[r]
+#define a2r a2[r]
+#endif
+            const float inv = 1.0 / Wr;
+            const vec3 cur = inv * vec3(a0r.rgb), m = inv * vec3(a0r.w, a1r.x, a1r.y), g = inv * vec3(a1r.z, a1r.w, a2r);
             // the two most likely motion candidates
-            const vec2 mvPos = any(notEqual(textureSize(mvCTex, 0), p.rndSize))
-                ? clamp(pos, vec2(0.5), vec2(p.rndSize) - 0.5) : pos;
-            const vec2 mvA = texelFetch(mvATex, near, 0).xy, mvB = texelFetch(mvBTex, near, 0).xy,
-                       mvC = textureLod(mvCTex, mvPos * p.invRnd, 0.0).xy;
+            vec2 mvA, mvB, mvC;
+#if DISPLAY_MV
+            const bool displayMv = p.mvSize.x > 0;
+            if (displayMv)
+            {
+                // one vector for every candidate: the display-resolution texel of the pixel (int() truncates as NGX's
+                // cvt.rzi), in f32 straight from the game's texture
+                const ivec2 t = ivec2((centre * (1.0 / vec2(p.hiSize))) * vec2(p.mvSize));
+                mvA = texelFetch(motionTex, ivec2(t.x > 0 ? min(t.x, p.mvSize.x - 1) : 0, t.y > 0 ? min(t.y, p.mvSize.y - 1) : 0), 0).xy;
+                mvB = mvA; mvC = mvA;
+            }
+            else
+#else
+            const bool displayMv = false;
+#endif
+            {
+                const vec2 mvPos = any(notEqual(textureSize(mvCTex, 0), p.rndSize))
+                    ? clamp(pos, vec2(0.5), vec2(p.rndSize) - 0.5) : pos;
+                mvA = texelFetch(mvATex, near, 0).xy; mvB = texelFetch(mvBTex, near, 0).xy;
+                mvC = textureLod(mvCTex, mvPos * p.invRnd, 0.0).xy;
+            }
             vec3 big = vec3(mvA, m.x), small = vec3(mvC, m.y);
             if (big.z < small.z) { const vec3 t = big; big = small; small = t; }
             vec3 second = !(small.z < m.z) ? small : vec3(mvB, m.z);
@@ -210,10 +416,15 @@ void main()
             float b2 = k2 * kn, b1 = k1 * kn;
             if (b2 < (1.0 / 255.0)) { b2 = 0.0; b1 = 1.0; }
             const vec2 size = vec2(p.hiSize);
-            const vec2 q1 = centre + big.xy;
+            // display-resolution: the position is one fma of the raw texel (rrlite_post_3_*_mvhi_*)
+            precise vec2 qd = fma(p.mvScale, big.xy + p.mvOffs, centre);
+            const vec2 q1 = displayMv ? qd : centre + big.xy;
             // the fallback colour is only fetched where the history sample leaves the image or the history was reset:
             // the value is the same either way, so computing it in the branch saves the fetch on ordinary pixels
             const bool out1 = q1.x < 0.0 || q1.y < 0.0 || q1.x > size.x || q1.y > size.y || p.reset != 0u;
+            // the second candidate often has the first one's vector (where the motion is uniform): the same position,
+            // so the first one's sample or fallback (a NaN is never equal, and +0 and -0 give the same position)
+            const bool same = all(equal(second.xy, big.xy));
 #if PRESET_L
             // linear light: a sample's expansion (when the previous exposure is positive) or the colour texel
             const vec3 h1 = out1 ? texelFetch(colorTex, colourTexel(near), 0).rgb : historyLinear(q1, p.expoPrev == 0.0 ? 1.0 : p.expoPrev);
@@ -221,7 +432,9 @@ void main()
             if (b2 > 0.0)
             {
                 const vec2 q2 = centre + second.xy;
-                if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
+                if (same || displayMv)
+                    h2 = h1;
+                else if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
                     h2 = out1 ? h1 : texelFetch(colorTex, colourTexel(near), 0).rgb;
                 else h2 = historyLinear(q2, p.expoPrev == 0.0 ? 1.0 : p.expoPrev);
             }
@@ -232,14 +445,16 @@ void main()
             if (b2 > 0.0)
             {
                 const vec2 q2 = centre + second.xy;
-                if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
+                if (same || displayMv)
+                    h2 = h1;
+                else if (q2.x < 0.0 || q2.y < 0.0 || q2.x > size.x || q2.y > size.y || p.reset != 0u)
                     h2 = out1 ? h1 : compress(e2 * texelFetch(colorTex, colourTexel(near), 0).rgb);
                 else h2 = history(q2);
             }
             const vec3 hist = e1 * (expand(fma(vec3(b1), h1, b2 * h2)) * (1.0 / e2));
 #endif
             const vec3 lin = expand(cur);
-            const float g0 = clamp(p.gain * W * g.x, 0.0, 1.0);
+            const float g0 = clamp(p.gain * Wr * g.x, 0.0, 1.0);
             const float ga = fma(g0, 1.0 - g.y, g.y), gb = fma(g0, 1.0 - g.z, g.z);
             outA = fma(lin - hist, vec3(ga), hist);
             if (isinf(outA.x + outA.y + outA.z) || isnan(outA.x + outA.y + outA.z)) outA = lin;
@@ -255,7 +470,12 @@ void main()
                        b = uint(min(max(fma(pk.b, 1023.0, 0.5), 0.0), 1023.0));
             packed.w[pix.y * p.hiSize.x + pix.x] = r | (gg << 11) | (b << 22);
         }
+#if D4R_VKD3D
+        // selected: DXC leaves the row loop rolled around the branch (its sums and accumulators then in scratch arrays)
+        outA0 = r == 0 ? outA : outA0; outA1 = r == 0 ? outA1 : outA;
+#else
         if (r == 0) outA0 = outA; else outA1 = outA;
+#endif
     }
     // the half-resolution mean of the new history. The reference adds a column's two rows first (the thread's own
     // pair) and then the paired column (a shfl.sync.bfly of that sum); the row pair's vertical sum is materialised

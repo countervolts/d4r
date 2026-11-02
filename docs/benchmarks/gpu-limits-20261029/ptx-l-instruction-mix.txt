@@ -1,0 +1,4 @@
+rrlite_enc0_4x4_mvhi_hdr (dlss-0148-00.ptx): 9328 statements, 336 mma, 27.8 per mma, 3 bar, 70 bra
+  mov 1990, cvt 1953, mul 1107, add 962, mma 336, setp 296, max 206, selp 198, or 193, shl 189, min 184, ld 182, abs 178, sub 176, neg 160, and 150, rsqrt 128, fma 106, shr 87, div 76
+rrlite_dec0_4x4 (dlss-0161-00.ptx): 8116 statements, 304 mma, 26.7 per mma, 1 bar, 2 bra
+  mov 1882, cvt 1827, mul 962, add 922, mma 304, min 208, selp 166, max 164, sub 160, neg 160, abs 158, ld 151, shl 151, rsqrt 128, fma 124, or 118, shfl 96, rcp 76, and 73, movmatrix 64

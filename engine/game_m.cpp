@@ -1,5 +1,6 @@
 #include "game_m.h"
 #include "game_internal.h"
+#include "game_profile.h"
 
 namespace d4r {
 
@@ -7,11 +8,12 @@ struct GameUpscalerM::Impl {
     MModel& model;
     MEngine engine;
     uint32_t width, height, outputWidth, outputHeight;
+    game_detail::StageProfile profile;
     game_detail::CanonicalInputs fallback;
     bool started = false;
     Impl(MModel& m, VkPhysicalDevice p, VkDevice d, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetwork* external)
         : model(m), engine(m, rw, rh, ow, oh, external), width(rw), height(rh), outputWidth(ow), outputHeight(oh),
-          fallback(p, d, rw, rh, rw, rh) {}
+          profile(p, d), fallback(p, d, rw, rh, ow, oh) {}   // the motion fallback holds display-resolution vectors too
     void inputs(VkCommandBuffer cb, const GameFrameM& frame);
     void result(VkCommandBuffer cb, const GameFrameM& frame);
 };
@@ -20,6 +22,11 @@ GameUpscalerM::GameUpscalerM(MModel& model, VkPhysicalDevice physical, VkDevice 
     : impl(std::make_unique<Impl>(model, physical, device, outputWidth, outputHeight, renderWidth, renderHeight, external)) {}
 GameUpscalerM::~GameUpscalerM() = default;
 
+// the model has a final-store variant for this packed output format (RGBA16F needs none)
+static bool packedOutput(const MModel& model, VkFormat format) {
+    return (model.hasRgb10Output() && format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) ||
+        (model.hasR11G11B10Output() && format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+}
 // the game's inputs into the engine's images, and the frame's settings
 void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
     auto& g = *this;
@@ -34,20 +41,22 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
     const bool directColor = frame.color.view != VK_NULL_HANDLE && !frame.color.x && !frame.color.y;
     const bool directMotion = frame.motion.view != VK_NULL_HANDLE && !frame.motion.x && !frame.motion.y;
     const bool directDepth = frame.depth.view != VK_NULL_HANDLE && !frame.depth.x && !frame.depth.y;
-    const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasRgb10Output()) &&
+    const bool directOutput = game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth,
+                                  packedOutput(g.model, frame.output.format)) &&
         !frame.output.x && !frame.output.y;
     if (!g.started) {
         if (!g.model.uploadRecorded()) g.model.recordUpload(cb);
         g.engine.recordInitialize(cb);
         g.started = true;
     }
-    g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, w, h, directColor, directMotion, directDepth);
+    const uint32_t mw = frame.displayMotion ? g.outputWidth : w, mh = frame.displayMotion ? g.outputHeight : h;
+    g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, mw, mh, directColor, directMotion, directDepth);
     MFrameSettings s;
     s.renderWidth = w; s.renderHeight = h;
     s.jitter[0] = frame.jitter[0]; s.jitter[1] = frame.jitter[1];
     s.motionScale[0] = frame.motionToRender[0]; s.motionScale[1] = frame.motionToRender[1];
     s.motionOffset[0] = frame.motionOffset[0]; s.motionOffset[1] = frame.motionOffset[1];
-    s.reset = frame.reset; s.depthInverted = frame.depthInverted;
+    s.reset = frame.reset; s.depthInverted = frame.depthInverted; s.displayMotion = frame.displayMotion;
     FrameImages images{};
     images.color = directColor ? frame.color.view : g.fallback.color.view;
     images.motion = directMotion ? frame.motion.view : g.fallback.motion.view;
@@ -59,20 +68,32 @@ void GameUpscalerM::Impl::inputs(VkCommandBuffer cb, const GameFrameM& frame) {
 }
 void GameUpscalerM::Impl::result(VkCommandBuffer cb, const GameFrameM& frame) {
     auto& g = *this;
-    if (game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasRgb10Output()) && !frame.output.x && !frame.output.y) return;
+    if (game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth,
+                                  packedOutput(g.model, frame.output.format)) && !frame.output.x && !frame.output.y) return;
     game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.outputWidth, g.outputHeight);
 }
 void GameUpscalerM::record(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFrame(cb); // begins and ends with barriers against all other work
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.renderWidth ? frame.renderWidth : g.width,
+                    frame.renderHeight ? frame.renderHeight : g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "exposure", "input", "network", "expansion", "reconstruction", "downsample", "output"});
+    g.inputs(cb, frame);
+    g.engine.recordFrame(cb, g.profile.pool(), g.profile.first());
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 void GameUpscalerM::recordFront(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->inputs(cb, frame);
-    impl->engine.recordFront(cb);
+    auto& g = *impl;
+    g.profile.begin(cb, frame.profile, frame.renderWidth ? frame.renderWidth : g.width,
+                    frame.renderHeight ? frame.renderHeight : g.height, g.outputWidth, g.outputHeight,
+                    {"prepare", "exposure", "input", "external_network_wait", "expansion", "reconstruction", "downsample", "output"});
+    g.inputs(cb, frame);
+    g.engine.recordFront(cb, g.profile.pool(), g.profile.first());
 }
 void GameUpscalerM::recordBack(VkCommandBuffer cb, const GameFrameM& frame) {
-    impl->engine.recordBack(cb);
-    impl->result(cb, frame);
+    auto& g = *impl;
+    g.engine.recordBack(cb, g.profile.pool(), g.profile.first(4));
+    g.result(cb, frame);
+    g.profile.end(cb);
 }
 } // namespace d4r

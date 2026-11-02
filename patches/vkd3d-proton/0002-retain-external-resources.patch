@@ -1,10 +1,12 @@
 diff --git a/include/vkd3d_device_vkd3d_ext.idl b/include/vkd3d_device_vkd3d_ext.idl
+index 2157b62e..860640d5 100644
 --- a/include/vkd3d_device_vkd3d_ext.idl
 +++ b/include/vkd3d_device_vkd3d_ext.idl
-@@ -120,6 +120,19 @@
+@@ -119,6 +119,19 @@ interface ID3D12DXVKInteropDeviceD4R : ID3D12DXVKInteropDevice3
+     HRESULT SplitCommandListForExternalWait(ID3D12CommandList *list, UINT64 vk_semaphore, UINT64 value);
  }
  
- [
++[
 +    uuid(4f8c9462-8197-4dc1-a584-cf44d9706db2),
 +    object,
 +    local,
@@ -17,14 +19,14 @@ diff --git a/include/vkd3d_device_vkd3d_ext.idl b/include/vkd3d_device_vkd3d_ext
 +    HRESULT RetainExternalResources(ID3D12CommandList *list, IUnknown *resources);
 +}
 +
-+[
+ [
      uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
      object,
-     local,
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b789190e..027c9a1b 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
-@@ -2791,6 +2791,24 @@
+@@ -2624,6 +2624,24 @@ static void d3d12_command_allocator_free_command_buffer(struct d3d12_command_all
      }
  }
  
@@ -49,18 +51,18 @@ diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
  static bool d3d12_command_allocator_add_view(struct d3d12_command_allocator *allocator,
          struct vkd3d_view *view)
  {
-@@ -2858,6 +2876,10 @@
-     struct d3d12_device *device = allocator->device;
+@@ -2692,6 +2710,10 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
      const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
      unsigned int i;
-+
+ 
 +    for (i = 0; i < allocator->external_resources_count; ++i)
 +        IUnknown_Release(allocator->external_resources[i]);
 +    allocator->external_resources_count = 0;
- 
++
      for (i = 0; i < allocator->buffer_view_count; ++i)
      {
-@@ -2993,6 +3015,7 @@
+         VK_CALL(vkDestroyBufferView(device->vk_device, allocator->buffer_views[i], NULL));
+@@ -2826,6 +2848,7 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
              d3d12_command_list_allocator_destroyed(allocator->current_command_list);
  
          d3d12_command_allocator_free_resources(allocator);
@@ -69,9 +71,10 @@ diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
          vkd3d_free(allocator->views);
          vkd3d_free(allocator->pipelines);
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 5307aeb0..2ecdcab3 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
-@@ -4658,7 +4658,8 @@
+@@ -3752,7 +3752,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice1)
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice2)
              || IsEqualGUID(riid, &IID_ID3D12DXVKInteropDevice3)
@@ -81,7 +84,7 @@ diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
      {
          d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
          *object = &device->ID3D12DXVKInteropDevice_iface;
-@@ -11380,7 +11381,7 @@
+@@ -10465,7 +10466,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
  }
  
  extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
@@ -91,9 +94,10 @@ diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
  extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
  
 diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index e5c0006b..74f6706f 100644
 --- a/libs/vkd3d/device_vkd3d_ext.c
 +++ b/libs/vkd3d/device_vkd3d_ext.c
-@@ -1157,7 +1157,16 @@
+@@ -1157,7 +1157,16 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_SplitCommandListForEx
      return d3d12_command_list_split_for_external_wait(cmd_list, (VkSemaphore)vk_semaphore, value);
  }
  
@@ -111,7 +115,7 @@ diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
  {
      /* IUnknown methods */
      d3d12_dxvk_interop_device_QueryInterface,
-@@ -1192,6 +1201,9 @@
+@@ -1192,6 +1201,9 @@ CONST_VTBL struct ID3D12DXVKInteropDeviceD4RVtbl d3d12_dxvk_interop_device_vtbl
  
      /* ID3D12DXVKInteropDeviceD4R methods */
      d3d12_dxvk_interop_device_SplitCommandListForExternalWait,
@@ -120,11 +124,12 @@ diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
 +    d3d12_dxvk_interop_device_RetainExternalResources,
  };
  
- static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)
+ void d3d12_device_notify_vk_swapchain_creation(struct d3d12_device *device, struct dxgi_vk_swap_chain *chain)
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index c2ebcda6..dc42e358 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -2758,6 +2758,10 @@
+@@ -2774,6 +2774,10 @@ struct d3d12_command_allocator
      LONG refcount;
      LONG internal_refcount;
  
@@ -135,7 +140,7 @@ diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
      D3D12_COMMAND_LIST_TYPE type;
  
      struct vkd3d_view **views;
-@@ -5474,7 +5478,9 @@
+@@ -5553,7 +5557,9 @@ typedef ID3D12DeviceExt5 d3d12_device_vkd3d_ext_iface;
  HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *list,
          VkSemaphore semaphore, uint64_t value);
  

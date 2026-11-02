@@ -39,6 +39,7 @@ fi
 APP_DIR="${D4R_OPTISCALER_APP_DIR:-${TMPDIR:-/tmp}/d4r-optiscaler-harness-${UID}-$(date +%s%N)}"
 mkdir -p "$APP_DIR"
 LAUNCHER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/d4r-optiscaler-proton.XXXXXXXX")"
+trap 'rm -rf "$LAUNCHER_DIR"' EXIT
 COMPAT_DIR="${D4R_OPTISCALER_COMPAT_DIR:-${TMPDIR:-/tmp}/d4r-optiscaler-compat-$UID}"
 mkdir -p "$COMPAT_DIR"
 
@@ -95,10 +96,20 @@ LogToFile=true
 LogLevel=1
 EOF
 
+# Optional real-provider regression: exercise the latency router while keeping
+# this offscreen SR harness's FG disabled. All changes stay in APP_DIR.
+if [[ -n "${D4R_OPTISCALER_FEATURE_RUNTIME:-}" ]]; then
+  python3 "$ROOT/packaging/d4r-features.py" "$APP_DIR" \
+    --runtime "$D4R_OPTISCALER_FEATURE_RUNTIME" --fg off --latency auto
+fi
+
 # Proton refreshes nvapi64.dll in the prefix on every run. Make a temporary
 # launcher that copies our identity bridge instead. Its other files are links
 # to the unmodified Proton installation.
 cp -f "$PROTON_DIR/proton" "$PROTON_DIR/filelock.py" "$PROTON_DIR/version" "$LAUNCHER_DIR/"
+for helper in utilities.py vulkan.py; do
+  [[ ! -f "$PROTON_DIR/$helper" ]] || ln -s "$PROTON_DIR/$helper" "$LAUNCHER_DIR/$helper"
+done
 ln -s "$PROTON_DIR/files" "$LAUNCHER_DIR/files"
 ln -s "$PROTON_DIR/protonfixes" "$LAUNCHER_DIR/protonfixes"
 LAUNCHER="$LAUNCHER_DIR/proton" python3 - <<'PY'
@@ -107,10 +118,15 @@ from pathlib import Path
 
 path = Path(os.environ["LAUNCHER"])
 source = path.read_text()
-old = 'try_copy(g_proton.arch_pe_dir("wine/nvapi", False) + "nvapi64.dll", "drive_c/windows/system32",'
-new = 'try_copy(os.environ.get("D4R_NVAPI_IDENTITY_DLL", g_proton.arch_pe_dir("wine/nvapi", False) + "nvapi64.dll"), "drive_c/windows/system32",'
-if source.count(old) != 1:
+providers = ['g_proton.arch_pe_dir("wine/nvapi", False) + "nvapi64.dll"',
+             'g_proton.arch_pe_dir("wine/" + nvapi_path, False) + "nvapi64.dll"']
+matches = [provider for provider in providers
+           if source.count('try_copy(' + provider + ', "drive_c/windows/system32",') == 1]
+if len(matches) != 1:
     raise SystemExit("Proton NVAPI copy point changed; cannot stage identity bridge")
+provider = matches[0]
+old = 'try_copy(' + provider + ', "drive_c/windows/system32",'
+new = 'try_copy(os.environ.get("D4R_NVAPI_IDENTITY_DLL", ' + provider + '), "drive_c/windows/system32",'
 path.write_text(source.replace(old, new))
 PY
 chmod +x "$LAUNCHER_DIR/proton"
@@ -138,8 +154,8 @@ export DXVK_CONFIG="${DXVK_CONFIG:-dxgi.customVendorId = 10de}"
 
 if [[ ! -s "$OUTPUT_PATH" || ! -f "$APP_DIR/OptiScaler.log" || ! -f "$APP_DIR/d4r_nvngx.log" ]] ||
    ! rg -q 'DLSSFeatureDx12::Init _CreateFeature result: NVSDK_NGX_Result_Success' "$APP_DIR/OptiScaler.log" ||
-   ! rg -q 'NVSDK_NGX_CUDA_CreateFeature -> 0x00000001' "$APP_DIR/d4r_nvngx.log" ||
-   ! rg -q 'frame [0-9]+ done:' "$APP_DIR/d4r_nvngx.log"; then
+   ! rg -q 'NVSDK_NGX_CUDA_CreateFeature(\(feature=1\))? -> 0x00000001' "$APP_DIR/d4r_nvngx.log" ||
+   ! rg -q 'frame [0-9]+ done(:| \(slot [0-9]+\))' "$APP_DIR/d4r_nvngx.log"; then
   printf 'OptiScaler did not complete the official DLSS path; inspect %s\n' "$APP_DIR" >&2
   exit 1
 fi

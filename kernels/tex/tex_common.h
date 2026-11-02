@@ -138,6 +138,45 @@ __attribute__((device)) static inline f8v k32_e4m3(f8v c, const kop& a0, const k
 }
 #endif
 
+// RDNA4 native FP8: the tails encode with the hardware conversion. e4m3x4_f32 gives the codes of four f32 values
+// that hold f16 values already clamped to the finite e4m3 range (the instruction encodes overflow as NaN), in the
+// bytes of one word. With the clamp it equals e4m3x2 for every non-NaN f16 (all 65536 patterns checked on an
+// RX 9070 XT). -DD4R_TEX_SOFT_E4M3 keeps e4m3x2.
+#if defined(D4R_TEX_FP8) && defined(__GFX12__) && !defined(D4R_TEX_SOFT_E4M3)
+#define D4R_TEX_HW_E4M3 1
+__attribute__((device)) static inline uint32_t e4m3x4_f32(float a, float b, float c, float d)
+{
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, d, (int)w, true);
+}
+#endif
+
+// cvt.rn.f16x2.e4m3x2 for the kernels whose PTX make_ptx.py points here (dec0's tail on the native-FP8 build):
+// two e4m3 codes -> an f16 pair. The hardware conversion equals ZLUDA's e4m3_to_f16_bits for every code except
+// the NaN codes 0x7f / 0xff (a different NaN), which the head never stages: it clamps to +-448 before encoding.
+DEV __attribute__((always_inline)) uint32_t d4r_dec_e4m3x2(uint16_t codes)
+{
+#ifdef D4R_TEX_HW_E4M3
+    typedef float dec_f2v __attribute__((ext_vector_type(2)));
+    typedef _Float16 dec_h2v __attribute__((ext_vector_type(2)));
+    const dec_f2v f = __builtin_amdgcn_cvt_pk_f32_fp8((int)codes, false);
+    return __builtin_bit_cast(uint32_t, (dec_h2v){(_Float16)f[0], (_Float16)f[1]});
+#else
+    uint32_t out = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t code = (codes >> (8 * i)) & 0xffu, magnitude = code & 0x7fu;
+        const uint32_t normal = (magnitude << 7) + 0x2000u;
+        const uint32_t subnormal = __builtin_bit_cast(uint16_t, (_Float16)((float)(magnitude & 7u) * 0x1p-9f));
+        uint32_t half = magnitude >= 8u ? normal : subnormal;
+        half = magnitude == 0x7fu ? 0x7fffu : half;
+        out |= (((code & 0x80u) << 8) | half) << (16 * i);
+    }
+    return out;
+#endif
+}
+
 // ZLUDA's f16x2_to_e4m3x2_satfinite_bits: RNE satfinite e4m3 of both halves, low half -> low byte.
 __attribute__((device)) static inline uint32_t e4m3x2(uint32_t bits)
 {
@@ -222,6 +261,39 @@ DEV __attribute__((always_inline)) void d4r_sust_v2b16(uint64_t surface, int32_t
         sust_v2b16_generic(surface, x, y, a, b);
 }
 
+typedef int16_t v4s __attribute__((ext_vector_type(4)));
+extern "C" __attribute__((device)) void __zluda_ptx_impl_surfobj_b_2d_v4_b16_zero(uint64_t surface, v2i coord, v4s value);
+
+__attribute__((device, noinline)) static void sust_v4b16_generic(uint64_t surface, int32_t x, int32_t y,
+                                                               uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    __zluda_ptx_impl_surfobj_b_2d_v4_b16_zero(surface, (v2i){x, y},
+                                           (v4s){(int16_t)a, (int16_t)b, (int16_t)c, (int16_t)d});
+}
+
+FP_BODY void sust_rgba16f_body(tsharp_t* image, int32_t px, int32_t y,
+                             uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    __ockl_image_store_2D(image, (v2i){px, y},
+                         (v4f){half_bits_to_float(a), half_bits_to_float(b),
+                               half_bits_to_float(c), half_bits_to_float(d)});
+}
+
+// RR stores complete RGBA16F texels. No channel reads or partial-pixel merges
+// are needed; other layouts retain the generic byte-addressed store.
+DEV __attribute__((always_inline)) void d4r_sust_v4b16(uint64_t surface, int32_t x, int32_t y,
+                                                     uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    tsharp_t* image = (tsharp_t*)surface;
+    if (__ockl_image_channel_data_type_2D(image) == 14 && __ockl_image_channel_order_2D(image) == 8 && (x & 7) == 0)
+    {
+        if (x >= 0)
+            sust_rgba16f_body(image, x >> 3, y, a, b, c, d);
+    }
+    else
+        sust_v4b16_generic(surface, x, y, a, b, c, d);
+}
+
 
 // f32 comparisons on the bits (no fcmp: kernels ZLUDA compiles in strict-FP mode cannot lower
 // constrained fcmp); same results as the float compares, -0.0 included
@@ -299,10 +371,35 @@ extern "C" __attribute__((device)) int __ockl_image_width_2D(tsharp_t* image);
 extern "C" __attribute__((device)) int __ockl_image_height_2D(tsharp_t* image);
 __attribute__((device)) static inline uint32_t redirect_pitch(uint64_t surface)
 {
-    // 'R2' tag in the high half (other handles may have data there), row pitch / 8 in the low half
+    // 'R2' (RGBA16F), 'R3' (RGB10A2) or 'R4' (RGBA8) tag in the high half (other handles may have
+    // data there), row pitch / 8 in the low half
     const uint32_t word = ((const __attribute__((address_space(4))) uint32_t*)surface)[21];
-    return (word >> 16) == 0x5232u ? (word & 0xffffu) << 3 : 0u;
+    return (word >> 16) >= 0x5232u && (word >> 16) <= 0x5234u ? (word & 0xffffu) << 3 : 0u;
 }
+__attribute__((device)) static inline bool redirect_rgb10a2(uint64_t surface)
+{
+    return (((const __attribute__((address_space(4))) uint32_t*)surface)[21] >> 16) == 0x5233u;
+}
+__attribute__((device)) static inline bool redirect_rgba8(uint64_t surface)
+{
+    return (((const __attribute__((address_space(4))) uint32_t*)surface)[21] >> 16) == 0x5234u;
+}
+// One channel as the game-side path produces it: the f32 value rounded toward zero to a half (the RGBA16F
+// store), then converted to UNORM by a blit (NaN and negatives 0, clamped at 1, rounded to nearest).
+__attribute__((device)) static inline uint32_t redirect_unorm(uint16_t half, float scale)
+{
+    float value = (float)__builtin_bit_cast(_Float16, half);
+    value = value > 0.0f ? value : 0.0f;
+    value = value < 1.0f ? value : 1.0f;
+    return (uint32_t)(value * scale + 0.5f);
+}
+// D4R_AS1_STORES: redirect stores through address-space-1 pointers (global_store instead of flat_store; the
+// redirect target is linear device memory)
+#ifdef D4R_AS1_STORES
+#define D4R_REDIRECT_PTR(T, address) ((__attribute__((address_space(1))) T*)(uintptr_t)(address))
+#else
+#define D4R_REDIRECT_PTR(T, address) ((T*)(address))
+#endif
 __attribute__((device)) static inline uint8_t* redirect_row(uint64_t surface, int32_t y)
 {
     const uint64_t base = *(const __attribute__((address_space(4))) uint64_t*)(surface + 88);
@@ -325,7 +422,16 @@ DEV __attribute__((always_inline)) void d4r_sust_p_v4b32(uint64_t surface, int32
         {
             const uint32_t lo = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(__builtin_bit_cast(float, a), __builtin_bit_cast(float, b)));
             const uint32_t hi = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(__builtin_bit_cast(float, c), __builtin_bit_cast(float, d)));
-            *(uint2_t*)(redirect_row(surface, y) + 8 * x) = (uint2_t){lo, hi};
+            if (redirect_rgb10a2(surface))
+                *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + 4 * x) =
+                    redirect_unorm((uint16_t)lo, 1023.0f) | redirect_unorm((uint16_t)(lo >> 16), 1023.0f) << 10 |
+                    redirect_unorm((uint16_t)hi, 1023.0f) << 20 | redirect_unorm((uint16_t)(hi >> 16), 3.0f) << 30;
+            else if (redirect_rgba8(surface))
+                *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + 4 * x) =
+                    redirect_unorm((uint16_t)lo, 255.0f) | redirect_unorm((uint16_t)(lo >> 16), 255.0f) << 8 |
+                    redirect_unorm((uint16_t)hi, 255.0f) << 16 | redirect_unorm((uint16_t)(hi >> 16), 255.0f) << 24;
+            else
+                *D4R_REDIRECT_PTR(uint2_t, redirect_row(surface, y) + 8 * x) = (uint2_t){lo, hi};
         }
         return;
     }
@@ -428,9 +534,16 @@ DEV __attribute__((always_inline)) void d4r_sust_b32(uint64_t surface, int32_t x
     tsharp_t* image = (tsharp_t*)surface;
     if (redirect_pitch(surface) != 0)
     {
-        // raw bits at byte offset x (RGBA16F rows are 8 bytes per pixel)
-        if (x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
-            *(uint32_t*)(redirect_row(surface, y) + x) = data;
+        // Raw RGBA16F stores carry two half channels at each four-byte offset. Packing those channels
+        // separately keeps the original store ownership (no read-modify-write or cross-thread race).
+        if (redirect_rgba8(surface) && x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
+            *D4R_REDIRECT_PTR(uint16_t, redirect_row(surface, y) + (x >> 1)) =
+                (uint16_t)(redirect_unorm((uint16_t)data, 255.0f) |
+                           redirect_unorm((uint16_t)(data >> 16), 255.0f) << 8);
+        // raw bits at byte offset x (RGBA16F rows are 8 bytes per pixel); the shim only asks for packed
+        // RGB10A2 texels from kernels without raw stores; RGBA8 preserves each half-pair store
+        if (!redirect_rgb10a2(surface) && !redirect_rgba8(surface) && x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
+            *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + x) = data;
         return;
     }
     const int dt = __ockl_image_channel_data_type_2D(image), order = __ockl_image_channel_order_2D(image);

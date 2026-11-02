@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Sat, 31 Oct 2026 15:10:00 +0100
+Subject: [PATCH] Enable the NGX module's Vulkan device extensions
+
+OptiScaler's vkCreateDevice hook adds fixed NVNGX, FFX and XeSS extension
+lists; neither games nor Streamline's interposer ask the NGX module, so the
+VK_KHR_pipeline_binary and VK_KHR_maintenance5 that d4r's NVSDK_NGX_VULKAN_
+GetFeatureDeviceExtensionRequirements reports (its native network on AMD's
+Windows driver) never reached the game's device. Ask the loaded NvngxPath
+module with the physical device's own instance, add what it requests, and
+enable the pipelineBinaries and maintenance5 features with them.
+
+diff --git a/OptiScaler/hooks/Vulkan_Hooks.cpp b/OptiScaler/hooks/Vulkan_Hooks.cpp
+index af8120de..106387a2 100644
+--- a/OptiScaler/hooks/Vulkan_Hooks.cpp
++++ b/OptiScaler/hooks/Vulkan_Hooks.cpp
+@@ -650,7 +650,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
+             featureState = &deviceFeatures;
+ 
+         VulkanSpoofing::hkvkCreateDevice(physicalDevice, &localCreateInfo, pAllocator, pDevice, featureState,
+-                                         requestedApiVersion);
++                                         requestedApiVersion, physicalDeviceInstance);
+ 
+         timelineSemaphoresEnabled = TimelineSemaphoresEnabled(&localCreateInfo);
+ 
+diff --git a/OptiScaler/spoofing/Vulkan_Spoofing.cpp b/OptiScaler/spoofing/Vulkan_Spoofing.cpp
+index 3f8fd12d..2bee4db6 100644
+--- a/OptiScaler/spoofing/Vulkan_Spoofing.cpp
++++ b/OptiScaler/spoofing/Vulkan_Spoofing.cpp
+@@ -5,6 +5,7 @@
+ #include <SysUtils.h>
+ 
+ #include <proxies/KernelBase_Proxy.h>
++#include <proxies/NVNGX_Proxy.h>
+ #include <hooks/VulkanwDx12_Hooks.h>
+ 
+ #include <magic_enum.hpp>
+@@ -550,6 +551,10 @@ struct VulkanDeviceFeatureState::Impl
+     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR computeShaderDerivatives {
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR
+     };
++    VkPhysicalDevicePipelineBinaryFeaturesKHR pipelineBinary {
++        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR
++    };
++    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+ 
+     Impl(VkDeviceCreateInfo* pCreateInfo, PFN_vkGetPhysicalDeviceFeatures2 getFeatures2)
+         : pCreateInfo(pCreateInfo), getFeatures2(getFeatures2)
+@@ -569,7 +574,7 @@ struct VulkanDeviceFeatureState::Impl
+             CopyFeatureChain(pCreateInfo->pNext, features2, vulkan12Features, vulkan13Features, shaderFloat16Int8,
+                              storage8Bit, descriptorIndexing, bufferDeviceAddress, vulkanMemoryModel, synchronization2,
+                              subgroupSizeControl, timelineSemaphore, descriptorBuffer, shaderFloat8, cooperativeMatrix,
+-                             cooperativeMatrix2, computeShaderDerivatives);
++                             cooperativeMatrix2, computeShaderDerivatives, pipelineBinary, maintenance5);
+     }
+ 
+     bool CanUpgradeExtBufferDeviceAddress(VkPhysicalDevice physicalDevice)
+@@ -859,6 +864,25 @@ struct VulkanDeviceFeatureState::Impl
+ 
+         if (HasExtension(pCreateInfo, VK_NV_LOW_LATENCY_2_EXTENSION_NAME))
+             EnableTimelineSemaphores(physicalDevice);
++
++        // Requested by the NGX module (hkvkCreateDevice): d4r creates its native network's pipelines through these
++        if (HasExtension(pCreateInfo, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME))
++            EnableFeatureStruct(pCreateInfo, getFeatures2, physicalDevice, modifiedFeatures, pipelineBinary,
++                                &VkPhysicalDevicePipelineBinaryFeaturesKHR::pipelineBinaries);
++
++        if (HasExtension(pCreateInfo, VK_KHR_MAINTENANCE_5_EXTENSION_NAME))
++        {
++            // A chain with VkPhysicalDeviceVulkan14Features must not also carry VkPhysicalDeviceMaintenance5Features
++            if (const auto* existing = FindFeatureStruct<VkPhysicalDeviceVulkan14Features>(
++                    pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES))
++                EnableExistingFeature(modifiedFeatures, const_cast<VkPhysicalDeviceVulkan14Features*>(existing),
++                                      vulkan14Features, &VkPhysicalDeviceVulkan14Features::maintenance5,
++                                      GetSupportedFeatureStruct(getFeatures2, physicalDevice, vulkan14Features)
++                                          .maintenance5);
++            else
++                EnableFeatureStruct(pCreateInfo, getFeatures2, physicalDevice, modifiedFeatures, maintenance5,
++                                    &VkPhysicalDeviceMaintenance5FeaturesKHR::maintenance5);
++        }
+     }
+ 
+     void EnableFeatures(VkPhysicalDevice physicalDevice)
+@@ -890,7 +914,8 @@ bool VulkanDeviceFeatureState::EnableTimelineSemaphores(VkPhysicalDevice physica
+ 
+ VkResult VulkanSpoofing::hkvkCreateDevice(VkPhysicalDevice physicalDevice, VkDeviceCreateInfo* pCreateInfo,
+                                           const VkAllocationCallbacks* pAllocator, VkDevice* pDevice,
+-                                          VulkanDeviceFeatureState* featureState, uint32_t requestedApiVersion)
++                                          VulkanDeviceFeatureState* featureState, uint32_t requestedApiVersion,
++                                          VkInstance instance)
+ {
+     if (State::Instance().creatingD3DDevice)
+     {
+@@ -1171,6 +1196,26 @@ VkResult VulkanSpoofing::hkvkCreateDevice(VkPhysicalDevice physicalDevice, VkDev
+         for (const auto* extension : ffxFeatureExtensions)
+             addExtension(extension);
+ 
++        // What the NGX module (NvngxPath) asks for: games and Streamline's interposer enable fixed lists, so d4r's
++        // VK_KHR_pipeline_binary and VK_KHR_maintenance5 (its native network on AMD's driver) never reached the device
++        if (instance != VK_NULL_HANDLE && Config::Instance()->DLSSEnabled.value_or_default() &&
++            NVNGXProxy::NVNGXModule() != nullptr && NVNGXProxy::VULKAN_GetFeatureDeviceExtensionRequirements() != nullptr)
++        {
++            NVSDK_NGX_FeatureDiscoveryInfo info {};
++            info.SDKVersion = NVSDK_NGX_Version_API;
++            info.FeatureID = NVSDK_NGX_Feature_SuperSampling;
++            info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
++            info.ApplicationDataPath = L".";
++            uint32_t count = 0;
++            VkExtensionProperties* requested = nullptr;
++            const auto result = NVNGXProxy::VULKAN_GetFeatureDeviceExtensionRequirements()(
++                instance, physicalDevice, &info, &count, &requested);
++            LOG_INFO("Adding NGX module Vulkan extensions ({:X}, {})", (UINT) result, count);
++            if (result == NVSDK_NGX_Result_Success && requested != nullptr)
++                for (uint32_t i = 0; i < count; i++)
++                    addExtension(requested[i].extensionName);
++        }
++
+         if (effectiveApiVersion < VK_API_VERSION_1_2)
+         {
+             static constexpr const char* vulkan12FallbackExtensions[] = {
+diff --git a/OptiScaler/spoofing/Vulkan_Spoofing.h b/OptiScaler/spoofing/Vulkan_Spoofing.h
+index 53d91cca..2c302a6a 100644
+--- a/OptiScaler/spoofing/Vulkan_Spoofing.h
++++ b/OptiScaler/spoofing/Vulkan_Spoofing.h
+@@ -36,7 +36,8 @@ class VulkanSpoofing
+ 
+     static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, VkDeviceCreateInfo* pCreateInfo,
+                                      const VkAllocationCallbacks* pAllocator, VkDevice* pDevice,
+-                                     VulkanDeviceFeatureState* featureState, uint32_t requestedApiVersion);
++                                     VulkanDeviceFeatureState* featureState, uint32_t requestedApiVersion,
++                                     VkInstance instance = VK_NULL_HANDLE);
+     static VkResult hkvkCreateInstance(VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+                                        VkInstance* pInstance);
+ 

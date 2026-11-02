@@ -8,7 +8,7 @@
 //           @FILE#0xOFFSET, which uploads FILE into a fresh device buffer (once
 //           per distinct FILE) and passes that buffer's address plus OFFSET.
 // After the launch every uploaded buffer is written to OUTDIR/<basename>.out.
-#include <dlfcn.h>
+#include "d4r_dlfcn.h"
 
 #include <cstdint>
 #include <cstdio>

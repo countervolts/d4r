@@ -1,21 +1,44 @@
+Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
+
 d4r @VERSION@: where every file in this release comes from
 ============================================================
 
 Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt):
   d4r/nvngx.dll          NGX shim            tools/d4r_nvngx_shim.cpp in the d4r repository
   d4r/nvcuda.dll         Wine CUDA bridge    tools/wine_nvcuda_bridge.c
+  d4r/d4r_nvapi64.dll    optional latency NVAPI router, tools/d4r_nvapi_router.cpp
+  d4r/d4r-features.py    per-game opt-in setup and exact INI backups
   d4r/kernels/           native RDNA3/RDNA4 kernels for the DLSS 4 and 4.5 network layers, kernels/k and kernels/m
                          (d4r-kernels.txt lists hashes of the DLSS code each kernel replaces; it holds no NVIDIA code)
   d4r/d4r.ini, d4r/d4r-check.sh, D4R_README.txt
+  Experimental vkhip: engine/vkhip/ and the opt-in in tools/d4r_nvngx_shim.cpp.
+                         The donor is built from engine/vkhip/donor.comp; native code objects and
+                         model weights are runtime inputs, not embedded in these sources.
+@installer   install.sh           downloads and verifies NVIDIA DLLs; no driver installation. Then builds the engine's
+@installer                        models from them with d4r/tools/build-engine-models.sh
+@installer   d4r/tools/models/    d4r's engine-model compilers and shader sources (engine/, kernels/tools, kernels/rr,
+@installer                        vulkan/ptx2glsl.py) and the D3D12 test app (tools/d3d12_dlss_harness.cpp)
+@installer   d4r/tools/models/bin/glslangValidator
+@installer                        Khronos glslang 16.6.0 (unmodified release build), https://github.com/KhronosGroup/glslang
+@installer                        License: d4r/licenses/glslang-LICENSE.txt
 
 Third-party software, unmodified or patched by d4r:
+  OptiScaler/            OptiScaler v10's complete unmodified dependency folder, including:
+                         Intel XeSS/XeLL/XeFG (XeSS license), AMD FidelityFX loader/upscaler/FG (MIT),
+                         dlssg_to_fsr3_amd_is_better.dll (Nukem9, GPL-3.0,
+                         https://github.com/Nukem9/dlssg-to-fsr3), and Microsoft's private D3D12
+                         interop core (DirectX license). Upstream license texts are preserved under
+                         d4r/licenses/OptiScaler/. No NVIDIA DLSSG or Streamline DLLs are added.
+                         Fakenvapi is integrated in OptiScaler v10; no separate DLL is needed.
+                         Proxy packages include these files; ASI add-ons use the host installation.
+                         The legacy d4r NVAPI router ships only with ASI add-ons for 0.9 compatibility.
   d4r/zluda/libcuda.so   ZLUDA (Apache License 2.0 or MIT), https://github.com/vosen/ZLUDA
-                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0007 applied.
+                         commit @ZLUDA_COMMIT@ with d4r/source/patches/zluda/0002 to 0014 applied.
                          It contains LLVM (Apache License 2.0 with LLVM exceptions).
                          Licenses: d4r/licenses/ZLUDA-LICENSE-*.txt, d4r/licenses/LLVM-LICENSE.txt
   d3d12.dll, d3d12core.dll
                          vkd3d-proton (GNU LGPL 2.1), https://github.com/HansKristian-Work/vkd3d-proton
-                         commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 and 0002 applied,
+                         commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 to 0005 applied,
                          built with its build-win64.txt cross file (meson --buildtype release).
                          Licenses: d4r/licenses/vkd3d-proton-*.txt
   d4r/rocm/lib/          ROCm 7.2.4 runtime, unmodified, from AMD's Ubuntu 22.04 packages
@@ -28,19 +51,34 @@ Third-party software, unmodified or patched by d4r:
                          GNU LGPL 2.1), unmodified, from Ubuntu 22.04's libelf1 and libnuma1 packages; their
                          sources are Ubuntu's elfutils 0.186-1ubuntu0.1 and numactl 2.0.14-3ubuntu2 source packages.
                          Licenses: d4r/licenses/ROCm-lib*-copyright.txt
-  dxgi.dll               OptiScaler 0.9.4 (GNU GPL 3.0), unmodified OptiScaler.dll renamed to dxgi.dll.
-                         Source: https://github.com/optiscaler/OptiScaler/tree/v0.9.4
+  dxgi.dll               OptiScaler 10.0.0-pre1 (GNU GPL 3.0), unmodified OptiScaler.dll renamed.
+                         Pinned nightly-20261024. Exact source, archive digest and per-file hashes:
+                         d4r/source/optiscaler.json (custom build inputs are identified separately).
+                         https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261024
                          License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
-  OptiScaler.ini         OptiScaler 0.9.4's OptiScaler.ini with the values d4r needs set
-                         (packaging/optiscaler.settings in the d4r repository)
+  OptiScaler.ini         Upstream v10 INI with packaging/optiscaler.settings applied.
+                         NvngxPath selects d4r; OptiDllPath selects the OptiScaler/ dependency folder.
+                         FG is bundled but disabled by default. UseFakenvapi=false preserves Proton
+                         NVAPI GPU/topology queries; v10's latency hooks can translate Reflex markers.
 
-@clean Not included: NVIDIA's DLSS library (nvngx_dlss.dll) and NGX runtime (_nvngx.dll). You supply them
+@clean Not included: NVIDIA's DLSS libraries (nvngx_dlss.dll, nvngx_dlssd.dll) and NGX runtime (_nvngx.dll). You supply them
 @clean and are responsible for complying with NVIDIA's license terms.
-@full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever distributes
-@full this zip, not by NVIDIA:
+@full NVIDIA's software, not covered by any license in d4r/licenses and included by whoever built this
+@full zip, not by NVIDIA. NVIDIA's license does not permit redistributing it; do not share this zip:
 @full   d4r/nvngx_dlss.dll   NVIDIA DLSS Super Resolution library @DLSS_VERSION@
 @full   d4r/ngx/_nvngx.dll   NVIDIA NGX runtime from NVIDIA's Windows display driver, @NGX_VERSION@
-@full   d4r/kernels/*/hiluma_engine_output_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
-@full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll with parts replaced by d4r code
-@full                        (kernels/tex in the d4r repository), compiled by ZLUDA
+@installer NVIDIA DLLs are not bundled. install.sh downloads DLSS 310.7.0 from NVIDIA/DLSS
+@installer commit a291cc7d2cc642a51566f3dfd5376f635cd1b284, DLSS Ray Reconstruction 310.9.1 from commit
+@installer 374959484e79a640feaba44c93ac8cfb0a03f5b5 and _nvngx.dll from NVIDIA driver 596.36.
+@installer URLs and SHA-256 hashes are pinned in install.sh. NVIDIA license terms apply. The engine models
+@installer install.sh builds in d4r/engine hold values read from those DLLs: they are not part of this zip.
+@installer Included NVIDIA PTX-derived kernels (not covered by d4r licenses):
+@installer   d4r/kernels/*/hiluma_engine_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@installer                        NVIDIA's PTX with parts replaced by d4r code (kernels/tex) or translated to
+@installer                        HIP (kernels/native), compiled by ZLUDA or ROCm's clang.
+@full   Optional d4r/nvngx_dlssd.dll: NVIDIA DLSS Ray Reconstruction library, when supplied through D4R_BUNDLE_DLSSD
+@full   d4r/kernels/*/hiluma_engine_*, rrlite_enc0_*, rrlite_dec0_*, rrlite_post_*, rrlite_downsample_*
+@full                        DLSS kernels: NVIDIA's PTX from nvngx_dlss.dll, with parts replaced by d4r code
+@full                        (kernels/tex in the d4r repository) or translated to HIP (kernels/native),
+@full                        compiled by ZLUDA or ROCm's clang
 d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.

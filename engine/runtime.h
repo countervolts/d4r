@@ -7,31 +7,15 @@
 #include <vector>
 #include <string>
 
+#include "k_frame.h"
+#include "m_shared.h"
+
 namespace d4r {
-constexpr unsigned KLayers = 11;
-// These are the shader ABI, not NGX/CUDA parameter blocks. Sizes are checked in runtime.cpp.
-struct InputParams {
-    float out2rnd[2], rndOffs[2], mvScale[2], mvOffs[2], invHist[2], invValid[2], tok2uv[2];
-    int32_t colOrigin[2], colSize[2], depOrigin[2], depSize[2], mvOrigin[2], mvSize[2];
-    int32_t tokW; uint32_t flags; // FrameFlagReset, FrameFlagRegularDepth, FrameFlagDisplayMotion
-    float expo, expoIn, expoRatio, minW;
-};
-struct OutputParams {
-    float out2rnd[2], rndOffs[2], near2rnd[2], sub2rnd[2], out2tok[2], mvScale[2], mvOffs[2], invOut[2], invOutValid[2];
-    int32_t colOrigin[2], colMax[2], depOrigin[2], depMax[2], mvOrigin[2], mvMax[2], outOrigin[2], outSize[2];
-    int32_t tokW, tokH; uint32_t flags; // as InputParams::flags (both must agree), plus the table bits
-    float expo, expoRatio, sharp, minAlpha, alphaThr, lutScale, kA, kB, c184, c186;
-};
-constexpr uint32_t FrameFlagReset = 1, FrameFlagRegularDepth = 2, FrameFlagDisplayMotion = 4;
-// OutputParams::flags only: the reconstruction table of this frame, 0..15 (kReconstructionTable). A model
-// holding a single table ignores it.
-constexpr uint32_t FrameFlagTableShift = 8, FrameFlagTableMask = 15u << FrameFlagTableShift;
-constexpr uint32_t KTableBytes = 32768, KTableCount = 16;
-struct LayerShape { int32_t w, h, sx, sy; };
-struct Shape {
-    uint32_t outputWidth, outputHeight;
-    std::array<LayerShape, KLayers> layers;
-};
+// Pipelines created after this call opt out of storage and uniform buffer robustness (VK_EXT_pipeline_robustness);
+// the device must enable pipelineRobustness. For a host device with robustBufferAccess2 (vkd3d-proton): RADV then
+// cannot use scalar loads for storage buffers, which costs preset K's v_dot2 network about 1.6x on a Steam Deck.
+// The engine's shaders stay in bounds without it.
+void setBufferRobustnessDisabled(bool disabled);
 struct FrameImages {
     VkImageView color, motion, depth;
     VkImageLayout colorLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -47,26 +31,6 @@ struct FrameOutput {
     VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
 };
 struct HistoryImages { VkImage color, luma, feature; };
-// Standard linear HDR, render-resolution motion vectors. Coordinates start at (0,0).
-// Motion is in render pixels by default; provide a scale to convert another convention to output pixels.
-// Exposure is supplied by the application. Ratios refer to the compressed history already in this Engine.
-struct FrameSettings {
-    uint32_t renderWidth, renderHeight;
-    float jitter[2] = {0, 0};
-    float motionScale[2] = {0, 0}; // (0,0) chooses output/render, or 1 with displayMotion
-    float motionOffset[2] = {0, 0};
-    float colorExposure = 1, historyExposureRatio = 1, networkExposureScale = 1;
-    float sharpness = 1.37f;
-    bool reset = false;
-    bool depthInverted = true; // false: regular depth (larger is farther); needs Model::hasRegularDepth
-    // Motion vectors at output resolution (one texel per output pixel, in output pixels); needs Model::hasDisplayMotion.
-    bool displayMotion = false;
-    bool autoExposure = false; // GameUpscaler only: measure the exposure instead of using the three fields above; exclusive with GameFrame::exposure
-    // GameUpscaler with autoExposure: the game's exposure scale and the factor it pre-multiplied the colour by.
-    // Values other than 1 need Model::hasRegularDepth (the same shader revision).
-    float exposureScale = 1, preExposure = 1;
-};
-struct FrameParams { InputParams input; OutputParams output; };
 // The network run by something else (the native HIP layers, engine/hip_net.h and the CUDA bridge's
 // d4rEngineNet*): the caller owns two storage buffers of the model's own size, shared with that network and
 // written/read by the engine's stages as row-major f16. Preset M: `tokens` and `head` are each
@@ -75,39 +39,19 @@ struct FrameParams { InputParams input; OutputParams output; };
 // tokens and the final store reads the head.
 struct ExternalNetwork { VkBuffer tokens = VK_NULL_HANDLE, head = VK_NULL_HANDLE; };
 
-// Automatic K exposure: key / geometric mean of luma on an output/2 grid sampled across the colour rectangle,
-// kept as a half float inside the Engine. When passed to setFrame, the frame's exposure fields (expo, expoIn,
-// expoRatio) are written on the GPU and the values in InputParams/OutputParams are ignored. NGX measures on
-// every second evaluation, starting with the first; a frame that does not measure keeps the last value.
-struct ExposureControl {
-    int32_t origin[2] = {0, 0}, size[2] = {0, 0};
-    float scale = 1;            // applied to the luma before the logarithm, together with 1 / preExposure
-    float key = 0.18f / 0.82f;
-    // The game's. NGX scales the luma it measures by 1 / pre (cuda_luma_convert_kernel), so the kept measurement is
-    // pre times the unscaled one, and the frame's exposure is exposureScale * measured / pre.
-    float exposureScale = 1, preExposure = 1;
-    bool measure = true;
-    bool reset = false;         // the history was produced with no earlier exposure: previous = current
-    // The game supplies the exposure in FrameImages::exposure instead of measuring it (measure is then unused).
-    bool game = false;
-};
-Shape makeKShape(uint32_t outputWidth, uint32_t outputHeight);
-// NGX keeps sixteen reconstruction tables on a uniform grid of the upscaling ratio (0.5 + index * 3/28) and
-// uses the nearest even one for the geometric mean of the two axes' ratios, at most index 14 (ratio 2).
-uint32_t kReconstructionTable(uint32_t outputWidth, uint32_t outputHeight, uint32_t renderWidth, uint32_t renderHeight);
-FrameParams makeKFrameParams(const Shape& shape, const FrameSettings& settings);
-// NGX's window schedule: the bottleneck layer's shift follows an eight-frame cycle, counted from the feature's
-// first evaluation, and every shallower layer follows from the one below it as (2 * shift + 4) mod 8, which
-// leaves the three outer layers on each side at (4,4).
-std::array<LayerShape, KLayers> makeKWindows(const Shape& shape, uint32_t frameIndex);
-
+// The network's shaders: cooperative matrices (layer.comp, VK_KHR_cooperative_matrix with 16x16x16 f16 inputs / f32
+// accumulation) or v_dot2_f32_f16 without them (layer_dot2.comp, the model's <layer>_dot2.spv: RDNA2). Auto takes
+// the matrices when the device exposes the extension (D4R_ENGINE_K_NETWORK=dot2|matrix overrides); a build with the
+// Vulkan table (the shim) cannot see the device's extensions, so there Auto means Matrix and the caller decides.
+enum class KNetwork { Auto, Matrix, Dot2 };
 // Device must enable shaderInt16, shaderStorageImageExtendedFormats,
 // storageBuffer16BitAccess, shaderFloat16, subgroupSizeControl,
-// computeFullSubgroups and VK_KHR_cooperative_matrix (16x16x16 f16 inputs / f32 accumulation).
+// computeFullSubgroups and, for KNetwork::Matrix, VK_KHR_cooperative_matrix.
 // Caller serializes recording and waits for the GPU before destruction. Frames execute in recording order.
 class Model {
 public:
-    Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+          KNetwork network = KNetwork::Auto, bool accuracy = false);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -120,7 +64,10 @@ public:
     bool hasDisplayMotion() const; // packaged shaders read FrameFlagDisplayMotion (render-resolution motion otherwise)
     bool hasGameExposure() const; // packaged shaders read FrameImages::exposure (exposure flag 4)
     bool hasRatioTables() const; // lut.bin holds all sixteen reconstruction tables, not only one ratio's
+    bool hasAccuracyStages() const; // reconstruction compiled with D4R_ACCURACY
     bool hasRgb10Output() const; // a packaged RGB10A2 final-store variant is available
+    bool hasDirectOutput(VkFormat format) const; // the final store can write a borrowed output of this format
+    bool dot2Network() const; // the network runs layer_dot2.comp (no cooperative matrices)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
@@ -129,7 +76,6 @@ private:
 
 // Optional diagnostic markers: 0 at entry, then setup, exposure, input, eleven layers,
 // reconstruction, and final synchronization (16 intervals). The callback records commands only.
-constexpr unsigned KTimingStages = KLayers + 5;
 struct FrameProfiler {
     void (*mark)(VkCommandBuffer, uint32_t boundary, void* user) = nullptr;
     void* user = nullptr;
@@ -172,6 +118,8 @@ public:
     VkImage outputImage() const; // RGBA16F, GENERAL, ready for a transfer read after recordFrame
     HistoryImages historyImages() const; // most recently recorded frame, GENERAL
     VkBuffer headBuffer() const;
+    // The input stage's tokens (16 f16 per token; the layers reuse the buffer: see kRecordedLayers).
+    VkBuffer tokenBuffer() const;
     VkDeviceSize headBytes() const;
     VkDeviceSize activationBytes() const;
     // Seed initial history for replay/validation. Caller records copies after recordInitialize, before the first frame.
@@ -186,17 +134,12 @@ private:
 // are recorded with their parameters and execute in recording order. Reconstruction works at 1.5 x the output
 // size, selecting NGX's post_3_1/post_3_2 tile class from the render ratio. Render dimensions must not exceed
 // the output. Exposure is measured on the GPU every frame, as NGX does for this preset.
-struct MFrameSettings {
-    float jitter[2] = {0, 0};     // render-pixel offsets in [-0.5, 0.5], as NGX's reconstruction tiles require
-    float motionScale[2] = {1, 1};  // (motion texel + offset) * scale = render pixels
-    float motionOffset[2] = {0, 0}; // jittered motion vectors: jitter - previous jitter, in motion texel units
-    bool reset = false;
-    bool depthInverted = true;
-    uint32_t renderWidth = 0, renderHeight = 0; // zero uses the constructor size; otherwise within its capacity
-};
 class MModel {
 public:
-    MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    // dot2: the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2), the
+    // model directory's *_dot2.spv (D4R_ENGINE_M_NETWORK=dot2|matrix overrides); presets M and L
+    MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+           bool dot2 = false);
     ~MModel();
     MModel(const MModel&) = delete;
     MModel& operator=(const MModel&) = delete;
@@ -204,8 +147,11 @@ public:
     bool uploadRecorded() const;
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
+    bool hasR11G11B10Output() const;   // a packaged R11G11B10F final-store variant (down_m_r11g11b10.spv)
     bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
+    bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005, L's dot2
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
+    bool dot2Network() const;  // the v_dot2 stages (no cooperative matrices, no FP8)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
@@ -273,7 +219,11 @@ struct RFrameSettings {
 };
 class RModel {
 public:
-    RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    // int64Atomics: the device has shaderBufferInt64Atomics enabled; preset F then measures the exposure in one pass
+    // (engine/rr/exposure_f.comp PASS 2) instead of two. robustImages: the device has robustImageAccess2 enabled; the
+    // translated stages then leave the zero of an image load outside the image to the device (engine/rr/ptx2rr.py fetch0)
+    RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
+           bool int64Atomics = false, bool robustImages = false);
     ~RModel();
     RModel(const RModel&) = delete;
     RModel& operator=(const RModel&) = delete;
@@ -285,9 +235,40 @@ private:
     std::unique_ptr<Impl> impl;
     friend class REngine;
 };
+// Experimental (engine/vkhip/vkhip_net.h): Ray Reconstruction network stages recorded by the caller in place of the
+// engine's shaders. D/E stages: 0 enc0, 1 - 5 enc1 - enc5, 6 - 9 dec4 - dec1, 10 dec0.
+// F stages: 0 - 5 enc0 - enc5, then two stages per decoder (6 dec4_0 ... 15 dec0_1).
+class RStageRecorder {
+public:
+    virtual ~RStageRecorder() = default;
+    // records `stage` over groupsX x groupsY windows with this frame's window shift (parameter block byte 80);
+    // false: the engine's shader runs instead. The engine places its barrier after the stage either way.
+    virtual bool recordStage(VkCommandBuffer command, unsigned stage, uint32_t groupsX, uint32_t groupsY, uint32_t shift) = 0;
+    // whether recordStage records `stage`, asked for enc0 only: when the model has enc0's gather (enc0_g.spv) and the
+    // arena an address, the engine dispatches the gather before recordStage(0), which then runs the rest of the stage
+    virtual bool records(unsigned stage) const = 0;
+};
+// enc0's gather (RModel's enc0_g.spv): per window its shared buffer sh, the 10 x 10 noise grid (4 x f16, 800 bytes) and
+// the two 16-byte feature planes of the 10 x 10 pixels; window i (row-major in the frame's grid) at scratchEnd - (i + 1) x
+// RGatherBytes
+constexpr uint32_t RGatherBytes = 4000;
+// What a network stage (enc0 0: with its gather, Swin stages 1 - 9, decoder 0 10) reads and writes besides the arena: its parameter block's fixed fields
+// (the level's token grid, the arena offsets at block bytes 8, 24, 48 and 56) and its images (null where the stage has
+// none; decoder 0's surface 144 alternates with the frame's parity).
+struct RStageResources {
+    uint32_t width = 0, height = 0;
+    uint64_t arena[4] = {};              // input, skip, output, merge
+    VkImageView texture88 = VK_NULL_HANDLE, texture96 = VK_NULL_HANDLE, texture104 = VK_NULL_HANDLE;
+    VkImageView surface112 = VK_NULL_HANDLE, surface120 = VK_NULL_HANDLE, surface128 = VK_NULL_HANDLE;
+    VkImageView surface144[2] = {};      // per frame parity
+    uint64_t scratchEnd = 0;             // enc0: the end of its gather's scratch (RGatherBytes); 0: no gather
+};
 class REngine {
 public:
-    REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight);
+    // arenaAddress: the arena buffer gets a device address (the device has bufferDeviceAddress enabled), for a
+    // stage recorder that reaches it by address
+    REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight,
+            bool arenaAddress = false);
     ~REngine();
     REngine(const REngine&) = delete;
     REngine& operator=(const REngine&) = delete;
@@ -303,6 +284,63 @@ public:
     // writes it ("enc1-112", "dec0-144", "q0", ...), GENERAL layout
     struct DebugImage { std::string name; VkImage image; VkFormat format; uint32_t width, height; };
     std::vector<DebugImage> debugImages() const;
+    // The stage recorder (not owned; null: none). stageResources is D/E only (presets A - C: the stage's size);
+    // stageParameterAddress is F and A - C only.
+    void setStageRecorder(RStageRecorder* recorder);
+    VkBuffer arenaBuffer() const;
+    uint64_t stageParameterAddress(unsigned stage) const; // presets F, A - C; F requires arenaAddress
+    RStageResources stageResources(unsigned stage) const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+// ---------------------------------------------------------------- Super Resolution presets E and F (the DLSS 3 CNN)
+// NGX 310.7's CNN upscaler: its input kernel and its reconstruction kernel translated from the user's DLL, the
+// network between them d4r's own packed-f16 shaders (engine/sr/e_net.comp), so it runs on any GPU with binary16
+// arithmetic, cooperative matrices not required (engine/runtime_e.inc, built by engine/compile_sr_e.py). Same
+// conventions as the classes above. The device needs shaderFloat16, storageBuffer16BitAccess, shaderInt16,
+// subgroupSizeControl and computeFullSubgroups with 32-wide subgroups.
+struct EFrameSettings {
+    float jitter[2] = {0, 0};       // render pixels, as the game passes them to NGX
+    float motionScale[2] = {1, 1};  // NGX's MV scale: motion texels times this are the motion's pixels
+    bool reset = false;
+    float preExposure = 1, exposureScale = 1;   // the game's (DLSS.Pre.Exposure, DLSS.Exposure.Scale)
+};
+class EModel {
+public:
+    EModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE);
+    ~EModel();
+    EModel(const EModel&) = delete;
+    EModel& operator=(const EModel&) = delete;
+    void recordUpload(VkCommandBuffer command);
+    bool uploadRecorded() const;
+    bool hasAutoExposure() const;   // the model directory holds the exposure shaders (exposure_e0/1.spv)
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+    friend class EEngine;
+};
+class EEngine {
+public:
+    // hdr: NGX's IsHDR (linear colour, the exposure textures); lowResMotion: MVLowRes (render-size motion vectors,
+    // in render pixels; otherwise output-size motion in output pixels). Render size at most the output size.
+    // autoExposure (HDR): NGX's AutoExposure, the exposure measured from the colour on every second frame instead of
+    // read from images.exposure (needs EModel::hasAutoExposure).
+    EEngine(EModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight,
+            bool hdr, bool lowResMotion, bool autoExposure = false);
+    ~EEngine();
+    EEngine(const EEngine&) = delete;
+    EEngine& operator=(const EEngine&) = delete;
+    void recordInitialize(VkCommandBuffer command);
+    // color (and depth with lowResMotion) at the render size, motion at the render or output size; images.exposure
+    // the game's 1x1 exposure (HDR without autoExposure; 1 when absent). A borrowed RGBA16F finalOutput (GENERAL) is written directly.
+    void setFrame(const FrameImages& images, const EFrameSettings& settings, FrameOutput finalOutput = {});
+    // With a timestamp query pool, four stamps are written from query `first`: start, after the input kernel, after
+    // the network and after the reconstruction.
+    void recordFrame(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
+    VkImage outputImage() const; // RGBA16F, GENERAL, when no finalOutput was bound
+    struct DebugBuffer { std::string name; VkBuffer buffer; VkDeviceSize offset, bytes; };
+    std::vector<DebugBuffer> debugBuffers() const; // the network's tensors in the arena (engine/replay_e.cpp)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

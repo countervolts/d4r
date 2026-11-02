@@ -2,33 +2,7 @@
 // GCC treats an included file as a header and warns that these types use the including file's anonymous namespace.
 #pragma GCC diagnostic ignored "-Wsubobject-linkage"
 namespace {
-constexpr unsigned MLayers = 10;
-constexpr const char* MShader[MLayers] = {"m_enc1", "m_enc2", "m_tube", "m_tube", "m_tube", "m_tube", "m_tube", "m_tube", "m_dec2", "m_dec1"};
-constexpr int32_t MShift[MLayers] = {2, 2, 2, 0, 2, 0, 2, 0, 0, 0};
-constexpr unsigned MScale[MLayers] = {1, 2, 4, 4, 4, 4, 4, 4, 2, 1};       // token grid divisor
-constexpr unsigned MChannels[MLayers] = {64, 96, 128, 128, 128, 128, 128, 128, 96, 64};
-struct MEnc0Params {
-    int32_t size[2], shift[2], tok[2];
-    float jitter[2], prevJitter[2], mvScale[2], mvOffs[2], rnd2hi[2], hi2rnd[2], hiSize[2];
-    float changeScale, changeGain;
-    uint32_t depthFlag, reset, frame;
-    float expo, expoPrev;
-    float halfInv[2], renderInv[2]; // CUDA texture coordinates use host-rounded reciprocals
-};
-struct MDec0Params { int32_t size[2], tokW; uint32_t reset; float rndOffs[2], rnd2hi[2], hiSize[2], histOffs[2], sigma, rho, renderInv[2]; };
-struct MPostParams { int32_t colOrigin[2], hiSize[2], rndSize[2]; float hi2rnd[2], rndOffs[2], invRnd[2], gain; uint32_t reset; float expo, expoPrev; };
-struct MDownParams { int32_t srcSize[2], outOrigin[2], colOrigin[2], colSize[2]; float out2rnd[2], rndOffs[2], expo; };
-struct MLayerParams { int32_t w, h, sx, sy; uint32_t o[72]; };
-// The grid NGX measures the exposure on (cuda_dldn_engine_luma_convert_kernel's launch, presets M and L alike,
-// harness captures 2026-10-11): half the output, unless the output is more than twice the render size on that axis
-// (Ultra Performance), then half the render size but at least 256 (640x360 -> 1920x1080: 320x256, 854x480 ->
-// 2560x1440: 427x256, 1280x720 -> 3840x2160: 640x360).
-uint32_t exposureGrid(uint32_t render, uint32_t output) { return output / 2 <= render ? output / 2 : std::max(render / 2, 256u); }
-static_assert(sizeof(MEnc0Params) == 124 && offsetof(MEnc0Params, expo) == 100 && offsetof(MEnc0Params, halfInv) == 108, "enc0_m.comp and exposure_k.comp (words 25, 26)");
-static_assert(sizeof(MDec0Params) == 64, "dec0_m.comp");
-static_assert(sizeof(MPostParams) == 64 && offsetof(MPostParams, expo) == 56, "post_m.comp and exposure_k.comp (words 14, 15)");
-static_assert(sizeof(MDownParams) == 52 && offsetof(MDownParams, expo) == 48, "down_m.comp and exposure_k.comp (word 12)");
-static_assert(sizeof(MLayerParams) == 304, "layer_m.comp");
+using namespace m_detail;
 struct Tex {
     const Device* device = nullptr;
     VkImage handle = VK_NULL_HANDLE;
@@ -57,6 +31,19 @@ struct Tex {
         VKCHECK(vkCreateImageView(d.handle, &vi, nullptr, &view));
     }
 };
+// The v_dot2 stages' weights: every FP8 matrix W[K][N] at byte offset o of weights8.bin as binary16 pairs [K/2][N]
+// (W[2k][n] low, W[2k + 1][n] high) at dword o / 2, in a buffer twice the size (the matrices do not overlap). The
+// layers' matrices are blocked as test_m.pack8 ([K/16][N/16][16 n][16 k]); the input and expansion stages' are plain.
+// The attention output projection, MLP and patch merge matrices (v_dot4_i32_i8) are int8 instead: [K/4][N] words of four (W[4k + i][n] in byte i), each column
+// scaled by its largest magnitude / 127 (rounded to nearest even), followed by the N column scales as f32
+// (test_m.widen does the same).
+// qvInt8 (D4RM0006): the heads' q and v matrices are int8 as well (layer_m_dot2.comp gemmHeadI8) and the MLP's w2
+// blocks share their column scales in pairs (MLP_PAIR_SCALE); older packages' shaders read q and v as binary16 pairs
+// stageInt8 (D4RM0007): the expansion stage's matrix (dec0_m.comp INT8, plain [K/4][N] words) and the decoders'
+// expansion matrices (layer_m_dot2.comp EXPAND_INT8) are int8 as well
+// Preset L (lEnc0 / lDec0 set; its packages have no older dot2 form): the network as D4RM0007, the input stage's block
+// (C 32) with its patch merge (merge_l_dot2.comp) and its embedding (W1 as binary16 pairs, W2 int8), the
+// expansion stage's block with its patch expand, all int8 as the network's.
 void bindRange(VkDevice device, VkDescriptorSet set, uint32_t binding, const Buffer& buffer, VkDeviceSize offset) {
     VkDescriptorBufferInfo info{buffer.handle, offset, VK_WHOLE_SIZE};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -66,33 +53,112 @@ void bindRange(VkDevice device, VkDescriptorSet set, uint32_t binding, const Buf
 }
 } // namespace
 
+// D4R_TRACE_STAGES=1 prints each stage before the driver compiles it; AMD's Windows driver (LLPC) crashes outright
+// on some SPIR-V, so the last printed name is the one the compiler died on.
+void traceStage(const std::string& file) {
+    if (std::getenv("D4R_TRACE_STAGES") != nullptr) {
+        std::fprintf(stderr, "d4r: stage %s\n", file.c_str());
+        std::fflush(stderr);
+    }
+}
 struct MModel::Impl {
     Device device;
     Buffer w8, w16;
     std::vector<char> bytes8, bytes16;   // until recordUpload
+    bool dot2 = false;                   // the v_dot2 stages: the FP8 matrices widened (widenM) instead of w8
+    // the matrices' buffer and the byte offset of the FP8 matrix at o in it
+    const Buffer& weights() const { return dot2 ? w16x : w8; }
+    VkDeviceSize weightsAt(uint32_t o) const { return dot2 ? VkDeviceSize(o) * 2 : o; }
+    Buffer w16x;                         // dot2: the widened matrices
     uint32_t enc0[3]{}, dec0[2]{};
     std::array<std::array<uint32_t, 74>, MLayers> layers{};
-    std::array<Pipeline, MLayers> network;      // one per layer (five distinct shaders)
-    Pipeline input, expand, post, postQuality, postCompact, down, downRgb10;
+    std::array<Pipeline, MLayers> network;      // one per layer (five distinct shaders); createNetwork
+    std::string directory;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    std::once_flag networkOnce;
+    Pipeline input, expand, post, postQuality, postCompact, down, downRgb10, downR11;
+    Pipeline inputFeatures;                    // optional RDNA4 L split feature/embedding boundary
     Pipeline inputPlanes, expandPlanes;         // token buffers in NGX's plane layout, for an external (HIP) network
+    std::array<Pipeline, 2> mergeDot2;          // dot2: the encoders' patch merges (merge_m_dot2.comp), after enc1, enc2
+    Pipeline mergeL;                            // dot2, preset L: the input stage's patch merge, after the stage
     bool planes = false;
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, ldr = false;
-    // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4,
+    // preset L (offsets.bin D4RL0002, L_NOTES.md): the input and expansion stages are layer_m.comp's KIND 3 and 4
+    // (dot2: layer_l_dot2.comp's),
     // with their own layer offset blocks; constants: change scale and gain, sigma, rho, the first gate's gain
     bool presetL = false, dynamicResolution = false;
+    bool displayMotion = false;     // D4RM0005, L's dot2: the input stage and post_m read display-resolution motion (binding 12)
+    bool qvInt8 = false;            // D4RM0006: layer_m_dot2's q and v matrices are int8 (widenM)
+    bool stageInt8 = false;         // D4RM0007: the expansion stage's and the decoders' expansion matrices are int8
+    bool halfRgb10 = false;         // the half-resolution history is RGB10A2 (post_m_dot2.spv), else RGBA32F
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t dither16 = 0;
     float lConst[5]{};
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
+    // The network layers (and dot2's merges), on first use by an engine that runs them: one with an external network
+    // (HIP, vkhip) never does, and AMD's Windows driver crashes compiling the FP8 cooperative-matrix layers.
+    void createNetwork() {
+        std::call_once(networkOnce, [this] {
+            const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            const std::string variant = dot2 ? "_dot2" : "";
+            const VkDevice dev = device.handle;
+            for (unsigned i = 0; i < MLayers; ++i) network[i].create(dev, directory + "/" + MShader[i] + variant + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+            if (dot2)
+                for (unsigned i = 0; i < 2; ++i)
+                    mergeDot2[i].create(dev, directory + "/m_merge" + std::to_string(i + 1) + "_dot2.spv", {b,b,b,b,b}, 32, cache);
+        });
+    }
+    // The front and expansion stages of the internal (Vulkan) network. An engine with an external network never
+    // dispatches them (the plane-layout stages take their place), and AMD's Windows driver crashes compiling the
+    // FP8 cooperative-matrix variants, so they are built only on first use by an engine that runs them. The
+    // constructor records the files and descriptor types here; MEngine calls this before its first frame.
+    struct FrontStages {
+        std::string merge, mergePlanes, features, input, expand;
+        std::vector<VkDescriptorType> inTypes, exTypes;
+    } front;
+    std::once_flag frontOnce;
+    void createFrontStages() {
+        std::call_once(frontOnce, [this] {
+            const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            const VkDevice dev = device.handle;
+            if (!front.merge.empty()) { traceStage(front.merge); mergeL.create(dev, front.merge, {b,b,b,b,b}, 32, cache); }
+            if (!front.features.empty()) { traceStage(front.features); inputFeatures.create(dev, front.features, front.inTypes, 32, cache); }
+            traceStage(front.input); input.create(dev, front.input, front.inTypes, 32, cache);
+            traceStage(front.expand); expand.create(dev, front.expand, front.exTypes, 32, cache);
+        });
+    }
+    // the patch merge that writes the external network's token buffer in NGX's plane layout (preset L's dot2
+    // stages: the input stage leaves the tokens to the merge, so an external dot2 engine needs this instead of
+    // mergeL, which writes them token-major for the internal dot2 network)
+    Pipeline mergePlanes;
+    std::once_flag mergePlanesOnce;
+    void createMergePlanes() {
+        std::call_once(mergePlanesOnce, [this] {
+            if (front.mergePlanes.empty()) return;
+            const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            traceStage(front.mergePlanes); mergePlanes.create(device.handle, front.mergePlanes, {b,b,b,b,b}, 32, cache);
+        });
+    }
 };
-MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache)
+MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool dot2)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
+    if (const char* force = std::getenv("D4R_ENGINE_M_NETWORK")) {
+        if (!std::strcmp(force, "dot2")) dot2 = true;
+        else if (!std::strcmp(force, "matrix")) dot2 = false;
+    }
+    m.dot2 = dot2;
     m.ldr = exists(directory + "/ldr");     // the stages were compiled for a game without the HDR flag: no exposure
     auto head = read(directory + "/offsets.bin");
     m.presetL = head.size() >= 8 && (!std::memcmp(head.data(), "D4RL0002", 8) || !std::memcmp(head.data(), "D4RL0001", 8));
-    m.dynamicResolution = head.size() >= 8 && (!std::memcmp(head.data(), "D4RM0004", 8) || !std::memcmp(head.data(), "D4RL0002", 8));
+    // D4RM0006: D4RM0005 plus the dot2 layers' int8 Q and V
+    // D4RM0007: D4RM0006 plus the int8 expansion stage and decoder expansions
+    m.stageInt8 = head.size() >= 8 && !std::memcmp(head.data(), "D4RM0007", 8);
+    m.qvInt8 = m.stageInt8 || (head.size() >= 8 && !std::memcmp(head.data(), "D4RM0006", 8));
+    m.displayMotion = m.qvInt8 || (head.size() >= 8 && !std::memcmp(head.data(), "D4RM0005", 8));
+    m.dynamicResolution = head.size() >= 8 && (m.displayMotion || !std::memcmp(head.data(), "D4RM0004", 8) ||
+                                               !std::memcmp(head.data(), "D4RL0002", 8));
     const size_t expect = m.presetL ? 40 + (MLayers + 2) * 74 * 4 : 16 + 5 * 4 + MLayers * 74 * 4;
     if (head.size() != expect || (!m.presetL && !m.dynamicResolution && std::memcmp(head.data(), "D4RM0003", 8))) throw std::runtime_error("incompatible M/L model metadata");
     uint32_t n8 = 0, n16 = 0;
@@ -114,42 +180,105 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
     }
     for (auto& l : m.layers) inside(l[0], l[1]);
+    // AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix preset-L stages - including the
+    // plane-layout ones an external (vkhip/HIP) network needs - so on that driver preset L takes the model's dot2
+    // stages (no cooperative matrices) whenever the package has the dot2 plane stages. Every other driver, RADV
+    // included, keeps the matrix stages, byte-identical.
+    if (!m.dot2 && m.presetL) {
+        if (driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY && exists(directory + "/enc0_l_planes_dot2.spv") &&
+            exists(directory + "/dec0_l_planes_dot2.spv") && exists(directory + "/merge_l_dot2_planes.spv")) {
+            dot2 = m.dot2 = true;
+            std::fprintf(stderr, "d4r: preset L on AMD's Windows driver: the dot2 stages (LLPC crashes compiling the FP8 cooperative-matrix stages)\n");
+        }
+    }
+    const std::string dot2Probe = m.presetL ? "/enc0_l_dot2.spv" : "/m_enc1_dot2.spv";
+    if (m.dot2 && !exists(directory + dot2Probe))
+        throw std::runtime_error("the model has no stages for GPUs without cooperative matrices (" + directory +
+                                 dot2Probe + "): rebuild it with the current compile_m.py");
+    // preset L's dot2 stages read display-resolution motion as M's do (post_l_dot2 binding 12); its matrix stages do not
+    if (m.dot2 && m.presetL) m.displayMotion = true;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    m.w8.create(m.device, b8.size(), usage); m.w16.create(m.device, b16.size(), usage);
-    m.bytes8 = b8; m.bytes16 = b16;
+    m.w16.create(m.device, b16.size(), usage);
+    m.bytes16 = b16;
+    if (m.dot2) {
+        m.bytes8 = m.presetL ? widenM(b8, m.layers, m.enc0, m.dec0, true, true, &m.lEnc0, &m.lDec0)
+                             : widenM(b8, m.layers, m.enc0, m.dec0, m.qvInt8, m.stageInt8);
+        m.w16x.create(m.device, m.bytes8.size(), usage);
+    }
+    else { m.w8.create(m.device, b8.size(), usage); m.bytes8 = b8; }
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    for (unsigned i = 0; i < MLayers; ++i) m.network[i].create(device, directory + "/" + MShader[i] + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+    const std::string variant = m.dot2 ? "_dot2" : "";
+    m.directory = directory; m.cache = cache;
+    // preset L's input stage merges its pixel-resolution output into the network's tokens as a stage of its own
     // layer_m.comp's L stages: bindings 0-6 of a layer, then the stage's own (layer_m.comp KIND 3 and 4)
     const std::vector<VkDescriptorType> lIn{b,b,b,b,b,b,b,b,t,t,t,t,t,t,s,s,s,b}, lEx{b,b,b,b,b,b,b,b,s,s,s,s};
     const std::string in = m.presetL ? "enc0_l" : "enc0_m", ex = m.presetL ? "dec0_l" : "dec0_m", po = m.presetL ? "post_l" : "post_m";
-    const auto inTypes = m.presetL ? lIn : std::vector<VkDescriptorType>{b,t,t,t,t,t,t,s,s,s,b,b,b,b};
+    auto inTypes = m.presetL ? lIn : std::vector<VkDescriptorType>{b,t,t,t,t,t,t,s,s,s,b,b,b,b};
+    const bool splitFeatures = m.presetL && !m.dot2 && exists(directory + "/enc_features_l.spv");
+    if (splitFeatures) inTypes.push_back(b);
     const auto exTypes = m.presetL ? lEx : std::vector<VkDescriptorType>{b,t,t,s,s,s,s,b,b,b};
-    m.input.create(device, directory + "/" + in + ".spv", inTypes, 32, cache);
-    m.expand.create(device, directory + "/" + ex + ".spv", exTypes, 32, cache);
-    if ((m.planes = exists(directory + "/" + in + "_planes.spv") && exists(directory + "/" + ex + "_planes.spv"))) {
-        m.inputPlanes.create(device, directory + "/" + in + "_planes.spv", inTypes, 32, cache);
-        m.expandPlanes.create(device, directory + "/" + ex + "_planes.spv", exTypes, 32, cache);
+    m.front.merge = m.dot2 && m.presetL ? directory + "/merge_l_dot2.spv" : "";
+    m.front.features = splitFeatures ? directory + "/enc_features_l.spv" : "";
+    m.front.input = directory + "/" + in + variant + ".spv";
+    m.front.expand = directory + "/" + ex + variant + ".spv";
+    m.front.inTypes = inTypes; m.front.exTypes = exTypes;
+    if ((m.planes = exists(directory + "/" + in + "_planes" + variant + ".spv") && exists(directory + "/" + ex + "_planes" + variant + ".spv"))) {
+        traceStage(directory + "/" + in + "_planes" + variant + ".spv");
+        m.inputPlanes.create(device, directory + "/" + in + "_planes" + variant + ".spv", inTypes, 32, cache);
+        traceStage(directory + "/" + ex + "_planes" + variant + ".spv");
+        m.expandPlanes.create(device, directory + "/" + ex + "_planes" + variant + ".spv", exTypes, 32, cache);
+        if (m.dot2 && m.presetL && exists(directory + "/merge_l_dot2_planes.spv"))
+            m.front.mergePlanes = directory + "/merge_l_dot2_planes.spv";
     }
-    m.post.create(device, directory + "/" + po + ".spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    m.postQuality.create(device, directory + "/" + po + "_q.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    if (exists(directory + "/" + po + "_c.spv"))
-        m.postCompact.create(device, directory + "/" + po + "_c.spv", {b,t,t,t,t,t,t,t,t,s,s,b}, 64, cache);
-    m.down.create(device, directory + "/down_m.spv", {b,t,s,b}, 64, cache);
-    if (exists(directory + "/down_m_rgb10.spv"))
-        m.downRgb10.create(device, directory + "/down_m_rgb10.spv", {b,t,s,b}, 64, cache);
-    m.exposure[0].create(device, directory + "/exposure_m0.spv", {b,t,b}, 64, cache);
-    m.exposure[1].create(device, directory + "/exposure_m1.spv", {b,b,b,b,b,b}, 64, cache);
+    // the reconstruction, downsample and exposure stages: the reconstruction as wave32 with the dot2 stages (RDNA2, Steam
+    // Deck: 1362 -> 1252 us at 720p; the downsample was slower as wave32), the rest wave64. D4R_ENGINE_M_STAGE_WAVE=32|64
+    // forces one size for all of them; they use no subgroup operations, so the outputs are identical.
+    const char* waveEnv = std::getenv("D4R_ENGINE_M_STAGE_WAVE");
+    const uint32_t forced = waveEnv && !std::strcmp(waveEnv, "32") ? 32 : waveEnv && !std::strcmp(waveEnv, "64") ? 64 : 0;
+    const uint32_t wave = forced ? forced : 64, postWave = forced ? forced : m.dot2 ? 32 : 64;
+    auto postTypes = std::vector<VkDescriptorType>{b,t,t,t,t,t,t,t,t,s,s,b};
+    if (m.displayMotion) postTypes.push_back(t);    // the game's motion texture
+    // the dot2 models' reconstruction writes its half-resolution mean as RGB10A2 (post_m.comp HALF_RGB10)
+    m.halfRgb10 = m.dot2 && exists(directory + "/" + po + "_dot2.spv");
+    const std::string pv = m.halfRgb10 ? "_dot2" : "";
+    traceStage(directory + "/" + po + pv + ".spv");
+    m.post.create(device, directory + "/" + po + pv + ".spv", postTypes, postWave, cache);
+    traceStage(directory + "/" + po + "_q" + pv + ".spv");
+    m.postQuality.create(device, directory + "/" + po + "_q" + pv + ".spv", postTypes, postWave, cache);
+    if (exists(directory + "/" + po + "_c" + pv + ".spv")) {
+        traceStage(directory + "/" + po + "_c" + pv + ".spv");
+        m.postCompact.create(device, directory + "/" + po + "_c" + pv + ".spv", postTypes, postWave, cache);
+    }
+    // the dot2 models' downsample builds split its horizontal pass finer (down_m.comp SEG)
+    const std::string down = m.dot2 && exists(directory + "/down_m_dot2.spv") ? "_dot2" : "";
+    traceStage(directory + "/down_m" + down + ".spv");
+    m.down.create(device, directory + "/down_m" + down + ".spv", {b,t,s,b}, wave, cache);
+    if (exists(directory + "/down_m_rgb10" + down + ".spv")) {
+        traceStage(directory + "/down_m_rgb10" + down + ".spv");
+        m.downRgb10.create(device, directory + "/down_m_rgb10" + down + ".spv", {b,t,s,b}, wave, cache);
+    }
+    if (exists(directory + "/down_m_r11g11b10" + down + ".spv")) {
+        traceStage(directory + "/down_m_r11g11b10" + down + ".spv");
+        m.downR11.create(device, directory + "/down_m_r11g11b10" + down + ".spv", {b,t,s,b}, wave, cache);
+    }
+    traceStage(directory + "/exposure_m0.spv");
+    m.exposure[0].create(device, directory + "/exposure_m0.spv", {b,t,b}, wave, cache);
+    traceStage(directory + "/exposure_m1.spv");
+    m.exposure[1].create(device, directory + "/exposure_m1.spv", {b,b,b,b,b,b}, wave, cache);
 }
 MModel::~MModel() = default;
 bool MModel::uploadRecorded() const { return impl->uploaded; }
 bool MModel::hasExternalNetworkStages() const { return impl->planes; }
 bool MModel::hasRgb10Output() const { return impl->downRgb10.handle != VK_NULL_HANDLE; }
+bool MModel::hasR11G11B10Output() const { return impl->downR11.handle != VK_NULL_HANDLE; }
 bool MModel::hasDynamicResolution() const { return impl->dynamicResolution; }
+bool MModel::hasDisplayMotion() const { return impl->displayMotion; }
 bool MModel::isPresetL() const { return impl->presetL; }
+bool MModel::dot2Network() const { return impl->dot2; }
 void MModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
     if (m.uploaded) throw std::runtime_error("model upload already recorded");
-    recordContents(cb, m.w8, m.bytes8); recordContents(cb, m.w16, m.bytes16);
+    recordContents(cb, m.weights(), m.bytes8); recordContents(cb, m.w16, m.bytes16);
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     m.uploaded = true;
 }
@@ -161,12 +290,15 @@ struct MEngine::Impl {
     std::array<Buffer, MLayers> layerP;
     Buffer tokens, skip1, merged1, skip2, merged2, tubeA, tubeB, dec2Out, dec1Out;
     Buffer skipL, enc0LP, dec0LP;               // preset L: the input stage's pixel output and the two stages' layer blocks
+    Buffer preparedFeatures;                  // optional per-block FP8 features across split input dispatches
     std::array<Tex, 2> mvA, feat, hist, half;
     Tex mvB, mvC, gates, mix, cov;
     Tex output;   // the engine's own output: only for frames that do not write the caller's image (created on first use)
     bool outputNew = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MLayers> layerSets{};
+    std::array<VkDescriptorSet, 2> mergeSets{};     // dot2: the encoders' patch merges
+    VkDescriptorSet mergeLSet = VK_NULL_HANDLE;     // dot2, preset L: the input stage's patch merge
     std::array<VkDescriptorSet, 2> enc0Sets{}, dec0Sets{}, postSets{}, expSets{};
     VkDescriptorSet downSet = VK_NULL_HANDLE;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
@@ -181,7 +313,8 @@ struct MEngine::Impl {
     std::vector<Bindings> bindings;
     float prevJitter[2] = {0, 0};
     unsigned current = 0, frame = 0;
-    bool initialized = false, frameSet = false, external = false, frontDone = false, quality = false, compact = false, rgb10Output = false;
+    bool initialized = false, frameSet = false, external = false, frontDone = false, quality = false, compact = false, rgb10Output = false,
+        r11Output = false;
     Impl(MModel::Impl& m) : model(m) {}
     ~Impl() {
         auto dev = model.device.handle;
@@ -200,6 +333,12 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     if (external && (!external->tokens || !external->head)) throw std::runtime_error("external network without its buffers");
     if (external && !e.model.planes) throw std::runtime_error("the M model has no stages for an external network");
     e.external = external != nullptr;
+    if (!external) { e.model.createNetwork(); e.model.createFrontStages(); }
+    else if (e.model.dot2 && e.model.presetL) {
+        if (e.model.front.mergePlanes.empty())
+            throw std::runtime_error("the dot2 preset L model has no merge_l_dot2_planes.spv for an external network (rebuild it with the current compile_m.py)");
+        e.model.createMergePlanes();
+    }
     if (renderWidth < 64 || renderHeight < 64 || outputWidth % 2 || outputHeight % 2 || outputWidth > 16384 || outputHeight > 16384)
         throw std::runtime_error("unsupported preset M dimensions");
     e.rw = e.maxRw = renderWidth; e.rh = e.maxRh = renderHeight; e.ow = outputWidth; e.oh = outputHeight;
@@ -233,8 +372,8 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     e.cov.create(d, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT);
     for (auto& t : e.hist) t.create(d, e.hw, e.hh, VK_FORMAT_R16G16B16A16_SFLOAT);
     // The native formatted RGB10 history has RGBA32F backing. UNORM filtering differs by up to three ulps.
-    for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, VK_FORMAT_R32G32B32A32_SFLOAT);
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
+    for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, model.impl->halfRgb10 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT);
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 160}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 24; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
     VKCHECK(vkCreateDescriptorPool(dev, &pi, nullptr, &e.pool));
@@ -255,30 +394,46 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         std::memcpy(lp.o, m.layers[i].data() + 2, sizeof(lp.o));
         std::memcpy(e.layerP[i].mapped, &lp, sizeof(lp));
         auto set = e.layerSets[i] = descriptorSet(dev, e.pool, m.network[i].descriptors);
-        bindBuffer(dev, set, 0, e.layerP[i]); bindRange(dev, set, 1, m.w8, m.layers[i][0]); bindRange(dev, set, 2, m.w16, m.layers[i][1]);
+        bindBuffer(dev, set, 0, e.layerP[i]); bindRange(dev, set, 1, m.weights(), m.weightsAt(m.layers[i][0])); bindRange(dev, set, 2, m.w16, m.layers[i][1]);
         bindBuffer(dev, set, 3, *in[i]); bindBuffer(dev, set, 4, *skip[i]); bindBuffer(dev, set, 5, *out[i]); bindBuffer(dev, set, 6, *merged[i]);
+        if (m.dot2 && i < 2) {
+            // the merge reads the layer's parameter block, weights and block output
+            auto ms = e.mergeSets[i] = descriptorSet(dev, e.pool, m.mergeDot2[i].descriptors);
+            bindBuffer(dev, ms, 0, e.layerP[i]); bindRange(dev, ms, 1, m.weights(), m.weightsAt(m.layers[i][0])); bindRange(dev, ms, 2, m.w16, m.layers[i][1]);
+            bindBuffer(dev, ms, 3, *out[i]); bindBuffer(dev, ms, 4, *merged[i]);
+        }
     }
     if (m.presetL) {
         // the input stage's pixel-resolution block output (the expansion's skip input) and the two stages' layer
         // parameter blocks (token pixel grid, window shift, offsets; the shift alternates per frame like the layers')
         e.skipL.create(d, VkDeviceSize(e.gw) * e.gh * 32 + 64, sb);
+        if (m.inputFeatures.handle)
+            e.preparedFeatures.create(d, VkDeviceSize((e.gw + 9) / 8) * ((e.gh + 9) / 8) * 64 * 32, sb);
         e.enc0LP.create(d, sizeof(MLayerParams), sbt, true); e.dec0LP.create(d, sizeof(MLayerParams), sbt, true);
         MLayerParams lp{int32_t(e.gw), int32_t(e.gh), 2, 2, {}};
         std::memcpy(lp.o, m.lEnc0.data() + 2, sizeof(lp.o)); std::memcpy(e.enc0LP.mapped, &lp, sizeof(lp));
         lp.sx = lp.sy = 0; std::memcpy(lp.o, m.lDec0.data() + 2, sizeof(lp.o)); std::memcpy(e.dec0LP.mapped, &lp, sizeof(lp));
+        if (m.dot2) {
+            // an external dot2 engine dispatches the plane-layout merge (mergeL is the internal network's)
+            const Pipeline& merge = external ? m.mergePlanes : m.mergeL;
+            auto ms = e.mergeLSet = descriptorSet(dev, e.pool, merge.descriptors);
+            bindBuffer(dev, ms, 0, e.enc0LP); bindRange(dev, ms, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, ms, 2, m.w16, m.lEnc0[1]);
+            bindBuffer(dev, ms, 3, e.skipL); bindBuffer(dev, ms, 4, e.tokens);
+        }
     }
     for (unsigned i = 0; i < 2; ++i) {      // i: the index of this frame's history outputs
         const unsigned prev = 1 - i;
         if (m.presetL) {
             auto s0 = e.enc0Sets[i] = descriptorSet(dev, e.pool, (external ? m.inputPlanes : m.input).descriptors);
-            bindBuffer(dev, s0, 0, e.enc0LP); bindRange(dev, s0, 1, m.w8, m.lEnc0[0]); bindRange(dev, s0, 2, m.w16, m.lEnc0[1]);
+            bindBuffer(dev, s0, 0, e.enc0LP); bindRange(dev, s0, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, s0, 2, m.w16, m.lEnc0[1]);
             bindBuffer(dev, s0, 3, e.dummy); bindBuffer(dev, s0, 4, e.dummy); bindBuffer(dev, s0, 5, e.skipL); bindBuffer(dev, s0, 6, e.tokens);
             bindBuffer(dev, s0, 7, e.enc0P);
             bindImage(dev, s0, 11, e.mvA[prev].view, e.linear); bindImage(dev, s0, 12, e.half[prev].view, e.linear); bindImage(dev, s0, 13, e.feat[prev].view, e.linear);
             bindImage(dev, s0, 14, e.mvA[i].view); bindImage(dev, s0, 15, e.mvB.view); bindImage(dev, s0, 16, e.mvC.view);
             bindRange(dev, s0, 17, m.w16, m.dither16);
+            if (m.inputFeatures.handle) bindBuffer(dev, s0, 18, e.preparedFeatures);
             auto s1 = e.dec0Sets[i] = descriptorSet(dev, e.pool, (external ? m.expandPlanes : m.expand).descriptors);
-            bindBuffer(dev, s1, 0, e.dec0LP); bindRange(dev, s1, 1, m.w8, m.lDec0[0]); bindRange(dev, s1, 2, m.w16, m.lDec0[1]);
+            bindBuffer(dev, s1, 0, e.dec0LP); bindRange(dev, s1, 1, m.weights(), m.weightsAt(m.lDec0[0])); bindRange(dev, s1, 2, m.w16, m.lDec0[1]);
             bindBuffer(dev, s1, 3, e.dec1Out); bindBuffer(dev, s1, 4, e.skipL); bindBuffer(dev, s1, 5, e.dummy); bindBuffer(dev, s1, 6, e.dummy);
             bindBuffer(dev, s1, 7, e.dec0P);
             bindImage(dev, s1, 8, e.feat[i].view); bindImage(dev, s1, 9, e.gates.view); bindImage(dev, s1, 10, e.mix.view); bindImage(dev, s1, 11, e.cov.view);
@@ -287,11 +442,11 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         bindBuffer(dev, s0, 0, e.enc0P);
         bindImage(dev, s0, 4, e.mvA[prev].view, e.linear); bindImage(dev, s0, 5, e.half[prev].view, e.linear); bindImage(dev, s0, 6, e.feat[prev].view, e.linear);
         bindImage(dev, s0, 7, e.mvA[i].view); bindImage(dev, s0, 8, e.mvB.view); bindImage(dev, s0, 9, e.mvC.view);
-        bindRange(dev, s0, 10, m.w8, m.enc0[0]); bindRange(dev, s0, 11, m.w16, m.enc0[1]); bindRange(dev, s0, 12, m.w16, m.enc0[2]); bindBuffer(dev, s0, 13, e.tokens);
+        bindRange(dev, s0, 10, m.weights(), m.weightsAt(m.enc0[0])); bindRange(dev, s0, 11, m.w16, m.enc0[1]); bindRange(dev, s0, 12, m.w16, m.enc0[2]); bindBuffer(dev, s0, 13, e.tokens);
         auto s1 = e.dec0Sets[i] = descriptorSet(dev, e.pool, (external ? m.expandPlanes : m.expand).descriptors);
         bindBuffer(dev, s1, 0, e.dec0P); bindImage(dev, s1, 1, e.mvA[i].view, e.nearest); bindImage(dev, s1, 2, e.feat[prev].view, e.linear);
         bindImage(dev, s1, 3, e.feat[i].view); bindImage(dev, s1, 4, e.gates.view); bindImage(dev, s1, 5, e.mix.view); bindImage(dev, s1, 6, e.cov.view);
-        bindBuffer(dev, s1, 7, e.dec1Out); bindRange(dev, s1, 8, m.w8, m.dec0[0]); bindRange(dev, s1, 9, m.w16, m.dec0[1]);
+        bindBuffer(dev, s1, 7, e.dec1Out); bindRange(dev, s1, 8, m.weights(), m.weightsAt(m.dec0[0])); bindRange(dev, s1, 9, m.w16, m.dec0[1]);
         }
         auto s2 = e.postSets[i] = descriptorSet(dev, e.pool, m.post.descriptors);
         bindBuffer(dev, s2, 0, e.postP);
@@ -325,14 +480,17 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
     auto& e = *impl;
     if (!images.color || !images.motion || !images.depth) throw std::runtime_error("frame has a null image view");
     if (finalOutput.view && finalOutput.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
-        (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.downRgb10.handle))
-        throw std::runtime_error("unsupported borrowed output format or missing RGB10A2 shader");
+        (finalOutput.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !e.model.downRgb10.handle) &&
+        (finalOutput.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !e.model.downR11.handle))
+        throw std::runtime_error("unsupported borrowed output format or missing RGB10A2/R11G11B10 shader");
     const uint32_t rw = s.renderWidth ? s.renderWidth : e.maxRw;
     const uint32_t rh = s.renderHeight ? s.renderHeight : e.maxRh;
     if (rw < 64 || rh < 64 || rw > e.maxRw || rh > e.maxRh)
         throw std::runtime_error("render size exceeds the engine's capacity or is below 64");
     if (!e.model.dynamicResolution && (rw != e.maxRw || rh != e.maxRh))
         throw std::runtime_error("recompile the M/L model for dynamic render sizes");
+    if (s.displayMotion && !e.model.displayMotion)
+        throw std::runtime_error("display-resolution motion needs an M model rebuilt by the current compile_m.py (D4RM0005)");
     if (e.external && (rw != e.maxRw || rh != e.maxRh))
         throw std::runtime_error("external M/L network requires its constructor render size");
     const bool reset = s.reset || e.frame == 0 || rw != e.rw || rh != e.rh;
@@ -343,14 +501,20 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
         20ull * rw <= 9ull * e.hw && 20ull * rh <= 9ull * e.hh;
     const bool L = e.model.presetL;
     const float fx = float(e.hw) / float(e.rw), fy = float(e.hh) / float(e.rh);
+    // motion units -> reconstruction pixels: render-resolution vectors scale by reconstruction / render, display-resolution
+    // ones (in output pixels) by reconstruction / output
+    const float mx = s.displayMotion ? float(e.hw) / float(e.ow) : fx, my = s.displayMotion ? float(e.hh) / float(e.oh) : fy;
     e.enc0 = {{int32_t(e.rw), int32_t(e.rh)}, {2, 2}, {int32_t(e.gw / 2), int32_t(e.gh / 2)}, {s.jitter[0], s.jitter[1]}, {e.prevJitter[0], e.prevJitter[1]},
-              {s.motionScale[0] * fx, s.motionScale[1] * fy}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
+              {s.motionScale[0] * mx, s.motionScale[1] * my}, {s.motionOffset[0], s.motionOffset[1]}, {fx, fy}, {1.f / fx, 1.f / fy}, {float(e.hw), float(e.hh)},
               L ? e.model.lConst[0] : 9.045065879821777f, L ? e.model.lConst[1] : 0.22356846928596497f,
-              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
+              s.depthInverted ? 1u : 0u, reset ? 1u : 0u, e.frame & 7u, 1.f, 0.f, {1.f / float(e.hw), 1.f / float(e.hh)}, {1.f / float(e.maxRw), 1.f / float(e.maxRh)},
+              s.displayMotion ? 1u : 0u, {int32_t(e.ow) - 1, int32_t(e.oh) - 1}, {float(e.ow) / float(e.rw), float(e.oh) / float(e.rh)}};
     e.dec0 = {{int32_t(e.rw), int32_t(e.rh)}, int32_t(e.gw / 2), reset ? 1u : 0u, {s.jitter[0], s.jitter[1]}, {fx, fy}, {float(e.hw), float(e.hh)},
               {e.prevJitter[0], e.prevJitter[1]}, L ? e.model.lConst[2] : 8.f, L ? e.model.lConst[3] : 0.07863261550664902f, {1.f / float(e.maxRw), 1.f / float(e.maxRh)}};
     e.post = {{0, 0}, {int32_t(e.hw), int32_t(e.hh)}, {int32_t(e.rw), int32_t(e.rh)}, {1.f / fx, 1.f / fy}, {s.jitter[0], s.jitter[1]},
-              {1.f / float(e.maxRw), 1.f / float(e.maxRh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f};
+              {1.f / float(e.maxRw), 1.f / float(e.maxRh)}, L ? e.model.lConst[4] : 2.7530112f, reset ? 1u : 0u, 1.f, 0.f,
+              {s.displayMotion ? int32_t(e.ow) : 0, s.displayMotion ? int32_t(e.oh) : 0}, {e.enc0.mvScale[0], e.enc0.mvScale[1]},
+              {s.motionOffset[0], s.motionOffset[1]}};
     e.down = {{int32_t(e.hw), int32_t(e.hh)}, {0, 0}, {0, 0}, {int32_t(e.rw), int32_t(e.rh)}, {float(e.rw) / float(e.ow), float(e.rh) / float(e.oh)}, {s.jitter[0], s.jitter[1]}, 1.f};
     const uint32_t sw = exposureGrid(e.rw, e.ow), sh = exposureGrid(e.rh, e.oh);
     const uint32_t bx = (sw + 31) / 32, by = (sh + 31) / 32;
@@ -396,7 +560,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 }
                 auto in = b.input[i], post = b.post[i];
                 if (L) {
-                    bindBuffer(dev, in, 0, e.enc0LP); bindRange(dev, in, 1, m.w8, m.lEnc0[0]); bindRange(dev, in, 2, m.w16, m.lEnc0[1]);
+                    bindBuffer(dev, in, 0, e.enc0LP); bindRange(dev, in, 1, m.weights(), m.weightsAt(m.lEnc0[0])); bindRange(dev, in, 2, m.w16, m.lEnc0[1]);
                     bindBuffer(dev, in, 3, e.dummy); bindBuffer(dev, in, 4, e.dummy); bindBuffer(dev, in, 5, e.skipL); bindBuffer(dev, in, 6, e.tokens);
                     bindBuffer(dev, in, 7, e.enc0P);
                     bindImage(dev, in, 8, images.color, e.nearest, images.colorLayout);
@@ -406,6 +570,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                     bindImage(dev, in, 13, e.feat[1 - i].view, e.linear);
                     bindImage(dev, in, 14, e.mvA[i].view); bindImage(dev, in, 15, e.mvB.view); bindImage(dev, in, 16, e.mvC.view);
                     bindRange(dev, in, 17, m.w16, m.dither16);
+                    if (m.inputFeatures.handle) bindBuffer(dev, in, 18, e.preparedFeatures);
                 } else {
                 bindBuffer(dev, in, 0, e.enc0P);
                 bindImage(dev, in, 1, images.color, e.nearest, images.colorLayout);
@@ -414,7 +579,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 bindImage(dev, in, 4, e.mvA[1 - i].view, e.linear); bindImage(dev, in, 5, e.half[1 - i].view, e.linear);
                 bindImage(dev, in, 6, e.feat[1 - i].view, e.linear);
                 bindImage(dev, in, 7, e.mvA[i].view); bindImage(dev, in, 8, e.mvB.view); bindImage(dev, in, 9, e.mvC.view);
-                bindRange(dev, in, 10, m.w8, m.enc0[0]); bindRange(dev, in, 11, m.w16, m.enc0[1]);
+                bindRange(dev, in, 10, m.weights(), m.weightsAt(m.enc0[0])); bindRange(dev, in, 11, m.w16, m.enc0[1]);
                 bindRange(dev, in, 12, m.w16, m.enc0[2]); bindBuffer(dev, in, 13, e.tokens);
                 }
                 bindBuffer(dev, post, 0, e.postP); bindImage(dev, post, 1, images.color, e.nearest, images.colorLayout);
@@ -423,6 +588,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
                 bindImage(dev, post, 6, e.mvA[i].view, e.nearest); bindImage(dev, post, 7, e.mvB.view, e.nearest);
                 bindImage(dev, post, 8, e.mvC.view, e.linear); bindImage(dev, post, 9, e.hist[i].view);
                 bindImage(dev, post, 10, e.half[i].view); bindBuffer(dev, post, 11, e.packed);
+                if (m.displayMotion) bindImage(dev, post, 12, images.motion, e.nearest, images.motionLayout);
             }
             e.bindings.push_back(b);
         } catch (...) {
@@ -434,6 +600,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
     e.enc0Sets = found->input; e.postSets = found->post;
     e.expSets[0] = found->exposure; e.downSet = found->down;
     e.rgb10Output = finalOutput.view && finalOutput.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    e.r11Output = finalOutput.view && finalOutput.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     e.frameSet = true;
 }
 namespace {
@@ -477,7 +644,14 @@ void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     }
     stamp();
     // (preset L's input stage covers the same blocks: its shift is at most 2 in x and 2 in y)
-    dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], (e.gw + 2 + 7) / 8, (e.gh + 2 + 7) / 8);
+    // the dot2 input and expansion stages' workgroups are 2x2 of the 8x8-pixel blocks (preset M; L's are one block)
+    const uint32_t blocks = m.dot2 && !m.presetL ? 2 : 1;
+    if (m.inputFeatures.handle) {
+        dispatch(cb, m.inputFeatures, e.enc0Sets[e.current], (e.gw + 9) / 8, (e.gh + 9) / 8);
+        nextStage(cb);
+    }
+    dispatch(cb, e.external ? m.inputPlanes : m.input, e.enc0Sets[e.current], ((e.gw + 2 + 7) / 8 + blocks - 1) / blocks, ((e.gh + 2 + 7) / 8 + blocks - 1) / blocks);
+    if (m.dot2 && m.presetL) { nextStage(cb); dispatch(cb, e.external ? m.mergePlanes : m.mergeL, e.mergeLSet, (e.gw / 2 + 7) / 8, (e.gh / 2 + 7) / 8); }
     stamp();
     if (e.external) closeStages(cb); else nextStage(cb);
     e.frontDone = true;
@@ -491,8 +665,14 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     uint32_t query = first;
     auto stamp = [&] { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, query++); };
     stamp();
-    if (m.presetL)      // one block more in x on frames whose expansion shift is 2
-        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], (e.gw + (e.frame & 1u) * 2u + 7) / 8, e.gh / 8);
+    if (m.presetL) {
+        // the blocks with a pixel of the render size (the stage writes no other; a block's windows are its own): one
+        // more in x on frames whose expansion shift is 2; dot2: workgroups of two blocks in x
+        const uint32_t bx = (e.rw + (e.frame & 1u) * 2u + 7) / 8, by = (e.rh + 7) / 8;
+        dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], m.dot2 ? (bx + 1) / 2 : bx, by);
+    }
+    else if (m.dot2)    // workgroups of 2x2 blocks
+        dispatch(cb, m.expand, e.dec0Sets[i], (e.gw / 8 + 1) / 2, (e.gh / 8 + 1) / 2);
     else
         dispatch(cb, e.external ? m.expandPlanes : m.expand, e.dec0Sets[i], e.gw / 8, e.gh / 8);
     nextStage(cb);
@@ -503,7 +683,7 @@ void MEngine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
              e.postSets[i], (e.hw + 15) / 16, (e.hh + 15) / 16); nextStage(cb);
     stamp();
     // D4RM0004's downsample workgroup covers 8x64 output pixels.
-    dispatch(cb, e.rgb10Output ? m.downRgb10 : m.down, e.downSet, (e.ow + 7) / 8, (e.oh + 63) / 64);
+    dispatch(cb, e.rgb10Output ? m.downRgb10 : e.r11Output ? m.downR11 : m.down, e.downSet, (e.ow + 7) / 8, (e.oh + 63) / 64);
     stamp();
     closeStages(cb);
     e.current = 1 - e.current; ++e.frame; e.frameSet = false; e.frontDone = false;
@@ -512,9 +692,17 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     auto& e = *impl; auto& m = e.model;
     if (e.external) throw std::runtime_error("this engine's network is external: record the front and the back");
     recordFront(cb, stamps, first);
+    // timing only: D4R_ENGINE_M_LAYER_STAMPS=1 also stamps after every network layer, from query first + 7 on
+    static const bool layerStamps = std::getenv("D4R_ENGINE_M_LAYER_STAMPS") != nullptr;
+    // the dot2 network's layers read their inputs through the vector caches, which an execution-only dependency
+    // (emptyStage) leaves stale: a ping-pong buffer read two layers earlier then serves old lines (one window in
+    // about every second 720p frame, run to run)
+    auto layerBarrier = [&] { if (m.dot2) nextStage(cb); else emptyStage(cb); };
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
-        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); emptyStage(cb);
+        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); layerBarrier();
+        if (m.dot2 && l < 2) { dispatch(cb, m.mergeDot2[l], e.mergeSets[l], (w / 2 + 7) / 8, (h / 2 + 7) / 8); layerBarrier(); }
+        if (stamps && layerStamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, first + 7 + l);
     }
     recordBack(cb, stamps, stamps ? first + 3 : 0);
 }
@@ -525,11 +713,24 @@ std::vector<MEngine::DebugResource> MEngine::debugResources() const {
     std::vector<DebugResource> r{{"enc0-params", e.enc0P.handle, VK_NULL_HANDLE, e.enc0P.size, 0, 0},
                                  {"tokens", e.tokens.handle, VK_NULL_HANDLE, e.tokens.size, 0, 0},
                                  {"head", e.dec1Out.handle, VK_NULL_HANDLE, e.dec1Out.size, 0, 0},
+                                 // the network's own activations, layer by layer
+                                 {"skip1", e.skip1.handle, VK_NULL_HANDLE, e.skip1.size, 0, 0},
+                                 {"merged1", e.merged1.handle, VK_NULL_HANDLE, e.merged1.size, 0, 0},
+                                 {"skip2", e.skip2.handle, VK_NULL_HANDLE, e.skip2.size, 0, 0},
+                                 {"merged2", e.merged2.handle, VK_NULL_HANDLE, e.merged2.size, 0, 0},
+                                 {"tubeA", e.tubeA.handle, VK_NULL_HANDLE, e.tubeA.size, 0, 0},
+                                 {"tubeB", e.tubeB.handle, VK_NULL_HANDLE, e.tubeB.size, 0, 0},
+                                 {"dec2", e.dec2Out.handle, VK_NULL_HANDLE, e.dec2Out.size, 0, 0},
                                  {"gates", VK_NULL_HANDLE, e.gates.handle, VkDeviceSize(w) * h * 4, w, h},
                                  {"mix", VK_NULL_HANDLE, e.mix.handle, VkDeviceSize(w) * h * 4, w, h},
                                  {"cov", VK_NULL_HANDLE, e.cov.handle, VkDeviceSize(w) * h * 8, w, h},
                                  {"mvA", VK_NULL_HANDLE, e.mvA[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
-                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h}};
+                                 {"feat", VK_NULL_HANDLE, e.feat[1 - e.current].handle, VkDeviceSize(w) * h * 4, w, h},
+                                 // the reconstruction's outputs: the history, its half-resolution mean and the packed
+                                 // image the downsample reads
+                                 {"hist", VK_NULL_HANDLE, e.hist[1 - e.current].handle, VkDeviceSize(e.hw) * e.hh * 8, e.hw, e.hh},
+                                 {"half", VK_NULL_HANDLE, e.half[1 - e.current].handle, VkDeviceSize(e.hw / 2) * (e.hh / 2) * 16, e.hw / 2, e.hh / 2},
+                                 {"packed", e.packed.handle, VK_NULL_HANDLE, e.packed.size, 0, 0}};
     if (e.model.presetL) r.push_back({"skip", e.skipL.handle, VK_NULL_HANDLE, e.skipL.size, 0, 0});
     return r;
 }

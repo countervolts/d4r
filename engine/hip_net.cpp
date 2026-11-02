@@ -8,6 +8,15 @@
 #define __HIP_PLATFORM_AMD__
 #include "hip_net.h"
 #include <hip/hip_runtime_api.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -65,14 +74,18 @@ uint32_t global32(hipModule_t module, const char* name, uint32_t fallback) {
     }
     return v;
 }
-void* import(intptr_t fd, uint64_t bytes, hipExternalMemory_t& memory) {
+void* import(ExternalMemoryHandle handle, uint64_t bytes, hipExternalMemory_t& memory) {
     hipExternalMemoryHandleDesc desc{}; desc.size = bytes;
 #ifdef _WIN32
-    desc.type = hipExternalMemoryHandleTypeOpaqueWin32; desc.handle.win32.handle = reinterpret_cast<void*>(fd);
+    // an NT handle stays the importer's to close
+    desc.type = hipExternalMemoryHandleTypeOpaqueWin32; desc.handle.win32.handle = handle;
+    const hipError_t imported = hipImportExternalMemory(&memory, &desc);
+    CloseHandle(handle);
+    HIPCHECK(imported);
 #else
-    desc.type = hipExternalMemoryHandleTypeOpaqueFd; desc.handle.fd = int(fd);
-#endif
+    desc.type = hipExternalMemoryHandleTypeOpaqueFd; desc.handle.fd = handle;
     HIPCHECK(hipImportExternalMemory(&memory, &desc));
+#endif
     hipExternalMemoryBufferDesc buffer{}; buffer.offset = 0; buffer.size = bytes;
     void* at = nullptr; HIPCHECK(hipExternalMemoryGetMappedBuffer(&at, memory, &buffer));
     return at;
@@ -133,8 +146,9 @@ struct HipNetwork::Impl {
     }
 };
 
-HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t height, intptr_t tokensFd, intptr_t outputFd,
-                       uint64_t tokensBytes, uint64_t outputBytes) : impl(std::make_unique<Impl>()) {
+HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t height, ExternalMemoryHandle tokensFd,
+                       ExternalMemoryHandle outputFd, uint64_t tokensBytes, uint64_t outputBytes)
+    : impl(std::make_unique<Impl>()) {
     auto& n = *impl;
     HIPCHECK(hipInit(0));
     int leastPriority = 0, greatestPriority = 0;

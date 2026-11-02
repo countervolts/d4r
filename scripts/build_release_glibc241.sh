@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 # Run inside packaging/build/Dockerfile.glibc241 with a recent official Rust toolchain and ROCm mounted.
 # Supply isolated, patched ZLUDA/vkd3d checkouts and the usual package_release.sh inputs.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${D4R_RELEASE_BUILD_ROOT:?set the build output directory}"
-: "${D4R_ZLUDA_SRC:?set a build-local ZLUDA checkout with patches 0002-0007 applied}"
-: "${D4R_VKD3D_SRC:?set a build-local vkd3d-proton checkout with patches 0001 and 0002 applied}"
+: "${D4R_ZLUDA_SRC:?set a build-local ZLUDA checkout with patches 0002-0014 applied}"
+: "${D4R_VKD3D_SRC:?set a build-local vkd3d-proton checkout with patches 0001-0005 applied}"
 : "${D4R_ROCM_DIR:?set ROCm with clang and device libraries}"
 BUILD="$(realpath -m "$D4R_RELEASE_BUILD_ROOT")"
 [[ "$(getconf GNU_LIBC_VERSION)" == 'glibc 2.41' ]] || {
@@ -75,6 +76,14 @@ export D4R_DLSS_PTX_DIR="$BUILD/ptx"
 python3 "$ROOT/kernels/tools/extract_dlss_ptx.py" "$D4R_BUNDLE_DLSS" "$D4R_DLSS_PTX_DIR" > "$BUILD/logs/extract.log"
 build_textures() {
     local arch="$1" folder fp8 accuracy out
+    # RDNA2: only K's natively translated hiluma output/input kernels (no WMMA), fast set only (the accuracy
+    # set keeps ZLUDA's compile of them); package_release.sh builds the K layers and copies these
+    if [[ "$arch" == gfx103* ]]; then
+        D4R_PREFER_ACCURACY=0 D4R_GPU_ARCH="$arch" D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" \
+            "$ROOT/kernels/build.sh" tex "$D4R_BUNDLE_TEX/$arch" > "$BUILD/logs/tex-$arch-0.log" 2>&1
+        echo "Texture kernels rebuilt: $arch (native hiluma output/input only)"
+        return 0
+    fi
     folders=("$arch")
     [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
     for folder in "${folders[@]}"; do
@@ -92,10 +101,10 @@ build_textures() {
 }
 pending=()
 failed=0
-for arch in ${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
+for arch in ${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
     build_textures "$arch" &
     pending+=("$!")
-    if (( ${#pending[@]} >= 4 )); then
+    if (( ${#pending[@]} >= ${D4R_TEX_JOBS:-4} )); then
         wait "${pending[0]}" || failed=1
         pending=("${pending[@]:1}")
     fi
@@ -106,6 +115,6 @@ python3 -m unittest discover -s "$ROOT/tests" -v > "$BUILD/logs/tests.log" 2>&1
 export D4R_SKIP_BUILD=1
 export D4R_MAX_GLIBC=2.41
 export D4R_BUILD_INFO="$BUILD/toolchain.txt"
-export D4R_PACKAGE_KERNEL_JOBS=4
+export D4R_PACKAGE_KERNEL_JOBS="${D4R_PACKAGE_KERNEL_JOBS:-4}"
 "$ROOT/scripts/package_release.sh" "$BUILD/dist" > "$BUILD/logs/package.log" 2>&1
 echo "Release packaged in $BUILD/dist"

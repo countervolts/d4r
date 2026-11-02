@@ -5,13 +5,9 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
+#include "d4r_dlfcn.h"
+#include "d4r_vk_hip_memory.h"
 #include <vector>
-
-template <typename T> static T vk_proc(VkDevice device, const char* name)
-{
-    return reinterpret_cast<T>(vkGetDeviceProcAddr(device, name));
-}
 
 static void print_hip(const char* stage, hipError_t result)
 {
@@ -122,17 +118,18 @@ int main()
     externalBufferInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
     externalBufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    externalBufferInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    externalBufferInfo.handleType = D4R_VK_MEMORY_HANDLE_TYPE;
     VkExternalBufferProperties externalBufferProperties{};
     externalBufferProperties.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
     vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, &externalBufferInfo, &externalBufferProperties);
     const VkExternalMemoryProperties& externalMemory = externalBufferProperties.externalMemoryProperties;
-    std::printf("RADV OPAQUE_FD buffer: features=0x%x compatible=0x%x\n",
+    std::printf("Vulkan " D4R_VK_MEMORY_HANDLE_NAME " buffer: features=0x%x compatible=0x%x\n",
                 externalMemory.externalMemoryFeatures, externalMemory.compatibleHandleTypes);
     if ((externalMemory.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) == 0 ||
         (externalMemory.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0)
     {
-        std::fprintf(stderr, "RADV does not support importing and exporting OPAQUE_FD buffers\n");
+        std::fprintf(stderr, "The Vulkan driver does not support importing and exporting " D4R_VK_MEMORY_HANDLE_NAME
+                     " buffers\n");
         vkDestroyInstance(instance, nullptr);
         return 1;
     }
@@ -164,7 +161,7 @@ int main()
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    const char* deviceExtensions[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
+    const char* deviceExtensions[] = {D4R_VK_EXTERNAL_MEMORY_EXTENSION};
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.queueCreateInfoCount = 1;
@@ -181,18 +178,9 @@ int main()
         return 1;
     }
 
-    auto getMemoryFd = vk_proc<PFN_vkGetMemoryFdKHR>(device, "vkGetMemoryFdKHR");
-    if (getMemoryFd == nullptr)
-    {
-        std::fprintf(stderr, "vkGetMemoryFdKHR is unavailable\n");
-        vkDestroyDevice(device, nullptr);
-        vkDestroyInstance(instance, nullptr);
-        return 1;
-    }
-
     VkExternalMemoryBufferCreateInfo externalCreateInfo{};
     externalCreateInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-    externalCreateInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    externalCreateInfo.handleTypes = D4R_VK_MEMORY_HANDLE_TYPE;
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.pNext = &externalCreateInfo;
@@ -224,7 +212,7 @@ int main()
 
     VkExportMemoryAllocateInfo exportInfo{};
     exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    exportInfo.handleTypes = D4R_VK_MEMORY_HANDLE_TYPE;
     VkMemoryAllocateInfo allocationInfo{};
     allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocationInfo.pNext = &exportInfo;
@@ -247,13 +235,9 @@ int main()
         return 1;
     }
 
-    VkMemoryGetFdInfoKHR fdInfo{};
-    fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    fdInfo.memory = memory;
-    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    int fd = -1;
-    vkResult = getMemoryFd(device, &fdInfo, &fd);
-    std::printf("vkGetMemoryFdKHR: %d fd=%d\n", static_cast<int>(vkResult), fd);
+    hipExternalMemoryHandleDesc hipHandle{};
+    vkResult = d4r_export_vk_memory(device, memory, allocationInfo.allocationSize, &hipHandle);
+    std::printf("Vulkan memory export (" D4R_VK_MEMORY_HANDLE_NAME "): %d\n", static_cast<int>(vkResult));
     if (vkResult != VK_SUCCESS)
     {
         vkFreeMemory(device, memory, nullptr);
@@ -263,16 +247,13 @@ int main()
         return 1;
     }
 
-    hipExternalMemoryHandleDesc hipHandle{};
-    hipHandle.type = hipExternalMemoryHandleTypeOpaqueFd;
-    hipHandle.handle.fd = fd;
-    hipHandle.size = allocationInfo.allocationSize;
     hipExternalMemory_t hipMemory = nullptr;
     hipResult = hipImportExternalMemory(&hipMemory, &hipHandle);
-    print_hip("hipImportExternalMemory(Vulkan OPAQUE_FD)", hipResult);
+    print_hip("hipImportExternalMemory(Vulkan " D4R_VK_MEMORY_HANDLE_NAME ")", hipResult);
+    d4r_close_exported_vk_memory(hipHandle);
     if (hipResult != hipSuccess)
     {
-        std::fprintf(stderr, "HIP could not import RADV's exported Vulkan memory\n");
+        std::fprintf(stderr, "HIP could not import the exported Vulkan memory\n");
         vkFreeMemory(device, memory, nullptr);
         vkDestroyBuffer(device, buffer, nullptr);
         vkDestroyDevice(device, nullptr);

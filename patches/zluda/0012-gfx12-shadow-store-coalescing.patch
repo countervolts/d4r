@@ -1,0 +1,92 @@
+diff --git a/llvm_zluda/src/lib.cpp b/llvm_zluda/src/lib.cpp
+--- a/llvm_zluda/src/lib.cpp
++++ b/llvm_zluda/src/lib.cpp
+@@ -485,6 +485,8 @@
+     bool AnyFp8 = false;
+     for (const Site &S : Sites)
+         AnyFp8 |= S.Fp8;
++    if (PackedFp8 && AnyFp8)
++        F.addFnAttr("amdgpu-waves-per-eu", "8");
+     Type *F32Ty = Type::getFloatTy(F.getContext());
+     Value *Scale = ConstantFP::get(F32Ty, AnyFp8 ? 0x1p-16 : 1.0);
+     Value *Inverse = ConstantFP::get(F32Ty, AnyFp8 ? 0x1p16 : 1.0);
+@@ -758,6 +760,70 @@
+         Call->eraseFromParent();
+     }
+ 
++    // A complete pair overwrite needs one conversion. Reads of either
++    // NVIDIA register, accesses to its rewritten shadow, and block boundaries
++    // prevent coalescing. Scan after MMA rewriting to include hoisted reads.
++    DenseMap<AllocaInst *, int> ShadowOwners;
++    for (size_t Index = 0; Index < Shadows.size(); ++Index)
++        if (Shadows[Index] != nullptr)
++            ShadowOwners[Shadows[Index]] = static_cast<int>(Index);
++    SmallVector<std::pair<StoreInst *, StoreInst *>, 64> StorePairs;
++    DenseMap<int, StoreInst *> PendingStores;
++    for (BasicBlock &Block : F)
++    {
++        PendingStores.clear();
++        for (Instruction &I : Block)
++        {
++            auto *Load = dyn_cast<LoadInst>(&I);
++            auto *Store = dyn_cast<StoreInst>(&I);
++            if (Load == nullptr && Store == nullptr)
++                continue;
++            Value *Pointer = Load != nullptr ? Load->getPointerOperand() : Store->getPointerOperand();
++            auto *Register = dyn_cast<AllocaInst>(Pointer);
++            auto Shadow = ShadowOwners.find(Register);
++            if (Shadow != ShadowOwners.end())
++            {
++                PendingStores.erase(Shadow->second);
++                continue;
++            }
++            auto Found = Owner.find(Register);
++            if (Found == Owner.end() || Found->second < 0 || Shadows[Found->second] == nullptr)
++                continue;
++            int Index = Found->second;
++            if (Load != nullptr)
++            {
++                PendingStores.erase(Index);
++                continue;
++            }
++            auto Previous = PendingStores.find(Index);
++            if (Previous != PendingStores.end() && Previous->second->getPointerOperand() != Pointer)
++            {
++                StorePairs.push_back({Previous->second, Store});
++                PendingStores.erase(Previous);
++            }
++            else
++                PendingStores[Index] = Store;
++        }
++    }
++    DenseSet<StoreInst *> CoalescedStores;
++    for (auto [First, Second] : StorePairs)
++    {
++        if (ResultStores.contains(First) || ResultStores.contains(Second))
++            continue;
++        auto *Register = cast<AllocaInst>(First->getPointerOperand());
++        const RegisterPair &Pair = Shadowed[Owner[Register]];
++        const bool FirstHigh = Register == Pair.High;
++        IRBuilder<> Builder(Second);
++        Value *Nv = UndefValue::get(Pair32);
++        Nv = Builder.CreateInsertElement(Nv, First->getValueOperand(), Builder.getInt8(FirstHigh));
++        Nv = Builder.CreateInsertElement(Nv, Second->getValueOperand(), Builder.getInt8(!FirstHigh));
++        Builder.CreateStore(fromNv(Builder, Nv), shadowFor(Pair));
++        CoalescedStores.insert(First);
++        CoalescedStores.insert(Second);
++        First->eraseFromParent();
++        Second->eraseFromParent();
++    }
++
+     // Every other access now goes through the shadow.
+     for (LoadInst *Load : Loads)
+     {
+@@ -770,6 +836,8 @@
+     }
+     for (StoreInst *Store : Stores)
+     {
++        if (CoalescedStores.contains(Store))
++            continue;
+         if (!ResultStores.contains(Store))
+         {
+             auto *Register = cast<AllocaInst>(Store->getPointerOperand());

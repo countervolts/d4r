@@ -1,0 +1,187 @@
+{
+ "date": "2026-10-29",
+ "gpu": "RX 9070 XT, RADV, 330 W power cap",
+ "preset": "SR L",
+ "resolution": "1920x1080 -> 3840x2160",
+ "route": "vkhip",
+ "method": "d4r-m with D4R_M_WARMUP_PASSES=12 D4R_M_TIME_EACH=1, 100 timed evaluations per trial, builds interleaved within each trial; the input stage is enc0_l and the expansion stage dec0_l. Trials come from two sessions (ab-base.log: sr-l against sr-l-def; ab-rerun.log: the four experiment builds).",
+ "output": "all 4 outputs of every trial of every build byte-identical to the baseline's",
+ "builds": {
+  "sr-l": {
+   "description": "baseline: the source before the unroll fix (WPW=2)",
+   "trials": [
+    {
+     "trial_log": "ab-base.log",
+     "trial": 1,
+     "whole_median_us": 4296.2,
+     "enc0_l_median_us": 892.8,
+     "dec0_l_median_us": 778.5
+    },
+    {
+     "trial_log": "ab-base.log",
+     "trial": 2,
+     "whole_median_us": 4293.0,
+     "enc0_l_median_us": 892.3,
+     "dec0_l_median_us": 775.8
+    },
+    {
+     "trial_log": "ab-base.log",
+     "trial": 3,
+     "whole_median_us": 4302.0,
+     "enc0_l_median_us": 892.9,
+     "dec0_l_median_us": 775.4
+    }
+   ],
+   "median_of_trials": {
+    "whole_median_us": 4296.2,
+    "enc0_l_median_us": 892.8,
+    "dec0_l_median_us": 775.8
+   }
+  },
+  "sr-l-def": {
+   "description": "experiment 1: dec0_l patch-expand token copy unrolled (the kept change; current engine/layer_m.comp)",
+   "trials": [
+    {
+     "trial_log": "ab-base.log",
+     "trial": 1,
+     "whole_median_us": 4264.1,
+     "enc0_l_median_us": 889.8,
+     "dec0_l_median_us": 745.0
+    },
+    {
+     "trial_log": "ab-base.log",
+     "trial": 2,
+     "whole_median_us": 4271.6,
+     "enc0_l_median_us": 890.9,
+     "dec0_l_median_us": 745.0
+    },
+    {
+     "trial_log": "ab-base.log",
+     "trial": 3,
+     "whole_median_us": 4281.8,
+     "enc0_l_median_us": 895.6,
+     "dec0_l_median_us": 749.0
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 1,
+     "whole_median_us": 4254.5,
+     "enc0_l_median_us": 890.7,
+     "dec0_l_median_us": 750.7
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 2,
+     "whole_median_us": 4260.9,
+     "enc0_l_median_us": 891.0,
+     "dec0_l_median_us": 747.3
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 3,
+     "whole_median_us": 4274.8,
+     "enc0_l_median_us": 894.7,
+     "dec0_l_median_us": 749.9
+    }
+   ],
+   "median_of_trials": {
+    "whole_median_us": 4267.85,
+    "enc0_l_median_us": 890.95,
+    "dec0_l_median_us": 748.15
+   }
+  },
+  "sr-l-exp": {
+   "description": "experiment 1, a second build of the same source",
+   "trials": [
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 1,
+     "whole_median_us": 4251.0,
+     "enc0_l_median_us": 890.2,
+     "dec0_l_median_us": 748.9
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 2,
+     "whole_median_us": 4268.0,
+     "enc0_l_median_us": 893.1,
+     "dec0_l_median_us": 749.3
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 3,
+     "whole_median_us": 4266.1,
+     "enc0_l_median_us": 894.2,
+     "dec0_l_median_us": 749.6
+    }
+   ],
+   "median_of_trials": {
+    "whole_median_us": 4266.1,
+    "enc0_l_median_us": 893.1,
+    "dec0_l_median_us": 749.3
+   }
+  },
+  "sr-l-w1": {
+   "description": "experiment 2: experiment 1 plus WPW=1 (one window per wave) for enc0_l and dec0_l",
+   "trials": [
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 1,
+     "whole_median_us": 4368.6,
+     "enc0_l_median_us": 937.9,
+     "dec0_l_median_us": 814.0
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 2,
+     "whole_median_us": 4377.0,
+     "enc0_l_median_us": 941.8,
+     "dec0_l_median_us": 814.8
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 3,
+     "whole_median_us": 4400.2,
+     "enc0_l_median_us": 944.1,
+     "dec0_l_median_us": 813.3
+    }
+   ],
+   "median_of_trials": {
+    "whole_median_us": 4377.0,
+    "enc0_l_median_us": 941.8,
+    "dec0_l_median_us": 814.0
+   }
+  },
+  "sr-l-acc8": {
+   "description": "experiment 3: experiment 1 plus M_ACC8 (f32 accumulators until the FP8 conversion for Q, the MLP hidden layer and the expansion); reverted",
+   "trials": [
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 1,
+     "whole_median_us": 4258.2,
+     "enc0_l_median_us": 888.4,
+     "dec0_l_median_us": 743.6
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 2,
+     "whole_median_us": 4270.6,
+     "enc0_l_median_us": 889.3,
+     "dec0_l_median_us": 744.8
+    },
+    {
+     "trial_log": "ab-rerun.log",
+     "trial": 3,
+     "whole_median_us": 4294.5,
+     "enc0_l_median_us": 898.9,
+     "dec0_l_median_us": 752.0
+    }
+   ],
+   "median_of_trials": {
+    "whole_median_us": 4270.6,
+    "enc0_l_median_us": 889.3,
+    "dec0_l_median_us": 744.8
+   }
+  }
+ }
+}

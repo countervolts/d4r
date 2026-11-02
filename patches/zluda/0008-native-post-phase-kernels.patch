@@ -1,0 +1,122 @@
+ZLUDA: post-phase kernels for native overrides. A native code object may define NAME_post1 .. NAME_post8; the hook
+launches them after NAME on the same stream with the same parameters (u32 globals d4r_postK_grid_x/_grid_y, 0 = the
+launch's grid; d4r_postK_block_x/_y/_z, 0 = 32/1/1). Preset K's bottleneck layer (dec5) runs as four phase kernels.
+
+diff --git a/zluda/src/impl/function.rs b/zluda/src/impl/function.rs
+index 033d9a0..69c70c9 100644
+--- a/zluda/src/impl/function.rs
++++ b/zluda/src/impl/function.rs
+@@ -26,6 +26,9 @@ pub(crate) struct Function {
+     /// the kernel prepares into a shared overflow slot). 0 = only the last key is kept.
+     pub(crate) prep_slots: u32,
+     pub(crate) prep_seen: std::sync::Mutex<Vec<u64>>,
++    /// d4r phase kernels NAME_post1.. launched after the main kernel, on the same stream with the same
++    /// parameters: (function, grid x, grid y, block x, block y, block z); a grid entry of 0 keeps the launch's value
++    pub(crate) post: Vec<(hipFunction_t, u32, u32, u32, u32, u32)>,
+ }
+ 
+ impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
+@@ -220,7 +223,25 @@ pub(crate) fn launch_kernel(
+             kernel_params,
+             extra_for_hip,
+         )
++    }?;
++    for &(post, gx, gy, bx, by, bz) in f.post.iter() {
++        unsafe {
++            hipModuleLaunchKernel(
++                post,
++                if gx != 0 { gx } else { grid_dim_x },
++                if gy != 0 { gy } else { grid_dim_y },
++                if gx != 0 || gy != 0 { 1 } else { grid_dim_z },
++                bx,
++                by,
++                bz,
++                0,
++                stream,
++                kernel_params,
++                extra_for_hip,
++            )
++        }?;
+     }
++    Ok(())
+ }
+ 
+ pub(crate) unsafe fn set_attribute(
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 9f72f2f..3173500 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -37,12 +37,12 @@ impl ModuleMutable {
+         Ok(match self.functions.entry(name) {
+             hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+             hash_map::Entry::Vacant(entry) => {
+-                let (func_handle, prep, block_z, grid_x, prep_key, prep_slots) = match native_override(entry.key()) {
++                let (func_handle, prep, block_z, grid_x, prep_key, prep_slots, post) = match native_override(entry.key()) {
+                     Some(native) => native,
+                     None => {
+                         let mut func_handle = unsafe { std::mem::zeroed() };
+                         unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
+-                        (func_handle, None, 0, 0, None, 0)
++                        (func_handle, None, 0, 0, None, 0, Vec::new())
+                     }
+                 };
+                 let func = Box::new(Function {
+@@ -56,6 +56,7 @@ impl ModuleMutable {
+                     prep_last: std::sync::atomic::AtomicU64::new(0),
+                     prep_slots,
+                     prep_seen: std::sync::Mutex::new(Vec::new()),
++                    post,
+                 });
+                 &*entry.insert(func)
+             }
+@@ -69,9 +70,10 @@ impl ModuleMutable {
+ /// same stream with `d4r_prep_blocks` (a u32 global in the code object) blocks of 128 threads.
+ /// An optional u32 global `d4r_block_z` replaces the launch's block z dimension, and `d4r_grid_x`
+ /// (persistent kernels, which derive the original grid from their parameters) the grid.
++#[allow(clippy::type_complexity)]
+ fn native_override(
+     name: &CStr,
+-) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, Option<u32>, u32)> {
++) -> Option<(hipFunction_t, Option<(hipFunction_t, u32)>, u32, u32, Option<u32>, u32, Vec<(hipFunction_t, u32, u32, u32, u32, u32)>)> {
+     let dir = std::env::var_os("D4R_ZLUDA_NATIVE_DIR")?;
+     let path = std::path::Path::new(&dir).join(format!("{}.hsaco", name.to_str().ok()?));
+     let image = fs::read(&path).ok()?;
+@@ -128,17 +130,35 @@ fn native_override(
+     };
+     // d4r_prep_key_slots: the kernel keeps one prepared image per key (see Function::prep_slots)
+     let prep_slots = read_u32(c"d4r_prep_key_slots");
++    // d4r: phase kernels NAME_post1 .. NAME_post8, each with u32 globals d4r_postK_grid_x / _grid_y (0 = the
++    // launch's grid) and d4r_postK_block_x / _y / _z (0 = 32 / 1 / 1)
++    let mut post = Vec::new();
++    for k in 1..=8u32 {
++        let Ok(post_name) = CString::new(format!("{}_post{}", name.to_str().ok()?, k)) else { break };
++        let mut post_func = unsafe { mem::zeroed() };
++        if unsafe { hipModuleGetFunction(&mut post_func, native_module, post_name.as_ptr()) }.is_err() {
++            break;
++        }
++        let sym = |field: &str| CString::new(format!("d4r_post{}_{}", k, field)).unwrap();
++        let gx = read_u32(&sym("grid_x"));
++        let gy = read_u32(&sym("grid_y"));
++        let bx = read_u32(&sym("block_x"));
++        let by = read_u32(&sym("block_y"));
++        let bz = read_u32(&sym("block_z"));
++        post.push((post_func, gx, gy, if bx == 0 { 32 } else { bx }, if by == 0 { 1 } else { by }, if bz == 0 { 1 } else { bz }));
++    }
+     eprintln!(
+-        "[d4r-native] {:?} -> {} (prep: {:?}, block_z: {}, grid_x: {}, prep_key: {:?}, prep_slots: {})",
++        "[d4r-native] {:?} -> {} (prep: {:?}, block_z: {}, grid_x: {}, prep_key: {:?}, prep_slots: {}, post: {})",
+         name,
+         path.display(),
+         prep.map(|p| p.1),
+         block_z,
+         grid_x,
+         prep_key,
+-        prep_slots
++        prep_slots,
++        post.len()
+     );
+-    Some((func, prep, block_z, grid_x, prep_key, prep_slots))
++    Some((func, prep, block_z, grid_x, prep_key, prep_slots, post))
+ }
+ 
+ impl ZludaObject for Module {

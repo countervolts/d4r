@@ -1544,7 +1544,7 @@ index 0fbc7f7..ea47914 100644
                  });
                  &*entry.insert(func)
              }
-@@ -50,6 +61,78 @@ impl ModuleMutable {
+@@ -50,6 +61,86 @@ impl ModuleMutable {
      }
  }
  
@@ -1558,6 +1558,14 @@ index 0fbc7f7..ea47914 100644
 +    let dir = std::env::var_os("D4R_ZLUDA_NATIVE_DIR")?;
 +    let path = std::path::Path::new(&dir).join(format!("{}.hsaco", name.to_str().ok()?));
 +    let image = fs::read(&path).ok()?;
++    // HIP can crash on a short or truncated code object: an ELF's section headers (e_shoff, e_shentsize, e_shnum) must fit
++    let le = |at: usize, size: usize| image[at..at + size].iter().rev().fold(0u64, |v, &b| (v << 8) | u64::from(b));
++    if image.len() < 64
++        || (image.starts_with(b"\x7fELF") && le(40, 8).saturating_add(le(58, 2) * le(60, 2)) > image.len() as u64)
++    {
++        eprintln!("[d4r-native] {} is truncated ({} bytes)", path.display(), image.len());
++        return None;
++    }
 +    // HIP may reference the image after loading; the override lives for the whole process.
 +    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
 +    let mut native_module = unsafe { mem::zeroed() };
@@ -1623,7 +1631,7 @@ index 0fbc7f7..ea47914 100644
  impl ZludaObject for Module {
      const COOKIE: usize = 0xe9138bd040487d4a;
  
-@@ -263,6 +346,8 @@ fn get_best_ptx_and_compile(
+@@ -263,6 +354,8 @@ fn get_best_ptx_and_compile(
          implicit_max_block: ptx::implicit_max_block(),
          sched_strategy: ptx::sched_strategy(),
          wmma: llvm_zluda::compile::wmma_rewrite_requested(),
@@ -1632,7 +1640,7 @@ index 0fbc7f7..ea47914 100644
      };
      let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
          (Some(text), Some(p)) => (|| {
-@@ -302,6 +387,8 @@ struct ExtraCacheAttributes {
+@@ -302,6 +395,8 @@ struct ExtraCacheAttributes {
      implicit_max_block: Option<u32>,
      sched_strategy: Option<&'static str>,
      wmma: bool,
@@ -1641,7 +1649,7 @@ index 0fbc7f7..ea47914 100644
  }
  
  fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
-@@ -323,9 +410,27 @@ fn zluda_build_version() -> &'static str {
+@@ -323,9 +418,27 @@ fn zluda_build_version() -> &'static str {
      static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
      VERSION.get_or_init(|| {
          let sha = env!("VERGEN_GIT_SHA");

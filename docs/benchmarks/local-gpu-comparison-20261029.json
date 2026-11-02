@@ -1,0 +1,3022 @@
+{
+ "date": "2026-10-29",
+ "gpu": "AMD Radeon RX 9070 XT (gfx1201, Navi 48, PCI 1002:7550)",
+ "driver": "Mesa 26.2.5-arch3.1 RADV, kernel 7.3.0-5-cachyos, DRM 3.64",
+ "power_limit_w": 250.0,
+ "power_cap_default_w": 330.0,
+ "method": {
+  "cadence": "40+ warmup and 100 measured evaluations per case, three interleaved trials, median of the three trial medians",
+  "timing": "Vulkan timestamp queries bracketing the evaluation; initialization, input uploads and output readback outside them (same exclusions as the NVIDIA CUDA-event probe)",
+  "inputs": "the official probe's inputs recreated byte for byte: SR patterned RGBA16F with zero motion and depth 0.5; RR one static noisy fsr_rr_scene frame with its guides, hit distance 4, view/projection, zero motion, alternating jitter, Reset only on the first evaluation",
+  "quality": "Performance geometry (render half the output per axis); d4r has no separate quality knob in the replay runners",
+  "not_comparable": "whole-evaluation stamps here versus NVIDIA CUDA-event bracketing: both exclude init/upload/readback, but d4r's engine runs one submit with barriers while NGX evaluates on its own; cross-backend arithmetic is native FP8, not NVIDIA's PTX"
+ },
+ "model_provenance": {
+  "sr_m_l": "engine models rebuilt from the retained captures of nvngx_dlss.dll 310.7.0; the NVIDIA reference measured 310.9.16",
+  "rr_a_b_c": "engine/compile_rr_cnn.py from nvngx_dlssd_310.3.0.dll, matching the NVIDIA A/B/C library",
+  "rr_d_e_f": "handoff models from nvngx_dlssd_310.9.1.dll; the NVIDIA reference measured 310.9.16"
+ },
+ "results": {
+  "sr-M-1440p": {
+   "preset": "M",
+   "geometry": "1280x720->2560x1440",
+   "family": "sr",
+   "nvidia_ms": 1.081472,
+   "local_fastest_ms": 1.26062,
+   "local_over_nvidia": 1.1657,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      1.3123,
+      1.31294,
+      1.31666
+     ],
+     "median_of_trial_medians_ms": 1.31294,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 16.2,
+      "input": 90.5,
+      "network": 821.5,
+      "expansion": 66.9,
+      "reconstruction": 245.1,
+      "downsample": 72.2
+     },
+     "gpu_clock_mhz_median": 1741.0,
+     "gpu_busy_percent_median": 15,
+     "ppt_w_median": 37.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-m-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      1.26044,
+      1.26062,
+      1.26626
+     ],
+     "median_of_trial_medians_ms": 1.26062,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 16.7,
+      "input": 94.0,
+      "network": 761.5,
+      "expansion": 68.6,
+      "reconstruction": 251.2,
+      "downsample": 72.6
+     },
+     "gpu_clock_mhz_median": 1795.0,
+     "gpu_busy_percent_median": 31,
+     "ppt_w_median": 64.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "vkhip native layers"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-m-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    },
+    "hip": {
+     "trial_medians_ms": [
+      1.50687,
+      1.503515,
+      1.50638
+     ],
+     "median_of_trial_medians_ms": 1.50638,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 16.6,
+      "input": 92.0,
+      "network": 943.4,
+      "expansion": 68.8,
+      "reconstruction": 245.8,
+      "downsample": 73.0
+     },
+     "gpu_clock_mhz_median": 2735.5,
+     "gpu_busy_percent_median": 15.0,
+     "ppt_w_median": 61.5,
+     "setting": "native HIP layers through the HIP runtime, engine stages split around them",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-m-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    }
+   }
+  },
+  "sr-L-1440p": {
+   "preset": "L",
+   "geometry": "1280x720->2560x1440",
+   "family": "sr",
+   "nvidia_ms": 1.413184,
+   "local_fastest_ms": 2.0016,
+   "local_over_nvidia": 1.4164,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      2.04612,
+      2.04322,
+      2.04198
+     ],
+     "median_of_trial_medians_ms": 2.04322,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 17.5,
+      "input": 430.4,
+      "network": 841.5,
+      "expansion": 360.4,
+      "reconstruction": 320.6,
+      "downsample": 73.8
+     },
+     "gpu_clock_mhz_median": 1820.5,
+     "gpu_busy_percent_median": 21.0,
+     "ppt_w_median": 64.5,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-l-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      1.99718,
+      2.00874,
+      2.0016
+     ],
+     "median_of_trial_medians_ms": 2.0016,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 17.6,
+      "input": 446.3,
+      "network": 767.5,
+      "expansion": 374.5,
+      "reconstruction": 323.8,
+      "downsample": 73.4
+     },
+     "gpu_clock_mhz_median": 1910.0,
+     "gpu_busy_percent_median": 26.0,
+     "ppt_w_median": 77.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "vkhip native layers"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-l-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    },
+    "hip": {
+     "trial_medians_ms": [
+      2.22388,
+      2.228705,
+      2.23424
+     ],
+     "median_of_trial_medians_ms": 2.228705,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 17.9,
+      "input": 435.6,
+      "network": 949.2,
+      "expansion": 370.4,
+      "reconstruction": 318.8,
+      "downsample": 73.6
+     },
+     "gpu_clock_mhz_median": 2731.5,
+     "gpu_busy_percent_median": 20.5,
+     "ppt_w_median": 77.0,
+     "setting": "native HIP layers through the HIP runtime, engine stages split around them",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/sr-l-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+    }
+   }
+  },
+  "rr-A-1440p": {
+   "preset": "A",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 1.35824,
+   "local_fastest_ms": 2.05062,
+   "local_over_nvidia": 1.5098,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      9.27554,
+      9.26294,
+      9.26044
+     ],
+     "median_of_trial_medians_ms": 9.26294,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 3167.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 232.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-a-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      2.04948,
+      2.05062,
+      2.05806
+     ],
+     "median_of_trial_medians_ms": 2.05062,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 1711.0,
+     "gpu_busy_percent_median": 58.5,
+     "ppt_w_median": 171.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-a-vkhip-trial0"
+    }
+   }
+  },
+  "rr-B-1440p": {
+   "preset": "B",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 1.352768,
+   "local_fastest_ms": 2.05164,
+   "local_over_nvidia": 1.5166,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      9.2708,
+      9.26342,
+      9.26996
+     ],
+     "median_of_trial_medians_ms": 9.26996,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 3174.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 235.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-b-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      2.04946,
+      2.05164,
+      2.05588
+     ],
+     "median_of_trial_medians_ms": 2.05164,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 1835.5,
+     "gpu_busy_percent_median": 63.0,
+     "ppt_w_median": 180.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-b-vkhip-trial0"
+    }
+   }
+  },
+  "rr-C-1440p": {
+   "preset": "C",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 1.357984,
+   "local_fastest_ms": 2.05396,
+   "local_over_nvidia": 1.5125,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      9.27238,
+      9.27858,
+      9.2936
+     ],
+     "median_of_trial_medians_ms": 9.27858,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 3173.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 235.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-c-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      2.05684,
+      2.05056,
+      2.05396
+     ],
+     "median_of_trial_medians_ms": 2.05396,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 1831.5,
+     "gpu_busy_percent_median": 62.5,
+     "ppt_w_median": 179.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-c-vkhip-trial0"
+    }
+   }
+  },
+  "rr-D-1440p": {
+   "preset": "D",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 1.859808,
+   "local_fastest_ms": 3.65654,
+   "local_over_nvidia": 1.9661,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      3.96548,
+      3.96158,
+      3.96362
+     ],
+     "median_of_trial_medians_ms": 3.96362,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 2517.0,
+     "gpu_busy_percent_median": 92,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-d-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      3.65256,
+      3.66918,
+      3.65654
+     ],
+     "median_of_trial_medians_ms": 3.65654,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.5
+     },
+     "gpu_clock_mhz_median": 2416.0,
+     "gpu_busy_percent_median": 89,
+     "ppt_w_median": 250.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "10 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-d-vkhip-trial0"
+    }
+   }
+  },
+  "rr-E-1440p": {
+   "preset": "E",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 1.863104,
+   "local_fastest_ms": 3.64928,
+   "local_over_nvidia": 1.9587,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      3.94674,
+      3.94048,
+      3.95194
+     ],
+     "median_of_trial_medians_ms": 3.94674,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.4
+     },
+     "gpu_clock_mhz_median": 2554.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-e-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      3.64928,
+      3.64492,
+      3.65024
+     ],
+     "median_of_trial_medians_ms": 3.64928,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.4
+     },
+     "gpu_clock_mhz_median": 2411.0,
+     "gpu_busy_percent_median": 88,
+     "ppt_w_median": 249.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "10 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-e-vkhip-trial0"
+    }
+   }
+  },
+  "rr-F-1440p": {
+   "preset": "F",
+   "geometry": "1280x720->2560x1440",
+   "family": "rr",
+   "nvidia_ms": 2.09984,
+   "local_fastest_ms": 3.5731,
+   "local_over_nvidia": 1.7016,
+   "fastest_route": "vulkan",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      3.5731,
+      3.5676,
+      3.57386
+     ],
+     "median_of_trial_medians_ms": 3.5731,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.7
+     },
+     "gpu_clock_mhz_median": 2325.0,
+     "gpu_busy_percent_median": 91,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-f-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      3.60786,
+      3.60276,
+      3.61188
+     ],
+     "median_of_trial_medians_ms": 3.60786,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.6
+     },
+     "gpu_clock_mhz_median": 2305.0,
+     "gpu_busy_percent_median": 87,
+     "ppt_w_median": 250.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "14 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-1440p <repo>/build/local-preset-compare-20261029/logs/rr-f-vkhip-trial0"
+    }
+   }
+  },
+  "sr-M-4k": {
+   "preset": "M",
+   "geometry": "1920x1080->3840x2160",
+   "family": "sr",
+   "nvidia_ms": 2.553312,
+   "local_fastest_ms": 2.86468,
+   "local_over_nvidia": 1.1219,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      2.92388,
+      2.96094,
+      2.92782
+     ],
+     "median_of_trial_medians_ms": 2.92782,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 66.7,
+      "input": 201.8,
+      "network": 1742.2,
+      "expansion": 156.1,
+      "reconstruction": 581.4,
+      "downsample": 182.2
+     },
+     "gpu_clock_mhz_median": 1798.0,
+     "gpu_busy_percent_median": 20.5,
+     "ppt_w_median": 57.5,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-m-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      2.86468,
+      2.87186,
+      2.86322
+     ],
+     "median_of_trial_medians_ms": 2.86468,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 66.8,
+      "input": 206.0,
+      "network": 1663.9,
+      "expansion": 157.3,
+      "reconstruction": 589.9,
+      "downsample": 182.4
+     },
+     "gpu_clock_mhz_median": 2014.0,
+     "gpu_busy_percent_median": 25.0,
+     "ppt_w_median": 85.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "vkhip native layers"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-m-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    },
+    "hip": {
+     "trial_medians_ms": [
+      3.025075,
+      3.01738,
+      3.020505
+     ],
+     "median_of_trial_medians_ms": 3.020505,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 67.0,
+      "input": 202.4,
+      "network": 1759.9,
+      "expansion": 155.6,
+      "reconstruction": 574.9,
+      "downsample": 182.9
+     },
+     "gpu_clock_mhz_median": 2741.0,
+     "gpu_busy_percent_median": 15,
+     "ppt_w_median": 58.0,
+     "setting": "native HIP layers through the HIP runtime, engine stages split around them",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-m-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    }
+   }
+  },
+  "sr-L-4k": {
+   "preset": "L",
+   "geometry": "1920x1080->3840x2160",
+   "family": "sr",
+   "nvidia_ms": 3.160704,
+   "local_fastest_ms": 4.52896,
+   "local_over_nvidia": 1.4329,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      4.56016,
+      4.56142,
+      4.5566
+     ],
+     "median_of_trial_medians_ms": 4.56016,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 67.4,
+      "input": 946.8,
+      "network": 1797.3,
+      "expansion": 828.8,
+      "reconstruction": 739.8,
+      "downsample": 181.3
+     },
+     "gpu_clock_mhz_median": 1804.0,
+     "gpu_busy_percent_median": 16,
+     "ppt_w_median": 55.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-l-vulkan-trial0 37 -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      4.51128,
+      4.53896,
+      4.52896
+     ],
+     "median_of_trial_medians_ms": 4.52896,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 67.4,
+      "input": 977.1,
+      "network": 1685.6,
+      "expansion": 867.6,
+      "reconstruction": 748.3,
+      "downsample": 181.4
+     },
+     "gpu_clock_mhz_median": 2067.5,
+     "gpu_busy_percent_median": 39.0,
+     "ppt_w_median": 114.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "vkhip native layers"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-l-vkhip-trial0 37 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    },
+    "hip": {
+     "trial_medians_ms": [
+      4.658825,
+      4.63951,
+      4.66141
+     ],
+     "median_of_trial_medians_ms": 4.658825,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "exposure": 67.7,
+      "input": 961.3,
+      "network": 1784.7,
+      "expansion": 846.2,
+      "reconstruction": 732.0,
+      "downsample": 181.7
+     },
+     "gpu_clock_mhz_median": 2710.0,
+     "gpu_busy_percent_median": 24.5,
+     "ppt_w_median": 84.5,
+     "setting": "native HIP layers through the HIP runtime, engine stages split around them",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/sr-l-hip-trial0 37 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+    }
+   }
+  },
+  "rr-A-4k": {
+   "preset": "A",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 2.97936,
+   "local_fastest_ms": 4.61858,
+   "local_over_nvidia": 1.5502,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      18.98325,
+      18.9901,
+      18.99145
+     ],
+     "median_of_trial_medians_ms": 18.9901,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.0
+     },
+     "gpu_clock_mhz_median": 3163.0,
+     "gpu_busy_percent_median": 100.0,
+     "ppt_w_median": 249.5,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-a-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      4.61288,
+      4.61858,
+      4.62638
+     ],
+     "median_of_trial_medians_ms": 4.61858,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.2
+     },
+     "gpu_clock_mhz_median": 2448.0,
+     "gpu_busy_percent_median": 93.5,
+     "ppt_w_median": 250.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-a <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-a-vkhip-trial0"
+    }
+   }
+  },
+  "rr-B-4k": {
+   "preset": "B",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 2.983008,
+   "local_fastest_ms": 4.62458,
+   "local_over_nvidia": 1.5503,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      18.98205,
+      18.99825,
+      19.00775
+     ],
+     "median_of_trial_medians_ms": 18.99825,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.0
+     },
+     "gpu_clock_mhz_median": 3161.0,
+     "gpu_busy_percent_median": 100.0,
+     "ppt_w_median": 249.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-b-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      4.62526,
+      4.6219,
+      4.62458
+     ],
+     "median_of_trial_medians_ms": 4.62458,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.2
+     },
+     "gpu_clock_mhz_median": 2449.5,
+     "gpu_busy_percent_median": 93.5,
+     "ppt_w_median": 249.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-b <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-b-vkhip-trial0"
+    }
+   }
+  },
+  "rr-C-4k": {
+   "preset": "C",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 2.987552,
+   "local_fastest_ms": 4.62718,
+   "local_over_nvidia": 1.5488,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      18.99965,
+      18.9918,
+      19.00135
+     ],
+     "median_of_trial_medians_ms": 18.99965,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.0
+     },
+     "gpu_clock_mhz_median": 3159.0,
+     "gpu_busy_percent_median": 100.0,
+     "ppt_w_median": 248.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-c-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      4.63132,
+      4.62718,
+      4.62264
+     ],
+     "median_of_trial_medians_ms": 4.62718,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.2
+     },
+     "gpu_clock_mhz_median": 2442.5,
+     "gpu_busy_percent_median": 93.5,
+     "ppt_w_median": 250.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "11 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models-cnn/rr-c <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-c-vkhip-trial0"
+    }
+   }
+  },
+  "rr-D-4k": {
+   "preset": "D",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 4.054944,
+   "local_fastest_ms": 8.07134,
+   "local_over_nvidia": 1.9905,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      8.5984,
+      8.60572,
+      8.60784
+     ],
+     "median_of_trial_medians_ms": 8.60572,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.0
+     },
+     "gpu_clock_mhz_median": 2519.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-d-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      8.06884,
+      8.07796,
+      8.07134
+     ],
+     "median_of_trial_medians_ms": 8.07134,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.0
+     },
+     "gpu_clock_mhz_median": 2453.0,
+     "gpu_busy_percent_median": 99.0,
+     "ppt_w_median": 249.5,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "10 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-d <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-d-vkhip-trial0"
+    }
+   }
+  },
+  "rr-E-4k": {
+   "preset": "E",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 4.057024,
+   "local_fastest_ms": 8.02898,
+   "local_over_nvidia": 1.979,
+   "fastest_route": "vkhip",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      8.56338,
+      8.56494,
+      8.56894
+     ],
+     "median_of_trial_medians_ms": 8.56494,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.8
+     },
+     "gpu_clock_mhz_median": 2511.0,
+     "gpu_busy_percent_median": 99,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-e-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      8.02898,
+      8.03464,
+      8.0281
+     ],
+     "median_of_trial_medians_ms": 8.02898,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 0.8
+     },
+     "gpu_clock_mhz_median": 2448.5,
+     "gpu_busy_percent_median": 99.0,
+     "ppt_w_median": 249.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "10 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-e <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-e-vkhip-trial0"
+    }
+   }
+  },
+  "rr-F-4k": {
+   "preset": "F",
+   "geometry": "1920x1080->3840x2160",
+   "family": "rr",
+   "nvidia_ms": 4.657856,
+   "local_fastest_ms": 7.71968,
+   "local_over_nvidia": 1.6573,
+   "fastest_route": "vulkan",
+   "routes": {
+    "vulkan": {
+     "trial_medians_ms": [
+      7.71968,
+      7.74172,
+      7.71794
+     ],
+     "median_of_trial_medians_ms": 7.71968,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.5
+     },
+     "gpu_clock_mhz_median": 2301.0,
+     "gpu_busy_percent_median": 99.5,
+     "ppt_w_median": 250.0,
+     "setting": "engine Vulkan network and stages",
+     "note": [],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-f-vulkan-trial0"
+    },
+    "vkhip": {
+     "trial_medians_ms": [
+      7.82942,
+      7.83572,
+      7.8514
+     ],
+     "median_of_trial_medians_ms": 7.83572,
+     "measured_frames": 100,
+     "stages_median_us": {
+      "output": 1.5
+     },
+     "gpu_clock_mhz_median": 2318.0,
+     "gpu_busy_percent_median": 99.0,
+     "ppt_w_median": 249.0,
+     "setting": "native HIP code objects as Vulkan pipelines in the engine command list (D4R_ENGINE_VKHIP)",
+     "note": [
+      "14 vkhip stages"
+     ],
+     "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-rr <repo>/build/local-preset-compare-20261029/models/rr-f <repo>/build/local-preset-compare-20261029/inputs/rr-4k <repo>/build/local-preset-compare-20261029/logs/rr-f-vkhip-trial0"
+    }
+   }
+  }
+ },
+ "cost_ratios": {
+  "sr_L_over_M": {
+   "local_1440p": 1.5878,
+   "local_4k": 1.581,
+   "nvidia_1440p": 1.3067,
+   "nvidia_4k": 1.2379
+  },
+  "rr_over_a": {
+   "1440p": {
+    "B": 1.0005,
+    "C": 1.0016,
+    "D": 1.7831,
+    "E": 1.7796,
+    "F": 1.7424
+   },
+   "4k": {
+    "B": 1.0013,
+    "C": 1.0019,
+    "D": 1.7476,
+    "E": 1.7384,
+    "F": 1.6714
+   }
+  },
+  "rr_nvidia_over_a": {
+   "1440p": {
+    "B": 0.996,
+    "C": 0.9998,
+    "D": 1.3693,
+    "E": 1.3717,
+    "F": 1.546
+   },
+   "4k": {
+    "B": 1.0012,
+    "C": 1.0027,
+    "D": 1.361,
+    "E": 1.3617,
+    "F": 1.5634
+   }
+  }
+ },
+ "stage_profiles": {
+  "stages_us_median": {
+   "sr-M-1440p-vulkan": {
+    "exposure": 16.2,
+    "input": 90.5,
+    "network": 821.5,
+    "expansion": 66.9,
+    "reconstruction": 245.1,
+    "downsample": 72.2
+   },
+   "sr-M-1440p-vkhip": {
+    "exposure": 16.7,
+    "input": 94.0,
+    "network": 761.5,
+    "expansion": 68.6,
+    "reconstruction": 251.2,
+    "downsample": 72.6
+   },
+   "sr-M-1440p-hip": {
+    "exposure": 16.6,
+    "input": 92.0,
+    "network": 943.4,
+    "expansion": 68.8,
+    "reconstruction": 245.8,
+    "downsample": 73.0
+   },
+   "sr-L-1440p-vulkan": {
+    "exposure": 17.5,
+    "input": 430.4,
+    "network": 841.5,
+    "expansion": 360.4,
+    "reconstruction": 320.6,
+    "downsample": 73.8
+   },
+   "sr-L-1440p-vkhip": {
+    "exposure": 17.6,
+    "input": 446.3,
+    "network": 767.5,
+    "expansion": 374.5,
+    "reconstruction": 323.8,
+    "downsample": 73.4
+   },
+   "sr-L-1440p-hip": {
+    "exposure": 17.9,
+    "input": 435.6,
+    "network": 949.2,
+    "expansion": 370.4,
+    "reconstruction": 318.8,
+    "downsample": 73.6
+   },
+   "rr-A-1440p-vulkan": {
+    "output": 0.5
+   },
+   "rr-A-1440p-vkhip": {
+    "output": 0.5
+   },
+   "rr-D-1440p-vulkan": {
+    "output": 0.5
+   },
+   "rr-D-1440p-vkhip": {
+    "output": 0.5
+   },
+   "rr-E-1440p-vulkan": {
+    "output": 0.4
+   },
+   "rr-E-1440p-vkhip": {
+    "output": 0.4
+   },
+   "rr-F-1440p-vulkan": {
+    "output": 0.7
+   },
+   "rr-F-1440p-vkhip": {
+    "output": 0.6
+   },
+   "sr-M-4k-vulkan": {
+    "exposure": 66.7,
+    "input": 201.8,
+    "network": 1742.2,
+    "expansion": 156.1,
+    "reconstruction": 581.4,
+    "downsample": 182.2
+   },
+   "sr-M-4k-vkhip": {
+    "exposure": 66.8,
+    "input": 206.0,
+    "network": 1663.9,
+    "expansion": 157.3,
+    "reconstruction": 589.9,
+    "downsample": 182.4
+   },
+   "sr-M-4k-hip": {
+    "exposure": 67.0,
+    "input": 202.4,
+    "network": 1759.9,
+    "expansion": 155.6,
+    "reconstruction": 574.9,
+    "downsample": 182.9
+   },
+   "sr-L-4k-vulkan": {
+    "exposure": 67.4,
+    "input": 946.8,
+    "network": 1797.3,
+    "expansion": 828.8,
+    "reconstruction": 739.8,
+    "downsample": 181.3
+   },
+   "sr-L-4k-vkhip": {
+    "exposure": 67.4,
+    "input": 977.1,
+    "network": 1685.6,
+    "expansion": 867.6,
+    "reconstruction": 748.3,
+    "downsample": 181.4
+   },
+   "sr-L-4k-hip": {
+    "exposure": 67.7,
+    "input": 961.3,
+    "network": 1784.7,
+    "expansion": 846.2,
+    "reconstruction": 732.0,
+    "downsample": 181.7
+   },
+   "rr-A-4k-vulkan": {
+    "output": 1.0
+   },
+   "rr-A-4k-vkhip": {
+    "output": 1.2
+   },
+   "rr-D-4k-vulkan": {
+    "output": 1.0
+   },
+   "rr-D-4k-vkhip": {
+    "output": 1.0
+   },
+   "rr-E-4k-vulkan": {
+    "output": 0.8
+   },
+   "rr-E-4k-vkhip": {
+    "output": 0.8
+   },
+   "rr-F-4k-vulkan": {
+    "output": 1.5
+   },
+   "rr-F-4k-vkhip": {
+    "output": 1.5
+   }
+  },
+  "rr_network_stages_us": [
+   {
+    "preset": "a",
+    "backend": "vulkan",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 9.1717,
+    "network_sum_us_from_stamps": 8501.0,
+    "stages_us": {
+     "Enc0": 657.0,
+     "Enc1": 709.0,
+     "Enc2": 627.0,
+     "Enc3": 617.0,
+     "Enc4": 245.0,
+     "Dec4": 404.0,
+     "Dec3": 314.0,
+     "Dec2": 587.0,
+     "Dec1": 1129.0,
+     "Dec0": 979.0,
+     "PDL": 2233.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "a",
+    "backend": "vkhip",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 2.046,
+    "network_sum_us_from_stamps": 1299.0,
+    "stages_us": {
+     "Enc0": 247.0,
+     "Enc1": 147.0,
+     "Enc2": 92.0,
+     "Enc3": 44.0,
+     "Enc4": 21.0,
+     "Dec4": 18.0,
+     "Dec3": 22.0,
+     "Dec2": 47.0,
+     "Dec1": 95.0,
+     "Dec0": 151.0,
+     "PDL": 415.0
+    },
+    "vkhip_stages": "11",
+    "entries": 8
+   },
+   {
+    "preset": "d",
+    "backend": "vulkan",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.9304,
+    "network_sum_us_from_stamps": 3419.0,
+    "stages_us": {
+     "enc0": 1049.0,
+     "enc1": 312.0,
+     "enc2": 180.0,
+     "enc3": 79.0,
+     "enc4": 58.0,
+     "enc5": 41.0,
+     "dec4": 120.0,
+     "dec3": 140.0,
+     "dec2": 216.0,
+     "dec1": 370.0,
+     "dec0": 854.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "d",
+    "backend": "vkhip",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.6362,
+    "network_sum_us_from_stamps": 3122.0,
+    "stages_us": {
+     "enc0": 1076.0,
+     "enc1": 297.0,
+     "enc2": 164.0,
+     "enc3": 62.0,
+     "enc4": 47.0,
+     "enc5": 22.0,
+     "dec4": 52.0,
+     "dec3": 80.0,
+     "dec2": 189.0,
+     "dec1": 356.0,
+     "dec0": 777.0
+    },
+    "vkhip_stages": "10",
+    "entries": 8
+   },
+   {
+    "preset": "e",
+    "backend": "vulkan",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.9472,
+    "network_sum_us_from_stamps": 3516.0,
+    "stages_us": {
+     "enc0": 1137.0,
+     "enc1": 310.0,
+     "enc2": 182.0,
+     "enc3": 79.0,
+     "enc4": 58.0,
+     "enc5": 41.0,
+     "dec4": 120.0,
+     "dec3": 141.0,
+     "dec2": 219.0,
+     "dec1": 372.0,
+     "dec0": 857.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "e",
+    "backend": "vkhip",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.6398,
+    "network_sum_us_from_stamps": 3219.0,
+    "stages_us": {
+     "enc0": 1162.0,
+     "enc1": 299.0,
+     "enc2": 165.0,
+     "enc3": 63.0,
+     "enc4": 46.0,
+     "enc5": 22.0,
+     "dec4": 53.0,
+     "dec3": 79.0,
+     "dec2": 191.0,
+     "dec1": 358.0,
+     "dec0": 781.0
+    },
+    "vkhip_stages": "10",
+    "entries": 8
+   },
+   {
+    "preset": "f",
+    "backend": "vulkan",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.5486,
+    "network_sum_us_from_stamps": 2863.0,
+    "stages_us": {
+     "enc0": 667.0,
+     "enc1": 252.0,
+     "enc2": 128.0,
+     "enc3": 61.0,
+     "enc4": 47.0,
+     "enc5": 25.0,
+     "dec4_0": 46.0,
+     "dec4_1": 41.0,
+     "dec3_0": 60.0,
+     "dec3_1": 54.0,
+     "dec2_0": 126.0,
+     "dec2_1": 110.0,
+     "dec1_0": 220.0,
+     "dec1_1": 197.0,
+     "dec0_0": 384.0,
+     "dec0_1": 445.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "f",
+    "backend": "vkhip",
+    "geometry": "1440p",
+    "whole_ms_median_of_entries": 3.5776,
+    "network_sum_us_from_stamps": 2902.0,
+    "stages_us": {
+     "enc0": 661.0,
+     "enc1": 262.0,
+     "enc2": 133.0,
+     "enc3": 62.0,
+     "enc4": 45.0,
+     "enc5": 30.0,
+     "dec4_0": 54.0,
+     "dec4_1": 40.0,
+     "dec3_0": 59.0,
+     "dec3_1": 53.0,
+     "dec2_0": 123.0,
+     "dec2_1": 109.0,
+     "dec1_0": 225.0,
+     "dec1_1": 195.0,
+     "dec0_0": 411.0,
+     "dec0_1": 440.0
+    },
+    "vkhip_stages": "14",
+    "entries": 8
+   },
+   {
+    "preset": "a",
+    "backend": "vulkan",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 18.8144,
+    "network_sum_us_from_stamps": 17230.0,
+    "stages_us": {
+     "Enc0": 1425.0,
+     "Enc1": 1526.0,
+     "Enc2": 1242.0,
+     "Enc3": 1113.0,
+     "Enc4": 471.0,
+     "Dec4": 410.0,
+     "Dec3": 708.0,
+     "Dec2": 1110.0,
+     "Dec1": 2236.0,
+     "Dec0": 2104.0,
+     "PDL": 4885.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "a",
+    "backend": "vkhip",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 4.5247,
+    "network_sum_us_from_stamps": 2769.0,
+    "stages_us": {
+     "Enc0": 533.0,
+     "Enc1": 315.0,
+     "Enc2": 188.0,
+     "Enc3": 84.0,
+     "Enc4": 44.0,
+     "Dec4": 24.0,
+     "Dec3": 48.0,
+     "Dec2": 89.0,
+     "Dec1": 199.0,
+     "Dec0": 327.0,
+     "PDL": 918.0
+    },
+    "vkhip_stages": "11",
+    "entries": 8
+   },
+   {
+    "preset": "d",
+    "backend": "vulkan",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 8.5669,
+    "network_sum_us_from_stamps": 7365.0,
+    "stages_us": {
+     "enc0": 2332.0,
+     "enc1": 685.0,
+     "enc2": 382.0,
+     "enc3": 165.0,
+     "enc4": 98.0,
+     "enc5": 42.0,
+     "dec4": 170.0,
+     "dec3": 300.0,
+     "dec2": 459.0,
+     "dec1": 816.0,
+     "dec0": 1916.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "d",
+    "backend": "vkhip",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 8.0659,
+    "network_sum_us_from_stamps": 6846.0,
+    "stages_us": {
+     "enc0": 2393.0,
+     "enc1": 658.0,
+     "enc2": 353.0,
+     "enc3": 133.0,
+     "enc4": 74.0,
+     "enc5": 37.0,
+     "dec4": 81.0,
+     "dec3": 172.0,
+     "dec2": 410.0,
+     "dec1": 796.0,
+     "dec0": 1739.0
+    },
+    "vkhip_stages": "10",
+    "entries": 8
+   },
+   {
+    "preset": "e",
+    "backend": "vulkan",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 8.6099,
+    "network_sum_us_from_stamps": 7585.0,
+    "stages_us": {
+     "enc0": 2531.0,
+     "enc1": 679.0,
+     "enc2": 387.0,
+     "enc3": 166.0,
+     "enc4": 97.0,
+     "enc5": 42.0,
+     "dec4": 172.0,
+     "dec3": 303.0,
+     "dec2": 468.0,
+     "dec1": 819.0,
+     "dec0": 1921.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "e",
+    "backend": "vkhip",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 8.0498,
+    "network_sum_us_from_stamps": 7034.0,
+    "stages_us": {
+     "enc0": 2579.0,
+     "enc1": 659.0,
+     "enc2": 353.0,
+     "enc3": 134.0,
+     "enc4": 73.0,
+     "enc5": 37.0,
+     "dec4": 81.0,
+     "dec3": 170.0,
+     "dec2": 411.0,
+     "dec1": 797.0,
+     "dec0": 1740.0
+    },
+    "vkhip_stages": "10",
+    "entries": 8
+   },
+   {
+    "preset": "f",
+    "backend": "vulkan",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 7.9102,
+    "network_sum_us_from_stamps": 6362.0,
+    "stages_us": {
+     "enc0": 1567.0,
+     "enc1": 564.0,
+     "enc2": 277.0,
+     "enc3": 126.0,
+     "enc4": 68.0,
+     "enc5": 35.0,
+     "dec4_0": 77.0,
+     "dec4_1": 60.0,
+     "dec3_0": 128.0,
+     "dec3_1": 110.0,
+     "dec2_0": 280.0,
+     "dec2_1": 246.0,
+     "dec1_0": 499.0,
+     "dec1_1": 442.0,
+     "dec0_0": 871.0,
+     "dec0_1": 1012.0
+    },
+    "vkhip_stages": null,
+    "entries": 8
+   },
+   {
+    "preset": "f",
+    "backend": "vkhip",
+    "geometry": "4k",
+    "whole_ms_median_of_entries": 7.9078,
+    "network_sum_us_from_stamps": 6391.0,
+    "stages_us": {
+     "enc0": 1545.0,
+     "enc1": 582.0,
+     "enc2": 286.0,
+     "enc3": 125.0,
+     "enc4": 65.0,
+     "enc5": 31.0,
+     "dec4_0": 88.0,
+     "dec4_1": 58.0,
+     "dec3_0": 132.0,
+     "dec3_1": 113.0,
+     "dec2_0": 271.0,
+     "dec2_1": 238.0,
+     "dec1_0": 505.0,
+     "dec1_1": 435.0,
+     "dec0_0": 924.0,
+     "dec0_1": 993.0
+    },
+    "vkhip_stages": "14",
+    "entries": 8
+   }
+  ]
+ },
+ "verification": {
+  "sr": [
+   {
+    "preset": "m",
+    "geometry": "1440p",
+    "backend": "vulkan",
+    "model_preset": "M",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "c2b00f97147bca8baba58e13090477f0aefe79a87be4462ce6398b14e7f51dd0"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-1440p-vulkan 0 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "m",
+    "geometry": "1440p",
+    "backend": "vkhip",
+    "model_preset": "M",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "66ad967b5012de44b251c8004a9f4c5367736142ca9dbf3e66c4b091d2fe73d6"
+    },
+    "vkhip_layer_stamps": [
+     "D4R_VKHIP_STAMPS frame=0 total=1.5457 b.enc1=0.5541 g.enc1=0.0028 b.enc2=0.7102 g.enc2=-0.5536 b.tube0=0.7709 g.tube0=-0.7098 b.tube1=0.8151 g.tube1=-0.7705 b.tube2=0.8670 g.tube2=-0.8148 b.tube3=0.9149 g.tube3=-0.8666 b.tube4=0.9664 g.tube4=-0.9146 b.tube5=1.0154 g.tube5=-0.9660 b.dec2=1.1824 g.dec2=-1.0150 b.dec1=1.5198 g.dec1=-1.1820 tail=0.0199 busy=9.3160 gaps=-7.7902",
+     "D4R_VKHIP_STAMPS frame=1 total=2.1492 b.enc1=0.4691 g.enc1=0.0064 b.enc2=0.7008 g.enc2=-0.4684 b.tube0=0.7951 g.tube0=-0.7002 b.tube1=0.8621 g.tube1=-0.7946 b.tube2=0.9261 g.tube2=-0.8617 b.tube3=0.9951 g.tube3=-0.9257 b.tube4=1.0679 g.tube4=-0.9947 b.tube5=1.1401 g.tube5=-1.0675 b.dec2=1.3831 g.dec2=-1.1397 b.dec1=2.1281 g.dec1=-1.3826 tail=0.0104 busy=10.4674 gaps=-8.3286",
+     "D4R_VKHIP_STAMPS frame=2 total=2.4515 b.enc1=0.6720 g.enc1=0.0062 b.enc2=1.0078 g.enc2=-0.6712 b.tube0=1.1238 g.tube0=-1.0072 b.tube1=1.2400 g.tube1=-1.1233 b.tube2=1.3620 g.tube2=-1.2396 b.tube3=1.6311 g.tube3=-1.3616 b.tube4=1.8117 g.tube4=-1.6307 b.tube5=1.9117 g.tube5=-1.8113 b.dec2=2.1672 g.dec2=-1.9112 b.dec1=2.4362 g.dec1=-2.1666 tail=0.0047 busy=15.3634 gaps=-12.9166"
+    ],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-1440p-vkhip 0 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "m",
+    "geometry": "1440p",
+    "backend": "hip",
+    "model_preset": "M",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "66ad967b5012de44b251c8004a9f4c5367736142ca9dbf3e66c4b091d2fe73d6"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-1440p-hip 0 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "m",
+    "geometry": "4k",
+    "backend": "vulkan",
+    "model_preset": "M",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "fd9df2a7e31fb929ff7821baa905dbd8b94e38c3093d3ca93b5e701c7f0c2d99"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-4k-vulkan 0 -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "m",
+    "geometry": "4k",
+    "backend": "vkhip",
+    "model_preset": "M",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "2d6fea1322d39a8d0aa335b0f8f147fe873b9fdc86c660d9f57acbee9e85cdbb"
+    },
+    "vkhip_layer_stamps": [
+     "D4R_VKHIP_STAMPS frame=0 total=3.3408 b.enc1=1.1319 g.enc1=0.0037 b.enc2=1.4667 g.enc2=-1.1314 b.tube0=1.5872 g.tube0=-1.4663 b.tube1=1.6930 g.tube1=-1.5868 b.tube2=1.8074 g.tube2=-1.6926 b.tube3=1.9135 g.tube3=-1.8072 b.tube4=2.0322 g.tube4=-1.9132 b.tube5=2.1365 g.tube5=-2.0319 b.dec2=2.4504 g.dec2=-2.1362 b.dec1=3.3245 g.dec1=-2.4492 tail=0.0088 busy=19.5433 gaps=-16.2113",
+     "D4R_VKHIP_STAMPS frame=1 total=5.5287 b.enc1=1.7022 g.enc1=0.0084 b.enc2=2.3824 g.enc2=-1.7016 b.tube0=2.8332 g.tube0=-2.3819 b.tube1=3.0354 g.tube1=-2.8327 b.tube2=3.2627 g.tube2=-3.0351 b.tube3=3.4890 g.tube3=-3.2623 b.tube4=3.7153 g.tube4=-3.4886 b.tube5=3.9172 g.tube5=-3.7149 b.dec2=4.5637 g.dec2=-3.9168 b.dec1=5.5116 g.dec1=-4.5632 tail=0.0046 busy=34.4128 gaps=-28.8887",
+     "D4R_VKHIP_STAMPS frame=2 total=4.3761 b.enc1=1.3480 g.enc1=0.0085 b.enc2=1.8231 g.enc2=-1.3472 b.tube0=1.9914 g.tube0=-1.8226 b.tube1=2.1401 g.tube1=-1.9908 b.tube2=2.5259 g.tube2=-2.1397 b.tube3=2.6780 g.tube3=-2.5255 b.tube4=2.8455 g.tube4=-2.6776 b.tube5=2.9938 g.tube5=-2.8451 b.dec2=3.4462 g.dec2=-2.9934 b.dec1=4.3580 g.dec1=-3.4457 tail=0.0051 busy=26.1501 gaps=-21.7791"
+    ],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-4k-vkhip 0 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "m",
+    "geometry": "4k",
+    "backend": "hip",
+    "model_preset": "M",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "2d6fea1322d39a8d0aa335b0f8f147fe873b9fdc86c660d9f57acbee9e85cdbb"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-m 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-m-4k-hip 0 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "1440p",
+    "backend": "vulkan",
+    "model_preset": "L",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "08dd5aa65a74f18b7a954a14a72b899966234ee6910b38f50c8d994364355b4a"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-1440p-vulkan 0 -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "1440p",
+    "backend": "vkhip",
+    "model_preset": "L",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "83db3bcef2d595cdc82d50d9a3d35d7dffe71c3575cbbc5e45459f0c491084e1"
+    },
+    "vkhip_layer_stamps": [
+     "D4R_VKHIP_STAMPS frame=0 total=2.0714 b.enc1=0.6028 g.enc1=0.0028 b.enc2=0.8192 g.enc2=-0.6024 b.tube0=0.8891 g.tube0=-0.8187 b.tube1=0.9573 g.tube1=-0.8887 b.tube2=1.0266 g.tube2=-0.9570 b.tube3=1.0949 g.tube3=-1.0263 b.tube4=1.1658 g.tube4=-1.0946 b.tube5=1.2312 g.tube5=-1.1654 b.dec2=1.3886 g.dec2=-1.2308 b.dec1=2.0560 g.dec1=-1.3882 tail=0.0093 busy=11.2315 gaps=-9.1693",
+     "D4R_VKHIP_STAMPS frame=1 total=2.8789 b.enc1=0.9807 g.enc1=0.0063 b.enc2=1.3060 g.enc2=-0.9800 b.tube0=1.4067 g.tube0=-1.3054 b.tube1=1.5316 g.tube1=-1.4062 b.tube2=1.6532 g.tube2=-1.5312 b.tube3=1.7556 g.tube3=-1.6529 b.tube4=1.8791 g.tube4=-1.7552 b.tube5=2.0042 g.tube5=-1.8787 b.dec2=2.2865 g.dec2=-2.0038 b.dec1=2.8573 g.dec1=-2.2860 tail=0.0112 busy=17.6608 gaps=-14.7932",
+     "D4R_VKHIP_STAMPS frame=2 total=2.1257 b.enc1=0.5009 g.enc1=0.0063 b.enc2=0.7336 g.enc2=-0.5002 b.tube0=0.8342 g.tube0=-0.7331 b.tube1=0.8938 g.tube1=-0.8337 b.tube2=0.9601 g.tube2=-0.8934 b.tube3=1.0282 g.tube3=-0.9596 b.tube4=1.1019 g.tube4=-1.0279 b.tube5=1.1745 g.tube5=-1.1015 b.dec2=1.7019 g.dec2=-1.1741 b.dec1=2.1065 g.dec1=-1.7014 tail=0.0086 busy=11.0356 gaps=-8.9185"
+    ],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-1440p-vkhip 0 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "1440p",
+    "backend": "hip",
+    "model_preset": "L",
+    "output": {
+     "pixels": 3686400,
+     "nonzero_rgb_pixels": 3686400,
+     "nonfinite_components": 0,
+     "sha256": "83db3bcef2d595cdc82d50d9a3d35d7dffe71c3575cbbc5e45459f0c491084e1"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1280 720 2560 1440 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-1440p-hip 0 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-1440p/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "4k",
+    "backend": "vulkan",
+    "model_preset": "L",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "6c40087e85ef5bf7e0a663daf83b62d1656b11c44e626ead17108bbe766f6035"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-4k-vulkan 0 -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "4k",
+    "backend": "vkhip",
+    "model_preset": "L",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "fb3a499c8d369b3d535df76f7487c2cd814e781732128e49fc82fedd912dfd16"
+    },
+    "vkhip_layer_stamps": [
+     "D4R_VKHIP_STAMPS frame=0 total=4.2896 b.enc1=1.6210 g.enc1=0.0045 b.enc2=2.3053 g.enc2=-1.6203 b.tube0=2.5591 g.tube0=-2.3048 b.tube1=2.7775 g.tube1=-2.5586 b.tube2=3.0078 g.tube2=-2.7771 b.tube3=3.0974 g.tube3=-3.0074 b.tube4=3.2152 g.tube4=-3.0970 b.tube5=3.3209 g.tube5=-3.2148 b.dec2=3.6402 g.dec2=-3.3205 b.dec1=4.2762 g.dec1=-3.6397 tail=0.0046 busy=29.8206 gaps=-25.5356",
+     "D4R_VKHIP_STAMPS frame=1 total=3.6736 b.enc1=0.9388 g.enc1=0.0056 b.enc2=1.6248 g.enc2=-0.9381 b.tube0=1.7856 g.tube0=-1.6243 b.tube1=1.9424 g.tube1=-1.7852 b.tube2=2.1002 g.tube2=-1.9420 b.tube3=2.2556 g.tube3=-2.0999 b.tube4=2.4144 g.tube4=-2.2552 b.tube5=2.5655 g.tube5=-2.4140 b.dec2=3.0098 g.dec2=-2.5651 b.dec1=3.6593 g.dec1=-3.0093 tail=0.0046 busy=22.2964 gaps=-18.6274",
+     "D4R_VKHIP_STAMPS frame=2 total=3.7379 b.enc1=1.5601 g.enc1=0.0104 b.enc2=1.8919 g.enc2=-1.5593 b.tube0=2.0092 g.tube0=-1.8912 b.tube1=2.1125 g.tube1=-2.0086 b.tube2=2.2234 g.tube2=-2.1120 b.tube3=2.3278 g.tube3=-2.2229 b.tube4=2.4426 g.tube4=-2.3272 b.tube5=2.5431 g.tube5=-2.4421 b.dec2=3.0932 g.dec2=-2.5426 b.dec1=3.7127 g.dec1=-3.0926 tail=0.0095 busy=23.9165 gaps=-20.1881"
+    ],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-4k-vkhip 0 vkhip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   },
+   {
+    "preset": "l",
+    "geometry": "4k",
+    "backend": "hip",
+    "model_preset": "L",
+    "output": {
+     "pixels": 8294400,
+     "nonzero_rgb_pixels": 8294400,
+     "nonfinite_components": 0,
+     "sha256": "fb3a499c8d369b3d535df76f7487c2cd814e781732128e49fc82fedd912dfd16"
+    },
+    "vkhip_layer_stamps": [],
+    "command": "/tmp/d4r-preset-compare-20261029/engine/d4r-m <repo>/build/local-preset-compare-20261029/models/sr-l 1920 1080 3840 2160 <repo>/build/local-preset-compare-20261029/logs/verify/sr-l-4k-hip 0 hip -- <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/0-depth.bin -0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/1-depth.bin 0.25 -0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/2-depth.bin 0.25 0.25 <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-color.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-motion.bin <repo>/build/local-preset-compare-20261029/inputs/sr-4k/3-depth.bin -0.25 0.25"
+   }
+  ],
+  "rr": [
+   {
+    "preset": "a",
+    "backend": "vulkan",
+    "model": "models-cnn/rr-a",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 1",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "762fc4f065a13b4c394e179f708cd4b296a780656b8d4e596c9f060e05f9231b"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "ce0b49aac68d14a4f0e91975c75714174b832bac2b11319bd94730c02529491a"
+     }
+    }
+   },
+   {
+    "preset": "a",
+    "backend": "vkhip",
+    "model": "models-cnn/rr-a",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 1",
+    "vkhip_stages": "11",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "4d3183f7ba8a9879ff9a83d5169d9cc0a1d5e285b38aef95d62f8540c4973b81"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "e7514949b3affe603b6e214ae56575b180e7e5584e49bb778cf7606b6da37ddd"
+     }
+    }
+   },
+   {
+    "preset": "b",
+    "backend": "vulkan",
+    "model": "models-cnn/rr-b",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 2",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "601da5e420dd1aa77d07cbc55bd62733a346f2265a6413d523666a556cdbe15b"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "52b33cf06888bfdd0c2784a45af240d84f61922b4494541919cf2bb026ddd38e"
+     }
+    }
+   },
+   {
+    "preset": "b",
+    "backend": "vkhip",
+    "model": "models-cnn/rr-b",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 2",
+    "vkhip_stages": "11",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "5f3c55a1f04b459719aa954c4b3ca3993b036ea6898a4453c57f7cef2c44ecb8"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "a3ec70cd461bc7dc82916301fe6649d140bbd75ee226868ad02de914511a29cd"
+     }
+    }
+   },
+   {
+    "preset": "c",
+    "backend": "vulkan",
+    "model": "models-cnn/rr-c",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 3",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "601da5e420dd1aa77d07cbc55bd62733a346f2265a6413d523666a556cdbe15b"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "52b33cf06888bfdd0c2784a45af240d84f61922b4494541919cf2bb026ddd38e"
+     }
+    }
+   },
+   {
+    "preset": "c",
+    "backend": "vkhip",
+    "model": "models-cnn/rr-c",
+    "manifest_format": "D4RR0003",
+    "declared_preset_line": "preset 3",
+    "vkhip_stages": "11",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "5f3c55a1f04b459719aa954c4b3ca3993b036ea6898a4453c57f7cef2c44ecb8"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "a3ec70cd461bc7dc82916301fe6649d140bbd75ee226868ad02de914511a29cd"
+     }
+    }
+   },
+   {
+    "preset": "d",
+    "backend": "vulkan",
+    "model": "models/rr-d",
+    "manifest_format": "D4RR0001",
+    "declared_preset_line": "preset 4",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "698e1d9be751ac6c1ff1556d306a958eaebd5dbc547aabf2d770e3a98773c21b"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "85122625e8f76db49fe141e4f88f794f77bd3dbbb29d7fa3cd1b5bca9ca48e07"
+     }
+    }
+   },
+   {
+    "preset": "d",
+    "backend": "vkhip",
+    "model": "models/rr-d",
+    "manifest_format": "D4RR0001",
+    "declared_preset_line": "preset 4",
+    "vkhip_stages": "10",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "96dfb8dcfe9171e798a5e2a57499c906356c8a4a6856fe8ad6cff17830ba71f7"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "b6a629b6839e4f043414876ae5c263f98c30f660976ae972130e320750284a00"
+     }
+    }
+   },
+   {
+    "preset": "e",
+    "backend": "vulkan",
+    "model": "models/rr-e",
+    "manifest_format": "D4RR0001",
+    "declared_preset_line": "preset 5",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "2296040673b62715a2da8c8049e3ca8184da1f88a088cf1f253922300b4e3286"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "de296ffd1f045f7a9bf0a22b15398ade55493d2564aa78402c31af89b12c41b5"
+     }
+    }
+   },
+   {
+    "preset": "e",
+    "backend": "vkhip",
+    "model": "models/rr-e",
+    "manifest_format": "D4RR0001",
+    "declared_preset_line": "preset 5",
+    "vkhip_stages": "10",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "a6036a754bbf532bacba2be482b6c77f1c120035ecc31b284e74b6bdf5607d1f"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "a8f4c8af3501ef4a81c55bf3fbdbe82d2d5ce552589ec8576e5ae159284f0943"
+     }
+    }
+   },
+   {
+    "preset": "f",
+    "backend": "vulkan",
+    "model": "models/rr-f",
+    "manifest_format": "D4RR0002",
+    "declared_preset_line": "preset 6",
+    "vkhip_stages": null,
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "770662bdd72d6965ac7e60e3bb1cbcddc433a03e64a05ef6d459054a07c608bf"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "536892fdddf3623f7edc9e9e242e28b1f2d744227a3d9895b1e0efbfbab422e7"
+     }
+    }
+   },
+   {
+    "preset": "f",
+    "backend": "vkhip",
+    "model": "models/rr-f",
+    "manifest_format": "D4RR0002",
+    "declared_preset_line": "preset 6",
+    "vkhip_stages": "14",
+    "outputs": {
+     "0-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "2be12fd5a4421127a479356e1acc03bf99cb3cd029f9862e7cd1d7879fef1394"
+     },
+     "1-out.bin": {
+      "pixels": 3686400,
+      "nonzero_rgb_pixels": 3686400,
+      "nonfinite_components": 0,
+      "sha256": "2a416f8fcba46904d457ce98426f810002125046f39f75de826b66b3d2c4ed17"
+     }
+    }
+   }
+  ],
+  "route_agreement": [
+   {
+    "family": "sr-m",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 2745363,
+     "pixels": 3686400,
+     "mean_abs_error": 0.0005794517928734422,
+     "max_abs_error": 0.044921875,
+     "psnr_db_vs_unit_range": 57.51,
+     "identical": false
+    }
+   },
+   {
+    "family": "sr-m",
+    "against": "vulkan",
+    "route": "hip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 2745363,
+     "pixels": 3686400,
+     "mean_abs_error": 0.0005794517928734422,
+     "max_abs_error": 0.044921875,
+     "psnr_db_vs_unit_range": 57.51,
+     "identical": false
+    }
+   },
+   {
+    "family": "sr-l",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 2891390,
+     "pixels": 3686400,
+     "mean_abs_error": 0.0006843464216217399,
+     "max_abs_error": 0.065185546875,
+     "psnr_db_vs_unit_range": 55.39,
+     "identical": false
+    }
+   },
+   {
+    "family": "sr-l",
+    "against": "vulkan",
+    "route": "hip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 2891390,
+     "pixels": 3686400,
+     "mean_abs_error": 0.0006843464216217399,
+     "max_abs_error": 0.065185546875,
+     "psnr_db_vs_unit_range": 55.39,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-a",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3667321,
+     "pixels": 3686400,
+     "mean_abs_error": 0.00174338323995471,
+     "max_abs_error": 0.19140625,
+     "psnr_db_vs_unit_range": 49.74,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-b",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3670388,
+     "pixels": 3686400,
+     "mean_abs_error": 0.001798607176169753,
+     "max_abs_error": 0.23046875,
+     "psnr_db_vs_unit_range": 49.64,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-c",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3670388,
+     "pixels": 3686400,
+     "mean_abs_error": 0.001798607176169753,
+     "max_abs_error": 0.23046875,
+     "psnr_db_vs_unit_range": 49.64,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-d",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3595742,
+     "pixels": 3686400,
+     "mean_abs_error": 0.0016684436704963446,
+     "max_abs_error": 0.1943359375,
+     "psnr_db_vs_unit_range": 48.9,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-e",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3633428,
+     "pixels": 3686400,
+     "mean_abs_error": 0.002135736169293523,
+     "max_abs_error": 0.240234375,
+     "psnr_db_vs_unit_range": 47.75,
+     "identical": false
+    }
+   },
+   {
+    "family": "rr-f",
+    "against": "vulkan",
+    "route": "vkhip",
+    "geometry": "1440p",
+    "comparison": {
+     "differing_pixels": 3524460,
+     "pixels": 3686400,
+     "mean_abs_error": 0.002204995369538665,
+     "max_abs_error": 0.337890625,
+     "psnr_db_vs_unit_range": 47.6,
+     "identical": false
+    }
+   }
+  ],
+  "rr_history": [
+   {
+    "family": "rr-a",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   },
+   {
+    "family": "rr-b",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   },
+   {
+    "family": "rr-c",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   },
+   {
+    "family": "rr-d",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   },
+   {
+    "family": "rr-e",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   },
+   {
+    "family": "rr-f",
+    "reset_and_continued_differ": true,
+    "vkhip_reset_and_continued_differ": true
+   }
+  ],
+  "rr_4k": [
+   {
+    "vulkan": {
+     "preset": "a",
+     "backend": "vulkan",
+     "model": "models-cnn/rr-a",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "6c89a7f24c1160f167ac484c3f46ed9fba90c387c5eeca6b6954b33eb41ba492"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "130519c0bea496e50d16ddd97b37bfe8cd4885919f4713109a211f6e4a853dca"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "a",
+     "backend": "vkhip",
+     "model": "models-cnn/rr-a",
+     "vkhip_stages": "11",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "7a316b3c98fd8434999512c3ffaa30f75768a13cb879062c8a7d6c71c3dcf33b"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "e0609348cf096640a72c9bb7777fe69624580311c24df7d2db8c9a3887451629"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 8275049,
+      "pixels": 8294400,
+      "mean_abs_error": 0.0021346257999539375,
+      "max_abs_error": 0.189453125,
+      "psnr_db_vs_unit_range": 48.94
+     },
+     "continued": {
+      "differing_pixels": 8250794,
+      "pixels": 8294400,
+      "mean_abs_error": 0.0016586416168138385,
+      "max_abs_error": 0.294921875,
+      "psnr_db_vs_unit_range": 50.42
+     }
+    }
+   },
+   {
+    "vulkan": {
+     "preset": "b",
+     "backend": "vulkan",
+     "model": "models-cnn/rr-b",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "9ec0081f05219c11eff0b82e27de4298e7dbf4a02103bdd68131da612798f38f"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "3474dab5ae1f368403011faf74ff9b6ccf7998cbdd22a121bccae16fa712053d"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "b",
+     "backend": "vkhip",
+     "model": "models-cnn/rr-b",
+     "vkhip_stages": "11",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "8790b777f3e0b6c5d0d09dbb1f97a78e2043ef67a56a553c9ddcb9f50441b36a"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "7cbc01785d8ecee7f5046234ab287206eae78f7b240e9f4ba8f8c992a77b0250"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 8274717,
+      "pixels": 8294400,
+      "mean_abs_error": 0.002045911969617009,
+      "max_abs_error": 0.208984375,
+      "psnr_db_vs_unit_range": 49.39
+     },
+     "continued": {
+      "differing_pixels": 8257063,
+      "pixels": 8294400,
+      "mean_abs_error": 0.001684622373431921,
+      "max_abs_error": 0.1728515625,
+      "psnr_db_vs_unit_range": 50.46
+     }
+    }
+   },
+   {
+    "vulkan": {
+     "preset": "c",
+     "backend": "vulkan",
+     "model": "models-cnn/rr-c",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "9ec0081f05219c11eff0b82e27de4298e7dbf4a02103bdd68131da612798f38f"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "3474dab5ae1f368403011faf74ff9b6ccf7998cbdd22a121bccae16fa712053d"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "c",
+     "backend": "vkhip",
+     "model": "models-cnn/rr-c",
+     "vkhip_stages": "11",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "8790b777f3e0b6c5d0d09dbb1f97a78e2043ef67a56a553c9ddcb9f50441b36a"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "7cbc01785d8ecee7f5046234ab287206eae78f7b240e9f4ba8f8c992a77b0250"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 8274717,
+      "pixels": 8294400,
+      "mean_abs_error": 0.002045911969617009,
+      "max_abs_error": 0.208984375,
+      "psnr_db_vs_unit_range": 49.39
+     },
+     "continued": {
+      "differing_pixels": 8257063,
+      "pixels": 8294400,
+      "mean_abs_error": 0.001684622373431921,
+      "max_abs_error": 0.1728515625,
+      "psnr_db_vs_unit_range": 50.46
+     }
+    }
+   },
+   {
+    "vulkan": {
+     "preset": "d",
+     "backend": "vulkan",
+     "model": "models/rr-d",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "feae099f40c3d17d95ca7e54ff826dbcb3ab0562f4db626d83b05e0dd176dfaf"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "55e0d890e00263a032ca48d8b2132739c178d430b399bc2d2ff41c4d02cce65a"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "d",
+     "backend": "vkhip",
+     "model": "models/rr-d",
+     "vkhip_stages": "10",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "32c3b0eb1f9cf0c7c9a765d58e22f72547a946ebc2daacfc9afcff5a73f5e1f1"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "a708d50db12cbef29da38a2e81c9700985236ad50357bcda25cebc144413eb84"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 6843374,
+      "pixels": 8294400,
+      "mean_abs_error": 0.0003386449534446001,
+      "max_abs_error": 0.0087890625,
+      "psnr_db_vs_unit_range": 63.3
+     },
+     "continued": {
+      "differing_pixels": 8072082,
+      "pixels": 8294400,
+      "mean_abs_error": 0.0014448383590206504,
+      "max_abs_error": 0.29296875,
+      "psnr_db_vs_unit_range": 50.38
+     }
+    }
+   },
+   {
+    "vulkan": {
+     "preset": "e",
+     "backend": "vulkan",
+     "model": "models/rr-e",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "1c953f1c4ca229d9b4a60800088de14aa61fed8cf9e83cef6b3457c5c2d84fab"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "80cdcda5cb1b4a8835408721389abb6b1aa0719aa22fde5762fdc9f3449d8f9d"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "e",
+     "backend": "vkhip",
+     "model": "models/rr-e",
+     "vkhip_stages": "10",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "7c09a524dbbffc038bcc6e5da7338dc8ca92d49bc50a547dd7419cdf66592a7e"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "32f73a96917f4933ad8fd7ac3d58691d4e9b740fc63c672ef4cdbdca313a3aa6"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 6321616,
+      "pixels": 8294400,
+      "mean_abs_error": 0.00035172622301615775,
+      "max_abs_error": 0.009765625,
+      "psnr_db_vs_unit_range": 61.99
+     },
+     "continued": {
+      "differing_pixels": 8172433,
+      "pixels": 8294400,
+      "mean_abs_error": 0.001965466421097517,
+      "max_abs_error": 0.4072265625,
+      "psnr_db_vs_unit_range": 48.72
+     }
+    }
+   },
+   {
+    "vulkan": {
+     "preset": "f",
+     "backend": "vulkan",
+     "model": "models/rr-f",
+     "vkhip_stages": null,
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "4fb18bcf3756a130b639f00a292cb0e7f50b8ea4d5eb34bc9056f1eae1a48520"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "c4752913a2ea4d689f31b468a9a535f450afdd17d1e111753320bd9552ff483e"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip": {
+     "preset": "f",
+     "backend": "vkhip",
+     "model": "models/rr-f",
+     "vkhip_stages": "14",
+     "unavailable": false,
+     "outputs": {
+      "0-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "095ce45e57d66812d6667bae42b45e0ec0b6d81b3a82c7a0874a941cdfbab43a"
+      },
+      "1-out.bin": {
+       "bytes": 66355200,
+       "pixels": 8294400,
+       "nonzero_rgb_pixels": 8294400,
+       "nonfinite_components": 0,
+       "sha256": "da012b8c713de8cf6bd2d88354d76548b8b66120052801645aefe4bfebf7d4e0"
+      }
+     },
+     "continued_differs_from_reset": true
+    },
+    "vkhip_vs_vulkan": {
+     "reset": {
+      "differing_pixels": 1948063,
+      "pixels": 8294400,
+      "mean_abs_error": 0.00013857772864867002,
+      "max_abs_error": 0.01953125,
+      "psnr_db_vs_unit_range": 63.16
+     },
+     "continued": {
+      "differing_pixels": 7921328,
+      "pixels": 8294400,
+      "mean_abs_error": 0.0021007207687944174,
+      "max_abs_error": 0.2109375,
+      "psnr_db_vs_unit_range": 48.14
+     }
+    }
+   }
+  ]
+ },
+ "environment": {
+  "host": {
+   "kernel": "Linux 7.3.0-5-cachyos",
+   "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor"
+  },
+  "git": {
+   "head": "83f047e3805226bed86b6d8c17a7da9a54a75a41",
+   "status": "M docs/performance.md\n M engine/replay_m.cpp\n M engine/replay_rr.cpp\n?? docs/benchmarks/\n?? docs/local-gpu-preset-comparison.md\n?? docs/nvidia-blackwell-presets.md\n?? tools/bench_local_presets.py\n?? tools/bench_official_ngx_cuda.cpp\n?? tools/build_local_comparison_summary.py\n?? tools/check_local_rr_4k_routes.py\n?? tools/make_local_rr_inputs.cpp\n?? tools/make_local_sr_inputs.py\n?? tools/profile_local_rr_stages.py\n?? tools/record_local_environment.py\n?? tools/verify_local_routes.py",
+   "patched_files": [
+    "engine/replay_m.cpp",
+    "engine/replay_rr.cpp"
+   ],
+   "patch_diff": "diff --git a/engine/replay_m.cpp b/engine/replay_m.cpp\nindex ef74de5..3ee75ae 100644\n--- a/engine/replay_m.cpp\n+++ b/engine/replay_m.cpp\n@@ -249,6 +249,10 @@ int main(int argc, char** argv) try {\n         const auto now = [] { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); };\n         // D4R_M_RESET_ALL=1: every frame is a reset frame, as the D3D12 harness passes them without its temporal option\n         const bool resetAll = std::getenv(\"D4R_M_RESET_ALL\") != nullptr;\n+        // D4R_M_WARMUP_PASSES=N: leave the first N passes untimed, so a case gets the official probe's warmed\n+        // interval (N * frames evaluations) before the measured ones. D4R_M_TIME_EACH=1 prints every timed frame.\n+        const int warmupPasses = std::getenv(\"D4R_M_WARMUP_PASSES\") ? std::atoi(std::getenv(\"D4R_M_WARMUP_PASSES\")) : 0;\n+        const bool timeEach = std::getenv(\"D4R_M_TIME_EACH\") != nullptr;\n         for (int pass = 0; pass <= repeats; ++pass)\n             for (int f = 0; f < frames; ++f) {\n                 char** a = argv + sep + 1 + 5 * f;\n@@ -288,7 +292,7 @@ int main(int argc, char** argv) try {\n                 region.imageExtent = {ow, oh, 1};\n                 if (pass == 0) vkCmdCopyImageToBuffer(cb, engine.outputImage(), VK_IMAGE_LAYOUT_GENERAL, out.buffer, 1, &region);\n                 submit();\n-                if (pass) walls.push_back(now() - t0);\n+                if (pass > warmupPasses) walls.push_back(now() - t0);\n                 uint64_t t[17] = {};\n                 // D4R_ENGINE_M_LAYER_STAMPS=1: the ten network layers' stamps as well (queries 7 - 16)\n                 static const bool layerStamps = std::getenv(\"D4R_ENGINE_M_LAYER_STAMPS\") != nullptr && !hip;\n@@ -297,8 +301,8 @@ int main(int argc, char** argv) try {\n                 double d[6]; for (int k = 0; k < 6; ++k) d[k] = double(t[k + 1] - t[k]) * tick;\n                 if (hip) d[2] = networkUs; // measured HIP network time; the complete span includes host handoffs\n                 const double us = double(t[6] - t[0]) * tick;\n-                if (pass) for (int k = 0; k < 6; ++k) stage[k].push_back(d[k]);\n-                if (pass && layerStamps) for (int l = 0; l < 10; ++l) layer[l].push_back(double(t[7 + l] - (l ? t[6 + l] : t[2])) * tick);\n+                if (pass > warmupPasses) for (int k = 0; k < 6; ++k) stage[k].push_back(d[k]);\n+                if (pass > warmupPasses && layerStamps) for (int l = 0; l < 10; l++) layer[l].push_back(double(t[7 + l] - (l ? t[6 + l] : t[2])) * tick);\n                 if (pass == 0 && std::getenv(\"D4R_M_DUMP\")) {\n                     // development: every intermediate of this frame, to PREFIX-NAME-FRAME.bin\n                     for (const auto& d : engine.debugResources()) {\n@@ -316,7 +320,10 @@ int main(int argc, char** argv) try {\n                 if (pass == 0) {\n                     std::ofstream(prefix + \"-\" + std::to_string(f) + \".rgba16f\", std::ios::binary).write(static_cast<const char*>(out.map), std::streamsize(ow) * oh * 8);\n                     std::printf(\"frame %d: %.1f us GPU\\n\", f, us);\n-                } else times.push_back(us);\n+                } else if (pass > warmupPasses) {\n+                    times.push_back(us);\n+                    if (timeEach) std::printf(\"TIMED pass=%d frame=%d %.3f us\\n\", pass, f, us);\n+                }\n             }\n         if (!times.empty()) {\n             std::sort(times.begin(), times.end()); std::printf(\"%zu timed frames: median %.1f us, min %.1f us GPU\\n\", times.size(), times[times.size() / 2], times[0]);\ndiff --git a/engine/replay_rr.cpp b/engine/replay_rr.cpp\nindex 35ac8a9..76aac1c 100644\n--- a/engine/replay_rr.cpp\n+++ b/engine/replay_rr.cpp\n@@ -269,6 +269,11 @@ int main(int argc, char** argv) try {\n     VkQueryPool stamps; CK(vkCreateQueryPool(c.device, &qp, nullptr, &stamps));\n     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(c.physical, &props);\n     const int repeat = std::getenv(\"D4R_RR_TIME_REPEAT\") ? std::atoi(std::getenv(\"D4R_RR_TIME_REPEAT\")) : 1;\n+    // D4R_RR_NO_UPLOAD=1: upload the inputs once. Consecutive frames.txt entries that reuse the same frame then\n+    // evaluate back to back, as the official CUDA probe does (its textures are uploaded before the timed loop).\n+    // D4R_RR_NO_WRITE=1: save no debug images; the final out image is written by a separate verification run.\n+    const bool skipUpload = testFlag(\"D4R_RR_NO_UPLOAD\");\n+    const bool skipWrite = testFlag(\"D4R_RR_NO_WRITE\");\n     bool first = true;\n     while (frames >> key) {\n         uint32_t f;\n@@ -280,6 +285,7 @@ int main(int argc, char** argv) try {\n         s.reset = reset != 0; s.depthInverted = (inverted & 1) != 0; s.hardwareDepth = (inverted & 2) != 0;   // bit 1: DLSS.Use.HW.Depth\n         s.roughnessPacked = (inverted & 4) != 0;   // bit 2: DLSS.Roughness.Mode (preset F inputs)\n         for (size_t i = 0; i < inputs.size(); ++i) {\n+            if (skipUpload && !first) continue;\n             auto data = read(inputDir + \"/\" + std::to_string(f) + \"-\" + names[i] + \".bin\");\n             if (data.size() != size_t(rw) * rh * texelBytes(formats[i])) throw std::runtime_error(std::string(\"input size: \") + names[i]);\n             std::memcpy(staging.mapped, data.data(), data.size());\n@@ -298,15 +304,17 @@ int main(int argc, char** argv) try {\n         for (int k = 0; k < 4; ++k) {\n             std::ifstream probe(inputDir + \"/\" + std::to_string(f) + \"-\" + optionalNames[k] + \".bin\", std::ios::binary);\n             if (!probe) continue;\n-            auto data = read(inputDir + \"/\" + std::to_string(f) + \"-\" + optionalNames[k] + \".bin\");\n-            if (data.size() != size_t(rw) * rh * texelBytes(optionalFormats[k])) throw std::runtime_error(std::string(\"input size: \") + optionalNames[k]);\n-            std::memcpy(staging.mapped, data.data(), data.size());\n-            c.submit([&](VkCommandBuffer cb) {\n-                barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);\n-                VkBufferImageCopy region; copyRegion(region, rw, rh);\n-                vkCmdCopyBufferToImage(cb, staging.buffer, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);\n-                barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);\n-            });\n+            if (!skipUpload || first) {\n+                auto data = read(inputDir + \"/\" + std::to_string(f) + \"-\" + optionalNames[k] + \".bin\");\n+                if (data.size() != size_t(rw) * rh * texelBytes(optionalFormats[k])) throw std::runtime_error(std::string(\"input size: \") + optionalNames[k]);\n+                std::memcpy(staging.mapped, data.data(), data.size());\n+                c.submit([&](VkCommandBuffer cb) {\n+                    barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);\n+                    VkBufferImageCopy region; copyRegion(region, rw, rh);\n+                    vkCmdCopyBufferToImage(cb, staging.buffer, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);\n+                    barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);\n+                });\n+            }\n             VkImageView* slots[] = {&images.specularHitDistance, &images.disocclusionMask, &images.subsurfaceGuide, &images.colorBeforeParticles};\n             *slots[k] = optional[k].view;\n         }\n@@ -344,6 +352,7 @@ int main(int argc, char** argv) try {\n             std::cout << \"\\n\";\n         }\n         for (const auto& d : engine.debugImages()) {\n+            if (skipWrite) break;\n             if (testFlag(\"D4R_RR_OUTPUT_ONLY\") && d.name != \"out\") continue;\n             const size_t bytes = size_t(d.width) * d.height * texelBytes(d.format);\n             c.submit([&](VkCommandBuffer cb) {"
+  },
+  "toolchain": {
+   "gxx": "g++ (GCC) 16.2.1 20260810",
+   "hipconfig": "7.2.53211-3d9ef42",
+   "glslang": "Glslang Version: 11:16.6.0",
+   "python": "3.14.8"
+  },
+  "graphics": {
+   "glxinfo_device": "Device: AMD Radeon RX 9070 XT (radeonsi, gfx1201, ACO, DRM 3.64, 7.3.0-5-cachyos) (0x7550)",
+   "mesa": "OpenGL version string: 4.6 (Compatibility Profile) Mesa 26.2.5-arch3.1",
+   "vulkan_loader": "                     only contains the list of supported video profile names.",
+   "rocminfo": [
+    "  Marketing Name:          AMD Ryzen 7 9800X3D 8-Core Processor",
+    "  Name:                    gfx1201                            ",
+    "  Marketing Name:          AMD Radeon RX 9070 XT              ",
+    "      Name:                    amdgcn-amd-amdhsa--gfx1201         "
+   ]
+  },
+  "gpu": {
+   "pci": "03:00.0 \"VGA compatible controller\" \"Advanced Micro Devices, Inc. [AMD/ATI]\" \"Navi 48 [Radeon RX 9070/9070 XT/9070 GRE]\" -rc0 -p00 \"ASUSTeK Computer Inc.\" \"Device 0613\"",
+   "sysfs_uevent": {
+    "uevent": "DRIVER=amdgpu\nPCI_CLASS=30000\nPCI_ID=1002:7550\nPCI_SUBSYS_ID=1043:0613\nPCI_SLOT_NAME=0000:03:00.0\nMODALIAS=pci:v00001002d00007550sv00001043sd00000613bc03sc00i00"
+   },
+   "hwmon": {
+    "power_cap_uw": "250000000",
+    "power_cap_default_uw": "330000000",
+    "power_cap_max_uw": "374000000",
+    "sclk_now_hz": "2765000000",
+    "mclk_hz": "1349000000",
+    "junction_c": "53000"
+   },
+   "power_management": {
+    "performance_level": "auto",
+    "dpm_state": "performance",
+    "sclk_states": "0: 500Mhz \n1: 2765Mhz *\n2: 2520Mhz",
+    "power_profile": "PROFILE_INDEX(NAME) CLOCK_TYPE(NAME) FPS MinActiveFreqType MinActiveFreq BoosterFreqType BoosterFreq PD_Data_limit_c PD_Data_error_coeff PD_Data_error_rate_coeff\n 0 BOOTUP_DEFAULT*:\n                    0(       GFXCLK)       0       1       0       4     800 4587520  -65536       0\n                    1(         FCLK)       0       3       0       1       0 5898240   -6553   -6553\n 1 3D_FULL_SCREEN :\n                    0(       GFXCLK)       0       1       0       1       0 5570560    -655   -6553\n                    1(         FCLK)       0       1       0       1       0 5898240   -6553   -6553\n 2   POWER_SAVING :\n                    0(       GFXCLK)       0       1       0       3       0 5898240  -65536       0\n                    1(         FCLK)       0       1       0       1       0 5898240  -65536   -6553\n 3          VIDEO :\n                    0(       GFXCLK)       0       1       0       4     500 4587520  -65536       0\n                    1(         FCLK)       0       1       0       1       0 5898240   -6553   -6553\n 4             VR :\n                    0(       GFXCLK)       0       4     600       1       0 4587520  -16384       0\n                    1(         FCLK)       0       1       0       1       0 5898240   -6553   -6553\n 5        COMPUTE :\n                    0(       GFXCLK)       0       4     600       1       0 4587520  -16384       0\n                    1(         FCLK)       0       1       0       1       0 5898240   -6553   -6553\n 6         CUSTOM :\n                    0(       GFXCLK)       0       1       0       4     800 4587520  -65536       0\n                    1(         FCLK)       0       3       0       1       0 5898240   -6553   -6553\n 7      WINDOW_3D :\n                    0(       GFXCLK)       0       1       0       1       0 5570560    -655   -6553\n                    1(         FCLK)       0       3       0       1       0 5898240   -6553   -6553"
+   }
+  },
+  "runner_binaries": {
+   "d4r-e": "7a9e20544a5cdd69a0ac1ca1fa234d34ca7e82360c6bd4ff4f16872feca392e4",
+   "d4r-k": "29a054a3f16309d736d0ae60085e6f3e808074b92dd3a42d51955ba7c40a22fa",
+   "d4r-m": "c8514520cb5466123319583f501dc5fb744a2ddc7fb04928b0a7fca40f1d74af",
+   "d4r-rr": "e4ebcbeb3e7edc1b099b1f459fbd1b770efebfd680de4f36b428a008b56bc2b5"
+  },
+  "engine_library_sha256": "24afc0aa64c5c2a5606fe5ab2b224c21a93808d55a2c0cc24b8098f5eb827845",
+  "dlls": {
+   "nvngx_dlss_310.7.0.dll": {
+    "sha256": "be6e434a94ca32499515eb62ca0e6c274526055d568d0426e4c652dcdfb6ee6e",
+    "bytes": 58977904
+   },
+   "nvngx_dlssd_310.3.0.dll": {
+    "sha256": "e43fdcead51c388390fd74211dcc4ee8c218e7650d4f7ce3e8ca9d899db7f33a",
+    "bytes": 72997408
+   },
+   "nvngx_dlssd_310.9.1.dll": {
+    "sha256": "4bc7ea5fcb2f32cf86bc2cb072e8d2860914a0be511cbdcb2fc206c1d9d83b80",
+    "bytes": 48343664
+   }
+  },
+  "nvidia_reference_sha256": {
+   "sr": "bb795ff9a2493aafc2c94c23c1ae217a14dfed6d32ee43512ce4d33769249aa7",
+   "rr": "d175e432ba956992cbb27a3005f3ff485593db59ee4ed60f8498f157f6dccc5f"
+  },
+  "scripts_sha256": {
+   "bench_local_presets.py": "bd273ffdea4bc2920fcb178108b5f673b166dbb10e260d03bb1cc521472cbf49",
+   "build_local_comparison_summary.py": "a7ec2c85cd8468fd4c784a2d3950fd5c424e7982ce12262ea943992f0ae8e07c",
+   "check_local_rr_4k_routes.py": "7a3e4a2d9ca3384618c8c740b518c947cbac12a3a0c7092d5b49adebf346909f",
+   "make_local_sr_inputs.py": "8f959d0451fb7b1495f3dc1c68ddaf99db15dca538373c3a0f01780ad24ce601",
+   "profile_local_rr_stages.py": "cd06c02083f80cc843df011c21af7727294fcc1095bb934feef006932bec85a3",
+   "record_local_environment.py": "b9892cd62cfef3ff04a1c2587ecb879949e3a5bd37c2840a4565e8a7b6c47a13",
+   "verify_local_routes.py": "48cb42a3697c667a77259d416a7ac9cad59077cdfb7dbe8061fb9ddaad3af330",
+   "make_local_rr_inputs.cpp": "bccba27eb29e075e49af75a800d45e1e3070504f5e685e8faadcbed06f564919"
+  },
+  "models": {
+   "models/rr-d": {
+    "manifest": "model.json",
+    "manifest_sha256": "1096858c55ef54315cb3a8a8ce3ac98ff7c8a247b20b2bdff10ea5091cbede44",
+    "manifest_head": "{\n \"preset\": \"D\",\n \"stages\": {\n  \"enc0\": {\n   \"kernel\": \"cuda_dldn_engine_swin_enc0_diamond_wallaby_kernel\",\n   \"shader\": \"generated from the DLL\",\n   \"weights\"",
+    "preset": "D",
+    "hip_code_objects": {
+     "rr_dec0.hsaco": "b91d0f7f47973d105a0a26637d96f0490362504e30627864b94d3179cce39725",
+     "rr_dec1.hsaco": "b5a7d43192de7f129fa02dbffa7dbfa9464be6e0c9807075face74b0677152f7",
+     "rr_dec2.hsaco": "be09b26ed91975dbf254fe84ceb863750c4795cc062bb43e16ad15966005392b",
+     "rr_dec3.hsaco": "6a2f926c29fbd0278ee88617faadbeec8c5cd1c0dc9f11cfbaa51ee49b6b4f33",
+     "rr_dec4.hsaco": "5c1984eebd3e7094131a88c5b4e473522331704a74578bcee5c62aa595ff73f0",
+     "rr_enc1.hsaco": "62a7995da02a70a26783548b97ae2e7c973d609f99f86cc38a20b7db8cba6752",
+     "rr_enc2.hsaco": "d780b465ab268f705a96ad0912c8fe8ad73d14e0e2ab9930496461d0c21e2a3c",
+     "rr_enc3.hsaco": "8067a7e91098ebe47fd092a138158c29bd36cb9d1068012e0e3b1557467d5c52",
+     "rr_enc4.hsaco": "111316181538191a1a462c06e39d04db80f1cbeb780ca856209d67ba4ec3c28a",
+     "rr_enc5.hsaco": "ddc31fdbb3fa557da97e04ad783aba7f966a65b8ae274950b7cbe46f83ac5831"
+    }
+   },
+   "models/rr-e": {
+    "manifest": "model.json",
+    "manifest_sha256": "cdbdc2cbf0c53ed4c3f30a04ffdf6bd6f1ab9049a49f4ebf9321ebac833047ab",
+    "manifest_head": "{\n \"preset\": \"E\",\n \"stages\": {\n  \"enc0\": {\n   \"kernel\": \"cuda_dldn_engine_swin_enc0_kernel\",\n   \"shader\": \"generated from the DLL\",\n   \"weights\": 0\n  },\n  \"enc1",
+    "preset": "E",
+    "hip_code_objects": {
+     "rr_dec0.hsaco": "e8f8b532e72be192a1ca2b91773edeadaadda40086cae62d3d14c93fdaa8f5ff",
+     "rr_dec1.hsaco": "00aeb0147bc07f447194fd370f67761f988b6b96a672dc76e6ad766095cada94",
+     "rr_dec2.hsaco": "b6879eccefc0406c21160ce6a62295f3b5836900fa3b32f771b9959939fdb2b6",
+     "rr_dec3.hsaco": "769ce11a72acd921f1a253c025ba038788988b3601f1f9eb574df81039663677",
+     "rr_dec4.hsaco": "bd899d17f9ddc854f0f4ccf71eb48c84770f401ace7ebd5a59c184123160be78",
+     "rr_enc1.hsaco": "012ad6b8b82283bfaca1ec5cee0e259707aa9f693e779297933aaf3f5c753bd5",
+     "rr_enc2.hsaco": "26ae7cf1a885a71c5b380d7cf6c40f49f9ef50954f0b782f692f61fab650f9a2",
+     "rr_enc3.hsaco": "3ab85bf3729b2fa5122e63ae64bf3a5d77f3e206944498c3a6f961ae044380da",
+     "rr_enc4.hsaco": "2bd449acff38d90725777d4a52a7143ef00cbc946b2e50fa246bd2bcf19d1b5d",
+     "rr_enc5.hsaco": "dfd0995a56c94d501fd1fc8974470239f843fbee467b090c564ed9c63d142ba8"
+    }
+   },
+   "models/rr-f": {
+    "manifest": "rr.txt",
+    "manifest_sha256": "5cf06bbe3ae1157e22817f2d3496a2563c02a3b6b594625c7407713845a86fe5",
+    "manifest_head": "D4RR0002\npreset 6\nstage enc0 enc0.spv 32 weights-enc0m.bin enc0.args 144,160,176,192,208,224,240,264,272,288,304,320,336,352,528,536,544,552,1040,1056 368:rgba1",
+    "preset_line": "preset 6",
+    "hip_code_objects": {
+     "rr2_dec0_0.hsaco": "a9549c732a850f6b35a54ff4f29927326d93b23823ddbec440e5d1f92340031f",
+     "rr2_dec1_0.hsaco": "1cfaf20ad31dc61dacfa07acbd440d31731439d7ebdb2e8bc3ba57fba2989e02",
+     "rr2_dec1_1.hsaco": "f16d810997c99231e9be5d9b666a48cbfdd54bbe75e6e5d1c90a9a00c9948e32",
+     "rr2_dec2_0.hsaco": "ef40dcd6b7484b0cffffc234018097544390e0cdee609007aca0f0fb280317d1",
+     "rr2_dec2_1.hsaco": "7bd8e3da619d035bf37fa54f48e59f5b341ed12224426121fa31078221ecdcec",
+     "rr2_dec3_0.hsaco": "3b123313f5f114fcb64518dcd8dfcf0a4931c3c1a8548e62ecd7d38005f3bf48",
+     "rr2_dec3_1.hsaco": "d0eb3594e1b05abf0fe32ee4b78f82e34a9be3bcf9ed434ff39a752242d54a2d",
+     "rr2_dec4_0.hsaco": "f1da422b719866fb0d45bcabd7dfc5cd272522d428e4796d8157e7b210f49db0",
+     "rr2_dec4_1.hsaco": "419ddaeaa3e5fb5b97d4ceb1084afa42022ef612dd47bf88d7d4756d6fa4b548",
+     "rr2_enc1.hsaco": "191a1b99d3438c5b147e54587739dd654dd3d5b3f0b43b41ed43d1eb1ad39308",
+     "rr2_enc2.hsaco": "7455a1017ca10bf4a62d7783886eea2b2722943d692e9d7cb8e981046a1407d0",
+     "rr2_enc3.hsaco": "423f8e6b018558e248ed7ee6838520f5a25c1b1d8d7dd1e4a52843e2d75a5ebd",
+     "rr2_enc4.hsaco": "1c6e02056977944faceba429d248042982df582d3920ec2bace46d6538fe6732",
+     "rr2_enc5.hsaco": "b4d170d8928bbf5a0457ad2fe5c2b99cc00fbaedf5a19b9beda776dc350a1e6f"
+    }
+   },
+   "models/sr-l": {
+    "manifest": "model.json",
+    "manifest_sha256": "35fc4e8b43e74ca12265a37da13f8a3df8ed9009ee5188045ac541f3e7fb7b43",
+    "manifest_head": "{\n \"format\": \"D4RL0002\",\n \"preset\": \"L\",\n \"files\": {\n  \"hipnet.bin\": \"bb368a259855f5b6a2dcc91e0c41b0d6bfdfe9de750caff3d3d24d795029bd2c\",\n  \"offsets.bin\": \"587a3",
+    "preset": "L",
+    "hip_code_objects": {
+     "rrlite_dec1_4x4.hsaco": "2a48011cc30c2a029aa77a55ed4fe68bedb6fe25a20505dd4ca9fdb493b385ef",
+     "rrlite_dec2_4x4.hsaco": "b34d892fda8ad1da4084ec85e0ce03a96bff5dc2d95a725d1c6f277c11b925b0",
+     "rrlite_enc1_4x4.hsaco": "c5d41601e0d03ce5e991f683d2cf6aadda0c60f83d7fcd66e2002200e905740b",
+     "rrlite_enc2_4x4.hsaco": "c92f000c292a069bcff17af268bb799e67718941428bf1ac08503a18c450360f",
+     "rrlite_enc3_tube_4x4.hsaco": "209c982985d1c31c220b687362a6ba371cb642d644bfcc7c9eb91eb9803d12be"
+    }
+   },
+   "models/sr-m": {
+    "manifest": "model.json",
+    "manifest_sha256": "5e0bfc098296c73afd8f74d6f176f3044b92b5380c75631fecf125ed613cba4d",
+    "manifest_head": "{\n \"format\": \"D4RM0007\",\n \"preset\": \"M\",\n \"files\": {\n  \"hipnet.bin\": \"5939424101f9b50c233e541d755ca92610ce5dab644bf69159c669e11223db40\",\n  \"offsets.bin\": \"70151",
+    "preset": "M",
+    "hip_code_objects": {
+     "rrlite_dec1_4x4.hsaco": "2a48011cc30c2a029aa77a55ed4fe68bedb6fe25a20505dd4ca9fdb493b385ef",
+     "rrlite_dec2_4x4.hsaco": "b34d892fda8ad1da4084ec85e0ce03a96bff5dc2d95a725d1c6f277c11b925b0",
+     "rrlite_enc1_4x4.hsaco": "c5d41601e0d03ce5e991f683d2cf6aadda0c60f83d7fcd66e2002200e905740b",
+     "rrlite_enc2_4x4.hsaco": "c92f000c292a069bcff17af268bb799e67718941428bf1ac08503a18c450360f",
+     "rrlite_enc3_tube_4x4.hsaco": "209c982985d1c31c220b687362a6ba371cb642d644bfcc7c9eb91eb9803d12be"
+    }
+   },
+   "models-cnn/rr-a": {
+    "manifest": "rr.txt",
+    "manifest_sha256": "e81d8b4c82527a48c691a73eaefc7af5f4a5a91b9010ee83dbe5d9c781aaa794",
+    "manifest_head": "D4RR0003\npreset 1\ninput input.spv input.globals.bin 16,24,32,40,48,56,64,80,88,96,104,112,152,352,360,368 160:rgba16f\noutput output.spv - 160,168,176,184,192,24",
+    "preset_line": "preset 1",
+    "hip_code_objects": {
+     "rr3_dec0.hsaco": "076907db5543e36b6ad767c77e58dc8a8f46133d44c54d03881b74c120bd9fde",
+     "rr3_dec1.hsaco": "396915dae9076fcd4571e64212ffb425439946d43317176cb9bfe88cd4be06c3",
+     "rr3_dec2.hsaco": "9fa2bf54d6aeb1febfba0637f6de4c695a12f11da834ef1ee4eccc52af6df7fb",
+     "rr3_dec3.hsaco": "b7e4a0b37f958ef8add528bbb86c915cf96c7ec96f636c870f9a3c28731c0707",
+     "rr3_dec4.hsaco": "073f957161bb6ec97f51b5532d290197d1eb5f4071bb854d632df7fba9b3fd0b",
+     "rr3_enc0.hsaco": "5cf339c69547f2594f8e99c9eed743a92162f257726be1c87a6ffcbe4057d973",
+     "rr3_enc1.hsaco": "cd4fd54f332cae2ac6033c7b0c67209dfb93168247dbce3bbbf8241a811610d1",
+     "rr3_enc2.hsaco": "4635b3eb394c9a5829aa371fd12a8cd115f88d4228619334aad7bbd69ad0f5e6",
+     "rr3_enc3.hsaco": "e776bf5f287b41ca6a41cef202da288497ccfc7afcb72789ef523330930dfd83",
+     "rr3_enc4.hsaco": "7217c1bd8d752769298264ca68ce02f975e8fbd3e28b1d2d4e5c466bb07f0977",
+     "rr3_pdl.hsaco": "2bbfb5a15238f1bc61a3f79b35ad69bd8d26d9d509c4cf8e132abf66fa7ded84"
+    }
+   },
+   "models-cnn/rr-b": {
+    "manifest": "rr.txt",
+    "manifest_sha256": "99b57b1b590db7efba47de4477bafa51b9a166e1595be1cb713b18b88faa4dc4",
+    "manifest_head": "D4RR0003\npreset 2\ninput input.spv input.globals.bin 16,24,32,40,48,56,64,80,88,96,104,112,152,352,360,368 160:rgba16f\noutput output.spv - 160,168,176,184,192,24",
+    "preset_line": "preset 2",
+    "hip_code_objects": {
+     "rr3_dec0.hsaco": "2f436f461589f2610022e05c95b8ec5b0c1f9ac51adacc4c7d130c9ea6e471c3",
+     "rr3_dec1.hsaco": "0863da8cfc729bf0a511cbc9b3bfd7aa0a9a69c4c4e4036d33f99cb95f9c6e19",
+     "rr3_dec2.hsaco": "5e9ede390e939817d7631c36cd2f0ca75e08c9a38c0b8d54ad6598a225382a3a",
+     "rr3_dec3.hsaco": "972102fcd79ca2b7ae4422873734a70f68ed8981871d385b959178f09edc51fe",
+     "rr3_dec4.hsaco": "35fba05dcdb56a47e75ad30b3eb7c1c82d3dca433d52dc759d4c80dbb50b12ed",
+     "rr3_enc0.hsaco": "22331eeabb5cb5b8bfed2784c7ae87bb824d59f61989e132baaee511ea01751c",
+     "rr3_enc1.hsaco": "6be4dcd1e35e8e237c0d9101a73c0c697c53f220cfdb0a63c71467de796c050b",
+     "rr3_enc2.hsaco": "bdd6cccfaf5bb0fe575123369a20a9a494ba9edc351bc412ad48b1b74f146a16",
+     "rr3_enc3.hsaco": "884282e94cc47d2c6378472beff0e3ced80bc14db9368874501197dd5fc5874c",
+     "rr3_enc4.hsaco": "d60528fd583af637f3f0f32bba77f943f45b17e8d6cbbf29be0dafd6b35316d2",
+     "rr3_pdl.hsaco": "6f9ebde560d954ef6f8c5761faea828ce9c771f630adc5cdccf877f8892fd3ab"
+    }
+   },
+   "models-cnn/rr-c": {
+    "manifest": "rr.txt",
+    "manifest_sha256": "47bc6ff728985354dda2d119b084ed70e6abf256f69ce0318609b0700212ef7b",
+    "manifest_head": "D4RR0003\npreset 3\ninput input.spv input.globals.bin 16,24,32,40,48,56,64,80,88,96,104,112,152,352,360,368 160:rgba16f\noutput output.spv - 160,168,176,184,192,24",
+    "preset_line": "preset 3",
+    "hip_code_objects": {
+     "rr3_dec0.hsaco": "86897dcb04e991f6ea569e87dc26b82649360740ac183e23f9a4e88422f92ab6",
+     "rr3_dec1.hsaco": "a63e343729bbee1aed12da7392bd342027e9d953b97ab1e0b642468559a68316",
+     "rr3_dec2.hsaco": "1f2581191a921fc7dff3a56c985f7a5f0af3ade2e15edd0d7204722dc1f3e54e",
+     "rr3_dec3.hsaco": "205fe84c3ec2ce299bfd770991afabe4df68fd707ecbf8bdb963062c92ef208c",
+     "rr3_dec4.hsaco": "b376a3823dd33b7ec3a66d0d8784958af47d919a838f27057fa347f453395880",
+     "rr3_enc0.hsaco": "7e02caa7c57fda82586609c72027881808ac6faeeed6dab9744ca091cc4201cc",
+     "rr3_enc1.hsaco": "6369cabc33e1604d77e124bc00a8cbd015f6ea44eda246831767144d373df750",
+     "rr3_enc2.hsaco": "eba022606bccc9dc366e218df0754f4277056200f6db2819532ac5417246c87d",
+     "rr3_enc3.hsaco": "aaeccde3595c83c3e4c53ff095207b9414d9376a7e71084d0754b23a8b2533d6",
+     "rr3_enc4.hsaco": "6ff17dd9c0e6904e0c9cca621574f78f39aa62b76466f625849598a71dab49e9",
+     "rr3_pdl.hsaco": "5c1e05574724893d58930501aa6ff433fa8069710b8a2419e96e27a7ba26c868"
+    }
+   }
+  }
+ },
+ "sr_l_headroom_projection": {
+  "note": "Derived, not measured: d4r M stage times scaled by NVIDIA per-stage L-over-M work ratios, i.e. L costs if its outer stages matched M's relative efficiency.",
+  "nvidia_l_over_m_stage_ratios_4k": {
+   "exposure": 0.993,
+   "input": 2.352,
+   "network": 1.013,
+   "expansion": 2.949,
+   "reconstruction": 1.096,
+   "downsample": 0.981
+  },
+  "predicted_l_ms": {
+   "4k": 3.525,
+   "1440p": 1.654
+  },
+  "predicted_l_basis": {
+   "4k": "per-stage scaling of the measured M stages",
+   "1440p": "M stage sum 1.265 ms scaled by NVIDIA whole-times L/M 1.307 (no 1440p NVIDIA stage profile exists)"
+  },
+  "measured_l_ms": {
+   "4k": 4.527,
+   "1440p": 2.002
+  },
+  "saving_ms": {
+   "4k": 1.002,
+   "1440p": 0.348
+  },
+  "saving_by_stage_4k_ms": {
+   "input": 0.493,
+   "expansion": 0.404,
+   "reconstruction": 0.102
+  },
+  "predicted_l_over_m_4k": 1.23,
+  "predicted_l_over_m_1440p": 1.307,
+  "measured_l_over_m_4k": 1.58,
+  "measured_l_over_m_1440p": 1.588,
+  "nvidia_l_over_m_4k": 1.238,
+  "nvidia_l_over_m_1440p": 1.307,
+  "predicted_l_vs_nvidia_4k": 1.12,
+  "predicted_l_vs_nvidia_1440p": 1.17,
+  "why_not_lower": "The 1.54x network ratio is shared with M and is hardware-side; matching M's efficiency converges L onto M's 1.12x, not onto NVIDIA's absolute time."
+ },
+ "hardware_yardstick": {
+  "note": "Measured peaks on both cards (2026-10-29). Replaces an earlier version that used 811 TFLOPS dense FP8 for the RTX PRO 4500, which is the server edition's sparse figure.",
+  "rx_9070_xt": {
+   "fp8_dense_tflops_measured": [
+    350,
+    383
+   ],
+   "read_gbs_measured": [
+    413,
+    446
+   ],
+   "copy_gbs_measured": [
+    505,
+    523
+   ],
+   "bandwidth_gbs_spec": 640,
+   "compute_units": 64,
+   "power_cap_w": 250,
+   "power_default_w": 330,
+   "method": "HIP v_wmma_f32_16x16x16_fp8_fp8 throughput loop, grid-stride read and copy"
+  },
+  "rtx_pro_4500_blackwell": {
+   "fp8_dense_tflops_measured": [
+    418,
+    470
+   ],
+   "fp8_f16_accumulate_same_rate": true,
+   "fp16_dense_tflops_measured": 209,
+   "read_gbs_measured": [
+    817,
+    825
+   ],
+   "copy_gbs_measured": [
+    729,
+    743
+   ],
+   "sms": 82,
+   "driver": "595.91.07",
+   "power_limit_w": 200,
+   "method": "CUDA mma.sync.m16n8k32 e4m3 (f32 and f16 accumulation) throughput loop, grid-stride read and copy, rented workstation-edition card"
+  },
+  "ratios": {
+   "fp8": 1.15,
+   "copy_bandwidth": 1.4,
+   "read_bandwidth": 1.85
+  },
+  "rr_d_4k_fraction_of_peak": {
+   "note": "FLOPs estimated from native stage weight layouts; same estimate on both cards",
+   "local_network_tflops": 109,
+   "local_fraction": 0.29,
+   "nvidia_network_tflops": 232,
+   "nvidia_fraction": 0.53,
+   "stages": {
+    "enc0": [
+     0.18,
+     0.37
+    ],
+    "enc1": [
+     0.41,
+     0.75
+    ],
+    "dec1": [
+     0.34,
+     0.58
+    ],
+    "dec0": [
+     0.23,
+     0.49
+    ]
+   }
+  },
+  "rgp_rr_d_4k": {
+   "enc0": {
+    "us": 2516,
+    "vgprs": 192,
+    "lds_bytes": 14336,
+    "waves_per_simd": 8,
+    "valu_per_wmma": 15.5,
+    "valu_busy": 0.171,
+    "lds_busy": 0.047,
+    "vmem_busy": 0.073,
+    "reading": "latency-bound"
+   },
+   "dec0": {
+    "us": 1798,
+    "vgprs": 152,
+    "lds_bytes": 14336,
+    "waves_per_simd": 9,
+    "valu_per_wmma": 18.2,
+    "valu_busy": 0.608,
+    "lds_busy": 0.239,
+    "vmem_busy": 0.017,
+    "reading": "VALU-bound on non-matrix work"
+   }
+  },
+  "power_330w_rerun": {
+   "logs": "build/local-preset-compare-20261029/logs-330w/",
+   "rr_speedup": "8-12%, still at the cap",
+   "sr_change": "within ±5%, never near either cap",
+   "rr_d_4k_vkhip_ms": 7.316,
+   "rr_a_4k_vkhip_ms": 4.198,
+   "rr_f_4k_vulkan_ms": 7.09
+  },
+  "verdicts": [
+   {
+    "stage_class": "RR network (Swin D/E, rr2 F)",
+    "measured": "2.05-2.14x",
+    "yardstick": "FP8 ~1.15x",
+    "verdict": "software"
+   },
+   {
+    "stage_class": "SR network (ten Swin layers)",
+    "measured": "1.54x",
+    "yardstick": "FP8 ~1.15x",
+    "verdict": "mostly software"
+   },
+   {
+    "stage_class": "RR CNN (A/B/C)",
+    "measured": "1.49x",
+    "yardstick": "FP8 ~1.15x",
+    "verdict": "mostly software"
+   },
+   {
+    "stage_class": "SR input (enc0)",
+    "measured": "0.96x",
+    "yardstick": "bandwidth ~1.4x",
+    "verdict": "software advantage"
+   },
+   {
+    "stage_class": "SR reconstruction and downsample",
+    "measured": "0.71-0.82x",
+    "yardstick": "-",
+    "verdict": "software advantage"
+   },
+   {
+    "stage_class": "RR outer group",
+    "measured": "1.33-1.63x",
+    "yardstick": "bandwidth ~1.4x",
+    "verdict": "near the bandwidth floor"
+   },
+   {
+    "stage_class": "SR L non-native outer stages (enc0_l, dec0_l)",
+    "measured": "1.94x, 2.52x",
+    "yardstick": "bandwidth ~1.4x",
+    "verdict": "software"
+   },
+   {
+    "stage_class": "RR CNN as Vulkan shaders vs native code objects on the same card",
+    "measured": "17.23 ms vs 2.77 ms",
+    "yardstick": "same GPU",
+    "verdict": "software"
+   }
+  ],
+  "valu_measured": {
+   "note": "Vector throughput, same source on both cards (tools/bench_valu.h), independent chains. The FP32 loop compiles to plain v_fma_f32 on RDNA4 (no VOPD dual issue). See docs/amd-vector-issue-limit.md.",
+   "rx_9070_xt_330w": {
+    "fp32_fma_tfma_s": [
+     8.1,
+     8.9
+    ],
+    "int32_xor_shift_add_tops": [
+     15.8,
+     17.2
+    ],
+    "packed_f16_fma_per_half_tfma_s": [
+     22.1,
+     24.2
+    ]
+   },
+   "rtx_pro_4500": {
+    "fp32_fma_tfma_s": [
+     27.3,
+     28.1
+    ],
+    "int32_xor_shift_add_tops": [
+     19.4,
+     19.4
+    ],
+    "packed_f16_fma_per_half_tfma_s": [
+     29.1,
+     29.4
+    ]
+   },
+   "nvidia_over_local": {
+    "fp32_fma": 3.2,
+    "int32": 1.14,
+    "packed_f16": 1.22
+   },
+   "data": "docs/benchmarks/gpu-limits-20261029/valu-*.txt"
+  },
+  "rgp_sr_l_4k": {
+   "enc0_l": {
+    "vgprs": 192,
+    "lds_bytes": 8192,
+    "waves_per_simd": 8,
+    "valu_per_wave": 3334,
+    "wmma_per_wave": 160,
+    "valu_per_wmma": 20.8,
+    "valu_busy_pct": 59.8,
+    "fp32_math_share_of_valu_pct": 28
+   },
+   "dec0_l": {
+    "vgprs": 216,
+    "lds_bytes": 9216,
+    "waves_per_simd": 7,
+    "valu_per_wave": 2807,
+    "wmma_per_wave": 144,
+    "valu_per_wmma": 19.5,
+    "valu_busy_pct": 59,
+    "fp32_math_share_of_valu_pct": 30
+   },
+   "nvidia_ptx_statements_per_mma": {
+    "rrlite_enc0_4x4_mvhi_hdr": 27.8,
+    "rrlite_dec0_4x4": 26.7
+   },
+   "data": "docs/benchmarks/gpu-limits-20261029/rgp/"
+  },
+  "sr_l_experiments": "docs/benchmarks/gpu-limits-20261029/sr-l-experiments.json"
+ },
+ "limitations": [
+  "Model version mismatch: local SR M/L are 310.7.0 weights against NVIDIA 310.9.16; local RR D/E/F are 310.9.1 against 310.9.16. RR A/B/C match (310.3.0).",
+  "The replay runners have no HDR/auto-exposure creation flags: the SR case runs the engine's exposure stage with the same patterned input, not NGX's auto-exposure path (flags 0x4b).",
+  "These are isolated d4r engine evaluations on an RX 9070 XT at a 250 W cap, not game frame times, and not RTX 5070 Ti numbers.",
+  "Clocks are not pinned: the sclk DPM state list is dynamic (snapshots of 500/1826/2520 and 500/2765/2520 MHz, rocminfo nominal 2520), sampled per-run medians spanned 1228-3178 MHz, GPU busy averaged 91% and the heaviest runs sat at the 250 W cap (median-of-medians 242 W, maximum sample 352 W).",
+  "Cross-backend output differences are arithmetic, not failures: vkhip vs the engine's Vulkan stages is 55-57 dB (SR) and 47.6-49.7 dB (RR at 1440p) / 48.1-50.5 dB (RR at 4K) on this case."
+ ]
+}

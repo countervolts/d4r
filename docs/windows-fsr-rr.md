@@ -225,8 +225,7 @@ At 1280x720 with two direct signals and NGX's existing arithmetic settings, the 
 existing run-to-run noise; all seven replacements activate. These are synthetic GPU timings, not game FPS.
 This is a modest Windows optimization, not Linux performance parity. Actual loop expansion and
 straight-line cooperative-matrix component conversion did not improve the measured result beyond `-O`
-and are not included. Full measurements and deployment details are in
-`C:\Users\ayo\Desktop\d4r-windows-fsr-results-20261017-0333\SUMMARY-selected-O.md`.
+and are not included.
 
 ## History: the investigation before the vkd3d route
 

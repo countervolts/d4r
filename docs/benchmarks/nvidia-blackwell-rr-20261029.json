@@ -1,0 +1,442 @@
+{
+  "gpu": "NVIDIA RTX PRO 4500 Blackwell (200 W)",
+  "driver": "595.91.07",
+  "method": "Official NGX CUDA, CUDA events per evaluation, 40 warmup + 100 measured frames, median of three trial medians per case. Presets alternate within each geometry.",
+  "mode": "Performance (render dimensions half output in both axes)",
+  "flags": "0x3: HDR, low-resolution motion; linear depth, packed roughness, exposure=1",
+  "input": "Single static noisy ray-traced fsr_rr_scene frame reused with zero motion and alternating jitter. RGBA16F color/normals+roughness; RGBA8 UNORM linear diffuse/specular albedo; R32F linear depth/specular hit distance (constant 4); RG16F motion. View and projection matrices supplied. No quality measurement.",
+  "cases": {
+    "310.3.0/A/1280x720->2560x1440": {
+      "library": "310.3.0",
+      "preset": "A",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.334656,
+        1.35824,
+        1.361216
+      ],
+      "output_hashes": [
+        "be4d9a916cbbc356",
+        "be4d9a916cbbc356",
+        "be4d9a916cbbc356"
+      ],
+      "median_ms": 1.35824
+    },
+    "310.3.0/A/1920x1080->3840x2160": {
+      "library": "310.3.0",
+      "preset": "A",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        2.976896,
+        2.97936,
+        2.989728
+      ],
+      "output_hashes": [
+        "8401d75f1e4d9ec1",
+        "8401d75f1e4d9ec1",
+        "8401d75f1e4d9ec1"
+      ],
+      "median_ms": 2.97936
+    },
+    "310.3.0/B/1280x720->2560x1440": {
+      "library": "310.3.0",
+      "preset": "B",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.352768,
+        1.351904,
+        1.36048
+      ],
+      "output_hashes": [
+        "b9a4913a453dedca",
+        "b9a4913a453dedca",
+        "b9a4913a453dedca"
+      ],
+      "median_ms": 1.352768
+    },
+    "310.3.0/B/1920x1080->3840x2160": {
+      "library": "310.3.0",
+      "preset": "B",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        2.974912,
+        2.983008,
+        2.989088
+      ],
+      "output_hashes": [
+        "401dd0db519bd167",
+        "401dd0db519bd167",
+        "401dd0db519bd167"
+      ],
+      "median_ms": 2.983008
+    },
+    "310.3.0/C/1280x720->2560x1440": {
+      "library": "310.3.0",
+      "preset": "C",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.349856,
+        1.357984,
+        1.359424
+      ],
+      "output_hashes": [
+        "b9a4913a453dedca",
+        "b9a4913a453dedca",
+        "b9a4913a453dedca"
+      ],
+      "median_ms": 1.357984
+    },
+    "310.3.0/C/1920x1080->3840x2160": {
+      "library": "310.3.0",
+      "preset": "C",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        2.976864,
+        2.987552,
+        2.991616
+      ],
+      "output_hashes": [
+        "401dd0db519bd167",
+        "401dd0db519bd167",
+        "401dd0db519bd167"
+      ],
+      "median_ms": 2.987552
+    },
+    "310.3.0/D/1280x720->2560x1440": {
+      "library": "310.3.0",
+      "preset": "D",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.850816,
+        1.856288,
+        1.863712
+      ],
+      "output_hashes": [
+        "e369693fc1f473df",
+        "e369693fc1f473df",
+        "e369693fc1f473df"
+      ],
+      "median_ms": 1.856288
+    },
+    "310.3.0/D/1920x1080->3840x2160": {
+      "library": "310.3.0",
+      "preset": "D",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        4.061216,
+        4.071296,
+        4.073248
+      ],
+      "output_hashes": [
+        "a3b2f707a72a75df",
+        "a3b2f707a72a75df",
+        "a3b2f707a72a75df"
+      ],
+      "median_ms": 4.071296
+    },
+    "310.3.0/E/1280x720->2560x1440": {
+      "library": "310.3.0",
+      "preset": "E",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.85792,
+        1.860064,
+        1.865632
+      ],
+      "output_hashes": [
+        "31319deb0e445361",
+        "31319deb0e445361",
+        "31319deb0e445361"
+      ],
+      "median_ms": 1.860064
+    },
+    "310.3.0/E/1920x1080->3840x2160": {
+      "library": "310.3.0",
+      "preset": "E",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        4.052096,
+        4.062464,
+        4.064096
+      ],
+      "output_hashes": [
+        "163107812694ebf0",
+        "163107812694ebf0",
+        "163107812694ebf0"
+      ],
+      "median_ms": 4.062464
+    },
+    "310.9.16/D/1280x720->2560x1440": {
+      "library": "310.9.16",
+      "preset": "D",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.852736,
+        1.859808,
+        1.864
+      ],
+      "output_hashes": [
+        "e369693fc1f473df",
+        "e369693fc1f473df",
+        "e369693fc1f473df"
+      ],
+      "median_ms": 1.859808
+    },
+    "310.9.16/D/1920x1080->3840x2160": {
+      "library": "310.9.16",
+      "preset": "D",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        4.039712,
+        4.054944,
+        4.060608
+      ],
+      "output_hashes": [
+        "a3b2f707a72a75df",
+        "a3b2f707a72a75df",
+        "a3b2f707a72a75df"
+      ],
+      "median_ms": 4.054944
+    },
+    "310.9.16/E/1280x720->2560x1440": {
+      "library": "310.9.16",
+      "preset": "E",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        1.855712,
+        1.863104,
+        1.865184
+      ],
+      "output_hashes": [
+        "31319deb0e445361",
+        "31319deb0e445361",
+        "31319deb0e445361"
+      ],
+      "median_ms": 1.863104
+    },
+    "310.9.16/E/1920x1080->3840x2160": {
+      "library": "310.9.16",
+      "preset": "E",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        4.044704,
+        4.057024,
+        4.06096
+      ],
+      "output_hashes": [
+        "163107812694ebf0",
+        "163107812694ebf0",
+        "163107812694ebf0"
+      ],
+      "median_ms": 4.057024
+    },
+    "310.9.16/F/1280x720->2560x1440": {
+      "library": "310.9.16",
+      "preset": "F",
+      "input": "1280x720",
+      "output": "2560x1440",
+      "trial_medians_ms": [
+        2.094592,
+        2.09984,
+        2.101536
+      ],
+      "output_hashes": [
+        "bbc4b2cf1c00d64",
+        "bbc4b2cf1c00d64",
+        "bbc4b2cf1c00d64"
+      ],
+      "median_ms": 2.09984
+    },
+    "310.9.16/F/1920x1080->3840x2160": {
+      "library": "310.9.16",
+      "preset": "F",
+      "input": "1920x1080",
+      "output": "3840x2160",
+      "trial_medians_ms": [
+        4.64672,
+        4.657856,
+        4.65936
+      ],
+      "output_hashes": [
+        "ca33085007822595",
+        "ca33085007822595",
+        "ca33085007822595"
+      ],
+      "median_ms": 4.657856
+    }
+  },
+  "source_sha256": "3affe3e0787837d243955d77a6f11df11d0380faa4998a7fa899596901ecce07",
+  "library_sha256": {
+    "310.3.0": "d443d36d729a80338b398f9b36e9a3bce4528162536e32eb4aa4c4b45183805a",
+    "310.9.16": "a5d59de18841f15779039dda567a15dd723ba737915f489271fdb5f109fbfb96"
+  },
+  "profile_4k": {
+    "v310.3.0-p1-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 18,
+      "median_sum_kernel_ms": 2.931623,
+      "per_kernel_median_sum_ms": {
+        "Dec0": 0.2000815,
+        "Dec1": 0.12622499999999998,
+        "Dec2": 0.0938885,
+        "Dec3": 0.061008,
+        "Dec4": 0.0439205,
+        "Enc0": 0.3207225,
+        "Enc1": 0.193074,
+        "Enc2": 0.1975375,
+        "Enc3": 0.095265,
+        "Enc4": 0.06048,
+        "PDL": 0.461955,
+        "cuda_dldn_engine_auto_exposure_copy_kernel": 0.001696,
+        "cuda_dldn_engine_hkpn_input_kernel": 0.386003,
+        "cuda_dldn_engine_hkpn_output_kernel": 0.656613,
+        "cuda_dldn_engine_luma_convert_kernel": 0.022784,
+        "cuda_dldn_engine_reduce_sum_kernel": 0.014415999999999998
+      }
+    },
+    "v310.3.0-p2-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 18,
+      "median_sum_kernel_ms": 2.938903,
+      "per_kernel_median_sum_ms": {
+        "Dec0": 0.1996655,
+        "Dec1": 0.126241,
+        "Dec2": 0.094049,
+        "Dec3": 0.060815999999999995,
+        "Dec4": 0.043553,
+        "Enc0": 0.322307,
+        "Enc1": 0.193969,
+        "Enc2": 0.197746,
+        "Enc3": 0.0950085,
+        "Enc4": 0.0605445,
+        "PDL": 0.46077199999999996,
+        "cuda_dldn_engine_auto_exposure_copy_kernel": 0.001664,
+        "cuda_dldn_engine_hkpn_input_kernel_preset_1": 0.386499,
+        "cuda_dldn_engine_hkpn_output_kernel": 0.654005,
+        "cuda_dldn_engine_luma_convert_kernel": 0.022864000000000002,
+        "cuda_dldn_engine_reduce_sum_kernel": 0.014368
+      }
+    },
+    "v310.3.0-p3-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 18,
+      "median_sum_kernel_ms": 2.935975,
+      "per_kernel_median_sum_ms": {
+        "Dec0": 0.20061,
+        "Dec1": 0.126353,
+        "Dec2": 0.094401,
+        "Dec3": 0.0606885,
+        "Dec4": 0.043568499999999996,
+        "Enc0": 0.32163450000000005,
+        "Enc1": 0.194162,
+        "Enc2": 0.197282,
+        "Enc3": 0.095457,
+        "Enc4": 0.060480500000000006,
+        "PDL": 0.462563,
+        "cuda_dldn_engine_auto_exposure_copy_kernel": 0.00168,
+        "cuda_dldn_engine_hkpn_input_kernel_preset_1": 0.38486699999999996,
+        "cuda_dldn_engine_hkpn_output_kernel": 0.657077,
+        "cuda_dldn_engine_luma_convert_kernel": 0.022944,
+        "cuda_dldn_engine_reduce_sum_kernel": 0.0143685
+      }
+    },
+    "v310.9.16-p4-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 17,
+      "median_sum_kernel_ms": 4.0501275,
+      "per_kernel_median_sum_ms": {
+        "cuda_dldn_engine_auto_exposure_copy_kernel": 0.001696,
+        "cuda_dldn_engine_hkpn_output_kernel_transformer_diamond_wallaby": 0.7795099999999999,
+        "cuda_dldn_engine_luma_convert_kernel": 0.022736,
+        "cuda_dldn_engine_reduce_sum_kernel": 0.01432,
+        "cuda_dldn_engine_swin_dec0_diamond_wallaby_kernel": 0.717318,
+        "cuda_dldn_engine_swin_dec1_kernel": 0.40392300000000003,
+        "cuda_dldn_engine_swin_dec2_kernel": 0.214034,
+        "cuda_dldn_engine_swin_dec3_kernel": 0.089937,
+        "cuda_dldn_engine_swin_dec4_kernel": 0.0672325,
+        "cuda_dldn_engine_swin_enc0_diamond_wallaby_kernel": 1.0207760000000001,
+        "cuda_dldn_engine_swin_enc1_kernel": 0.315363,
+        "cuda_dldn_engine_swin_enc2_kernel": 0.2188975,
+        "cuda_dldn_engine_swin_enc3_kernel": 0.0871525,
+        "cuda_dldn_engine_swin_enc4_kernel": 0.06350449999999999,
+        "cuda_dldn_engine_swin_enc5_kernel": 0.029072
+      }
+    },
+    "v310.9.16-p5-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 17,
+      "median_sum_kernel_ms": 4.049583,
+      "per_kernel_median_sum_ms": {
+        "cuda_dldn_engine_auto_exposure_copy_kernel": 0.001696,
+        "cuda_dldn_engine_hkpn_output_kernel_transformer": 0.7178770000000001,
+        "cuda_dldn_engine_luma_convert_kernel": 0.022752,
+        "cuda_dldn_engine_reduce_sum_kernel": 0.014352,
+        "cuda_dldn_engine_swin_dec0_kernel": 0.7153975,
+        "cuda_dldn_engine_swin_dec1_kernel": 0.405987,
+        "cuda_dldn_engine_swin_dec2_kernel": 0.2146095,
+        "cuda_dldn_engine_swin_dec3_kernel": 0.0895685,
+        "cuda_dldn_engine_swin_dec4_kernel": 0.067632,
+        "cuda_dldn_engine_swin_enc0_kernel": 1.0779290000000001,
+        "cuda_dldn_engine_swin_enc1_kernel": 0.313859,
+        "cuda_dldn_engine_swin_enc2_kernel": 0.21982600000000002,
+        "cuda_dldn_engine_swin_enc3_kernel": 0.08664050000000001,
+        "cuda_dldn_engine_swin_enc4_kernel": 0.063872,
+        "cuda_dldn_engine_swin_enc5_kernel": 0.0290725
+      }
+    },
+    "v310.9.16-p6-4k": {
+      "warmup_frames": 40,
+      "measured_frames": 10,
+      "kernels_per_frame": 49,
+      "median_sum_kernel_ms": 4.589188,
+      "per_kernel_median_sum_ms": {
+        "rr2_dec0_kernel_0": 0.4200515,
+        "rr2_dec0_kernel_1": 0.383347,
+        "rr2_dec1_kernel_0": 0.245026,
+        "rr2_dec1_kernel_1": 0.214369,
+        "rr2_dec2_kernel_0": 0.141233,
+        "rr2_dec2_kernel_1": 0.12353700000000001,
+        "rr2_dec3_kernel_0": 0.061088500000000004,
+        "rr2_dec3_kernel_1": 0.054913000000000003,
+        "rr2_dec4_kernel_0": 0.055104,
+        "rr2_dec4_kernel_1": 0.046625,
+        "rr2_downsample_kernel_static_hdr_no_transparency": 0.308755,
+        "rr2_enc0_kernel": 0.712054,
+        "rr2_enc1_kernel": 0.295794,
+        "rr2_enc2_kernel": 0.166514,
+        "rr2_enc3_kernel": 0.07940849999999999,
+        "rr2_enc4_kernel": 0.0633765,
+        "rr2_enc5_kernel": 0.029471999999999998,
+        "rr2_histogram_auto_exposure_basic_kernel": 0.036463999999999996,
+        "rr2_pooled_history2_kernel": 0.0249285,
+        "rr2_post_kernel": 1.127449
+      }
+    }
+  },
+  "cost": {
+    "elapsed_seconds": 340.26729,
+    "hourly_usd": 0.72,
+    "estimated_usd": 0.068053458,
+    "note": "Creation-to-termination estimate, not a billing receipt"
+  },
+  "terminated": true
+}

@@ -1,16 +1,8 @@
-// CU mode: the waves of a window share one L0 cache (1-6% faster here; slower in the wide layers)
-// d4r-build-flags: -mcumode
+// Exact single-buffer enc1: reload the original input for the residual, preserve WGP mode.
+// d4r-build-flags: -DPOS_VSHARE1 -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM
+// RDNA3: two waves normalize one token per lane straight from global memory (POS_DIRECT_NORM: no raw-input LDS
+// staging; 237 -> 213 VGPRs, 0.175 -> 0.172 ms at 1440p, byte-identical)
+// d4r-build-flags-gfx11: -DPOS_VSHARE1 -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPOS_DIRECT_NORM
 #define PWIN_F32ACC
-#ifdef D4R_K_ENC1_POS_MT
-#if (!defined(__GFX12__) && !defined(__GFX11__)) || !defined(D4R_K_FP16_BASELINE)
-#error "experimental enc1 token tiling requires gfx11/gfx12 strict K baseline"
-#endif
-#if D4R_K_ENC1_POS_MT != 1 && D4R_K_ENC1_POS_MT != 2 && D4R_K_ENC1_POS_MT != 4
-#error "enc1 token tiles per wave must be 1, 2 or 4"
-#endif
-#include "pwin_pos.h"
-POS_ENCODER(dltss_pwin_enc1_layer, 2, 64, 64, 0, D4R_K_ENC1_POS_MT)
-#else
-#include "pwin_layer.h"
-PWIN_ENCODER_POS(dltss_pwin_enc1_layer, 2, 64, 64, true)
-#endif
+#include "pwin_pos_recompute.h"
+POS_RECOMPUTE_ENCODER(dltss_pwin_enc1_layer, 2, 64, 64, 0, 1)

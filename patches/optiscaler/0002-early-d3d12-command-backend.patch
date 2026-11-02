@@ -1,5 +1,5 @@
 From 7ed1f1d66b430ba35a197fbd9880cd6a76af8f06 Mon Sep 17 00:00:00 2001
-From: Codex <codex@localhost>
+From: ayo <93222141+countervolts@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 16:45:01 +0300
 Subject: [PATCH] Install the external d4r command backend before NGX
  initialization

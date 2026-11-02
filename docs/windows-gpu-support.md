@@ -177,7 +177,7 @@ intrinsic/layout, without a forced gfx12 shim.
 The fork reports RX 7800 XT enc1/enc2 identity/nonzero/reference checks. Those
 are **the author's results**, not validation of this adaptation or full K/M
 here. LDS exchange, full network, translated CUDA, accuracy, interop and speed
-still need physical gfx11 testing. Credit: realdody <dodobozicek@gmail.com>.
+still need physical gfx11 testing. Credit: realdody.
 
 ## Results and next hardware gate
 

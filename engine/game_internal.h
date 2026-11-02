@@ -48,9 +48,9 @@ inline void barrier(VkCommandBuffer cb, VkPipelineStageFlags source, VkPipelineS
     b.srcAccessMask = src; b.dstAccessMask = dst;
     vkCmdPipelineBarrier(cb, source, destination, 0, 1, &b, 0, nullptr, 0, nullptr);
 }
-inline bool directOutput(const GameImage& output, const GameImage& color, const GameImage& motion, const GameImage& depth, bool rgb10) {
-    return output.view != VK_NULL_HANDLE && (output.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
-        (rgb10 && output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)) &&
+// packedStore: the model has a final-store variant for output.format (RGBA16F needs none)
+inline bool directOutput(const GameImage& output, const GameImage& color, const GameImage& motion, const GameImage& depth, bool packedStore) {
+    return output.view != VK_NULL_HANDLE && (output.format == VK_FORMAT_R16G16B16A16_SFLOAT || packedStore) &&
         output.layout == VK_IMAGE_LAYOUT_GENERAL && output.image != color.image &&
         output.image != motion.image && output.image != depth.image;
 }

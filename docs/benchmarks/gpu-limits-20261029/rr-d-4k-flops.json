@@ -1,0 +1,79 @@
+{
+ "enc0": {
+  "level": 0,
+  "tokens": 2088960,
+  "gemm_flop_per_tok": 54272.0,
+  "attn_flop_per_tok": 24576.0,
+  "gflop": 164.71031808
+ },
+ "enc1": {
+  "level": 1,
+  "tokens": 522240,
+  "gemm_flop_per_tok": 149504.0,
+  "attn_flop_per_tok": 49152.0,
+  "gflop": 103.74610944
+ },
+ "enc2": {
+  "level": 2,
+  "tokens": 130560,
+  "gemm_flop_per_tok": 347136.0,
+  "attn_flop_per_tok": 196608.0,
+  "gflop": 70.99121664
+ },
+ "enc3": {
+  "level": 3,
+  "tokens": 32640,
+  "gemm_flop_per_tok": 561152.0,
+  "attn_flop_per_tok": 196608.0,
+  "gflop": 24.7332864
+ },
+ "enc4": {
+  "level": 4,
+  "tokens": 8160,
+  "gemm_flop_per_tok": 947200.0,
+  "attn_flop_per_tok": 786432.0,
+  "gflop": 14.14643712
+ },
+ "enc5": {
+  "level": 5,
+  "tokens": 2040,
+  "gemm_flop_per_tok": 742400.0,
+  "attn_flop_per_tok": 786432.0,
+  "gflop": 3.11881728
+ },
+ "dec4": {
+  "level": 4,
+  "tokens": 8160,
+  "gemm_flop_per_tok": 947200.0,
+  "attn_flop_per_tok": 786432.0,
+  "gflop": 14.14643712
+ },
+ "dec3": {
+  "level": 3,
+  "tokens": 32640,
+  "gemm_flop_per_tok": 561152.0,
+  "attn_flop_per_tok": 196608.0,
+  "gflop": 24.7332864
+ },
+ "dec2": {
+  "level": 2,
+  "tokens": 130560,
+  "gemm_flop_per_tok": 347136.0,
+  "attn_flop_per_tok": 196608.0,
+  "gflop": 70.99121664
+ },
+ "dec1": {
+  "level": 1,
+  "tokens": 522240,
+  "gemm_flop_per_tok": 149504.0,
+  "attn_flop_per_tok": 49152.0,
+  "gflop": 103.74610944
+ },
+ "dec0": {
+  "level": 0,
+  "tokens": 2088960,
+  "gemm_flop_per_tok": 49152.0,
+  "attn_flop_per_tok": 24576.0,
+  "gflop": 154.01484288
+ }
+}

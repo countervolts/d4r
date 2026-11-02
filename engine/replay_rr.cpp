@@ -9,11 +9,16 @@
 //   (RGBA8 UNORM), all at the render size.
 //   OUT_DIR receives F-NAME.bin for every debug image of frame F.
 #include "runtime.h"
+#ifdef D4R_ENGINE_VKHIP
+#include "vkhip/vkhip_net.h"
+#include <filesystem>
+#endif
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -23,6 +28,11 @@ void check(VkResult r, const char* operation) {
     if (r != VK_SUCCESS) throw std::runtime_error(std::string(operation) + ": VkResult " + std::to_string(r));
 }
 #define CK(call) check((call), #call)
+// a D4R_RR_TEST_* switch: set to anything but "" or "0"
+bool testFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") != 0;
+}
 std::vector<char> read(const std::string& file) {
     std::ifstream stream(file, std::ios::binary | std::ios::ate);
     if (!stream) throw std::runtime_error("cannot read " + file);
@@ -141,6 +151,7 @@ int main(int argc, char** argv) try {
     std::vector<const char*> extensions;
     if (cm.cooperativeMatrix) extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     if (f8.shaderFloat8) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    if (std::getenv("D4R_TMP_ISA_DIR") && hasExtension("VK_AMD_shader_info")) extensions.push_back("VK_AMD_shader_info");   // TEMP
     uint32_t families = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(c.physical, &families, qf);
     uint32_t family = 0;
     for (uint32_t i = 0; i < families; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { family = i; break; }
@@ -149,7 +160,7 @@ int main(int argc, char** argv) try {
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
     // D4R_RR_TEST_ROBUST2=1: robustBufferAccess2 / robustImageAccess2 as vkd3d-proton enables them (out-of-bounds
     // reads return zero)
-    const bool robust2 = std::getenv("D4R_RR_TEST_ROBUST2") != nullptr;
+    const bool robust2 = testFlag("D4R_RR_TEST_ROBUST2");
     if (robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     else { rb2.robustBufferAccess2 = rb2.robustImageAccess2 = rb2.nullDescriptor = VK_FALSE; }
     // Omit unsupported extension feature structures as well as their extension names. gfx11 RR uses f16 matrices.
@@ -161,9 +172,42 @@ int main(int argc, char** argv) try {
     }
     di.enabledExtensionCount = static_cast<uint32_t>(extensions.size()); di.ppEnabledExtensionNames = extensions.data();
     // D4R_RR_TEST_NO_ROBUST=1: no robust buffer or image access (out-of-bounds reads are undefined)
-    if (std::getenv("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
+    if (testFlag("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
     // D4R_RR_TEST_NO_COOPMAT=1: a device like vkd3d-proton's, without the cooperative-matrix and float8 features
-    if (std::getenv("D4R_RR_TEST_NO_COOPMAT")) { di.enabledExtensionCount = 0; v13.pNext = nullptr; }
+    if (testFlag("D4R_RR_TEST_NO_COOPMAT")) { di.enabledExtensionCount = 0; v13.pNext = nullptr; }
+    // D4R_RR_TEST_NO_INT64_ATOMICS=1: no 64-bit buffer atomics (preset F's exposure then takes its two passes)
+    if (testFlag("D4R_RR_TEST_NO_INT64_ATOMICS")) v12.shaderBufferInt64Atomics = v12.shaderSharedInt64Atomics = VK_FALSE;
+#ifdef D4R_ENGINE_VKHIP
+    // D4R_ENGINE_VKHIP=1 with a model that has hip/rr_<stage>.hsaco (kernels/rr/build_vkhip.sh): presets D and E's Swin
+    // stages on vkhip (vkhip::RRStages), which reach the engine's images through VK_EXT_descriptor_buffer
+    const bool vkhip = testFlag("D4R_ENGINE_VKHIP") && std::filesystem::is_directory(modelDir + "/hip") &&
+                       hasExtension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) && v12.bufferDeviceAddress;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT dbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+    // AMD's own driver (Windows) injects through VK_KHR_pipeline_binary; RADV through the patched pipeline cache
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 driverProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    vkGetPhysicalDeviceProperties2(c.physical, &driverProps);
+    const bool binaries = vkhip && driver.driverID != VK_DRIVER_ID_MESA_RADV;
+    if (binaries && !hasExtension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME))
+        throw std::runtime_error("vkhip needs VK_KHR_pipeline_binary outside RADV");
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR, &m5};
+    if (vkhip) {
+        dbf.descriptorBuffer = VK_TRUE;
+        dbf.pNext = binaries ? &pb : f2.pNext;
+        if (binaries) {
+            m5.maintenance5 = pb.pipelineBinaries = VK_TRUE;
+            extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+            extensions.push_back("VK_KHR_maintenance5");
+        }
+        f2.pNext = &dbf;
+        extensions.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        di.enabledExtensionCount = static_cast<uint32_t>(extensions.size()); di.ppEnabledExtensionNames = extensions.data();
+    }
+#else
+    const bool vkhip = false;
+    const bool binaries = false;
+#endif
     CK(vkCreateDevice(c.physical, &di, nullptr, &c.device));
 #ifdef D4R_ENGINE_VOLK
     volkLoadDevice(c.device);
@@ -178,8 +222,59 @@ int main(int argc, char** argv) try {
     std::string key;
     uint32_t rw, rh, ow, oh;
     frames >> key >> rw >> rh >> ow >> oh;
-    d4r::RModel model(c.physical, c.device, modelDir);
-    d4r::REngine engine(model, rw, rh, ow, oh);
+    d4r::RModel model(c.physical, c.device, modelDir, VK_NULL_HANDLE, v12.shaderBufferInt64Atomics == VK_TRUE,
+                      robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && rb2.robustImageAccess2 == VK_TRUE);
+    d4r::REngine engine(model, rw, rh, ow, oh, vkhip);
+#ifdef D4R_ENGINE_VKHIP
+    vkhip::RRStages vkhipStages;
+    if (vkhip) {
+        vkhip::NetFiles files;
+        std::map<std::string, std::vector<uint8_t>> weights;
+        files.pipelineBinary = binaries;
+        for (const char* s : {"enc0", "enc1", "enc2", "enc3", "enc4", "enc5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
+            const std::string code = modelDir + "/hip/rr_" + s + ".hsaco", w = modelDir + "/weights-" + s + "m.bin";
+            if (!std::filesystem::exists(code) || !std::filesystem::exists(w)) continue;
+            // D4R_VKHIP_RR_STAGES=enc4,enc5,...: only these stages on vkhip
+            const char* only = std::getenv("D4R_VKHIP_RR_STAGES");
+            if (only && *only && ("," + std::string(only) + ",").find("," + std::string(s) + ",") == std::string::npos) continue;
+            auto bytes = read(code);
+            files.code["rr_" + std::string(s)] = std::vector<uint8_t>(bytes.begin(), bytes.end());
+            auto wb = read(w);
+            weights[s] = std::vector<uint8_t>(wb.begin(), wb.end());
+        }
+        if (model.preset() >= 1 && model.preset() <= 3) {   // presets A - C: kernels/rr/build_vkhip_cnn.sh
+            for (const char* stage : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec4", "dec3", "dec2", "dec1", "dec0", "pdl"}) {
+                const char* only = std::getenv("D4R_VKHIP_RR_STAGES");
+                if (only && *only && ("," + std::string(only) + ",").find("," + std::string(stage) + ",") == std::string::npos) continue;
+                const std::string name = std::string("rr3_") + stage, path = modelDir + "/hip/" + name + ".hsaco";
+                if (!std::filesystem::exists(path)) continue;
+                auto code = read(path);
+                files.code[name] = {code.begin(), code.end()};
+            }
+        }
+        if (model.preset() == 6) {
+            for (const char* stage : {"enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1", "dec3_0", "dec3_1",
+                                      "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0"}) {
+                const char* only = std::getenv("D4R_VKHIP_RR_STAGES");
+                if (only && *only && ("," + std::string(only) + ",").find("," + std::string(stage) + ",") == std::string::npos) continue;
+                const std::string name = std::string("rr2_") + stage, path = modelDir + "/hip/" + name + ".hsaco";
+                if (!std::filesystem::exists(path)) continue;
+                auto code = read(path);
+                files.code[name] = {code.begin(), code.end()};
+                auto w = read(modelDir + "/weights-" + stage + "m.bin");
+                weights[stage] = {w.begin(), w.end()};
+            }
+        }
+        std::string error;
+        if (vkhipStages.create(c.physical, vkGetInstanceProcAddr, instance, c.device, vkGetDeviceProcAddr, c.memory, files,
+                               weights, engine, error)) {
+            engine.setStageRecorder(&vkhipStages);
+            std::cerr << "vkhip: " << vkhipStages.stageCount() << " Ray Reconstruction stages\n";
+        } else {
+            std::cerr << "vkhip unavailable: " << error << "\n";
+        }
+    }
+#endif
     const char* names[] = {"color", "motion", "depth", "normals", "roughness", "diffuse", "specular"};
     const VkFormat formats[] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT,
                                 VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM,
@@ -194,10 +289,17 @@ int main(int argc, char** argv) try {
     HostBuffer staging(c, VkDeviceSize(ow) * oh * 8 * 4);
     // GPU time of every frame: REngine's four stamps (start, after exposure, after the network, after the output)
     VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 4;
+    qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 32;
+    // D4R_ENGINE_RR_STAGE_STAMPS=1: the time of every network stage and output group as well (best frame of the repeats)
+    const bool stageTimes = std::getenv("D4R_ENGINE_RR_STAGE_STAMPS") != nullptr;
     VkQueryPool stamps; CK(vkCreateQueryPool(c.device, &qp, nullptr, &stamps));
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(c.physical, &props);
     const int repeat = std::getenv("D4R_RR_TIME_REPEAT") ? std::atoi(std::getenv("D4R_RR_TIME_REPEAT")) : 1;
+    // D4R_RR_NO_UPLOAD=1: upload the inputs once. Consecutive frames.txt entries that reuse the same frame then
+    // evaluate back to back, as the official CUDA probe does (its textures are uploaded before the timed loop).
+    // D4R_RR_NO_WRITE=1: save no debug images; the final out image is written by a separate verification run.
+    const bool skipUpload = testFlag("D4R_RR_NO_UPLOAD");
+    const bool skipWrite = testFlag("D4R_RR_NO_WRITE");
     bool first = true;
     while (frames >> key) {
         uint32_t f;
@@ -209,6 +311,7 @@ int main(int argc, char** argv) try {
         s.reset = reset != 0; s.depthInverted = (inverted & 1) != 0; s.hardwareDepth = (inverted & 2) != 0;   // bit 1: DLSS.Use.HW.Depth
         s.roughnessPacked = (inverted & 4) != 0;   // bit 2: DLSS.Roughness.Mode (preset F inputs)
         for (size_t i = 0; i < inputs.size(); ++i) {
+            if (skipUpload && !first) continue;
             auto data = read(inputDir + "/" + std::to_string(f) + "-" + names[i] + ".bin");
             if (data.size() != size_t(rw) * rh * texelBytes(formats[i])) throw std::runtime_error(std::string("input size: ") + names[i]);
             std::memcpy(staging.mapped, data.data(), data.size());
@@ -227,37 +330,56 @@ int main(int argc, char** argv) try {
         for (int k = 0; k < 4; ++k) {
             std::ifstream probe(inputDir + "/" + std::to_string(f) + "-" + optionalNames[k] + ".bin", std::ios::binary);
             if (!probe) continue;
-            auto data = read(inputDir + "/" + std::to_string(f) + "-" + optionalNames[k] + ".bin");
-            if (data.size() != size_t(rw) * rh * texelBytes(optionalFormats[k])) throw std::runtime_error(std::string("input size: ") + optionalNames[k]);
-            std::memcpy(staging.mapped, data.data(), data.size());
-            c.submit([&](VkCommandBuffer cb) {
-                barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                VkBufferImageCopy region; copyRegion(region, rw, rh);
-                vkCmdCopyBufferToImage(cb, staging.buffer, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-                barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-            });
+            if (!skipUpload || first) {
+                auto data = read(inputDir + "/" + std::to_string(f) + "-" + optionalNames[k] + ".bin");
+                if (data.size() != size_t(rw) * rh * texelBytes(optionalFormats[k])) throw std::runtime_error(std::string("input size: ") + optionalNames[k]);
+                std::memcpy(staging.mapped, data.data(), data.size());
+                c.submit([&](VkCommandBuffer cb) {
+                    barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    VkBufferImageCopy region; copyRegion(region, rw, rh);
+                    vkCmdCopyBufferToImage(cb, staging.buffer, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                    barrier(cb, optional[k].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+                });
+            }
             VkImageView* slots[] = {&images.specularHitDistance, &images.disocclusionMask, &images.subsurfaceGuide, &images.colorBeforeParticles};
             *slots[k] = optional[k].view;
         }
         engine.setFrame(images, s);
         if (first) c.submit([&](VkCommandBuffer cb) { model.recordUpload(cb); engine.recordInitialize(cb); first = false; });
         double best = 1e30, network = 0, output = 0, exposure = 0;
+        std::vector<double> stageBest(28, 1e30);
         for (int r = 0; r < repeat; ++r) {
             if (r) engine.setFrame(images, s);
             c.submit([&](VkCommandBuffer cb) {
-                vkCmdResetQueryPool(cb, stamps, 0, 4);
+                vkCmdResetQueryPool(cb, stamps, 0, 32);
                 engine.recordFrame(cb, stamps, 0);
             });
             uint64_t t[4];
             CK(vkGetQueryPoolResults(c.device, stamps, 0, 4, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             const double ms = props.limits.timestampPeriod * 1e-6;
+            if (stageTimes) {   // per stage: the minimum over the repeats (stamps 1, then 4 ... as written)
+                uint64_t all[32][2];
+                vkGetQueryPoolResults(c.device, stamps, 0, 32, sizeof(all), all, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                uint64_t prev = all[1][0];
+                for (uint32_t q = 4; q < 32 && all[q][1]; ++q) {
+                    stageBest[q - 4] = std::min(stageBest[q - 4], (all[q][0] - prev) * ms);
+                    prev = all[q][0];
+                }
+            }
             if ((t[3] - t[0]) * ms < best) {
                 best = (t[3] - t[0]) * ms; exposure = (t[1] - t[0]) * ms; network = (t[2] - t[1]) * ms; output = (t[3] - t[2]) * ms;
             }
         }
         std::cout << "frame " << f << ": " << best << " ms (exposure " << exposure << ", network " << network
                   << ", output " << output << ")\n";
+        if (stageTimes) {
+            std::cout << "stages (us):";
+            for (double t : stageBest) if (t < 1e29) std::cout << " " << static_cast<int>(t * 1000 + 0.5);
+            std::cout << "\n";
+        }
         for (const auto& d : engine.debugImages()) {
+            if (skipWrite) break;
+            if (testFlag("D4R_RR_OUTPUT_ONLY") && d.name != "out") continue;
             const size_t bytes = size_t(d.width) * d.height * texelBytes(d.format);
             c.submit([&](VkCommandBuffer cb) {
                 VkBufferImageCopy r; copyRegion(r, d.width, d.height);

@@ -1,0 +1,10 @@
+AMD Radeon RX 9070 XT units=32
+fp32 fma                 8.07 T ops/s
+fp32 fma                 8.60 T ops/s
+fp32 fma                 8.86 T ops/s
+int32 xor/shift/add     15.84 T ops/s
+int32 xor/shift/add     17.17 T ops/s
+int32 xor/shift/add     16.20 T ops/s
+packed f16x2 fma        22.08 T ops/s
+packed f16x2 fma        24.15 T ops/s
+packed f16x2 fma        24.06 T ops/s
