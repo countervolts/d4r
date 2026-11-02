@@ -173,7 +173,11 @@ private:
         return kSuccess;
     }
 
-    static constexpr unsigned kCapacity = 256;
+    // RESIDENT EVIL Requiem's engine reuses one long-lived parameter object for every NGX feature
+    // (DLSS, Ray Reconstruction, DLSSD, DLSS-G) and sets more than 256 distinct names on it. Past
+    // capacity the last slot is reused, which silently clobbers live parameters (DLSSG.Reset vanished
+    // every frame and the endpoint refused evaluates). Keep headroom well above any game's namespace.
+    static constexpr unsigned kCapacity = 4096;
     unsigned count_ = 0;
     Entry entries_[kCapacity];
 };
