@@ -5,6 +5,8 @@ HASH = 'e97423838c9a9060411bca04480f0c2cf02d9037be53ee88cc6fd7442d3f1bbb'
 ENTRY = 'k_conv_fp16_nhwc'
 
 def build(src, hooks=None):
+    # tile chosen by a gfx11 harness sweep (smaller tiles / 32 output channels per workgroup: more workgroups on
+    # this small layer); every output element runs the same chain, output bit-identical
     glsl, meta = _dl1.kconv_g(KS=1, NCH=16, NT=2, NTALL=8, BIAS=65536, order='c',
-                              TH=4, R=1, warps=8, act='leaky', hooks=hooks)
-    return glsl, meta + ['t1_grid 1 1 1 1 1 2']
+                              TH=8, R=2, warps=8, act='leaky', hooks=hooks)
+    return glsl, meta + ['t1_grid 1 1 1 2 1 2']

@@ -6,5 +6,5 @@ ENTRY = 'k_conv_fp16_nhwc'
 
 def build(src, hooks=None):
     glsl, meta = _dl1.kconv_g(KS=1, NCH=8, NT=2, NTALL=4, BIAS=16384, order='c',
-                              TH=16, R=4, warps=8, act='leaky', hooks=hooks)
-    return glsl, meta + ['t1_grid 1 1 1 16 1 1']
+                              TH=8, R=4, warps=4, act='leaky', hooks=hooks)
+    return glsl, meta + ['t1_grid 1 1 1 8 1 1']

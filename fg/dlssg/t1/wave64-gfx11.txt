@@ -1,0 +1,18 @@
+# Kernels that run faster as wave64 on RDNA3 (gfx11 harness, DLSS-G 310.9.16 full and Lite, both measured; NVXRT_WAVE64=1
+# times every eligible kernel). Only kernels without subgroup operations qualify (the layer checks the SPIR-V), so the
+# results are the same at either wave size. Format: module hash (prefix) and entry; t1_apply.py adds "wave 64" to their meta.
+2b9970f95707 Kernel_EstimateIntermMvecsScatter
+940f071f868e Kernel_OutputPushFine
+c5e79e251bb8 Kernel_EstimatePrev2CurrScatter
+62f162bb2674 Kernel_DL1Net_Output
+6a891670e263 Kernel_Scatter3d
+059a230217ee Kernel_WarpBlendingWeights
+4a6226217e84 Kernel_Prev2CurrPushFine
+6b71a77fa712 custom_upsample_hf_kernel
+4d5821c974a1 k_upscale
+7f2b2e87b28c k_upscale
+7e65660011e9 k_element_wise
+08ccdfa21f38 k_central_block
+a1000fe8bd03 k_pooling
+c7af15508421 Kernel_DL1Net_Input
+9b79bd4e3a96 k_initial_merge

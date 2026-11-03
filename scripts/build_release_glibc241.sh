@@ -74,8 +74,10 @@ echo 'Shim, bridge and vkd3d-proton rebuilt'
 export D4R_BUNDLE_TEX="$BUILD/kernels"
 export D4R_DLSS_PTX_DIR="$BUILD/ptx"
 python3 "$ROOT/kernels/tools/extract_dlss_ptx.py" "$D4R_BUNDLE_DLSS" "$D4R_DLSS_PTX_DIR" > "$BUILD/logs/extract.log"
-build_textures() {
-    local arch="$1" folder fp8 accuracy out
+# one job per texture set (target folder x accuracy); RDNA4 targets have four sets, so a job per target would
+# leave them as the tail
+build_texture_set() {
+    local arch="$1" folder="$2" accuracy="$3" fp8=0 out
     # RDNA2: only K's natively translated hiluma output/input kernels (no WMMA), fast set only (the accuracy
     # set keeps ZLUDA's compile of them); package_release.sh builds the K layers and copies these
     if [[ "$arch" == gfx103* ]]; then
@@ -84,25 +86,28 @@ build_textures() {
         echo "Texture kernels rebuilt: $arch (native hiluma output/input only)"
         return 0
     fi
+    [[ "$folder" == *-fp8 ]] && fp8=1
+    out="$D4R_BUNDLE_TEX/$folder"
+    [[ "$accuracy" == 1 ]] && out="$D4R_BUNDLE_TEX/accuracy/$folder"
+    D4R_PREFER_ACCURACY="$accuracy" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
+        D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" tex "$out" \
+        > "$BUILD/logs/tex-$folder-$accuracy.log" 2>&1
+    echo "Texture kernels rebuilt: $folder accuracy=$accuracy"
+}
+# the hiluma input proofs are the same for every target: kernels/build.sh runs each once
+export D4R_KERNEL_CACHE="${D4R_KERNEL_CACHE:-$BUILD/kernel-cache}"
+sets=()
+for arch in ${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
+    if [[ "$arch" == gfx103* ]]; then sets+=("$arch $arch 0"); continue; fi
     folders=("$arch")
     [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
-    for folder in "${folders[@]}"; do
-        fp8=0
-        [[ "$folder" == *-fp8 ]] && fp8=1
-        for accuracy in 0 1; do
-            out="$D4R_BUNDLE_TEX/$folder"
-            [[ "$accuracy" == 1 ]] && out="$D4R_BUNDLE_TEX/accuracy/$folder"
-            D4R_PREFER_ACCURACY="$accuracy" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" \
-                D4R_DLSS_DLL="$D4R_BUNDLE_DLSS" "$ROOT/kernels/build.sh" tex "$out" \
-                > "$BUILD/logs/tex-$folder-$accuracy.log" 2>&1
-            echo "Texture kernels rebuilt: $folder accuracy=$accuracy"
-        done
-    done
-}
+    for folder in "${folders[@]}"; do for accuracy in 0 1; do sets+=("$arch $folder $accuracy"); done; done
+done
 pending=()
 failed=0
-for arch in ${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
-    build_textures "$arch" &
+for set in "${sets[@]}"; do
+    # shellcheck disable=SC2086
+    build_texture_set $set &
     pending+=("$!")
     if (( ${#pending[@]} >= ${D4R_TEX_JOBS:-4} )); then
         wait "${pending[0]}" || failed=1

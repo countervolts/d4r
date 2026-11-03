@@ -195,10 +195,19 @@ void load()
         GetFileAttributesW(d4r_core.c_str()) != INVALID_FILE_ATTRIBUTES ? d4r_core.c_str() : L"none"));
     std::wstring fg = resolve(iniString(L"FG", L"nvngx_dlssg.dll"));
     g_fgEnabled = iniUInt(L"FGEnabled", 1) != 0;
+    // d4r.ini [FrameGeneration] Backend: d4r_boot.dll passes it as D4R_DLSSG_ENABLED (0 = pass-through: no DLSS-G,
+    // every feature goes to the next core, the game sees no frame generation), which wins over FGEnabled
+    wchar_t fg_env[8] = {};
+    if (GetEnvironmentVariableW(L"D4R_DLSSG_ENABLED", fg_env, 8) && fg_env[0])
+        g_fgEnabled = wcstoul(fg_env, nullptr, 0) != 0;
     g_arch = iniUInt(L"ArchID", 0x1b0);
     g_logLevel = iniUInt(L"LogLevel", 1);
     g_timing = iniUInt(L"Timing", 1);
     g_lite = iniUInt(L"Lite", 0);
+    // d4r.ini [FrameGeneration] Model = full | lite: d4r_boot.dll passes it as D4R_DLSSG_LITE, which wins over Lite
+    wchar_t lite_env[8] = {};
+    if (GetEnvironmentVariableW(L"D4R_DLSSG_LITE", lite_env, 8) && lite_env[0])
+        g_lite = wcstoul(lite_env, nullptr, 0) != 0;
     g_rrCreateMatrices = iniUInt(L"RrCreateMatrices", 1);
     g_dumpDir = iniString(L"DumpDir", L"");
     g_dumpAt = iniUInt(L"DumpAt", 600);
