@@ -1,0 +1,7 @@
+build/
+vkd3d-proton/out/
+harness/*.exe
+__pycache__/
+*.pyc
+*.ppm
+*.png

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Tue, 3 Nov 2026 02:00:00 +0100
+Subject: [PATCH] ForceNvidia: real DLSSG through a replacement nvngx on any GPU
+
+d4r runs NVIDIA's own DLSS Frame Generation (nvngx_dlssg.dll) on AMD GPUs through its NGX host
+(d4r\fg\dlssg). Two things stopped OptiScaler from using it as the DLSSG output on native Windows:
+
+- the menu disables "None (Real DLSSG)" on every non-NVIDIA primary GPU;
+- with StreamlineSpoofing, the arch save/restore around plugin loads reads Pascal (the default for a
+  non-NVIDIA GPU or fakenvapi) and writes it back into Streamline's system caps, so DLSSG, loaded after
+  DLSS/Reflex/PCL, reports "not supported on current hardware".
+
+With ForceNvidia the menu offers real DLSSG and the restore keeps the architecture the NVAPI in use reported.
+---
+diff --git a/OptiScaler/hooks/Streamline_Hooks.cpp b/OptiScaler/hooks/Streamline_Hooks.cpp
+index a4304ae8..fa6c32e6 100644
+--- a/OptiScaler/hooks/Streamline_Hooks.cpp
++++ b/OptiScaler/hooks/Streamline_Hooks.cpp
+@@ -822,7 +822,10 @@ uint32_t StreamlineHooks::getSystemCapsArch(SystemCaps* altSystemCaps)
+     uint32_t highestArch = 0;
+ 
+     auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+-    if (!fakenvapi::isUsingAsMainNvapi() && primaryGpu.vendorId == VendorId::Nvidia)
++    // ForceNvidia: Streamline's caps hold the architecture the replacement NVAPI reports; keep it (the default below
++    // would hand every plugin loaded after a spoofed one Pascal, and DLSSG then reports unsupported hardware)
++    if ((!fakenvapi::isUsingAsMainNvapi() && primaryGpu.vendorId == VendorId::Nvidia) ||
++        Config::Instance()->ForceNvidia.value_or_default())
+     {
+         if (State::Instance().streamlineVersion.major > 1)
+         {
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+index 06f49c18..4f8a71de 100644
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -3694,7 +3694,9 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
+ 
+     // DLSSG output requirements
+     auto constexpr dlssgOutputIndex = (uint32_t) FGOutput::DLSSG;
+-    const bool maySupportDlssg = primaryGpu.vendorId == VendorId::Nvidia;
++    // ForceNvidia: a replacement nvngx (d4r) runs NVIDIA's own DLSSG on this GPU
++    const bool maySupportDlssg =
++        primaryGpu.vendorId == VendorId::Nvidia || Config::Instance()->ForceNvidia.value_or_default();
+     const bool hasDlssgReplacement =
+         state.nukemsFgFileAvailable || state.artursFgFileAvailable || FfxApiProxy::IsFGReady(false);
+ 
