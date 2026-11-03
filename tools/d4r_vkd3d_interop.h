@@ -58,6 +58,18 @@ ID3D12DXVKInteropDeviceD4R2 : public ID3D12DXVKInteropDeviceD4R
 __CRT_UUID_DECL(ID3D12DXVKInteropDeviceD4R2, 0x4f8c9462, 0x8197, 0x4dc1, 0xa5, 0x84, 0xcf, 0x44, 0xd9, 0x70, 0x6d, 0xb2)
 
 
+// Implemented by the patched vkd3d-proton's native command lists: returns the list as a plain
+// ID3D12GraphicsCommandList. Proxy layers that forward unknown QueryInterface calls to the wrapped
+// object (e.g. ReShade) resolve to the native list through this interface, so the d4r interop calls,
+// which accept only vkd3d-proton's own objects, keep working when a proxy wraps the game's lists.
+MIDL_INTERFACE("a25167d5-4098-477a-b781-94ea06d7fdb9")
+ID3D12DXVKInteropCommandListD4R : public IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE GetCommandList(ID3D12GraphicsCommandList** list) = 0;
+};
+__CRT_UUID_DECL(ID3D12DXVKInteropCommandListD4R, 0xa25167d5, 0x4098, 0x477a, 0xb7, 0x81, 0x94, 0xea, 0x06, 0xd7, 0xfd, 0xb9)
+
+
 // Experimental (VKD3D_D4R_LINEAR_TEXTURES=1 in the patched vkd3d-proton): the dedicated, exportable memory
 // behind a linear-tiled texture and the layout of its only subresource.
 MIDL_INTERFACE("7b1e5d0a-93c4-4e8f-b6a2-51c08f2e4d73")
