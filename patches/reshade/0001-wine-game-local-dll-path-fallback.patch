@@ -1,0 +1,79 @@
+--- a/source/hook_manager.cpp	2026-11-03 11:25:59.183498519 +0100
++++ b/source/hook_manager.cpp	2026-11-03 11:32:46.637148676 +0100
+@@ -10,6 +10,8 @@
+ #include <cstring> // std::strcmp
+ #include <algorithm> // std::find_if, std::remove, std::remove_if
+ #include <Windows.h>
++#include <psapi.h> // EnumProcessModulesEx, GetModuleFileNameExW
++#pragma comment(lib, "psapi.lib")
+ 
+ enum class hook_method
+ {
+@@ -310,6 +312,35 @@
+ 	return reinterpret_cast<T>(find_internal(nullptr, reinterpret_cast<reshade::hook::address>(replacement)).call());
+ }
+ 
++// Pin a loaded module by its base file name, even if it is registered under a
++// different path than expected (e.g. Wine registers game-local DLLs under their
++// full 'Z:\...' drive path instead of 'C:\windows\system32\...').
++static HMODULE pin_module_by_filename(const std::filesystem::path &filename)
++{
++	HMODULE modules[1024];
++	DWORD cb_needed = 0;
++	if (!EnumProcessModulesEx(GetCurrentProcess(), modules, static_cast<DWORD>(sizeof(modules)), &cb_needed, LIST_MODULES_ALL))
++		return nullptr;
++
++	for (auto it = std::begin(modules); it != std::end(modules); ++it)
++	{
++		wchar_t full_name[MAX_PATH] {};
++		if (GetModuleFileNameExW(GetCurrentProcess(), *it, full_name, MAX_PATH) == 0)
++			continue;
++
++		if (_wcsicmp(filename.c_str(), std::filesystem::path(full_name).filename().c_str()) != 0)
++			continue;
++
++		HMODULE pinned = nullptr;
++		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, full_name, &pinned) || pinned == g_module_handle)
++			return nullptr;
++
++		return pinned;
++	}
++
++	return nullptr;
++}
++
+ static void install_delayed_hooks(const std::filesystem::path &loaded_path, bool check_all = false)
+ {
+ 	if (s_is_loading_export_module)
+@@ -326,10 +357,18 @@
+ 	const auto check_delayed_hook_path = [](const std::filesystem::path &path) -> HMODULE {
+ 		// Pin the module so it cannot be unloaded by the application and cause problems when ReShade tries to call into it afterwards
+ 		HMODULE delayed_handle = nullptr;
+-		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, path.c_str(), &delayed_handle) || delayed_handle == g_module_handle)
+-			return nullptr;
++		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, path.c_str(), &delayed_handle))
++		{
++			if (delayed_handle == g_module_handle)
++				return nullptr;
++
++			return delayed_handle;
++		}
+ 
+-		return delayed_handle;
++		// The module may be registered under a different path than expected (e.g. Wine
++		// registers game-local DLLs under their full drive path). Fall back to matching
++		// by base file name so hooks still install for shadowed system libraries.
++		return pin_module_by_filename(path.filename());
+ 	};
+ 	const auto install_delayed_hook_path = [&loaded_path](const std::filesystem::path &path, HMODULE delayed_handle) {
+ 		reshade::log::message(reshade::log::level::info, "Installing delayed hooks for '%s' (Just loaded via LoadLibrary('%s')) ...", path.u8string().c_str(), loaded_path.u8string().c_str());
+@@ -577,7 +616,8 @@
+ 	}
+ 	// Similarly, if the target module was not loaded yet, wait for it to get loaded in one of the 'LoadLibrary' hooks and install it then
+ 	// Pin the module so it cannot be unloaded by the application and cause problems when ReShade tries to call into it afterwards
+-	else if (HMODULE handle; !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, target_path.c_str(), &handle))
++	else if (HMODULE handle = nullptr; !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, target_path.c_str(), &handle)
++			&& (handle = pin_module_by_filename(target_name)) == nullptr)
+ 	{
+ 		log::message(log::level::info, "> Delayed.");
+ 
