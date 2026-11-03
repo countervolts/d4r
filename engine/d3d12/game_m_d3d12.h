@@ -25,12 +25,13 @@ public:
     GameUpscalerM& operator=(const GameUpscalerM&) = delete;
     // Records the frame; then exactly one of submitted or discarded. The game's textures are transitioned from their
     // given states and back; the descriptor heap, root signatures and pipelines are d4r's afterwards.
-    void record(ID3D12GraphicsCommandList* list, const GameFrameM& frame);
+    // profiler: MEngine's boundaries (recordFrame, recordFront and recordBack respectively).
+    void record(ID3D12GraphicsCommandList* list, const GameFrameM& frame, const FrameProfiler& profiler = {});
     // The external network's frame in halves: recordFront records the front (and the game's textures' entry
     // transitions), recordBack the back (and their exit transitions). Submit the front, run the network, then record
     // the back. recordFront reports submitted/discarded like record() does, once the whole frame has run.
-    void recordFront(ID3D12GraphicsCommandList* list, const GameFrameM& frame);
-    void recordBack(ID3D12GraphicsCommandList* list);
+    void recordFront(ID3D12GraphicsCommandList* list, const GameFrameM& frame, const FrameProfiler& profiler = {});
+    void recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
     void submitted(ID3D12Fence* fence, uint64_t value);
     void discarded();
     bool idle() const;

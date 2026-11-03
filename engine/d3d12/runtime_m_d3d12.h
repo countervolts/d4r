@@ -68,13 +68,16 @@ public:
     // UNORDERED_ACCESS with typed UAV stores (RGB10A2 through the packaged rgb10 downsample). Retained until the frames
     // using them retire.
     void setFrame(const FrameTextures& textures, const MFrameSettings& settings, FrameOutput output);
-    void recordFrame(ID3D12GraphicsCommandList* list);
+    // Profiler boundaries: 0 at entry, 1 after the parameters, 2 after exposure, 3 after the input stage, 4 after the
+    // network, 5 after the expansion, 6 after the reconstruction and 7 after the downsample (the end).
+    void recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
     // The external network's halves, in the Vulkan runtime's order (../runtime_m.inc): the front (exposure and the input
     // stage, which writes the external tokens; submit it and wait on a fence) and the back (expansion, reconstruction
     // and downsample, which read the external head; record it only after the external network has finished). Together
     // they dispatch exactly what recordFrame does. The external resources stay in COMMON and are never transitioned.
-    void recordFront(ID3D12GraphicsCommandList* list);
-    void recordBack(ID3D12GraphicsCommandList* list);
+    // Profiler boundaries: the front's 0 to 3 and the back's 0, then 1 to 3 for its three stages, as recordFrame's.
+    void recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
+    void recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
     void submitted(ID3D12Fence* fence, uint64_t value);
     void discarded();
     bool idle() const;

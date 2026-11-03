@@ -118,6 +118,10 @@ fi
 "$STRIP" -o "$STAGE/d4r/nvcuda.dll" "$ROOT/build/windows-nvcuda/nvcuda.dll"
 "$STRIP" -o "$STAGE/d4r/nvapi/nvapi64.dll" "$ROOT/build/windows-nvapi/nvapi64.dll"
 cp "$D4R_ZLUDA_DIR/nvcuda.dll" "$STAGE/d4r/zluda/nvcuda.dll"
+# a ZLUDA built with llvm-mingw (scripts/windows/build-zluda-windows.ps1) imports its C++ runtime from beside it
+for runtime in libc++.dll libunwind.dll; do
+  [[ -f "$D4R_ZLUDA_DIR/$runtime" ]] && cp "$D4R_ZLUDA_DIR/$runtime" "$STAGE/d4r/zluda/$runtime"
+done
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.ps1" "$ROOT/packaging/d4r-check.cmd" "$STAGE/d4r/"
 printf 'install.cmd puts NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder.\r\n' > "$STAGE/d4r/ngx/README.txt"

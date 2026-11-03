@@ -94,10 +94,12 @@ def capture(directory, name, stubbed=False):
                 raise ValueError(f'{kernel}: invalid captured pointer')
 
 
-# The network layers of presets L and M, whose launches compile_m.py reads (their arguments and weight uploads, never
-# their results). On RDNA2 ZLUDA compiles each of them for minutes (matrix products emulated), so the model build
-# replaces them with empty kernels of the same parameters.
-NETWORK_KERNELS = re.compile(r'rrlite_(enc0_4x4_\w+|enc1_4x4|enc2_4x4|enc3_tube_4x4|dec2_4x4|dec1_4x4|dec0_4x4\w*)$')
+# The network layers of presets L and M, whose launches compile_m.py reads, and of K, whose launches extract_k.py
+# reads (their arguments and weight uploads, never their results). On RDNA2 ZLUDA compiles each of them for minutes
+# (matrix products emulated: K's enc1 264 s for gfx1030 against 6 s for gfx1101), so the model build replaces them
+# with empty kernels of the same parameters.
+NETWORK_KERNELS = re.compile(r'rrlite_(enc0_4x4_\w+|enc1_4x4|enc2_4x4|enc3_tube_4x4|dec2_4x4|dec1_4x4|dec0_4x4\w*)$|'
+                             r'dltss_pwin_(enc[0-4]|dec[0-5])_layer$')
 
 
 def stub_ptx(dll, out):

@@ -78,12 +78,20 @@ struct GameUpscaler::Impl {
     Engine engine;
     uint32_t maxWidth, maxHeight;
     uint32_t frames = 0;
-    Impl(Model& m, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh)
-        : model(m), shape(makeKShape(ow, oh)), engine(m, shape), maxWidth(rw), maxHeight(rh) {}
+    bool external = false;
+    std::vector<D3D12_RESOURCE_BARRIER> exit;   // recordFront's: the textures' states, restored by recordBack
+    Impl(Model& m, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetworkDx* network)
+        : model(m), shape(makeKShape(ow, oh)), engine(m, shape, network), maxWidth(rw), maxHeight(rh),
+          external(network != nullptr) {}
+    // Validates the frame, sets it on the engine and returns the barriers into and out of the engine's states.
+    void prepare(const GameFrame& frame, std::vector<D3D12_RESOURCE_BARRIER>& entry, std::vector<D3D12_RESOURCE_BARRIER>& leave);
 };
 
 GameUpscaler::GameUpscaler(Model& model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth, uint32_t maxRenderHeight)
-    : impl(std::make_unique<Impl>(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight)) {
+    : GameUpscaler(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight, nullptr) {}
+GameUpscaler::GameUpscaler(Model& model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth, uint32_t maxRenderHeight,
+                           const ExternalNetworkDx* external)
+    : impl(std::make_unique<Impl>(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight, external)) {
     if (!maxRenderWidth || !maxRenderHeight || maxRenderWidth > outputWidth || maxRenderHeight > outputHeight)
         throw std::runtime_error("render dimensions must be positive and no larger than the output");
     // Setup on the model's own queue: a discarded game list cannot lose the upload or the cleared history
@@ -94,8 +102,9 @@ GameUpscaler::GameUpscaler(Model& model, uint32_t outputWidth, uint32_t outputHe
 }
 GameUpscaler::~GameUpscaler() = default;
 
-void GameUpscaler::record(ID3D12GraphicsCommandList* list, const GameFrame& frame) {
-    auto& g = *impl;
+void GameUpscaler::Impl::prepare(const GameFrame& frame, std::vector<D3D12_RESOURCE_BARRIER>& entry,
+                                 std::vector<D3D12_RESOURCE_BARRIER>& exit) {
+    auto& g = *this;
     const uint32_t w = frame.settings.renderWidth, h = frame.settings.renderHeight;
     if (!w || !h || w > g.maxWidth || h > g.maxHeight) throw std::runtime_error("render size exceeds the adapter's inputs");
     if (frame.output.resource == frame.color.resource || frame.output.resource == frame.motion.resource ||
@@ -107,7 +116,6 @@ void GameUpscaler::record(ID3D12GraphicsCommandList* list, const GameFrame& fram
                                {true, frame.motion.x, frame.motion.y}, {true, frame.depth.x, frame.depth.y},
                                {true, frame.output.x, frame.output.y}, gameExposure, g.frames);
     // the game's states to the engine's and back (a resource listed twice, such as colour and exposure, once)
-    std::vector<D3D12_RESOURCE_BARRIER> entry, exit;
     std::vector<ID3D12Resource*> seen;
     auto require = [&](const GameTexture& t, D3D12_RESOURCE_STATES needed) {
         if (!t.resource || std::find(seen.begin(), seen.end(), t.resource) != seen.end()) return;
@@ -127,9 +135,33 @@ void GameUpscaler::record(ID3D12GraphicsCommandList* list, const GameFrame& fram
     // setFrame validates everything before a command is recorded
     g.engine.setFrame(textures, plan.params.input, plan.params.output, &plan.windows, plan.exposureOn ? &plan.exposure : nullptr,
                       FrameOutput{frame.output.resource, frame.output.format});
+}
+void GameUpscaler::record(ID3D12GraphicsCommandList* list, const GameFrame& frame, const FrameProfiler& profiler) {
+    if (impl->external) throw std::runtime_error("this upscaler's network is external: record the front and the back");
+    std::vector<D3D12_RESOURCE_BARRIER> entry, exit;
+    impl->prepare(frame, entry, exit);
     if (!entry.empty()) list->ResourceBarrier(UINT(entry.size()), entry.data());
-    g.engine.recordFrame(list);
+    impl->engine.recordFrame(list, profiler);
     if (!exit.empty()) list->ResourceBarrier(UINT(exit.size()), exit.data());
+}
+void GameUpscaler::recordFront(ID3D12GraphicsCommandList* list, const GameFrame& frame, const FrameProfiler& profiler) {
+    if (!impl->external) throw std::runtime_error("this upscaler's network is internal: record the whole frame");
+    std::vector<D3D12_RESOURCE_BARRIER> entry;
+    impl->exit.clear();
+    impl->prepare(frame, entry, impl->exit);
+    if (!entry.empty()) list->ResourceBarrier(UINT(entry.size()), entry.data());
+    impl->engine.recordFront(list, profiler);
+}
+void GameUpscaler::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
+    impl->engine.recordBack(list, profiler);
+    if (!impl->exit.empty()) list->ResourceBarrier(UINT(impl->exit.size()), impl->exit.data());
+    impl->exit.clear();
+}
+uint64_t GameUpscaler::networkTokenBytes(uint32_t outputWidth, uint32_t outputHeight) {
+    return Engine::networkTokenBytes(makeKShape(outputWidth, outputHeight));
+}
+uint64_t GameUpscaler::networkHeadBytes(uint32_t outputWidth, uint32_t outputHeight) {
+    return Engine::networkHeadBytes(makeKShape(outputWidth, outputHeight));
 }
 void GameUpscaler::submitted(ID3D12Fence* fence, uint64_t value) { impl->engine.submitted(fence, value); }
 void GameUpscaler::discarded() { impl->engine.discarded(); }

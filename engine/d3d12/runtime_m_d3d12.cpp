@@ -130,8 +130,9 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
                                  std::string("exposure_m0"), std::string("exposure_m1"), std::string(m.presetL ? "enc0_l" : in)})
         if (!std::filesystem::exists(directory + "/" + f + ".dxil"))
             throw std::runtime_error(directory + " has no " + f + ".dxil: build the model with compile_m.py --dxil yes on Windows");
-    // L's stages take render-resolution motion only (its matrix stages have no display-resolution variant)
-    m.displayMotion = !m.presetL && head[7] >= '5';
+    // display-resolution motion: M from D4RM0005; L when compile_m.py built its reconstruction with DISPLAY_MV
+    // (l_display_mv.bin; its input stage always reads it, enc0_features.glsl), render-resolution only before that
+    m.displayMotion = m.presetL ? std::filesystem::exists(directory + "/l_display_mv.bin") : head[7] >= '5';
     uint32_t n8, n16;
     std::memcpy(&n8, head.data() + 8, 4); std::memcpy(&n16, head.data() + 12, 4);
     if (m.presetL) {
@@ -501,7 +502,8 @@ void MEngine::setFrame(const FrameTextures& textures, const MFrameSettings& s, F
         throw std::runtime_error("frame has a null texture");
     const uint32_t rw = s.renderWidth ? s.renderWidth : e.maxRw, rh = s.renderHeight ? s.renderHeight : e.maxRh;
     if (rw < 64 || rh < 64 || rw > e.maxRw || rh > e.maxRh) throw std::runtime_error("render size exceeds the engine's capacity or is below 64");
-    if (s.displayMotion && !m.displayMotion) throw std::runtime_error("display-resolution motion needs an M model rebuilt by the current compile_m.py");
+    if (s.displayMotion && !m.displayMotion) throw std::runtime_error(m.presetL ? "display-resolution motion needs an L model rebuilt by the current compile_m.py"
+                                                                                   : "display-resolution motion needs an M model rebuilt by the current compile_m.py");
     const bool reset = s.reset || e.frame == 0 || rw != e.rw || rh != e.rh;
     e.rw = rw; e.rh = rh;
     e.gw = (rw + 31) / 32 * 32; e.gh = (rh + 31) / 32 * 32;
@@ -562,7 +564,7 @@ void MEngine::setFrame(const FrameTextures& textures, const MFrameSettings& s, F
     e.frameSet = true;
 }
 
-void MEngine::recordFrame(ID3D12GraphicsCommandList* list) {
+void MEngine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& e = *impl; auto& m = e.model;
     if (e.external) throw std::runtime_error("this engine's network is external: record the front and the back");
     if (!e.frameSet) throw std::runtime_error("setFrame before recording");
@@ -572,6 +574,9 @@ void MEngine::recordFrame(ID3D12GraphicsCommandList* list) {
     auto& b = e.bindings[e.current];
     const UINT base = Impl::BlockBase + b.block * Impl::BlockSlots;
     const unsigned i = e.parity;
+    // a timestamp after the pending barriers, so each stage's waits count towards the stage before
+    auto mark = [&](uint32_t boundary) { if (profiler.mark) { e.flush(list); profiler.mark(list, boundary, profiler.user); } };
+    mark(0);
     e.now = e.rest;
     ID3D12DescriptorHeap* heaps[] = {e.heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -600,31 +605,38 @@ void MEngine::recordFrame(ID3D12GraphicsCommandList* list) {
     // earlier work on the game's textures and the engine's resources (a previous frame) completes first
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     e.barriers.push_back(uav);
+    mark(1);
     if (!m.ldr) {
         e.dispatch(list, m.exp0, base + Impl::Exp0Slot, e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
         e.dispatch(list, m.exp1, Impl::Exp1Base, 1, 1);
     }
+    mark(2);
     if (m.enc0LX) e.dispatch(list, m.enc0LX, base + Impl::Enc0LXSlot + 21 * i, (e.gw + 9) / 8, (e.gh + 9) / 8);
     else {
         e.dispatch(list, m.enc0, base + Impl::Enc0Slot + 14 * i, (e.gw + 2 + 7) / 8, (e.gh + 2 + 7) / 8);
         if (m.presetL) e.dispatch(list, m.enc0L, Impl::Enc0LBase, (e.gw + 9) / 8, (e.gh + 9) / 8);
     }
+    mark(3);
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
         const uint32_t gx = (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, gy = (h + MShift[l] + 7) / 8;
         const bool w2 = m.tubeW2.state && MScale[l] == 4 && gx * gy >= m.tubeW2Groups;
         e.dispatch(list, w2 ? m.tubeW2 : m.network[l], Impl::LayerBase + 7 * l, gx, gy);
     }
+    mark(4);
     // L: the blocks with a pixel of the render size, one more in x on frames whose expansion shift is 2
     if (m.presetL) e.dispatch(list, m.dec0, Impl::Dec0Base + Impl::Dec0Slots * i, (e.rw + (e.frame & 1u) * 2u + 7) / 8, (e.rh + 7) / 8);
     else e.dispatch(list, m.dec0, Impl::Dec0Base + Impl::Dec0Slots * i, e.gw / 8, e.gh / 8);
+    mark(5);
     const bool compact = e.compact && e.post.rndOffs[0] >= -0.5f && e.post.rndOffs[0] <= 0.5f && e.post.rndOffs[1] >= -0.5f && e.post.rndOffs[1] <= 0.5f;
     e.dispatch(list, compact ? m.postC : e.quality ? m.postQ : m.post, base + Impl::PostSlot + 13 * i, (e.hw + 15) / 16, (e.hh + 15) / 16);
+    mark(6);
     e.dispatch(list, e.rgb10 ? m.downRgb10 : m.down, base + Impl::DownSlot, (e.ow + 7) / 8, (e.oh + 63) / 64);
     // every engine resource back to its resting state
     for (auto& [r, state] : e.now)
         if (state != e.rest.at(r)) e.barriers.push_back(transition(r, state, e.rest.at(r)));
     e.flush(list);
+    mark(7);
     b.pending = true; b.lastUse = ++e.uses;
     e.recorded = e.current;
     e.parity = 1 - e.parity; ++e.frame;
@@ -633,7 +645,7 @@ void MEngine::recordFrame(ID3D12GraphicsCommandList* list) {
 // The front of an external network's frame (../runtime_m.inc recordFront): the parameters, the history's reset and the
 // exposure and input stages, which write the caller's tokens. The engine's own resources are back in their resting
 // states when this returns; the tokens are in COMMON and are not transitioned (hip_net_d3d12.h).
-void MEngine::recordFront(ID3D12GraphicsCommandList* list) {
+void MEngine::recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& e = *impl; auto& m = e.model;
     if (!e.external) throw std::runtime_error("recordFront needs an engine with an external network");
     if (!e.frameSet) throw std::runtime_error("setFrame before recording");
@@ -644,6 +656,9 @@ void MEngine::recordFront(ID3D12GraphicsCommandList* list) {
     auto& b = e.bindings[e.current];
     const UINT base = Impl::BlockBase + b.block * Impl::BlockSlots;
     const unsigned i = e.parity;
+    // a timestamp after the pending barriers, so each stage's waits count towards the stage before
+    auto mark = [&](uint32_t boundary) { if (profiler.mark) { e.flush(list); profiler.mark(list, boundary, profiler.user); } };
+    mark(0);
     e.now = e.rest;
     ID3D12DescriptorHeap* heaps[] = {e.heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -666,10 +681,12 @@ void MEngine::recordFront(ID3D12GraphicsCommandList* list) {
     list2->WriteBufferImmediate(UINT(values.size()), values.data(), nullptr);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     e.barriers.push_back(uav);
+    mark(1);
     if (!m.ldr) {
         e.dispatch(list, m.exp0, base + Impl::Exp0Slot, e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
         e.dispatch(list, m.exp1, Impl::Exp1Base, 1, 1);
     }
+    mark(2);
     if (m.presetL) {
         // L: the feature slots, then the block and merge in the plane layout, which write the network's tokens
         e.dispatch(list, m.enc0, base + Impl::Enc0Slot + 14 * i, (e.gw + 2 + 7) / 8, (e.gh + 2 + 7) / 8);
@@ -679,18 +696,22 @@ void MEngine::recordFront(ID3D12GraphicsCommandList* list) {
     for (auto& [r, state] : e.now)
         if (state != e.rest.at(r)) e.barriers.push_back(transition(r, state, e.rest.at(r)));
     e.flush(list);
+    mark(3);
     e.frontDone = true;
 }
 
 // The back (../runtime_m.inc recordBack): the expansion (which reads the caller's head), the reconstruction and the
 // downsample. Record and submit it only after the external network has finished; the head is in COMMON.
-void MEngine::recordBack(ID3D12GraphicsCommandList* list) {
+void MEngine::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& e = *impl; auto& m = e.model;
     if (!e.external) throw std::runtime_error("recordBack needs an engine with an external network");
     if (!e.frontDone) throw std::runtime_error("recordFront before recordBack");
     auto& b = e.bindings[e.current];
     const UINT base = Impl::BlockBase + b.block * Impl::BlockSlots;
     const unsigned i = e.parity;
+    // a timestamp after the pending barriers, so each stage's waits count towards the stage before
+    auto mark = [&](uint32_t boundary) { if (profiler.mark) { e.flush(list); profiler.mark(list, boundary, profiler.user); } };
+    mark(0);
     e.now = e.rest;
     ID3D12DescriptorHeap* heaps[] = {e.heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -700,12 +721,15 @@ void MEngine::recordBack(ID3D12GraphicsCommandList* list) {
     list->ResourceBarrier(1, &uav);
     if (m.presetL) e.dispatch(list, m.dec0Planes, Impl::Dec0Base + Impl::Dec0Slots * i, (e.rw + (e.frame & 1u) * 2u + 7) / 8, (e.rh + 7) / 8);
     else e.dispatch(list, m.dec0Planes, Impl::Dec0Base + Impl::Dec0Slots * i, e.gw / 8, e.gh / 8);
+    mark(1);
     const bool compact = e.compact && e.post.rndOffs[0] >= -0.5f && e.post.rndOffs[0] <= 0.5f && e.post.rndOffs[1] >= -0.5f && e.post.rndOffs[1] <= 0.5f;
     e.dispatch(list, compact ? m.postC : e.quality ? m.postQ : m.post, base + Impl::PostSlot + 13 * i, (e.hw + 15) / 16, (e.hh + 15) / 16);
+    mark(2);
     e.dispatch(list, e.rgb10 ? m.downRgb10 : m.down, base + Impl::DownSlot, (e.ow + 7) / 8, (e.oh + 63) / 64);
     for (auto& [r, state] : e.now)
         if (state != e.rest.at(r)) e.barriers.push_back(transition(r, state, e.rest.at(r)));
     e.flush(list);
+    mark(3);
     b.pending = true; b.lastUse = ++e.uses;
     e.recorded = e.current;
     e.parity = 1 - e.parity; ++e.frame;

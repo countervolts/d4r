@@ -180,7 +180,7 @@ GameDenoiser::GameDenoiser(RModel &model, uint32_t outputWidth, uint32_t outputH
 }
 GameDenoiser::~GameDenoiser() = default;
 
-void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &frame)
+void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &frame, const FrameProfiler &profiler)
 {
     auto &g = *impl;
     const GameTexture *inputs[] = {&frame.color,
@@ -287,7 +287,7 @@ void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &fra
     }
     if (!entry.empty())
         list->ResourceBarrier(UINT(entry.size()), entry.data());
-    g.engine.recordFrame(list);
+    g.engine.recordFrame(list, profiler);
     ++g.frames;
     if (!exit.empty())
         list->ResourceBarrier(UINT(exit.size()), exit.data());

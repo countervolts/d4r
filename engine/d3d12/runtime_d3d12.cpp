@@ -765,7 +765,7 @@ void Engine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& p
 // The front of an external network's frame (the Vulkan Engine::recordFront): setup, exposure and the input stage, which
 // writes the caller's tokens. The engine's own resources are back in their resting states when this returns; the
 // tokens stay in COMMON and are never transitioned (hip_net_d3d12.h).
-void Engine::recordFront(ID3D12GraphicsCommandList* list) {
+void Engine::recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& e = *impl;
     if (!e.external) throw std::runtime_error("recordFront needs an engine with an external network");
     if (!e.initialized || !e.model.uploaded || !e.frameSet) throw std::runtime_error("initialize/upload/setFrame before recording inference");
@@ -776,6 +776,8 @@ void Engine::recordFront(ID3D12GraphicsCommandList* list) {
     auto& b = e.bindings[e.current];
     const UINT base = Impl::BindingBase + b.block * Impl::BlockSlots;
     const auto& src = e.history[e.previous]; const auto& dest = e.history[1 - e.previous];
+    auto mark = [&](uint32_t boundary) { if (profiler.mark) profiler.mark(list, boundary, profiler.user); };
+    mark(0);
     ID3D12DescriptorHeap* heaps[] = {e.heap.gpu.Get()};
     list->SetDescriptorHeaps(1, heaps);
     const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -811,6 +813,7 @@ void Engine::recordFront(ID3D12GraphicsCommandList* list) {
         list->ResourceBarrier(UINT(back.size()), back.data());
     }
     uavBarrier(list);    // earlier writes to the borrowed output and the engine's buffers
+    mark(1);
     if (e.exposureOn) {
         if (e.exposure.flags & 1u) {
             e.dispatch(list, e.model.exposure[0], base + Impl::ExposureSlot0, e.exposure.blocksX, e.exposure.blocks / e.exposure.blocksX);
@@ -819,22 +822,26 @@ void Engine::recordFront(ID3D12GraphicsCommandList* list) {
         e.dispatch(list, e.model.exposure[1], base + Impl::ExposureSlot1, 1, 1);
         uavBarrier(list);
     }
+    mark(2);
     const auto lb = e.shape.layers[0];
     e.dispatch(list, e.model.input, base + Impl::InputSlot + e.previous * 12, UINT(lb.w) / 8, UINT(lb.h) / 8);
     uavBarrier(list);
     list->ResourceBarrier(UINT(exit.size()), exit.data());
+    mark(3);
     e.frontDone = true;
 }
 
 // The back of an external network's frame (the Vulkan Engine::recordBack): the final store, which reads the caller's
 // head. Record and submit it only after the external network has finished; the head stays in COMMON.
-void Engine::recordBack(ID3D12GraphicsCommandList* list) {
+void Engine::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& e = *impl;
     if (!e.external) throw std::runtime_error("recordBack needs an engine with an external network");
     if (!e.frontDone) throw std::runtime_error("recordFront before recordBack");
     auto& b = e.bindings[e.current];
     const UINT base = Impl::BindingBase + b.block * Impl::BlockSlots;
     const auto& dest = e.history[1 - e.previous];
+    auto mark = [&](uint32_t boundary) { if (profiler.mark) profiler.mark(list, boundary, profiler.user); };
+    mark(0);
     ID3D12DescriptorHeap* heaps[] = {e.heap.gpu.Get()};
     list->SetDescriptorHeaps(1, heaps);
     const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -847,8 +854,10 @@ void Engine::recordBack(ID3D12GraphicsCommandList* list) {
     uavBarrier(list);
     e.dispatch(list, e.rgb10 ? e.model.outputRgb10 : e.model.output, base + Impl::OutputSlot + e.previous * 12,
                (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+    mark(1);
     uavBarrier(list);
     list->ResourceBarrier(UINT(exit.size()), exit.data());
+    mark(2);
     b.pending = true; b.lastUse = ++e.uses;
     e.recorded = e.current;
     e.previous = 1 - e.previous;

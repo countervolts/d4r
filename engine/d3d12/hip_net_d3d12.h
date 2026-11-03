@@ -19,9 +19,12 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct ID3D12Device;
 struct ID3D12Resource;
+struct ID3D12Fence;
 
 namespace d4r {
 class HipNetwork;
@@ -56,6 +59,20 @@ public:
     // Launches the network's graph and blocks until it has finished. The queue that wrote the tokens must have
     // retired on the CPU first; the head is complete when run() returns.
     void run();
+    // GPU-side ordering instead of run()'s CPU waits: `fence` (created with D3D12_FENCE_FLAG_SHARED on this object's
+    // device) is imported into HIP as an external semaphore. Throws when HIP cannot import it; run() still works.
+    void useFence(ID3D12Fence* fence);
+    // Queues, without blocking: a wait on the HIP stream until the fence reaches `wait` (the game's queue signals it
+    // after the front), the network, then a signal of `signal` (the queue waits for it before the back). Both
+    // resources stay in COMMON; the fence orders every access, so no CPU wait or barrier is needed between them.
+    void launchAfter(uint64_t wait, uint64_t signal);
+    // Blocks until everything launchAfter() queued has finished (timing; lastMilliseconds() then holds the last one).
+    void finish();
+    // Diagnostic (the replay's D4R_REPLAY_HIP_PHASES): per window phase, the graph's median microseconds and the sum
+    // of its kernels run one by one.
+    std::vector<std::pair<float, float>> debugPhaseMicros(uint32_t trials);
+    // Diagnostic: every launch of `phase`'s graph run one by one, median microseconds, in network order.
+    std::vector<float> debugNodeMicros(uint32_t phase, uint32_t trials);
     // GPU time of the last run() (HIP events around the graph), 0 before the first run.
     float lastMilliseconds();
     // One per run(), never reset.

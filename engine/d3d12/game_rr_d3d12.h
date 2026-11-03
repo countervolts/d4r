@@ -30,7 +30,8 @@ class GameDenoiser
     // Records the frame; then exactly one of submitted or discarded. The game's
     // textures are transitioned from their given states and back; the descriptor
     // heap, root signatures and pipelines are d4r's afterwards.
-    void record(ID3D12GraphicsCommandList *list, const GameFrameR &frame);
+    // profiler: REngine::recordFrame's boundaries.
+    void record(ID3D12GraphicsCommandList *list, const GameFrameR &frame, const FrameProfiler &profiler = {});
     void submitted(ID3D12Fence *fence, uint64_t value);
     void discarded();
     bool idle() const;

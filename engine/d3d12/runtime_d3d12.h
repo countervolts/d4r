@@ -107,8 +107,10 @@ public:
     // input stage, which writes the external tokens; submit it and wait on a fence) and the back (the final store,
     // which reads the external head; record and submit it only after the external network has finished). Together they
     // dispatch what recordFrame does. The external resources stay in COMMON and are never transitioned.
-    void recordFront(ID3D12GraphicsCommandList* list);
-    void recordBack(ID3D12GraphicsCommandList* list);
+    // Profiler boundaries: the front's 0 at entry, 1 after setup, 2 after exposure and 3 after the input stage; the
+    // back's 0 at entry, 1 after the final store and 2 at the end.
+    void recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
+    void recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
     // The last recorded frame was executed, and fence reaches value once it has run on the GPU. A null fence: the
     // host cannot tell, and the frame's resources are kept for 16 more frames.
     void submitted(ID3D12Fence* fence, uint64_t value);

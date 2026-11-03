@@ -246,8 +246,14 @@ void* importSharedBuffer(ID3D12Device* device, ID3D12Resource* resource, uint64_
 struct HipNetworkDx::Impl {
     ComPtr<ID3D12Resource> tokens, head;
     std::unique_ptr<d4r::HipNetwork> network;
+    ID3D12Device* device = nullptr;
+    hipExternalSemaphore_t fence = nullptr;   // useFence(): the shared D3D12 fence, imported
     uint32_t launches = 0;
     float milliseconds = 0;
+    ~Impl() {
+        if (network) network->wait();         // nothing queued may outlive the semaphore or the buffers
+        if (fence) (void)hipDestroyExternalSemaphore(fence);
+    }
 };
 
 HipNetworkDx::HipNetworkDx(ID3D12Device* device, const std::string& modelDirectory, uint32_t width, uint32_t height,
@@ -260,6 +266,7 @@ HipNetworkDx::HipNetworkDx(ID3D12Device* device, const std::string& modelDirecto
         std::filesystem::is_empty(kernels))
         throw std::runtime_error("the model has no native HIP network (" + hipnet + " and " + kernels + "/*.hsaco)");
     checkAdapter(device);
+    impl->device = device;
     const uint64_t tokensAllocation = alignedBytes(tokensBytes), headAllocation = alignedBytes(headBytes);
     impl->tokens = sharedBuffer(device, tokensAllocation);
     impl->head = sharedBuffer(device, headAllocation);
@@ -290,6 +297,51 @@ void HipNetworkDx::run() {
     impl->milliseconds = impl->network->lastMilliseconds();
     ++impl->launches;
 }
+void HipNetworkDx::useFence(ID3D12Fence* fence) {
+    if (!fence) throw std::runtime_error("no shared fence");
+    HANDLE handle = nullptr;
+    if (FAILED(impl->device->CreateSharedHandle(fence, nullptr, GENERIC_ALL, nullptr, &handle)))
+        throw std::runtime_error("CreateSharedHandle failed for the network's fence (create it with D3D12_FENCE_FLAG_SHARED)");
+    hipExternalSemaphoreHandleDesc desc{};
+    desc.type = hipExternalSemaphoreHandleTypeD3D12Fence;
+    desc.handle.win32.handle = handle;
+    hipExternalSemaphore_t imported = nullptr;
+    const hipError_t result = hipImportExternalSemaphore(&imported, &desc);
+    CloseHandle(handle);   // the import holds its own reference
+    hipCheck(result, "hipImportExternalSemaphore (D3D12 fence)");
+    if (impl->fence) (void)hipDestroyExternalSemaphore(impl->fence);
+    impl->fence = imported;
+}
+void HipNetworkDx::launchAfter(uint64_t wait, uint64_t signal) {
+    if (!impl->fence) throw std::runtime_error("launchAfter() needs useFence() first");
+    const auto stream = static_cast<hipStream_t>(impl->network->stream());
+    hipExternalSemaphoreWaitParams waitParams{};
+    waitParams.params.fence.value = wait;
+    hipCheck(hipWaitExternalSemaphoresAsync(&impl->fence, &waitParams, 1, stream), "hipWaitExternalSemaphoresAsync");
+    impl->network->launch();
+    hipExternalSemaphoreSignalParams signalParams{};
+    signalParams.params.fence.value = signal;
+    hipCheck(hipSignalExternalSemaphoresAsync(&impl->fence, &signalParams, 1, stream), "hipSignalExternalSemaphoresAsync");
+    ++impl->launches;
+}
+void HipNetworkDx::finish() {
+    impl->network->wait();
+    impl->milliseconds = impl->network->lastMilliseconds();
+}
 float HipNetworkDx::lastMilliseconds() { return impl->milliseconds; }
+std::vector<float> HipNetworkDx::debugNodeMicros(uint32_t phase, uint32_t trials) {
+    impl->network->wait();
+    return impl->network->debugNodeMicros(phase, trials);
+}
+std::vector<std::pair<float, float>> HipNetworkDx::debugPhaseMicros(uint32_t trials) {
+    impl->network->wait();
+    std::vector<std::pair<float, float>> out;
+    for (uint32_t phase = 0; phase < impl->network->phases(); ++phase) {
+        float nodes = 0;
+        for (float us : impl->network->debugNodeMicros(phase, trials)) nodes += us;
+        out.emplace_back(impl->network->debugGraphMicros(phase, trials), nodes);
+    }
+    return out;
+}
 uint32_t HipNetworkDx::launches() const { return impl->launches; }
 } // namespace d4r::dx

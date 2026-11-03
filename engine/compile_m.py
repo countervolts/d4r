@@ -123,12 +123,18 @@ def build_dxil(output, ldr, preset_l=False, target='windows'):
     # vkd3d: the plain casts, which round to nearest even there (RX 9070 XT, M reconstruction 657 -> 597 us, Vulkan 565)
     native = ['-DD4R_VKD3D=1'] if target == 'vkd3d' else [] if EXACT else ['-DD4R_NATIVE_HALF=1']
     if preset_l:
+        marker = output / 'l_display_mv.bin'
+        marker.unlink(missing_ok=True)
         hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_lf.dxil', ['-DL_FEATURES=1'] + ldr_define + ags, wave=32)
-        # the reconstruction one render texel wider per tier than M's (compile_l)
+        # the reconstruction one render texel wider per tier than M's (compile_l). DISPLAY_MV: the game's
+        # display-resolution motion (binding 12) when mvSize is set, as post_l_dot2 and the RDNA 3 stages take it; the
+        # input stage (enc0_lf, enc0_lx) reads it through enc0_features.glsl. l_display_mv.bin tells the runtime
+        # (runtime_m_d3d12.cpp) that these stages have it; an older L package keeps render-resolution motion only
         tiers = (('post_l', 11), ('post_l_q', 16), ('post_l_c', 12))
         for out, tile in tiers:
             hlsl_build.build(HERE / 'post_m.comp', output / (out + '.dxil'),
-                             ['-DPRESET_L=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr_define + exact + native, wave=64)
+                             ['-DPRESET_L=1', '-DDISPLAY_MV=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr_define + exact + native, wave=64)
+        marker.write_bytes(b'D4RLDMV1')
     else:
         hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_m.dxil', ldr_define + ags, wave=32)
         hlsl_build.build(HERE / 'dec0_m.comp', output / 'dec0_m.dxil', ags, wave=32)

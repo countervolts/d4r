@@ -11,7 +11,8 @@ Super Resolution: NVIDIA's DLSS keeps the weights packed in nvngx_dlss.dll; they
 bundled Vulkan test app renders one frame per model through this d4r folder's nvngx.dll, which runs NGX's CUDA backend
 on ZLUDA (zluda\\), and the bridge (nvcuda.dll) saves what NGX uploads. The d4r folder's kernels run DLSS's
 networks on RDNA3 and RDNA4, so a test frame takes seconds even with ZLUDA's cache empty (17 s for K on an RX 9070
-XT); on RDNA2 ZLUDA compiles the network layers first (about half an hour, then cached).
+XT). On RDNA2 ZLUDA would compile K's, L's and M's network layers with emulated matrix products (minutes each), so
+their test frames run them as empty kernels (stub_network): only their launches are read.
 Ray Reconstruction (rr-d, rr-e, rr-f): everything comes from nvngx_dlssd.dll 310.9.1 itself, as on Linux (about half
 a minute each; no test frame, no ZLUDA).
 Everything written is derived from NVIDIA's DLLs: it stays in this folder and must not be redistributed.
@@ -56,12 +57,66 @@ def vkhip_kernels(runtime):
     return candidates[0] if len(candidates) == 1 else None
 
 
+# Lists HIP's devices in a process of its own (a HIP runtime fault there cannot take the builder down): "index bytes
+# target name" per line, through AMD's driver runtime. The target is hipDeviceProp_tR0600's gcnArchName (offset 1160,
+# as tools/wine_nvcuda_bridge.c reads it), "-" when unreadable.
+HIP_DEVICES = r'''
+import ctypes
+hip = ctypes.WinDLL("amdhip64_7.dll")
+if hip.hipInit(0) == 0:
+    count = ctypes.c_int(0); hip.hipGetDeviceCount(ctypes.byref(count))
+    for i in range(count.value):
+        size = ctypes.c_size_t(0); name = ctypes.create_string_buffer(256)
+        hip.hipDeviceTotalMem(ctypes.byref(size), i); hip.hipDeviceGetName(name, 256, i)
+        props = ctypes.create_string_buffer(1472 + 512)
+        arch = "-"
+        if hip.hipGetDevicePropertiesR0600(props, i) == 0:
+            arch = props.raw[1160:1160 + 256].split(b"\0")[0].split(b":")[0].decode(errors="replace") or "-"
+        print(i, size.value, arch, name.value.decode(errors="replace"))
+'''
+
+
+def hip_device_only():
+    """With more than one AMD GPU (a Ryzen CPU's integrated graphics beside a Radeon card), AMD's Windows HIP runtime
+    has crashed in its own worker thread on the frames' first allocations (RX 7900 XTX with an iGPU: 0xC0000005 in
+    amdhip64_7.dll at cuMemAlloc). The test frames then see only the card with the most memory - the dedicated one, as
+    integrated graphics have a share of system memory - through HIP_VISIBLE_DEVICES. A value the user set is kept.
+    Returns the GPU target of the device the test frames use ("gfx1031"), '' when unknown."""
+    try:
+        listed = subprocess.run([sys.executable, '-c', HIP_DEVICES], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    devices = []
+    for line in listed.splitlines():
+        index, size, arch, *name = line.split(' ', 3)
+        devices.append((int(size), int(index), arch if arch != '-' else '', name[0] if name else ''))
+    if not devices:
+        return ''
+    size, index, arch, name = max(devices)
+    # with HIP_VISIBLE_DEVICES set, the listing only has the devices it names
+    if len(devices) > 1 and not os.environ.get('HIP_VISIBLE_DEVICES'):
+        os.environ['HIP_VISIBLE_DEVICES'] = str(index)
+        print(f'{len(devices)} AMD GPUs: the test frames use HIP device {index} ({name}, {size >> 20} MiB) only')
+    return arch
+
+
+def stub_network(arch):
+    """The K, L and M test frames only provide their network layers' launches (arguments and weight uploads): on RDNA2
+    those layers run as empty kernels (model_tools.py stub-ptx), so ZLUDA does not compile them with emulated matrix
+    products for minutes each. D4R_ENGINE_STUB_NETWORK=0 / 1 forces either, as in build-engine-models.sh."""
+    forced = os.environ.get('D4R_ENGINE_STUB_NETWORK', 'auto')
+    if forced in ('0', '1'):
+        return forced == '1'
+    return arch.startswith('gfx103')
+
+
 class Builder:
     def __init__(self, runtime, kit, work, timeout):
         self.runtime, self.kit, self.work, self.timeout = runtime, kit, work, timeout
         self.tools = kit / 'model_tools.py'
         self.dll = runtime / 'nvngx_dlss.dll'
         self.total, self.done = 0, 0   # models to build and built, for the progress line
+        self.stubs = None              # the empty network modules (stub_network), when the frames use them
 
     def status(self, log):
         """the progress line for the step that writes LOG: a bar of the models built and the step in words"""
@@ -77,6 +132,8 @@ class Builder:
                 part = 'test frame' + (' (again)' if part != 'run' else '')
             elif step.startswith('ptx'):
                 model, part = 'DLSS', 'extracting kernels'
+            elif step == 'stubs':
+                model, part = 'DLSS', 'emptying the network kernels'
             else:
                 part = 'compiling'
         filled = 24 * self.done // max(self.total, 1)
@@ -136,6 +193,10 @@ class Builder:
         # two frames: NGX's first (reset) frame comes out black in the Vulkan test app, so the second is the one
         # checked; the model tools read the first frame's launches
         env['D4R_HARNESS_ALLOW_BLACK'] = '1'
+        # K, L and M with empty network kernels (stub_network): their frame's pixels are not checked
+        stubbed = self.stubs is not None and name in ('k', 'l', 'm')
+        if stubbed:
+            env['D4R_CUDA_REPLACE_DIR'] = str(self.stubs)
         app = self.work / 'app'
         # AMD's Windows driver now and then loses the device in one of DLSS's kernels under ZLUDA (seen with L);
         # the next run gets through
@@ -146,7 +207,8 @@ class Builder:
                         self.runtime / 'nvngx.dll', w / 'out.raw', 2, env=env, cwd=app, check=attempt == 2):
                 break
             print(f'  the test frame of {name} failed (log {w / "run.log"}); rendering it again...')
-        result = subprocess.run([sys.executable, str(self.tools), 'capture', str(w), name])
+        result = subprocess.run([sys.executable, str(self.tools), 'capture', str(w), name,
+                                 *(['--stubbed'] if stubbed else [])])
         if result.returncode:
             log = w / 'shim.log'
             if log.is_file():
@@ -212,6 +274,7 @@ def main():
         if not (kit / 'bin' / required).is_file():
             fail(f'{required} is missing from {kit / "bin"} (an incomplete d4r folder; extract the release again)')
     os.environ['D4R_DXC'] = str(kit / 'bin' / 'dxc.exe')
+    arch = hip_device_only()
 
     root = Path(os.environ.get('D4R_MODEL_LOG_DIR') or Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()))
                 / 'd4r' / 'model-builds')
@@ -229,6 +292,10 @@ def main():
             print(f'Building the Super Resolution models ({", ".join(sr_models)}) from what NGX uploads...')
             (work / 'app').mkdir()
             shutil.copy2(kit / 'bin' / 'vulkan_dlss_harness.exe', work / 'app')
+            if any(m.removesuffix('-ldr') in ('k', 'l', 'm') for m in sr_models) and stub_network(arch):
+                b.python('stubs.log', b.tools, 'stub-ptx', dll, work / 'stubs')
+                b.stubs = work / 'stubs'
+                print(f'  {arch}: the network layers run as empty kernels in the test frames', flush=True)
         frames = []
         for model in sr_models:
             base = model.removesuffix('-ldr')

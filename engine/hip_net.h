@@ -40,12 +40,19 @@ public:
     bool done();        // true once the queued layers have finished
     void wait();        // blocks until they have
     float lastMilliseconds(); // GPU time of the last finished launch
+    // The HIP stream launch() queues on (a hipStream_t), for callers that order it against another API with
+    // external semaphores (d3d12/hip_net_d3d12.h's shared D3D12 fence) instead of waiting on the CPU.
+    void* stream() const;
     // Diagnostic: relaunches the network `rounds` x 8 times on the unchanged input tokens (the graphs cycle with
     // period 8) and returns an FNV-1a hash of the output buffer after each launch, rounds-major.
     std::vector<uint64_t> debugRepeatHashes(uint32_t rounds);
     // Diagnostic: median GPU microseconds of every launch node of graph `phase` run individually (not graph-fused),
     // over `trials` runs. Node order is network order, a layer's post kernels following its main kernel.
     std::vector<float> debugNodeMicros(uint32_t phase, uint32_t trials);
+    // Diagnostic: median GPU microseconds of the whole captured graph of `phase` over `trials` launches, and the
+    // number of phases (graphs) the network cycles through.
+    float debugGraphMicros(uint32_t phase, uint32_t trials);
+    uint32_t phases() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

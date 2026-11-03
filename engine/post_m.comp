@@ -16,7 +16,8 @@
 // the previous exposure on its own, a candidate off screen (or after a reset) takes the linear colour texel, and the
 // blend is scaled by the current exposure.
 // DISPLAY_MV (default: not PRESET_L): the game's display-resolution motion texture (binding 12) is read when mvSize is
-// set; preset L's dot2 build (post_l_dot2) takes it as M does, NVIDIA's L kernels have no such variant in the capture.
+// set; preset L's dot2, RDNA 3 and D3D12 builds (post_l_dot2, rdna3/post_l*, post_l*.dxil) take it as M does,
+// NVIDIA's L kernels have no such variant in the capture.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
 #include "normalized_store.glsl"

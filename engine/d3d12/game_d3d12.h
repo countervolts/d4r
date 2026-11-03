@@ -28,13 +28,26 @@ public:
     // The model must outlive this object. Inputs up to maxRenderWidth x maxRenderHeight. Uploads the model (once per
     // Model) and clears the history on the model's own queue, waiting for the GPU (Model::execute).
     GameUpscaler(Model& model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth, uint32_t maxRenderHeight);
+    // With an external network (d3dhip, ExternalNetworkDx): the eleven layers run outside the engine, between
+    // recordFront and recordBack, in the buffers `external` names; record() is then not available.
+    GameUpscaler(Model& model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth, uint32_t maxRenderHeight,
+                 const ExternalNetworkDx* external);
     ~GameUpscaler(); // only once every recorded frame has retired (idle)
     GameUpscaler(const GameUpscaler&) = delete;
     GameUpscaler& operator=(const GameUpscaler&) = delete;
     // Records the frame; then exactly one of submitted or discarded (Engine's contract). Inputs and output are
     // transitioned from their given states and back, so the list's states are unchanged afterwards; the descriptor
     // heaps, root signature and pipeline state are d4r's (the caller restores its own, as with NGX).
-    void record(ID3D12GraphicsCommandList* list, const GameFrame& frame);
+    // profiler: the engine's boundaries (FrameProfiler; the halves' as Engine::recordFront/recordBack).
+    void record(ID3D12GraphicsCommandList* list, const GameFrame& frame, const FrameProfiler& profiler = {});
+    // The external network's halves: recordFront writes the tokens (the game's textures move to the engine's states
+    // here), recordBack reads the head, stores the output and restores the textures' states. Then submitted or
+    // discarded, as after record().
+    void recordFront(ID3D12GraphicsCommandList* list, const GameFrame& frame, const FrameProfiler& profiler = {});
+    void recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler = {});
+    // The network's dimensions (preset K's output size) and buffer sizes, for the external network's creation.
+    static uint64_t networkTokenBytes(uint32_t outputWidth, uint32_t outputHeight);
+    static uint64_t networkHeadBytes(uint32_t outputWidth, uint32_t outputHeight);
     void submitted(ID3D12Fence* fence, uint64_t value);
     void discarded();
     // Every submitted frame has executed (its fence was reached) and none awaits submitted/discarded.

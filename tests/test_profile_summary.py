@@ -46,3 +46,15 @@ class ProfileSummaryTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual([r['vk_output_mode'] for r in rows], ['compute', 'transfer'])
         self.assertEqual([r['timings_ms']['vk_total']['median'] for r in rows], [3, 4])
+
+    def test_stage_rows(self):
+        def row(frame, render='1280x720', input_ms='0.3'):
+            return (f'[  5.000] D4R_ENGINE_STAGE_PROFILE preset=K gpu_frame={frame} render={render} output=2560x1440 '
+                    f'gpu_eval=2.000 prepare=0.010 setup=0.020 input={input_ms} enc0=0.400 cpu_record=0.050 game_interval=16.6')
+        log = '\n'.join(('NVSDK_NGX_D3D12_CreateFeature(feature=1)', row(60), row(300), row(360, input_ms='0.5'),
+                         row(420, render='1706x960')))
+        rows = summary.summarize_stages(log)
+        self.assertEqual([r['samples'] for r in rows], [2, 1])
+        self.assertEqual(list(rows[0]['timings_ms'])[:4], ['gpu_eval', 'prepare', 'setup', 'input'])
+        self.assertEqual(rows[0]['timings_ms']['input']['median'], 0.4)
+        self.assertEqual(rows[1]['render'], '1706x960')

@@ -392,7 +392,8 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
         else {
             if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) throw std::runtime_error("M/L output does not allow UAV stores");
             const DXGI_FORMAT format = t.format == DXGI_FORMAT_UNKNOWN ? readFormat(desc.Format) : t.format;
-            if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT && format != DXGI_FORMAT_R10G10B10A2_UNORM)
+            if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT && format != DXGI_FORMAT_R10G10B10A2_UNORM &&
+                format != DXGI_FORMAT_R11G11B10_FLOAT)
                 throw std::runtime_error("M/L output format is unsupported");
         }
     }

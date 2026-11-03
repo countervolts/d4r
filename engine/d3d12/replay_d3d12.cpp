@@ -219,7 +219,10 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
     const bool readback = outputDir != "-";
     const bool profile = std::getenv("D4R_ENGINE_PROFILE") && std::string(std::getenv("D4R_ENGINE_PROFILE")) == "1";
     constexpr unsigned boundaries = d4r::KTimingStages + 1;
-    const uint32_t queryCount = 2 + (profile ? boundaries * repeats : 0);
+    // D4R_REPLAY_PHASES=1: four timestamps per timed frame (front start/end, back start/end; the whole frame for the
+    // DXIL network) and per-phase medians over the eight-frame window cycle
+    const bool phases = std::getenv("D4R_REPLAY_PHASES") && std::string(std::getenv("D4R_REPLAY_PHASES")) == "1";
+    const uint32_t queryCount = std::max<uint32_t>(2 + (profile ? boundaries * repeats : 0), phases ? 2 + 4 * repeats : 0);
     Context context; context.create(std::max<uint32_t>(queryCount, 2 + boundaries));
     auto* device = context.device.Get();
     auto* list = context.list.Get();
@@ -258,6 +261,17 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
 #endif
     }
     d4r::dx::Engine engine(model, shape, hip ? &external : nullptr);
+#ifdef D4R_ENGINE_D3DHIP
+    if (hipNetwork && std::getenv("D4R_REPLAY_HIP_PHASES")) {
+        std::cout << "HIP network per window phase (us): graph, kernels one by one\n";
+        const auto per = hipNetwork->debugPhaseMicros(25);
+        for (size_t k = 0; k < per.size(); ++k) std::printf("  phase %zu: %8.1f %8.1f\n", k, per[k].first, per[k].second);
+        const auto nodes = hipNetwork->debugNodeMicros(0, 25);
+        std::cout << "phase 0 launches (us, network order):";
+        for (size_t k = 0; k < nodes.size(); ++k) std::printf("%s%zu:%.1f", k % 8 ? "  " : "\n  ", k, nodes[k]);
+        std::cout << '\n';
+    }
+#endif
     model.recordUpload(list); engine.recordInitialize(list);
     for (auto& image : images) image->recordUpload(list, device);
     // A case captured mid-sequence starts from NGX's history (color, luma, feature): the first frame reads the
@@ -278,11 +292,34 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         engine.setFrame({images[f.color]->frame, images[f.motion]->frame, images[f.depth]->frame, {}}, f.input, f.output, &windows);
         ++evaluation;
     };
+    // d3dhip's handoff: GPU-side through a shared fence (the default), or CPU-serialized (D4R_D3DHIP_SYNC=cpu)
+    const char* syncMode = std::getenv("D4R_D3DHIP_SYNC");
+    const bool fenced = hipNetwork && !(syncMode && std::string(syncMode) == "cpu");
+    ComPtr<ID3D12Fence> shared;
+    uint64_t sharedValue = 0;
+    if (fenced) {
+        CK(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&shared)));
+        hipNetwork->useFence(shared.Get());
+        std::cout << "d3dhip sync: GPU fence (shared D3D12 fence imported into HIP)\n";
+    }
     auto recordFrameSplit = [&](uint32_t frame) {
         marks.first = 2 + frame * boundaries;
         engine.recordFront(list);
-        context.submit();                       // the front retires on the CPU first
-        hipNetwork->run();
+        if (fenced) {
+            // the front runs, HIP waits for it on the GPU, the rest of `list` waits for HIP: no CPU wait
+            CK(list->Close());
+            ID3D12CommandList* lists[] = {list};
+            context.queue->ExecuteCommandLists(1, lists);
+            CK(context.queue->Signal(shared.Get(), ++sharedValue));
+            hipNetwork->launchAfter(sharedValue, sharedValue + 1);
+            CK(context.queue->Wait(shared.Get(), ++sharedValue));
+            CK(context.queue->Signal(context.fence.Get(), ++context.value));
+            context.wait();                     // only to reuse the one allocator; the GPU order is the fence's
+            CK(context.allocator->Reset()); CK(list->Reset(context.allocator.Get(), nullptr));
+        } else {
+            context.submit();                   // the front retires on the CPU first
+            hipNetwork->run();
+        }
         engine.recordBack(list);
         engine.submitted(context.fence.Get(), context.value + 1);
     };
@@ -347,8 +384,79 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         // the last input as successive frames, as d4r-k
         std::vector<double> gpu, wall, networkMilliseconds;
         std::array<std::vector<double>, d4r::KTimingStages> stageTrials;
+        // phase -> {front, network gap, back, whole frame} samples (D4R_REPLAY_PHASES)
+        std::array<std::array<std::vector<double>, 4>, 8> phaseSamples;
+        std::vector<uint32_t> phaseOf(repeats);
+        auto collectPhases = [&](bool split) {
+            const auto t = context.stamps(2 + 4 * uint32_t(repeats));
+            for (int i = 0; i < repeats; ++i) {
+                const uint64_t* q = &t[2 + 4 * i];
+                auto& ph = phaseSamples[phaseOf[i] % 8];
+                if (split) {
+                    ph[0].push_back(context.micros(q[0], q[1])); ph[1].push_back(context.micros(q[1], q[2]));
+                    ph[2].push_back(context.micros(q[2], q[3]));
+                }
+                ph[3].push_back(context.micros(q[0], q[3]));
+            }
+        };
+        // d3dhip with GPU-side ordering (`fenced`, above): one shared fence orders front -> HIP network -> back on the
+        // GPU, so the CPU only waits once per batch; each frame records into its own pair of lists
+        std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+        std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
+        if (fenced) {
+            for (int i = 0; i < 2 * repeats; ++i) {
+                ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> commands;
+                CK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+                CK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)));
+                CK(commands->Close());
+                allocators.push_back(allocator); lists.push_back(commands);
+            }
+        }
         for (unsigned trial = 0; trial < 12; ++trial) {
             double hipTotal = 0;
+            if (fenced) {
+                const auto begin = std::chrono::steady_clock::now();
+                auto* queue = context.queue.Get();
+                for (int i = 0; i < repeats; ++i) {
+                    setFrame(kcase.frames.back());
+                    auto* front = lists[2 * i].Get(); auto* back = lists[2 * i + 1].Get();
+                    CK(allocators[2 * i]->Reset()); CK(front->Reset(allocators[2 * i].Get(), nullptr));
+                    CK(allocators[2 * i + 1]->Reset()); CK(back->Reset(allocators[2 * i + 1].Get(), nullptr));
+                    phaseOf[i] = evaluation - 1;
+                    if (i == 0) front->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    if (phases) front->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 + 4 * i);
+                    engine.recordFront(front);
+                    if (phases) front->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 + 4 * i + 1);
+                    CK(front->Close());
+                    ID3D12CommandList* first[] = {front};
+                    queue->ExecuteCommandLists(1, first);
+                    CK(queue->Signal(shared.Get(), ++sharedValue));            // the tokens are written
+                    hipNetwork->launchAfter(sharedValue, sharedValue + 1);    // HIP: wait, network, signal
+                    CK(queue->Wait(shared.Get(), ++sharedValue));              // the head is written
+                    if (phases) back->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 + 4 * i + 2);
+                    engine.recordBack(back);
+                    if (phases) back->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 + 4 * i + 3);
+                    if (i == repeats - 1) {
+                        back->EndQuery(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                        back->ResolveQueryData(context.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                               phases ? 2 + 4 * repeats : 2, context.stampReadback.Get(), 0);
+                    }
+                    CK(back->Close());
+                    ID3D12CommandList* second[] = {back};
+                    queue->ExecuteCommandLists(1, second);
+                    engine.submitted(context.fence.Get(), context.value + 1);
+                }
+                CK(queue->Signal(context.fence.Get(), ++context.value));
+                context.wait();
+                hipNetwork->finish();
+                if (FAILED(device->GetDeviceRemovedReason())) check(device->GetDeviceRemovedReason(), "device removed");
+                const double cpu = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count() / repeats;
+                const auto times = context.stamps(2);
+                if (trial >= 3) { gpu.push_back(context.micros(times[0], times[1]) / repeats); wall.push_back(cpu);
+                                  networkMilliseconds.push_back(hipNetwork->lastMilliseconds());
+                                  if (phases) collectPhases(true); }
+                continue;
+            }
             if (hipNetwork) {
                 // CPU-serialized: each frame is a front submission and wait, the HIP graph, then the back
                 double total = 0; const auto begin = std::chrono::steady_clock::now();
@@ -368,27 +476,46 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
                 continue;
             }
             context.stamp(0);
-            for (int i = 0; i < repeats; ++i) { setFrame(kcase.frames.back()); engine.recordFrame(list, profile ? profiler : d4r::dx::FrameProfiler{}); engine.submitted(context.fence.Get(), context.value + 1); }
+            for (int i = 0; i < repeats; ++i) {
+                setFrame(kcase.frames.back()); phaseOf[i] = evaluation - 1;
+                if (phases) context.stamp(2 + 4 * i);
+                engine.recordFrame(list, profile ? profiler : d4r::dx::FrameProfiler{});
+                if (phases) context.stamp(2 + 4 * i + 3);
+                engine.submitted(context.fence.Get(), context.value + 1);
+            }
             context.stamp(1);
-            context.resolve(profile ? 2 + boundaries * repeats : 2);
+            context.resolve(phases ? 2 + 4 * repeats : profile ? 2 + boundaries * repeats : 2);
             const auto t0 = std::chrono::steady_clock::now();
             context.submit();
             const double cpu = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / repeats;
             if (trial >= 3) {
                 const auto times = context.stamps(2);
                 gpu.push_back(context.micros(times[0], times[1]) / repeats); wall.push_back(cpu);
+                if (phases) collectPhases(false);
                 if (profile) { auto values = stageMicros(uint32_t(repeats)); for (unsigned s = 0; s < values.size(); ++s) stageTrials[s].push_back(values[s]); }
             }
         }
         std::sort(gpu.begin(), gpu.end()); std::sort(wall.begin(), wall.end());
         if (hipNetwork) {
             std::sort(networkMilliseconds.begin(), networkMilliseconds.end());
-            std::cout << "full native frame (hip): " << gpu[gpu.size() / 2] << " us GPU median (min " << gpu.front() << "); "
+            std::cout << "full native frame (hip" << (fenced ? ", GPU fence" : ", CPU-serialized") << "): " << gpu[gpu.size() / 2]
+                      << " us GPU median (min " << gpu.front() << "); "
                       << wall[wall.size() / 2] << " us submit+wait per frame; network "
                       << networkMilliseconds[networkMilliseconds.size() / 2] << " ms hip median\n";
         } else
             std::cout << "full native frame: " << gpu[gpu.size() / 2] << " us GPU median (min " << gpu.front() << "); "
                       << wall[wall.size() / 2] << " us amortized submit+wait; " << repeats << " frames/submit\n";
+        if (phases) {
+            auto median = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            auto maxOf = [](const std::vector<double>& v) { return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()); };
+            std::cout << "per window phase (median us; max of the whole frame):\n";
+            std::cout << "  phase   front  network    back   frame   max\n";
+            for (unsigned k = 0; k < 8; ++k) {
+                const auto& ph = phaseSamples[k];
+                std::printf("  %5u %7.1f %8.1f %7.1f %7.1f %7.1f\n", k, median(ph[0]), median(ph[1]), median(ph[2]),
+                            median(ph[3]), maxOf(ph[3]));
+            }
+        }
         if (profile) {
             std::cout << "stage GPU medians (us/frame, includes preceding dependencies; timestamp instrumentation enabled):\n";
             for (unsigned s = 0; s < stageTrials.size(); ++s) {

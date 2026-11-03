@@ -68,6 +68,36 @@ __declspec(dllexport) int d4rHipNetRun(void* net, char* error, unsigned errorByt
     }
 }
 
+// GPU-side ordering: imports `fence` (D3D12_FENCE_FLAG_SHARED) into HIP. 0: d4rHipNetLaunchAfter may be used;
+// otherwise *error says why and d4rHipNetRun's CPU-serialized handoff remains.
+__declspec(dllexport) int d4rHipNetUseFence(void* net, ID3D12Fence* fence, char* error, unsigned errorBytes) {
+    if (net == nullptr) {
+        setError(error, errorBytes, "the network is not created");
+        return -1;
+    }
+    try {
+        static_cast<Net*>(net)->network->useFence(fence);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(error, errorBytes, e.what());
+        return -1;
+    }
+}
+// Queues without blocking: HIP waits for the fence to reach `wait`, runs the network, signals `signal`.
+__declspec(dllexport) int d4rHipNetLaunchAfter(void* net, unsigned long long wait, unsigned long long signal, char* error,
+                                               unsigned errorBytes) {
+    if (net == nullptr) {
+        setError(error, errorBytes, "the network is not created");
+        return -1;
+    }
+    try {
+        static_cast<Net*>(net)->network->launchAfter(wait, signal);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(error, errorBytes, e.what());
+        return -1;
+    }
+}
 __declspec(dllexport) float d4rHipNetMilliseconds(void* net) {
     return net != nullptr ? static_cast<Net*>(net)->network->lastMilliseconds() : 0.0f;
 }

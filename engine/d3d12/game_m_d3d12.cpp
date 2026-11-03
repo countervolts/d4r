@@ -54,29 +54,29 @@ GameUpscalerM::GameUpscalerM(MModel& model, uint32_t outputWidth, uint32_t outpu
     : impl(std::make_unique<Impl>(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight, external)) {}
 GameUpscalerM::~GameUpscalerM() = default;
 
-void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const GameFrameM& frame) {
+void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const GameFrameM& frame, const FrameProfiler& profiler) {
     auto& g = *impl;
     std::vector<D3D12_RESOURCE_BARRIER> entry, exit;
     prepareFrame(g.engine, entry, exit, frame);
     if (!entry.empty()) list->ResourceBarrier(UINT(entry.size()), entry.data());
-    g.engine.recordFrame(list);
+    g.engine.recordFrame(list, profiler);
     if (!exit.empty()) list->ResourceBarrier(UINT(exit.size()), exit.data());
 }
 
-void GameUpscalerM::recordFront(ID3D12GraphicsCommandList* list, const GameFrameM& frame) {
+void GameUpscalerM::recordFront(ID3D12GraphicsCommandList* list, const GameFrameM& frame, const FrameProfiler& profiler) {
     auto& g = *impl;
     if (g.front) throw std::runtime_error("recordBack before the next recordFront");
     std::vector<D3D12_RESOURCE_BARRIER> entry;
     prepareFrame(g.engine, entry, g.exit, frame);
     if (!entry.empty()) list->ResourceBarrier(UINT(entry.size()), entry.data());
-    g.engine.recordFront(list);
+    g.engine.recordFront(list, profiler);
     g.front = true;
 }
 
-void GameUpscalerM::recordBack(ID3D12GraphicsCommandList* list) {
+void GameUpscalerM::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
     auto& g = *impl;
     if (!g.front) throw std::runtime_error("recordFront before recordBack");
-    g.engine.recordBack(list);
+    g.engine.recordBack(list, profiler);
     if (!g.exit.empty()) list->ResourceBarrier(UINT(g.exit.size()), g.exit.data());
     g.exit.clear();
     g.front = false;

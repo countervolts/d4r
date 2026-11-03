@@ -351,6 +351,7 @@ bool HipNetwork::done() {
     check(e, "hipEventQuery"); n.pending = false; return true;
 }
 void HipNetwork::wait() { HIPCHECK(hipStreamSynchronize(impl->stream)); impl->pending = false; }
+void* HipNetwork::stream() const { return impl->stream; }
 std::vector<uint64_t> HipNetwork::debugRepeatHashes(uint32_t rounds) {
     // per launch: the output buffer hash, then one hash per owned allocation (weights and activations)
     auto& n = *impl; std::vector<uint64_t> hashes; std::vector<unsigned char> host;
@@ -387,5 +388,18 @@ std::vector<float> HipNetwork::debugNodeMicros(uint32_t phase, uint32_t trials) 
     for (auto& s : samples) { std::sort(s.begin(), s.end()); result.push_back(s[s.size() / 2]); }
     return result;
 }
+float HipNetwork::debugGraphMicros(uint32_t phase, uint32_t trials) {
+    auto& n = *impl; std::vector<float> samples;
+    hipEvent_t a = nullptr, b = nullptr; HIPCHECK(hipEventCreate(&a)); HIPCHECK(hipEventCreate(&b));
+    for (uint32_t t = 0; t < trials + 2; ++t) {
+        HIPCHECK(hipEventRecord(a, n.stream)); HIPCHECK(hipGraphLaunch(n.executable[phase % n.graphs], n.stream));
+        HIPCHECK(hipEventRecord(b, n.stream)); HIPCHECK(hipEventSynchronize(b));
+        float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, a, b)); if (t >= 2) samples.push_back(ms * 1000.0f);
+    }
+    (void)hipEventDestroy(a); (void)hipEventDestroy(b);
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+}
+uint32_t HipNetwork::phases() const { return impl->graphs; }
 float HipNetwork::lastMilliseconds() { float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, impl->start, impl->stop)); return ms; }
 } // namespace d4r

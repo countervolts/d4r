@@ -31,6 +31,7 @@ videos/
 # Machine-specific notes, CI runner setup, local experiments, benchmark automation (kept locally, never published)
 /private/
 /external/
+/docs/benchmarks
 # Native kernel build products and inputs extracted from NVIDIA's DLL at build time
 /kernels/out/
 *.hsaco

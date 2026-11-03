@@ -4,6 +4,23 @@ set -euo pipefail
 # Builds build/d4r_nvngx.dll, the D3D12/Vulkan-to-CUDA NGX core shim loaded by
 # OptiScaler through its NvngxPath setting.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Native Windows (Git Bash or MSYS2): MSYS2's MinGW, the Vulkan SDK's headers and the HIP SDK (its clang-cl too) when
+# they are not given. The HIP SDK's short path: "Program Files" would split the unquoted include and library flags.
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+  if ! command -v "${MINGW_CXX:-x86_64-w64-mingw32-g++}" >/dev/null && [[ -x /c/msys64/mingw64/bin/x86_64-w64-mingw32-g++ ]]; then
+    export PATH="/c/msys64/mingw64/bin:$PATH"
+  fi
+  if [[ -z "${VULKAN_INCLUDE:-}" && ! -d /usr/include/vulkan && -n "${VULKAN_SDK:-}" ]]; then
+    VULKAN_INCLUDE="$(cygpath -m "$VULKAN_SDK")/Include"
+  fi
+  if [[ -z "${D4R_ROCM_DIR:-}" && -n "${HIP_PATH:-}" && -f "$HIP_PATH/include/hip/hip_runtime_api.h" ]]; then
+    D4R_ROCM_DIR="$(cygpath -m -s "$HIP_PATH")"
+    D4R_ROCM_DIR="${D4R_ROCM_DIR%/}"
+  fi
+  if [[ -z "${CLANG_CL:-}" ]] && ! command -v clang-cl >/dev/null && [[ -x "${D4R_ROCM_DIR:-}/bin/clang-cl.exe" ]]; then
+    CLANG_CL="$D4R_ROCM_DIR/bin/clang-cl.exe"
+  fi
+fi
 MINGW_CXX="${MINGW_CXX:-x86_64-w64-mingw32-g++}"
 CLANG_CL="${CLANG_CL:-clang-cl}"
 BUILD_ID="$(bash "$ROOT/scripts/runtime_build_id.sh")"
@@ -82,7 +99,7 @@ fi
   "$ROOT/engine/d3d12/runtime_d3d12.cpp" "$ROOT/engine/d3d12/game_d3d12.cpp" \
   "$ROOT/engine/d3d12/runtime_rr_d3d12.cpp" "$ROOT/engine/d3d12/game_rr_d3d12.cpp" \
   "$ROOT/engine/d3d12/runtime_m_d3d12.cpp" "$ROOT/engine/d3d12/game_m_d3d12.cpp" \
-  -ld3d12 -ldxgi -lbcrypt -Wl,--entry,d4r_dll_entry -o "$ROOT/build/d4r_nvngx.dll"
+  -ld3d12 -ldxgi -lbcrypt -lsetupapi -Wl,--entry,d4r_dll_entry -o "$ROOT/build/d4r_nvngx.dll"
 printf 'Built %s\n' "$ROOT/build/d4r_nvngx.dll"
 cp "$ROOT/build/d4r_nvngx.dll" "$ROOT/build/d4r.asi"
 printf 'Built %s\n' "$ROOT/build/d4r.asi"
