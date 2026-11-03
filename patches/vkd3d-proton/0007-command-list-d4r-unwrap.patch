@@ -1,0 +1,145 @@
+diff --git a/include/vkd3d_command_list_vkd3d_ext.idl b/include/vkd3d_command_list_vkd3d_ext.idl
+index 204f309e..8f04a02b 100644
+--- a/include/vkd3d_command_list_vkd3d_ext.idl
++++ b/include/vkd3d_command_list_vkd3d_ext.idl
+@@ -51,3 +51,17 @@ interface ID3D12GraphicsCommandListExt2 : ID3D12GraphicsCommandListExt1
+ {
+     BOOL VerifyOpacityMicromapArrayNVAPI(D3D12_GPU_VIRTUAL_ADDRESS opacity_micromap_array);
+ }
++
++[
++    uuid(a25167d5-4098-477a-b781-94ea06d7fdb9),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropCommandListD4R : IUnknown
++{
++    /* d4r: returns the native vkd3d-proton command list. Proxy layers (e.g. ReShade)
++     * forward unknown QueryInterface calls to the wrapped object, so this interface
++     * resolves the native list from a proxied ID3D12GraphicsCommandList. */
++    HRESULT GetCommandList(ID3D12GraphicsCommandList **list);
++}
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index f4480e2b..9d30a965 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3562,6 +3562,12 @@ static inline struct d3d12_command_list *impl_from_ID3D12GraphicsCommandList(d3d
+     return CONTAINING_RECORD(iface, struct d3d12_command_list, ID3D12GraphicsCommandList_iface);
+ }
+ 
++/* d4r */
++static inline struct d3d12_command_list *impl_from_ID3D12DXVKInteropCommandListD4R(d3d12_command_list_d4r_iface *iface)
++{
++    return CONTAINING_RECORD(iface, struct d3d12_command_list, ID3D12DXVKInteropCommandListD4R_iface);
++}
++
+ void d3d12_command_list_invalidate_current_pipeline(struct d3d12_command_list *list, bool meta_shader)
+ {
+     list->current_pipeline = VK_NULL_HANDLE;
+@@ -6577,6 +6583,60 @@ static void d3d12_command_list_track_query_heap(struct d3d12_command_list *list,
+ 
+ extern ULONG STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_AddRef(d3d12_command_list_vkd3d_ext_iface *iface);
+ 
++extern ULONG STDMETHODCALLTYPE d3d12_command_list_AddRef(d3d12_command_list_iface *iface);
++extern ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *iface);
++static ULONG STDMETHODCALLTYPE d3d12_command_list_d4r_AddRef(d3d12_command_list_d4r_iface *iface);
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_d4r_QueryInterface(d3d12_command_list_d4r_iface *iface,
++        REFIID iid, void **object)
++{
++    if (!object)
++        return E_POINTER;
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_ID3D12DXVKInteropCommandListD4R))
++    {
++        *object = iface;
++        d3d12_command_list_d4r_AddRef(iface);
++        return S_OK;
++    }
++    *object = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d3d12_command_list_d4r_AddRef(d3d12_command_list_d4r_iface *iface)
++{
++    struct d3d12_command_list *list = impl_from_ID3D12DXVKInteropCommandListD4R(iface);
++    return d3d12_command_list_AddRef(&list->ID3D12GraphicsCommandList_iface);
++}
++
++static ULONG STDMETHODCALLTYPE d3d12_command_list_d4r_Release(d3d12_command_list_d4r_iface *iface)
++{
++    struct d3d12_command_list *list = impl_from_ID3D12DXVKInteropCommandListD4R(iface);
++    return d3d12_command_list_Release(&list->ID3D12GraphicsCommandList_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_d4r_GetCommandList(d3d12_command_list_d4r_iface *iface,
++        ID3D12GraphicsCommandList **list)
++{
++    struct d3d12_command_list *cmd_list = impl_from_ID3D12DXVKInteropCommandListD4R(iface);
++
++    if (!list)
++        return E_POINTER;
++    *list = (ID3D12GraphicsCommandList *)&cmd_list->ID3D12GraphicsCommandList_iface;
++    ID3D12GraphicsCommandList_AddRef(*list);
++    return S_OK;
++}
++
++CONST_VTBL struct ID3D12DXVKInteropCommandListD4RVtbl d3d12_command_list_d4r_vtbl =
++{
++    /* IUnknown methods */
++    d3d12_command_list_d4r_QueryInterface,
++    d3d12_command_list_d4r_AddRef,
++    d3d12_command_list_d4r_Release,
++
++    /* ID3D12DXVKInteropCommandListD4R methods */
++    d3d12_command_list_d4r_GetCommandList,
++};
++
+ HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_iface *iface,
+         REFIID iid, void **object)
+ {
+@@ -6617,6 +6677,13 @@ HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_i
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID(iid, &IID_ID3D12DXVKInteropCommandListD4R))
++    {
++        d3d12_command_list_d4r_AddRef(&command_list->ID3D12DXVKInteropCommandListD4R_iface);
++        *object = &command_list->ID3D12DXVKInteropCommandListD4R_iface;
++        return S_OK;
++    }
++
+     if (IsEqualGUID(iid, &IID_ID3DDestructionNotifier))
+     {
+         ID3DDestructionNotifier_AddRef(&command_list->destruction_notifier.ID3DDestructionNotifier_iface);
+@@ -23181,6 +23248,8 @@ static HRESULT d3d12_command_list_init(struct d3d12_command_list *list, struct d
+ 
+     list->ID3D12GraphicsCommandListExt_iface.lpVtbl = &d3d12_command_list_vkd3d_ext_vtbl;
+ 
++    list->ID3D12DXVKInteropCommandListD4R_iface.lpVtbl = &d3d12_command_list_d4r_vtbl; /* d4r */
++
+     hash_map_init(&list->query_resolve_lut,
+             vkd3d_query_lookup_entry_hash,
+             vkd3d_query_lookup_entry_compare,
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 65d6568b..d7f6e480 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3023,6 +3023,9 @@ struct vkd3d_rendering_info
+ /* ID3D12CommandListExt */
+ typedef ID3D12GraphicsCommandListExt2 d3d12_command_list_vkd3d_ext_iface;
+ 
++/* ID3D12DXVKInteropCommandListD4R */
++typedef ID3D12DXVKInteropCommandListD4R d3d12_command_list_d4r_iface;
++
+ struct d3d12_rt_state_object;
+ 
+ struct d3d12_resource_tracking
+@@ -3424,6 +3427,7 @@ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+     d3d12_command_list_vkd3d_ext_iface ID3D12GraphicsCommandListExt_iface;
++    d3d12_command_list_d4r_iface ID3D12DXVKInteropCommandListD4R_iface; /* d4r */
+     LONG refcount;
+ 
+     D3D12_COMMAND_LIST_TYPE type;
