@@ -2,6 +2,8 @@
 
 want to run xess (xmx) on radeon? check out [x4r](https://github.com/countervolts/x4r)!
 
+nightly for windows and linux can be found [here](https://github.com/countervolts/d4r-nightly)
+
 d4r runs NVIDIA's official DLSS Super Resolution (`nvngx_dlss.dll`) and experimental Ray Reconstruction (`nvngx_dlssd.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest kernels replaced by hand-written RDNA2, RDNA3 and RDNA4 code.
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus L for Ultra Performance). Ray Reconstruction presets D, E and F are experimental ([building](docs/building.md)). DLSS 5 is PURPOSELY not supported.
