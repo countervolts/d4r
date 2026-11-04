@@ -1,0 +1,42 @@
+diff -ruN a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+--- a/libs/vkd3d/device_vkd3d_ext.c	2026-11-03 18:25:53.807995005 +0100
++++ b/libs/vkd3d/device_vkd3d_ext.c	2026-11-03 18:25:53.823881552 +0100
+@@ -303,7 +303,10 @@
+     device = d3d12_device_from_ID3D12DeviceExt(iface);
+     vk_procs = &device->vk_procs;
+ 
+-    if (d3d12_device_use_descriptor_heap(device))
++    /* Under NVX emulation the combined image+sampler index is unavailable, but the
++     * image-view handle API also works for descriptors in shader-visible heaps, so
++     * prefer it whenever the driver exposes it. */
++    if (d3d12_device_use_descriptor_heap(device) && !vk_procs->vkGetImageViewHandleNVX)
+     {
+         image_index = d3d12_device_find_shader_visible_descriptor_heap_offset(device, srv_handle.ptr,
+                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+@@ -354,7 +357,7 @@
+     device = d3d12_device_from_ID3D12DeviceExt(iface);
+     vk_procs = &device->vk_procs;
+ 
+-    if (d3d12_device_use_descriptor_heap(device))
++    if (d3d12_device_use_descriptor_heap(device) && !vk_procs->vkGetImageViewHandleNVX)
+     {
+         image_index = d3d12_device_find_shader_visible_descriptor_heap_offset(device,
+                 uav_handle.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+@@ -526,7 +529,7 @@
+         params->pNext = NULL;
+     }
+ 
+-    if (d3d12_device_use_descriptor_heap(device))
++    if (d3d12_device_use_descriptor_heap(device) && !vk_procs->vkGetImageViewHandle64NVX)
+     {
+         if (params->texDesc)
+         {
+@@ -600,7 +603,7 @@
+         params->pNext = NULL;
+     }
+ 
+-    if (d3d12_device_use_descriptor_heap(device))
++    if (d3d12_device_use_descriptor_heap(device) && !vk_procs->vkGetImageViewHandle64NVX)
+     {
+         if (params->type != D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_SURFACE &&
+             params->type != D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_TEXTURE)
