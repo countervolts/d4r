@@ -1985,6 +1985,9 @@ static d4r::dx::RModel* native_engine_rr(unsigned preset);
 
 static std::string rr_model_directory(int slot);
 static bool engine_requested();
+// The render GPU cannot run the engine's shaders (initialize: older than RDNA 3 on native Windows): the CUDA route
+// runs as with [Engine] Enabled = false
+static std::atomic<bool> g_engineGpuOff{false};
 // The native Vulkan frontend stages only Super Sampling's inputs, so its Ray Reconstruction is the engine's alone: on
 // offer with the engine on and a preset D, E or F package installed (nvngx_dlssd.dll is not used)
 static bool native_vk_rr_package()
@@ -2082,6 +2085,8 @@ static void set_cuda_adapter_luid(const LUID& luid)
 static void start_engine_preload();
 
 static bool native_engine_available(bool ldr);
+enum class AmdGeneration { Unknown, Older, Rdna3, Rdna4 }; // ordered: newer compares greater
+static AmdGeneration amd_render_generation(ID3D12Device* renderDevice);
 static d4r::dx::MModel* native_engine_m(bool ldr, bool presetL = false);
 static d4r::dx::rdna3::MModel* native_engine_m_rdna3(bool ldr, bool presetL);
 
@@ -2116,7 +2121,18 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         if (vkd3d && env_uint("D4R_ENGINE_NATIVE_D3D12", 0) != 0) vkd3d = false;
         if (vkd3d) logf("the game's D3D12 device is vkd3d-proton's: the Vulkan engine (vkhip) instead of the native D3D12 engine");
     }
-    if (device != nullptr && native_d3d12_requested() && !vkd3d)
+    // Every native D3D12 shader uses WMMA (RDNA 3 and later); creating one on an older AMD GPU removes the game's
+    // device, so such a GPU takes the CUDA route. An unidentified GPU keeps the engine; D4R_ENGINE_GPU_CHECK=0 skips this.
+    bool nativeGpu = true;
+    if (device != nullptr && native_d3d12_requested() && !vkd3d && env_uint("D4R_ENGINE_GPU_CHECK", 1) != 0 &&
+        amd_render_generation(device) == AmdGeneration::Older)
+    {
+        nativeGpu = false;
+        g_engineGpuOff = true;
+        logf("native D3D12 engine: not on this GPU (its shaders need RDNA 3 or later); the CUDA route instead, as with "
+             "[Engine] Enabled = false");
+    }
+    if (device != nullptr && native_d3d12_requested() && !vkd3d && nativeGpu)
     {
         device->AddRef();
         g.device = device;
@@ -3299,6 +3315,7 @@ struct Feature
     uint32_t rejectedFormatCount = 0; // game thread; rate-limits format diagnostics
     std::atomic<int> latestOutput{-1};
     std::atomic<uint32_t> completedFrames{0};
+    uint32_t engineFrames = 0;    // game thread: frames the engine recorded into the game's lists (no CUDA completion)
     uint32_t evaluatedFrames = 0; // worker only
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.
@@ -4309,6 +4326,9 @@ struct NativeVram
 {
     std::once_flag once;
     bool ready = false, split = false;
+    // a shared buffer HIP could not import: every later feature stages through host memory (HIP's import does not
+    // start working mid-session, and retrying it each frame left the game without a DLSS image)
+    std::atomic<bool> importFailed{false};
     using Import = int(WINAPI*)(void*, uint64_t, CudaDevicePtr*, void**);
     Import import = nullptr;
     ID3D12RootSignature* inputRoot = nullptr;
@@ -4370,7 +4390,7 @@ static bool native_vram_available()
     if (!vram_interop_requested() || g_vk.interop != nullptr)
         return false;
     std::call_once(g_dxv.once, init_native_vram);
-    return g_dxv.ready;
+    return g_dxv.ready && !g_dxv.importFailed.load();
 }
 
 // The view format a shader reads `format` through: typeless and depth formats as their colour-readable equivalent,
@@ -4438,6 +4458,9 @@ static bool create_native_vram_buffer(VramBuffer& target, size_t bytes)
     {
         logf("native VRAM: shared buffer of %zu bytes failed (HRESULT 0x%08lx, import %d)", bytes,
              static_cast<unsigned long>(hr), imported);
+        if (SUCCEEDED(hr) && !g_dxv.importFailed.exchange(true))
+            logf("native VRAM: off for this session (HIP cannot import D3D12 shared buffers here); features stage "
+                 "through host memory from their next frame");
         if (buffer.d3d != nullptr)
             buffer.d3d->Release();
         return false;
@@ -10015,7 +10038,7 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
     // A device initialized for the native D3D12 engine (native Windows with [Engine] on) runs Super Sampling on it
     // alone. D4R_ENGINE_NATIVE_D3D12=1 takes that path on vkd3d-proton too (comparing the D3D12 kernels on Linux).
     static const bool forceNativeD3d12 = env_uint("D4R_ENGINE_NATIVE_D3D12", 0) != 0;
-    const bool nativeD3d12 = !nativeVulkan && (g.nativeD3d12Only || forceNativeD3d12);
+    const bool nativeD3d12 = !nativeVulkan && (g.nativeD3d12Only || (forceNativeD3d12 && !g_engineGpuOff.load()));
     // Without vkd3d-proton (native Windows) the CUDA backend stages through host memory and the submission hooks
     // keep each frame's resources alive (retain_native).
     if (!nativeVulkan && !nativeD3d12 && g_vk.interop == nullptr)
@@ -10139,10 +10162,20 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
                              (native_engine_m(ldrFeature, feature->preset == 12) != nullptr ||
                               native_engine_m_rdna3(ldrFeature, feature->preset == 12) != nullptr);
         const bool presetRR = rayReconstruction && native_engine_rr(feature->preset) != nullptr;
+        // The native engine has Super Resolution's K, L and M only: another preset (the CNN presets A-F and J, which
+        // an OptiScaler override can ask for) or an M/L without its package runs as K rather than leaving the game
+        // without DLSS (there is no CUDA route to fall back to here)
+        if (!rayReconstruction && !presetM && feature->preset != 11 && native_engine_available(ldrFeature))
+        {
+            logf("native D3D12: preset %u has no native package (the engine runs K, L and M); the feature runs K",
+                 feature->preset);
+            feature->preset = 11;
+        }
         if (!presetRR && !presetM && (rayReconstruction || feature->preset != 11 || !native_engine_available(ldrFeature)))
         {
-            logf("native D3D12 CreateFeature refused: preset=%u flags=0x%x (requires a matching SR K/M/L or RR D/E/F package)",
-                 feature->preset, feature->flags);
+            logf("native D3D12 CreateFeature refused: preset=%u flags=0x%x (%s)", feature->preset, feature->flags,
+                 rayReconstruction ? "no Ray Reconstruction D/E/F package for it"
+                                   : "no Super Resolution K, L or M package for it; the native engine has no other presets");
             delete feature;
             return NGX_FAIL_FEATURE_NOT_SUPPORTED;
         }
@@ -10254,7 +10287,7 @@ static EngineBackend g_engine;
 static bool engine_requested()
 {
     static const bool requested = env_uint("D4R_ENGINE", 0) != 0;
-    return requested;
+    return requested && !g_engineGpuOff.load();
 }
 
 // [Engine] Enabled = auto (D4R_ENGINE_K=0) keeps K on the native kernels only on RDNA3: there they beat the Vulkan
@@ -12424,31 +12457,106 @@ static std::string engine_m_directory(bool ldr, bool presetL)
                           : engine_model_directory("D4R_ENGINE_M_MODEL_DIR", L"\\engine\\m"));
 }
 
-// Whether an RDNA4 GPU (FP8 WMMA) is installed, from the PnP tree's PCI ids: DXGI reports OptiScaler's NVIDIA identity
-// to every caller in the game. Creating the FP8 WMMA pipelines on RDNA3 does not just fail: AMD's driver removes the
-// game's device (DXGI_ERROR_DRIVER_INTERNAL_ERROR in Ghost of Tsushima on an RX 7700 XT), so they are only tried here.
-static bool rdna4_installed()
+// The AMD architecture of a PCI device id, for the shaders the native D3D12 engine may create: all of them use WMMA
+// (RDNA 3 and later), and M's, L's and RR's FP8 WMMA ones RDNA 4 only. Creating a pipeline the GPU cannot run does
+// not just fail: AMD's driver removes the game's device (FP8 shaders on an RX 7700 XT in Ghost of Tsushima; RDNA 3
+// shaders on an RX 6800 in Delta Force, at the first pipeline). An id not listed counts as older.
+static AmdGeneration amd_generation(unsigned device)
 {
-    static const bool found = [] {
+    // Navi 48 (RX 9070 XT / 9070 / 9070 GRE 0x7550, Radeon AI PRO R9700 0x7551), Navi 44 (RX 9060 XT / 9060)
+    if (device == 0x7550 || device == 0x7551 || device == 0x7590)
+        return AmdGeneration::Rdna4;
+    // Navi 31/32/33 (RX 7000, Radeon PRO W7000, mobile), and the RDNA 3/3.5 APUs: Phoenix, Hawk Point, Strix Point,
+    // Strix Halo, Krackan Point
+    if ((device >= 0x7440 && device <= 0x749f) || device == 0x15bf || device == 0x15c8 || device == 0x1900 ||
+        device == 0x1901 || device == 0x150e || device == 0x1586 || device == 0x1114)
+        return AmdGeneration::Rdna3;
+    return AmdGeneration::Older;
+}
+
+// The render adapter's PCI address through the kernel thunks (D3DKMTOpenAdapterFromLuid, KMTQAITYPE_ADAPTERADDRESS):
+// DXGI reports OptiScaler's NVIDIA identity to every caller in the game, but not a different LUID or bus address.
+static bool render_adapter_address(ID3D12Device* device, DWORD& bus, DWORD& address)
+{
+    struct OpenFromLuid { LUID luid; UINT adapter; };
+    struct Query { UINT adapter; UINT type; void* data; UINT size; };
+    struct Address { UINT bus, device, function; };
+    struct Close { UINT adapter; };
+    const HMODULE gdi = GetModuleHandleW(L"gdi32.dll") != nullptr ? GetModuleHandleW(L"gdi32.dll") : LoadLibraryW(L"gdi32.dll");
+    if (device == nullptr || gdi == nullptr)
+        return false;
+    const auto open = reinterpret_cast<LONG(WINAPI*)(OpenFromLuid*)>(
+        reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid")));
+    const auto query = reinterpret_cast<LONG(WINAPI*)(Query*)>(
+        reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTQueryAdapterInfo")));
+    const auto close = reinterpret_cast<LONG(WINAPI*)(Close*)>(
+        reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTCloseAdapter")));
+    if (open == nullptr || query == nullptr || close == nullptr)
+        return false;
+    OpenFromLuid adapter{};
+    device->GetAdapterLuid(&adapter.luid);
+    if (open(&adapter) != 0)
+        return false;
+    Address location{};
+    Query request{adapter.adapter, 6 /* KMTQAITYPE_ADAPTERADDRESS */, &location, sizeof(location)};
+    const bool found = query(&request) == 0;
+    Close closing{adapter.adapter};
+    close(&closing);
+    bus = location.bus;
+    address = (location.device << 16) | location.function; // SPDRP_ADDRESS's encoding for PCI
+    return found;
+}
+
+// The architecture of the AMD GPU the game renders on, from the PnP tree's PCI ids. When the render adapter's
+// address cannot be read, the newest AMD GPU installed (an iGPU beside a Radeon card is the older one).
+// Unknown: no AMD GPU found, or the PnP tree could not be read.
+static AmdGeneration amd_render_generation(ID3D12Device* renderDevice)
+{
+    static const AmdGeneration generation = [renderDevice] {
+        DWORD renderBus = 0, renderAddress = 0;
+        const bool located = render_adapter_address(renderDevice, renderBus, renderAddress);
         const HDEVINFO set = SetupDiGetClassDevsW(nullptr, L"PCI", nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
-        if (set == INVALID_HANDLE_VALUE) return false;
-        bool rdna4 = false;
+        if (set == INVALID_HANDLE_VALUE) return AmdGeneration::Unknown;
+        AmdGeneration newest = AmdGeneration::Unknown, render = AmdGeneration::Unknown;
+        unsigned renderId = 0;
         SP_DEVINFO_DATA data{};
         data.cbSize = sizeof(data);
-        for (DWORD index = 0; !rdna4 && SetupDiEnumDeviceInfo(set, index, &data); ++index)
+        for (DWORD index = 0; SetupDiEnumDeviceInfo(set, index, &data); ++index)
         {
             wchar_t ids[512] = {};
             unsigned vendor = 0, device = 0;
-            if (SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_HARDWAREID, nullptr, reinterpret_cast<PBYTE>(ids),
-                                                  sizeof(ids) - sizeof(wchar_t), nullptr) &&
-                std::swscanf(ids, L"PCI\\VEN_%4x&DEV_%4x", &vendor, &device) == 2 && vendor == 0x1002)
-                // Navi 48 (RX 9070 XT / 9070 / 9070 GRE 0x7550, Radeon AI PRO R9700 0x7551), Navi 44 (RX 9060 XT / 9060)
-                rdna4 = device == 0x7550 || device == 0x7551 || device == 0x7590;
+            if (!SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_HARDWAREID, nullptr, reinterpret_cast<PBYTE>(ids),
+                                                   sizeof(ids) - sizeof(wchar_t), nullptr) ||
+                std::swscanf(ids, L"PCI\\VEN_%4x&DEV_%4x", &vendor, &device) != 2 || vendor != 0x1002)
+                continue;
+            const AmdGeneration found = amd_generation(device);
+            newest = std::max(newest, found);
+            DWORD bus = 0, address = 0;
+            if (located &&
+                SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_BUSNUMBER, nullptr, reinterpret_cast<PBYTE>(&bus), sizeof(bus), nullptr) &&
+                SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_ADDRESS, nullptr, reinterpret_cast<PBYTE>(&address), sizeof(address), nullptr) &&
+                bus == renderBus && address == renderAddress)
+            {
+                render = found;
+                renderId = device;
+            }
         }
         SetupDiDestroyDeviceInfoList(set);
-        return rdna4;
+        const char* names[] = {"unknown", "older than RDNA 3", "RDNA 3", "RDNA 4"};
+        if (render != AmdGeneration::Unknown)
+            logf("render GPU: AMD 1002:%04x (%s)", renderId, names[int(render)]);
+        else
+            logf("render GPU: not identified (%s); the newest AMD GPU installed is %s",
+                 located ? "no PnP device at its PCI address" : "no kernel adapter address", names[int(newest)]);
+        return render != AmdGeneration::Unknown ? render : newest;
     }();
-    return found;
+    return generation;
+}
+
+// Whether the game renders on an RDNA4 GPU (FP8 WMMA). Only asked once the game's device is known (g.device).
+static bool rdna4_installed()
+{
+    return amd_render_generation(g.device) == AmdGeneration::Rdna4;
 }
 
 static d4r::dx::MModel* native_engine_m(bool ldr, bool presetL)
@@ -13522,8 +13630,10 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
     if (frame <= 3 || frame % 600 == 0)
-        logf("engine frame %u recorded on D3D12 (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)", frame,
-             p.jitterX, p.jitterY, game.settings.reset, p.mvScaleX, p.mvScaleY, p.renderWidth, p.renderHeight);
+        logf("engine frame %u recorded on D3D12 (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u, "
+             "exposure %s, preExposure %.6g, exposureScale %.6g)", frame,
+             p.jitterX, p.jitterY, game.settings.reset, p.mvScaleX, p.mvScaleY, p.renderWidth, p.renderHeight,
+             ldr ? "none (LDR)" : (gameExposure ? "game texture" : "automatic"), p.preExposure, p.exposureScale);
     return true;
 }
 
@@ -14048,7 +14158,10 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
         return fsr_rr_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame);
 
     if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame))
+    {
+        ++feature->engineFrames;
         return NGX_SUCCESS;
+    }
     if (feature->nativeD3d12)
         return NGX_FAIL_FEATURE_NOT_SUPPORTED; // no CUDA backend without vkd3d-proton (the log names the refusal)
 
@@ -14676,8 +14789,12 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle)
     }
     if (feature == nullptr || feature->nativeVulkan)
         return NGX_FAIL_INVALID_PARAMETER;
-    logf("NVSDK_NGX_D3D12_ReleaseFeature(id=%u) after %u completed frames", feature->handle.Id,
-         feature->completedFrames.load());
+    if (feature->engineFrames != 0)
+        logf("NVSDK_NGX_D3D12_ReleaseFeature(id=%u) after %u engine frames and %u completed CUDA frames",
+             feature->handle.Id, feature->engineFrames, feature->completedFrames.load());
+    else
+        logf("NVSDK_NGX_D3D12_ReleaseFeature(id=%u) after %u completed frames", feature->handle.Id,
+             feature->completedFrames.load());
     release_feature(feature);
     return NGX_SUCCESS;
 }
