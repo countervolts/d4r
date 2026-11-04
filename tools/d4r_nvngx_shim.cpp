@@ -3018,6 +3018,7 @@ struct Feature
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.
     uint64_t engineViewBytes = 0;
+    size_t engineSmallViews = 0; // views outside the byte and count budget
     bool engineViewBudgetReported = false;
     std::vector<std::unique_ptr<EngineBorrowedView>> engineViews; // destroyed after engine descriptor pools
     std::unique_ptr<vkhip::KNetwork> engineVkHip; // buffers outlive the adapter's descriptor sets
@@ -9622,7 +9623,11 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
         VkMemoryRequirements memory{};
         d4r::vkTable.GetImageMemoryRequirements(g_vk.device, image.image, &memory);
         constexpr uint64_t cacheBudget = 512ull * 1024 * 1024;
-        if (feature.engineViews.size() < 64 && memory.size <= cacheBudget - feature.engineViewBytes)
+        // Exposure has no copy path, so a game that cycles its render targets must not cost it a view: tiny images
+        // sit outside the budget, which then only limits the textures that can fall back to copies.
+        const bool tiny = memory.size <= 64 * 1024;
+        if (tiny ? feature.engineSmallViews < 1024 :
+            feature.engineViews.size() - feature.engineSmallViews < 64 && memory.size <= cacheBudget - feature.engineViewBytes)
         {
             auto view = std::make_unique<EngineBorrowedView>();
             view->device = g_vk.device; view->format = image.format;
@@ -9635,7 +9640,8 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
             {
                 resource->AddRef(); view->resource = resource;
                 feature.engineViews.push_back(std::move(view));
-                feature.engineViewBytes += memory.size;
+                if (tiny) ++feature.engineSmallViews;
+                else feature.engineViewBytes += memory.size;
                 found = feature.engineViews.end() - 1;
             }
         }
