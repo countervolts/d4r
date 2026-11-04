@@ -1,5 +1,5 @@
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-index a7684464..29285e19 100644
+index ba48d1d1..527f441b 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
 @@ -735,7 +735,25 @@ static bool d4r_linear_texture_candidate(const D3D12_HEAP_PROPERTIES *heap_prope
