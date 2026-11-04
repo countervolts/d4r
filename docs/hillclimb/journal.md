@@ -1,0 +1,103 @@
+# Hill-climb journal (performance, native Windows, RX 9070 XT gfx1201)
+
+Goal: docs/hillclimb/goal.md; method: docs/hillclimb/performance.md. Branch `hillclimb/perf` (from `windows`
+fe53aa0). Never pushed.
+
+## Environment (2026-11-04)
+
+- RX 9070 XT (gfx1201), AMD Software driver 32.0.32015.7029 (26.10.1, dated 2026-10-18), Windows 11 Pro 26300.
+- HAGS: `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` is absent (driver/OS default). Not changed.
+- **C: has only ~4 GB free.** Every build, runtime and run goes to `D:\d4r-hc` (103 GB free):
+  - `D:\d4r-hc\build\tools`, `D:\d4r-hc\build\engine-win` (`scripts/build_windows_tools.ps1 -Out D:/d4r-hc/build`, 54 s)
+  - the shim still builds into the repo's `build/` (`scripts/build_d4r_nvngx_shim.sh`, 52 s, ~15 MB)
+  - `D:\d4r-hc\rt`: a portable d4r folder for the harnesses: `nvngx.dll` (= build/d4r_nvngx.dll), `d4r_hip_net.dll`,
+    `packaging/d4r.ini` unchanged, NVIDIA's `nvngx_dlss.dll` (310.7) / `nvngx_dlssd.dll` (310.9.1) /
+    `ngx/_nvngx.dll` from `%LOCALAPPDATA%\d4r\nvidia`, `nvcuda.dll` + `zluda\` + `nvapi\` copied from Cyberpunk's
+    d4r folder (the Vulkan frontend's NGX init needs them), `engine\` a junction to the installed models
+    `%LOCALAPPDATA%\d4r\engine-models\f94e8367186cb04b` (the same key Cyberpunk's install uses).
+- Cyberpunk 2077 and Ghost of Tsushima already carry a release install of d4r (install.ps1, not windows-game.ps1;
+  no `.d4r-backup\manifest.json`). Left untouched so far. Portal RTX has no d4r/OptiScaler.
+
+## Benchmark (Phase 0)
+
+Harness changes (tools only, no effect on the shim):
+- `d3d12_dlss_harness`: `D4R_HARNESS_GPU_TIMING=<file>` writes "frame gpu_us" from two queue timestamps in the game's
+  list around EvaluateFeature (the second lands in the split's second part when the shim splits the list, so it
+  includes cross-queue waits). `D4R_HARNESS_GPU_SCENE=1` draws the motion scene with GPU copies in the evaluation's
+  own list instead of six CPU uploads + waits per frame. Output byte-identical to the CPU scene (K 720p->1440p, 200
+  frames, final frame sha 739591b7...).
+- `vulkan_dlss_harness`: `D4R_HARNESS_SIZE="W H OW OH"` (was compile-time), `D4R_HARNESS_GPU_TIMING` (bottom-of-pipe
+  timestamps around EvaluateFeature), `D4R_HARNESS_CHECK_EVERY=N` (read back/check every Nth + last frame),
+  `D4R_HARNESS_PAN_CANVAS=1` (the pan scene as one canvas uploaded once and a GPU copy per frame).
+
+Trap found: **the CPU-uploaded motion scene leaves ~7 ms between frames, and after ~70 frames the clock drops**: every
+stage of K got 1.57x slower at once (gpu_eval 1.55 -> 2.43 ms at frame 70). With the GPU scene the frame interval is the
+evaluation itself and K stays at ~1.5 ms over 200 frames.
+
+Create flags 0x6b (HDR | MVLowRes | DepthInverted | 0x20 | AutoExposure) in both harnesses: the D3D12 harness default
+(0) asks for display-resolution motion and the shim refuses render-size motion textures ("a texture does not cover
+its rectangle"). The preset is forced with `D4R_DLSS_PRESET` (d4r.ini's `[DLSS] Model = K` otherwise overrides the
+harness's hint and every SR case runs K). RR F: `D4R_HARNESS_FEATURE_ID=13 D4R_RR_PRESET=6`.
+
+## First numbers with the shipped models (fe53aa0, 200 frames, median of frames 41-200, single run)
+
+| Case | D3D12 (ms) | Vulkan (ms) | Target |
+|---|---:|---:|---:|
+| K 720p->1440p | 1.511 (DXIL network) | 3.668 (Vulkan engine network, no vkhip: package has no HIP layers) | 0.649 |
+| M 720p->1440p | 1.641 (DXIL) | 29.6 (**CUDA staging fallback**: "missing hipnet.bin") | 1.081 |
+| L 720p->1440p | 2.400 (DXIL) | **segfault** (LLPC) | 1.413 |
+| RR F 720p->1440p | 4.066 (DXIL) | **segfault** | 2.100 |
+| K 1080p->4K | 2.727 | | 1.532 |
+| M 1080p->4K | 3.449 | | 2.553 |
+| L 1080p->4K | 5.296 | | 3.161 |
+| RR F 1080p->4K | 9.042 | | 4.658 |
+
+K stage split at 720p->1440p (D4R_PROFILE, high clock): setup 0.008, exposure 0.002, input 0.107, network 0.86
+(enc0 0.140, enc1 0.096, enc2 0.049, enc3 0.045, enc4 0.059, dec5 0.083, dec4 0.056, dec3 0.044, dec2 0.044, dec1 0.118,
+dec0 0.150), output 0.550.
+
+**The installer's models have no HIP layers on RDNA4**: `packaging/build_engine_models.py` adds `--hip` only for K and
+only for gfx110x/gfx103x release kernels; M/L never. So on this machine a Vulkan game gets K on the slow Vulkan
+network, M on CUDA staging, and L / RR F crash. The vkhip numbers in docs/experimental-vkhip.md were taken with
+hand-built packages (`compile_m.py --hip KDIR`).
+
+## Tried and rejected (seeded from earlier docs; do not retry without a new reason)
+
+From docs/windows-k-d3dhip.md (gfx1101): memory-word handoff (hipStreamWaitValue32 on imported D3D12 memory never sees
+D3D12 writes on Windows); splitting K's reconstruction around the HIP network (no gain); reconstruction as wave32
+(slower, not identical); K input stage wave64 (slightly slower); DXIL prefetch depth 4 (-0.056 ms on 26.10.1, not
+taken over).
+From docs/performance.md (gfx1101 unless noted): f16 accumulation on WMMA (20x error); occupancy tweaks (VGPR caps,
+waves-per-EU), persistent work-groups; non-temporal hints; splitting position-only layers by channel; HIP arrays over
+Vulkan buffers (ROCm lacks the export); signalling Vulkan timeline semaphores from HIP.
+From docs/experimental-vkhip.md (gfx1201): chaining the M plane-layout input stage into the first layer (RADV did not
+overlap, no gain); RR F native blocks vs translated (now all translated, +0.5% vs Vulkan); rr2_m phases as vkhip kernels,
+WGP mode for translated stages, partial unrolling, max-ilp/memory-clause scheduling for level 0-2 stages, source-order
+schedule (all slower).
+
+## Log
+
+### 2026-11-04: Phase 0 setup
+
+- Kernel sets for gfx1201 (D:\d4r-hc\kernels): `kernels/build.sh k` (K layers) and `D4R_NATIVE_FP8=1
+  D4R_VKHIP_LAYERS=1 kernels/build.sh m` (M/L chained vkhip layers). ROCm 7.14, a few minutes each.
+- Captures: the release builder (Cyberpunk's d4r\tools copy) with `--keep --models k,l,m` against D:\d4r-hc\rt-build
+  (its own engine\ so the installed models are untouched): 1m55s; the rebuilt k/l/m are byte-identical to the
+  installed ones.
+- HIP packages in D:\d4r-hc\models: `compile_k.py ... --hip kernels/k-gfx1201 --capture`, `compile_m.py ... --hip
+  kernels/m-vkhip-gfx1201` for m and l (adds hipnet.bin, hip/, *_planes.dxil). k-ldr/m-ldr/l-ldr/rr-d/rr-e are
+  junctions to the installed packages.
+- RR F from the repo (`extract_dlss_ptx.py`, `compile_rr2.py`, `compile_rr_dxil.py`, 2m06s) keeps native-work and
+  has `enc0_llpc.spv` / `dec0_1_llpc.spv`; the installed rr-f has neither (it was built by the 2026-10-27 release kit),
+  which is why the Vulkan harness segfaulted on F with the installed models. Its shaders differ from the installed
+  ones (newer compile_rr2.py). `kernels/rr/build_vkhip_f.sh` wants `<stage>_m.preprocessed.comp` and
+  `dec0_0_m.build.json`, which a fresh compile_rr2.py model does not have: generated them with
+  `compile_rr_dxil.preprocess_f` (same defines), then the script built the 14 rr2 objects in 16 s, none with scratch.
+- Vulkan with the HIP packages, 720p->1440p, single runs: K 3.73 (still the Vulkan network: the native Vulkan frontend
+  never wired K's vkhip, only the vkd3d-proton adapter has it), M 1.430 (vkhip), L 5.110 (vkhip, soft-dot2 front),
+  RR F 4.727 on its Vulkan route and **3.900 on vkhip (D4R_ENGINE_RR_VKHIP=1), byte-identical**.
+- D3D12 M/L with HIP packages take d3dhip (GPU-fence handoff) by default; against `D4R_DX_NET=dxil` it is a wash:
+  M 1.751 vs 1.624 (720p->1440p), 3.542 vs 3.527 (4K); L 2.520 vs 2.471, 5.430 vs 5.542; d3dhip p99 is worse.
+  The matrix pins D3D12 SR on DXIL (the installed packages' route).
+- `D4R_PREFER_ACCURACY=1` does not change D3D12 M at all (byte-identical to the fast set, same time): the D3D12 M
+  engine has one set. The -acc cases stay in the matrix as the exact-set guard for any lane B change.

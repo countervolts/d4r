@@ -39,7 +39,8 @@ X(BeginCommandBuffer) X(EndCommandBuffer) X(ResetCommandPool) X(QueueSubmit) X(Q
 X(CreateImage) X(GetImageMemoryRequirements) X(AllocateMemory) X(BindImageMemory) X(CreateImageView) \
 X(CreateBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory) X(MapMemory) X(UnmapMemory) \
 X(CmdPipelineBarrier) X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CmdCopyBufferToImage) X(DestroyImageView) X(DestroyImage) \
-X(DestroyBuffer) X(FreeMemory) X(DestroyCommandPool) X(DestroyDevice) X(DestroyInstance)
+X(DestroyBuffer) X(FreeMemory) X(DestroyCommandPool) X(DestroyDevice) X(DestroyInstance) \
+X(CreateQueryPool) X(DestroyQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults) X(CmdCopyBuffer)
 #define DECLARE(name) static PFN_vk##name vk##name;
 VK_FUNCTIONS(DECLARE)
 #undef DECLARE
@@ -47,7 +48,8 @@ VK_FUNCTIONS(DECLARE)
 #ifndef D4R_HARNESS_SCALE
 #define D4R_HARNESS_SCALE 1
 #endif
-constexpr uint32_t W = 640 * D4R_HARNESS_SCALE, H = 360 * D4R_HARNESS_SCALE, OW = 2 * W, OH = 2 * H;
+// D4R_HARNESS_SIZE="W H OW OH" sets the render and output sizes at run time.
+static uint32_t W = 640 * D4R_HARNESS_SCALE, H = 360 * D4R_HARNESS_SCALE, OW = 2 * W, OH = 2 * H;
 static VkDevice device;
 static VkPhysicalDeviceMemoryProperties memory;
 static void check(VkResult r, const char* name) { if (r != VK_SUCCESS) { std::fprintf(stderr, "%s: %d\n", name, r); std::exit(1); } }
@@ -95,6 +97,12 @@ int main(int argc, char** argv)
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::puts("loading Vulkan and NGX shim");
+    if (const char* size = std::getenv("D4R_HARNESS_SIZE")) {
+        unsigned w = 0, h = 0, ow = 0, oh = 0;
+        if (std::sscanf(size, "%u %u %u %u", &w, &h, &ow, &oh) != 4 || !w || !h || ow < w || oh < h) return 2;
+        W = w; H = h; OW = ow; OH = oh;
+        std::printf("size %ux%u -> %ux%u\n", W, H, OW, OH);
+    }
     const unsigned frames = argc > 3 ? std::strtoul(argv[3], nullptr, 10) : 3;
     const bool discard = argc > 4 && !std::strcmp(argv[4], "discard");
     const bool invalid = argc > 4 && !std::strcmp(argv[4], "invalid");
@@ -280,6 +288,63 @@ int main(int argc, char** argv)
         const float ring = std::fmod(std::sqrt((x - 640) * (x - 640) + (y - 360) * (y - 360)) / 9.0f, 1.0f);
         return 0.45f * checker + 0.35f * waves + 0.2f * ring;
     };
+    // D4R_HARNESS_GPU_TIMING=<file>: "frame gpu_us" per frame from two timestamps around EvaluateFeature (both at the
+    // bottom of the pipe, so the first waits for the frame's uploads and the second for everything DLSS recorded).
+    const char* gpuTiming = std::getenv("D4R_HARNESS_GPU_TIMING");
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties physicalProperties; vkGetPhysicalDeviceProperties(physical,&physicalProperties);
+    if (gpuTiming) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType=VK_QUERY_TYPE_TIMESTAMP; qi.queryCount=2*inFlight;
+        check(vkCreateQueryPool(device,&qi,nullptr,&timestamps),"query pool");
+    }
+    auto recordTiming = [&](unsigned slot, unsigned frame) {
+        uint64_t stamps[2] = {};
+        if (vkGetQueryPoolResults(device,timestamps,2*slot,2,sizeof(stamps),stamps,8,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) return;
+        if (FILE* f = std::fopen(gpuTiming,"a")) {
+            std::fprintf(f,"%u %.2f\n",frame,stamps[1] >= stamps[0] ? 1e-3*double(stamps[1]-stamps[0])*physicalProperties.limits.timestampPeriod : -1.0);
+            std::fclose(f);
+        }
+    };
+    std::vector<unsigned> pending(inFlight, UINT32_MAX);
+    // D4R_HARNESS_CHECK_EVERY=N: read back and check every Nth frame and the last one only (default every frame), so
+    // the CPU does not leave the GPU idle between timed frames.
+    const unsigned checkEvery = std::max(1, std::getenv("D4R_HARNESS_CHECK_EVERY") ? std::atoi(std::getenv("D4R_HARNESS_CHECK_EVERY")) : 1);
+    // D4R_HARNESS_PAN_CANVAS=1: a pan by a whole number of render pixels per frame is one wide canvas uploaded once; each frame copies its window
+    // on the GPU instead of the CPU drawing the pattern again (the same scene, rounded once per canvas column).
+    const uint32_t panStep = std::getenv("D4R_HARNESS_PAN_CANVAS") && pan > 0 && (uint64_t(pan) * W) % OW == 0 ? uint32_t(uint64_t(pan) * W / OW) : 0;
+    const uint32_t canvasWidth = W + (frames ? frames - 1 : 0) * panStep;
+    VkBuffer canvas = VK_NULL_HANDLE; VkDeviceMemory canvasMemory = VK_NULL_HANDLE;
+    if (panStep) {
+        const VkDeviceSize canvasColor = VkDeviceSize(canvasWidth)*H*8, motionBytes = VkDeviceSize(W)*H*4;
+        const VkDeviceSize canvasBytes = canvasColor + 2*motionBytes;
+        VkBufferCreateInfo ub = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ub.size=canvasBytes; ub.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VkBuffer upload; check(vkCreateBuffer(device,&ub,nullptr,&upload),"canvas upload");
+        VkMemoryRequirements ur; vkGetBufferMemoryRequirements(device,upload,&ur);
+        VkDeviceMemory uploadMemory = allocate(ur,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkBindBufferMemory(device,upload,uploadMemory,0),"bind canvas upload");
+        void* mapped; check(vkMapMemory(device,uploadMemory,0,VK_WHOLE_SIZE,0,&mapped),"map canvas");
+        auto* color = static_cast<uint16_t*>(mapped);
+        // canvas column u is render column x of frame n where u = x - n * panStep + (frames - 1) * panStep
+        const int offset = int((frames ? frames - 1 : 0) * panStep);
+        for (uint32_t y=0;y<H;++y) for (uint32_t u=0;u<canvasWidth;++u) for (int c=0;c<4;++c)
+            color[(VkDeviceSize(y)*canvasWidth+u)*4+c] = half(c==3 ? 1.0f : pattern((int(u)-offset+0.5f)*OW/W, (y+0.5f)*OH/H, c));
+        auto* motion = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(mapped) + canvasColor);
+        for (uint32_t j=0;j<W*H;++j) { motion[j*2]=0; motion[j*2+1]=0; motion[W*H*2+j*2]=half(-float(pan)*W/OW); motion[W*H*2+j*2+1]=0; }
+        ub.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        check(vkCreateBuffer(device,&ub,nullptr,&canvas),"canvas");
+        VkMemoryRequirements cr; vkGetBufferMemoryRequirements(device,canvas,&cr);
+        canvasMemory = allocate(cr,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkBindBufferMemory(device,canvas,canvasMemory,0),"bind canvas");
+        VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(commands[0],&begin),"begin canvas");
+        VkBufferCopy whole={0,0,canvasBytes}; vkCmdCopyBuffer(commands[0],upload,canvas,1,&whole);
+        check(vkEndCommandBuffer(commands[0]),"end canvas");
+        VkSubmitInfo submit={VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount=1; submit.pCommandBuffers=&commands[0];
+        check(vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE),"submit canvas"); check(vkQueueWaitIdle(queue),"canvas wait");
+        check(vkResetCommandPool(device,pools[0],0),"reset pool");
+        vkDestroyBuffer(device,upload,nullptr); vkFreeMemory(device,uploadMemory,nullptr);
+        std::printf("pan canvas: %u render pixels per frame, %ux%u\n", panStep, canvasWidth, H);
+    }
     for (unsigned n=0;n<frames;++n)
     {
         if (dynamic) {
@@ -289,6 +354,7 @@ int main(int argc, char** argv)
         }
         const unsigned slot = n % inFlight; VkCommandBuffer cmd = commands[slot];
         check(vkWaitForFences(device,1,&fences[slot],VK_TRUE,UINT64_MAX),"fence wait"); check(vkResetFences(device,1,&fences[slot]),"fence reset");
+        if (timestamps && pending[slot] != UINT32_MAX) { recordTiming(slot, pending[slot]); pending[slot] = UINT32_MAX; }
         check(vkResetCommandPool(device,pools[slot],0),"reset pool");
         if (recreate && n && n % 4 == 0) {
             ngx(ReleaseFeature(handle),"release before recreation");
@@ -309,7 +375,12 @@ int main(int argc, char** argv)
             b.dstAccessMask=i==3 ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,i==3 ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
             if(i==3) continue;
-            if (pan && i != 1) {
+            if (panStep && i != 1) {
+                VkBufferImageCopy up={}; up.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; up.imageExtent={W,H,1};
+                if (i == 0) { up.bufferOffset = VkDeviceSize((frames - 1 - n) * panStep) * 8; up.bufferRowLength = canvasWidth; }
+                else up.bufferOffset = VkDeviceSize(canvasWidth)*H*8 + (n ? VkDeviceSize(W)*H*4 : 0);
+                vkCmdCopyBufferToImage(cmd,canvas,b.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&up);
+            } else if (pan && i != 1) {
                 uint8_t* base = sceneData + sceneBytes*slot;
                 const float shift = float(n) * pan;
                 if (i == 0) {
@@ -345,7 +416,9 @@ int main(int argc, char** argv)
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,0,nullptr,1,&b);
         }
         if (invalid) described[2].type=1;
+        if (timestamps) { vkCmdResetQueryPool(cmd,timestamps,2*slot,2); vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,2*slot); }
         const Result evaluated=EvaluateFeature(cmd,handle,params,nullptr);
+        if (timestamps) vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,2*slot+1);
         if (invalid) { if (evaluated != 0xBAD0000e) return 1; std::puts("invalid resource rejected"); break; }
         ngx(evaluated,"evaluate");
         if (discard) { std::puts("discarded command buffer; releasing pending feature"); break; }
@@ -360,7 +433,9 @@ int main(int argc, char** argv)
         VkSubmitInfo submit={VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount=1; submit.pCommandBuffers=&cmd;
         check(vkQueueSubmit(queue,1,&submit,fences[slot]),"submit");
         if (exitEarly && n+1==frames) { std::puts("exiting with the last frame in flight"); std::fflush(stdout); ExitProcess(0); }
+        pending[slot] = n;
         if (inFlight > 1 && n+1 < frames) continue; // pipelined: only the last frame is checked
+        if (n+1 < frames && n % checkEvery != 0) continue;
         check(vkQueueWaitIdle(queue),"wait");
         void* data; check(vkMapMemory(device,readMemory,0,VK_WHOLE_SIZE,0,&data),"map");
         const auto* values=static_cast<const uint16_t*>(data);
@@ -382,10 +457,14 @@ int main(int argc, char** argv)
         if (n+1==frames) { FILE* out=std::fopen(argv[2],"wb"); if (!out) return 1; const auto written=std::fwrite(values,1,OW*OH*8,out); std::fclose(out); if (written!=OW*OH*8) return 1; }
         vkUnmapMemory(device,readMemory);
     }
+    check(vkQueueWaitIdle(queue),"drain");
+    for (unsigned i=0;i<inFlight && timestamps;++i) if (pending[i] != UINT32_MAX) recordTiming(i, pending[i]);
     ngx(ReleaseFeature(handle),"release"); ngx(DestroyParameters(params),"destroy params"); ngx(Shutdown(),"shutdown");
     check(vkQueueWaitIdle(queue),"final wait");
     for (unsigned i=0;i<inFlight;++i) { vkDestroyCommandPool(device,pools[i],nullptr); vkDestroyFence(device,fences[i],nullptr); } vkDestroyBuffer(device,readback,nullptr); vkFreeMemory(device,readMemory,nullptr);
     if (scene) { vkDestroyBuffer(device,scene,nullptr); vkFreeMemory(device,sceneMemory,nullptr); }
+    if (canvas) { vkDestroyBuffer(device,canvas,nullptr); vkFreeMemory(device,canvasMemory,nullptr); }
+    if (timestamps) vkDestroyQueryPool(device,timestamps,nullptr);
     for (int i=0;i<4;++i) { vkDestroyImageView(device,images[i].resource.image.view,nullptr); vkDestroyImage(device,images[i].resource.image.image,nullptr); vkFreeMemory(device,allocations[i],nullptr); }
     for (int i=0;i<4 && rr;++i) { vkDestroyImageView(device,guides[i].resource.image.view,nullptr); vkDestroyImage(device,guides[i].resource.image.image,nullptr); vkFreeMemory(device,guideMemory[i],nullptr); }
     vkDestroyDevice(device,nullptr); vkDestroyInstance(instance,nullptr);

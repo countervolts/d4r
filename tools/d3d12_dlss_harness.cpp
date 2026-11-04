@@ -1871,7 +1871,65 @@ int main(int argc, char** argv)
             d4r_ngx_set_float(parameters, "Jitter.Offset.X", jitterX[phase]);
             d4r_ngx_set_float(parameters, "Jitter.Offset.Y", jitterY[phase]);
         }
-        if (motionScene)
+        // D4R_HARNESS_GPU_SCENE=1: the motion scene's frames are drawn on the GPU in the evaluation's own list (a copy
+        // of the background and of the box, the same texels as the CPU scene), as a game renders its inputs right
+        // before DLSS, instead of six CPU uploads with a wait each. Timed runs need it: the uploads leave the GPU idle
+        // about 7 ms per frame, and the driver then lowers the clock about 35%.
+        static const bool gpuScene = motionScene && std::getenv("D4R_HARNESS_GPU_SCENE") != nullptr && !rgba8 &&
+                                     !mvRgba16 && !motionHighRes;
+        if (gpuScene)
+        {
+            static ID3D12Resource *backgroundTextures[3] = {}, *boxTextures[3] = {};
+            ID3D12Resource* targets[3] = {colorTexture, depthTexture, motionTexture};
+            if (backgroundTextures[0] == nullptr)
+            {
+                const DXGI_FORMAT formats[3] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
+                const std::vector<float> backgroundDepth(static_cast<size_t>(resourceWidth) * inHeight, 0.5f);
+                const std::vector<uint16_t> backgroundMotion(static_cast<size_t>(motionWidth) * motionHeight * 2, 0);
+                std::vector<uint16_t> boxColor(80 * 80 * 4), boxMotion(80 * 80 * 2);
+                const std::vector<float> boxDepth(80 * 80, 0.2f);
+                for (size_t pixel = 0; pixel < 80 * 80; ++pixel)
+                {
+                    boxColor[pixel * 4 + 0] = white;
+                    boxColor[pixel * 4 + 1] = dark;
+                    boxColor[pixel * 4 + 2] = dark;
+                    boxColor[pixel * 4 + 3] = white;
+                    boxMotion[pixel * 2 + 0] = 0xc400u;
+                    boxMotion[pixel * 2 + 1] = 0;
+                }
+                const void* backgroundData[3] = {backgroundColor.data(), backgroundDepth.data(), backgroundMotion.data()};
+                const UINT backgroundRows[3] = {resourceWidth * 8, resourceWidth * 4, motionWidth * 4};
+                const void* boxData[3] = {boxColor.data(), boxDepth.data(), boxMotion.data()};
+                const UINT boxRows[3] = {80 * 8, 80 * 4, 80 * 4};
+                for (int i = 0; i < 3; ++i)
+                {
+                    D3D12_RESOURCE_DESC desc;
+                    targets[i]->GetDesc(&desc);
+                    backgroundTextures[i] = create_texture(static_cast<UINT>(desc.Width), desc.Height, formats[i], D3D12_RESOURCE_FLAG_NONE);
+                    boxTextures[i] = create_texture(80, 80, formats[i], D3D12_RESOURCE_FLAG_NONE);
+                    upload(backgroundTextures[i], backgroundData[i], backgroundRows[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    upload(boxTextures[i], boxData[i], boxRows[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+                }
+            }
+            const UINT left = 220u + 4u * static_cast<UINT>(frame - 1);
+            for (int i = 0; i < 3; ++i)
+            {
+                barrier(targets[i], srv, D3D12_RESOURCE_STATE_COPY_DEST);
+                g_list->CopyResource(targets[i], backgroundTextures[i]);
+                if (left < inWidth && inHeight > 100)
+                {
+                    D3D12_TEXTURE_COPY_LOCATION destination = {}, source = {};
+                    destination.pResource = targets[i];
+                    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    source.pResource = boxTextures[i];
+                    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    const D3D12_BOX box = {0, 0, 0, std::min(80u, inWidth - left), std::min(80u, inHeight - 100u), 1};
+                    g_list->CopyTextureRegion(&destination, left, 100, 0, &source, &box);
+                }
+                barrier(targets[i], D3D12_RESOURCE_STATE_COPY_DEST, srv);
+            }
+        }
+        else if (motionScene)
         {
             color = backgroundColor;
             std::fill(depth.begin(), depth.end(), 0.5f);
@@ -2148,7 +2206,30 @@ int main(int argc, char** argv)
         }
         if (thrashSource != nullptr && thrashTarget != nullptr)
             g_list->CopyBufferRegion(thrashTarget, 0, thrashSource, 0, thrashBytes);
+        // D4R_HARNESS_GPU_TIMING=<file>: one "frame gpu_us" line per frame, from two queue timestamps written into the
+        // game's list right before and right after EvaluateFeature. A list the shim splits records the second one into
+        // its second part, so the figure covers everything the game's queue waits for: input copies, cross-queue
+        // handoffs, the engine and the output copy.
+        static const char* gpuTimingPath = std::getenv("D4R_HARNESS_GPU_TIMING");
+        static ID3D12QueryHeap* timingHeap = nullptr;
+        static ID3D12Resource* timingReadback = nullptr;
+        if (gpuTimingPath != nullptr && timingHeap == nullptr)
+        {
+            D3D12_QUERY_HEAP_DESC heapDesc = {};
+            heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            heapDesc.Count = 2;
+            if (!check(g_device->CreateQueryHeap(&heapDesc, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&timingHeap)), "CreateQueryHeap"))
+                return 1;
+            timingReadback = create_buffer(D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        if (timingHeap != nullptr)
+            g_list->EndQuery(timingHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
         result = evaluate(g_list, feature, parameters, nullptr);
+        if (timingHeap != nullptr)
+        {
+            g_list->EndQuery(timingHeap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            g_list->ResolveQueryData(timingHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, timingReadback, 0);
+        }
         QueryPerformanceCounter(&counterRecorded);
         if (const char* delay = std::getenv("D4R_HARNESS_DELAY_SUBMIT_MS"))
             Sleep(static_cast<DWORD>(std::clamp(std::atoi(delay), 0, 4000)));
@@ -2170,6 +2251,26 @@ int main(int argc, char** argv)
                              1e6 * static_cast<double>(counterStart.QuadPart) / counterFrequency.QuadPart);
                 std::fclose(timingFile);
             }
+        if (timingHeap != nullptr)
+        {
+            UINT64 frequency = 0;
+            g_queue->GetTimestampFrequency(&frequency);
+            UINT64* stamps = nullptr;
+            const D3D12_RANGE range = {0, 16};
+            if (SUCCEEDED(timingReadback->Map(0, &range, reinterpret_cast<void**>(&stamps))))
+            {
+                if (FILE* timingFile = std::fopen(gpuTimingPath, "a"))
+                {
+                    std::fprintf(timingFile, "%d %.2f\n", frame,
+                                 frequency != 0 && stamps[1] >= stamps[0]
+                                     ? 1e6 * static_cast<double>(stamps[1] - stamps[0]) / static_cast<double>(frequency)
+                                     : -1.0);
+                    std::fclose(timingFile);
+                }
+                const D3D12_RANGE none = {0, 0};
+                timingReadback->Unmap(0, &none);
+            }
+        }
         // NGX rejecting an evaluation outright is reported here; only a failure raised later,
         // on the shim's worker, is invisible in this return value and shows up in the image.
         if (result != NGX_SUCCESS)
