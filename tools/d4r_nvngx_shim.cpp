@@ -387,7 +387,7 @@ struct DenoiserProbe
 // --- logging -----------------------------------------------------------------
 
 static std::mutex g_logMutex;
-static FILE* g_log = nullptr;
+static HANDLE g_log = INVALID_HANDLE_VALUE; // FILE_APPEND_DATA: other processes' lines land whole, in order
 static HMODULE g_selfModule = nullptr;
 
 // --- portable install ----------------------------------------------------------
@@ -892,31 +892,61 @@ static void ensure_portable_config()
     std::call_once(g_portableOnce, load_portable_config);
 }
 
+// The log can be shared by more than one process: a launcher and the game it starts both load the DLL, and
+// CP2077's benchmark relaunches itself. With a private file position (fopen "a" or "w") the second process
+// truncated the first one's log and each wrote at its own offset, which left the tail out of timestamp order.
+// Every line is written by one append (FILE_APPEND_DATA puts each WriteFile at the end of the file) and tagged
+// with the writer's process id; a fresh log only starts when no other process has the file open for writing.
+static HANDLE log_open_path(const wchar_t* path)
+{
+    if (g_logFresh)
+    {
+        // Without FILE_SHARE_WRITE this fails while another process is writing to the log: keep its lines
+        const HANDLE fresh = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (fresh != INVALID_HANDLE_VALUE)
+            CloseHandle(fresh);
+    }
+    return CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
 static void log_open()
 {
     ensure_portable_config();
     wchar_t path[MAX_PATH] = {};
     DWORD length = GetEnvironmentVariableW(L"D4R_SHIM_LOG", path, MAX_PATH);
     if (length > 0 && length < MAX_PATH)
-        g_log = _wfopen(path, g_logFresh ? L"w" : L"a");
+        g_log = log_open_path(path);
     else if (!g_portable.dir.empty()) // no log when the DLL's folder is unknown
-        g_log = _wfopen((g_portable.dir + L"\\d4r_nvngx.log").c_str(), g_logFresh ? L"w" : L"a");
+        g_log = log_open_path((g_portable.dir + L"\\d4r_nvngx.log").c_str());
 }
 
 static void logf(const char* format, ...)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
-    if (g_log == nullptr)
+    static bool opened = false;
+    if (!opened)
+    {
+        opened = true; // one attempt: a log that cannot be opened stays off rather than retrying every line
         log_open();
-    if (g_log == nullptr)
+    }
+    if (g_log == INVALID_HANDLE_VALUE)
         return;
-    std::fprintf(g_log, "[%10.3f] ", GetTickCount64() / 1000.0);
+    char line[4096];
+    int used = std::snprintf(line, sizeof(line), "[%10.3f] [pid %lu] ", GetTickCount64() / 1000.0,
+                             static_cast<unsigned long>(GetCurrentProcessId()));
+    if (used < 0)
+        return;
     va_list arguments;
     va_start(arguments, format);
-    std::vfprintf(g_log, format, arguments);
+    const int body = std::vsnprintf(line + used, sizeof(line) - used - 1, format, arguments);
     va_end(arguments);
-    std::fputc('\n', g_log);
-    std::fflush(g_log);
+    if (body > 0)
+        used = std::min<int>(used + body, int(sizeof(line)) - 2); // a longer line is cut, not split
+    line[used++] = '\n';
+    DWORD written = 0;
+    WriteFile(g_log, line, DWORD(used), &written, nullptr);
 }
 
 // NGX core and feature diagnostics, routed into the shim log.
@@ -3316,6 +3346,7 @@ struct Feature
     std::atomic<int> latestOutput{-1};
     std::atomic<uint32_t> completedFrames{0};
     uint32_t engineFrames = 0;    // game thread: frames the engine recorded into the game's lists (no CUDA completion)
+    uint32_t engineMisses = 0;    // game thread: native D3D12 frames the engine could not record (no fallback there)
     uint32_t evaluatedFrames = 0; // worker only
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.
@@ -4195,7 +4226,12 @@ static void init_vram_interop()
 {
     if (FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), reinterpret_cast<void**>(&g_vk.interop))))
     {
-        logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
+        // On native Windows (D3D12Core, no vkd3d-proton) this interface never exists: VRAM interop there is the
+        // native route (native_vram_available), so only a Wine/Proton device that lacks it is worth a line
+        static const bool underWine =
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (underWine)
+            logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
         return;
     }
     VkInstance instance = VK_NULL_HANDLE;
@@ -10158,10 +10194,22 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
             feature->preset = 6;
         if (feature->preset == 0) feature->preset = rayReconstruction ? 4 : 11;
         const bool ldrFeature = (feature->flags & 1u) == 0;
-        const bool presetM = (feature->preset == 13 || feature->preset == 12) && !rayReconstruction &&
-                             (native_engine_m(ldrFeature, feature->preset == 12) != nullptr ||
-                              native_engine_m_rdna3(ldrFeature, feature->preset == 12) != nullptr);
-        const bool presetRR = rayReconstruction && native_engine_rr(feature->preset) != nullptr;
+        bool presetM = (feature->preset == 13 || feature->preset == 12) && !rayReconstruction &&
+                       (native_engine_m(ldrFeature, feature->preset == 12) != nullptr ||
+                        native_engine_m_rdna3(ldrFeature, feature->preset == 12) != nullptr);
+        bool presetRR = rayReconstruction && native_engine_rr(feature->preset) != nullptr;
+        // Ray Reconstruction likewise: a hint without its package (D or E asked for with only F installed, F without
+        // its package, a flagged or retired value) runs the newest installed one instead of being refused
+        if (rayReconstruction && !presetRR)
+            for (const unsigned candidate : {6u, 5u, 4u})
+                if (native_engine_rr(candidate) != nullptr)
+                {
+                    logf("native D3D12: Ray Reconstruction preset %u has no native package; the feature runs %c",
+                         feature->preset, char('A' + candidate - 1));
+                    feature->preset = candidate;
+                    presetRR = true;
+                    break;
+                }
         // The native engine has Super Resolution's K, L and M only: another preset (the CNN presets A-F and J, which
         // an OptiScaler override can ask for) or an M/L without its package runs as K rather than leaving the game
         // without DLSS (there is no CUDA route to fall back to here)
@@ -10171,6 +10219,18 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
                  feature->preset);
             feature->preset = 11;
         }
+        // ... and without K's package, the M or L that is installed
+        if (!rayReconstruction && !presetM && !native_engine_available(ldrFeature))
+            for (const unsigned candidate : {13u, 12u})
+                if (native_engine_m(ldrFeature, candidate == 12) != nullptr ||
+                    native_engine_m_rdna3(ldrFeature, candidate == 12) != nullptr)
+                {
+                    logf("native D3D12: preset %u has no native package and K is not installed; the feature runs %c",
+                         feature->preset, candidate == 13 ? 'M' : 'L');
+                    feature->preset = candidate;
+                    presetM = true;
+                    break;
+                }
         if (!presetRR && !presetM && (rayReconstruction || feature->preset != 11 || !native_engine_available(ldrFeature)))
         {
             logf("native D3D12 CreateFeature refused: preset=%u flags=0x%x (%s)", feature->preset, feature->flags,
@@ -10216,8 +10276,13 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
                                                              : create_cuda_feature(*feature);
     if (feature->cudaCreationDeferred)
     {
-        logf(nativeD3d12 ? "engine backend: native D3D12 feature; CUDA fallback unavailable" :
-                          "engine backend: CUDA feature creation deferred until fallback is needed");
+        if (nativeD3d12)
+            logf("engine backend: native D3D12 feature, %s preset %c (this route has no CUDA fallback: a frame the "
+                 "engine cannot record is logged and the game keeps its own output)",
+                 rayReconstruction ? "Ray Reconstruction" : "Super Resolution",
+                 feature->preset >= 1 && feature->preset <= 26 ? char('A' + feature->preset - 1) : '?');
+        else
+            logf("engine backend: CUDA feature creation deferred until fallback is needed");
         // the denoiser's model loads on a thread of its own: start it now, so it is usually ready by the first frame
         // (the native Vulkan frontend starts it once its engine is initialised, NVSDK_NGX_VULKAN_CreateFeature)
         if (rayReconstruction && !nativeVulkan)
@@ -14163,7 +14228,14 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
         return NGX_SUCCESS;
     }
     if (feature->nativeD3d12)
-        return NGX_FAIL_FEATURE_NOT_SUPPORTED; // no CUDA backend without vkd3d-proton (the log names the refusal)
+    {
+        // no CUDA backend without vkd3d-proton: say so rather than leaving the game's output unwritten in silence
+        if (++feature->engineMisses <= 3 || feature->engineMisses % 600 == 0)
+            logf("native D3D12 feature %u: frame %u not recorded by the engine (%u so far; %u recorded); the game "
+                 "keeps its own output for it",
+                 feature->handle.Id, frame, feature->engineMisses, feature->engineFrames);
+        return NGX_FAIL_FEATURE_NOT_SUPPORTED;
+    }
 
     if (feature->cudaCreationDeferred)
     {
