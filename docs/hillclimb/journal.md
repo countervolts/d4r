@@ -498,3 +498,18 @@ schedule (all slower).
   - post in three groups 153 / 195 / 195, pooled 45.
   post is per-pixel f32 filtering (5-tap history and the like), and its MMA helpers are not called from main, so
   `D4R_MMA_PACKED` does not apply. The RR F numerics are already at the most relaxed level (D4R_RR_RELAXED=3).
+- **Tried again, rejected (lane B): the gather pass (enc0g) on LLPC with one FP8 conversion per pair and no NaN
+  branch.** Under `RR_LLPC_SAT`, ptx2rr.py's `f16x2_to_e4m3x2` clamps the pair to +-448 and converts it once (a NaN
+  half gives +-448, or 0 with relu, instead of 0x7f). compile_rr2.py writes `enc0g_llpc.spv` with it:
+  - Every other file the build writes is byte-identical. The preprocessed texts the D3D12 build and the HIP hybrids
+    read are unchanged.
+  - LLPC: 8996 -> 7682 instructions, 139 -> 47 mode writes, 322 -> 232 branches, 86 -> 95 VGPRs.
+  - The remaining mode writes are FP16_OVFL=0 before every plain conversion. LLPC never sets the bit here, and GLSL
+    cannot hoist them.
+  - Replay: 3.34 -> 3.28 ms, byte-identical.
+  - Bench (rt-vd against rt-vg2, 3 rounds): vk-RRF-1440 3.353 -> 3.310 (-1.27%, spread 0.81%), vk-RRF-4k
+    7.375 -> 7.300 (-1.02%, spread 0.76%), identical. Every candidate run was below every control run, but under
+    2x the spread on both cases. Reverted.
+  Housekeeping: `models-rrg` / `models-fullg` already existed from the first try, so this one used `models-rrg2`,
+  `models-fullg2` and `rt-vg2`. A failed `ln` left two links inside `models-rrg/rr-f` (`hip/hip`,
+  `native-work/native-work`); I removed them.
