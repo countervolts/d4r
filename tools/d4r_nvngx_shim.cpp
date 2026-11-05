@@ -13579,9 +13579,14 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
     {
 #ifdef D4R_ENGINE_D3DHIP
         // D4R_D3DHIP_K=1: the network on the model's native HIP layers (compile_k.py --hip; engine\k\hipnet.bin and
-        // hip\), between the engine's front and back in the game's split list. Opt-in: faster than the DXIL network
-        // where AMD's driver compiles that network poorly (26.10.1 on RDNA3), slower on others.
-        if (feature.engineDx == nullptr && env_uint("D4R_D3DHIP_K", 0) != 0 && !feature.engineKHipFailed)
+        // hip\), between the engine's front and back in the game's split list. Faster than the DXIL network where
+        // AMD's driver compiles that network poorly (26.10.1 on RDNA3) and on RDNA4 (RX 9070 XT, 26.10.1: 1.30
+        // against 1.38 ms at 720p -> 1440p, 2.70 against 2.77 at 1080p -> 4K), slower on others. Default (2): on
+        // with an RDNA4 GPU in the fast set ([Kernels] PreferAccuracy = false) when the package has the HIP layers;
+        // 0 never, 1 on any GPU.
+        const unsigned d3dhipK = env_uint("D4R_D3DHIP_K", 2);
+        if (feature.engineDx == nullptr && !feature.engineKHipFailed &&
+            (d3dhipK == 1 || (d3dhipK == 2 && env_uint("D4R_PREFER_ACCURACY", 0) == 0 && rdna4_installed())))
         {
             const std::string directory = ldr ? engine_model_directory("D4R_ENGINE_MODEL_LDR_DIR", L"\\engine\\k-ldr")
                                               : engine_model_directory("D4R_ENGINE_MODEL_DIR", L"\\engine\\k");
