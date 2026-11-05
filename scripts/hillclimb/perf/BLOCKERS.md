@@ -40,6 +40,18 @@ a tester should do.
   clamp instead of LLPC's guarded saturating conversion. Identical on every harness case, but a NaN accumulator now
   gives +-448 instead of the NaN code, and LLPC's leaked FP16_OVFL mode (which binary16 overflow follows) moved
   (journal). Portal RTX (Vulkan, RR) is the place to look: RR and preset L, highlights and disocclusions.
+- **RR F's remaining LLPC stages need image descriptors for HIP (2026-11-05).** On vk-RRF-1440 (3.41 ms) the
+  stages still on AMD's Vulkan compiler are the gather (~0.40 ms), dec0_1 (0.42) and post (0.46). The other 15 stages
+  run as vkhip HIP kernels, about 30% faster than LLPC built them. These three read or write images. A HIP kernel can
+  reach an image only through its raw descriptor, which needs vkGetDescriptorEXT (VK_EXT_descriptor_buffer).
+  The Vulkan frontend does not ask games for that extension, so neither vulkan_dlss_harness nor a game has it.
+  - Measured with descriptors (the Vulkan replay enables the extension): dec0_1 as HIP 366 against 421 us (about
+    -1.5% of the case, 52.5 dB against the LLPC output). Patch at `C:\d4r-hc	mp\d1hip\dec0_1-vkhip.patch`
+    (journal). The gather and post ports would add more, perhaps 0.2-0.3 ms, unmeasured.
+  - A human should decide whether d4r may add VK_EXT_descriptor_buffer to the device extensions it asks Vulkan games
+    for on AMD's driver (`d4r_vulkan_frontend.inl`, next to pipeline binary / maintenance5). Games that append only
+    the names (Streamline) do not enable its `descriptorBuffer` feature. Calling vkGetDescriptorEXT then is outside
+    the spec, even if the driver allows it. Checking a game with the extension enabled is part of the decision.
 - **Indiana Jones and the Great Circle** (the verified Windows Vulkan game) is not installed; Portal RTX is the
   Vulkan game check until it is.
 

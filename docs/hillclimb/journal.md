@@ -456,3 +456,11 @@ schedule (all slower).
   AMD Vulkan game for another device extension (and its feature bit, which Streamline-style games do not pass) is
   not worth 1.5% without a game check. An arena output plus a Vulkan store pass would cost about what it saves
   (~18 MB written and read). It becomes worth taking if the frontend ever gets descriptor_buffer for another reason.
+- RR F's output passes on Vulkan (replay, 720p -> 1440p): post ~0.46 ms in three tile groups, down ~0.10, pooled
+  0.045 (`D4R_ENGINE_RR_SKIP` ablations).
+  - post on LLPC: 82 VGPRs, wave64, about 2700 instructions per thread (206 v_mul_f32, 158 v_add_f32, 154 v_fmac_f32,
+    122 v_pk_fma_f16, 44 image_sample_lz, 52 branches). Over the ~2M threads that is VALU throughput for 0.46 ms.
+  - `spirv-opt -O` variants (`<stage>_llpc.spv`) of post / down / pooled / downp: 542 -> 528 us (-0.4% of the case).
+    Not kept.
+  - post as wave32 (its shared scratch is sized for 32-wide subgroups): identical output but +20 us per group.
+    Rejected.
