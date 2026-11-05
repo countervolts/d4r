@@ -39,4 +39,4 @@ Untargeted: vk-M-1440-r11 1.412. Vulkan score (geomean of the 9 Vulkan cases): 4
 network (the native Vulkan frontend has no K vkhip); L runs soft-dot2 front stages on LLPC.
 
 ## Kept commits
-
+18ab21b score=- / 3.957 / - worst=vk-L-1440 +0.99% (spread 1.38%) RR F on vkhip by default on AMD's driver: vk-RRF-1440 -18.9%, vk-RRF-4k -13.5%, byte-identical (lane A)

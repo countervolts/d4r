@@ -315,6 +315,17 @@ def compile_l(a, one, R):
     for planes, suffix in ((0, ''), (1, '_planes')):
         glsl('layer_m.comp', f'enc0_l{suffix}.spv', defines('enc0l') + ldr + [f'-DPLANES={planes}'] + FAST + L_WPW_ENC0 + RESF32 + L_FAST)
         glsl('layer_m.comp', f'dec0_l{suffix}.spv', defines('dec0l') + [f'-DPLANES={planes}'] + FAST + L_WPW + RESF32 + L_FAST)
+    # AMD's Windows driver (LLPC) crashes compiling these FP8 cooperative-matrix modules as glslang writes them, and
+    # compiles them after SPIRV-Tools' -O (as preset F's enc0_llpc.spv, compile_rr2.py). RX 9070 XT, driver 26.10.1,
+    # 1280x720 -> 2560x1440: the input and expansion stages 0.61 / 0.47 ms against 2.16 / 1.83 ms of the soft-dot2
+    # stages that driver ran before, 51.8 dB against the D3D12 engine (soft-dot2: 48.7-51.2). runtime_m.inc loads
+    # <stem>_llpc.spv only on that driver; RADV keeps the modules above byte for byte.
+    opt = os.environ.get('D4R_SPIRV_OPT') or shutil.which('spirv-opt') or shutil.which('spirv-opt.exe')
+    if opt:
+        for stem in [*SHADERS.values(), 'enc0_l', 'dec0_l', 'enc0_l_planes', 'dec0_l_planes']:
+            subprocess.run([opt, '-O', str(a.output / f'{stem}.spv'), '-o', str(a.output / f'{stem}_llpc.spv')], check=True)
+    else:
+        print("no spirv-opt: AMD's Windows driver runs preset L's soft-dot2 stages (D4R_SPIRV_OPT)")
     # the reconstruction one render texel wider per tier than M's (4x4 taps): 11 (reconstruction/render >= 3),
     # 16 (the whole post_3_2 range), 12 (the compact tier: render/reconstruction <= 0.45, jitter within half a texel)
     for out, tile in (('post_l', 11), ('post_l_q', 16), ('post_l_c', 12)):

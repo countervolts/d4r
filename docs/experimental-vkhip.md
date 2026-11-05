@@ -182,6 +182,18 @@ expansion 1830.1, reconstruction 384.7, downsample 69.8 us. The same frame on th
 us against 2115.4 and 1830.1 here: the emulated `v_dot2` is what this route costs. `vkhip` is byte-identical to
 `hip` on all four frames and 52.24-53.87 dB against the DXIL engine.
 
+**The matrix stages on LLPC (2026-11-05).** The crash is in LLPC's handling of glslang's module, not in the FP8
+cooperative matrices: the same modules through SPIRV-Tools' `spirv-opt -O` compile and run, as preset F's
+`enc0_llpc.spv` already showed. `compile_m.py` now writes `<stem>_llpc.spv` for L's matrix stages (`enc0_l`,
+`dec0_l`, their `_planes` variants and the five network layers `m_*.spv`) when `spirv-opt` is on PATH or in
+`D4R_SPIRV_OPT`, and `MModel` takes them on AMD's driver when the package has all nine, ahead of the soft-dot2
+stages; RADV loads the same files as before. glslang's module still segfaults in `vkCreateShaderModule` (checked
+against a package without the dot2 plane files). `d4r-m` with the HIP L package: input 613 / expansion 473 us against
+2158 / 1832 for soft dot2, vkhip byte-identical to hip, 51.75 / 51.83 dB against the D3D12 engine (soft dot2:
+51.22 / 48.67). The internal Vulkan network (no vkhip) compiles too with the `m_*_llpc.spv` layers (51.6-53.0 dB
+against D3D12). Through the shim (`vulkan_dlss_harness`, bench.py): 5.215 -> 2.252 ms at 1280x720 -> 2560x1440 and
+11.309 -> 5.029 ms at 1920x1080 -> 3840x2160.
+
 ## RDNA2 on native Windows (unofficial, 2026-11-02)
 
 Untested on RDNA2 hardware. Preset K takes vkhip on gfx1030-gfx1036 through AMD's driver only

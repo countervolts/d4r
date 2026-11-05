@@ -72,6 +72,12 @@ struct MModel::Impl {
         const std::string soft = dir + "/" + stem + "_llpc.spv";
         return llpc && exists(soft) ? soft : dir + "/" + stem + ".spv";
     }
+    // a cooperative-matrix stage file: on AMD's Windows driver the model's <stem>_llpc.spv (the module through
+    // SPIRV-Tools' -O, compile_m.py), which that driver compiles where it crashes on glslang's module
+    std::string matrixFile(const std::string& dir, const std::string& stem) const {
+        return llpc && matrixLlpc ? dir + "/" + stem + "_llpc.spv" : dir + "/" + stem + ".spv";
+    }
+    bool matrixLlpc = false;             // AMD's Windows driver and the model has every matrix stage's _llpc.spv
     // the matrices' buffer and the byte offset of the FP8 matrix at o in it
     const Buffer& weights() const { return dot2 ? w16x : w8; }
     VkDeviceSize weightsAt(uint32_t o) const { return dot2 ? VkDeviceSize(o) * 2 : o; }
@@ -110,7 +116,7 @@ struct MModel::Impl {
             const std::string variant = dot2 ? "_dot2" : "";
             const VkDevice dev = device.handle;
             for (unsigned i = 0; i < MLayers; ++i) {
-                const std::string file = dot2 ? dot2File(directory, MShader[i] + variant) : directory + "/" + MShader[i] + variant + ".spv";
+                const std::string file = dot2 ? dot2File(directory, MShader[i] + variant) : matrixFile(directory, MShader[i]);
                 traceStage(file);
                 network[i].create(dev, file, {b,b,b,b,b,b,b}, 32, cache);
             }
@@ -195,11 +201,21 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         inside(m.enc0[0], m.enc0[1]); inside(m.dec0[0], m.dec0[1]); inside(0, m.enc0[2]);
     }
     for (auto& l : m.layers) inside(l[0], l[1]);
-    // AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix preset-L stages - including the
-    // plane-layout ones an external (vkhip/HIP) network needs - so on that driver preset L takes the model's dot2
-    // stages (no cooperative matrices) whenever the package has the dot2 plane stages. Every other driver, RADV
-    // included, keeps the matrix stages, byte-identical.
-    if (!m.dot2 && m.presetL) {
+    // AMD's Windows driver (LLPC) crashes compiling the FP8 cooperative-matrix preset-L stages as glslang writes
+    // them - including the plane-layout ones an external (vkhip/HIP) network needs. A model with every matrix
+    // stage's <stem>_llpc.spv (SPIRV-Tools' -O, which that driver compiles) keeps the matrix stages there; an older
+    // one takes the model's dot2 stages (no cooperative matrices, f16 pair products emulated) whenever the package
+    // has the dot2 plane stages. Every other driver, RADV included, keeps the matrix stages, byte-identical.
+    if (!m.dot2 && m.presetL && m.llpc) {
+        m.matrixLlpc = true;
+        for (const char* stem : {"enc0_l", "dec0_l", "enc0_l_planes", "dec0_l_planes"})
+            m.matrixLlpc = m.matrixLlpc && exists(directory + "/" + stem + "_llpc.spv");
+        for (unsigned i = 0; i < MLayers; ++i)
+            m.matrixLlpc = m.matrixLlpc && exists(directory + "/" + MShader[i] + "_llpc.spv");
+        if (m.matrixLlpc)
+            std::fprintf(stderr, "d4r: preset L on AMD's Windows driver: the matrix stages' LLPC builds\n");
+    }
+    if (!m.dot2 && m.presetL && !m.matrixLlpc) {
         if (driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY && exists(directory + "/enc0_l_planes_dot2.spv") &&
             exists(directory + "/dec0_l_planes_dot2.spv") && exists(directory + "/merge_l_dot2_planes.spv")) {
             dot2 = m.dot2 = true;
@@ -234,18 +250,20 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     const auto exTypes = m.presetL ? lEx : std::vector<VkDescriptorType>{b,t,t,s,s,s,s,b,b,b};
     m.front.merge = m.dot2 && m.presetL ? directory + "/merge_l_dot2.spv" : "";
     m.front.features = splitFeatures ? directory + "/enc_features_l.spv" : "";
-    m.front.input = m.dot2 ? m.dot2File(directory, in + variant) : directory + "/" + in + variant + ".spv";
-    m.front.expand = m.dot2 ? m.dot2File(directory, ex + variant) : directory + "/" + ex + variant + ".spv";
+    m.front.input = m.dot2 ? m.dot2File(directory, in + variant) : m.matrixFile(directory, in);
+    m.front.expand = m.dot2 ? m.dot2File(directory, ex + variant) : m.matrixFile(directory, ex);
     // LLPC rejects the v_dot2 stages' capability at module creation and crashes on the matrix ones: refuse here,
     // naming the files, rather than in the driver
     if (m.llpc && m.dot2 && !llpcDot2(physical, directory))
         m.front.llpcMissing = true;
     m.front.inTypes = inTypes; m.front.exTypes = exTypes;
     if ((m.planes = exists(directory + "/" + in + "_planes" + variant + ".spv") && exists(directory + "/" + ex + "_planes" + variant + ".spv"))) {
-        traceStage(directory + "/" + in + "_planes" + variant + ".spv");
-        m.inputPlanes.create(device, directory + "/" + in + "_planes" + variant + ".spv", inTypes, 32, cache);
-        traceStage(directory + "/" + ex + "_planes" + variant + ".spv");
-        m.expandPlanes.create(device, directory + "/" + ex + "_planes" + variant + ".spv", exTypes, 32, cache);
+        const std::string inPlanes = m.dot2 ? directory + "/" + in + "_planes" + variant + ".spv" : m.matrixFile(directory, in + "_planes");
+        const std::string exPlanes = m.dot2 ? directory + "/" + ex + "_planes" + variant + ".spv" : m.matrixFile(directory, ex + "_planes");
+        traceStage(inPlanes);
+        m.inputPlanes.create(device, inPlanes, inTypes, 32, cache);
+        traceStage(exPlanes);
+        m.expandPlanes.create(device, exPlanes, exTypes, 32, cache);
         if (m.dot2 && m.presetL && exists(directory + "/merge_l_dot2_planes.spv"))
             m.front.mergePlanes = directory + "/merge_l_dot2_planes.spv";
     }
