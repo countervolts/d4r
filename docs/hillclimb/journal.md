@@ -425,3 +425,8 @@ schedule (all slower).
   - vk-RRF-1440 3.521 -> 3.412 (-3.09%, spread 0.73%);
   - vk-RRF-4k 7.731 -> 7.520 (-2.74%, spread 0.41%);
   - output byte-identical; Vulkan score 5.218 -> 5.066 over the RRF cases.
+- enc0's `RR2_WAVES` 6 against 5: 3.425 against 3.429 ms (three ABAB pairs, identical output): flat, so 5 stays. 0 / 4 / 8
+  spill (32 bytes of scratch).
+- **Owner, 2026-11-05: byte-identical output is not a requirement.** From now on, numerics-changing levers are taken
+  when they are faster and their quality holds (PSNR / max-diff against the current output, recorded here), not only
+  lane A ones. Levers dropped partly for not being identical get a second look.
