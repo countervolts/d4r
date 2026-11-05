@@ -575,3 +575,7 @@ schedule (all slower).
   1.22, network 1.92, expansion 0.89, reconstruction 0.95, downsample 0.23); RR F 8.39 (front 2.05, network 3.66, back
   2.63). Against NVIDIA's M stages at that size (post 0.836, downsample 0.254, Swin 1.078) M's whole gap is the
   network (~1.72 ms without the handoff). Two more helper agents: M's Swin HIP layers, RR F's D3D12 back stages.
+- **Kept: RR F's encoder 0 in the d3dhip HIP section** (helper agent-rrenc0's patch): byte-identical, dx-RRF-1440
+  -1.29%, dx-RRF-4k -1.82% in the harness (the replay showed -2.7%). Only packages with `hip/rr2_enc0.hsaco` take it
+  (models-rre/rr-f here; models/rr-f lacks it). The replay's `hip N` figure for preset F is not meaningful (HIP events
+  around the graph launch); use the D3D12 front / network / back split.
