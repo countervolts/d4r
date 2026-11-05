@@ -198,3 +198,14 @@ schedule (all slower).
   from earlier). bench.py (3 rounds): vk-K-1440 1.652 -> 1.107 (-32.97%), vk-K-4k 2.938 -> 2.392 (-18.57%),
   dx-K-1440 identical. Output against the Vulkan network: pan scene 65.7 dB (truth PSNR 29.84 dB both), static
   107 dB, LDR 61.5 dB; finite, same mean/std. vk M, L and RR F byte-identical.
+- **vkhip K at 4K was nondeterministic** (found by bench.py's hash check: two control hashes on vk-K-4k). 600-frame
+  runs at 1920x1080 -> 3840x2160: 15-25% diverge (67 dB from the usual output, all over the frame: one early glitch
+  spread by the history); 1440p 16/16 stable; the Vulkan network route 12/12 and d3dhip with the same kernels 12/12
+  stable. Not scratch: LLPC's own metadata uses bytes per lane too (`vk_pipeline_stats` `VKSTATS_ELF` + a msgpack
+  reader, `C:\d4r-hc\tools\palmeta.py`), and 2x / 4x / 32x the scratch size still diverged (4/12 at 2x). Not the
+  barriers (MEMORY_READ/WRITE after every dispatch: 2/12), not `-mcumode` (enc0/dec0 without it: 3/16). **The
+  trimmed grids**: `D4R_ENGINE_K_TRIM=0` was stable 16/16 with the usual output's hash. d3dhip never trims. Fix:
+  vkhip K launches the full grids on AMD's driver (RADV keeps trimming): 32/32 stable; bench vk-K-1440 +0.62%,
+  vk-K-4k -0.29% (noise), identical. Why trimming races is not understood: the trimmed windows' tokens are not read by
+  the rule the trimming uses, so some HIP layer may read them after all (a padded window's halo) and pick up whatever
+  another dispatch left there.
