@@ -438,3 +438,21 @@ schedule (all slower).
   As output_k.comp's comments say, the reference filters in half precision: its sample positions sit on half
   rounding ties, and the recurrent history spreads any change over the frame. An f32 filter is another algorithm,
   not a rounding nuance. Not worth 1.7%.
+- **RR F's dec0_1 as a vkhip HIP kernel: built and measured, parked.** Patch kept outside the repo
+  (`C:\d4r-hc\tmp\d1hip\dec0_1-vkhip.patch`). What it took:
+  - The hybrid prep (generalised to `rr2_hybrid_prep.py`) turns the four storage images (176 rgba8_snorm, 184 / 192
+    rgba8, 200 rgba16f) into a binding-3 descriptor table.
+  - glsl2hip gets `GLSL_IMAGES`: a fourth kernel argument and stores through `llvm.amdgcn.image.store.2d`, with the
+    hardware's bounds check standing in for the shader's. Module-scope private arrays (`rr2_r16` / `rr2_m16`) become
+    kernel locals, and their users lambdas.
+  - The F loader writes the four descriptors (vkGetDescriptorEXT, `RStageResources::surfaceF`) after the arguments.
+  Results:
+  - Spill-free at `RR2_WAVES=6` (211 VGPRs). Replay stage stamps (720p -> 1440p synthetic): 421 us on LLPC against
+    366-370 (WAVES 5: 390; 7 spills 8 B; rolled none 399; WGP mode 406). About -52 us, ~1.5% of vk-RRF-1440.
+  - Lane B: the 8-bit surfaces differ by one LSB in <= 1% of values and kc by <= 0.016; the output settles at
+    52.5 dB against the LLPC route over 8 frames, finite, same mean.
+  Parked because the descriptors need VK_EXT_descriptor_buffer. The Vulkan frontend asks games only for cooperative
+  matrix, float8, pipeline binary and maintenance5, so neither vulkan_dlss_harness nor a game has it. Asking every
+  AMD Vulkan game for another device extension (and its feature bit, which Streamline-style games do not pass) is
+  not worth 1.5% without a game check. An arena output plus a Vulkan store pass would cost about what it saves
+  (~18 MB written and read). It becomes worth taking if the frontend ever gets descriptor_buffer for another reason.
