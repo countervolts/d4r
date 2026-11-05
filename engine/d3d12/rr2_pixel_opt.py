@@ -276,13 +276,75 @@ _E4_HELPERS = '''uint rrE4H(uint h)
 uint rrE4x2(uint w) { return rrE4H(w & 0xffffu) | (rrE4H(w >> 16u) << 8u); }
 '''
 
+# rrE4x2 where the wave runs uniformly, on AMD's driver: one hardware conversion
+# of both halves clamped to +-448 (lane-local, v_cvt_pk_fp8_f32) instead of two
+# software codecs. The clamp takes an infinity to its own bound, as rrCode does,
+# and a NaN to a bound, which the selects replace by 0x7f: every input keeps its
+# code. vkd3d-proton's rrCode is already the hardware conversion; the macro keeps
+# its preprocessed source unchanged.
+_E4_UNIFORM = '''#if D4R_VKD3D
+#define rrE4x2W rrE4x2
+#else
+uint rrE4x2W(uint w)
+{
+    const vector<float16_t, 2> v = clamp(vector<float16_t, 2>(asfloat16(uint16_t(w & 0xffffu)),
+                                                              asfloat16(uint16_t(w >> 16u))),
+                                         float16_t(-448.0), float16_t(448.0));
+    const uint4 h = uint4(uint(asuint16(v.x)) | (uint(asuint16(v.y)) << 16), 0u, 0u, 0u);
+    uint c = convert(MatrixAcc16, MatrixB8, 0, m16(h)).reg[0] & 0xffffu;
+    c = (w & 0x7fffu) > 0x7c00u ? (c & 0xff00u) | 0x7fu : c;
+    c = ((w >> 16u) & 0x7fffu) > 0x7c00u ? (c & 0x00ffu) | 0x7f00u : c;
+    return c;
+}
+#endif
+'''
+
+_ENTRY = re.compile(r'(?m)^void main\(\)')
+# the split stages' window test (rr/gen_rr2_enc0.py): workgroup and subgroup
+# indices against a uniform bound, the same for every lane of a wave
+_VALID_DEF = re.compile(r'const bool rr2_valid = ((?:gl_SubgroupID < \d+u && )?gl_WorkGroupID\.x < rr2_gx);')
+_VALID_IF = re.compile(r'if\s*\(\s*rr2_valid\s*\)$')
+
+
+def _uniform_flow(source, at):
+    """Whether `at`, inside main, runs with every lane of its wave.
+
+    Each block open between main's brace and `at` must be a bare scope or the
+    wave-uniform `if (rr2_valid)`; any other if / else / loop body may be
+    divergent, where the driver's lowering of an AGS conversion is unsafe.
+    """
+    entry = _ENTRY.search(source)
+    if not entry or at < entry.end():
+        return False
+    valid = bool(_VALID_DEF.search(source, entry.end(), at))
+    i = source.index('{', entry.end())
+    stack = []
+    j = i + 1
+    while True:
+        j = _skip(source, j)
+        if j >= at:
+            break
+        c = source[j]
+        if c == '{':
+            head = source[max(i + 1, j - 200):j].rstrip()
+            stack.append(head[-1:] in (';', '{', '}') or (valid and bool(_VALID_IF.search(head))))
+        elif c == '}':
+            if not stack:
+                return False
+            stack.pop()
+        elif c in '"\'':
+            return False
+        j += 1
+    return all(stack)
+
 
 def _packed_encode(source):
     """`f16x2_to_e4m3x2(H2(w), false)` encodes w's two halves; rrE4x2(w) does.
 
     H2 splits w into two binary16 values and the codec raises them to f32; the
     helper takes the stored half bits directly.  Same codes (NaN -> 0x7f,
-    saturating round to nearest even), one pack/unpack less per pair.
+    saturating round to nearest even), one pack/unpack less per pair. In
+    wave-uniform flow it is rrE4x2W, the hardware conversion (_E4_UNIFORM).
     """
     edits = []
     for _, start, op in _calls(source, ('f16x2_to_e4m3x2',)):
@@ -296,16 +358,18 @@ def _packed_encode(source):
         word = _arguments(call[1])
         if len(word) != 1 or not re.fullmatch(r'\s*[A-Za-z_]\w*\s*', word[0]):
             continue
-        edits.append((start, close + 1, 'rrE4x2(' + word[0].strip() + ')'))
+        name = 'rrE4x2W' if _uniform_flow(source, start) else 'rrE4x2'
+        edits.append((start, close + 1, name + '(' + word[0].strip() + ')'))
     if not edits:
         return source
+    uniform = any(e[2].startswith('rrE4x2W(') for e in edits)
     source = _apply(source, edits)
     if re.search(r'(?m)^void main\(\)', source):
         at = re.search(r'(?m)^void main\(\)', source).start()
     else:
         at = source.find('#include "rr_wmma.hlsli"')
         at = source.find('\n', at) + 1
-    return source[:at] + _E4_HELPERS + source[at:]
+    return source[:at] + _E4_HELPERS + (_E4_UNIFORM if uniform else '') + source[at:]
 
 
 # --------------------------------------------------------------------------- pair accessors
@@ -366,7 +430,7 @@ _TYPE = ('bool|int|uint|float|double|half|float16_t|uint16_t|int16_t|uint8_t|int
          'bvec2|bvec3|bvec4|RRByte|RRHalf|RRFloat|RRHalf8|RRBytes8|Matrix16')
 
 _UINT16_CALL = re.compile(
-    r'(?:HU|PARAM16|SH16|GA16|GW16|GX\d+_16|rrE4H|rrE4x2)$')
+    r'(?:HU|PARAM16|SH16|GA16|GW16|GX\d+_16|rrE4H|rrE4x2W?)$')
 
 
 def _declarations(source):
@@ -474,7 +538,7 @@ def _uint_typed(expr, types):
         name = call[0]
         return (name == 'uint' or name in ('HU', 'HU2_', 'PARAM32', 'PARAM16', 'PARAM8',
                                            'SH32', 'SH16', 'bfi32', 'rrCode', 'rrE4H',
-                                           'rrE4x2', 'h2e4m3_hw', 'f16x2_to_e4m3x2')
+                                           'rrE4x2', 'rrE4x2W', 'h2e4m3_hw', 'f16x2_to_e4m3x2')
                 or bool(re.fullmatch(r'(?:GA|GW|GX)\d+(?:_\d+)?', name)))
     m = re.fullmatch(r'(.+?)\s*&\s*0x[fF]{4}u', e, re.S)
     if m:
