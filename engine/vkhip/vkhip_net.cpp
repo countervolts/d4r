@@ -519,12 +519,8 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
         if (!p) return false;
         n.preps.push_back({p, blocks, 1, n.argBlock(baseParams[i]), prep});
     }
-    // AMD's driver (pipeline binaries) launches the full grids: with the trimmed ones, gfx1201 at 1920x1080 -> 3840x2160
-    // diverged in 15-25% of 600-frame runs (a small difference, 67 dB, that the history then spread) while the full
-    // grids were deterministic in 32 of 32 and give the trimmed grids' usual output; 0.6-0.8% slower. RADV keeps the
-    // trimmed grids. D4R_ENGINE_K_TRIM=0/1 overrides either.
     const char* trimEnv = std::getenv("D4R_ENGINE_K_TRIM");
-    const bool trim = trimEnv ? std::strcmp(trimEnv, "0") != 0 : !files.pipelineBinary;
+    const bool trim = !trimEnv || std::strcmp(trimEnv, "0") != 0;
     for (uint32_t phase = 0; phase < 8; ++phase) {
         int32_t size[2][11], shift[2][11];
         for (uint32_t i = 0; i < 11; ++i) {
