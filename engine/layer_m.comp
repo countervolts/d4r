@@ -318,7 +318,15 @@ ACC bias32(uint off, uint stride) { ACC b; coopMatLoad(b, w32.w, off / 4u, strid
 #endif
 #ifdef M_RELAXED
 // straight from f32 into FP8, two elements per saturating conversion; the activation in f32 as well
+// M_LLPC_SAT (compile_m.py, preset L's *_llpc.spv for AMD's Windows driver): both as a clamp to +-448 and the plain
+// conversion. LLPC keeps saturatedConvertEXT's NaN-preserving clamp (a clamp, a class test and a select per element)
+// and FINITE's compare and select, each select waiting on its compare's VCC. The clamp gives the same code for every
+// finite value and infinity; a NaN gives +-448 instead of the NaN code.
+#ifdef M_LLPC_SAT
+#define SAT2_(dst, i, v) { const fe4m3vec2 t_ = fe4m3vec2(clamp(v, vec2(-448.0), vec2(448.0))); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
+#else
 #define SAT2_(dst, i, v) { fe4m3vec2 t_; saturatedConvertEXT(t_, (v)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
+#endif
 #define MK8_F8(dst, a) { SAT2_(dst, 0, vec2((a)[0], (a)[1])) SAT2_(dst, 2, vec2((a)[2], (a)[3])) SAT2_(dst, 4, vec2((a)[4], (a)[5])) SAT2_(dst, 6, vec2((a)[6], (a)[7])) }
 // SATF2_: the same for a value that is never infinite, written as "an infinity becomes NaN, then saturate", which RADV
 // turns into the hardware conversion with FP16_OVFL instead of a NaN-preserving clamp per element and the conversion
@@ -327,7 +335,15 @@ ACC bias32(uint off, uint stride) { ACC b; coopMatLoad(b, w32.w, off / 4u, strid
 // values it scales, so an infinite channel makes the reciprocal 0 and the product NaN, never infinite. The binary16
 // accumulators (q, the MLP, the expansion, the residual) can overflow to infinity and keep SAT2_.
 vec2 finite2_(vec2 v) { return vec2(isinf(v.x) ? uintBitsToFloat(0x7fc00000u) : v.x, isinf(v.y) ? uintBitsToFloat(0x7fc00000u) : v.y); }
-#define SATF2_(dst, i, v) { fe4m3vec2 t_; saturatedConvertEXT(t_, finite2_(v)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
+// SATN2_: SATF2_ as written, in every build: the normalised tokens, which are NaN by design where a channel is
+// infinite. Under M_LLPC_SAT these also keep LLPC's FP16_OVFL writes ahead of the binary16 arithmetic that follows,
+// which the images depend on (with every conversion clamped, 8 of 29 MB of a 720p -> 1440p frame changed).
+#define SATN2_(dst, i, v) { fe4m3vec2 t_; saturatedConvertEXT(t_, finite2_(v)); (dst)[i] = t_.x; (dst)[(i) + 1] = t_.y; }
+#ifdef M_LLPC_SAT
+#define SATF2_ SAT2_
+#else
+#define SATF2_ SATN2_
+#endif
 #define MK8_F8F(dst, a) { SATF2_(dst, 0, vec2((a)[0], (a)[1])) SATF2_(dst, 2, vec2((a)[2], (a)[3])) SATF2_(dst, 4, vec2((a)[4], (a)[5])) SATF2_(dst, 6, vec2((a)[6], (a)[7])) }
 #ifdef M_AMD_GELU
 #ifndef M_AMD_GELU_SLOPE
@@ -370,8 +386,8 @@ vec2 finite2_(vec2 v) { return vec2(isinf(v.x) ? uintBitsToFloat(0x7fc00000u) : 
 #endif
 // the normalised tokens into FP8 (inside NM1 / N2: x0..x7 the token, g0 / g1 the gains)
 #define H1N_FREE(N, r_) { const float f_ = float(r_); \
-        SATF2_(h1[N], 0, vec2(x0, x1) * f_) SATF2_(h1[N], 2, vec2(x2, x3) * f_) \
-        SATF2_(h1[N], 4, vec2(x4, x5) * f_) SATF2_(h1[N], 6, vec2(x6, x7) * f_) }
+        SATN2_(h1[N], 0, vec2(x0, x1) * f_) SATN2_(h1[N], 2, vec2(x2, x3) * f_) \
+        SATN2_(h1[N], 4, vec2(x4, x5) * f_) SATN2_(h1[N], 6, vec2(x6, x7) * f_) }
 #ifdef L_HALF_INPUT
 #define H1N(N, r_) { const f16vec2 rr_ = f16vec2(float16_t(r_)); \
     const f16vec2 a_ = f16vec2(x0, x1) * (rr_ * g0.xy), b_ = f16vec2(x2, x3) * (rr_ * g0.zw); \
@@ -380,8 +396,8 @@ vec2 finite2_(vec2 v) { return vec2(isinf(v.x) ? uintBitsToFloat(0x7fc00000u) : 
     h1[N][4] = c_.x; h1[N][5] = c_.y; h1[N][6] = d_.x; h1[N][7] = d_.y; }
 #elif defined(M_RELAXED)
 #define H1N(N, r_) { const float f_ = float(r_); \
-        SATF2_(h1[N], 0, vec2(x0, x1) * (f_ * vec2(g0.xy))) SATF2_(h1[N], 2, vec2(x2, x3) * (f_ * vec2(g0.zw))) \
-        SATF2_(h1[N], 4, vec2(x4, x5) * (f_ * vec2(g1.xy))) SATF2_(h1[N], 6, vec2(x6, x7) * (f_ * vec2(g1.zw))) }
+        SATN2_(h1[N], 0, vec2(x0, x1) * (f_ * vec2(g0.xy))) SATN2_(h1[N], 2, vec2(x2, x3) * (f_ * vec2(g0.zw))) \
+        SATN2_(h1[N], 4, vec2(x4, x5) * (f_ * vec2(g1.xy))) SATN2_(h1[N], 6, vec2(x6, x7) * (f_ * vec2(g1.zw))) }
 #else
 #define H1N(N, r_) { \
         h1[N][0] = floate4m3_t(CL8(x0 * float16_t(r_ * g0.x))); h1[N][1] = floate4m3_t(CL8(x1 * float16_t(r_ * g0.y))); \

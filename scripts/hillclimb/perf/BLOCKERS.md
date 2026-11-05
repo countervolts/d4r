@@ -35,6 +35,11 @@ a tester should do.
   default) still race between waves: rarely through HIP (about 1 in 70 harness runs here), more where waves are skewed.
   A human should decide to add `-DPOS_HB_SYNC` to the sources' `d4r-build-flags*` lines of enc0 and dec0 (one
   `s_barrier` per window; on gfx1201 it measured no slower) and rebuild the packages.
+- **The LLPC FP8-conversion changes need a Vulkan game look** (2026-11-05, 441a237 and the L commit after it). RR F's
+  enc0 / dec0_1 and preset L's input / expansion stages on AMD's Windows driver now convert f32 sums to FP8 with a
+  clamp instead of LLPC's guarded saturating conversion. Identical on every harness case, but a NaN accumulator now
+  gives +-448 instead of the NaN code, and LLPC's leaked FP16_OVFL mode (which binary16 overflow follows) moved
+  (journal). Portal RTX (Vulkan, RR) is the place to look: RR and preset L, highlights and disocclusions.
 - **Indiana Jones and the Great Circle** (the verified Windows Vulkan game) is not installed; Portal RTX is the
   Vulkan game check until it is.
 

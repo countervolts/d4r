@@ -321,9 +321,21 @@ def compile_l(a, one, R):
     # stages that driver ran before, 51.8 dB against the D3D12 engine (soft-dot2: 48.7-51.2). runtime_m.inc loads
     # <stem>_llpc.spv only on that driver; RADV keeps the modules above byte for byte.
     opt = os.environ.get('D4R_SPIRV_OPT') or shutil.which('spirv-opt') or shutil.which('spirv-opt.exe')
+    # D4R_M_LLPC_SAT (on by default on Windows hosts, off elsewhere): the input and expansion stages' _planes_llpc.spv compiled
+    # with M_LLPC_SAT, their FP8 conversions as a clamp and the plain conversion (layer_m.comp SAT2_), which LLPC
+    # compiles without the per-element compare and select: the same images (a NaN gives +-448 instead of the NaN code).
+    llpc_sat = os.environ.get('D4R_M_LLPC_SAT', '1' if os.name == 'nt' else '0') == '1'
     if opt:
         for stem in [*SHADERS.values(), 'enc0_l', 'dec0_l', 'enc0_l_planes', 'dec0_l_planes']:
-            subprocess.run([opt, '-O', str(a.output / f'{stem}.spv'), '-o', str(a.output / f'{stem}_llpc.spv')], check=True)
+            src = a.output / f'{stem}.spv'
+            if llpc_sat and stem in ('enc0_l_planes', 'dec0_l_planes'):   # (the runtime's matrix stages on that driver)
+                kind, planes = ('enc0l', 'dec0l')[stem.startswith('dec0_l')], 1
+                src = a.output / f'{stem}_llpc_sat.spv'
+                glsl('layer_m.comp', src.name, defines(kind) + (ldr if kind == 'enc0l' else []) + [f'-DPLANES={planes}'] + FAST +
+                     (L_WPW_ENC0 if kind == 'enc0l' else L_WPW) + RESF32 + L_FAST + ['-DM_LLPC_SAT'])
+            subprocess.run([opt, '-O', str(src), '-o', str(a.output / f'{stem}_llpc.spv')], check=True)
+            if src.name.endswith('_llpc_sat.spv'):
+                src.unlink()
     else:
         print("no spirv-opt: AMD's Windows driver runs preset L's soft-dot2 stages (D4R_SPIRV_OPT)")
     # the reconstruction one render texel wider per tier than M's (4x4 taps): 11 (reconstruction/render >= 3),
