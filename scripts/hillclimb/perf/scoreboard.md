@@ -28,10 +28,10 @@ only: no verified Vulkan game is installed, and Portal RTX has not been run.
 | vk-M-4k | 3.201 | 3.216 | 2.553 | 1.26x |
 | vk-L-1440 | 5.158 | 2.181 | 1.413 | 1.54x |
 | vk-L-4k | 11.315 | 4.886 | 3.161 | 1.55x |
-| vk-RRF-1440 | 4.650 | 3.412 | 2.100 | 1.62x |
-| vk-RRF-4k | 9.600 | 7.520 | 4.658 | 1.61x |
+| vk-RRF-1440 | 4.650 | 3.359 | 2.100 | 1.60x |
+| vk-RRF-4k | 9.600 | 7.378 | 4.658 | 1.58x |
 
-Scores (geomean): D3D12 2.532 -> 2.480, Vulkan 4.089 -> 2.537. The matrix pins D3D12 M/L on DXIL (installed packages
+Scores (geomean): D3D12 2.532 -> 2.480, Vulkan 4.089 -> 2.530. The matrix pins D3D12 M/L on DXIL (installed packages
 have no HIP layers); d3dhip, the default with HIP packages, is the second figure.
 
 What helped:
@@ -44,7 +44,7 @@ What helped:
 - d3dhip chaining M / L's layers like vkhip (ed503cc).
 - LLPC's FP8 conversions without the per-element guard: RR F's enc0 / dec0_1 (441a237), L's front stages (92ec16d).
 - RR F's D3D12 gather encodes FP8 with the hardware conversion in uniform flow (0f61b35).
-- RR F's encoder 0 on vkhip (944bd20).
+- RR F's encoder 0 on vkhip (944bd20), and dec0_1 through descriptor set 0's table (ffde45b).
 
 What didn't (journal):
 - DXIL M two windows per wave; output_k as wave32.
@@ -56,8 +56,8 @@ What didn't (journal):
 What's left, largest first:
 - **RR F's translated stages.** D3D12 ablations at 720p -> 1440p (4.03 ms): enc0 0.66, post 0.56, dec0_0 0.48, dec0_1
   0.47, gather 0.40 ms. Their FP8 conversions are now one clamp + one conversion per element on both APIs; the rest is
-  translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 now runs as HIP (944bd20); dec0_1, the gather and post stay SPIR-V,
-  because HIP needs raw image descriptors, which games' devices lack (BLOCKERS; dec0_1 measured at -52 us with them).
+  translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 and dec0_1 now run as HIP (944bd20, ffde45b). The gather and post stay
+  SPIR-V: they sample textures, which needs sampler descriptors in the same set-0 scheme and a port of their filtering.
 - **RR F's D3D12 network.** The same stages as HIP run 1.61 ms on vkhip against 2.05 ms as DXIL (AMD's D3D12 compiler:
   per-element clamps the HIP kernels avoid, more registers). d3dhip would carry the HIP version into D3D12 games, but
   its two cross-API fence waits cost ~0.6 ms here (prototype: 4.13 against 3.87 ms end to end), more than it gains.
@@ -119,3 +119,4 @@ ed503cc score=- / - / - (side matrix, D3D12 M/L on d3dhip: 2.523 -> 2.399) worst
 92ec16d score=- / 2.574 -> 2.561 (vulkan) worst=- preset L's LLPC input / expansion stages convert FP8 with a clamp (M_LLPC_SAT, normalised tokens stay guarded): vk-L-1440 -1.97%, vk-L-4k -2.82%, every case identical (FP16_OVFL caveat in the journal)
 0f61b35 score=2.485 -> 2.480 (d3d12; dx cases only, 3 rounds) worst=dx-K-1440 +0.71% (spread 1.26%) RR F's D3D12 gather (enc0g) hardware FP8 encode in uniform flow: dx-RRF-1440 -1.50% (spread 0.15%), dx-RRF-4k -1.55% (spread 0.36%), every case identical
 944bd20 score=- / 2.561 -> 2.537 (vulkan; vk-RRF cases benched, 3 rounds, the rest carried) worst=- RR F's encoder 0 as a vkhip HIP kernel (enc0_hip_prep.py + glsl2hip.py, Windows builds only): vk-RRF-1440 -3.09% (spread 0.73%), vk-RRF-4k -2.74% (spread 0.41%), identical
+ffde45b score=- / 2.537 -> 2.530 (vulkan; vk-RRF cases benched, 3 rounds, the rest carried) worst=- RR F's dec0_1 as a vkhip HIP kernel reading descriptor set 0's table (no descriptor_buffer; Windows builds only): vk-RRF-1440 -1.73% (spread 0.8%), vk-RRF-4k -1.83% (spread 0.81%), lane B (49 dB pan / 59 dB still against control, finite)

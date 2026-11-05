@@ -491,3 +491,10 @@ schedule (all slower).
   Housekeeping: C: ran out of space mid-replay (14 MB free; the climb's folder is 30 GB of 954 GB). A reference run
   wrote empty files. I deleted my own partial outputs and the rejected post-wave32 outputs (`tmp/rro_t`,
   `tmp/rro_l`, `tmp/rrout_rrp`) and reran.
+- Vulkan RR F per stage after ffde45b (replay stamps, 720p -> 1440p synthetic, us). A temporary stamp after the
+  gather (not committed) split the first column:
+  - exposure + gather 255, enc0 (HIP) 430, enc1 234, enc2 115, enc3 59, enc4 39, enc5 29.
+  - dec4 44 + 35, dec3 54 + 48, dec2 113 + 102, dec1 200 + 181, dec0_0 353, dec0_1 (HIP) 367.
+  - post in three groups 153 / 195 / 195, pooled 45.
+  post is per-pixel f32 filtering (5-tap history and the like), and its MMA helpers are not called from main, so
+  `D4R_MMA_PACKED` does not apply. The RR F numerics are already at the most relaxed level (D4R_RR_RELAXED=3).
