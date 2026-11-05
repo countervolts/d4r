@@ -23,10 +23,10 @@ index 2157b62e..860640d5 100644
      uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
      object,
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index b789190e..027c9a1b 100644
+index e4cdb24c..b904d56f 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
-@@ -2624,6 +2624,24 @@ static void d3d12_command_allocator_free_command_buffer(struct d3d12_command_all
+@@ -2611,6 +2611,24 @@ static void d3d12_command_allocator_free_command_buffer(struct d3d12_command_all
      }
  }
  
@@ -51,7 +51,7 @@ index b789190e..027c9a1b 100644
  static bool d3d12_command_allocator_add_view(struct d3d12_command_allocator *allocator,
          struct vkd3d_view *view)
  {
-@@ -2692,6 +2710,10 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
+@@ -2679,6 +2697,10 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
      const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
      unsigned int i;
  
@@ -62,7 +62,7 @@ index b789190e..027c9a1b 100644
      for (i = 0; i < allocator->buffer_view_count; ++i)
      {
          VK_CALL(vkDestroyBufferView(device->vk_device, allocator->buffer_views[i], NULL));
-@@ -2826,6 +2848,7 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
+@@ -2813,6 +2835,7 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
              d3d12_command_list_allocator_destroyed(allocator->current_command_list);
  
          d3d12_command_allocator_free_resources(allocator);
@@ -71,7 +71,7 @@ index b789190e..027c9a1b 100644
          vkd3d_free(allocator->views);
          vkd3d_free(allocator->pipelines);
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 5307aeb0..2ecdcab3 100644
+index 8db4f4bd..5ed65288 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -3752,7 +3752,8 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
@@ -84,7 +84,7 @@ index 5307aeb0..2ecdcab3 100644
      {
          d3d12_dxvk_interop_device_AddRef(&device->ID3D12DXVKInteropDevice_iface);
          *object = &device->ID3D12DXVKInteropDevice_iface;
-@@ -10465,7 +10466,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
+@@ -10525,7 +10526,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
  }
  
  extern CONST_VTBL struct ID3D12DeviceExt5Vtbl d3d12_device_vkd3d_ext_vtbl;
@@ -126,7 +126,7 @@ index e5c0006b..74f6706f 100644
  
  void d3d12_device_notify_vk_swapchain_creation(struct d3d12_device *device, struct dxgi_vk_swap_chain *chain)
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index c2ebcda6..dc42e358 100644
+index 745668f7..cf1ac277 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -2774,6 +2774,10 @@ struct d3d12_command_allocator
@@ -140,7 +140,7 @@ index c2ebcda6..dc42e358 100644
      D3D12_COMMAND_LIST_TYPE type;
  
      struct vkd3d_view **views;
-@@ -5553,7 +5557,9 @@ typedef ID3D12DeviceExt5 d3d12_device_vkd3d_ext_iface;
+@@ -5551,7 +5555,9 @@ typedef ID3D12DeviceExt5 d3d12_device_vkd3d_ext_iface;
  HRESULT d3d12_command_list_split_for_external_wait(struct d3d12_command_list *list,
          VkSemaphore semaphore, uint64_t value);
  

@@ -1,0 +1,40 @@
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index 7090a021..ce290e08 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -63,6 +63,7 @@ VKD3D_DECL_CONFIG("defer_resource_destruction", DEFER_RESOURCE_DESTRUCTION)
+ VKD3D_DECL_CONFIG("prefer_thin_uav_tiling", PREFER_THIN_UAV_TILING)
+ VKD3D_DECL_CONFIG_PLAIN(EXTENDED_DEBUG_UTILS)
+ VKD3D_DECL_CONFIG("no_descriptor_heap", NO_DESCRIPTOR_HEAP)
++VKD3D_DECL_CONFIG("descriptor_heap", DESCRIPTOR_HEAP)
+ VKD3D_DECL_CONFIG("avoid_image_buffer_aliasing", AVOID_IMAGE_BUFFER_ALIASING)
+ VKD3D_DECL_CONFIG("extra_rtas_sync", EXTRA_RTAS_SYNC)
+ VKD3D_DECL_CONFIG("zero_fill_blp", ZERO_FILL_BLP)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index 361c54dd..d1fa7821 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 19;
++	uint32_t reserved0 : 18;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 5d3dbbae..6fb1463b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -142,7 +142,9 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(EXT_DEPTH_BIAS_CONTROL, EXT_depth_bias_control),
+     VK_EXTENSION(EXT_ZERO_INITIALIZE_DEVICE_MEMORY, EXT_zero_initialize_device_memory),
+     VK_EXTENSION(EXT_SHADER_FLOAT8, EXT_shader_float8),
+-    VK_EXTENSION_DISABLE_COND(EXT_DESCRIPTOR_HEAP, EXT_descriptor_heap, VKD3D_CONFIG_FLAG_STATIC(NO_DESCRIPTOR_HEAP)),
++    /* d4r: VK_EXT_descriptor_heap breaks split-timeline MFG (past-frame evaluations
++     * see next-frame heap updates early -> black generated frames). Keep it opt-in. */
++    VK_EXTENSION_COND(EXT_DESCRIPTOR_HEAP, EXT_descriptor_heap, VKD3D_CONFIG_FLAG_STATIC(DESCRIPTOR_HEAP)),
+     VK_EXTENSION_DISABLE_COND(EXT_RAY_TRACING_INVOCATION_REORDER, EXT_ray_tracing_invocation_reorder, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION(EXT_SHADER_LONG_VECTOR, EXT_shader_long_vector),
+     VK_EXTENSION(EXT_SHADER_ATOMIC_FLOAT, EXT_shader_atomic_float),
