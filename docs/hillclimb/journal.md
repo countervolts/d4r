@@ -666,3 +666,17 @@ schedule (all slower).
   0.14 ms, but the network wait grew from ~0.87 to ~1.37 ms, and the frame was 2.373 against 2.273 ms. The output is
   finite but 31.5 dB from the D3D12 stage after 200 frames, unexplained. Reverted. D3D12's plane stage (WPW=2, RGA 1947
   instructions a wave) beats ZLUDA's NVIDIA-order tail here.
+- **Tried, below the bar: RR F's d3dhip HIP stages with paired weight loads** (helper agent-rrswin; notes, patch and
+  profiling hook in `C:\d4r-hc\agents\agent-rrswin`). Isolated stage times at 720p input (us): enc0 460, dec0_0 372,
+  enc1 240, dec1_0 213, dec1_1 187, enc2 121, dec2_0 115, dec2_1 104, enc3 61, dec3_0 55, dec3_1 49, dec4_0 48,
+  enc4 42, dec4_1 37, enc5 29 (2123 in all; network 2280-2330). Unlike M's Swin layers these are not at the
+  load-instruction ceiling: with the weight loads removed the stages gain only 12% (M: 20%), and doubling the WMMA
+  count costs 30%, so the matrix pipe is about a third loaded. Each window's serial K32 accumulator chain sets the
+  time, with little independent work next to it (dec0_0: one wave per window, ~4500 instructions for 272 WMMAs; the
+  small stages have 20-70 windows for 64 CUs). More waves or more accumulators would be the lever, but the kernels
+  are at 158-256 VGPRs (dec4_0 at 256 with 24 KiB of LDS). Built `RR2_WPAIR` (M's paired layout: in enc2,
+  `global_load_b64` 105 -> 9), byte-identical: dx-RRF-1440 3.789 -> 3.767 ms (-0.59%), dx-RRF-4k 8.247 -> 8.215
+  (-0.38%), network -1.2%. `-mno-cumode` on enc4 / enc5 / dec4_0 / dec4_1 is -5 to -14% a stage, ~-0.3% of the frame.
+  Both are under the 1% bar, alone and together; not kept. The 14 translated stages build from preprocessed handoffs
+  (`<stage>_m.preprocessed.comp`), so edits to rr2_m.comp only reach them after re-preprocessing; dec0_0 is
+  rr2_w.comp. The packaged rr-f has no rr2_dec0_1.hsaco.
