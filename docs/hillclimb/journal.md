@@ -698,3 +698,10 @@ schedule (all slower).
   computes its own into LDS), spills down (enc0 108 -> 44 B). Network -1.6%; dx-K-1440 -0.89 / -1.01 / -1.66%,
   dx-K-4k -1.35 / -0.83 / -0.35% over three sessions. Borderline against the 1% bar and not yet re-measured here.
   The climb stopped at this point, on the user's call.
+- **Audit of the helper agents' side effects (end of the climb).** No agent committed (no t3/* branch has commits
+  outside hillclimb/perf); their edits stayed in their worktrees; no stray processes or stale GPU lock. Shared inputs
+  untouched (model folders, `C:\d4r-hc\kernels\m-vkhip-gfx1201`, kcap). rt-lx was still hardlinked to agent package
+  trees (1112 files), so I replaced it with a real copy (content unchanged: rt-rrh plus the two L plane stages,
+  original K enc0). Linux / gfx11 builds re-checked against the parents of the agent-derived commits: M/L kernels for
+  gfx1101 (fast and accuracy sets) are ISA-identical across 0feb1a0, and output_k.comp's SPIR-V (three flag sets)
+  is byte-identical across 1f8d128.
