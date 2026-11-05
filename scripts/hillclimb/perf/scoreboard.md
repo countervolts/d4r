@@ -3,6 +3,63 @@
 One line per kept commit: `<sha> score=<geomean ms D3D12 / Vulkan / headline> worst=<case ±%> note`.
 Method and matrix: bench.py / matrix.json; journal: docs/hillclimb/journal.md.
 
+## Summary (2026-11-05, stopped at the plateau condition; game checks still owed)
+
+Stopped under performance.md section 8's plateau rule: the last 10 iterations, across K's network scheduling, the
+d3dhip handoff, RR F's HIP stages, M's flags, L's front stages and the stage wave sizes, kept nothing (journal). What
+is left above 5% of a case needs a kernel project (below). **No result is confirmed in game yet**: the game folders
+hold release installs that `windows-game.ps1` refuses (BLOCKERS, Needs a human). Vulkan is confirmed in the harness
+only: no verified Vulkan game is installed, and Portal RTX has not been run.
+
+| Case | Baseline | Final | Target | Gap now |
+|---|---:|---:|---:|---:|
+| dx-K-1440 | 1.384 | 1.285 | 0.649 | 1.98x |
+| dx-K-4k | 2.772 | 2.711 | 1.532 | 1.77x |
+| dx-M-1440 (DXIL / d3dhip) | 1.674 | 1.664 / 1.534 | 1.081 | 1.42x (d3dhip) |
+| dx-M-4k (DXIL / d3dhip) | 3.692 | 3.518 / 3.371 | 2.553 | 1.32x (d3dhip) |
+| dx-L-1440 (DXIL / d3dhip) | 2.433 | 2.447 / 2.334 | 1.413 | 1.65x (d3dhip) |
+| dx-L-4k (DXIL / d3dhip) | 5.376 | 5.407 / 5.251 | 3.161 | 1.66x (d3dhip) |
+| dx-RRF-1440 | 4.126 | 4.122 | 2.100 | 1.96x |
+| dx-RRF-4k | 9.089 | 9.083 | 4.658 | 1.95x |
+| vk-K-1440 | 3.553 | 1.085 | 0.649 | 1.67x |
+| vk-K-4k | 5.374 | 2.378 | 1.532 | 1.55x |
+| vk-M-1440 | 1.422 | 1.431 | 1.081 | 1.32x |
+| vk-M-4k | 3.201 | 3.216 | 2.553 | 1.26x |
+| vk-L-1440 | 5.158 | 2.253 | 1.413 | 1.59x |
+| vk-L-4k | 11.315 | 5.021 | 3.161 | 1.59x |
+| vk-RRF-1440 | 4.650 | 3.786 | 2.100 | 1.80x |
+| vk-RRF-4k | 9.600 | 8.285 | 4.658 | 1.78x |
+
+Scores (geomean): D3D12 2.532 -> 2.489, Vulkan 4.089 -> 2.628. The matrix pins D3D12 M/L on DXIL (installed packages
+have no HIP layers); d3dhip, the default with HIP packages, is the second figure.
+
+What helped:
+- RR F on vkhip by default (18ab21b).
+- L's matrix stages on LLPC through spirv-opt (696ea5d).
+- K's Vulkan network reads transposed weight tiles on LLPC (fd6c117).
+- d3dhip K by default on RDNA4 (e4fd9a5).
+- K on vkhip in the native Vulkan frontend (cdc0787), made safe by finding the cross-wave race in K's enc0 / dec0
+  (79b9ee4, which also adds the Windows kernel flag file).
+- d3dhip chaining M / L's layers like vkhip (ed503cc).
+
+What didn't (journal):
+- DXIL M two windows per wave; output_k as wave32.
+- The gfx1201 K flag sweeps beyond the kept lines; the M flag sweep (combined -0.59%).
+- A per-dispatch counter chain for K.
+- Wave64 / spirv-opt variants for L's front stages; stage wave 32 for K, M and L.
+- The CPU d3dhip handoff.
+
+What's left, largest first:
+- **RR F's enc0 / dec0_1.** Translated-PTX SPIR-V stages, about half of F's network. A HIP port needs texture sampling
+  on the pipeline-binary path.
+- **K's output stage.** 0.37 ms Vulkan / 0.47 DXIL, about a third of K. AMD's DXIL compiler scalarises half vectors.
+- **K's network.** A per-block dataflow chain for the deep layers is worth at most ~5% end to end (measured bound).
+  The deep layers' phase kernels make it a large job.
+- **L's front stages on LLPC.** About 1.09 ms against 0.86 on D3D12; a HIP port.
+- **The d3dhip handoff.** ~0.12 ms, two cross-API fence waits; possibly OS scheduling, which is off limits here.
+- **For a human.** The release packages need gfx1201 HIP layers (BLOCKERS). With them, D3D12 M/L would take the
+  faster d3dhip route.
+
 ## Phase 0 baseline (fe53aa0 shim, HIP packages in D:\d4r-hc\models, now C:\d4r-hc\models, frames back to back)
 
 D3D12 (bench.py self-noise run, median of 6 run medians per side; control-vs-control deltas <= 0.72%):
@@ -48,3 +105,4 @@ cdc0787 score=- / 1.628 (K cases) / - worst=dx-K-1440 +0.02% K on vkhip in the n
 ed58f6e score=- / - / - worst=- tool only: vk_pipeline_stats writes the pipeline binary (VKSTATS_ELF)
 7c029f0 score=- / - / - worst=vk-K-4k +0.6% vkhip scratch opt-in: K's Vulkan route back on the Vulkan network, byte-identical to before cdc0787 (vk-K-4k 2.916 -> 2.922)
 79b9ee4 score=2.654 -> 2.557 (d3d12 2.499 -> 2.489, vulkan 2.819 -> 2.628) worst=vk-L-1440 +0.54% K cross-wave barrier (POS_HB_SYNC), Windows flag file, vkhip K default on gfx12: vk-K-1440 -34.36%, vk-K-4k -19.53%, dx-K -1.4..-2.0% identical
+ed503cc score=- / - / - (side matrix, D3D12 M/L on d3dhip: 2.523 -> 2.399) worst=dx-L-4k-hip -1.07% d3dhip chains M/L's layers (hipExtAnyOrderLaunch + flags): dx-M-1440-hip -9.19%, dx-M-4k-hip -1.75%, dx-L-1440-hip -4.74%, all identical (lane A); main matrix unchanged

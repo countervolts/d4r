@@ -256,3 +256,38 @@ schedule (all slower).
   -4.74%, dx-L-4k -1.07%, dx-L-rgb10 -4.98%. Deterministic: 24 of 24 600-frame runs at 4K and at 1440p. The main
   matrix pins D3D12 M/L on DXIL (installed packages have no HIP layers), so its score does not move: dx-K and dx-M
   (DXIL) unchanged and identical. d3dhip M at 1440p is now ahead of DXIL (1.534 against 1.65).
+- **Tried, rejected: a barrier-free K chain with per-dispatch completion counters.** Bound first (throwaway bridge,
+  `hipExtAnyOrderLaunch` on chosen K nodes, wrong output): no barriers at all 602 -> 531 us isolated at 720p ->
+  1440p (1196 -> 1079 at 4K), end-to-end 1.294 -> 1.231; only the deep part (nodes 3-11: enc3, enc4, dec5's phases,
+  dec4, dec3, dec2) 550 us; only the enc0-2 / dec2-0 joins 590; only dec5's internal phases 594. Then the real thing:
+  `PWIN_CHAIN` (a guard object at every K entry: wait until the previous dispatch's counter reaches its block count,
+  count this block at exit; pointers in PwinParams' unused tail; `+FLAGS` glob lines in windows-flags.txt). Output
+  byte-identical, but 643 us against 638 unchained. Worse, the guard code alone made the kernels slower with the
+  chain off (595 -> 638 us). So the saving in the bound came from consecutive layers actually overlapping, not from
+  relaunch latency; only per-block dataflow (as M's `SWIN_DATAFLOW`) can get it, and the deep layers' phase kernels
+  with compile-time grids make that a large kernel project. Reverted.
+- **d3dhip handoff (~0.12 ms on K, also on M/L)**: K's isolated HIP network matches vkhip's, so the handoff is the
+  whole d3dhip overhead. It is two cross-API fence waits (D3D12 front -> HIP, HIP -> game queue). dxdiag reports
+  "Hardware Scheduling: Enabled:True" with "Block List: DISABLE_HWSCH". If the OS resolves these waits on the CPU,
+  2 x ~50-60 us fits. Scheduling settings are off limits, so not pursued; no code-side lever found.
+- **RR F enc0 / dec0_1 as HIP**: the vkhip F route runs 14 stages as HIP but enc0 and dec0_1 (the two largest on
+  D3D12, 0.84 / 0.95 ms) stay SPIR-V: they are translated-PTX shaders (`*.generated.comp`, 19.6k / 12.2k lines)
+  with no `_m` source, and glsl2hip stops at enc0's `sampler2D` (texture sampling, which the pipeline-binary HIP
+  path has no binding for). Not a quick candidate. D3D12 RR F on d3dhip exists only in the replay tool (not the
+  shim), and would save at most ~0.1-0.2 ms of network minus the handoff: not pursued.
+- **Tried, rejected: gfx1201 flag sweep of M's HIP layers** (vkhip M 720p -> 1440p, C X X C, 160 frames). The base
+  flags reproduce the package's code exactly. Of 60 variants (the gfx1101 macros one at a time, cumode, wave priority,
+  the memory-clause scheduler, each layer's gfx1101 line), 38 compile to the base's code (the SWIN_DATAFLOW /
+  DIRECT_E4M3 path ignores those macros). The other 22: all identical, all within +-0.35%. The four best singles
+  together (enc1 memory-clause, enc2 half-bpermute, tube both, dec1 cumode): 1.4152 -> 1.4068 (-0.59%), below the 1%
+  bar.
+- **Tried, rejected: steering LLPC on L's front stages.** Vulkan L spends ~1.09 ms in `enc0_l_planes_llpc.spv` /
+  `dec0_l_planes_llpc.spv` (D3D12: 0.86). As the engine creates them (32-wide subgroups, required) LLPC uses 116 /
+  109 VGPRs. Without the requirement it builds wave64 at 31 / 21 VGPRs, but `layer_m.comp` assumes 32-lane waves
+  (`id & 31`, `id >> 5`, shuffles by 16), so that is not an option. spirv-opt variants (`-O --loop-unroll`, `-O -O`,
+  `--loop-unroll-partial=2`, `--scalar-replacement=0`) give the same module as `-O`; `-Os` the same registers and LDS.
+- Stage wave sizes on gfx1201 (outputs identical): K's stages as wave32 1.08 -> 1.16 ms (720p -> 1440p), 2.34 ->
+  2.49 (4K); M's 1.42 -> 1.48, L's 2.23 -> 2.30. Wave64, the default, stays. d3dhip CPU handoff
+  (`D4R_D3DHIP_SYNC=cpu`) against the GPU fence: K 1.35 against 1.28, M 1.60 against 1.53.
+- **Stopped at the plateau condition** (10 iterations since ed503cc without a kept change, across >= 3
+  opportunities); summary at the top of scoreboard.md. Game checks still owed (BLOCKERS).
