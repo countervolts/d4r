@@ -96,11 +96,23 @@ layout(set = 0, binding = 5, std430) buffer O1 { f16vec4 a[]; } out1;
 #endif
 #define LD(m, arr, off, stride) coopMatLoad(m, arr, (off) / 4u, (stride) / 4u, RM)
 // The D3D12 fast package transposes each 16x16 weight tile in a separate
-// weight file. Column-major loads reconstruct the same logical B operand.
-#if D4R_HLSL && D4R_WEIGHT_TILES_COLMAJOR
+// weight file. Column-major loads reconstruct the same logical B operand. AMD's
+// Windows Vulkan driver (LLPC) loads a row-major B operand one 16-bit element at
+// a time; the model's *_llpc.spv layers read the same transposed tiles.
+#if D4R_WEIGHT_TILES_COLMAJOR
 #define LDW(m, off, stride) coopMatLoad(m, wb.w, (off) / 4u, (stride) / 4u, CMJ)
 #else
 #define LDW(m, off, stride) LD(m, wb.w, off, stride)
+#endif
+// D4R_LLPC_LOADS (the *_llpc.spv layers, compile_k.py): the patch merge / expansion, embedding and head weights are
+// transposed per 16x16 tile as well (weights_llpc.bin) and read with LDW, and a bias tile (16 equal rows) is read
+// with stride 0, so LLPC loads each column's value once instead of eight times. The values are the same.
+#if D4R_LLPC_LOADS
+#define LDX(m, off, stride) LDW(m, off, stride)
+#define BIAS_STRIDE(s) 0u
+#else
+#define LDX(m, off, stride) LD(m, wb.w, off, stride)
+#define BIAS_STRIDE(s) (s)
 #endif
 #define ST(m, arr, off, stride) coopMatStore(HACC(m), arr, (off) / 4u, (stride) / 4u, RM)
 #define SYNC memoryBarrierShared(); barrier();
@@ -207,7 +219,7 @@ void writeTRaw(uint off,f16vec4 v) {TT[off/4u]=v;}
 #endif
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 int tdiv2(int v) { return v < 0 ? -((-v) / 2) : v / 2; }
-ACC bias_tile(uint off, uint stride) { HACC b; LD(b, wb.w, off, stride); return ACC(b); }   // vectors are stored as 16 equal rows
+ACC bias_tile(uint off, uint stride) { HACC b; LD(b, wb.w, off, BIAS_STRIDE(stride)); return ACC(b); }   // vectors are stored as 16 equal rows
 f16vec4 softmax_exp(f16vec4 s)
 {
     const f16vec4 t = clamp(s, f16vec4(uint16BitsToFloat16(uint16_t(0xCD69))), f16vec4(uint16BitsToFloat16(uint16_t(0x4D69))));
@@ -266,7 +278,7 @@ void main()
             {
                 MA a; LOAD_T_RAW(a,kt*16u,SLO);
                 MB b[C / 16];
-                for (uint nt = 0u; nt < NT; ++nt) LD(b[nt], wb.w, WEIGHT_OFFSET(104) + kt * 16u * 4u * UC + mt * UC + nt * 16u, 4u * UC);
+                for (uint nt = 0u; nt < NT; ++nt) LDX(b[nt], WEIGHT_OFFSET(104) + kt * 16u * 4u * UC + mt * UC + nt * 16u, 4u * UC);
                 for (uint nt = 0u; nt < NT; ++nt) acc[nt] = coopMatMulAdd(a, b[nt], acc[nt]);
             }
         }
@@ -294,7 +306,7 @@ void main()
         }
         for (uint nt = 0u; nt < NT; ++nt)
         {
-            MB b; LD(b, wb.w, WEIGHT_OFFSET(106) + nt * 16u, UC);
+            MB b; LDX(b, WEIGHT_OFFSET(106) + nt * 16u, UC);
             FORW { WINV STORE_B_TOKEN(coopMatMulAdd(EA_ TILE,b,bias_tile(WEIGHT_OFFSET(107)+nt*16u,UC)),mt*16u,nt*16u); }
         }
         FORW { WINV for (uint c = 0u; c < HC; c += 4u) writeBToken(tok,ch0+c,max(readBToken(tok,ch0+c),f16vec4(0.0))); }
@@ -487,7 +499,7 @@ void main()
         for (uint kt = 0u; kt < NT; ++kt)
         {
             MB b[3];
-            for (uint nt = 0u; nt < 3u; ++nt) LD(b[nt], wb.w, WEIGHT_OFFSET(106) + kt * 16u * 48u + nt * 16u, 48u);
+            for (uint nt = 0u; nt < 3u; ++nt) LDX(b[nt], WEIGHT_OFFSET(106) + kt * 16u * 48u + nt * 16u, 48u);
             FORW {
                 WINV
                 MA a; LOAD_B_TOKEN(a,mt*16u,kt*16u);
@@ -536,7 +548,7 @@ void main()
                 for (uint j = 0u; j < 2u; ++j)
                 {
                     LOAD_T_RAW(a[j],(kt+j)*16u,S4);
-                    for (uint i = 0u; i < NI; ++i) LD(b[j * NI + i], wb.w, WEIGHT_OFFSET(104) + (kt + j) * 16u * MN + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
+                    for (uint i = 0u; i < NI; ++i) LDX(b[j * NI + i], WEIGHT_OFFSET(104) + (kt + j) * 16u * MN + min(mt + 4u * i, MN / 16u - 1u) * 16u, MN);
                 }
                 for (uint j = 0u; j < 2u; ++j)
                     for (uint i = 0u; i < NI; ++i) MG_ TILE[i] = coopMatMulAdd(a[j], b[j * NI + i], MG_ TILE[i]);

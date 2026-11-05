@@ -314,6 +314,18 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     m.hasDisplayMotion = data.hasDisplayMotion; m.hasGameExposure = data.hasGameExposure;
     m.hasRatioTables = data.hasRatioTables; m.offsets = data.offsets;
     auto& weights = data.weights; auto& lut = data.lut;
+    // AMD's Windows driver (LLPC) loads a row-major cooperative-matrix B operand one 16-bit element at a time (1168
+    // buffer_load_u16 in dec5): there the network takes the model's <layer>_llpc.spv, which read weights_llpc.bin
+    // (every 16x16 B tile transposed, compile_k.py d3d12_weight_tiles) with column-major loads - the same logical
+    // operands, so the same output. Every other driver keeps weights.bin.
+    bool llpcTiles = !m.dot2 && driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY &&
+                     !std::getenv("D4R_ENGINE_K_ROW_MAJOR_WEIGHTS");
+    for (unsigned i = 0; i < KLayers && llpcTiles; ++i) llpcTiles = exists(directory + "/" + Names[i] + "_llpc.spv");
+    if (llpcTiles && exists(directory + "/weights_llpc.bin")) {
+        auto tiles = read(directory + "/weights_llpc.bin");
+        llpcTiles = tiles.size() == weights.size() + 8 && !std::memcmp(tiles.data(), "D4RWTL01", 8);
+        if (llpcTiles) std::memcpy(weights.data(), tiles.data() + 8, weights.size());
+    } else llpcTiles = false;
     if (weights.size() > m.device.properties.limits.maxStorageBufferRange)
         throw std::runtime_error("model weights exceed the device's storage buffer range");
     m.weights.create(m.device, weights.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -321,7 +333,7 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     m.weightBytes = std::move(weights); m.lutBytes = std::move(lut);
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     for (unsigned i = 0; i < KLayers; ++i) {
-        std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : ".spv");
+        std::string spv = directory + "/" + Names[i] + (m.dot2 ? "_dot2.spv" : llpcTiles ? "_llpc.spv" : ".spv");
         // AMD's Windows driver (LLPC) rejects the v_dot2 layers' capability 6912: their _dot2_llpc.spv there
         const std::string llpc = directory + "/" + Names[i] + "_dot2_llpc.spv";
         if (m.dot2 && driverId(physical) == VK_DRIVER_ID_AMD_PROPRIETARY && exists(llpc)) spv = llpc;

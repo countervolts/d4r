@@ -160,18 +160,27 @@ def validate(index, weight_bytes):
                 raise ValueError(f'{name}: tensor at {offset} with {size} elements is outside/alignment-invalid')
 
 
-def d3d12_weight_tiles(index, weights):
+def d3d12_weight_tiles(index, weights, llpc=False):
     """Transpose individual 16x16 B-operand tiles, preserving binary16 bits and
-    all offsets/strides. Nonmatrix data and the canonical Vulkan file are untouched."""
+    all offsets/strides. Nonmatrix data and the canonical Vulkan file are untouched.
+    llpc: also the patch merge / expansion, embedding and head weights (weights_llpc.bin)."""
     source = np.frombuffer(weights, dtype='<u2')
     packed = source.copy()
     matrices = {}
     unpacked_offsets = set()
     for e in index.values():
         for key, value in e.items():
-            if key in ('g1', 'bo', 'g2', 'b2', 'table', 'b1', 'embed_w', 'embed_b',
-                       'merge_w', 'merge_b', 'expand_w', 'expand_b', 'head_w', 'head_b'):
+            if key in ('g1', 'bo', 'g2', 'b2', 'table', 'b1', 'embed_b', 'merge_b', 'expand_b', 'head_b') or                     (not llpc and key in ('embed_w', 'merge_w', 'expand_w', 'head_w')):
                 unpacked_offsets.update(value if isinstance(value, list) else [value])
+        if llpc:
+            c = e['C']
+            shapes = {'embed_w': (16, c), 'merge_w': (4 * c, e.get('merge_n', 0)), 'expand_w': (e['X'], 4 * c),
+                      'head_w': (c, 48)}
+            for key, (k, n) in shapes.items():
+                if key in e:
+                    if e[key] in matrices and matrices[e[key]] != (k, n):
+                        raise ValueError('incompatible aliased LLPC weight matrices')
+                    matrices[e[key]] = (k, n)
         for key in ('qkv', 'wo', 'w1', 'w2'):
             k, n = (e['C'], 32) if key in ('qkv', 'w1') else (32, e['C'])
             for offset in e[key]:
@@ -362,6 +371,16 @@ def main():
     (a.output / 'direct_origins.bin').write_bytes(b'D4RO0003')
     if dxil:
         build_dxil(index, a.output, a.ldr, a.d3d12_target)
+        # AMD's Windows Vulkan driver (LLPC) loads a row-major cooperative-matrix B operand one 16-bit element at a
+        # time: the network layers again with column-major loads of every weight matrix's transposed 16x16 tiles
+        # (weights_llpc.bin, the same logical operands) and stride-0 bias tiles (layer.comp D4R_LLPC_LOADS).
+        # runtime.cpp takes these on that driver only, with the same output.
+        (a.output / 'weights_llpc.bin').write_bytes(b'D4RWTL01' + d3d12_weight_tiles(index, (a.output / 'weights.bin').read_bytes(), llpc=True))
+        for name, e in index.items():
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3',
+                            *defines(e, os.environ.get('K_DEFS_' + name.upper(), '').split() +
+                                     ['-DD4R_WEIGHT_TILES_COLMAJOR=1', '-DD4R_LLPC_LOADS=1']),
+                            str(HERE / 'layer.comp'), '-o', str(a.output / (name + '_llpc.spv'))], check=True)
     if a.hip:
         package_hip(a.output, a.hip, a.capture, a.hip_accuracy)
     files = sorted(a.output.glob('*.bin')) + sorted(a.output.glob('*.spv')) + sorted(a.output.glob('*.dxil'))

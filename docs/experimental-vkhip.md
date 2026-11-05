@@ -194,6 +194,22 @@ against a package without the dot2 plane files). `d4r-m` with the HIP L package:
 against D3D12). Through the shim (`vulkan_dlss_harness`, bench.py): 5.215 -> 2.252 ms at 1280x720 -> 2560x1440 and
 11.309 -> 5.029 ms at 1920x1080 -> 3840x2160.
 
+### Preset K's Vulkan network on AMD's driver (2026-11-05)
+
+K's vkhip network does not load in the native Vulkan frontend on gfx1201: four of its eleven kernels spill
+(`dltss_pwin_enc0/dec0/dec1/dec2`, 256 VGPRs, up to 132 bytes of scratch) and the pipeline-binary injection refuses
+scratch. K therefore runs the engine's Vulkan network, which on LLPC was 2.6x the D3D12 engine (3.61 against 1.37 ms
+at 1280x720 -> 2560x1440). The cause is the weight loads: LLPC loads a row-major cooperative-matrix B operand one
+16-bit element at a time (a WMMA B lane holds a column; dec5 had 1168 `buffer_load_u16` for 136 WMMAs).
+`compile_k.py` now writes `<layer>_llpc.spv` with `D4R_WEIGHT_TILES_COLMAJOR` and `D4R_LLPC_LOADS` and a
+`weights_llpc.bin` whose B-operand tiles (attention, MLP, patch merge / expansion, embedding and head matrices) are
+transposed per 16x16 tile, and reads bias tiles (16 equal rows) with stride 0; the runtime takes them on AMD's driver
+when the package has all of them. The logical operands are the same, so the output is byte-identical. dec5's 16-bit
+loads drop to 54 (the position tables, read as accumulators, and a few vectors). Packages without the files, RADV and
+the D3D12 engine are unchanged. `tools/vk_pipeline_stats.cpp` prints a SPIR-V compute shader's register, LDS and
+scratch use and (`-ir`) its ISA on the installed driver through `VK_KHR_pipeline_executable_properties`, e.g.
+`VKSTATS_WAVE=32 vk_pipeline_stats dec5_llpc.spv -ir b0=ssbo b1=ssbo b2=ssbo b3=ssbo b4=ssbo b5=ssbo`.
+
 ## RDNA2 on native Windows (unofficial, 2026-11-02)
 
 Untested on RDNA2 hardware. Preset K takes vkhip on gfx1030-gfx1036 through AMD's driver only
