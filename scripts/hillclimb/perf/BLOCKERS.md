@@ -46,7 +46,7 @@ a tester should do.
   reach an image only through its raw descriptor, which needs vkGetDescriptorEXT (VK_EXT_descriptor_buffer).
   The Vulkan frontend does not ask games for that extension, so neither vulkan_dlss_harness nor a game has it.
   - Measured with descriptors (the Vulkan replay enables the extension): dec0_1 as HIP 366 against 421 us (about
-    -1.5% of the case, 52.5 dB against the LLPC output). Patch at `C:\d4r-hc	mp\d1hip\dec0_1-vkhip.patch`
+    -1.5% of the case, 52.5 dB against the LLPC output). Patch at `C:\d4r-hc\tmp\d1hip\dec0_1-vkhip.patch`
     (journal). The gather and post ports would add more, perhaps 0.2-0.3 ms, unmeasured.
   - A human should decide whether d4r may add VK_EXT_descriptor_buffer to the device extensions it asks Vulkan games
     for on AMD's driver (`d4r_vulkan_frontend.inl`, next to pipeline binary / maintenance5). Games that append only
