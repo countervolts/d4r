@@ -367,4 +367,12 @@ schedule (all slower).
   keeps its code. 53 of enc0g's 54 sites; 6493 instructions. vkd3d keeps its text (`#define rrE4x2W rrE4x2`; the
   preprocessed enc0g is identical). Full compile_rr_dxil.py rebuild: only enc0g.dxil changes (other .hlsl differ in
   blank lines only, their DXIL identical). Interleaved single runs (C X, 160 frames): 1440p 4.090/4.018,
-  4.092/4.022, 4.096/4.033 (-1.6%); 4K 9.040 -> 8.888 (-1.7%); identical every time. Full bench matrix still owed.
+  4.092/4.022, 4.096/4.033 (-1.6%); 4K 9.040 -> 8.888 (-1.7%); identical every time. Bench (dx cases, 3 rounds):
+  dx-RRF-1440 4.122 -> 4.061 (-1.50%, spread 0.15%), dx-RRF-4k 9.083 -> 8.942 (-1.55%, spread 0.36%), all identical,
+  the others within their spreads; D3D12 score 2.485 -> 2.480.
+- **D3D12 RR F, where the rest goes** (empty-shader ablations on 0f61b35's base, dx-RRF-1440 4.034 ms, single runs):
+  enc0 -0.66, post -0.56, dec0_0 -0.48, dec0_1 -0.47 ms (gather -0.40 before the change above). enc0's FP8
+  conversions are already `v_maxmin` + `v_cvt_pk_fp8_f32` (640 / 320 of 4843 instructions, 215 VGPRs, 7 waves); dec0_1's
+  selects (~190) are lane-shuffle selects around `v_permlane16_var`, not conversion guards. Per stage D3D12 is now close
+  to the Vulkan route (enc0 ~0.6, dec0_1 ~0.45 on LLPC); the Vulkan network's remaining ~0.5 ms lead is its HIP stages,
+  which the journal's d3dhip estimate (<= 0.1-0.2 ms after the handoff) already covers. No further cheap lever found.
