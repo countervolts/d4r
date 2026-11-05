@@ -22,8 +22,9 @@ class GameDenoiser
     // The model must outlive this object. Render size is fixed at maxRenderWidth x
     // maxRenderHeight; uploads the model on its own queue (once per model),
     // waiting for the GPU.
+    // shareArena: the engine's plane arena is shareable (REngine), for an external network (setExternalNetwork).
     GameDenoiser(RModel &model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth,
-                 uint32_t maxRenderHeight);
+                 uint32_t maxRenderHeight, bool shareArena = false);
     ~GameDenoiser(); // only once every recorded frame has retired (idle)
     GameDenoiser(const GameDenoiser &) = delete;
     GameDenoiser &operator=(const GameDenoiser &) = delete;
@@ -31,7 +32,17 @@ class GameDenoiser
     // textures are transitioned from their given states and back; the descriptor
     // heap, root signatures and pipelines are d4r's afterwards.
     // profiler: REngine::recordFrame's boundaries.
+    // With an external network set, record() records only the engine's front (REngine::recordFront) and leaves the
+    // game's textures in the engine's states; recordBack (into the list that runs after the network) records the back
+    // and restores them. submitted / discarded then follow the back's list.
     void record(ID3D12GraphicsCommandList *list, const GameFrameR &frame, const FrameProfiler &profiler = {});
+    void recordBack(ID3D12GraphicsCommandList *list);
+    // The engine's plane arena (for the external network to import) and the network itself (REngine's, before the
+    // first record).
+    ID3D12Resource *arena() const;
+    uint64_t arenaBytes() const;
+    void setExternalNetwork(const ExternalNetworkRr *external);
+    bool external() const;
     void submitted(ID3D12Fence *fence, uint64_t value);
     void discarded();
     bool idle() const;
