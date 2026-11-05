@@ -358,6 +358,13 @@ D4R_ENGINE_VKHIP=1 D4R_RR_OUTPUT_ONLY=1 /tmp/d4r-vkhip-build/d4r-rr MODEL INPUTS
 measured; gfx1200 is untested. The build refuses non-F and non-relaxed=3 models.
 `D4R_VKHIP_RR_STAGES=enc1,dec0_0` restricts replacement to named blocks; missing
 blocks use Vulkan. `D4R_ENGINE_VKHIP=0` selects the Vulkan control.
+
+On Windows (AMD's driver) `build_vkhip_f.sh` also builds encoder 0, `rr2_enc0.hsaco` (2026-11-05). This is the
+hybrid stage that runs after the gather pass `enc0g`. It reads its windows from the gather's records, not from its
+textures, so `kernels/rr/enc0_hip_prep.py` drops those bindings, and `glsl2hip.py --include=glsl_hip_enc0.h` translates
+the rest. It is spill-free at 226 VGPRs. Output stays byte-identical, and vk-RRF went 3.521 → 3.412 ms at
+1280x720 → 2560x1440 and 7.731 → 7.520 ms at 4k. Linux (RADV) keeps the model's enc0, and dec0's pixel tail (dec0_1)
+stays on Vulkan.
 `D4R_RR_OUTPUT_ONLY=1` saves and reads back only the final image; it does not change
 frame evaluation or GPU timestamp boundaries.
 

@@ -858,7 +858,7 @@ bool RRStages::create(VkPhysicalDevice physical, PFN_vkGetInstanceProcAddr insta
     std::vector<FLoaded> fLoaded;
     uint64_t fUsed = kAlign;
     auto fCarve = [&](uint64_t size) { uint64_t at = fUsed; fUsed = (at + size + kTail + kAlign - 1) / kAlign * kAlign; return at; };
-    for (unsigned i = 1; i < 15; ++i) {
+    for (unsigned i = 0; i < 15; ++i) {
         const std::string name = std::string("rr2_") + fNames[i];
         auto code = files.code.find(name);
         if (code == files.code.end()) continue;
