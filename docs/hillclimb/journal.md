@@ -680,3 +680,10 @@ schedule (all slower).
   Both are under the 1% bar, alone and together; not kept. The 14 translated stages build from preprocessed handoffs
   (`<stage>_m.preprocessed.comp`), so edits to rr2_m.comp only reach them after re-preprocessing; dec0_0 is
   rr2_w.comp. The packaged rr-f has no rr2_dec0_1.hsaco.
+- **Decided against: two windows per wave in M/L's HIP Swin core.** agent-mswin2's ceiling probe
+  (`C:\d4r-hc\agents\agent-mswin2\pair.hip`, rerun here): one 16-byte weight load per 2 FP8 WMMAs 204-213 TFLOPS,
+  per 4 WMMAs (two windows) 258-266, no loads 339-355. The layers run at 120-146 TFLOPS, ~35% below even the current
+  ceiling because of token-side VALU (norms, FP8 packs, softmax, GELU), and that work doubles with the WMMAs. A
+  window's activations cost +~64 VGPRs: the C 96 / 128 layers (enc2 174, tube 163, dec2 235 VGPRs) cannot take that
+  without scratch, and the C 64 layers (enc1 145, dec1 133) gained only 11-13% with no weight loads at all. Expected:
+  about -40 us of M at 4K (~1%) for a rewrite of the core's token ownership and its patch merge / expand. Not done.
