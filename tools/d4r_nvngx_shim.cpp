@@ -12361,13 +12361,16 @@ static std::unique_ptr<vkhip::MNetwork> create_engine_vkhip_net(const std::strin
     return network;
 }
 
-static bool create_engine_vkhip(Feature& feature, const std::string& directory,
-                                size_t tokenBytes, size_t headBytes)
+// Preset K's eleven native layers on vkhip (D4RHIP, compile_k.py --hip) for a feature with this output size, or null
+// (logged) when the adapter, the model or the injection cannot run them. Both Vulkan frontends use it: vkd3d-proton's
+// adapter and the native Vulkan frontend (d4r_vulkan_frontend.inl).
+static std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& directory, uint32_t outWidth,
+                                                              uint32_t outHeight, size_t tokenBytes, size_t headBytes)
 {
-    if (env_uint("D4R_ENGINE_VKHIP", 1) == 0) return false;
+    if (env_uint("D4R_ENGINE_VKHIP", 1) == 0) return nullptr;
     auto unavailable = [&](const std::string& reason) {
         logf("experimental vkhip unavailable: %s; using the standard engine network", reason.c_str());
-        return false;
+        return nullptr;
     };
     std::string gfx, reason;
     float timestampPeriod = 1.0f;
@@ -12393,16 +12396,22 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     }
     auto network = std::make_unique<vkhip::KNetwork>();
     std::string error;
-    if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
-                         feature.outHeight, tokenBytes, headBytes, error)) return unavailable(error);
+    if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, outWidth,
+                         outHeight, tokenBytes, headBytes, error)) return unavailable(error);
     logf("experimental vkhip ready on %s: %u native dispatches, %s layers, shared image-format adapter, regular/inverted depth",
          gfx.c_str(), network->dispatchesPerFrame(), accuracy ? "accuracy" : "fast");
     if (env_uint("D4R_VKHIP_STAMPS", 0) != 0)
         network->enableStamps([](const char* line) { logf("%s", line); }, timestampPeriod);
     if (const std::string dump = env_string("D4R_VKHIP_DUMP_DIR"); !dump.empty())
         network->enableDump(dump, env_uint("D4R_VKHIP_DUMP_FRAMES", 4));
-    feature.engineVkHip = std::move(network);
-    return true;
+    return network;
+}
+
+static bool create_engine_vkhip(Feature& feature, const std::string& directory,
+                                size_t tokenBytes, size_t headBytes)
+{
+    feature.engineVkHip = create_engine_vkhip_k(directory, feature.outWidth, feature.outHeight, tokenBytes, headBytes);
+    return feature.engineVkHip != nullptr;
 }
 
 // NGX's K configuration against what a K model package supports (either engine's Model): the refusal, or null.

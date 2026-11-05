@@ -470,7 +470,16 @@ std::vector<uint8_t> palBinary(const std::vector<uint8_t>& f, const Module& modu
     for (size_t k = 0; k < map->a.size(); ++k)
         map->a[k] = Mp::uint(k >= kernel.kernargSgpr && k < kernel.kernargSgpr + 2 ? push + k - kernel.kernargSgpr : 0xffffffffu);
     if (lds->u < kernel.lds) { why = "donor LDS smaller than the kernel's"; return {}; }
-    if (kernel.scratch) { why = "kernel uses scratch (not supported through pipeline binaries)"; return {}; }
+    // Scratch on gfx12 (D4R_VKHIP_SCRATCH=0 refuses it as before): flat scratch is architected there, so the
+    // hardware sets the kernel's scratch up from the pipeline's scratch_en / scratch_memory_size (bytes per lane, the
+    // kernel descriptor's private segment size), exactly as for a spilling LLPC shader (the kernel descriptor still
+    // enables only the kernarg pointer: no private segment buffer). The gfx1201 K layers spill (enc0 132 B, dec0 104, dec1 40, dec2 44): RX 9070 XT, 26.10.1, 720p ->
+    // 1440p, K 1.649 -> 1.107 ms on vkhip, 65.7 dB against the Vulkan network, the same pan-scene truth PSNR.
+    // gfx11 stays refused (not measured).
+    const char* scratchEnv = std::getenv("D4R_VKHIP_SCRATCH");
+    const bool scratchOk = kernel.scratch && !(scratchEnv && scratchEnv[0] == '0') &&
+                           (module.mach == gfx12Mach(120000) || module.mach == gfx12Mach(120001));
+    if (kernel.scratch && !scratchOk) { why = "kernel uses scratch (not supported through pipeline binaries)"; return {}; }
     // gfx10.3 has these modes in the same rsrc1 bits as gfx11
     const bool gfx11 = gfx11Mach(110000) == module.mach || gfx11Mach(110001) == module.mach ||
                        gfx11Mach(110002) == module.mach || gfx11Mach(110003) == module.mach || gfx10(module.mach);
@@ -490,8 +499,8 @@ std::vector<uint8_t> palBinary(const std::vector<uint8_t>& f, const Module& modu
         cs->set(".fp16_overflow", Mp::boolean((r1 >> 26) & 1));
     }
     cs->set(".excp_en", Mp::uint((r2 >> 24) & 0x7f));
-    cs->set(".scratch_en", Mp::boolean(false));
-    cs->set(".scratch_memory_size", Mp::uint(0));
+    cs->set(".scratch_en", Mp::boolean(kernel.scratch != 0));
+    cs->set(".scratch_memory_size", Mp::uint(kernel.scratch));
     cs->set(".trap_present", Mp::boolean(false));
     cs->set(".image_op", Mp::boolean(false));
     regs->set(".tgid_x_en", Mp::boolean((r2 >> 7) & 1));

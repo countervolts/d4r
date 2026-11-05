@@ -88,6 +88,7 @@ struct NativeVkEngineView
 };
 struct NativeVkEngineState
 {
+    std::unique_ptr<vkhip::KNetwork> kVkHip; // k's network when vkhip took it (outlives k, which uses its buffers)
     std::unique_ptr<d4r::GameUpscaler> k;
     std::unique_ptr<vkhip::MNetwork> mVkHip; // m's network when vkhip took it (outlives m, which uses its buffers)
     uint32_t mVkHipWidth = 0, mVkHipHeight = 0; // its fixed grid
@@ -933,7 +934,8 @@ static bool native_vk_engine_idle(NativeVkEngineState& state)
 
 static void native_vk_engine_destroy(NativeVkEngineState& state)
 {
-    state.k.reset(); state.m.reset(); state.mDynamic.reset(); state.mVkHip.reset(); // after m, which uses its buffers
+    state.k.reset(); state.kVkHip.reset(); // after k, which uses its buffers
+    state.m.reset(); state.mDynamic.reset(); state.mVkHip.reset(); // after m, which uses its buffers
     state.r.reset(); state.rVkHip.reset(); // after the denoiser, which records its stages
     for (auto& output : state.rOutputs) g_nativeVkStaging.free(output.second);
     if (state.rView) g_nativeVk.destroyView(g_nativeVk.device, state.rView, nullptr);
@@ -1509,14 +1511,31 @@ static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* 
             settings.preExposure = ldr ? 1.0f : params.preExposure;
             if (!state.k)
             {
+                // vkhip (D4R_ENGINE_VKHIP): K's eleven native layers in this command buffer between the engine's
+                // front and back, when the model has them (compile_k.py --hip); otherwise the engine's Vulkan network
+                const size_t tokenBytes = static_cast<size_t>(d4r::Engine::networkTokenBytes(feature.outWidth, feature.outHeight));
+                const size_t headBytes = static_cast<size_t>(d4r::Engine::networkHeadBytes(feature.outWidth, feature.outHeight));
+                state.kVkHip = create_engine_vkhip_k(ldr ? g_engine.directoryLdr : g_engine.directory, feature.outWidth,
+                                                     feature.outHeight, tokenBytes, headBytes);
+                const d4r::ExternalNetwork external = state.kVkHip ?
+                    d4r::ExternalNetwork{state.kVkHip->tokens(), state.kVkHip->head()} : d4r::ExternalNetwork{};
                 state.k = std::make_unique<d4r::GameUpscaler>(*model, g_vk.physical, g_vk.device, feature.outWidth,
-                                                              feature.outHeight, feature.outWidth, feature.outHeight);
-                logf("native Vulkan engine (K): feature %u runs preset K in the game's command buffer (%ux%u -> %ux%u)",
-                     feature.handle.Id, params.renderWidth, params.renderHeight, feature.outWidth, feature.outHeight);
+                                                              feature.outHeight, feature.outWidth, feature.outHeight,
+                                                              state.kVkHip ? &external : nullptr);
+                logf("native Vulkan engine (K): feature %u runs preset K in the game's command buffer (%ux%u -> %ux%u), "
+                     "network on %s", feature.handle.Id, params.renderWidth, params.renderHeight, feature.outWidth,
+                     feature.outHeight, state.kVkHip ? "vkhip" : "Vulkan");
             }
             d4r::vkTable.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                             0, 1, &before, 0, nullptr, 0, nullptr);
-            state.k->record(cmd, game);
+            if (state.kVkHip)
+            {
+                state.k->recordFront(cmd, game);
+                state.kVkHip->record(cmd, game.settings.reset);
+                state.k->recordBack(cmd, game);
+            }
+            else
+                state.k->record(cmd, game);
             if (frame <= 3 || frame % 600 == 0)
                 logf("native Vulkan engine frame %u recorded, preset K (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)",
                      frame, params.jitterX, params.jitterY, settings.reset, params.mvScaleX, params.mvScaleY,

@@ -122,7 +122,10 @@ metadata gets the kernel descriptor's settings (VGPRs, float mode, WGP mode, wor
 data map is rewritten so that the push constant lands in s[0:1]. The driver's donor map is `[GlobalTable, push0,
 push1]`. The patched binary is loaded with `vkCreatePipelineBinariesKHR` under a key of its own. The driver compiles
 the donor for the GPU it runs on, so the donor ELF's machine authenticates the code objects. There is no sysfs here,
-and none is needed. Kernels that use scratch are refused on this path.
+and none is needed. Kernels that use scratch are refused on this path, except on gfx12: there flat scratch is
+architected, so the stage metadata's `.scratch_en` / `.scratch_memory_size` (the kernel descriptor's private segment
+size, bytes per lane) are enough for the driver to set the kernel's scratch up as for a spilling LLPC shader
+(`D4R_VKHIP_SCRATCH=0` refuses them there too).
 
 The device needs `VK_KHR_pipeline_binary` and `VK_KHR_maintenance5` with their features. With
 `D4R_ENGINE_VKHIP` (the default), the native Vulkan frontend asks the game for both through
@@ -196,9 +199,17 @@ against D3D12). Through the shim (`vulkan_dlss_harness`, bench.py): 5.215 -> 2.2
 
 ### Preset K's Vulkan network on AMD's driver (2026-11-05)
 
-K's vkhip network does not load in the native Vulkan frontend on gfx1201: four of its eleven kernels spill
-(`dltss_pwin_enc0/dec0/dec1/dec2`, 256 VGPRs, up to 132 bytes of scratch) and the pipeline-binary injection refuses
-scratch. K therefore runs the engine's Vulkan network, which on LLPC was 2.6x the D3D12 engine (3.61 against 1.37 ms
+**Update (later the same day): K on vkhip in the native Vulkan frontend.** The frontend now creates K's vkhip network
+(`create_engine_vkhip_k`, shared with vkd3d-proton's adapter) and records the engine's front, the eleven native layers
+and the engine's back, as for M. Four of the gfx1201 layers spill (`dltss_pwin_enc0/dec0/dec1/dec2`, 256 VGPRs,
+132 / 104 / 40 / 44 bytes of scratch under every flag set tried), which the pipeline-binary injection used to refuse;
+on gfx12 it now passes the scratch size on (above). RX 9070 XT, 26.10.1, 1280x720 -> 2560x1440: 1.649 -> 1.107 ms;
+output 65.7 dB against the Vulkan network, the same pan-scene truth PSNR (29.84 dB). The Vulkan network below remains
+the fallback (packages without HIP layers, `D4R_ENGINE_VKHIP=0`).
+
+Before that, K's vkhip network did not load in the native Vulkan frontend on gfx1201: four of its eleven kernels spill
+(`dltss_pwin_enc0/dec0/dec1/dec2`, 256 VGPRs, up to 132 bytes of scratch) and the pipeline-binary injection refused
+scratch. K therefore ran the engine's Vulkan network, which on LLPC was 2.6x the D3D12 engine (3.61 against 1.37 ms
 at 1280x720 -> 2560x1440). The cause is the weight loads: LLPC loads a row-major cooperative-matrix B operand one
 16-bit element at a time (a WMMA B lane holds a column; dec5 had 1168 `buffer_load_u16` for 136 WMMAs).
 `compile_k.py` now writes `<layer>_llpc.spv` with `D4R_WEIGHT_TILES_COLMAJOR` and `D4R_LLPC_LOADS` and a

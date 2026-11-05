@@ -42,3 +42,4 @@ network (the native Vulkan frontend has no K vkhip); L runs soft-dot2 front stag
 18ab21b score=- / 3.957 / - worst=vk-L-1440 +0.99% (spread 1.38%) RR F on vkhip by default on AMD's driver: vk-RRF-1440 -18.9%, vk-RRF-4k -13.5%, byte-identical (lane A)
 696ea5d score=- / 3.292 / - worst=vk-RRF-1440 -0.25% L's matrix stages on LLPC through spirv-opt: vk-L-1440 -56.8%, vk-L-4k -55.5% (lane B, Vulkan L on AMD's driver only)
 fd6c117 score=- / 2.810 / - worst=dx-K-1440 1.372 (unchanged) K's Vulkan network on LLPC reads transposed weight tiles: vk-K-1440 3.610 -> 1.653, vk-K-4k 5.461 -> 2.927 (lane A for the tiles, the LLPC load variant byte-identical too)
+e4fd9a5 score=- / - / - (dx-K geomean 1.650 -> 1.577) worst=dx-K-4k -1.95% d3dhip K by default on RDNA4: dx-K-1440 -5.40%, dx-K-4k -1.95%, dx-K-q1440 -5.32%, dx-K-1440-rgb10 -5.11% (lane B; Cyberpunk check blocked, BLOCKERS)

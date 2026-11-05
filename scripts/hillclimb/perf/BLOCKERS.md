@@ -19,7 +19,7 @@ a tester should do.
   (5.15 ms against 2.28 ms at 720p -> 1440p). The installed rr-f (2026-10-27 kit) has no `_llpc` files.
   The kit's `tools/models/bin` holds dxc and glslangValidator; `spirv-opt.exe` (Vulkan SDK, Apache-2.0) belongs
   next to them.
-- **Game checks cannot use `windows-game.ps1` here** (2026-11-05). Cyberpunk 2077 (`bind\d4r`) and Ghost of
+- **Game checks cannot use `windows-game.ps1` here** (2026-11-05). Cyberpunk 2077 (`bin\x64\d4r`) and Ghost of
   Tsushima (`d4r`) carry release installs of d4r (install.ps1, 2026-10-26/27) with no `.d4r-backup\manifest.json`;
   `windows-game.ps1 -Action install` refuses them ("An existing d4r directory has no installation manifest;
   preserved") and also expects a ZLUDA-style `package.json` package, which the climb's builds are not. The release
