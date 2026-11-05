@@ -352,10 +352,13 @@ encoder 0 leaves for the network (surfaces 128/112/120 at level 0) and the three
 surface 144 for each frame parity) travel through D3D12 buffers shared the same way, staged into and out of HIP images
 (`hipMemcpy2D`). Those images are row-major; the stages load, sample and store them through hardware image descriptors
 that HIP builds for a pitched 2D resource (its texture object's 8 descriptor dwords), and the bilinear sampler is a
-constant descriptor (CLAMP on all axes, `FILTER_MODE` in word 2 on gfx12). Preset F runs the fourteen
+constant descriptor (CLAMP on all axes, `FILTER_MODE` in word 2 on gfx12). Preset F runs the fifteen
 `hip/rr2_<stage>.hsaco` objects instead, which work directly in the engine's arena through their own parameter blocks
 (the engine hands each stage's block and grid over between the front and the back, and the arena reserves the phases'
-records for every phased stage, as the Vulkan route does when it gives the recorder device addresses).
+records for every phased stage, as the Vulkan route does when it gives the recorder device addresses). Encoder 0 is one
+of them when the package has `hip/rr2_enc0.hsaco` (the vkhip route's hybrid stage, which runs after the gather pass):
+the front then records only the parameters, the exposure and the gather, and hands encoder 0's block over first.
+`D4R_HIP_RR_ENC0=0` (or a package without that file) keeps encoder 0 on the engine's DXIL front.
 
 ```
 d4r-rr-d3d12 MODEL INPUT_DIR OUT [repeats] hip
@@ -374,12 +377,15 @@ peak 1, 54.8 and 55.3 dB with the frame's own range as the peak, mean absolute e
 kernels' f16 rounding. The Vulkan SPIR-V route on the same frames is 43.2 dB against the D3D12 DXIL network, so the
 HIP stages are closer to this engine than the Vulkan shaders are.
 
-Preset F runs its fourteen `hip/rr2_*.hsaco` (built by `kernels/rr/build_vkhip_f.sh`, the same objects as vkhip's F
-route) on the HIP stream too. Each kernel takes one 24-byte by-value argument, `{param, weights, arena}` as vkhip lays
-out its kernarg block, so the launch passes that struct, not three pointers: HIP copies the kernel's declared 24 bytes
-from the first pointer, and the garbage weight and arena addresses hung the driver. On four 1440p frames the output is
-42.2 dB RGB against the DXIL network at peak 1 (54.0 dB at the output range; vkhip against the same DXIL run is 42.2 /
-54.0 dB), at 4k 43.2 / 51.9 dB, no nonfinite samples.
+Preset F runs its `hip/rr2_*.hsaco` (built by `kernels/rr/build_vkhip_f.sh`, the same objects as vkhip's F route,
+encoder 0 included when the package has it) on the HIP stream too. Each kernel takes one 24-byte by-value argument,
+`{param, weights, arena}` as vkhip lays out its kernarg block, so the launch passes that struct, not three pointers: HIP
+copies the kernel's declared 24 bytes from the first pointer, and the garbage weight and arena addresses hung the
+driver. On four 1440p frames the output is 42.2 dB RGB against the DXIL network at peak 1 (54.0 dB at the output range;
+vkhip against the same DXIL run is 42.2 / 54.0 dB), at 4k 43.2 / 51.9 dB, no nonfinite samples. Encoder 0 on HIP is
+byte-identical to the DXIL front's (8 frames at 1280x720 -> 2560x1440, `inputs/rr-syn`, 15 repeats) and takes 0.47 ms
+instead of 0.55: front 0.85 -> 0.30 ms, network 1.81 -> 2.28 ms, back 1.15 -> 1.12 ms, the frame 3.81 -> 3.69 ms
+(3 rounds interleaved, spread 0.2%).
 
 ## Linux execution and remaining gates
 

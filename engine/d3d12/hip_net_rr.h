@@ -15,11 +15,14 @@
 // the engine's back. Preset F can instead order the two queues on the GPU through a shared D3D12 fence (useFence(),
 // launchAfter()), as preset K's HipNetworkDx does.
 //
-// Preset F launches its fourteen stages as one HIP graph per frame parity: the parameter blocks live in two device
-// areas (one per parity, a fixed address per stage), each graph launches the stages with its area's addresses, and a
-// frame's blocks are copied from pinned memory only when they differ from what that area last held (the engine's
-// blocks change only with the frame parity's shift, so after two frames there is no copy). A graph is recaptured
-// whenever a stage's grid or block size changes.
+// Preset F launches its stages as one HIP graph per frame parity: encoder 0 first (when the package has its code
+// object, hip/rr2_enc0.hsaco, the code object the Vulkan vkhip route runs after encoder 0's gather pass; the engine's
+// front then keeps only the parameters, the exposure and the gather, D4R_HIP_RR_ENC0=0 or the missing file leaves
+// encoder 0 on the engine's DXIL front), then stages 1 - 14. The parameter blocks live in two device areas (one per
+// parity, a fixed address per stage), each graph launches the stages with its area's addresses, and a frame's blocks
+// are copied from pinned memory only when they differ from what that area last held (the engine's blocks change only
+// with the frame parity's shift, so after two frames there is no copy). A graph is recaptured whenever a stage's grid
+// or block size changes.
 //
 // Construction throws std::runtime_error with the reason when the model has no HIP network of this preset, the code
 // objects are incomplete, the D3D12 device is not HIP device 0's adapter, or HIP cannot import the shared arena; the

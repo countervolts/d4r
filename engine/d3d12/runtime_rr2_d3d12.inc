@@ -1344,10 +1344,11 @@ struct R2Engine
                 dispatch(list, model.stages[R2Gather].pipeline, b.gather[cur], gx, gy);
                 if (std::getenv("D4R_RR_TMP_FINE")) stamp(14); // TMP
             }
-            if (external && stage >= 1 && stage <= 14)
+            // The external network's stage: the same block the engine would bind, its grid and (its host derives the
+            // windows from) this frame's shift. Stages 1 - 14 are always its own; encoder 0 only when the network runs
+            // it too (a package with hip/rr2_enc0.hsaco, d3d12/hip_net_rr.cpp), after the gather pass above.
+            if (external && (stage >= 1 ? stage <= 14 : external->network->runs(stage)))
             {
-                // the external network's stage: the same block the engine would bind, its grid and (its host derives
-                // the windows from) this frame's shift
                 external->network->stage(stage, blocks[stage].data(), blocks[stage].size(), gx, gy, shift);
                 continue;
             }
@@ -1427,9 +1428,10 @@ struct R2Engine
         dispatchOutput(list, &profiler, rebindAfterMark);
         completeRecording(list);
     }
-    // The front of an external network's frame: the parameters, the exposure, encoder 0 (and its gather), then the
-    // network's fourteen stages handed over with this frame's blocks and grids. The engine's own resources are back in
-    // their resting states when this returns; submit it and wait on a fence before the network runs.
+    // The front of an external network's frame: the parameters, the exposure, the gather pass, then encoder 0 and the
+    // network's fourteen stages handed over with this frame's blocks and grids (encoder 0 stays here when the network
+    // does not run it). The engine's own resources are back in their resting states when this returns; submit it and
+    // wait on a fence before the network runs.
     void recordFront(ID3D12GraphicsCommandList *list)
     {
         if (!frameSet || recorded != SIZE_MAX)
