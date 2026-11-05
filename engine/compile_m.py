@@ -100,7 +100,15 @@ def build_dxil(output, ldr, preset_l=False, target='windows'):
         # L's input and expansion stages again with the token buffers in NGX's plane layout, for the native HIP network
         # (layer_m.hlsl PLANES; the same flags as the stage above, as the SPIR-V plane builds are layer_m.comp's)
         if preset_l and name in ('enc0l', 'dec0l'):
-            subprocess.run(args + ['-DPLANES=1', '-Fo', str(output / (out + '_planes.dxil'))], check=True)
+            # two windows per wave for these two, as the vkd3d build above takes them: a wave walks two of its block's
+            # four 4x4 windows and loads each weight tile once for both (layer_m.hlsl WPW). They are issue-bound
+            # (RGA: 1947 / 2555 instructions a wave, 75 / 78 VGPRs, no spills) and the tiles' loads are ~100 of those
+            # slots; sharing them costs 128 / 119 VGPRs. RX 9070 XT, d3dhip, D4R_PROFILE=1: input 490 -> 469 us and
+            # expansion 374 -> 348 us at 1280x720, 1206 -> 1160 / 879 -> 847 at 1920x1080; gpu_eval 2.354 -> 2.321 ms
+            # (1280x720 -> 2560x1440) and 5.238 -> 5.133 (1920x1080 -> 3840x2160), output byte-identical.
+            # M_D3D12_DEFS still overrides it; the non-planes L stages keep one window (not measured there).
+            lwpw = [] if tuned or 'WPW=' in os.environ.get('M_D3D12_DEFS', '') else ['-DWPW=2']
+            subprocess.run(args + lwpw + ['-DPLANES=1', '-Fo', str(output / (out + '_planes.dxil'))], check=True)
     ldr_define = ['-DLDR=1'] if ldr else []
     if preset_l and tuned:
         # vkd3d-proton: L's input stage also in one dispatch (enc0_lx, layer_m.hlsl KIND 3 with L_FUSED and
