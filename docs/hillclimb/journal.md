@@ -618,3 +618,19 @@ schedule (all slower).
   M's reconstruction (post_m, 10x10, 1889 instructions, 88 VGPRs, 0.309 ms) is also issue-bound. Only algorithm
   changes (bilinear history, fewer taps) moved it; nothing kept (`M_AMD_POST_MATH` -1.3%, under the bar).
   The K target (0.649 ms) cannot come from this stage: input 0.09 + network ~0.73 is already 0.82 ms.
+- **Kept: M/L's HIP Swin layers with paired weight loads** (helper agent-mswin, report
+  `C:\d4r-hc\agents\agent-mswin\REPORT.md`; `SWIN_TOK_WPAIR` + `-mcumode` in kernels/windows-flags.txt). dx-M
+  -2.01% / -1.77%, dx-L -1.55% / -1.09% (1440p / 4K), byte-identical. Per layer at 1080p input (us): enc1 425, enc2
+  250, tube x6 604, dec2 228, dec1 431; sum 1937 at 129 TFLOPS (33% of the 390 TFLOPS FP8 peak). Roofline on this
+  card (microbenchmarks `peakfp8.hip`, `wload.hip` there): WMMA alone 283-310 TFLOPS; with one 8-byte global load
+  per WMMA 153; one 16-byte load per two WMMAs 200; LDS-staged 182. So the layers sit on the load-instruction
+  ceiling: VGPR caps +16% / +73% (scratch), dropping the FP8 clamps nothing, GELU removed -5%, all operands from one
+  address -20% (the load instruction, not the cache, costs). `SWIN_TOK_BUFFER_WEIGHTS` no gain.
+  `SWIN_TOK_NO_LOAD_SYNC` is a trap: -20% end to end but 21 dB wrong after 100 frames, while a single frame's head
+  can still look identical (the asm batch barrier keeps WMMAs below their loads). NVIDIA's ten layers run at ~226
+  TFLOPS (1.078 ms). The next step is two windows per wave (N = 32 per weight operand): halves the loads again,
+  +~64 VGPRs, occupancy 9 -> 6, a rewrite of swin_tok_core's token ownership. In review I reverted the patch's change
+  to the `SWIN_TOK_WIDE_WEIGHTS` (gfx11 token) branch, which read operands that path never loads; L uses the same
+  code objects and was measured here too. Package hip/ kernels = `kernels/build.sh m` with
+  `D4R_GPU_ARCH=gfx1201 D4R_VKHIP_LAYERS=1 D4R_NATIVE_FP8=1` (ISA-identical to the shipped ones); hsaco files embed
+  their source path, so compare `llvm-objdump -d` output, not bytes.
