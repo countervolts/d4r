@@ -82,22 +82,23 @@ struct GameUpscaler::Impl {
     uint32_t frames = 0;
     bool external = false;
     std::vector<D3D12_RESOURCE_BARRIER> exit;   // recordFront's: the textures' states, restored by recordBack
-    // The game's colour, motion and depth, copied into the engine's own textures when the frame starts; the stages
-    // read the copies. The reconstruction stage reads these inputs again after the network, milliseconds after the
-    // evaluation began, and in Ghost of Tsushima and Cyberpunk 2077 (RX 9070 XT, driver 26.10.1) what it read there
-    // was no longer the frame: whole 16x16 groups of the history went black on bright surfaces and stayed black
-    // (preset K's "black speckles"), while a copy recorded at the start of the same evaluation, replayed through
-    // the same kernels, gave a clean frame. D4R_K_DIRECT_INPUTS=1 reads the game's textures in place again.
+    // D4R_K_DIRECT_INPUTS=0: the game's colour, motion and depth, copied into the engine's own textures when the
+    // frame starts, and the stages read the copies. The copies were the fix for preset K's "black speckles" in Ghost
+    // of Tsushima and Cyberpunk 2077 (RX 9070 XT, driver 26.10.1): whole 16x16 groups of the history went black on
+    // bright surfaces and stayed black. The reconstruction stage reads these inputs again after the network, and the
+    // suspicion was that the game had changed them by then. With the reconstruction filtering in f32
+    // (D4R_FILTER_F32), Ghost of Tsushima was checked clean in game without the copies (1080p -> 4K, LDR, d3dhip,
+    // 2026-11-05), so by default the stages read the game's textures in place and the copies' time is saved.
     struct Staged { ID3D12Resource* source = nullptr; ComPtr<ID3D12Resource> copy; };
     Staged staged[3];
-    bool direct = false;
+    bool direct = true;
     std::vector<D3D12_RESOURCE_BARRIER> before, after;    // this frame's copies: into the copy states and back
     std::vector<std::pair<ID3D12Resource*, ID3D12Resource*>> copies;
     Impl(Model& m, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetworkDx* network)
         : model(m), shape(makeKShape(ow, oh)), engine(m, shape, network), maxWidth(rw), maxHeight(rh),
           external(network != nullptr) {
         const char* v = std::getenv("D4R_K_DIRECT_INPUTS");
-        direct = v && *v && *v != '0';
+        direct = !(v && *v == '0');
     }
     // The engine-owned copy of a game texture (one per distinct resource of the frame), created or replaced to
     // match the texture's description.
