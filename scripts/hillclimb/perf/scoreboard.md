@@ -3,7 +3,7 @@
 One line per kept commit: `<sha> score=<geomean ms D3D12 / Vulkan / headline> worst=<case ±%> note`.
 Method and matrix: bench.py / matrix.json; journal: docs/hillclimb/journal.md.
 
-## Phase 0 baseline (fe53aa0 shim, HIP packages in D:\d4r-hc\models, frames back to back)
+## Phase 0 baseline (fe53aa0 shim, HIP packages in D:\d4r-hc\models, now C:\d4r-hc\models, frames back to back)
 
 D3D12 (bench.py self-noise run, median of 6 run medians per side; control-vs-control deltas <= 0.72%):
 
@@ -22,5 +22,21 @@ Untargeted D3D12 cases: K 1706x960->1440p 1.427, K RGB10A2 1.385, M 720p->4K 2.2
 1.629 / 3.509 (byte-identical to the fast set: the D3D12 M engine has one set), M RGB10A2 1.662, L RGB10A2 2.373.
 D3D12 score (geomean of all 16 D3D12 cases): 2.532 ms.
 
-Vulkan: vk-K-1440 3.475 (Vulkan network: no vkhip for K in the native frontend). The other Vulkan cases of that run
-overlapped another GPU workload (three whisper-cli jobs from 21:14) and are being re-measured.
+Vulkan (bench.py self-noise run 2026-11-05, idle GPU; control-vs-control deltas <= 0.35%, spreads 0.26-2.92%):
+
+| Case | ms | Target | Gap |
+|---|---:|---:|---:|
+| vk-K-1440 | 3.553 | 0.649 | 5.47x |
+| vk-K-4k | 5.374 | 1.532 | 3.51x |
+| vk-M-1440 | 1.422 | 1.081 | 1.32x |
+| vk-M-4k | 3.201 | 2.553 | 1.25x |
+| vk-L-1440 | 5.158 | 1.413 | 3.65x |
+| vk-L-4k | 11.315 | 3.161 | 3.58x |
+| vk-RRF-1440 | 4.650 | 2.100 | 2.21x |
+| vk-RRF-4k | 9.600 | 4.658 | 2.06x |
+
+Untargeted: vk-M-1440-r11 1.412. Vulkan score (geomean of the 9 Vulkan cases): 4.089 ms. K runs the engine's Vulkan
+network (the native Vulkan frontend has no K vkhip); L runs soft-dot2 front stages on LLPC.
+
+## Kept commits
+

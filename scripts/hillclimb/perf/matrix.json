@@ -1,6 +1,6 @@
 {
  "comment": "Cases for bench.py. size = render W, H, output W, H. route: a regex the run's shim log must match, or the run is invalid. D3D12 SR stays on the DXIL network (the installed packages have no HIP layers; D4R_DX_NET=dxil pins it for packages that do). Thresholds: a kept change must beat 2x the case's measured self-noise and 1% of the case.",
- "tools": "D:/d4r-hc/build/tools",
+ "tools": "C:/d4r-hc/build/tools",
  "warmup": 40,
  "measured": 120,
  "rounds": 3,
