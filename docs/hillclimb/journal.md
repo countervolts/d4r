@@ -137,3 +137,21 @@ schedule (all slower).
   before and after; a case with another user above 10% at any sample is marked `busy`.
 - The working tree also carries someone else's uncommitted D3D12 K input-copy work (`engine/d3d12/game_d3d12.cpp`,
   `prepare_live_k.py`, `replay_d3d12.cpp`, "black speckles"); it is not part of this climb's commits.
+
+### 2026-11-05: Vulkan K on LLPC
+
+- K's vkhip network in the native Vulkan frontend (wired up, uncommitted) never loads here: the gfx1201 K kernels
+  spill (`enc0` 32 VGPRs spilled / 132 B scratch, `dec0` 25 / 104 B, `dec1` 9, `dec2` 10; all at 256 VGPRs) and the
+  pipeline-binary injection refuses scratch. Fixing that means gfx12 flag lines in `kernels/k/*.hip`, which Linux
+  shares: parked. bench: no change (same route).
+- **Profile of the Vulkan K network on LLPC** (`D4R_PROFILE=1` through the shim, 720p -> 1440p): the deep layers are
+  6-9x the D3D12 ones (enc3 0.28, enc4 0.38, dec5 0.77, dec4 0.38, dec3 0.27 ms against 0.045-0.083). Tools: a
+  small `vkstats` (C:\d4r-hc\tools\vkstats.cpp: builds a compute pipeline with VK_KHR_pipeline_executable_properties
+  and prints LLPC's statistics and ISA). dec5: 162 VGPRs (243 as wave32), no scratch, 136 WMMAs and **1168
+  `buffer_load_u16`**: LLPC loads a row-major cooperative-matrix B operand one 16-bit element at a time (a lane of
+  the WMMA B operand holds a column). `spirv-opt -O`: no change. Deeper prefetch (`PREFETCH_K/N=4`): no change.
+- **Fix**: the D3D12 package's `weights_d3d12.bin` already transposes each 16x16 B tile (`D4R_WEIGHT_TILES_COLMAJOR`,
+  HLSL only); the Vulkan layers with that define and the same file: 3.611 -> 1.794 ms (1440p), 5.473 -> 3.124 ms
+  (4K), byte-identical (lane A). Remaining u16 loads come from the merge/expand/embed/head B operands and the bias
+  tiles (accumulator layout, 16 equal rows): `D4R_LLPC_LOADS` transposes those too (`weights_llpc.bin`) and reads bias
+  tiles with stride 0: dec5 208 -> 54 u16 loads, enc3 544 -> 48.
