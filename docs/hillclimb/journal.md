@@ -191,3 +191,10 @@ schedule (all slower).
   1.238, 55.5 dB against DXIL; HDR 57.2 dB, finite, same mean/std. The Cyberpunk check is blocked (BLOCKERS:
   release installs that windows-game.ps1 refuses). The HIP kernels are built by our LLVM, so AMD's Cyberpunk D3D12
   application profile (the half-accumulation hazard) cannot reach them, but the in-game check is still owed.
+- **Kept (lane B): K on vkhip in the native Vulkan frontend, with scratch on gfx12.** The pipeline-binary injection
+  now sets the PAL stage metadata's `.scratch_en` / `.scratch_memory_size` from the kernel descriptor on gfx12
+  (architected flat scratch; `D4R_VKHIP_SCRATCH=0` refuses as before; gfx11 still refused) instead of refusing the
+  four spilling K layers, and the native frontend records K's front, vkhip network and back (the uncommitted wiring
+  from earlier). bench.py (3 rounds): vk-K-1440 1.652 -> 1.107 (-32.97%), vk-K-4k 2.938 -> 2.392 (-18.57%),
+  dx-K-1440 identical. Output against the Vulkan network: pan scene 65.7 dB (truth PSNR 29.84 dB both), static
+  107 dB, LDR 61.5 dB; finite, same mean/std. vk M, L and RR F byte-identical.
