@@ -62,3 +62,22 @@ for STAGE in enc1 enc2 enc3 enc4 enc5 dec4_0 dec4_1 dec3_0 dec3_1 dec2_0 dec2_1 
         --no-gpu-bundle-output -o "$TMP/rr2_$STAGE.hsaco" "$HERE/rr2_vkhip.hip"
     cp "$TMP/rr2_$STAGE.hsaco" "$MODEL/hip/rr2_$STAGE.hsaco"
 done
+# Windows (AMD's driver): encoder 0 too, from the hybrid stage the model runs after its gather pass (enc0g), with the
+# stage's texture bindings dropped (enc0_hip_prep.py). LLPC's enc0 took 0.11 ms more at 1280x720 -> 2560x1440 (RX 9070
+# XT, 2026-11-05); Linux (RADV) keeps the model's enc0.
+case "$(uname -s)" in MSYS*|MINGW*|CYGWIN*)
+    if grep -q '^stage enc0g ' "$MODEL/rr.txt" && [[ -f "$MODEL/native-work/enc0/enc0_m.comp" ]]; then
+        GLSLANG="$(command -v glslangValidator || echo "${VULKAN_SDK:-C:/VulkanSDK/1.4.341.1}/Bin/glslangValidator.exe")"
+        "$GLSLANG" -E -DRR_EXACT_CONVERT -DRR_RELAXED=2 -DRR_NATIVE -I"$MODEL/native-work/enc0" -I"$HERE/../../engine/rr" \
+            "$MODEL/native-work/enc0/enc0_m.comp" > "$TMP/enc0_m.preprocessed.comp"
+        python3 "$HERE/enc0_hip_prep.py" "$TMP/enc0_m.preprocessed.comp" "$TMP/enc0.comp"
+        python3 "$HERE/glsl2hip.py" --sat --rolled=hd,br --include=glsl_hip_enc0.h --v-layout="$MODEL/native-work/enc0/rr2_stage.h" \
+            "$TMP/enc0.comp" rr2_enc0 "$TMP/rr2_enc0.hip"
+        "$ROCM/lib/llvm/bin/clang++" -x hip --offload-arch="$ARCH" --offload-device-only -O3 -mcumode \
+            -fno-hip-fp32-correctly-rounded-divide-sqrt ${D4R_RRVK_FLAGS:-} --rocm-path="$ROCM" ${LIB[@]+"${LIB[@]}"} -I"$HERE" -DRR2_WAVES=5 \
+            --no-gpu-bundle-output -o "$TMP/rr2_enc0.hsaco" "$TMP/rr2_enc0.hip"
+        "$ROCM/lib/llvm/bin/llvm-readelf" --notes "$TMP/rr2_enc0.hsaco" | grep -q '\.private_segment_fixed_size: *0$' ||
+            { echo "rr2_enc0 spills to scratch" >&2; exit 1; }
+        cp "$TMP/rr2_enc0.hsaco" "$MODEL/hip/rr2_enc0.hsaco"
+    fi ;;
+esac

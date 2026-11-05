@@ -67,7 +67,7 @@ private:
 // REngine with arenaAddress) and on its images through raw descriptors, which needs VK_EXT_descriptor_buffer
 // (vkGetDescriptorEXT) enabled on the device; the stages' weights are the model's (weights-<stage>m.bin, `weights`),
 // rearranged for the kernels. Stages without a code object stay on the engine's shaders.
-// Preset F on RDNA4: files.code["rr2_<stage>"], weights["<stage>"] replace network stages 1-14.
+// Preset F on RDNA4: files.code["rr2_<stage>"], weights["<stage>"] replace network stages 0-14.
 // Uses the live frame parameters and arena guide planes; input/output texture stages stay on Vulkan.
 class RRStages final : public d4r::RStageRecorder {
 public:

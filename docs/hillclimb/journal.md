@@ -407,3 +407,21 @@ schedule (all slower).
   under the 5% bar. dec0_1's hybrid stores images (`sust_p4` / `sust_b4`) in its body, so it needs image descriptors in
   vkhip's F kernel ABI (D/E have them through VK_EXT_descriptor_buffer; F's ABI is {param, weights, arena}): with
   enc0g, post, down and pooled that is the multi-day project the summary lists.
+- **Kept: RR F's enc0 on vkhip (Windows).** Built after all; most of the ~30 "missing" GLSL kinds sat in functions
+  main never reaches. `kernels/rr/enc0_hip_prep.py`:
+  - strips the bindings and accessors;
+  - passes `rr2_xf` as a parameter;
+  - takes the grid from the parameter block (`gl_NumWorkGroups.z` = 1);
+  - prunes unreachable functions (79 -> 23);
+  - rewrites `hf` literals, the `spirv_instruction` NMin, the `Q1023` table, `vec4(...)`, accumulator casts and one
+    division.
+  `kernels/rr/glsl_hip_enc0.h` (`glsl2hip.py --include=`) supplies the rest. One trap: `float(qx[wv][m][i])` on a
+  non-const FP8 operand went through `Ref::operator float`, whose `floate4m3_t(*this)` picks the float constructor
+  again. That is an out-of-line recursive call: 16 bytes of scratch and 58 SGPRs. Reading it through the const
+  accessor (`glslF8f`) gives 0 scratch, 226 VGPRs, 20 SGPRs. The F loader, the replay and the shim now take stage 0.
+  `build_vkhip_f.sh` builds it only on MSYS (Linux/RADV unchanged). Rebuilding all 15 code objects from scratch
+  matches the tested ones in disassembly and notes. Bench (`rt-vc` vs `rt-ve`, same new shim; the candidate adds
+  `hip/rr2_enc0.hsaco`), 3 rounds:
+  - vk-RRF-1440 3.521 -> 3.412 (-3.09%, spread 0.73%);
+  - vk-RRF-4k 7.731 -> 7.520 (-2.74%, spread 0.41%);
+  - output byte-identical; Vulkan score 5.218 -> 5.066 over the RRF cases.
