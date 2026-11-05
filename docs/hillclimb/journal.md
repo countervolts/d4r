@@ -595,3 +595,26 @@ schedule (all slower).
   slower, as on Vulkan), dec0_1 wave64 (output 6.7 dB, wrong), other tile geometries, dispatch fixed cost (~0.9 us each, 22
   us in all), inter-group UAV barriers (~10 us). Post is ~84% issue-bound; removing its loads made it slower. The
   lever left is dec0_1 in HIP (it is one on vkhip, ffde45b), handed to agent-rrdec01.
+- **Kept: K's D3D12 output stage with fewer instructions** (1f8d128, from helper agent-kout's patch, report
+  `C:\d4r-hc\agents\agent-kout\REPORT.md`). dx-K-1440 1.3615 -> 1.2615 ms (-7.34%), dx-K-4k 2.759 -> 2.537 (-8.05%);
+  lane B (motion scene 43 dB after 200 frames, quality-scene truth metrics equal, game captures 65-68 dB). The stage
+  is VALU-issue-bound: 57600 waves x ~3200 instructions / 256 SIMDs matches the measured 0.49 ms. Ablations (wrong
+  output): 12 -> 4 filter taps -27.5%, history Catmull-Rom -> bilinear -23%, re-exposure -2.6%; LDS banking and the
+  transcendentals are not the limit. AMD's D3D12 compiler emits no packed f16 or VOPD at SM 6.6-6.9 (probe shaders):
+  that is the whole Vulkan 0.37 against D3D12 0.49 ms gap. Rejected: wave32 (+8.7%), a separate luma LDS plane (+10%),
+  512-thread groups. What I changed in review:
+  - **Build flags**: compile_k.py builds output_k with `-DD4R_NATIVE_HALF=1` too (the `rounding` list in
+    `ldr_define`). My first rebuilds lacked it, and every comparison of them with the agent's build came out ~3% slower
+    than they were; three guard variants were wrongly rejected that way before I found it. Rebuild with all of
+    compile_k's flags (`hlsl_build.py output_k.comp OUT -DD4R_NATIVE_HALF=1 -DD4R_FILTER_ACCUM_F32=1
+    -DD4R_FILTER_F32=1 --wave 64`, D4R_DXC = the runtime's dxcoob 1.9.2609.5).
+  - **The f32 filter can still underflow**: the agent dropped the running maximum because "f32 sums don't
+    underflow", but exp2 below ~-126 is 0 and 0/0 zeroes the pixel through the finiteness check (the black-speckle
+    mechanism). The guard sits in that check's cold branch (the sub-pixel takes the current bilinear luma).
+  - **The "bright" quad exchange stays in shared memory**: the agent's shuffles were byte-identical only because
+    neither the harness scenes nor five game captures (kcap 12739, 13181, 15078, 15518, 15955) have a quad of mixed
+    brightness. Removing the exchange entirely is byte-identical on all of them too. `diff -rq` over the replay's
+    output folders shows a difference in every case, from timings.csv; compare the .bin files only.
+  M's reconstruction (post_m, 10x10, 1889 instructions, 88 VGPRs, 0.309 ms) is also issue-bound. Only algorithm
+  changes (bilinear history, fewer taps) moved it; nothing kept (`M_AMD_POST_MATH` -1.3%, under the bar).
+  The K target (0.649 ms) cannot come from this stage: input 0.09 + network ~0.73 is already 0.82 ms.
