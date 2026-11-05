@@ -11,8 +11,15 @@
 // texture objects for a pitched 2D resource, so no shader-side format is re-derived here.
 //
 // Synchronization is the d3dhip way (d3d12/hip_net_d3d12.h): the caller submits the engine's front and waits on a
-// D3D12 fence on the CPU, calls run() (one launch per stage on a private HIP stream, then hipStreamSynchronize), then
-// records the engine's back. No shared fences.
+// D3D12 fence on the CPU, calls run() (the stages on a private HIP stream, then hipStreamSynchronize), then records
+// the engine's back. Preset F can instead order the two queues on the GPU through a shared D3D12 fence (useFence(),
+// launchAfter()), as preset K's HipNetworkDx does.
+//
+// Preset F launches its fourteen stages as one HIP graph per frame parity: the parameter blocks live in two device
+// areas (one per parity, a fixed address per stage), each graph launches the stages with its area's addresses, and a
+// frame's blocks are copied from pinned memory only when they differ from what that area last held (the engine's
+// blocks change only with the frame parity's shift, so after two frames there is no copy). A graph is recaptured
+// whenever a stage's grid or block size changes.
 //
 // Construction throws std::runtime_error with the reason when the model has no HIP network of this preset, the code
 // objects are incomplete, the D3D12 device is not HIP device 0's adapter, or HIP cannot import the shared arena; the
@@ -25,6 +32,7 @@
 
 struct ID3D12Device;
 struct ID3D12Resource;
+struct ID3D12Fence;
 
 namespace d4r::dx {
 class HipNetworkRr final : public ExternalNetworkRr::Network {
@@ -45,6 +53,15 @@ public:
     void stage(unsigned index, const void* block, size_t bytes, uint32_t gx, uint32_t gy, uint32_t shift) override;
     void run() override;
     bool runs(unsigned index) const override;
+    // Preset F only. GPU-side ordering instead of run()'s CPU waits: `fence` (created with D3D12_FENCE_FLAG_SHARED on
+    // this object's device) is imported into HIP as an external semaphore. Throws when HIP cannot import it.
+    void useFence(ID3D12Fence* fence);
+    // Queues the stages recorded since the last run, without blocking: a wait on the HIP stream until the fence reaches
+    // `wait` (the game's queue signals it after the engine's front), the network, then a signal of `signal` (the queue
+    // waits for it before the engine's back). The arena stays in COMMON; the fence orders every access.
+    void launchAfter(uint64_t wait, uint64_t signal);
+    // Blocks until everything launchAfter() queued has finished (lastMilliseconds() then holds the last one).
+    void finish();
     // GPU time of the last run() (HIP events around the whole network), 0 before the first run.
     float lastMilliseconds();
     // One per run(), never reset.

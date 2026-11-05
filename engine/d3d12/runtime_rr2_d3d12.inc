@@ -1442,7 +1442,8 @@ struct R2Engine
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         list->SetDescriptorHeaps(1, heaps);
         uploadParameters(list, nullptr, false);
-        dispatchStages(list, 0, R2Network, nullptr, false);
+        // up to decoder 0's second block, which belongs to the back: it reads the network's output
+        dispatchStages(list, 0, R2Dec0B, nullptr, false);
         for (auto &[r, state] : now)
             if (state != rest.at(r))
                 barriers.push_back(transition(r, state, rest.at(r)));

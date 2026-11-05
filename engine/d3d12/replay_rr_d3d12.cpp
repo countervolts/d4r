@@ -207,6 +207,27 @@ try
     auto stamps = d.buffer(20 * 8, D3D12_HEAP_TYPE_READBACK);
     UINT64 frequency;
     CK(d.queue->GetTimestampFrequency(&frequency));
+    // d3dhip preset F: the handoff through a shared D3D12 fence (the default), or CPU-serialized (D4R_D3DHIP_SYNC=cpu)
+    bool fenced = false;
+    ComPtr<ID3D12Fence> shared;
+    uint64_t sharedValue = 0;
+    ComPtr<ID3D12CommandAllocator> backAlloc;
+    ComPtr<ID3D12GraphicsCommandList> backList;
+#ifdef D4R_ENGINE_D3DHIP
+    if (hipNetwork && model.preset() == 6)
+    {
+        const char *syncMode = std::getenv("D4R_D3DHIP_SYNC");
+        if (!(syncMode && !std::strcmp(syncMode, "cpu")))
+        {
+            CK(d.dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&shared)));
+            hipNetwork->useFence(shared.Get());
+            CK(d.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&backAlloc)));
+            CK(d.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, backAlloc.Get(), nullptr, IID_PPV_ARGS(&backList)));
+            fenced = true;
+            std::cout << "d3dhip sync: GPU fence (shared D3D12 fence imported into HIP)\n";
+        }
+    }
+#endif
     struct Stamp
     {
         ID3D12QueryHeap *heap;
@@ -300,7 +321,48 @@ try
                 engine.discarded();
             }
             engine.setFrame(images, s, {output.get(), output.format});
-            if (const d4r::dx::ExternalNetworkRr *net = engine.externalNetwork())
+            if (fenced)
+            {
+#ifdef D4R_ENGINE_D3DHIP
+                // d3dhip through the shared fence: the front, HIP waiting for it on the GPU, the back waiting for HIP;
+                // the GPU time runs from the front's first command to the back's last
+                d.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                engine.recordFront(d.list.Get());
+                d.flushBarriers();
+                d.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                CK(d.list->Close());
+                ID3D12CommandList *front[] = {d.list.Get()};
+                d.queue->ExecuteCommandLists(1, front);
+                CK(d.queue->Signal(shared.Get(), ++sharedValue));
+                hipNetwork->launchAfter(sharedValue, sharedValue + 1);
+                CK(d.queue->Wait(shared.Get(), ++sharedValue));
+                backList->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                engine.recordBack(backList.Get());
+                backList->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                backList->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, stamps.get(), 0);
+                CK(backList->Close());
+                ID3D12CommandList *back[] = {backList.Get()};
+                d.queue->ExecuteCommandLists(1, back);
+                CK(d.queue->Signal(d.fence.Get(), ++d.fenceValue));
+                CK(d.fence->SetEventOnCompletion(d.fenceValue, d.event));
+                WaitForSingleObject(d.event, INFINITE);
+                CK(d.dev->GetDeviceRemovedReason());
+                hipNetwork->finish();
+                CK(d.alloc->Reset());
+                CK(d.list->Reset(d.alloc.Get(), nullptr));
+                CK(backAlloc->Reset());
+                CK(backList->Reset(backAlloc.Get(), nullptr));
+                engine.submitted(d.fence.Get(), d.fenceValue);
+                UINT64 *t;
+                CK(stamps.r->Map(0, nullptr, reinterpret_cast<void **>(&t)));
+                std::cout << "frame " << id << " repeat " << rep << " us " << (t[1] - t[0]) * 1e6 / double(frequency)
+                          << " fenced front " << (t[2] - t[0]) * 1e6 / double(frequency) << " network "
+                          << (t[3] - t[2]) * 1e6 / double(frequency) << " back " << (t[1] - t[3]) * 1e6 / double(frequency)
+                          << " hip " << hipNetwork->lastMilliseconds() * 1000.0 << "\n";
+                stamps.r->Unmap(0, nullptr);
+#endif
+            }
+            else if (const d4r::dx::ExternalNetworkRr *net = engine.externalNetwork())
             {
                 // d3dhip: the front retires on the CPU, then the network runs, then the back
                 const auto started = std::chrono::steady_clock::now();
