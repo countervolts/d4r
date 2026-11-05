@@ -650,3 +650,14 @@ schedule (all slower).
   buffer end"). On the committed code that does not reproduce: 1 MB blocks of 0xFF before every F weight buffer
   and after the parameter area leave all 8 replay frames byte-identical. The agent most likely compared different
   code objects (its RR2_FLOW build against one without it).
+- **Measured, not pursued yet: L's input stage as HIP on d3dhip.** L's D3D12 `enc0_l_planes` reads only buffers
+  (the feature slots `featsL`, per 8x8 block 64 pixels x 32 FP8 bytes; weights) and writes the skip (channel-linear,
+  token * 32 + channel) and the network's tokens in NGX's planes, so HIP could take it; the expansion
+  (`dec0_l_planes`) writes four textures (feat, gates, mix, cov), which HIP cannot. ZLUDA's native tail
+  (kernels/tex/enc0l_tail.hip: embedding, the C32 Swin block, skip, patch merge) has exactly those outputs and
+  layouts. Standalone (C:\d4r-hc\tmp\lhip: a loader from the featsL layout into the tail's shared-memory layout, then
+  `d4r_enc0l_tail`; random weights, timing only) on the RX 9070 XT: 416 us at the 1280x736 token grid, 921 us at
+  1920x1088, against D3D12's 469 / 1160 (188 VGPRs, occupancy 8, no scratch). Four waves (D4R_TEX_PARALLEL_WINDOWS)
+  433 / 960; SWIN_TOK_WPAIR and -mcumode 412 / 912. So -55 us (-2.4% of L) at 1440p and -250 us (-4.8%) at 4K, for
+  packaging NGX's enc0 weights, a shared featsL / skipL and a launch in the HIP section. Left for after the Swin
+  core's two-windows-per-wave rewrite, which this tail would share.
