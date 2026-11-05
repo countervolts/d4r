@@ -56,8 +56,8 @@ What didn't (journal):
 What's left, largest first:
 - **RR F's translated stages.** D3D12 ablations at 720p -> 1440p (4.03 ms): enc0 0.66, post 0.56, dec0_0 0.48, dec0_1
   0.47, gather 0.40 ms. Their FP8 conversions are now one clamp + one conversion per element on both APIs; the rest is
-  translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 now runs as HIP (944bd20); dec0_1 stays SPIR-V,
-  because its HIP port needs image stores on the pipeline-binary path.
+  translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 now runs as HIP (944bd20); dec0_1, the gather and post stay SPIR-V,
+  because HIP needs raw image descriptors, which games' devices lack (BLOCKERS; dec0_1 measured at -52 us with them).
 - **RR F's D3D12 network.** The same stages as HIP run 1.61 ms on vkhip against 2.05 ms as DXIL (AMD's D3D12 compiler:
   per-element clamps the HIP kernels avoid, more registers). d3dhip would carry the HIP version into D3D12 games, but
   its two cross-API fence waits cost ~0.6 ms here (prototype: 4.13 against 3.87 ms end to end), more than it gains.
