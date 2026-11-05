@@ -107,6 +107,20 @@ build_hip() {
             break
         fi
     done
+    # Windows hosts (Git Bash / MSYS2) only, fast set only: kernels/windows-flags.txt can replace a kernel's flags for
+    # a target, tuned for AMD's Windows HIP runtime and Vulkan driver. Linux builds never read it.
+    case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        if [[ "$ACCURACY" == 0 && -f "$HERE/windows-flags.txt" ]]; then
+            local line
+            for tag in "$ARCH" "${ARCH%??}"; do
+                line="$(awk -v t="$tag" -v n="$name" '$1 == t && $2 == n { sub(/^[^ ]+ +[^ ]+ */, ""); print; exit }' \
+                    "$HERE/windows-flags.txt" | tr -d '\r')"
+                if [[ -n "$line" ]]; then flags="$line"; break; fi
+            done
+        fi
+        ;;
+    esac
     [[ "$ACCURACY" == 1 ]] && extra+=" -DD4R_ACCURACY"
     [[ "${D4R_WMMA_SOFT:-0}" == 1 ]] && extra+=" -DD4R_WMMA_SOFT"
     # shellcheck disable=SC2086

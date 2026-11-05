@@ -105,6 +105,8 @@ def run_once(case, matrix, runtime, run_dir):
     result['samples'] = [round(s, 4) for s in measured]
     if out.exists():
         result['out_sha256'] = hashlib.sha256(out.read_bytes()).hexdigest()
+        if not os.environ.get('BENCH_KEEP_OUTPUT'):
+            out.unlink()  # 30-130 MB per run; a full matrix filled 75 GB (BENCH_KEEP_OUTPUT=1 keeps them)
     result['ok'] = code == 0 and result['route_ok'] and len(measured) >= matrix['measured'] * 0.9
     return result
 

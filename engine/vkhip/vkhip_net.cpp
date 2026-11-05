@@ -470,6 +470,16 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
         if (it == files.code.end()) { error = names[i] + ".hsaco missing"; return false; }
         if (!modules[i].parse(it->second)) { error = names[i] + ": " + modules[i].error; return false; }
         if (i == 0) n.resetWindowCycle = global32(modules[i], "d4r_reset_window_cycle", 0) != 0;
+        // gfx12: enc0 / dec0 built without the attention -> residual barrier (pwin_pos.h POS_HB_SYNC) race between
+        // waves, rarely on HIP but in 5-25% of 600-frame 4K runs here (their spills skew the waves); such packages
+        // stay on the engine's network unless D4R_VKHIP_SCRATCH=1
+        const bool gfx12 = modules[i].mach == gfx12Mach(120000) || modules[i].mach == gfx12Mach(120001);
+        const char* scratchEnv = std::getenv("D4R_VKHIP_SCRATCH");
+        if (gfx12 && (names[i] == "dltss_pwin_enc0_layer" || names[i] == "dltss_pwin_dec0_layer") &&
+            global32(modules[i], "d4r_pos_hb_sync", 0) == 0 && !(scratchEnv && scratchEnv[0] == '1')) {
+            error = names[i] + ".hsaco predates the gfx12 cross-wave barrier (rebuild with kernels/build.sh k on Windows)";
+            return false;
+        }
         if (modules[i].mach != (files.mach ? files.mach : modules[0].mach)) {
             error = names[i] + ".hsaco was built for another GPU (rebuild the engine models)"; return false;
         }

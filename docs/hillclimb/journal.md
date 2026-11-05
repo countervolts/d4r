@@ -217,3 +217,29 @@ schedule (all slower).
   cdc0787, vk-K-4k 2.922 against 2.916), and the trim change of 2291ccc is reverted (it only lowered the rate). The
   opt-in route keeps its speed (1.105 ms at 1440p). Spill-free gfx12 K layers are what would make it safe: a kernel
   change (register pressure in pwin_layer.h / pwin_pos.h) for a later iteration.
+- **Found the K race: a missing barrier in `pos_core`** (kernels/k/pwin_pos.h, enc0 and dec0). In the default path
+  (no `POS_VSHARE`), every wave computes V for each head from the `hb` rows of all 64 tokens; after the head loop it
+  rewrites its own `hb` rows (residual -> MLP input) with no barrier between, so a wave that finishes its heads first
+  overwrites rows another wave is still reading. `pwin_pos_recompute.h` has exactly this barrier ("All attention
+  readers finish before the shared input rows are reused"); `pwin_layer.h` reads only its own rows or syncs per head.
+  How it showed: the Windows-flag kernels diverged through d3dhip too (dx-K-q1440: 2 of 6 bench runs, then 1 of 40
+  interleaved runs; control 0 of 68), and later the *control* (the sources' gfx12 flags, the committed d3dhip default)
+  diverged once in 6 bench runs. Through vkhip at 4K (600 frames, `D4R_VKHIP_SCRATCH=1`) the unfixed kernels diverged
+  in 2 of 24; with the barrier, **64 of 64 identical**, the same hash as the race-free runs. The scratch through
+  pipeline binaries was innocent; the spills just skew the waves.
+- Fix: `POS_HB_SYNC` (barrier plus a `d4r_pos_hb_sync` marker global), set for gfx1201 and gfx12 enc0/dec0 in
+  kernels/windows-flags.txt (the shared flag lines, Linux and gfx11 compile unchanged; with the macro unset the
+  preprocessor output is identical). Code of the nine other layers unchanged (objdump). enc0 scratch 132 -> 108 B.
+  vkhip: gfx12 scratch back on by default (`D4R_VKHIP_SCRATCH=0` refuses); vkhip_net refuses gfx12 enc0/dec0 without
+  the marker ("predates the gfx12 cross-wave barrier"), so old packages stay on the Vulkan network (checked: 1.654 ms,
+  network on Vulkan) and new ones take vkhip (1.084 ms at 720p -> 1440p).
+- d3dhip with the Windows-flag + barrier kernels (bench, 3 rounds): dx-K-1440 1.304 -> 1.285 (-1.48%), dx-K-4k 2.743
+  -> 2.693 (-1.81%), dx-K-q1440 1.335 -> 1.306 (-2.17%), rgb10 -1.21%; candidate single-hashed everywhere.
+- **Kept: the barrier, the Windows flag file, vkhip K by default again on gfx12.** Full matrix (3 rounds) against
+  7c029f0: vk-K-1440 1.653 -> 1.085 (-34.36%), vk-K-4k 2.955 -> 2.378 (-19.53%) (lane B, the route of cdc0787 whose
+  output checks stand: the fixed kernels give the race-free hash), dx-K-1440 -1.38%, dx-K-4k -1.46%, dx-K-q1440 -1.51%,
+  dx-K-1440-rgb10 -1.96% (identical); all other cases within noise and identical; every candidate side single-hashed.
+  Score 2.654 -> 2.557 (d3d12 2.499 -> 2.489, vulkan 2.819 -> 2.628). Local packages models\k and k-ldr now hold the
+  kernels/build.sh k set built on Windows (k-gfx1201-sync2).
+- Disk: bench.py kept every run's raw output (30-130 MB) in its work folder; 75 GB filled C: and broke a matrix run.
+  It now deletes them after hashing (`BENCH_KEEP_OUTPUT=1` keeps them); the old work folders were removed.

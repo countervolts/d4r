@@ -470,16 +470,15 @@ std::vector<uint8_t> palBinary(const std::vector<uint8_t>& f, const Module& modu
     for (size_t k = 0; k < map->a.size(); ++k)
         map->a[k] = Mp::uint(k >= kernel.kernargSgpr && k < kernel.kernargSgpr + 2 ? push + k - kernel.kernargSgpr : 0xffffffffu);
     if (lds->u < kernel.lds) { why = "donor LDS smaller than the kernel's"; return {}; }
-    // Scratch on gfx12, experimental (D4R_VKHIP_SCRATCH=1): flat scratch is architected there, so the pipeline's
+    // Scratch on gfx12 (D4R_VKHIP_SCRATCH=0 refuses it): flat scratch is architected there, so the pipeline's
     // scratch_en / scratch_memory_size (bytes per lane, the kernel descriptor's private segment size; LLPC writes the
     // same unit) let the driver set the kernel's scratch up as for a spilling LLPC shader (the kernel descriptor still
-    // enables only the kernarg pointer). The gfx1201 K layers spill (enc0 132 B, dec0 104, dec1 40, dec2 44) and run
-    // much faster this way (RX 9070 XT, 26.10.1, 720p -> 1440p: K 1.65 -> 1.11 ms), but not reliably: at 1080p -> 4K,
-    // 5-25% of 600-frame runs diverged slightly (a glitch the history spreads), whatever the scratch size (1x-32x),
-    // barriers or grid trimming, while the same kernels through HIP (d3dhip) and M's scratch-free layers through this
-    // path were deterministic. So off by default; gfx11 stays refused.
+    // enables only the kernarg pointer). The gfx1201 K layers spill (enc0 108 B, dec0 104, dec1 40, dec2 44) and run
+    // much faster this way (RX 9070 XT, 26.10.1, 720p -> 1440p: K 1.65 -> 1.11 ms). The rare run-to-run differences
+    // first blamed on this path were a cross-wave race in enc0 / dec0 themselves (pwin_pos.h, POS_HB_SYNC), which the
+    // spills made more likely; vkhip_net refuses K layers without that barrier on gfx12. gfx11 stays refused.
     const char* scratchEnv = std::getenv("D4R_VKHIP_SCRATCH");
-    const bool scratchOk = kernel.scratch && scratchEnv && scratchEnv[0] == '1' &&
+    const bool scratchOk = kernel.scratch && !(scratchEnv && scratchEnv[0] == '0') &&
                            (module.mach == gfx12Mach(120000) || module.mach == gfx12Mach(120001));
     if (kernel.scratch && !scratchOk) { why = "kernel uses scratch (not supported through pipeline binaries)"; return {}; }
     // gfx10.3 has these modes in the same rsrc1 bits as gfx11

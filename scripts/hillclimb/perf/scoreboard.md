@@ -45,3 +45,5 @@ fd6c117 score=- / 2.810 / - worst=dx-K-1440 1.372 (unchanged) K's Vulkan network
 e4fd9a5 score=- / - / - (dx-K geomean 1.650 -> 1.577) worst=dx-K-4k -1.95% d3dhip K by default on RDNA4: dx-K-1440 -5.40%, dx-K-4k -1.95%, dx-K-q1440 -5.32%, dx-K-1440-rgb10 -5.11% (lane B; Cyberpunk check blocked, BLOCKERS)
 cdc0787 score=- / 1.628 (K cases) / - worst=dx-K-1440 +0.02% K on vkhip in the native Vulkan frontend, scratch on gfx12: vk-K-1440 1.652 -> 1.107 (-32.97%), vk-K-4k 2.938 -> 2.392 (-18.57%) (lane B; 4K nondeterminism fixed in the next commit)
 2291ccc score=- / - / - worst=vk-K-1440 +0.62% full grids for vkhip K on AMD's driver (noise-level cost; did not fix the race, reverted in the next commit)
+ed58f6e score=- / - / - worst=- tool only: vk_pipeline_stats writes the pipeline binary (VKSTATS_ELF)
+7c029f0 score=- / - / - worst=vk-K-4k +0.6% vkhip scratch opt-in: K's Vulkan route back on the Vulkan network, byte-identical to before cdc0787 (vk-K-4k 2.916 -> 2.922)

@@ -1,0 +1,16 @@
+# kernels/build.sh reads this on Windows hosts only (Git Bash / MSYS2), for the fast set only: TARGET KERNEL FLAGS
+# replaces KERNEL's per-target flag line from its source when building for TARGET (a full target such as gfx1201, or
+# gfx12 for every gfx12 target). Linux builds keep the sources' flag lines, which were tuned the other way.
+#
+# gfx1201 (RX 9070 XT, AMD 26.10.1, HIP SDK 7.14), 2026-11-05: from one-flag sweeps of the K layers on vkhip (Vulkan)
+# and d3dhip (D3D12), against the sources' gfx12 lines: dx-K-1440 -1.5%, dx-K-4k -1.8%, dx-K-q1440 -2.2%, the same
+# output. -DPOS_HB_SYNC (enc0, dec0) is a fix, not a tuning: the barrier between pos_core's attention and residual
+# (kernels/k/pwin_pos.h). Without it the waves of a window race, rarely through HIP (1 in ~70 runs) and in 5-25% of
+# 4K runs through vkhip's pipeline binaries, which refuse gfx12 enc0 / dec0 without it (docs/experimental-vkhip.md).
+gfx1201 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -mllvm -amdgpu-set-wave-priority -DPOS_HB_SYNC
+gfx1201 dltss_pwin_enc2_layer -DPWIN_VEC_FROM_WEIGHTS -DPWIN_NORM_OWNER -mllvm -amdgpu-set-wave-priority
+gfx1201 dltss_pwin_dec0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_NORM_LANE -DPOS_HB_SYNC
+gfx1201 dltss_pwin_dec4_layer -DPOS_NORM_LANE
+# the other gfx12 targets (gfx1200): the sources' gfx12 lines plus the fix
+gfx12 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC
+gfx12 dltss_pwin_dec0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC
