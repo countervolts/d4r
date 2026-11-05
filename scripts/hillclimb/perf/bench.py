@@ -19,6 +19,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -136,6 +137,27 @@ def other_gpu_load():
     return sum(v for _, v in busy), busy
 
 
+class GpuWatch:
+    """Samples other processes' GPU use in the background for the length of a case (each sample is two 1 s counter
+    readings), keeping the worst sample and who caused it."""
+    def __init__(self):
+        self.worst, self.users, self.samples = 0.0, [], 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+    def _run(self):
+        while not self._stop.is_set():
+            load, users = other_gpu_load()
+            self.samples += 1
+            if load > self.worst:
+                self.worst, self.users = load, users
+    def __enter__(self):
+        self._thread.start()
+        return self
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=30)
+
+
 def summarize(runs):
     good = [r for r in runs if r.get('ok')]
     if not good:
@@ -160,7 +182,7 @@ def main():
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--cases', default='.', help='regex on case ids')
     parser.add_argument('--rounds', type=int, default=None)
-    parser.add_argument('--work', default='D:/d4r-hc/bench')
+    parser.add_argument('--work', default='C:/d4r-hc/bench')
     parser.add_argument('--out', default=None)
     a = parser.parse_args()
     matrix = load_matrix(a.matrix)
@@ -177,6 +199,7 @@ def main():
                 time.sleep(60)
                 load, users = other_gpu_load()
         runs = {'control': [], 'candidate': []}
+        watch = GpuWatch().__enter__()
         for r in range(rounds):
             order = ['control', 'candidate', 'candidate', 'control']
             if r % 2:
@@ -188,17 +211,18 @@ def main():
                 flag = '' if res['ok'] else f"  INVALID exit={res['exit']} route={res['route_ok']} n={res['n']}"
                 print(f"{case['id']:<22} {side:<9} r{r} {res.get('median', float('nan')):7.3f} ms "
                       f"p99 {res.get('p99', float('nan')):7.3f}{flag}", flush=True)
+        watch.__exit__()
         ctl, cand = summarize(runs['control']), summarize(runs['candidate'])
-        after, users_after = other_gpu_load()
-        entry = {'case': case, 'control': ctl, 'candidate': cand, 'other_gpu_after': users_after,
-                 'busy': after > matrix.get('max_other_gpu', 10),
+        after, users_after = watch.worst, watch.users
+        entry = {'case': case, 'control': ctl, 'candidate': cand, 'other_gpu_worst': users_after,
+                 'other_gpu_samples': watch.samples, 'busy': after > matrix.get('max_other_gpu', 10),
                  'runs': {s: [{k: v for k, v in r.items() if k != 'samples'} for r in rs] for s, rs in runs.items()}}
         if ctl.get('median') and cand.get('median'):
             entry['delta'] = cand['median'] / ctl['median'] - 1
             entry['identical'] = ctl['hashes'] == cand['hashes'] and len(ctl['hashes']) == 1
             noise = max(ctl['spread'], cand['spread'])
             if entry['busy']:
-                print(f"!! {case['id']}: other GPU users at the end {users_after}: result unreliable", flush=True)
+                print(f"!! {case['id']}: other GPU users during the case {users_after}: result unreliable", flush=True)
             print(f"== {case['id']}: control {ctl['median']:.3f}  candidate {cand['median']:.3f}  "
                   f"({100 * entry['delta']:+.2f}%, spread {100 * noise:.2f}%, identical={entry['identical']})",
                   flush=True)

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Control = 'D:/d4r-hc/rt-ctl',     # portable d4r folder of the last kept build
-    [string]$Candidate = 'D:/d4r-hc/rt-cand',  # the tree under test (filled by -Build)
+    [string]$Control = 'C:/d4r-hc/rt-ctl',     # portable d4r folder of the last kept build
+    [string]$Candidate = 'C:/d4r-hc/rt-cand',  # the tree under test (filled by -Build)
     [string]$Cases = '.',                      # regex on matrix.json case ids
     [int]$Rounds = 0,                          # default: matrix.json's
     [string]$Out,
@@ -9,7 +9,7 @@ param(
 )
 # The hill climb's single entry point (docs/hillclimb/performance.md): optionally builds the current tree's shim
 # into the candidate runtime folder, then runs bench.py's interleaved control/candidate matrix. The runtime folders
-# are portable d4r folders whose engine\ is the shared model directory (D:\d4r-hc\models, HIP layers included).
+# are portable d4r folders whose engine\ is the shared model directory (C:\d4r-hc\models, HIP layers included).
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
 if ($Build) {

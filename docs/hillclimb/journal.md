@@ -101,3 +101,39 @@ schedule (all slower).
   The matrix pins D3D12 SR on DXIL (the installed packages' route).
 - `D4R_PREFER_ACCURACY=1` does not change D3D12 M at all (byte-identical to the fast set, same time): the D3D12 M
   engine has one set. The -acc cases stay in the matrix as the exact-set guard for any lane B change.
+
+### 2026-11-04: Vulkan candidates (benchmarks interleaved after the GPU was free)
+
+- **Contamination**: from 21:14 three `whisper-cli.exe` jobs (someone else's `worker3.sh slice_[pqr].tsv`, ~60% GPU
+  each) ran until ~21:30. The Vulkan self-noise run made in that window is discarded. bench.py now samples the GPU
+  engine counters before each case, waits while other processes use more than `max_other_gpu` (10%), and marks a case
+  `busy` if they appear during it. Never kill other users' jobs.
+- **RR F on vkhip by default with AMD's driver** (shim: `engine_rr_vkhip_capable`, F stays opt-in under RADV). Also
+  fixed: `ExperimentalRrVkHip = auto` (d4r.ini.default's own value) was parsed as `true` with a "must be true or
+  false" note; auto now keeps the default.
+- **K's vkhip network in the native Vulkan frontend** (`create_engine_vkhip_k`, `NativeVkEngineState::kVkHip`): the
+  vkd3d-proton adapter had it, the native Vulkan frontend never wired it.
+- **Preset L's matrix stages on LLPC through `spirv-opt -O`**: the LLPC crash on L's FP8 cooperative-matrix modules
+  (`enc0_l*.spv`, `dec0_l*.spv`, and the network layers `m_*.spv`) goes away after SPIRV-Tools' `-O`, exactly as it
+  did for RR F's `enc0_llpc.spv`. The unoptimised module still segfaults (checked, `d4r-m` on a package without the
+  dot2 plane files). `d4r-m` replay, 1280x720 -> 2560x1440 (GPU shared with the whisper jobs, so absolute numbers
+  are high): input 613 / expansion 473 us (matrix, vkhip) against 2158 / 1832 (soft dot2); vkhip == hip
+  byte-identical; PSNR against the D3D12 engine 51.75 / 51.83 dB (frames 0 / 3) against the soft-dot2 route's
+  51.22 / 48.67 dB. The internal Vulkan matrix network (no vkhip) also compiles and runs then (51.6-53.0 dB against
+  D3D12), which also removes the "Vulkan network fallback crashes on LLPC" known failure for L packages that have
+  the `_llpc` files. Harness (pan scene, 200 frames, single run): L 1440p 5.153 -> 2.275 ms. Lane B for the Vulkan
+  L route on AMD's driver (it changes that route's arithmetic from soft dot2 back to the matrix stages RADV runs);
+  output against the pan scene's analytic truth (4x4 supersampled, `D:\d4r-hc\tools\pan_truth.py`): 27.85 dB
+  against 27.83 dB for soft dot2, finite, same mean/std. The D3D12 path and RADV are untouched.
+- LDR HIP packages built (`compile_m.py --ldr --hip`, `compile_k.py --ldr --hip`) into D:\d4r-hc\models\{k,m,l}-ldr
+  (were junctions to the installed packages without HIP layers).
+
+### 2026-11-05: workspace moved to C:\d4r-hc
+
+- D: went away overnight (the queued Vulkan benchmarks died with it and were contaminated by other GPU work before
+  that). C: now has ~199 GB free, so the whole workspace lives in `C:\d4r-hc` (copied from D:, junctions re-pointed,
+  bench scripts and `runs/*.sh` repointed). Kernels and tools were rebuilt there too.
+- bench.py now samples other processes' GPU use throughout each case (`GpuWatch`, a background thread), not only
+  before and after; a case with another user above 10% at any sample is marked `busy`.
+- The working tree also carries someone else's uncommitted D3D12 K input-copy work (`engine/d3d12/game_d3d12.cpp`,
+  `prepare_live_k.py`, `replay_d3d12.cpp`, "black speckles"); it is not part of this climb's commits.
