@@ -530,3 +530,25 @@ schedule (all slower).
   - Flags cleared every evaluation, as vkhip_net's M chain does.
   Not started: race-prone work that needs its own validation (repeated runs, byte-identical against the barrier
   build).
+
+### 2026-11-05 (afternoon): d3dhip only (owner: focus on d3dhip K, M, L, RR F; numerics may change)
+
+- Current d3dhip profiles, harness 1280x720 -> 2560x1440 (`D4R_PROFILE=1`, rt-cand14): K 1.36 ms (input 0.09,
+  network + handoff 0.76, output 0.47-0.53); M 1.61 (input 0.11, network 0.97-1.01, expansion 0.08, reconstruction
+  0.30-0.36, downsample 0.10); L 2.27-2.47 (input 0.49-0.54, network 0.93-0.96, expansion 0.35-0.42, reconstruction
+  0.37-0.44, downsample 0.10); RR F on DXIL 4.0 (gather + enc0 0.82, network ~2.1, dec0 0.93, output 0.63).
+- **Why the first d3dhip RR F prototype lost**: REngine's external-network front (runtime_rr2_d3d12.inc
+  `recordFront`) dispatched every network stage in DXIL as well (`dispatchStages(0, R2Network)`), so the frame ran
+  the network twice. Up to `R2Dec0B` instead: replay front 1.25 -> 0.78-0.82 ms, frame 3.72-3.80 against DXIL
+  3.86-4.01 (74ae648, which also adds the per-parity HIP graphs and the shared-fence path). A shared arena alone
+  (`D3D12_HEAP_FLAG_SHARED`) did not slow the DXIL stages.
+- **Kept (lane B): RR F on d3dhip in the shim** (947afda): dx-RRF-1440 -6.11%, dx-RRF-4k -7.17% (numbers in the commit).
+  Split per part (D4R_PROFILE): front ~0.95, external_network_wait ~2.0, back ~1.2 ms at 1440p (the profiler's own
+  marks add a little). The harness has no D3D12 debug-layer switch; the smoke ran without it.
+- GPU sharing between agents: `C:\d4r-hc\tools\gpulock.sh` (a directory lock) wraps every timed run;
+  `C:\d4r-hc\tools\ab.sh` runs C X X C rounds of one.sh cases under it. Helper agents (DeepSeek V4.1 Flash, own
+  worktrees, briefed through `C:\d4r-hc\AGENTS-BRIEF.md`) work on: RR F's enc0 inside the HIP section, L's two plane
+  stages' DXIL, and K's output / M's reconstruction DXIL.
+- The working tree still has another session's K input copies in game_d3d12.cpp (on by default, D4R_K_DIRECT_INPUTS=1
+  turns them off). Shims built from this tree carry them, so K timings from such a shim are not comparable with
+  committed builds.
