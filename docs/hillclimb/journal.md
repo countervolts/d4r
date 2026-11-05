@@ -634,3 +634,19 @@ schedule (all slower).
   code objects and was measured here too. Package hip/ kernels = `kernels/build.sh m` with
   `D4R_GPU_ARCH=gfx1201 D4R_VKHIP_LAYERS=1 D4R_NATIVE_FP8=1` (ISA-identical to the shipped ones); hsaco files embed
   their source path, so compare `llvm-objdump -d` output, not bytes.
+- **Tried, rejected: RR F's d3dhip network as a per-block dataflow chain** (helper agent-rrflow; report and patch in
+  `C:\d4r-hc\agents\agent-rrflow`). Chained stages launched with `hipExtAnyOrderLaunch`; each block waits for the
+  producer blocks of its own input rectangle (one 32-byte flag per block, a frame-generation word, so no clears),
+  with the plan derived per frame from the stages' arena pointer words and geometry. A stage joins the chain only
+  if it writes nothing its predecessor (or the chain's first stage) reads or writes, since regions are reused
+  within a frame (region 1024: enc2, dec1_0, dec0_0). Mirror-aware producer ranges; at most three stages a chain.
+  20 of 20 runs (8 frames x 15 repeats) byte-identical to the graph build. But: replay network 2211 -> 2191 us
+  (-0.9%), harness -0.08%. The no-wait bound (wrong output) is -11.5% of the network, yet the isolated stages
+  already sum to 2090 of ~2230 us: all fourteen barriers cost only ~110-180 us, and most of the bound came from
+  overlapping stages that really depend on each other. Encoder chains: no gain, and about 1 run in 20 stalled
+  9.5 ms (a 3807-block producer still has blocks unscheduled while consumer blocks spin in their slots; M's grids
+  fit one dispatch, so M never hits this). A single fifteen-stage chain with an N-2 rule: no gain either.
+  The agent also reported the graph build's output changing with HIP's allocation layout ("a stage reads past a
+  buffer end"). On the committed code that does not reproduce: 1 MB blocks of 0xFF before every F weight buffer
+  and after the parameter area leave all 8 replay frames byte-identical. The agent most likely compared different
+  code objects (its RR2_FLOW build against one without it).
