@@ -155,3 +155,39 @@ schedule (all slower).
   (4K), byte-identical (lane A). Remaining u16 loads come from the merge/expand/embed/head B operands and the bias
   tiles (accumulator layout, 16 equal rows): `D4R_LLPC_LOADS` transposes those too (`weights_llpc.bin`) and reads bias
   tiles with stride 0: dec5 208 -> 54 u16 loads, enc3 544 -> 48.
+
+### 2026-11-05: profiles, D3D12 K output, d3dhip K
+
+- **Tool install**: Radeon GPU Analyzer 2.15 (GPUOpen-Tools' GitHub release `rga-windows-x64-2.15.zip`, unpacked
+  user-level into `C:\d4r-hc\.tools\rga`, profiling only). `rga -s dx12 -c gfx1201 --cs-blob X.dxil --isa ... -a ...`
+  gives the ISA and register/scratch statistics of a DXIL shader as AMD's D3D12 compiler builds it (AGS WMMA works).
+- Profiles at 720p -> 1440p (shim `D4R_PROFILE=1`, rt-cand5): D3D12 K 1.362 (input 0.089, network layers 0.789:
+  enc0 0.130, dec0 0.127, dec1 0.100, enc1 0.085; **output 0.472**), D3D12 M 1.665 (network 1.041, recon 0.300),
+  D3D12 L 2.449 (input 0.495, net 1.027, expansion 0.364, recon 0.379), D3D12 RR F 4.118 (enc0 0.840, dec0 0.948,
+  dec1 0.466, output 0.683). Vulkan: L 2.249, RR F 3.765 (net 3.177), M 1.423 (net 0.798), K 1.65 (recon 0.371).
+- D3D12 M per layer against its vkhip twin (us): enc1 204/205, enc2 135/98, tube 48-70/35, dec2 132/90, dec1 200/180.
+  RGA: no scratch in any M DXIL layer. M DXIL `WPW=2` (two windows per wave): not identical and slower (network
+  1015 -> 1073 us): rejected.
+- RGA on D3D12 output_k: 118 VGPRs, 3042 instructions, no packed f16 (AMD's DXIL compiler scalarises SM 6.6 half
+  vectors; the Vulkan build of the same stage has 69 VGPRs and packed f16). SM 6.9 is not an option for games.
+  K network DXIL layers: no scratch except dec5 (48 B).
+- **output_k as wave32** (D3D12): 1.424 against 1.377 ms and not byte-identical: rejected.
+- **output_k ablation** (timing only, wrong output): the 12-tap filter cut to 3 taps saves 0.14 ms (so the filter
+  costs ~0.19 ms), the luma-history Catmull-Rom removed saves 0.10 ms; tile load, motion, blend and stores ~0.18 ms.
+- **K HIP kernels on gfx1201 spill under every flag set tried** (enc0 84-144 B, dec0 48-104 B, dec1 40-48 B, dec2
+  32-44 B; enc2 also spills with `PWIN_NORM_OWNER`), so the vkhip pipeline-binary route (which refuses scratch) stays
+  closed for Vulkan K.
+- **d3dhip K on RDNA4**: `D4R_D3DHIP_K=1` (opt-in, written for RDNA3 26.10.1) on the RX 9070 XT: 1.300 against
+  1.377 ms at 720p -> 1440p, 2.700 against 2.773 at 1080p -> 4K (interleaved, 2x2 runs). Not byte-identical to the
+  DXIL network (different implementation: HIP accumulates in f32 where the DXIL layers accumulate in f16), so lane B.
+  Harness quality scene (static and panning 3,1 px/frame, 60 frames): psnr 22.12 / 10.34 dB, blinds 24.36 / 7.12,
+  flicker 0.00500 / 0.30493 against DXIL's 22.13 / 10.34, 24.36 / 7.12, 0.00501 / 0.30493: the same.
+- gfx1201 HIP K flag sweep (24 one-flag variants from the gfx11 Windows set, each swapped into the package, C X X C):
+  all byte-identical, all within the d3dhip route's run-to-run spread (+-0.02 ms); nothing clearly faster.
+- **Kept (lane B): d3dhip K by default on RDNA4** in the fast set (`D4R_D3DHIP_K` default 2; `0` keeps DXIL;
+  PreferAccuracy keeps DXIL, byte-identical to before). bench.py (3 rounds C X X C): dx-K-1440 1.371 -> 1.297
+  (-5.40%), dx-K-4k 2.799 -> 2.744 (-1.95%), dx-K-q1440 1.406 -> 1.331 (-5.32%), dx-K-1440-rgb10 1.374 -> 1.304
+  (-5.11%); candidate spreads up to 2.4% (the cross-queue handoff is noisier, p99 a little higher). LDR K 1.318 ->
+  1.238, 55.5 dB against DXIL; HDR 57.2 dB, finite, same mean/std. The Cyberpunk check is blocked (BLOCKERS:
+  release installs that windows-game.ps1 refuses). The HIP kernels are built by our LLVM, so AMD's Cyberpunk D3D12
+  application profile (the half-accumulation hazard) cannot reach them, but the in-game check is still owed.

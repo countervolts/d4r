@@ -15,7 +15,13 @@ d3dhip's handoff is now GPU-side: the split's front fence is created shared, imp
 semaphore (`HipNetworkDx::useFence`), and `launchAfter(wait, signal)` queues the semaphore wait, the network and the
 signal on HIP's stream; the game's queue waits for the signal before the back. No CPU wait between the parts. Output is
 byte-identical to the CPU-serialized handoff (48 of 48 replay files). `D4R_D3DHIP_SYNC=cpu` restores the old handoff.
-Preset K's d3dhip is opt-in, `D4R_D3DHIP_K=1` (DXIL remains faster on 26.8.1).
+Preset K's d3dhip is opt-in on RDNA3, `D4R_D3DHIP_K=1` (DXIL remains faster on 26.8.1). On RDNA4 it is the default
+in the fast set when the package has HIP layers (`compile_k.py --hip` with a gfx1201 kernel folder; the release
+packages have none yet); `D4R_D3DHIP_K=0` keeps the DXIL network, and `[Kernels] PreferAccuracy = true` keeps it too.
+RX 9070 XT, 26.10.1, harness, interleaved: 1.371 -> 1.297 ms at 1280x720 -> 2560x1440, 2.799 -> 2.744 at 1080p ->
+4K, 1.406 -> 1.331 at 1706x960 -> 2560x1440. The HIP network's arithmetic differs from the DXIL network's (f32
+against f16 accumulation): the output is not byte-identical (57 dB against the DXIL route on the motion scene, the same
+quality-scene PSNR, blinds and flicker).
 
 ## Results
 
