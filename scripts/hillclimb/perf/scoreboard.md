@@ -3,11 +3,12 @@
 One line per kept commit: `<sha> score=<geomean ms D3D12 / Vulkan / headline> worst=<case ±%> note`.
 Method and matrix: bench.py / matrix.json; journal: docs/hillclimb/journal.md.
 
-## Summary (2026-11-05, stopped at the plateau condition; game checks still owed)
+## Summary (2026-11-05, updated after the post-plateau round; game checks still owed)
 
 Stopped under performance.md section 8's plateau rule: the last 10 iterations, across K's network scheduling, the
-d3dhip handoff, RR F's HIP stages, M's flags, L's front stages and the stage wave sizes, kept nothing (journal). What
-is left above 5% of a case needs a kernel project (below). **No result is confirmed in game yet**: the game folders
+d3dhip handoff, RR F's HIP stages, M's flags, L's front stages and the stage wave sizes, kept nothing (journal). The
+stop was rejected (>5% items untried); the round after it kept three FP8-conversion changes (441a237, 92ec16d,
+0f61b35). What is left above 5% of a case needs a kernel project (below). **No result is confirmed in game yet**: the game folders
 hold release installs that `windows-game.ps1` refuses (BLOCKERS, Needs a human). Vulkan is confirmed in the harness
 only: no verified Vulkan game is installed, and Portal RTX has not been run.
 
@@ -19,18 +20,18 @@ only: no verified Vulkan game is installed, and Portal RTX has not been run.
 | dx-M-4k (DXIL / d3dhip) | 3.692 | 3.518 / 3.371 | 2.553 | 1.32x (d3dhip) |
 | dx-L-1440 (DXIL / d3dhip) | 2.433 | 2.447 / 2.334 | 1.413 | 1.65x (d3dhip) |
 | dx-L-4k (DXIL / d3dhip) | 5.376 | 5.407 / 5.251 | 3.161 | 1.66x (d3dhip) |
-| dx-RRF-1440 | 4.126 | 4.122 | 2.100 | 1.96x |
-| dx-RRF-4k | 9.089 | 9.083 | 4.658 | 1.95x |
+| dx-RRF-1440 | 4.126 | 4.061 | 2.100 | 1.93x |
+| dx-RRF-4k | 9.089 | 8.942 | 4.658 | 1.92x |
 | vk-K-1440 | 3.553 | 1.085 | 0.649 | 1.67x |
 | vk-K-4k | 5.374 | 2.378 | 1.532 | 1.55x |
 | vk-M-1440 | 1.422 | 1.431 | 1.081 | 1.32x |
 | vk-M-4k | 3.201 | 3.216 | 2.553 | 1.26x |
-| vk-L-1440 | 5.158 | 2.253 | 1.413 | 1.59x |
-| vk-L-4k | 11.315 | 5.021 | 3.161 | 1.59x |
-| vk-RRF-1440 | 4.650 | 3.786 | 2.100 | 1.80x |
-| vk-RRF-4k | 9.600 | 8.285 | 4.658 | 1.78x |
+| vk-L-1440 | 5.158 | 2.181 | 1.413 | 1.54x |
+| vk-L-4k | 11.315 | 4.886 | 3.161 | 1.55x |
+| vk-RRF-1440 | 4.650 | 3.561 | 2.100 | 1.70x |
+| vk-RRF-4k | 9.600 | 7.755 | 4.658 | 1.66x |
 
-Scores (geomean): D3D12 2.532 -> 2.489, Vulkan 4.089 -> 2.628. The matrix pins D3D12 M/L on DXIL (installed packages
+Scores (geomean): D3D12 2.532 -> 2.480, Vulkan 4.089 -> 2.561. The matrix pins D3D12 M/L on DXIL (installed packages
 have no HIP layers); d3dhip, the default with HIP packages, is the second figure.
 
 What helped:
@@ -41,6 +42,8 @@ What helped:
 - K on vkhip in the native Vulkan frontend (cdc0787), made safe by finding the cross-wave race in K's enc0 / dec0
   (79b9ee4, which also adds the Windows kernel flag file).
 - d3dhip chaining M / L's layers like vkhip (ed503cc).
+- LLPC's FP8 conversions without the per-element guard: RR F's enc0 / dec0_1 (441a237), L's front stages (92ec16d).
+- RR F's D3D12 gather encodes FP8 with the hardware conversion in uniform flow (0f61b35).
 
 What didn't (journal):
 - DXIL M two windows per wave; output_k as wave32.
@@ -50,8 +53,10 @@ What didn't (journal):
 - The CPU d3dhip handoff.
 
 What's left, largest first:
-- **RR F's enc0 / dec0_1.** Translated-PTX SPIR-V stages, about half of F's network. A HIP port needs texture sampling
-  on the pipeline-binary path.
+- **RR F's translated stages.** D3D12 ablations at 720p -> 1440p (4.03 ms): enc0 0.66, post 0.56, dec0_0 0.48, dec0_1
+  0.47, gather 0.40 ms. Their FP8 conversions are now one clamp + one conversion per element on both APIs; the rest is
+  translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 / dec0_1 stay SPIR-V: a HIP port needs texture
+  sampling on the pipeline-binary path.
 - **K's output stage.** 0.37 ms Vulkan / 0.47 DXIL, about a third of K. AMD's DXIL compiler scalarises half vectors.
 - **K's network.** A per-block dataflow chain for the deep layers is worth at most ~5% end to end (measured bound).
   The deep layers' phase kernels make it a large job.
@@ -108,4 +113,4 @@ ed58f6e score=- / - / - worst=- tool only: vk_pipeline_stats writes the pipeline
 ed503cc score=- / - / - (side matrix, D3D12 M/L on d3dhip: 2.523 -> 2.399) worst=dx-L-4k-hip -1.07% d3dhip chains M/L's layers (hipExtAnyOrderLaunch + flags): dx-M-1440-hip -9.19%, dx-M-4k-hip -1.75%, dx-L-1440-hip -4.74%, all identical (lane A); main matrix unchanged
 441a237 score=- / 2.620 -> 2.584 / 2.551 -> 2.534 worst=vk-L-4k +0.18% RR F's LLPC enc0 / dec0_1 FP8 conversions without the per-element guard (RR_LLPC_SAT): vk-RRF-1440 -5.82%, vk-RRF-4k -6.21%, every case identical (lane A on the harness; NaN / FP16_OVFL caveat in the journal)
 92ec16d score=- / 2.574 -> 2.561 (vulkan) worst=- preset L's LLPC input / expansion stages convert FP8 with a clamp (M_LLPC_SAT, normalised tokens stay guarded): vk-L-1440 -1.97%, vk-L-4k -2.82%, every case identical (FP16_OVFL caveat in the journal)
-0f61b35 score=- (single interleaved runs, full matrix owed) worst=- RR F's D3D12 gather (enc0g) hardware FP8 encode in uniform flow: dx-RRF-1440 4.09 -> 4.03 (-1.6%), dx-RRF-4k 9.04 -> 8.89 (-1.7%), identical
+0f61b35 score=2.485 -> 2.480 (d3d12; dx cases only, 3 rounds) worst=dx-K-1440 +0.71% (spread 1.26%) RR F's D3D12 gather (enc0g) hardware FP8 encode in uniform flow: dx-RRF-1440 -1.50% (spread 0.15%), dx-RRF-4k -1.55% (spread 0.36%), every case identical
