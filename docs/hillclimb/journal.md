@@ -552,3 +552,17 @@ schedule (all slower).
 - The working tree still has another session's K input copies in game_d3d12.cpp (on by default, D4R_K_DIRECT_INPUTS=1
   turns them off). Shims built from this tree carry them, so K timings from such a shim are not comparable with
   committed builds.
+- **Tried, rejected: a GPU-side d3dhip handoff (memory words instead of the shared fence)**, RR replay prototype
+  (reverted; kernels and shader in `C:\d4r-hc\tmp\spin`). An empty HIP section (wait + signal, no network) costs
+  ~140-157 us between the D3D12 front's end and the back's start; that is the handoff every d3dhip preset pays.
+  - D3D12 -> HIP: the front ends with `WriteBufferImmediate` (MARKER_OUT) of a frame number into a shared buffer; a
+    one-wave HIP kernel polls it with system-scope acquire loads. Works (HIP sees CP writes; output byte-identical),
+    empty gap 140 -> 106 us, but with the real network no end-to-end gain (3 rounds: 3.716 against 3.714 ms).
+  - HIP -> D3D12: a HIP kernel stores the frame number with a system-scope release; the back's first dispatch (one
+    thread, `globallycoherent` atomic polls, a bounded loop) waits for it. It never sees the word before its ~100 ms
+    limit, with the word in the shared device buffer and also with it in host memory (`hipHostRegister` +
+    `OpenExistingHeapFromAddress`); the HIP work then runs once the D3D12 dispatch has ended. So HIP's queue does not
+    run while the D3D12 queue executes that dispatch: the contexts are not scheduled concurrently here (HAGS is
+    block-listed on this machine), and part of the handoff is that context switch. With scheduling settings off
+    limits there is no lever left in the handoff mechanism; only fewer handoffs (none possible below two) or less
+    work across them.
