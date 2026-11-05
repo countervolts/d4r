@@ -464,3 +464,30 @@ schedule (all slower).
     Not kept.
   - post as wave32 (its shared scratch is sized for 32-wide subgroups): identical output but +20 us per group.
     Rejected.
+- **RR F's dec0_1 on vkhip without descriptor_buffer: kept.** The parked patch above, with the descriptors coming
+  from an ordinary descriptor set instead of vkGetDescriptorEXT. LLPC addresses a set's table as a user SGPR holding
+  the low dword, with the high dword taken from `s_getpc_b64` sign-extended from 16 bits (seen in post's ISA). So:
+  - A second donor, `donor_images.comp`, declares set 0 as four rgba8 storage images. AMD's driver puts that set's
+    table in one more API user-data entry next to the push constant.
+  - The HIP kernel enables the dispatch-id SGPRs (`llvm.amdgcn.dispatch.id`), and `palBinary` maps the table entry to
+    s2 (`Kernel::table`: gfx12, kernarg + dispatch id, 4 user SGPRs). `glsl_hip.h` `glslImageTable` rebuilds the
+    address as LLPC does. The kernarg goes back to 24 bytes.
+  - The code-object parser accepts a bare gfx12 `s_getpc_b64; s_sext_i32_i16` with no add pair. LLVM bundles every
+    PC-relative address, so a bare one cannot be a global's.
+  - The F loader makes one set of `surfaceF` (GENERAL) and a layout of the set plus the 8-byte push, and binds it in
+    recordStage. The engine rebinds its own set on every dispatch.
+  Checks:
+  - The replay output is byte-identical to the descriptor_buffer build, all 8 frames and every surface, so the
+    driver's table puts binding k at 32 k bytes.
+  - Against LLPC, the replay output is 64 dB on frame 0 and 53-56 dB after. Correction to the entry above: the
+    recurrent 8-bit surfaces (rec / ka / kb) do diverge after frame 0, with 35-80% of values off by more than one
+    LSB. The output does not drift.
+  - Harness, candidate against control after 160 pan frames: 49 dB, finite, same means. After 120 still frames:
+    59.4 dB. Candidate runs are deterministic (one hash over 6 runs).
+  Timing, interleaved (bench `C:\d4r-hc\bench\d1set.json`, 3 rounds; rt-ve control, rt-vd candidate, same shim):
+  - vk-RRF-1440: 3.418 -> 3.359 ms (-1.73%, spread 0.8%).
+  - vk-RRF-4k: 7.516 -> 7.378 ms (-1.83%, spread 0.81%).
+  - Replay: 3.39 -> 3.33 ms per frame.
+  Housekeeping: C: ran out of space mid-replay (14 MB free; the climb's folder is 30 GB of 954 GB). A reference run
+  wrote empty files. I deleted my own partial outputs and the rejected post-wave32 outputs (`tmp/rro_t`,
+  `tmp/rro_l`, `tmp/rrout_rrp`) and reran.

@@ -21,6 +21,16 @@ typedef int ivec2 __attribute__((ext_vector_type(2)));
 // everything in namespace glsl, so that GLSL's overloads hide HIP's math wrappers (glsl2hip.py wraps the shader too)
 namespace glsl {
 struct GlslArgs { uint64_t param, weights, arena; };
+#ifdef GLSL_IMAGES
+// A stage that writes storage images (rr2_hybrid_prep.py): their descriptors are descriptor set 0's table, which vkhip
+// (Kernel::table) hands the kernel in the dispatch id's low dword (s2). The high dword is the program counter's, as
+// LLPC forms it (s_getpc_b64; s_sext_i32_i16 of the high half).
+__device__ uint64_t glslDispatchId() __asm("llvm.amdgcn.dispatch.id");
+GD uint64_t glslImageTable() {
+    const uint32_t hi = uint32_t(int32_t(int16_t(uint16_t(__builtin_amdgcn_s_getpc() >> 32))));
+    return (uint64_t(hi) << 32) | uint32_t(glslDispatchId());
+}
+#endif
 template <class T> GD T* glslGlobal(uint64_t a) { return (T*)(__attribute__((address_space(1))) T*)a; }
 
 // ---------------------------------------------------------------- scalars

@@ -267,6 +267,7 @@ struct RStageResources {
     VkImageView surface112 = VK_NULL_HANDLE, surface120 = VK_NULL_HANDLE, surface128 = VK_NULL_HANDLE;
     VkImageView surface144[2] = {};      // per frame parity
     uint64_t scratchEnd = 0;             // enc0: the end of its gather's scratch (RGatherBytes); 0: no gather
+    VkImageView surfaceF[4] = {};        // preset F's dec0_1 (stage 15): its surfaces 176, 184, 192, 200
 };
 class REngine {
 public:
@@ -289,7 +290,8 @@ public:
     // writes it ("enc1-112", "dec0-144", "q0", ...), GENERAL layout
     struct DebugImage { std::string name; VkImage image; VkFormat format; uint32_t width, height; };
     std::vector<DebugImage> debugImages() const;
-    // The stage recorder (not owned; null: none). stageResources is D/E only (presets A - C: the stage's size);
+    // The stage recorder (not owned; null: none). stageResources is D/E only (presets A - C: the stage's size; F: dec0_1's
+    // surfaces);
     // stageParameterAddress is F and A - C only.
     void setStageRecorder(RStageRecorder* recorder);
     VkBuffer arenaBuffer() const;

@@ -361,10 +361,27 @@ blocks use Vulkan. `D4R_ENGINE_VKHIP=0` selects the Vulkan control.
 
 On Windows (AMD's driver) `build_vkhip_f.sh` also builds encoder 0, `rr2_enc0.hsaco` (2026-11-05). This is the
 hybrid stage that runs after the gather pass `enc0g`. It reads its windows from the gather's records, not from its
-textures, so `kernels/rr/enc0_hip_prep.py` drops those bindings, and `glsl2hip.py --include=glsl_hip_enc0.h` translates
+textures, so `kernels/rr/rr2_hybrid_prep.py` drops those bindings, and `glsl2hip.py --include=glsl_hip_hybrid.h` translates
 the rest. It is spill-free at 226 VGPRs. Output stays byte-identical, and vk-RRF went 3.521 → 3.412 ms at
-1280x720 → 2560x1440 and 7.731 → 7.520 ms at 4k. Linux (RADV) keeps the model's enc0, and dec0's pixel tail (dec0_1)
-stays on Vulkan.
+1280x720 → 2560x1440 and 7.731 → 7.520 ms at 4k. Linux (RADV) keeps the model's enc0.
+
+dec0's pixel tail, `rr2_dec0_1.hsaco`, is built the same way (spill-free at 211 VGPRs, `RR2_WAVES=6`). It stores
+its four surfaces (176 / 184 / 192 / 200) to storage images, which a HIP kernel can only reach through their
+descriptors. vkhip gets them there without VK_EXT_descriptor_buffer:
+
+- The pipeline is built from a second donor, `engine/vkhip/donor_images.comp`, which declares set 0 as four storage
+  images. Its layout has that set plus the 8-byte push constant (`createPipeline(..., images)`).
+- The kernel enables the dispatch-id SGPRs (`Kernel::table`). The PAL user-data map gets the set's table pointer in
+  s2, where the dispatch id's low dword would be.
+- The kernel forms the table's address as LLPC does: that low dword, and the high dword of `s_getpc_b64`
+  sign-extended from 16 bits (`glsl_hip.h` `glslImageTable`). The code-object parser lets this bare `s_getpc_b64`
+  through (it has no add pair; a global's always does).
+- The F loader writes one descriptor set of the engine's views (`RStageResources::surfaceF`) and binds it before the
+  dispatch. The engine binds its own sets on every dispatch, so nothing else sees it.
+
+The output is not byte-identical to the LLPC stage: 49 dB (pan) / 59 dB (still) against it after 120-160 harness
+frames, finite, same means. vk-RRF went 3.418 → 3.359 ms at 1440p and 7.516 → 7.378 ms at 4k. RADV keeps dec0_1 on
+Vulkan (no pipeline binaries).
 `D4R_RR_OUTPUT_ONLY=1` saves and reads back only the final image; it does not change
 frame evaluation or GPU timestamp boundaries.
 

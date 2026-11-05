@@ -12288,7 +12288,7 @@ static std::unique_ptr<vkhip::RRStages> create_engine_rr_vkhip(const std::string
         }
     else if (slot == 2)   // preset F: rr2 blocks, the model's weights rearranged for the kernels
         for (const char* stage : {"enc0", "enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1", "dec3_0", "dec3_1",
-                                  "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0"}) {
+                                  "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0", "dec0_1"}) {
             if (!only.empty() && ("," + only + ",").find("," + std::string(stage) + ",") == std::string::npos) continue;
             const std::string name = std::string("rr2_") + stage;
             std::vector<uint8_t> code, weight;

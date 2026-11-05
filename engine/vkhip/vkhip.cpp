@@ -161,9 +161,14 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         size_t j = i + 1;
         auto waits = [&] { while (gfx12 && j < n && (w[j] & S_WAIT_ALU_MASK) == S_WAIT_ALU) ++j; };
         waits();
-        if (gfx12 && j < n && w[j] == (S_SEXT_I32_I16 | ((reg + 1) << 16) | (reg + 1))) { ++j; waits(); }
+        const bool sext = gfx12 && j < n && w[j] == (S_SEXT_I32_I16 | ((reg + 1) << 16) | (reg + 1));
+        if (sext) { ++j; waits(); }
         const size_t add = j;
         bool ok = j + 1 < n && sop2Literal(w[j], S_ADD_U32, reg);
+        // gfx12's __builtin_amdgcn_s_getpc without an add: only its high dword is meant (glsl_hip.h glslImageTable,
+        // the descriptor table's high address). LLVM expands every PC-relative address as one bundle, so a global's
+        // getpc is never apart from its add pair; the low dword of this one changes with where the code is put.
+        if (!ok && sext && !(j < n && (w[j] & SOP2_OP_MASK) == S_ADD_U32)) { i = add - 1; continue; }
         j += 2; waits();
         const size_t addc = j;
         ok = ok && j + 1 < n && sop2Literal(w[j], S_ADDC_U32, reg + 1);
@@ -195,8 +200,11 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         const uint32_t ids = uint32_t(std::popcount((k.rsrc2 >> 7) & 0xfu));  // tgid x/y/z, tg size (not the wave offset)
         const bool segmentBuffer = gfx10(mach) && (k.props & 0x7f) == ((1u << 0) | (1u << 3)) && !k.scratch;
         k.kernargSgpr = segmentBuffer ? 4 : 0;
-        if (((k.props & 0x7f) != (1u << 3) && !segmentBuffer) || (k.preload & 0x7f) || user < k.kernargSgpr + 2 ||
-            (user > k.kernargSgpr + 2 && user + ids != 16)) {
+        // the kernarg pointer and the dispatch id (s[2:3], which carries a descriptor table: Kernel::table), gfx12
+        k.table = (k.props & 0x7f) == ((1u << 3) | (1u << 4)) && !segmentBuffer && user == 4 &&
+                  (mach == gfx12Mach(120000) || mach == gfx12Mach(120001));
+        if (((k.props & 0x7f) != (1u << 3) && !segmentBuffer && !k.table) || (k.preload & 0x7f) || user < k.kernargSgpr + 2 ||
+            (user > k.kernargSgpr + 2 && user + ids != 16 && !k.table)) {
             error = name + ": not a kernarg-only kernel"; return false;
         }
         if (!(k.props & (1u << 10))) { error = name + ": not wave32"; return false; }
@@ -457,18 +465,27 @@ std::vector<uint8_t> palBinary(const std::vector<uint8_t>& f, const Module& modu
         !symbol || symbol->type != Mp::Str) {
         why = "unrecognized donor metadata (driver changed?)"; return {};
     }
-    // the push constant: the donor's only API user data, two consecutive entries
+    // the push constant: two consecutive entries of the donor's API user data; with Kernel::table also descriptor set
+    // 0's table, one entry (the low dword of its address: the shader takes the high one from its program counter)
+    auto api = [&](size_t k) { return k < map->a.size() && map->a[k].type == Mp::Uint && map->a[k].u < PAL_GLOBAL_TABLE; };
     size_t sgpr = 0;
-    while (sgpr < map->a.size() && !(map->a[sgpr].type == Mp::Uint && map->a[sgpr].u < PAL_GLOBAL_TABLE)) ++sgpr;
-    if (sgpr + 1 >= map->a.size() || map->a[sgpr + 1].type != Mp::Uint || map->a[sgpr + 1].u != map->a[sgpr].u + 1) {
-        why = "donor push constant not in two consecutive user SGPRs"; return {};
-    }
+    while (sgpr < map->a.size() && !(api(sgpr) && api(sgpr + 1) && map->a[sgpr + 1].u == map->a[sgpr].u + 1)) ++sgpr;
+    if (sgpr + 1 >= map->a.size()) { why = "donor push constant not in two consecutive user SGPRs"; return {}; }
+    uint64_t table = ~0ull;
+    for (size_t k = 0; kernel.table && k < map->a.size(); ++k)
+        if (api(k) && k != sgpr && k != sgpr + 1) {
+            if (table != ~0ull) { why = "donor has more API user data than its push constant and one table"; return {}; }
+            table = map->a[k].u;
+        }
+    if (kernel.table && table == ~0ull) { why = "donor's descriptor table not in a user SGPR"; return {}; }
     const uint32_t user = (kernel.rsrc2 >> 1) & 0x1f;
     if (map->a.size() < user) { why = "donor user data map too short"; return {}; }
     const uint64_t push = map->a[sgpr].u;
-    // the push constant in the kernel's kernarg SGPRs (s[0:1], or s[4:5] behind gfx10's private segment buffer)
+    // the push constant in the kernel's kernarg SGPRs (s[0:1], or s[4:5] behind gfx10's private segment buffer); the
+    // table in the low dword of the dispatch id (s2)
     for (size_t k = 0; k < map->a.size(); ++k)
-        map->a[k] = Mp::uint(k >= kernel.kernargSgpr && k < kernel.kernargSgpr + 2 ? push + k - kernel.kernargSgpr : 0xffffffffu);
+        map->a[k] = Mp::uint(k >= kernel.kernargSgpr && k < kernel.kernargSgpr + 2 ? push + k - kernel.kernargSgpr
+                             : kernel.table && k == kernel.kernargSgpr + 2 ? table : 0xffffffffu);
     if (lds->u < kernel.lds) { why = "donor LDS smaller than the kernel's"; return {}; }
     // Scratch on gfx12 (D4R_VKHIP_SCRATCH=0 refuses it): flat scratch is architected there, so the pipeline's
     // scratch_en / scratch_memory_size (bytes per lane, the kernel descriptor's private segment size; LLPC writes the
@@ -620,9 +637,16 @@ VkPipeline palPipeline(const Device& vk, VkComputePipelineCreateInfo ci, const M
 } // namespace
 
 VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Module& module, const Kernel& kernel,
-                          Launch launch, uint64_t dataAddress, uint32_t id, std::string& error) {
+                          Launch launch, uint64_t dataAddress, uint32_t id, std::string& error, bool images) {
+    if (images != kernel.table || (images && !vk.pipelineBinary)) {
+        error = kernel.name + (images ? ": descriptor tables need AMD's driver and a kernel that reads one"
+                                      : ": the kernel reads a descriptor table its pipeline does not have");
+        return VK_NULL_HANDLE;
+    }
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = sizeof(donor_spv); smi.pCode = donor_spv;
+    // the donor with set 0's four storage images (donor_images.comp) for a kernel that reads their descriptors
+    if (images) { smi.codeSize = sizeof(donor_images_spv); smi.pCode = donor_images_spv; }
+    else { smi.codeSize = sizeof(donor_spv); smi.pCode = donor_spv; }
     VkShaderModule shader = VK_NULL_HANDLE;
     if (vk.createModule(vk.device, &smi, nullptr, &shader) != VK_SUCCESS) { error = "donor shader module"; return VK_NULL_HANDLE; }
     const uint32_t spec[5] = {launch.bx, launch.by, launch.bz, std::max(1u, (kernel.lds + 3) / 4), id};

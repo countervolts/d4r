@@ -54,7 +54,7 @@ if(D4R_GLSLANG AND Python3_Interpreter_FOUND)
     set(D4R_VKHIP_DONOR "${CMAKE_CURRENT_BINARY_DIR}/vkhip/donor_spv.h")
     add_custom_command(OUTPUT "${D4R_VKHIP_DONOR}"
         COMMAND ${CMAKE_COMMAND} -E env "D4R_GLSLANG=${D4R_GLSLANG}" "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build_vkhip_donor.py" "${CMAKE_CURRENT_BINARY_DIR}/vkhip"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vkhip/donor.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build_vkhip_donor.py"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vkhip/donor.comp" "${CMAKE_CURRENT_SOURCE_DIR}/vkhip/donor_images.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build_vkhip_donor.py"
         VERBATIM)
     add_library(d4r_vkhip STATIC vkhip/vkhip.cpp vkhip/vkhip_net.cpp "${D4R_VKHIP_DONOR}")
     target_compile_features(d4r_vkhip PUBLIC cxx_std_20)
