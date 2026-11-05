@@ -815,9 +815,9 @@ static void load_portable_config()
             portable_set("D4R_ENGINE_K", "0");
     }
     portable_set("D4R_ENGINE_VKHIP", ini_flag(ini, "engine", "ExperimentalVkHip", 1) ? "1" : "0");
-    // Ray Reconstruction's native stages follow ExperimentalVkHip (on by default for A - C and D - E); an explicit
-    // value overrides that, which is how preset F is turned on (its Vulkan path is the faster one).
-    if (const std::string rr = ini_value(ini, "engine", "ExperimentalRrVkHip"); !rr.empty())
+    // Ray Reconstruction's native stages follow ExperimentalVkHip (on by default for A - F on AMD's driver, A - E on
+    // RADV); an explicit true or false overrides that ("auto", d4r.ini.default's value, keeps the default)
+    if (const std::string rr = ascii_lower(ini_value(ini, "engine", "ExperimentalRrVkHip")); !rr.empty() && rr != "auto")
         portable_set("D4R_ENGINE_RR_VKHIP", ini_flag(ini, "engine", "ExperimentalRrVkHip", 1) ? "1" : "0");
     else if (!ini_flag(ini, "engine", "ExperimentalVkHip", 1))
         portable_set("D4R_ENGINE_RR_VKHIP", "0");
@@ -12249,13 +12249,16 @@ static bool vkhip_load(const std::wstring& name, std::vector<uint8_t>& bytes)
 
 // The native network stages of every Ray Reconstruction preset, on by default where they are the faster route:
 // presets A - C (kernels/rr/build_vkhip_cnn.sh) are about 8x faster than their Vulkan shaders, presets D and E
-// (kernels/rr/build_vkhip.sh) about 8% faster, while preset F (kernels/rr/build_vkhip_f.sh) measures within 1% of
-// its Vulkan path - so F stays an explicit experiment (D4R_ENGINE_RR_VKHIP=1). All six need RDNA4. On AMD's own
-// driver (native Windows, VK_KHR_pipeline_binary) the injector checks each code object against the driver's compile
-// for the GPU, which refuses a code object of another architecture.
+// (kernels/rr/build_vkhip.sh) about 8% faster. Preset F (kernels/rr/build_vkhip_f.sh) measures within 1% of its
+// Vulkan path on RADV, where it stays an explicit experiment (D4R_ENGINE_RR_VKHIP=1); on AMD's own driver (native
+// Windows) its Vulkan path is LLPC's compile and vkhip is 17% faster with byte-identical output (RX 9070 XT,
+// 1280x720 -> 2560x1440, frames back to back: 3.90 against 4.73 ms), so there F takes it by default too. All six need
+// RDNA4. On AMD's own driver (VK_KHR_pipeline_binary) the injector checks each code object against the driver's
+// compile for the GPU, which refuses a code object of another architecture.
 static bool engine_rr_vkhip_capable(int slot)
 {
-    if (!env_uint("D4R_ENGINE_RR_VKHIP", slot == 2 ? 0 : 1) || !env_uint("D4R_ENGINE_VKHIP", 1)) return false;
+    const unsigned requested = env_uint("D4R_ENGINE_RR_VKHIP", 2); // 2: not set (auto)
+    if (requested == 0 || !env_uint("D4R_ENGINE_VKHIP", 1)) return false;
     std::string gfx, reason; uint32_t mach = 0; bool binaries = false; float period = 0;
     if (!vkhip_adapter(true, true, mach, binaries, gfx, period, reason) ||
         (!binaries && mach != vkhip::gfx12Mach(120000) && mach != vkhip::gfx12Mach(120001))) {
@@ -12263,6 +12266,7 @@ static bool engine_rr_vkhip_capable(int slot)
              reason.empty() ? "requires RDNA4" : reason.c_str());
         return false;
     }
+    if (slot == 2 && requested == 2 && !binaries) return false; // F under RADV: opt-in
     return true;
 }
 static std::unique_ptr<vkhip::RRStages> create_engine_rr_vkhip(const std::string& directory, d4r::REngine& engine,

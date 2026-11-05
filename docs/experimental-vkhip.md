@@ -7,7 +7,8 @@ native kernels (the engine's Vulkan network is slower there). With
 `Enabled = true`, K falls back to the engine's Vulkan network instead. Presets
 M and L take the same switch for their ten shared Swin layers (the section
 below), and the Ray Reconstruction presets take `[Engine] ExperimentalRrVkHip`
-(auto: A - C and D - E on, F off; all six on RDNA4 only - see the RR sections).
+(auto: A - C and D - E on, F on with AMD's Windows driver and off under RADV; all six on RDNA4 only - see
+the RR sections).
 
 ```ini
 [Engine]
@@ -260,9 +261,12 @@ setup, so HDR gameplay is unverified.
 
 `ExperimentalRrVkHip = auto` (default) turns the RR vkhip route on for presets A - C
 (CNN) and D - E (native Swin RR, ten stages: `hip/rr_<stage>.hsaco` +
-`weights-<stage>m.bin`, stages enc0 - enc5 and dec4 - dec0), off for F, whose measured
-vkhip route is within ~2% of (or slower than) its Vulkan path and needs the F model's
-rr2 objects; `true` forces F too. `D4R_ENGINE_RR_VKHIP=0|1` overrides; turning
+`weights-<stage>m.bin`, stages enc0 - enc5 and dec4 - dec0). F (the F model's rr2
+objects) is on by default with AMD's Windows driver, where its Vulkan path is LLPC's
+compile and vkhip measures 17% faster with byte-identical output (RX 9070 XT,
+1280x720 -> 2560x1440, frames back to back: 3.90 against 4.73 ms, 2026-11-04); under
+RADV its vkhip route is within ~2% of (or slower than) its Vulkan path and F stays off
+unless `true` forces it. `D4R_ENGINE_RR_VKHIP=0|1` overrides; turning
 `ExperimentalVkHip` off turns RR vkhip off with it. On AMD's Windows driver the RR
 route uses the same `VK_KHR_pipeline_binary` injection as M (replay_rr now enables
 that plus `VK_KHR_maintenance5` on non-RADV drivers and hands the binaries to the
@@ -537,8 +541,8 @@ Notes:
   serialization, no shared fences) is in `docs/backend-draft.md`.
 
 Defaults on this machine: `ExperimentalVkHip = true` (K, M, L through vkhip in
-Vulkan games where the driver survives it), `ExperimentalRrVkHip = auto` (A - E on,
-F off), d3dhip automatic for preset M in the shim's D3D12 engine and for M/D/E in
+Vulkan games where the driver survives it), `ExperimentalRrVkHip = auto` (A - F on;
+F off under RADV), d3dhip automatic for preset M in the shim's D3D12 engine and for M/D/E in
 the replay runners when the model ships HIP layers, always with the logged DXIL
 fallback and `D4R_DX_NET=dxil` to force DXIL.
 
