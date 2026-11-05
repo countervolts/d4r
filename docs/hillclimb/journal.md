@@ -243,3 +243,16 @@ schedule (all slower).
   kernels/build.sh k set built on Windows (k-gfx1201-sync2).
 - Disk: bench.py kept every run's raw output (30-130 MB) in its work folder; 75 GB filled C: and broke a matrix run.
   It now deletes them after hashing (`BENCH_KEEP_OUTPUT=1` keeps them); the old work folders were removed.
+- **D3D12 M on d3dhip, re-measured** (rt-cand13): 1.70 against DXIL 1.65 at 720p -> 1440p, 3.44 against 3.49 at 4K.
+  Per-node HIP timing (a local bridge hack, `debugPhaseMicros`): K's isolated graph is 593 us, the same as vkhip's
+  network, so d3dhip K loses only its ~0.12 ms handoff; M's is 956 us against vkhip's ~0.80 ms for the same code
+  objects. The difference: vkhip chains M's ten layers through per-block flags (`d4r_dataflow`), while HIP put a full
+  barrier between them. (Note: one.sh needs numeric presets for M/L too, 13/12; a letter silently runs K.)
+- **Kept (lane A): the M chain in hip_net.cpp on Windows.** It copies vkhip's flag layout and `r69`-`r72` wiring. The
+  consumers launch with `hipExtModuleLaunchKernel(..., hipExtAnyOrderLaunch)`, the flags are cleared each
+  evaluation, and the chained nodes launch directly instead of as a graph (`D4R_HIP_M_CHAIN=0` keeps the barriers).
+  The isolated graph goes from 956 to 787 us. Side matrix (`matrix-hip.json`: the dx-M/L cases without `D4R_DX_NET=dxil`, 3 rounds),
+  all identical: dx-M-1440 -9.19%, dx-M-4k -1.75%, dx-M-720to4k -5.12%, dx-M-q1440 -2.48%, rgb10 -9.62%, dx-L-1440
+  -4.74%, dx-L-4k -1.07%, dx-L-rgb10 -4.98%. Deterministic: 24 of 24 600-frame runs at 4K and at 1440p. The main
+  matrix pins D3D12 M/L on DXIL (installed packages have no HIP layers), so its score does not move: dx-K and dx-M
+  (DXIL) unchanged and identical. d3dhip M at 1440p is now ahead of DXIL (1.534 against 1.65).
