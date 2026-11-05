@@ -6,6 +6,7 @@
 // Built as d4r_hip_net.dll beside nvngx.dll. Every entry catches its exceptions: the shim logs the message and
 // keeps its DXIL network.
 #include "hip_net_d3d12.h"
+#include "hip_net_rr.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -21,11 +22,28 @@ namespace {
 struct Net {
     std::unique_ptr<d4r::dx::HipNetworkDx> network;
 };
+struct RrNet {
+    std::unique_ptr<d4r::dx::HipNetworkRr> network;
+};
 
 void setError(char* error, unsigned bytes, const char* text) {
     if (error == nullptr || bytes == 0) return;
     std::strncpy(error, text, bytes - 1);
     error[bytes - 1] = '\0';
+}
+// Runs `body` on an RR network, turning exceptions into *error: 0 done, -1 failed.
+template <typename F> int rrCall(void* net, char* error, unsigned errorBytes, F body) {
+    if (net == nullptr) {
+        setError(error, errorBytes, "the network is not created");
+        return -1;
+    }
+    try {
+        body(*static_cast<RrNet*>(net)->network);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(error, errorBytes, e.what());
+        return -1;
+    }
 }
 } // namespace
 
@@ -104,5 +122,38 @@ __declspec(dllexport) float d4rHipNetMilliseconds(void* net) {
 
 __declspec(dllexport) void d4rHipNetDestroy(void* net) {
     delete static_cast<Net*>(net);
+}
+// Ray Reconstruction (hip_net_rr.h): the network over the engine's shared plane arena. presetF: a D4RR0002 package.
+// Null: *error says why.
+__declspec(dllexport) void* d4rHipRrCreate(ID3D12Device* device, const char* directory, int presetF, unsigned renderWidth,
+                                           unsigned renderHeight, unsigned outputWidth, unsigned outputHeight,
+                                           ID3D12Resource* arena, unsigned long long arenaBytes, char* error,
+                                           unsigned errorBytes) {
+    try {
+        auto net = std::make_unique<RrNet>();
+        net->network = std::make_unique<d4r::dx::HipNetworkRr>(device, directory, presetF != 0, renderWidth, renderHeight,
+                                                               outputWidth, outputHeight, arena, arenaBytes);
+        return net.release();
+    } catch (const std::exception& e) {
+        setError(error, errorBytes, e.what());
+        return nullptr;
+    }
+}
+// The engine's half (d4r::dx::ExternalNetworkRr, runtime_rr_d3d12.h), valid while the network lives.
+__declspec(dllexport) const void* d4rHipRrExternal(void* net) {
+    return net != nullptr ? &static_cast<RrNet*>(net)->network->external() : nullptr;
+}
+__declspec(dllexport) int d4rHipRrRun(void* net, char* error, unsigned errorBytes) {
+    return rrCall(net, error, errorBytes, [](d4r::dx::HipNetworkRr& n) { n.run(); });
+}
+__declspec(dllexport) int d4rHipRrUseFence(void* net, ID3D12Fence* fence, char* error, unsigned errorBytes) {
+    return rrCall(net, error, errorBytes, [fence](d4r::dx::HipNetworkRr& n) { n.useFence(fence); });
+}
+__declspec(dllexport) int d4rHipRrLaunchAfter(void* net, unsigned long long wait, unsigned long long signal, char* error,
+                                              unsigned errorBytes) {
+    return rrCall(net, error, errorBytes, [wait, signal](d4r::dx::HipNetworkRr& n) { n.launchAfter(wait, signal); });
+}
+__declspec(dllexport) void d4rHipRrDestroy(void* net) {
+    delete static_cast<RrNet*>(net);
 }
 }

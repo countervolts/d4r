@@ -44,8 +44,13 @@ struct GameDenoiser::Impl
     bool captureStart = false; // the trigger was just consumed: D4R_RR_CAPTURE_RESET restarts the history here
     uint32_t frames = 0;       // the engine's frame counter (recordings less discards)
     std::vector<CaptureFrame> pending; // recorded; fence set once submitted
-    Impl(RModel &m, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh)
-        : engine(m, rw, rh, ow, oh), maxWidth(rw), maxHeight(rh)
+    // with an external network: the front's exit barriers and output capture, for recordBack
+    std::vector<D3D12_RESOURCE_BARRIER> backExit;
+    CaptureFrame *backCapture = nullptr;
+    GameTexture backOutput;
+    bool frontRecorded = false;
+    Impl(RModel &m, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, bool shareArena)
+        : engine(m, rw, rh, ow, oh, shareArena), maxWidth(rw), maxHeight(rh)
     {
         captureDir = env("D4R_RR_CAPTURE_DIR");
     }
@@ -174,8 +179,8 @@ struct GameDenoiser::Impl
 };
 
 GameDenoiser::GameDenoiser(RModel &model, uint32_t outputWidth, uint32_t outputHeight, uint32_t maxRenderWidth,
-                           uint32_t maxRenderHeight)
-    : impl(std::make_unique<Impl>(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight))
+                           uint32_t maxRenderHeight, bool shareArena)
+    : impl(std::make_unique<Impl>(model, outputWidth, outputHeight, maxRenderWidth, maxRenderHeight, shareArena))
 {
 }
 GameDenoiser::~GameDenoiser() = default;
@@ -183,6 +188,8 @@ GameDenoiser::~GameDenoiser() = default;
 void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &frame, const FrameProfiler &profiler)
 {
     auto &g = *impl;
+    if (g.frontRecorded)
+        throw std::runtime_error("RR front recorded twice without its back");
     const GameTexture *inputs[] = {&frame.color,
                                    &frame.depth,
                                    &frame.motion,
@@ -287,12 +294,52 @@ void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &fra
     }
     if (!entry.empty())
         list->ResourceBarrier(UINT(entry.size()), entry.data());
+    if (g.engine.externalNetwork())
+    {
+        g.engine.recordFront(list);
+        g.backExit = std::move(exit);
+        g.backCapture = capture;
+        g.backOutput = frame.output;
+        g.frontRecorded = true;
+        return;
+    }
     g.engine.recordFrame(list, profiler);
     ++g.frames;
     if (!exit.empty())
         list->ResourceBarrier(UINT(exit.size()), exit.data());
     if (capture)
         Impl::copy(list, *capture, "output", frame.output.resource, frame.output.state, frame.output.format);
+}
+void GameDenoiser::recordBack(ID3D12GraphicsCommandList *list)
+{
+    auto &g = *impl;
+    if (!g.frontRecorded)
+        throw std::runtime_error("RR back recorded without its front");
+    g.frontRecorded = false;
+    g.engine.recordBack(list);
+    ++g.frames;
+    if (!g.backExit.empty())
+        list->ResourceBarrier(UINT(g.backExit.size()), g.backExit.data());
+    if (g.backCapture)
+        Impl::copy(list, *g.backCapture, "output", g.backOutput.resource, g.backOutput.state, g.backOutput.format);
+    g.backExit.clear();
+    g.backCapture = nullptr;
+}
+ID3D12Resource *GameDenoiser::arena() const
+{
+    return impl->engine.arena();
+}
+uint64_t GameDenoiser::arenaBytes() const
+{
+    return impl->engine.arenaBytes();
+}
+void GameDenoiser::setExternalNetwork(const ExternalNetworkRr *external)
+{
+    impl->engine.setExternalNetwork(external);
+}
+bool GameDenoiser::external() const
+{
+    return impl->engine.externalNetwork() != nullptr;
 }
 void GameDenoiser::submitted(ID3D12Fence *fence, uint64_t value)
 {
@@ -305,6 +352,8 @@ void GameDenoiser::discarded()
 {
     impl->engine.discarded();
     --impl->frames;
+    impl->frontRecorded = false;
+    impl->backCapture = nullptr;
     impl->pending.erase(std::remove_if(impl->pending.begin(), impl->pending.end(),
                                        [](const CaptureFrame &f) { return !f.fence; }),
                         impl->pending.end());

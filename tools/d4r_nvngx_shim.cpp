@@ -3063,6 +3063,14 @@ struct HipNetApi
     // optional (older d4r_hip_net.dll has neither): GPU-side ordering through a shared D3D12 fence
     int (*useFence)(void*, ID3D12Fence*, char*, unsigned) = nullptr;
     int (*launchAfter)(void*, unsigned long long, unsigned long long, char*, unsigned) = nullptr;
+    // optional (older d4r_hip_net.dll has none): Ray Reconstruction preset F's network (hip_net_rr.h)
+    void* (*rrCreate)(ID3D12Device*, const char*, int, unsigned, unsigned, unsigned, unsigned, ID3D12Resource*,
+                      unsigned long long, char*, unsigned) = nullptr;
+    const void* (*rrExternal)(void*) = nullptr;
+    int (*rrRun)(void*, char*, unsigned) = nullptr;
+    int (*rrUseFence)(void*, ID3D12Fence*, char*, unsigned) = nullptr;
+    int (*rrLaunchAfter)(void*, unsigned long long, unsigned long long, char*, unsigned) = nullptr;
+    void (*rrDestroy)(void*) = nullptr;
 };
 static HipNetApi g_hipApi;
 static bool g_hipLoaded = false;
@@ -3113,6 +3121,15 @@ static bool load_hip_net()
     }
     g_hipApi.useFence = reinterpret_cast<decltype(g_hipApi.useFence)>(GetProcAddress(module, "d4rHipNetUseFence"));
     g_hipApi.launchAfter = reinterpret_cast<decltype(g_hipApi.launchAfter)>(GetProcAddress(module, "d4rHipNetLaunchAfter"));
+    g_hipApi.rrCreate = reinterpret_cast<decltype(g_hipApi.rrCreate)>(GetProcAddress(module, "d4rHipRrCreate"));
+    g_hipApi.rrExternal = reinterpret_cast<decltype(g_hipApi.rrExternal)>(GetProcAddress(module, "d4rHipRrExternal"));
+    g_hipApi.rrRun = reinterpret_cast<decltype(g_hipApi.rrRun)>(GetProcAddress(module, "d4rHipRrRun"));
+    g_hipApi.rrUseFence = reinterpret_cast<decltype(g_hipApi.rrUseFence)>(GetProcAddress(module, "d4rHipRrUseFence"));
+    g_hipApi.rrLaunchAfter = reinterpret_cast<decltype(g_hipApi.rrLaunchAfter)>(GetProcAddress(module, "d4rHipRrLaunchAfter"));
+    g_hipApi.rrDestroy = reinterpret_cast<decltype(g_hipApi.rrDestroy)>(GetProcAddress(module, "d4rHipRrDestroy"));
+    if (!g_hipApi.rrCreate || !g_hipApi.rrExternal || !g_hipApi.rrRun || !g_hipApi.rrUseFence || !g_hipApi.rrLaunchAfter ||
+        !g_hipApi.rrDestroy)
+        g_hipApi.rrCreate = nullptr;   // all or nothing: Ray Reconstruction keeps its DXIL network
     logf("engine backend (D3D12, d3dhip): d4r_hip_net.dll loaded (%s)",
          g_hipApi.useFence && g_hipApi.launchAfter ? "GPU-fence handoff available" : "CPU-serialized handoff only");
     return true;
@@ -3143,10 +3160,15 @@ struct EngineDxFeature
     // (engine_dx_hip_network), so the game's thread never blocks between the parts
     bool hipFenced = false;
     uint32_t hipWidth = 0, hipHeight = 0;
+    // Ray Reconstruction preset F instead (d4rHipRr*): the network over the denoiser's shared plane arena; `front`,
+    // frontValue and hipFenced as above
+    void* hipRr = nullptr;
     ~EngineDxFeature()
     {
         if (hip != nullptr && g_hipApi.destroy != nullptr)
             g_hipApi.destroy(hip);
+        if (hipRr != nullptr && g_hipApi.rrDestroy != nullptr)
+            g_hipApi.rrDestroy(hipRr);
     }
 #endif
     float committedJitter[2]{}, pendingJitter[2]{};
@@ -12808,6 +12830,7 @@ static const char* const kEngineDxStagesMRdna3[] = {"prepare", "setup", "exposur
     "reconstruction", "downsample", "finish"};
 static const char* const kEngineDxStagesRR[] = {"prepare", "setup", "enc0", "enc1", "enc2", "enc3", "enc4", "enc5",
     "dec4", "dec3", "dec2", "dec1", "dec0", "output", "restore"};
+static const char* const kEngineDxStagesRRHip[] = {"front", "external_network_wait", "back"};
 template <size_t N> static constexpr uint32_t stage_count(const char* const (&)[N]) { return uint32_t(N); }
 
 // Resolve only completed submissions, without a CPU wait or queue flush. A
@@ -13060,14 +13083,17 @@ static bool engine_dx_split_ready()
 // is older or the import fails (then the CPU-serialized one). Throws when no fence can be created at all.
 static void engine_dx_hip_fence(EngineDxFeature& state)
 {
-    const bool gpu = env_string("D4R_D3DHIP_SYNC") != "cpu" && g_hipApi.useFence && g_hipApi.launchAfter;
+    const bool gpu = env_string("D4R_D3DHIP_SYNC") != "cpu" &&
+                     (state.hipRr != nullptr ? g_hipApi.rrUseFence && g_hipApi.rrLaunchAfter
+                                             : g_hipApi.useFence && g_hipApi.launchAfter);
     if (FAILED(g.device->CreateFence(0, gpu ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE,
                                      IID_PPV_ARGS(state.front.GetAddressOf()))))
         throw std::runtime_error("the front fence could not be created");
     if (!gpu)
         return;
     char error[256] = {};
-    state.hipFenced = g_hipApi.useFence(state.hip, state.front.Get(), error, sizeof(error)) == 0;
+    state.hipFenced = (state.hipRr != nullptr ? g_hipApi.rrUseFence(state.hipRr, state.front.Get(), error, sizeof(error))
+                                              : g_hipApi.useFence(state.hip, state.front.Get(), error, sizeof(error))) == 0;
     logf("engine backend (D3D12, d3dhip): %s", state.hipFenced ? "GPU-fence handoff (no CPU wait between the parts)"
                                                                 : (std::string("CPU-serialized handoff: ") + error).c_str());
 }
@@ -13078,7 +13104,7 @@ static void engine_dx_hip_network(void* owner, ID3D12CommandQueue* queue)
 {
     auto& state = *static_cast<EngineDxFeature*>(owner);
     std::lock_guard<std::mutex> lock(state.mutex);
-    if (!state.hip || !state.front)
+    if ((!state.hip && !state.hipRr) || !state.front)
         return;
     if (state.hipFenced)
     {
@@ -13087,7 +13113,8 @@ static void engine_dx_hip_network(void* owner, ID3D12CommandQueue* queue)
         const uint64_t front = ++state.frontValue, network = ++state.frontValue;
         char error[256] = {};
         if (FAILED(queue->Signal(state.front.Get(), front)) ||
-            g_hipApi.launchAfter(state.hip, front, network, error, sizeof(error)) != 0 ||
+            (state.hipRr != nullptr ? g_hipApi.rrLaunchAfter(state.hipRr, front, network, error, sizeof(error))
+                                    : g_hipApi.launchAfter(state.hip, front, network, error, sizeof(error))) != 0 ||
             FAILED(queue->Wait(state.front.Get(), network)))
         {
             // the back must not wait for a signal that never comes: release it, then fall back to the CPU handoff
@@ -13114,7 +13141,8 @@ static void engine_dx_hip_network(void* owner, ID3D12CommandQueue* queue)
         return;
     }
     char error[256] = {};
-    if (g_hipApi.run(state.hip, error, sizeof(error)) != 0)
+    if ((state.hipRr != nullptr ? g_hipApi.rrRun(state.hipRr, error, sizeof(error))
+                                : g_hipApi.run(state.hip, error, sizeof(error))) != 0)
         logf("engine backend (D3D12, d3dhip): %s", error[0] != '\0' ? error : "the network failed");
 }
 #endif
@@ -13462,8 +13490,56 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
         release_engine_dx(feature);
         s.reset = true;
     }
+#ifdef D4R_ENGINE_D3DHIP
+    // a failed split leaves this frame's engine external: the next frame is created with the DXIL network instead
+    if (feature.engineMHipFailed && feature.engineDx && feature.engineDx->hipRr)
+    {
+        release_engine_dx(feature);
+        s.reset = true;
+    }
+#endif
     try
     {
+#ifdef D4R_ENGINE_D3DHIP
+        // d3dhip for preset F: the network's fourteen stages as the package's HIP code objects (hip/rr2_*.hsaco,
+        // engine/d3d12/hip_net_rr.h) between the engine's front and back, which run in the game's list split around
+        // them, as presets M and L do. D4R_DX_NET=dxil or D4R_RR_DX_NET=dxil keeps the DXIL network.
+        if (!feature.engineDx && model->preset() == 6 && !feature.engineMHipFailed && env_string("D4R_DX_NET") != "dxil" &&
+            env_string("D4R_RR_DX_NET") != "dxil")
+        {
+            const std::string directory = engine_model_directory("D4R_ENGINE_MODEL_RR_F_DIR", L"\\engine\\rr-f");
+            if (GetFileAttributesA((directory + "/hip/rr2_dec0_0.hsaco").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                engine_dx_split_ready() && (feature.splitFence != nullptr || create_native_split(feature)) &&
+                load_hip_net() && g_hipApi.rrCreate != nullptr)
+            {
+                try
+                {
+                    auto state = std::make_unique<EngineDxFeature>();
+                    state->denoiser = std::make_unique<d4r::dx::GameDenoiser>(*model, feature.outWidth, feature.outHeight,
+                                                                              p.renderWidth, p.renderHeight, true);
+                    char error[256] = {};
+                    state->hipRr = g_hipApi.rrCreate(g.device, directory.c_str(), 1, p.renderWidth, p.renderHeight,
+                                                     feature.outWidth, feature.outHeight, state->denoiser->arena(),
+                                                     state->denoiser->arenaBytes(), error, sizeof(error));
+                    if (state->hipRr == nullptr)
+                        throw std::runtime_error(error[0] != '\0' ? error : "the HIP network could not be created");
+                    engine_dx_hip_fence(*state);
+                    state->denoiser->setExternalNetwork(
+                        static_cast<const d4r::dx::ExternalNetworkRr *>(g_hipApi.rrExternal(state->hipRr)));
+                    state->rrWidth = p.renderWidth;
+                    state->rrHeight = p.renderHeight;
+                    feature.engineDx = std::move(state);
+                    logf("engine backend (D3D12 RR F): feature %u runs in the game's command list (%ux%u -> %ux%u) with "
+                         "its network on the model's HIP layers (d3dhip)",
+                         feature.handle.Id, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight);
+                }
+                catch (const std::exception &error)
+                {
+                    logf("engine backend (D3D12 RR F, d3dhip): %s; using the DXIL network", error.what());
+                }
+            }
+        }
+#endif
         if (!feature.engineDx)
         {
             auto state = std::make_unique<EngineDxFeature>();
@@ -13475,17 +13551,55 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
         }
         auto &state = *feature.engineDx;
         engine_dx_settle(state);
+#ifdef D4R_ENGINE_D3DHIP
+        const bool hip = state.hipRr != nullptr;
+#else
+        const bool hip = false;
+#endif
+        int timing = -1;
         {
             std::lock_guard<std::mutex> lock(state.mutex);
-            const int timing = engine_dx_timing(state, frame, feature.preset == 6 ? "RR_F" : (feature.preset == 4 ? "RR_D" : "RR_E"),
-                                                kEngineDxStagesRR, stage_count(kEngineDxStagesRR), p.renderWidth,
-                                                p.renderHeight, feature.outWidth, feature.outHeight);
+            const char *name = feature.preset == 6 ? "RR_F" : (feature.preset == 4 ? "RR_D" : "RR_E");
+            timing = hip ? engine_dx_timing(state, frame, name, kEngineDxStagesRRHip, stage_count(kEngineDxStagesRRHip),
+                                            p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight)
+                         : engine_dx_timing(state, frame, name, kEngineDxStagesRR, stage_count(kEngineDxStagesRR),
+                                            p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight);
             EngineDxMarks marks{&state, timing, 0};
             engine_dx_mark(state, timing, list, 0);
-            state.denoiser->record(list, game, marks.profiler(1));
-            engine_dx_end_timing(state, timing, list);
+            if (hip)
+            {
+                state.denoiser->record(list, game);
+                engine_dx_mark(state, timing, list, 1);
+            }
+            else
+            {
+                state.denoiser->record(list, game, marks.profiler(1));
+                engine_dx_end_timing(state, timing, list);
+                state.pending = true;
+            }
+        }
+#ifdef D4R_ENGINE_D3DHIP
+        if (hip)
+        {
+            // the split's mutex is taken here without state.mutex: the between-parts hook takes them the other way
+            ID3D12GraphicsCommandList *back = nullptr;
+            const bool split = native_split_frame(feature, list, frame, engine_dx_hip_network, &state, &back);
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!split)
+            {
+                // no second part: complete the frame in the game's list (the network's results are an earlier
+                // frame's) and have the next frame's engine run the DXIL network instead
+                logf("engine backend (D3D12 RR F, d3dhip): feature %u could not split its list at frame %u; the DXIL "
+                     "engine replaces it", feature.handle.Id, frame);
+                feature.engineMHipFailed = true;
+                back = list;
+            }
+            engine_dx_mark(state, timing, back, 2);
+            state.denoiser->recordBack(back);
+            engine_dx_end_timing(state, timing, back);
             state.pending = true;
         }
+#endif
         d4r_submit::track(list, {&state, engine_dx_submitted, engine_dx_discarded});
     }
     catch (const std::exception &e)

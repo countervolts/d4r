@@ -101,7 +101,7 @@ if(WIN32)
         message(STATUS "d3d12 engines: native HIP network (d3dhip) available")
         # The NGX shim's bridge (tools/d4r_nvngx_shim.cpp loads it on first use; the shim must not import amdhip64):
         # d4r_hip_net.dll with d4rHipNet* over hip_net_d3d12.h.
-        add_library(d4r_hip_net_dll SHARED d3d12/hip_net_bridge.cpp d3d12/hip_net_d3d12.cpp)
+        add_library(d4r_hip_net_dll SHARED d3d12/hip_net_bridge.cpp d3d12/hip_net_d3d12.cpp d3d12/hip_net_rr.cpp)
         target_compile_features(d4r_hip_net_dll PRIVATE cxx_std_17)
         target_link_libraries(d4r_hip_net_dll PRIVATE d4r_hip_net d3d12 dxgi setupapi uuid)
         set_target_properties(d4r_hip_net_dll PROPERTIES OUTPUT_NAME d4r_hip_net ARCHIVE_OUTPUT_NAME d4r_hip_net_bridge)

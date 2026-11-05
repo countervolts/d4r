@@ -80,7 +80,7 @@ fi
 if [[ -n "$ROCM_DIR" && -f "$ROCM_DIR/include/hip/hip_runtime_api.h" ]]; then
   HIP_DEFINES="-DD4R_ENGINE_D3DHIP"
   HIP_INCLUDES="-I$ROCM_DIR/include"
-  HIP_SOURCES="$ROOT/engine/hip_net.cpp $ROOT/engine/d3d12/hip_net_d3d12.cpp"
+  HIP_SOURCES="$ROOT/engine/hip_net.cpp $ROOT/engine/d3d12/hip_net_d3d12.cpp $ROOT/engine/d3d12/hip_net_rr.cpp"
   HIP_LIBS="-L$ROCM_DIR/lib -lamdhip64 -lsetupapi"
   printf 'd3dhip: HIP network from %s\n' "$ROCM_DIR"
 else
