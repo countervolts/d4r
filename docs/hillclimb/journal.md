@@ -513,3 +513,20 @@ schedule (all slower).
   Housekeeping: `models-rrg` / `models-fullg` already existed from the first try, so this one used `models-rrg2`,
   `models-fullg2` and `rt-vg2`. A failed `ln` left two links inside `models-rrg/rr-f` (`hip/hip`,
   `native-work/native-work`); I removed them.
+- **Bound: RR F's HIP stages without barriers between them** (timing only, wrong output; local hack, not committed).
+  With the 15 `step()` barriers between the 16 vkhip stages gone (the gather's and post's kept), the replay goes
+  3.33 -> 2.98 ms (network 2.72 -> 2.34). That is the largest lever left on vk-RRF, but only an upper bound:
+  dependent stages overlap there. K's per-dispatch counters got nothing from a similar bound (above), so the real
+  thing has to be per-block dataflow like M's `SWIN_DATAFLOW`. Unlike M, RR F needs:
+  - Write-after-read waits. The arena regions are reused within a frame (rr.txt pointers: region 1024 is written by
+    enc2, dec1_0 and dec0_0 and read in between). A conservative rule: stage N waits until stage N-2 has fully
+    completed (a counter), which by induction completes every earlier stage. It also waits for its stage N-1
+    producer blocks (flags), and for all of stage N-1 wherever N writes a region N-1 reads.
+  - Mirror-aware producer ranges. Edge windows read tokens mirrored up to 6 inward, outside M's [t0, t1] range. With
+    M's formula, a block at x0 = -6 would not wait for the producer of token 6.
+  - The level mapping per stage: merge for enc1-enc5 (KIND 1), expand plus a skip for dec*_0 (KIND 2), the same grid
+    for dec*_1. The skip comes from stage <= N-2, so it is already complete.
+  - Waits and signals in both kernel families, rr2_native_body.h and the glsl2hip hybrids (enc0, dec0_1).
+  - Flags cleared every evaluation, as vkhip_net's M chain does.
+  Not started: race-prone work that needs its own validation (repeated runs, byte-identical against the barrier
+  build).

@@ -54,6 +54,10 @@ What didn't (journal):
 - The CPU d3dhip handoff.
 
 What's left, largest first:
+- **RR F's Vulkan stages chained without barriers.** Removing the 15 barriers between the HIP stages bounds the gain
+  at 3.33 -> 2.98 ms (replay; dependent stages overlap there, so only an upper bound). It needs per-block dataflow
+  like M's, plus write-after-read waits for the reused arena regions and mirror-aware ranges at the image edges
+  (journal).
 - **RR F's translated stages.** D3D12 ablations at 720p -> 1440p (4.03 ms): enc0 0.66, post 0.56, dec0_0 0.48, dec0_1
   0.47, gather 0.40 ms. Their FP8 conversions are now one clamp + one conversion per element on both APIs; the rest is
   translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 and dec0_1 now run as HIP (944bd20, ffde45b). The gather and post stay
