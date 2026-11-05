@@ -143,9 +143,18 @@ void createStaging(ID3D12Device* device, Staging& staging, uint32_t width, uint3
 // The presets D and E network's stages in network order (engine/rr_frame_parameters.h RNames' enums, the code objects
 // kernels/rr/build_vkhip.sh builds): encoder 0 and the output stage stay on the engine.
 constexpr const char* DeStages[] = {"enc1", "enc2", "enc3", "enc4", "enc5", "dec4", "dec3", "dec2", "dec1", "dec0"};
-// Preset F's (engine/runtime_rr2.inc R2Names indices 1..14, kernels/rr/build_vkhip_f.sh).
-constexpr const char* FStages[] = {"enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1", "dec3_0", "dec3_1",
-                                   "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0"};
+// Preset F's (engine/runtime_rr2.inc R2Names' indices, kernels/rr/build_vkhip_f.sh). Encoder 0 is the first one when
+// the package has its code object (the Vulkan vkhip route's stage 0, which runs after the gather pass and reads only
+// the gather's records: kernels/rr/enc0_hip_prep.py); see Enc0Switch.
+constexpr const char* FStages[] = {"enc0", "enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1", "dec3_0",
+                                   "dec3_1", "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0"};
+// D4R_HIP_RR_ENC0=0 (or "dxil"): keep encoder 0 on the engine's DXIL front, as before. Any other value (the default)
+// takes the package's rr2_enc0.hsaco when it has one; without it the engine keeps its own encoder 0 anyway.
+constexpr const char* Enc0Switch = "D4R_HIP_RR_ENC0";
+bool enc0Wanted() {
+    const char* value = std::getenv(Enc0Switch);
+    return !(value && (!std::strcmp(value, "0") || !std::strcmp(value, "dxil") || !std::strcmp(value, "off")));
+}
 constexpr unsigned DeCount = sizeof(DeStages) / sizeof(DeStages[0]);
 constexpr unsigned FCount = sizeof(FStages) / sizeof(FStages[0]);
 
@@ -207,6 +216,7 @@ struct HipNetworkRr::Impl {
         void* weights = nullptr;
     };
     std::vector<FStage> f;
+    std::vector<FStage*> stageAt;        // index -> kernel (null: the engine dispatches that stage itself)
     // preset F's parameter areas and graphs, one per frame parity (see hip_net_rr.h)
     struct FSlot {
         void* device = nullptr;              // the stages' blocks at `offsets`
@@ -337,7 +347,7 @@ struct HipNetworkRr::Impl {
             s.graph = nullptr;
             hipCheck(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "hipStreamBeginCapture");
             for (size_t i = 0; i < queued.size(); ++i)
-                launchF(f[queued[i].index - 1], queued[i], static_cast<uint8_t*>(s.device) + key[4 * i + 3]);
+                launchF(*stageAt[queued[i].index], queued[i], static_cast<uint8_t*>(s.device) + key[4 * i + 3]);
             hipCheck(hipStreamEndCapture(stream, &s.graph), "hipStreamEndCapture");
             hipCheck(hipGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0), "hipGraphInstantiate");
             s.key = std::move(key);
@@ -488,12 +498,15 @@ HipNetworkRr::HipNetworkRr(ID3D12Device* device, const std::string& modelDirecto
             n.de.push_back(std::move(stage));
         }
     } else {
-        // preset F: the fourteen kernels and their weights (the V tiles transposed first, as vkhip's F route)
+        // preset F: the kernels and their weights (the V tiles transposed first, as vkhip's F route). Encoder 0 is the
+        // one the package may lack (a package built before the vkhip route took it): the engine then keeps its own.
+        const bool wantEnc0 = enc0Wanted() && std::filesystem::exists(kernels + "/rr2_enc0.hsaco");
         n.f.reserve(FCount);
         for (unsigned i = 0; i < FCount; ++i) {
+            if (i == 0 && !wantEnc0) continue;   // encoder 0 stays on the engine's front
             Impl::FStage stage;
             stage.name = FStages[i];
-            stage.index = i + 1;
+            stage.index = i;
             const std::string code_name = "rr2_" + stage.name;
             auto code = readFile(kernels + "/" + code_name + ".hsaco");
             hipModule_t module = nullptr;
@@ -531,6 +544,9 @@ HipNetworkRr::HipNetworkRr(ID3D12Device* device, const std::string& modelDirecto
             stage.threads = threads;
             n.f.push_back(std::move(stage));
         }
+        // the block's launches are per stage index (encoder 0's is the graph's first)
+        n.stageAt.assign(FCount, nullptr);
+        for (auto& stage : n.f) n.stageAt[stage.index] = &stage;
     }
 
     // the engine's half of the interface
@@ -550,7 +566,8 @@ HipNetworkRr::~HipNetworkRr() = default;
 
 const ExternalNetworkRr& HipNetworkRr::external() const { return link; }
 bool HipNetworkRr::runs(unsigned index) const {
-    return impl->presetF ? index >= 1 && index <= FCount : index >= 1 && index <= DeCount;
+    if (impl->presetF) return index < impl->stageAt.size() && impl->stageAt[index] != nullptr;
+    return index >= 1 && index <= DeCount;
 }
 void HipNetworkRr::stage(unsigned index, const void* block, size_t bytes, uint32_t gx, uint32_t gy, uint32_t shift) {
     auto& n = *impl;

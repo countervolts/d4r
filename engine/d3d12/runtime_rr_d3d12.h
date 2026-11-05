@@ -43,7 +43,8 @@ struct ExternalNetworkRr
         virtual void stage(unsigned index, const void *block, size_t bytes, uint32_t gx, uint32_t gy, uint32_t shift) = 0;
         // Launches the stages of the recorded frame and blocks until they have finished (one HIP stream synchronize).
         virtual void run() = 0;
-        // The stage indices the network runs (presets D/E: 1..10; F: 1..14). The engine dispatches everything else.
+        // The stage indices the network runs (presets D/E: 1..10; F: 0..14 when the package has encoder 0's code object,
+        // 1..14 otherwise). The engine dispatches everything else.
         virtual bool runs(unsigned index) const = 0;
     };
     Network *network = nullptr;
