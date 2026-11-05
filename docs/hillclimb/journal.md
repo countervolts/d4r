@@ -376,3 +376,14 @@ schedule (all slower).
   selects (~190) are lane-shuffle selects around `v_permlane16_var`, not conversion guards. Per stage D3D12 is now close
   to the Vulkan route (enc0 ~0.6, dec0_1 ~0.45 on LLPC); the Vulkan network's remaining ~0.5 ms lead is its HIP stages,
   which the journal's d3dhip estimate (<= 0.1-0.2 ms after the handoff) already covers. No further cheap lever found.
+- **Tried, rejected: RR F's network on d3dhip with the GPU-fence handoff.** Per-stage stamps (synthetic 720p -> 1440p
+  case, `C:\d4r-hc\inputs\rr-syn`): F's 14 HIP stages take 1.61 ms on vkhip (Vulkan replay, `D4R_ENGINE_VKHIP=1
+  D4R_ENGINE_RR_STAGE_STAMPS=1`) against 2.05 ms for the same stages as DXIL on D3D12, spread over every stage (enc4 39
+  against 74 us, dec1 385 against 455, dec0_0 349 against ~460). Through the HIP runtime on D3D12 `HipNetworkRr`
+  measured 2.08-2.21 ms, but its timed region held 14 synchronous parameter uploads: without them 1.63-1.66 ms.
+  Prototype (reverted): `HipNetworkRr::useFence` / `launchAfter` (one asynchronous upload of all parameter blocks from a
+  pinned ring, then the 14 launches between a wait on and a signal of a shared D3D12 fence) and a replay mode that
+  records front and back up front and orders them with the fence. End to end 4.13-4.14 ms against DXIL's 3.87 (two
+  runs each, 120 frames): the network's 0.4 ms gain is eaten by about 0.6 ms of cross-API handoff (the two fence
+  waits; HAGS is block-listed here, so they may resolve on the CPU, and scheduling settings are off limits). Also not
+  byte-identical to the DXIL network. The remaining DXIL-vs-HIP gap is per-stage code generation.
