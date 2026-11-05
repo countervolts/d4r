@@ -205,10 +205,24 @@ struct HipNetworkRr::Impl {
         hipFunction_t function = nullptr;
         uint32_t threads = 32;
         void* weights = nullptr;
-        void* params = nullptr;
-        uint32_t paramBytes = 0;
     };
     std::vector<FStage> f;
+    // preset F's parameter areas and graphs, one per frame parity (see hip_net_rr.h)
+    struct FSlot {
+        void* device = nullptr;              // the stages' blocks at `offsets`
+        void* host = nullptr;                // pinned staging for the copy into `device`
+        size_t bytes = 0;
+        std::vector<uint8_t> held;           // what `device` holds (or is about to)
+        std::vector<uint64_t> key;           // per stage: index, grid, block offset (the graph's launches)
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        hipEvent_t done = nullptr;           // after the last launch reading `host`
+        bool pending = false;
+    };
+    FSlot slots[2];
+    uint32_t slot = 0;
+    hipExternalSemaphore_t fence = nullptr;
+    ID3D12Device* device = nullptr;
 
     struct Queued {
         unsigned index = 0;
@@ -221,12 +235,19 @@ struct HipNetworkRr::Impl {
 
     ~Impl() {
         if (stream) (void)hipStreamSynchronize(stream);
+        for (auto& s : slots) {
+            if (s.exec) (void)hipGraphExecDestroy(s.exec);
+            if (s.graph) (void)hipGraphDestroy(s.graph);
+            if (s.device) (void)hipFree(s.device);
+            if (s.host) (void)hipHostFree(s.host);
+            if (s.done) (void)hipEventDestroy(s.done);
+        }
+        if (fence) (void)hipDestroyExternalSemaphore(fence);
         for (auto& image : owned) image.reset();
         for (auto& stage : de)
             if (stage.weights) (void)hipFree(stage.weights);
         for (auto& stage : f) {
             if (stage.weights) (void)hipFree(stage.weights);
-            if (stage.params) (void)hipFree(stage.params);
         }
         for (auto module : modules) (void)hipModuleUnload(module);
         if (arenaExternal) (void)hipDestroyExternalMemory(arenaExternal);
@@ -275,19 +296,58 @@ struct HipNetworkRr::Impl {
                  "hipModuleLaunchKernel(rr)");
     }
 
-    void uploadF(FStage& stage, const Queued& q) {
-        if (q.block.size() > stage.paramBytes) {
-            if (stage.params) (void)hipFree(stage.params);
-            stage.paramBytes = uint32_t((q.block.size() + 255) / 256 * 256);
-            hipCheck(hipMalloc(&stage.params, stage.paramBytes), "hipMalloc(param block)");
+    // The queued stages' blocks into this frame parity's area (copied on the stream only when they changed) and its
+    // graph (recaptured when the launches changed). Returns the graph to launch on `stream`.
+    hipGraphExec_t prepareF() {
+        FSlot& s = slots[slot];
+        slot ^= 1;
+        std::vector<uint8_t> staged;
+        std::vector<uint64_t> key;
+        for (const auto& q : queued) {
+            const uint64_t offset = staged.size();
+            staged.insert(staged.end(), q.block.begin(), q.block.end());
+            staged.resize((staged.size() + 255) / 256 * 256);
+            key.insert(key.end(), {q.index, q.gx, q.gy, offset});
         }
-        hipCheck(hipMemcpy(stage.params, q.block.data(), q.block.size(), hipMemcpyHostToDevice),
-                 "hipMemcpy(param block)");
+        if (staged.size() > s.bytes) {
+            if (s.pending) hipCheck(hipEventSynchronize(s.done), "hipEventSynchronize(param area)");
+            hipCheck(hipStreamSynchronize(stream), "hipStreamSynchronize(param area)");
+            if (s.device) (void)hipFree(s.device);
+            if (s.host) (void)hipHostFree(s.host);
+            s.device = s.host = nullptr;
+            s.bytes = staged.size();
+            hipCheck(hipMalloc(&s.device, s.bytes), "hipMalloc(param area)");
+            hipCheck(hipHostMalloc(&s.host, s.bytes, hipHostMallocDefault), "hipHostMalloc(param area)");
+            if (!s.done) hipCheck(hipEventCreateWithFlags(&s.done, hipEventDisableTiming), "hipEventCreate(param area)");
+            s.held.clear();
+            s.key.clear();
+        }
+        if (staged != s.held) {
+            if (s.pending) hipCheck(hipEventSynchronize(s.done), "hipEventSynchronize(param area)");
+            std::memcpy(s.host, staged.data(), staged.size());
+            hipCheck(hipMemcpyAsync(s.device, s.host, staged.size(), hipMemcpyHostToDevice, stream), "hipMemcpyAsync(param area)");
+            hipCheck(hipEventRecord(s.done, stream), "hipEventRecord(param area)");
+            s.pending = true;
+            s.held = std::move(staged);
+        }
+        if (key != s.key) {
+            if (s.exec) (void)hipGraphExecDestroy(s.exec);
+            if (s.graph) (void)hipGraphDestroy(s.graph);
+            s.exec = nullptr;
+            s.graph = nullptr;
+            hipCheck(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "hipStreamBeginCapture");
+            for (size_t i = 0; i < queued.size(); ++i)
+                launchF(f[queued[i].index - 1], queued[i], static_cast<uint8_t*>(s.device) + key[4 * i + 3]);
+            hipCheck(hipStreamEndCapture(stream, &s.graph), "hipStreamEndCapture");
+            hipCheck(hipGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+            s.key = std::move(key);
+        }
+        return s.exec;
     }
 
-    void launchF(FStage& stage, const Queued& q) {
+    void launchF(FStage& stage, const Queued& q, void* params) {
         // the kernel's one by-value argument: the parameter block, its weights and the arena (vkhip's kernarg layout)
-        struct { uint64_t param, weights, arena; } args{uint64_t(reinterpret_cast<uintptr_t>(stage.params)),
+        struct { uint64_t param, weights, arena; } args{uint64_t(reinterpret_cast<uintptr_t>(params)),
                                                        uint64_t(reinterpret_cast<uintptr_t>(stage.weights)),
                                                        uint64_t(reinterpret_cast<uintptr_t>(arena))};
         void* arguments[] = {&args};
@@ -310,6 +370,7 @@ HipNetworkRr::HipNetworkRr(ID3D12Device* device, const std::string& modelDirecto
     checkHipAdapter(device);
 
     n.presetF = presetF;
+    n.device = device;
     n.w0 = (renderWidth + 31) / 32 * 32;
     n.h0 = (renderHeight + 31) / 32 * 32;
     hipCheck(hipInit(0), "hipInit");
@@ -520,9 +581,7 @@ void HipNetworkRr::run() {
     if (n.queued.empty()) throw std::runtime_error("no Ray Reconstruction stage was recorded");
     hipCheck(hipEventRecord(n.start, n.stream), "hipEventRecord");
     if (n.presetF) {
-        // the parameter blocks first (one copy per stage), then the launches: no host copy while a launch is pending
-        for (const auto& q : n.queued) n.uploadF(n.f[q.index - 1], q);
-        for (const auto& q : n.queued) n.launchF(n.f[q.index - 1], q);
+        hipCheck(hipGraphLaunch(n.prepareF(), n.stream), "hipGraphLaunch(rr2)");
     } else {
         // the engine's three staged images into HIP's
         for (int i = 0; i < 3; ++i) {
@@ -547,6 +606,48 @@ void HipNetworkRr::run() {
     n.milliseconds = milliseconds;
     ++n.frame;
     n.queued.clear();
+}
+void HipNetworkRr::useFence(ID3D12Fence* fence) {
+    if (!impl->presetF) throw std::runtime_error("the shared fence is preset F's");
+    if (!fence) throw std::runtime_error("no shared fence");
+    HANDLE handle = nullptr;
+    if (FAILED(impl->device->CreateSharedHandle(fence, nullptr, GENERIC_ALL, nullptr, &handle)))
+        throw std::runtime_error("CreateSharedHandle failed for the network's fence (create it with D3D12_FENCE_FLAG_SHARED)");
+    hipExternalSemaphoreHandleDesc desc{};
+    desc.type = hipExternalSemaphoreHandleTypeD3D12Fence;
+    desc.handle.win32.handle = handle;
+    hipExternalSemaphore_t imported = nullptr;
+    const hipError_t result = hipImportExternalSemaphore(&imported, &desc);
+    CloseHandle(handle);   // the import holds its own reference
+    hipCheck(result, "hipImportExternalSemaphore (D3D12 fence)");
+    if (impl->fence) (void)hipDestroyExternalSemaphore(impl->fence);
+    impl->fence = imported;
+}
+void HipNetworkRr::launchAfter(uint64_t wait, uint64_t signal) {
+    auto& n = *impl;
+    if (!n.fence) throw std::runtime_error("launchAfter() needs useFence() first");
+    if (n.queued.empty()) throw std::runtime_error("no Ray Reconstruction stage was recorded");
+    // the parameter copy (when there is one) goes ahead of the wait: the blocks are the network's own memory
+    const hipGraphExec_t graph = n.prepareF();
+    hipExternalSemaphoreWaitParams waitParams{};
+    waitParams.params.fence.value = wait;
+    hipCheck(hipWaitExternalSemaphoresAsync(&n.fence, &waitParams, 1, n.stream), "hipWaitExternalSemaphoresAsync");
+    hipCheck(hipEventRecord(n.start, n.stream), "hipEventRecord");
+    hipCheck(hipGraphLaunch(graph, n.stream), "hipGraphLaunch(rr2)");
+    hipCheck(hipEventRecord(n.stop, n.stream), "hipEventRecord");
+    hipExternalSemaphoreSignalParams signalParams{};
+    signalParams.params.fence.value = signal;
+    hipCheck(hipSignalExternalSemaphoresAsync(&n.fence, &signalParams, 1, n.stream), "hipSignalExternalSemaphoresAsync");
+    ++n.frame;
+    n.queued.clear();
+}
+void HipNetworkRr::finish() {
+    auto& n = *impl;
+    hipCheck(hipStreamSynchronize(n.stream), "hipStreamSynchronize");
+    if (n.frame) {
+        float milliseconds = 0;
+        if (hipEventElapsedTime(&milliseconds, n.start, n.stop) == hipSuccess) n.milliseconds = milliseconds;
+    }
 }
 float HipNetworkRr::lastMilliseconds() { return impl->milliseconds; }
 uint32_t HipNetworkRr::frames() const { return impl->frame; }
