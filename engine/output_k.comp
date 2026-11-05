@@ -89,6 +89,15 @@ shared float tileD[576];
 #ifdef D4R_HLSL
 shared uint brightQuad[256];  // one flag per pixel of the 16x16 group (see "bright" below)
 #endif
+// The Windows D3D12 reconstruction (compile_k.py's D4R_FILTER_F32 build; not vkd3d, which builds this file without
+// it) takes a few paths of its own, noted where they appear: AMD's D3D12 compiler compiles this stage to ~3.2k
+// scalar instructions with six waves per SIMD, so it wants fewer of them and fewer live registers. Vulkan, vkd3d
+// and the accuracy builds keep the code and the arithmetic they had.
+#if defined(D4R_HLSL) && D4R_FILTER_F32
+#define D4R_WIN_OUTPUT 1
+#else
+#define D4R_WIN_OUTPUT 0
+#endif
 
 // LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no range compression
 #ifndef LDR
@@ -172,6 +181,22 @@ CrAxis crAxis(float w0, float w1, float w2, float w3, float mid)
     return CrAxis(mid, 1.0 - mid, p.sharp * w0, p.sharp * (w1 - mid), p.sharp * (w2 - (1.0 - mid)), p.sharp * w3);
 #endif
 }
+#if D4R_WIN_OUTPUT
+// The row pass of the history resample (see the R[] loop in main). crPass clamps its four sharpened taps to [0, 1];
+// two VALU ops each, and they can only bind where the stored luma is above 1, i.e. in the encoded highlight range
+// (the row pass feeds the column pass, which keeps its own clamps). Dropping them saves 80 instructions and moves
+// the output by at most 0.0034 in 40 recurrent frames (82 dB against the control, finite, same mean).
+float crPassRow(float t0, float t1, float t2, float t3, CrAxis c)
+{
+    float t = c.split * t2;
+    t = fma(c.mid, t1, t);
+    t = fma(c.s0, t0, t);
+    t = fma(c.s1, t1, t);
+    t = fma(c.s2, t2, t);
+    t = fma(c.s3, t3, t);
+    return t;
+}
+#endif
 // One pass along one axis: the two middle taps are bilinear, the four sharpened taps are saturated, and
 // every term is the reference's own rounded product/fma.
 float crPass(float t0, float t1, float t2, float t3, CrAxis c)
@@ -188,6 +213,41 @@ float crPass(float t0, float t1, float t2, float t3, CrAxis c)
     t = fma(c.s3, clamp(t3, 0.0, 1.0), t);
     return t;
 }
+#if defined(D4R_HLSL) && D4R_FILTER_F32
+// The 12-tap anisotropic Gaussian for two sub-pixels at a time (the stage's hot loop; see main).
+//
+// No running maximum in the hot loop: when every exponent falls below -12 the reference returns the largest tap's
+// luma, because its binary16 weights and sums underflow to 0 and 0/0. This build sums in f32, where exp2(-12.5) is
+// 1.7e-4 and the weighted mean is exact; a mean over taps whose weights a factor 2^-12 apart is within a few percent
+// of the dominant one. f32 underflows too, though (exp2 below about -126 is 0, and a sharp kernel can put every tap
+// there). 0/0 would then zero the whole pixel through the finiteness check below (the black speckles the half
+// filter had); that check's branch instead gives such a sub-pixel the pixel's bilinear current luma, so the hot
+// path carries no guard at all. (RGA gfx1201, the whole stage: 106 VGPRs and 2876 instructions, from 112 and 3121.)
+void gaussPair(vec2 fA, vec2 fB, float fline0, float f0, float f1, float f2, float fs, int a0, int stepA, int stepB,
+               out vec2 sumY, out vec2 sumW)
+{
+    sumY = vec2(0.0); sumW = vec2(0.0);
+    float fline = fline0;
+    for (int r = 0; r < 4; ++r)
+    {
+        const int bs = int(roundEven(fline)) - 1;
+        const vec2 dA = float(a0 + r) - fA;
+        vec2 db = float(bs) - fB;
+        const vec2 cross = dA * f2;
+        vec2 lin = fma(db, cross, (dA * dA) * f0);
+        const int ti = (a0 + r) * stepA + bs * stepB;
+        for (int j = 0; j < 3; ++j)
+        {
+            const vec2 E = fma(db * db, vec2(f1), lin);
+            const vec2 w = exp2(E), Y = vec2(float(tileC[ti + j * stepB].x));
+            sumY = fma(w, Y, sumY);
+            sumW += w;
+            db += 1.0; lin += cross;
+        }
+        fline += fs;
+    }
+}
+#endif
 void main()
 {
     const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
@@ -199,9 +259,18 @@ void main()
     const ivec2 t0 = ivec2(vec2(roundHalfAway(b0.x), roundHalfAway(b0.y)) - 4.0);
     const ivec2 t1 = ivec2(vec2(roundHalfAway(b1.x), roundHalfAway(b1.y)) + 4.0);
     const int tw = t1.x - t0.x + 1, th = t1.y - t0.y + 1;
+#if D4R_WIN_OUTPUT
+    // The footprint as a 2D walk (16 in x, 16 in y: at most 24 texels on a side), so the loop needs no integer
+    // division by the block's width: AMD's D3D12 compiler divides per iteration of the flat loop below.
+    for (int ty = int(gl_LocalInvocationID.y); ty < th; ty += 16)
+    for (int tx = int(gl_LocalInvocationID.x); tx < tw; tx += 16)
+    {
+        const ivec2 t = ivec2(tx, ty), g = t + t0;
+#else
     for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256) // rolled: the staged footprint varies per group
     {
         const ivec2 t = ivec2(i % tw, i / tw), g = t + t0;
+#endif
         const vec4 t0c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
         const vec4 c = CANONICAL_INPUT ? canonicalHalf(t0c) : t0c;
         const vec3 rgb = max(c.rgb, 0.0);
@@ -266,6 +335,45 @@ void main()
 #endif
         const vec2 ts = p.invOut * 0.5;
         // 5x5 texels T[col][row] from nine gathers (gather: x = (0,1), y = (1,1), z = (1,0), w = (0,0))
+#if D4R_WIN_OUTPUT
+        // The nine gathers are consumed one at a time: each one's four texels go straight into the 5x5 tile and
+        // its four values into the running maximum, so only one gather's registers are live at a time.
+        float T[5][5];      // [row][col]
+        vec4 g = textureGather(hiresTex, ts * (base + vec2(-0.5, -0.5)), 0);
+        float gm = max(max(g.x, g.y), max(g.z, g.w));
+        T[0][0] = g.w; T[0][1] = g.z; T[1][0] = g.x; T[1][1] = g.y;
+        g = textureGather(hiresTex, ts * (base + vec2(1.5, -0.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[0][2] = g.w; T[0][3] = g.z; T[1][2] = g.x; T[1][3] = g.y;
+        g = textureGather(hiresTex, ts * (base + vec2(3.5, -0.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[0][4] = g.w; T[1][4] = g.x;
+        g = textureGather(hiresTex, ts * (base + vec2(-0.5, 1.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[2][0] = g.w; T[2][1] = g.z; T[3][0] = g.x; T[3][1] = g.y;
+        g = textureGather(hiresTex, ts * (base + vec2(1.5, 1.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[2][2] = g.w; T[2][3] = g.z; T[3][2] = g.x; T[3][3] = g.y;
+        g = textureGather(hiresTex, ts * (base + vec2(3.5, 1.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[2][4] = g.w; T[3][4] = g.x;
+        g = textureGather(hiresTex, ts * (base + vec2(-0.5, 3.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[4][0] = g.w; T[4][1] = g.z;
+        g = textureGather(hiresTex, ts * (base + vec2(1.5, 3.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[4][2] = g.w; T[4][3] = g.z;
+        g = textureGather(hiresTex, ts * (base + vec2(3.5, 3.5)), 0);
+        gm = max(gm, max(max(g.x, g.y), max(g.z, g.w)));
+        T[4][4] = g.w;
+        // stored luma at 0.99 and above is an encoding of [0.99, 1): rare enough to branch on
+        if (!(gm < 0.99))
+        {
+            for (int r = 0; r < 5; ++r)
+                for (int c = 0; c < 5; ++c)
+                    T[r][c] = softIn(vec4(T[r][c])).x;
+        }
+#else
         vec4 g00 = textureGather(hiresTex, ts * (base + vec2(-0.5, -0.5)), 0);
         vec4 g10 = textureGather(hiresTex, ts * (base + vec2(1.5, -0.5)), 0);
         vec4 g20 = textureGather(hiresTex, ts * (base + vec2(3.5, -0.5)), 0);
@@ -290,13 +398,18 @@ void main()
         T[2][2] = g11.w; T[2][3] = g11.z; T[3][2] = g11.x; T[3][3] = g11.y;
         T[2][4] = g21.w; T[3][4] = g21.x;
         T[4][0] = g02.w; T[4][1] = g02.z; T[4][2] = g12.w; T[4][3] = g12.z; T[4][4] = g22.w;
+#endif
         // Each row filtered for the two sub-pixel columns. Stored luma lies in [0, 1), so the clamps of the
         // sharpened taps do nothing here; the column pass below keeps them (rows can overshoot).
         const CrAxis cx = crAxis(x0, x1, x2, x3, mx), cy = crAxis(y0, y1, y2, y3, my);
         float R[5][2];
         for (int r = 0; r < 5; ++r)
             for (int c = 0; c < 2; ++c)
+#if D4R_WIN_OUTPUT
+                R[r][c] = crPassRow(T[r][c], T[r][c + 1], T[r][c + 2], T[r][c + 3], cx);
+#else
                 R[r][c] = crPass(T[r][c], T[r][c + 1], T[r][c + 2], T[r][c + 3], cx);
+#endif
         for (int sy = 0; sy < 2; ++sy)
             for (int sx = 0; sx < 2; ++sx)
             {
@@ -308,11 +421,30 @@ void main()
         // the history was compressed with last frame's exposure. The reference always re-exposes
         // (v' = L * k(L) with L = ratio * (v * g(v))); skipping it when the ratio is exactly 1 leaves the
         // pre-rounding value, which is not what k(g(v)) costs on a real frame.
+#if D4R_WIN_OUTPUT
+        // The reference re-exposes through expand then compress. Both take their Reinhard branch below 1000, where
+        // the composition is exactly r*v / (1 + v*(r-1)): one wave-level test replaces four pairs of branchy
+        // reciprocal/log2 evaluations (the value differs from the round trip by an ulp or two).
+        if (subgroupAll(all(lessThan(Hq, vec4(0.9)))) && p.expoRatio < 9.0)
+        {
+            const float rm1 = p.expoRatio - 1.0;
+            Hq = (p.expoRatio * Hq) * (vec4(1.0) / fma(Hq, vec4(rm1), vec4(1.0)));
+        }
+        else
+        {
+            for (int s = 0; s < 4; ++s)
+            {
+                const float L = p.expoRatio * (Hq[s] * expandK(Hq[s]));
+                Hq[s] = L * compressK(L);
+            }
+        }
+#else
         for (int s = 0; s < 4; ++s)
         {
             const float L = p.expoRatio * (Hq[s] * expandK(Hq[s]));
             Hq[s] = L * compressK(L);
         }
+#endif
     }
     {
         precise const float chk = fma(sig, hist.b, fma(hist.r, hist.g, fma(Hq.x, Hq.y, Hq.z * Hq.w)));
@@ -352,6 +484,9 @@ void main()
     // Through shared memory instead: AMD's D3D12 compiler does not give WaveReadLaneAt with a per-lane index
     // (subgroupShuffleXor in dialect_hlsl.h) the quad's lanes here, which left bright highlights on the
     // non-bright reconstruction table (about twice as bright as NGX at HDR highlights, RX 9070 XT, 2026-10-23).
+    // Not re-tested on 2026-11-05: neither the harness's scenes nor five captured game frames have a quad of mixed
+    // brightness (removing the exchange leaves them byte-identical), so they cannot show whether the shuffle works
+    // now. With the Windows build's changes below this exchange costs nothing measurable, so it stays.
     brightQuad[gl_LocalInvocationIndex] = bright;
     barrier();
     const uint qx = gl_LocalInvocationID.x, qy = gl_LocalInvocationID.y;
@@ -429,34 +564,18 @@ void main()
     // reproduce it). sumY / sumW then went NaN, the check below zeroed the filtered luma, and with the blend weight
     // near 1 the history luma became 0 and stayed 0: black speckles on bright foliage and edges. In f32 the game
     // and the replay agree byte for byte, 83-89 dB from the half filter on one frame, 67 dB after 30 frames.
-    vec4 sumY = vec4(0.0), sumW = vec4(0.0), eMax = vec4(-60000.0), yMax = vec4(0.0);
+    vec4 F;
     {
+        // Two sub-pixel pairs one after the other rather than four lanes at once: the same operations in the same
+        // order per lane, but half the live registers in the loop.
         const vec4 fA = vec4(subA), fB = vec4(subB);
         const float f0 = float(e0), f1 = float(e1), f2 = float(e2), fs = float(slope);
-        float fline = float(cB) + (float(a0) - float(cA)) * fs;
-        for (int r = 0; r < 4; ++r)
-        {
-            const int bs = int(roundEven(fline)) - 1;
-            const vec4 dA = float(a0 + r) - fA;
-            vec4 db = float(bs) - fB;
-            const vec4 cross = dA * f2;
-            vec4 lin = fma(db, cross, (dA * dA) * f0);
-            const int ti = (a0 + r) * stepA + bs * stepB;
-            for (int j = 0; j < 3; ++j)
-            {
-                const vec4 E = fma(db * db, vec4(f1), lin);
-                const vec4 w = exp2(E), Y = vec4(float(tileC[ti + j * stepB].x));
-                sumY = fma(w, Y, sumY);
-                sumW += w;
-                const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
-                eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
-                db += 1.0; lin += cross;
-            }
-            fline += fs;
-        }
+        const float fline0 = float(cB) + (float(a0) - float(cA)) * fs;
+        vec2 sY[2], sW[2];
+        gaussPair(fA.xy, fB.xy, fline0, f0, f1, f2, fs, a0, stepA, stepB, sY[0], sW[0]);
+        gaussPair(fA.zw, fB.zw, fline0, f0, f1, f2, fs, a0, stepA, stepB, sY[1], sW[1]);
+        F = vec4(sY[0] / sW[0], sY[1] / sW[1]);
     }
-    vec4 F = sumY / sumW;
-    F = mix(F, yMax, lessThan(eMax, vec4(-12.0)));
 #else
 #if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
     // Profile-independent sums; see the explanation above.
@@ -520,7 +639,16 @@ void main()
     precise const float16_t avg = float16_t(0.25) * ((conf.x + conf.z) + (conf.y + conf.w));
     const float alphaC = float(clamp(fma(avg, hv2 - hi, hi), float16_t(0.0), float16_t(1.0)));
     const vec4 bl = vec4(clamp(fma(conf, f16vec4(hv - lo), f16vec4(lo)), float16_t(0.0), float16_t(1.0)));
-    if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
+    if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u)))
+    {
+#if D4R_WIN_OUTPUT
+        // 0/0 from the f32 filter (every weight underflowed, see gaussPair): the current luma for that sub-pixel
+        F = mix(vec4(cur.x), F, lessThan(abs(F), vec4(uintBitsToFloat(0x7F800000u))));
+        if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
+#else
+        cur.xyz = vec3(0.0); F = vec4(0.0);
+#endif
+    }
     // a single-rounded fma, as the reference: fma.rn.ftz.f32 N, bl, F - Hq, Hq
     const vec4 N = fma(bl, F - Hq, Hq);
     // Native averages the four f32 blend registers, before the encoded half-surface stores.
