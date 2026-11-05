@@ -579,3 +579,11 @@ schedule (all slower).
   -1.29%, dx-RRF-4k -1.82% in the harness (the replay showed -2.7%). Only packages with `hip/rr2_enc0.hsaco` take it
   (models-rre/rr-f here; models/rr-f lacks it). The replay's `hip N` figure for preset F is not meaningful (HIP events
   around the graph launch); use the D3D12 front / network / back split.
+- **Kept: L's two d3dhip plane stages with two windows per wave** (a953312, helper agent-lplanes): `-DWPW=2` on
+  `enc0_l_planes.dxil` / `dec0_l_planes.dxil` only; dx-L-1440 2.354 -> 2.317 ms, dx-L-4k 5.237 -> 5.154 (-1.59%
+  each, tools/ab.sh 3 rounds), byte-identical. Per stage (D4R_PROFILE): input 490 -> 469 us, expansion 374 -> 348 at
+  720p. Both stages are issue-bound (RGA: 1947 / 2555 instructions a wave, no spills; the FP8 packs need f32
+  sources on gfx12, ~400 conversion instructions a wave). Rejected by the agent, all slower or equal: -O1, M_ACC32,
+  PF/PFN prefetch, f32 embedding, binary16 MLP residual, MLP weight tiles staged in LDS (slower), removing the four
+  group barriers (free already). A constant-address probe was 35% faster only because the compiler deleted half the
+  program. Runtime with this package: `C:\d4r-hc\rt-lx` (rt-rrh plus the two files); rt-rrh stays the older control.
