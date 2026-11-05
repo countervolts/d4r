@@ -655,14 +655,14 @@ schedule (all slower).
   token * 32 + channel) and the network's tokens in NGX's planes, so HIP can take it; the expansion
   (`dec0_l_planes`) writes four textures (feat, gates, mix, cov), which HIP cannot. ZLUDA's native tail
   (kernels/tex/enc0l_tail.hip: embedding, the C32 Swin block, skip, patch merge) has exactly those outputs and
-  layouts. Standalone (C:\d4r-hc	mp\lhip: a loader from the featsL layout into the tail's shared-memory layout, then
+  layouts. Standalone (C:\d4r-hc\tmp\lhip: a loader from the featsL layout into the tail's shared-memory layout, then
   `d4r_enc0l_tail`; random weights) on the RX 9070 XT: 416 us at the 1280x736 token grid, 921 us at 1920x1088 (188
   VGPRs, occupancy 8, no scratch; four waves 433 / 960, -mcumode 412 / 912). I first set that against the profile's
   whole input stage (469 / 1160 us) and expected -2.4% / -4.8%. That was the wrong comparison: the gather pass
   (enc0_m.comp L_FEATURES) stays on D3D12 either way, and the block alone is ~0.35 ms at 720p.
   Built anyway, to measure it: the kernel packaged with NGX's enc0 weights, HipNetworkDx owning a shared featsL / skipL
   and launching it ahead of the graph, MEngine skipping its dispatch (`D4R_HIP_L_ENC0`; patch and sources in
-  `C:\d4r-hc	mp\lhipoute`). In the harness (L 720p -> 1440p, D4R_PROFILE), the input stage went from ~0.50 to
+  `C:\d4r-hc\tmp\lhip\route`). In the harness (L 720p -> 1440p, D4R_PROFILE), the input stage went from ~0.50 to
   0.14 ms, but the network wait grew from ~0.87 to ~1.37 ms, and the frame was 2.373 against 2.273 ms. The output is
   finite but 31.5 dB from the D3D12 stage after 200 frames, unexplained. Reverted. D3D12's plane stage (WPW=2, RGA 1947
   instructions a wave) beats ZLUDA's NVIDIA-order tail here.
