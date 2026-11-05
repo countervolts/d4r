@@ -430,3 +430,11 @@ schedule (all slower).
 - **Owner, 2026-11-05: byte-identical output is not a requirement.** From now on, numerics-changing levers are taken
   when they are faster and their quality holds (PSNR / max-diff against the current output, recorded here), not only
   lane A ones. Levers dropped partly for not being identical get a second look.
+- **Tried, rejected (lane B): K's D3D12 output stage in f32.** AMD's DXIL compiler scalarises its half vectors anyway,
+  so the scratch variant turned `float16_t` / `f16vec*` into f32 (bit casts through `f16tof32` / `f32tof16`):
+  - RGA: 2112 against 2155 VALU, 107 against 10 conversions, 118 against 107 VGPRs, LDS 7.9 against 12.5 KB.
+  - dx-K-1440: 1.327 -> 1.304 ms (-1.7%, three ABAB pairs).
+  - The output moves 28.2 dB from the base: 30% of values change by more than 1e-3, max 0.97, finite.
+  As output_k.comp's comments say, the reference filters in half precision: its sample positions sit on half
+  rounding ties, and the recurrent history spreads any change over the frame. An f32 filter is another algorithm,
+  not a rounding nuance. Not worth 1.7%.
