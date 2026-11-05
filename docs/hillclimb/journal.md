@@ -209,3 +209,11 @@ schedule (all slower).
   vk-K-4k -0.29% (noise), identical. Why trimming races is not understood: the trimmed windows' tokens are not read by
   the rule the trimming uses, so some HIP layer may read them after all (a padded window's halo) and pick up whatever
   another dispatch left there.
+- **The vkhip K race is not the trimming.** The Windows-flag K kernels (below) diverged again at 4K with the full
+  grids (enc0, enc2 and dec0 variants each alone: 1-2 of 12 runs); the unchanged kernels had just been lucky (0/32).
+  vkhip M at 4K (no scratch): 12/12 stable; d3dhip K with the same kernels: 12/12 stable (both flag sets). So the race
+  goes with the spilling layers on the pipeline-binary path. **Reverted to opt-in**: gfx12 scratch through pipeline
+  binaries only with `D4R_VKHIP_SCRATCH=1` (K's Vulkan route is back on the Vulkan network, byte-identical to before
+  cdc0787, vk-K-4k 2.922 against 2.916), and the trim change of 2291ccc is reverted (it only lowered the rate). The
+  opt-in route keeps its speed (1.105 ms at 1440p). Spill-free gfx12 K layers are what would make it safe: a kernel
+  change (register pressure in pwin_layer.h / pwin_pos.h) for a later iteration.
