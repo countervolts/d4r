@@ -74,6 +74,14 @@ float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.
 groupshared float4 inputFeatures[256];
 #endif
 int clamp1(int v, int origin, int hi) { return v > 0 ? min(v + origin, hi) : origin; }
+#ifdef D4R_ACCURACY
+// PTX runs this stage with fma.rn.ftz, so denormal operands flush to zero; this machine's fast path
+// keeps them, which is where the thin-geometry speckle comes from.
+float fz(float v) { return floatBitsToUint(v) < 0x00800000u ? 0.0 : v; }
+#define FZ(x) fz(x)
+#else
+#define FZ(x) (x)
+#endif
 // The reference's expansion of the stored history luma: rcp.approx(1 - v) below 0.99900102 (its threshold,
 // one ulp above 0.999), otherwise ex2(((v + 0x3C4FAE29) * 9) * log2e) - 1) / (9 v).
 float expandK(float v)
@@ -194,7 +202,7 @@ void main()
 #if LDR
             S += c;
 #else
-            S = fma(vec3(max(1.0 / (c.x + 1.0), p.minW)), c, S);   // fused in the reference
+            S = fma(vec3(max(1.0 / (FZ(c.x) + 1.0), p.minW)), FZ(c), S);   // fused in the reference
 #endif
             const vec3 L = c * logK(c.x);
             lo = min(lo, L); hi = max(hi, L);
