@@ -62,7 +62,7 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); }
 #define Q8(dst, src) Q8PAIRS(dst, src)
-#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; SAT8V(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
 // The block is one wave: its lanes hand values to one another through shared memory (stores by some lanes, loads by
 // others). The memory model needs a subgroup barrier between them; RADV keeps a wave's shared-memory accesses in order
@@ -378,7 +378,8 @@ void main()
                 
                 ML[wv][m][i] = w32f.w[W_BU_F / 4u + 16u * m + 8u * hl + uint(i)];
             }
-            Q8(Nb[wv][m], rv[wv][m])
+            // guarded under RR_LLPC_SAT as well: decoder 0's r is not always finite (its images change otherwise)
+            Q8G(Nb[wv][m], rv[wv][m])
 #if KIND == 5
             // the tail takes r as binary16: converted here, so that the f32 values are not live across the MLP
             [[unroll]] for (int i = 0; i < 8; i += 2)
@@ -428,7 +429,7 @@ void main()
             floate4m3_t Tb[8];
             [[unroll]] for (int i = 0; i < 8; i += 2) {
                 const vec2 y_ = vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]));
-                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(y_));
+                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(y_));   // guarded: r + the MLP (r is not always finite)
                 Tb[i] = q.x; Tb[i+1] = q.y;
             }
 #if KIND == 4
