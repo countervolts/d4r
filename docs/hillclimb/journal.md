@@ -687,3 +687,14 @@ schedule (all slower).
   window's activations cost +~64 VGPRs: the C 96 / 128 layers (enc2 174, tube 163, dec2 235 VGPRs) cannot take that
   without scratch, and the C 64 layers (enc1 145, dec1 133) gained only 11-13% with no weight loads at all. Expected:
   about -40 us of M at 4K (~1%) for a rewrite of the core's token ownership and its patch merge / expand. Not done.
+- **Housekeeping: a stray K enc0 code object in five runtimes.** A helper (agent-knet) wrote an experimental
+  `dltss_pwin_enc0_layer.hsaco` through a hardlink into rt-lx from 16:35 to 17:20 on 2026-11-05. It restored rt-lx
+  itself, but rt-kc, rt-ke, rt-km, rt-l0 and rt-rrswin had been copied in that window and kept the experimental file
+  (disassembly 387565c6 against the original 69674d49). Restored from rt-lx (md5 892b4f8a). The M, L and RR F
+  numbers do not involve that kernel. K's output-stage A/B (1f8d128) ran with the same file on both sides, so its
+  delta holds, but its absolute K times came from that build.
+- **Not committed: agent-knet's `-DPOS_VSHARE1` for gfx1201 K enc0 / dec0** (`C:\d4r-hc\agents\agent-knet\knet.patch`,
+  kernels/windows-flags.txt only). Byte-identical (every wave computed V^T for all four key tiles; now each wave
+  computes its own into LDS), spills down (enc0 108 -> 44 B). Network -1.6%; dx-K-1440 -0.89 / -1.01 / -1.66%,
+  dx-K-4k -1.35 / -0.83 / -0.35% over three sessions. Borderline against the 1% bar and not yet re-measured here.
+  The climb stopped at this point, on the user's call.
