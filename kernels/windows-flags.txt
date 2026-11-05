@@ -14,3 +14,19 @@ gfx1201 dltss_pwin_dec4_layer -DPOS_NORM_LANE
 # the other gfx12 targets (gfx1200): the sources' gfx12 lines plus the fix
 gfx12 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC
 gfx12 dltss_pwin_dec0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC
+# M's (DLSS 4.5) token-lane Swin layers: the weight image stores the two k16 operands of a k32 step next to
+# each other, so one 16-byte read per lane fetches both (SWIN_TOK_WPAIR: half the weight-load instructions,
+# byte-identical output). The M layers run at the one-8-byte-load-per-WMMA ceiling (docs/hillclimb/journal.md,
+# "M's Swin HIP layers"): measured on the RX 9070 XT, the isolated ten-layer network 1.94 -> 1.85 ms
+# at 1920x1080, the D3D12 harness preset M 1920x1080 -> 3840x2160 3.43 -> 3.37 ms and 1280x720 -> 2560x1440
+# 1.62 -> 1.60 ms, every frame byte-identical. -mcumode: -0.5% more (identical).
+gfx1201 rrlite_enc1_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx1201 rrlite_enc2_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx1201 rrlite_enc3_tube_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx1201 rrlite_dec2_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx1201 rrlite_dec1_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx12 rrlite_enc1_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx12 rrlite_enc2_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx12 rrlite_enc3_tube_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx12 rrlite_dec2_4x4 -DSWIN_TOK_WPAIR -mcumode
+gfx12 rrlite_dec1_4x4 -DSWIN_TOK_WPAIR -mcumode
