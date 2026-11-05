@@ -1,6 +1,7 @@
 // vk_pipeline_stats SHADER.spv [-ir] [push=N] [bN=ssbo|sampler|image|ubo|texel|stexel ...]
 // Build (Git Bash, MSYS2 MinGW + Vulkan SDK): x86_64-w64-mingw32-g++ -O1 -std=c++17 -I$VULKAN_SDK/Include tools/vk_pipeline_stats.cpp -o vk_pipeline_stats.exe -static
-// VKSTATS_WAVE=32|64 requests a subgroup size; VKSTATS_NO_FP8=1 skips VK_EXT_shader_float8.
+// VKSTATS_WAVE=32|64 requests a subgroup size; VKSTATS_NO_FP8=1 skips VK_EXT_shader_float8; VKSTATS_ELF=FILE writes the
+// pipeline's binary (VK_KHR_pipeline_binary: on AMD's driver the AMDPAL ELF with its msgpack metadata note).
 // Builds the compute pipeline on the first GPU with VK_KHR_pipeline_executable_properties and prints the driver's
 // statistics (and, with -ir, its internal representations). Bindings are all in set 0.
 #define VK_NO_PROTOTYPES
@@ -57,7 +58,12 @@ int main(int argc, char** argv)
     cm.cooperativeMatrix = VK_TRUE;
     VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT, &cm};
     f8.shaderFloat8 = VK_TRUE; f8.shaderFloat8CooperativeMatrix = VK_TRUE;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, getenv("VKSTATS_NO_FP8") ? (void*)&cm : (void*)&f8};
+    const char* elf = getenv("VKSTATS_ELF");
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR, getenv("VKSTATS_NO_FP8") ? (void*)&cm : (void*)&f8};
+    pbf.pipelineBinaries = VK_TRUE;
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &pbf};
+    m5.maintenance5 = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, elf ? (void*)&m5 : getenv("VKSTATS_NO_FP8") ? (void*)&cm : (void*)&f8};
     v13.subgroupSizeControl = v13.computeFullSubgroups = v13.maintenance4 = v13.synchronization2 = VK_TRUE;
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
     v12.shaderFloat16 = v12.shaderInt8 = v12.storageBuffer8BitAccess = v12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
@@ -70,6 +76,7 @@ int main(int argc, char** argv)
     std::vector<const char*> ext{"VK_KHR_pipeline_executable_properties", "VK_KHR_cooperative_matrix"};
     if (!getenv("VKSTATS_NO_FP8")) ext.push_back("VK_EXT_shader_float8");
     if (getenv("VKSTATS_EXT")) ext.push_back(getenv("VKSTATS_EXT"));
+    if (elf) { ext.push_back("VK_KHR_pipeline_binary"); ext.push_back("VK_KHR_maintenance5"); }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &q;
     dci.enabledExtensionCount = uint32_t(ext.size()); dci.ppEnabledExtensionNames = ext.data();
     VkDevice dev; CK(vkCreateDevice(pd, &dci, nullptr, &dev));
@@ -90,7 +97,30 @@ int main(int argc, char** argv)
     cpi.stage.module = sm; cpi.stage.pName = "main"; cpi.layout = lay;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     if (const char* w = getenv("VKSTATS_WAVE")) { rs.requiredSubgroupSize = atoi(w); cpi.stage.pNext = &rs; }
+    VkPipelineCreateFlags2CreateInfoKHR flags2{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+    if (elf) {
+        flags2.flags = VkPipelineCreateFlags2KHR(cpi.flags) | VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+        cpi.pNext = &flags2;
+    }
     VkPipeline pipe; CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
+    if (elf) {
+        DFN(vkCreatePipelineBinariesKHR); DFN(vkGetPipelineBinaryDataKHR);
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR}; bci.pipeline = pipe;
+        VkPipelineBinaryHandlesInfoKHR handles{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        CK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &handles));
+        std::vector<VkPipelineBinaryKHR> bins(handles.pipelineBinaryCount);
+        handles.pPipelineBinaries = bins.data();
+        CK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &handles));
+        for (size_t b = 0; b < bins.size(); ++b) {
+            VkPipelineBinaryDataInfoKHR di{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR}; di.pipelineBinary = bins[b];
+            VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+            size_t size = 0; CK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &size, nullptr));
+            std::vector<char> data(size); CK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &size, data.data()));
+            const std::string path = b ? std::string(elf) + "." + std::to_string(b) : std::string(elf);
+            std::ofstream(path, std::ios::binary).write(data.data(), std::streamsize(size));
+            fprintf(stderr, "wrote %s (%zu bytes)\n", path.c_str(), size);
+        }
+    }
     VkPipelineInfoKHR pinfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR}; pinfo.pipeline = pipe;
     uint32_t ne = 0; vkGetPipelineExecutablePropertiesKHR(dev, &pinfo, &ne, nullptr);
     std::vector<VkPipelineExecutablePropertiesKHR> ep(ne, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
