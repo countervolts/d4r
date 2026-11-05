@@ -291,3 +291,35 @@ schedule (all slower).
   (`D4R_D3DHIP_SYNC=cpu`) against the GPU fence: K 1.35 against 1.28, M 1.60 against 1.53.
 - **Stopped at the plateau condition** (10 iterations since ed503cc without a kept change, across >= 3
   opportunities); summary at the top of scoreboard.md. Game checks still owed (BLOCKERS).
+
+### 2026-11-05: after the plateau stop (the stop was rejected: >5% items left untried)
+
+- **K's output stage on Vulkan, ablations** (timing only, wrong output; vk-K-1440, 1.085 ms): the 12-tap filter
+  removed 0.175 ms, the Catmull-Rom history 0.083, both 0.257. Inside the filter: the exps cost nothing measurable, the
+  LDS reads nothing, the max-tap tracking 0.028 ms (2.6%). The filter is ~534 of the stage's 1546 VALU instructions
+  (69 VGPRs either way), already packed f16. No byte-identical lever above ~0.03 ms: not pursued. The centre-only
+  estimate (`D4R_GAUSSIAN_CENTER`) was dropped earlier for quality (compile_k.py), so it is not an option.
+- **RR F's enc0 / dec0_1 on LLPC** (vk-RRF-1440, 3.77 ms): an empty enc0 saves 0.83 ms, an empty dec0_1 0.53 (36% of
+  the case between them). enc0_llpc: 202 VGPRs, 10.7k instructions, no scratch; dec0_1_llpc: 189 VGPRs, 9.1k. Of
+  enc0's instructions ~4.4k are the FP8 conversions' guards: `rr_exact.glsl`'s `FINITE` (infinity -> NaN before
+  `saturatedConvertEXT`) is RADV's pattern for one conversion; LLPC keeps a compare and a select per element, each
+  select waiting on its compare's VCC (`s_wait_alu depctr_va_vcc`), and writes MODE.FP16_OVFL before every
+  conversion. LLPC test shaders: `saturatedConvertEXT` without FINITE is worse (clamp, class test, select per
+  element); a plain conversion is the mode write and the conversion only; `clamp(v, +-448)` + plain conversion is one
+  `v_med3` per element more. No LLPC form keeps a NaN's code more cheaply than FINITE.
+  - Plain conversions everywhere (ablation): 3.77 -> 3.43 ms, output different (overflow becomes NaN).
+  - `clamp` + plain conversion at every site: 3.53 ms, output different. Bisected: only `Q8(Nb, rv)` (the residual
+    r = x + attention in dec0_1, KIND 5) changes the images, so r is not always finite there. ACT8, Q8 of the
+    attention's f32 sums (q, k, v, o) and enc0's input are identical.
+  - Kept: `RR_LLPC_SAT` (rr_exact.glsl `SAT8V`), clamp + plain conversion for the f32 sums of FP8 products; the
+    residual and the tail (r + MLP) keep the guarded form (`Q8G`). compile_rr2.py compiles `<stage>_llpc.spv` with it
+    on Windows hosts (`D4R_RR_LLPC_SAT`, default 1 on Windows, 0 elsewhere). With the define off the rebuilt model is
+    byte-identical to HEAD's in all 99 files compile_rr2.py writes; on, only enc0_llpc.spv and dec0_1_llpc.spv change.
+    The preprocessed sources the D3D12 and HIP builds use differ only in whitespace (dec0_0's glsl2hip output too).
+    For finite values the conversion is the same (nearest even, everything above 448 saturates to 448). A NaN
+    accumulator now gives +-448 instead of the NaN code: the harness shows none at these sites, but a NaN from a game
+    input would reach them; NVIDIA's network propagates NaN there.
+  - Bench (bench.py, full matrix, 3 rounds C X X C, rt-cand14 against the same runtime with the two rebuilt files):
+    vk-RRF-1440 3.781 -> 3.561 (-5.82%, spread 0.82%), vk-RRF-4k 8.269 -> 7.755 (-6.21%, spread 0.46%); every
+    case identical, nothing else outside its spread (worst vk-L-4k +0.18%). Scores D3D12 2.484 / 2.485, Vulkan
+    2.620 -> 2.584. Lane A on the harness; the NaN case above is the only numerical difference.

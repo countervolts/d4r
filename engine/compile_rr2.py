@@ -109,6 +109,11 @@ if os.environ.get('D4R_RR2_ONE_WAVE_DEC0_1', '1' if UNGUARDED else '0') != '0' a
 # (2026-10-20; the guarded build is the same either way), so that build splits.
 # D4R_RR2_SPLIT=1 / 0 forces the gather pass / the single shader.
 SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WAVE and not UNGUARDED else '1') != '0'
+# D4R_RR_LLPC_SAT (on by default on Windows hosts, off elsewhere): the hybrid stages' <stage>_llpc.spv compiled with
+# RR_LLPC_SAT, the FP8 conversions of f32 accumulators as a clamp and the plain conversion (engine/rr/rr_exact.glsl
+# SAT8V), which LLPC compiles without a compare and a select per element: the same images, preset F 3.77 -> 3.53 ms
+# at 720p -> 1440p on Vulkan (RX 9070 XT, 2026-11-05). A NaN accumulator gives +-448 instead of the NaN code.
+LLPC_SAT = os.environ.get('D4R_RR_LLPC_SAT', '1' if os.name == 'nt' else '0') == '1'
 
 
 def find_module(ptx_dir, kernel):
@@ -259,7 +264,16 @@ def main():
             # carries <stage>_llpc.spv as well; runtime_rr2.inc loads it only on that driver.
             opt = os.environ.get('D4R_SPIRV_OPT') or shutil.which('spirv-opt') or shutil.which('spirv-opt.exe')
             if opt:
-                subprocess.run([opt, '-O', str(out / f'{stage}.spv'), '-o', str(out / f'{stage}_llpc.spv')],
+                src = out / f'{stage}.spv'
+                if LLPC_SAT:   # the same shader with LLPC's form of the FP8 conversions (LLPC_SAT above)
+                    src = work / f'{stage}_llpc_sat.spv'
+                    subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, '-DRR_LLPC_SAT',
+                                             f'-I{work}', f'-I{HERE / "rr"}', str(work / f'{stage}_m.comp'), '-o', str(src)],
+                                   check=True, stdout=subprocess.DEVNULL)
+                    if not UNGUARDED:
+                        subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(src)],
+                                       check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([opt, '-O', str(src), '-o', str(out / f'{stage}_llpc.spv')],
                                check=True, stdout=subprocess.DEVNULL)
                 print(f'{stage}: {stage}_llpc.spv (for AMD\'s Windows driver)')
             else:
