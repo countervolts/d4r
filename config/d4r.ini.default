@@ -173,8 +173,9 @@ Network = auto
 ; size the feature was created with; other sizes keep the engine's Vulkan network. (D4R_ENGINE_VKHIP)
 ExperimentalVkHip = true
 ; Ray Reconstruction's network stages on native HIP code objects inside the engine's command list (RDNA4 only).
-; auto = presets A - C and D - E use them (8x and 8% faster than their Vulkan shaders), preset F stays on its
-; Vulkan path (its vkhip blocks measure within 1%); true or false forces every preset. Needs the model's hip/
+; auto = presets A - C and D - E use them (8x and 8% faster than their Vulkan shaders), and preset F does on AMD's
+; Windows driver (17% faster, byte-identical) but stays on its Vulkan path under RADV (within 1% there); true or
+; false forces every preset. Needs the model's hip/
 ; code objects (kernels/rr/build_vkhip_cnn.sh, build_vkhip.sh, build_vkhip_f.sh); without them the Vulkan engine
 ; runs and the log says why. Follows ExperimentalVkHip: false there turns this off too. (D4R_ENGINE_RR_VKHIP)
 ExperimentalRrVkHip = auto
