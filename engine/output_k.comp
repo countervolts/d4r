@@ -421,6 +421,43 @@ void main()
     const float estimate = mix(filtered, float(yMax), (eMax < float16_t(-12.0)));
     vec4 F = vec4(estimate);
 #else
+#if defined(D4R_HLSL) && D4R_FILTER_F32
+    // The whole filter in f32: the exponents, weights and running maximum as well as the sums. In Ghost of
+    // Tsushima (RX 9070 XT, driver 26.10.1, preset K LDR) the half-precision exponents of this loop came out
+    // non-finite on 5-8% of the pixels inside the game process only, from the same LUT entry, tap positions and
+    // network head that a replay of the captured frame evaluates finitely (renaming the replay executable does not
+    // reproduce it). sumY / sumW then went NaN, the check below zeroed the filtered luma, and with the blend weight
+    // near 1 the history luma became 0 and stayed 0: black speckles on bright foliage and edges. In f32 the game
+    // and the replay agree byte for byte, 83-89 dB from the half filter on one frame, 67 dB after 30 frames.
+    vec4 sumY = vec4(0.0), sumW = vec4(0.0), eMax = vec4(-60000.0), yMax = vec4(0.0);
+    {
+        const vec4 fA = vec4(subA), fB = vec4(subB);
+        const float f0 = float(e0), f1 = float(e1), f2 = float(e2), fs = float(slope);
+        float fline = float(cB) + (float(a0) - float(cA)) * fs;
+        for (int r = 0; r < 4; ++r)
+        {
+            const int bs = int(roundEven(fline)) - 1;
+            const vec4 dA = float(a0 + r) - fA;
+            vec4 db = float(bs) - fB;
+            const vec4 cross = dA * f2;
+            vec4 lin = fma(db, cross, (dA * dA) * f0);
+            const int ti = (a0 + r) * stepA + bs * stepB;
+            for (int j = 0; j < 3; ++j)
+            {
+                const vec4 E = fma(db * db, vec4(f1), lin);
+                const vec4 w = exp2(E), Y = vec4(float(tileC[ti + j * stepB].x));
+                sumY = fma(w, Y, sumY);
+                sumW += w;
+                const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
+                eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
+                db += 1.0; lin += cross;
+            }
+            fline += fs;
+        }
+    }
+    vec4 F = sumY / sumW;
+    F = mix(F, yMax, lessThan(eMax, vec4(-12.0)));
+#else
 #if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
     // Profile-independent sums; see the explanation above.
     vec4 sumY = vec4(0.0), sumW = vec4(0.0);
@@ -456,6 +493,7 @@ void main()
     }
     vec4 F = vec4(sumY) / vec4(sumW);
     F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
+#endif
 #endif
     // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads
     // it as an f16 value widened to f32 (dlss-0046 converts every lane with cvt.rn.f16.f32 before the

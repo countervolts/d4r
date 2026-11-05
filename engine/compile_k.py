@@ -239,7 +239,8 @@ def build_dxil(index, output, ldr, target='windows'):
     # AMD's Cyberpunk application profile changes native half accumulation.
     # Keep Gaussian sums in f32 on Windows and round only the filter result;
     # vkd3d/RADV keeps its existing native-half implementation.
-    reconstruction = [] if vkd3d else ['-DD4R_FILTER_ACCUM_F32=1']
+    # Ghost of Tsushima's half exponents too (black speckles in game only): the whole filter in f32 (D4R_FILTER_F32).
+    reconstruction = [] if vkd3d else ['-DD4R_FILTER_ACCUM_F32=1', '-DD4R_FILTER_F32=1']
     for name, e in index.items():
         tpw = 2 if vkd3d and e['C'] == 32 and e['kind'] != 'dec0' else 1
         extra = ['-DCOLUMN_MAJOR_ENC0=0', f'-DTPW={tpw}'] + (['-DPADX=0', '-DPAD4=0'] if e['C'] == 128 else [])
