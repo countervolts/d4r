@@ -8,6 +8,7 @@ Pass that directory here; both d4r-k and d4r-k-d3d12 can replay case.txt.
 import argparse
 import json
 from pathlib import Path
+import struct
 
 
 def prepare(directory):
@@ -31,15 +32,33 @@ def prepare(directory):
         raise ValueError('expected color, motion and depth textures')
     for index, (name, geometry) in enumerate(zip(('color', 'motion', 'depth'), textures)):
         width, height, format_id = map(int, geometry.split())
+        file = name + '.bin'
         # Replays consume floating point planes, not UNORM bit patterns.
         if format_id == 56:
             raise ValueError('R16_UNORM depth needs conversion to float before replay')
+        if format_id == 24:
+            # R10G10B10A2_UNORM colour (Ghost of Tsushima): decoded to RGBA16F as the view's hardware decode reads it
+            # (10-bit unorm and the 2-bit alpha are exact in binary16)
+            raw = (directory / file).read_bytes()
+            if len(raw) != width * height * 4:
+                raise ValueError(f'incomplete {name} texture')
+            words = memoryview(raw).cast('I')
+            out = bytearray(width * height * 8)
+            texel = struct.Struct('<4e')
+            for i, w in enumerate(words):
+                texel.pack_into(out, 8 * i, (w & 1023) / 1023, (w >> 10 & 1023) / 1023, (w >> 20 & 1023) / 1023, (w >> 30) / 3)
+            file = name + '-rgba16f.bin'
+            (directory / file).write_bytes(out)
+            format_id = 10
+        if format_id in (20, 21):
+            # D32_FLOAT_S8X24 depth: the capture holds its float plane (R32_FLOAT_X8X24's view), four bytes a texel
+            format_id = 41
         if format_id not in formats:
             raise ValueError(f'unsupported capture DXGI format {format_id}')
         channels, bits = formats[format_id]
-        if (directory / f'{name}.bin').stat().st_size != width * height * channels * bits // 8:
+        if (directory / file).stat().st_size != width * height * channels * bits // 8:
             raise ValueError(f'incomplete {name} texture')
-        lines.append(f'image {index} {quote(name + ".bin")} {width} {height} {channels} {bits}')
+        lines.append(f'image {index} {quote(file)} {width} {height} {channels} {bits}')
     lines.append('frame ' + ' '.join(quote('frame.' + name) for name in ('input', 'output', 'windows')) + ' 0 1 2')
     (directory / 'case.txt').write_text('\n'.join(lines) + '\n')
     references = {'312': 'output.bin', '288': 'next-color.bin', '296': 'next-luma.bin', '304': 'next-feature.bin'}

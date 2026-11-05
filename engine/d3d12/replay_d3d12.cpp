@@ -119,14 +119,37 @@ struct Footprint {
         device->GetCopyableFootprints(&desc, 0, 1, 0, &layout, &rows, &rowBytes, &total);
     }
 };
+// D4R_REPLAY_FORMATS=A,B,C: the case's images (in case order) as these DXGI formats instead of the float format
+// their channels/bits name, the file's bytes uploaded unchanged: a live snapshot replayed with the game's own
+// textures (prepare_live_k.py writes float planes; point a case at the raw color.bin / depth.bin for this). 20 or 19
+// (D32_FLOAT_S8X24 / R32G8X24_TYPELESS) is a depth-stencil resource whose depth plane takes the file; 0 keeps the
+// default for that image.
+DXGI_FORMAT replayFormat(size_t index) {
+    const char* list = std::getenv("D4R_REPLAY_FORMATS");
+    if (!list) return DXGI_FORMAT_UNKNOWN;
+    std::string s(list);
+    for (size_t i = 0, at = 0; at <= s.size(); ++i) {
+        const size_t comma = s.find(',', at);
+        const std::string item = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        if (i == index) return item.empty() ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(std::stoi(item));
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+    }
+    return DXGI_FORMAT_UNKNOWN;
+}
 struct Image {
     ComPtr<ID3D12Resource> texture, upload;
     d4r::dx::FrameTexture frame;
-    Image(ID3D12Device* device, const d4r::KCaseImage& image) {
+    Image(ID3D12Device* device, const d4r::KCaseImage& image, DXGI_FORMAT forced = DXGI_FORMAT_UNKNOWN) {
         D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = image.w; desc.Height = image.h;
-        desc.DepthOrArraySize = desc.MipLevels = 1; desc.Format = imageFormat(image.channels, image.bits); desc.SampleDesc.Count = 1;
+        desc.DepthOrArraySize = desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+        desc.Format = forced != DXGI_FORMAT_UNKNOWN ? forced : imageFormat(image.channels, image.bits);
+        if (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS) {
+            desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;     // a game's depth buffer: typeless, depth-stencil capable
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        }
         CK(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)));
         const auto data = d4r::readFile(image.file);
         Footprint f(device, texture.Get());
@@ -236,7 +259,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
     auto kcase = d4r::loadKCase(caseFile);
     const auto shape = kcase.shape;
     std::vector<std::unique_ptr<Image>> images;
-    for (auto& image : kcase.images) images.push_back(std::make_unique<Image>(device, image));
+    for (auto& image : kcase.images) images.push_back(std::make_unique<Image>(device, image, replayFormat(images.size())));
 
     const auto start = std::chrono::steady_clock::now();
     d4r::dx::Model model(device, modelDir);
@@ -285,11 +308,27 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
     context.submit();
     std::cerr << "Model/engine setup: " << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() << " ms\n";
 
+    // D4R_REPLAY_OUTPUT_FORMAT=N: the final store goes to a borrowed output of DXGI format N (24: R10G10B10A2, a
+    // game's swap-chain-style target, which runs output_k_rgb10), as in a game, instead of the engine's own RGBA16F
+    ComPtr<ID3D12Resource> borrowedOutput;
+    d4r::dx::FrameOutput finalOutput{};
+    if (const char* format = std::getenv("D4R_REPLAY_OUTPUT_FORMAT"); format && *format) {
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = shape.outputWidth; desc.Height = shape.outputHeight;
+        desc.DepthOrArraySize = desc.MipLevels = 1; desc.Format = DXGI_FORMAT(std::stoi(format)); desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        CK(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                           nullptr, IID_PPV_ARGS(&borrowedOutput)));
+        finalOutput = {borrowedOutput.Get(), desc.Format};
+        std::cout << "final output: borrowed, DXGI format " << unsigned(desc.Format) << "\n";
+    }
     uint32_t evaluation = 0;
     auto setFrame = [&](const d4r::KCaseFrame& f) {
         if (f.input.flags & d4r::FrameFlagReset) evaluation = 0;
         const auto windows = f.autoWindows ? d4r::makeKWindows(shape, evaluation) : f.windows;
-        engine.setFrame({images[f.color]->frame, images[f.motion]->frame, images[f.depth]->frame, {}}, f.input, f.output, &windows);
+        engine.setFrame({images[f.color]->frame, images[f.motion]->frame, images[f.depth]->frame, {}}, f.input, f.output, &windows,
+                        nullptr, finalOutput);
         ++evaluation;
     };
     // d3dhip's handoff: GPU-side through a shared fence (the default), or CPU-serialized (D4R_D3DHIP_SYNC=cpu)
@@ -347,7 +386,8 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
         if (readback) {
             // the history images alternate: the readbacks follow this frame's destination set
             auto history = engine.historyImages();
-            result = std::make_unique<Readback>(device, engine.outputImage(), srv);
+            result = borrowedOutput ? std::make_unique<Readback>(device, borrowedOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                                    : std::make_unique<Readback>(device, engine.outputImage(), srv);
             color = std::make_unique<Readback>(device, history[0], srv);
             luma = std::make_unique<Readback>(device, history[1], srv);
             feature = std::make_unique<Readback>(device, history[2], srv);

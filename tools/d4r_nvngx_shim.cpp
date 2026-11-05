@@ -549,16 +549,25 @@ static std::wstring portable_path(const std::string& value)
     return g_portable.dir + L"\\" + path;
 }
 
+// The C runtime keeps its own copy of the environment, taken when it started: SetEnvironmentVariable alone is never
+// seen by std::getenv, which the engine runtimes (engine/d3d12) and a few shim checks (D4R_DX_NET) use, so a d4r.ini
+// setting such as [Env] D4R_D3D12_CAPTURE_DIR had no effect there. Set both.
 static void portable_set(const char* name, const std::string& value)
 {
     if (GetEnvironmentVariableA(name, nullptr, 0) == 0)
+    {
         SetEnvironmentVariableA(name, value.c_str());
+        _putenv_s(name, value.c_str());
+    }
 }
 
 static void portable_set(const wchar_t* name, const std::wstring& value)
 {
     if (GetEnvironmentVariableW(name, nullptr, 0) == 0)
+    {
         SetEnvironmentVariableW(name, value.c_str());
+        _wputenv_s(name, value.c_str());
+    }
 }
 
 static void portable_set_unix(const char* name, const std::string& value)

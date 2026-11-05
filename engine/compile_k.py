@@ -256,7 +256,8 @@ def build_dxil(index, output, ldr, target='windows'):
         # Four lanes share each token's input feature reduction. On RADV the
         # wave64 SM6.6 build avoids DXC's SM6.9 failure for this schedule and
         # halves input-stage time on GFX1201. Reconstruction keeps SM6.9.
-        hlsl_build.build(HERE / (name + '.comp'), output / (name + '.dxil'), ldr_define + output_schedule,
+        hlsl_build.build(HERE / (name + '.comp'), output / (name + '.dxil'), ldr_define + output_schedule +
+                         os.environ.get('K_DEFS_' + name.upper(), '').split(),
                          wave=64 if vkd3d or name == 'output_k' else 32,
                          profile='cs_6_6' if name == 'input_k' else stage_profile)
     hlsl_build.build(HERE / 'output_k.comp', output / 'output_k_rgb10.dxil', ['-DOUTPUT_RGB10=1'] + ldr_define +
