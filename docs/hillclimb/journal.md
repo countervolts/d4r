@@ -323,3 +323,27 @@ schedule (all slower).
     vk-RRF-1440 3.781 -> 3.561 (-5.82%, spread 0.82%), vk-RRF-4k 8.269 -> 7.755 (-6.21%, spread 0.46%); every
     case identical, nothing else outside its spread (worst vk-L-4k +0.18%). Scores D3D12 2.484 / 2.485, Vulkan
     2.620 -> 2.584. Lane A on the harness; the NaN case above is the only numerical difference.
+- **Preset L's front stages on LLPC, the same conversions** (`layer_m.comp` `SAT2_` / `SATF2_`, enc0_l_planes_llpc /
+  dec0_l_planes_llpc, vk-L-1440 2.245 ms). `M_LLPC_SAT`: enc0 4920 -> 4189 instructions, dec0 3899 -> 3386.
+  - Every conversion clamped: 2.245 -> 2.155 ms (-4.0%), but the images change widely (8 of 29 MB of the output
+    frame), deterministically. Each site group alone (`SAT2_`; attention sums `MK8_F8F`; GELU; ReLU; softmax
+    probabilities; normalised tokens `H1N`) is identical. Cause: LLPC writes MODE.FP16_OVFL before every FP8
+    conversion (1 for a saturating one, 0 for a plain one) and never restores it, so the binary16 arithmetic that
+    follows saturates or overflows depending on the last conversion before it. The base dec0 runs all of it with
+    FP16_OVFL set; with every conversion plain it never is. `saturatedConvertEXT(clamp(v))` does not help (LLPC keeps
+    its clamp, class test and select).
+  - Keeping one group guarded: the attention sums or the normalised tokens give identical images (2.220 -> 2.169 /
+    2.240 -> 2.171 in single runs); GELU, ReLU or the softmax group do not. Kept: the normalised tokens always guarded
+    (`SATN2_`, which are also NaN by design where a channel is infinite), everything else clamped under
+    `M_LLPC_SAT`; compile_m.py builds the two `_planes_llpc.spv` with it on Windows hosts (`D4R_M_LLPC_SAT`). The
+    non-planes `_llpc` modules keep the old form: on this driver the runtime never reaches them (without the planes
+    matrix modules it takes the dot2 planes stages, 5.16 ms), so they cannot be tested here. Full compile_m.py
+    rebuilds of M and L: M's files all identical, L's only the two modules (and model.json's hashes of them; its
+    hsaco hashes differ because kernels/m-vkhip-gfx1201 was rebuilt at 02:42, after the installed models).
+  - Caveat for this and for RR F's change above: identity holds where no binary16 operation overflows under a
+    different FP16_OVFL state than before. The mode sequence moved in both (base dec0_l: 128 writes of 1; now
+    16 x 0, 16 x 1, 64 x 0, 16 x 1, 16 x 0); the base's own sequence is a compiler artefact, not a design choice,
+    and every bench case is identical. Content with binary16 overflow in those stages could differ.
+  - Bench (Vulkan cases, 3 rounds C X X C; control = the RR F commit's runtime, candidate = the two rebuilt L
+    modules): vk-L-1440 2.225 -> 2.181 (-1.97%, spread 1.33%), vk-L-4k 5.028 -> 4.886 (-2.82%, spread 0.72%), every
+    case identical, the others within their spreads. Vulkan score 2.574 -> 2.561. D3D12 never loads these modules.
