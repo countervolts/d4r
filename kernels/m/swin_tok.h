@@ -173,6 +173,27 @@ __device__ __forceinline__ tok_weight tok_weight_buffer(const tok_weight* wl, in
 }
 #endif
 
+#ifdef SWIN_TOK_WPAIR
+#if !defined(SWIN_A8) || defined(SWIN_TOK_WIDE_WEIGHTS)
+#error "SWIN_TOK_WPAIR requires gfx12 native FP8 operands"
+#endif
+// SWIN_TOK_WPAIR: the weight image stores the two k16 operands of a k32 step (s = 0, s = 1) next to each
+// other, 8 bytes apart, so one 16-byte read per lane fetches both (half the weight-load instructions).
+// The values, their order and the WMMAs are unchanged; only the image layout and the load width differ.
+struct tok_wpair
+{
+    gop a, b;
+};
+// acc += A B of one k32 step, its two weight operands fetched together. TOK_WK32: the weight is the first
+// operand (the usual transposed form); TOK_WK32B: the weight is the second operand (V's projection, whose
+// result is consumed transposed).
+#define TOK_WK32(acc, dst, tiles, kc, nt, a0, a1) do { const tok_wpair p_ = wtp(dst, tiles, kc, nt); tok_weight_k32(acc, p_.a, a0, p_.b, a1); } while (0)
+#define TOK_WK32B(acc, dst, tiles, kc, nt, a0, a1) do { const tok_wpair p_ = wtp(dst, tiles, kc, nt); tok_weight_k32(acc, a0, p_.a, a1, p_.b); } while (0)
+#else
+#define TOK_WK32(acc, dst, tiles, kc, nt, a0, a1) tok_weight_k32(acc, wt(dst, tiles, kc, 0, nt), a0, wt(dst, tiles, kc, 1, nt), a1)
+#define TOK_WK32B(acc, dst, tiles, kc, nt, a0, a1) tok_weight_k32(acc, a0, wt(dst, tiles, kc, 0, nt), a1, wt(dst, tiles, kc, 1, nt))
+#endif
+
 enum : int { TOK_ID, TOK_PI, TOK_X, TOK_NU, TOK_PE };
 // A GEMM's weight tiles as in GemmDesc (slot dst + ((kc * 2 + s) * NT + nt) * 16 + r holds the 16 K slots of
 // row r of tile nt), with the raw weight column of (nt, r) chosen by perm:
@@ -314,13 +335,23 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
     const int local = idx - g.dst;
     if (local >= g.KC * 2 * g.NT * 16)
         return;
+#ifdef SWIN_TOK_WPAIR
+    // paired image (see tok_wpair): one 16-byte unit holds the 8 K values of the unit's half for s = 0 and s = 1
+    // of the same (kc, nt) tile pair, so the two operands of a k32 step are one read
+    const int unit = local & 31, pair = local >> 5;
+    const int kc = pair / g.NT, nt = pair % g.NT;
+    const int physical_r = unit >> 1;
+#else
     const int physical_r = local & 15, rest = local >> 4;
+#endif
 #ifdef SWIN_GFX11_ROW
     const int r = (physical_r >> 1) + 8 * (physical_r & 1);
 #else
     const int r = physical_r;
 #endif
+#ifndef SWIN_TOK_WPAIR
     const int nt = rest % g.NT, s = (rest / g.NT) & 1, kc = rest / g.NT / 2;
+#endif
     int n = 16 * nt + r, base = g.base;
     if (g.perm == TOK_PI)
         n = gperm(tok_kslot(nt, r));
@@ -335,6 +366,23 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
         n = gc % g.blkcols;
     }
     u4v_t v;
+#ifdef SWIN_TOK_WPAIR
+    {
+        // unit's half h: K slots 8 h + 0 .. 8 h + 7 of step s
+        const int h = unit & 1;
+#pragma unroll
+        for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+            {
+                uint32_t word = 0;
+#pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    word |= (uint32_t)w[woff(base, g.Ks, g.Ns, 32 * kc + tok_kslot(s, 8 * h + 4 * j + b), n)] << (8 * b);
+                v[2 * s + j] = word;
+            }
+    }
+#else
 #pragma unroll
     for (int j = 0; j < 4; ++j)
     {
@@ -344,6 +392,7 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
             word |= (uint32_t)w[woff(base, g.Ks, g.Ns, 32 * kc + tok_kslot(s, 4 * j + b), n)] << (8 * b);
         v[j] = word;
     }
+#endif
 #ifdef SWIN_PREP_CONTENT_CACHE
     const u4v_t old = raw[idx];
     if (old[0] == v[0] && old[1] == v[1] && old[2] == v[2] && old[3] == v[3])
@@ -651,6 +700,14 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* con
 #else
     auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
 #endif
+#ifdef SWIN_TOK_WPAIR
+    // the s = 0 and s = 1 operands of (kc, nt) in one 16-byte read (see expand_tok_weights): this lane's
+    // (row l16, half) pair sits at gop 2 (2 l16 + half) of the pair block
+    auto wtp = [&](int dst, int nt_count, int kc, int nt) {
+        const u4v_t q = *(const u4v_t*)(wl + 2 * (dst + (kc * nt_count + nt) * 32) + 2 * l16 + m_half());
+        return tok_wpair{(u2v){q[0], q[1]}, (u2v){q[2], q[3]}};
+    };
+#endif
 
     // residual of the output projection: f16(x0 + b_o)
 #ifndef SWIN_RES32
@@ -705,8 +762,8 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* con
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
             {
-                tok_weight_k32(qt[nt], wt(K::qv(hd, 0), 2, kc, 0, nt), hop[kc][0], wt(K::qv(hd, 0), 2, kc, 1, nt), hop[kc][1]);
-                tok_weight_k32(vt[nt], tok_arow(hop[kc][0]), wt(K::qv(hd, 1), 2, kc, 0, nt), tok_arow(hop[kc][1]), wt(K::qv(hd, 1), 2, kc, 1, nt));
+                TOK_WK32(qt[nt], K::qv(hd, 0), 2, kc, nt, hop[kc][0], hop[kc][1]);
+                TOK_WK32B(vt[nt], K::qv(hd, 1), 2, kc, nt, tok_arow(hop[kc][0]), tok_arow(hop[kc][1]));
             }
 #ifdef SWIN_GFX11_SCALED
         const gop qraw0 = tok_codes(qt[0]), qraw1 = tok_codes(qt[1]);
@@ -828,7 +885,7 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* con
     for (int kc = 0; kc < NH; ++kc)
 #pragma unroll
         for (int t = 0; t < NT; ++t)
-            tok_weight_k32(x[t], wt(K::WO, NT, kc, 0, t), oc[kc][0], wt(K::WO, NT, kc, 1, t), oc[kc][1]);
+            TOK_WK32(x[t], K::WO, NT, kc, t, oc[kc][0], oc[kc][1]);
 
     // ------------------------------------------------ norm2: h2 codes, the K operands of fc1
     gop fop[NKC][2];
@@ -903,6 +960,24 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* con
         for (int nt = 0; nt < 2; ++nt)
             zb[nt] = ch[K::CB1 + 4 * c + 2 * nt];
 #ifndef SWIN_TOK_WIDE_WEIGHTS
+#ifdef SWIN_TOK_WPAIR
+#pragma unroll
+        for (int kc = 0; kc < NKC; ++kc)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+            {
+                const tok_wpair p = wtp(w1, 2, kc, nt);
+                wa[kc][0][nt] = p.a;
+                wa[kc][1][nt] = p.b;
+            }
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            const tok_wpair p = wtp(w1 + 2 * C, NT, 0, t);
+            wb[0][t] = p.a;
+            wb[1][t] = p.b;
+        }
+#else
 #pragma unroll
         for (int kc = 0; kc < NKC; ++kc)
 #pragma unroll
@@ -915,6 +990,7 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const f8v* con
 #pragma unroll
             for (int t = 0; t < NT; ++t)
                 wb[s][t] = wt(w1 + 2 * C, NT, 0, s, t);
+#endif
 #ifndef SWIN_TOK_NO_LOAD_SYNC
         // one wait for the whole batch here instead of one before each WMMA
         asm("" : "+v"(wb[1][NT - 1]));
@@ -1043,6 +1119,14 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
 #else
     auto wt = [&](int dst, int nt_count, int kc, int s, int nt) { return wl[weight_stride * (dst + ((kc * 2 + s) * nt_count + nt) * 16)]; };
 #endif
+#ifdef SWIN_TOK_WPAIR
+    // the s = 0 and s = 1 operands of (kc, nt) in one 16-byte read (see expand_tok_weights): this lane's
+    // (row l16, half) pair sits at gop 2 (2 l16 + half) of the pair block
+    auto wtp = [&](int dst, int nt_count, int kc, int nt) {
+        const u4v_t q = *(const u4v_t*)(wl + 2 * (dst + (kc * nt_count + nt) * 32) + 2 * l16 + m_half());
+        return tok_wpair{(u2v){q[0], q[1]}, (u2v){q[2], q[3]}};
+    };
+#endif
 
 #ifdef SWIN_DATAFLOW
     // vkhip's barrier-free chain (every layer): wait for the producer blocks of the previous layer that hold
@@ -1154,7 +1238,7 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
             T16 e = tok_t16(ch[K::CPEB + 2 * (NT * wv + ct)]);
 #pragma unroll
             for (int kc = 0; kc < CIN / 32; ++kc)
-                tok_weight_k32(e, wt(pew, NT, kc, 0, ct), pa[kc][0], wt(pew, NT, kc, 1, ct), pa[kc][1]);
+                TOK_WK32(e, pew, NT, kc, ct, pa[kc][0], pa[kc][1]);
 #if defined(SWIN_GFX11_ROW) && defined(SWIN_NO_Q8)
 #pragma unroll
             for (int k = 0; k < 4; ++k)
@@ -1296,7 +1380,7 @@ __device__ __forceinline__ void swin_tok_block(const CommonParams& p, const Tube
                         tok_weight_k32(y, wt(K::PM, NTP, kc, 0, u), merge_operand(kc, 0),
                                        wt(K::PM, NTP, kc, 1, u), merge_operand(kc, 1));
 #else
-                        tok_weight_k32(y, wt(K::PM, NTP, kc, 0, u), as[kc][0], wt(K::PM, NTP, kc, 1, u), as[kc][1]);
+                        TOK_WK32(y, K::PM, NTP, kc, u, as[kc][0], as[kc][1]);
 #endif
 #ifdef SWIN_CODES_F32
                     constexpr float lim = (float)(half_t)6.2831855f;
