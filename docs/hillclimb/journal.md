@@ -566,3 +566,12 @@ schedule (all slower).
     block-listed on this machine), and part of the handoff is that context switch. With scheduling settings off
     limits there is no lever left in the handoff mechanism; only fewer handoffs (none possible below two) or less
     work across them.
+- **Bound: RR F's d3dhip network without barriers** (timing only, wrong output; local hack, reverted): the fourteen
+  stages launched directly with `hipExtAnyOrderLaunch` instead of the graph, replay 720p -> 1440p, two rounds: network
+  gap 1.80 -> 1.57 ms, frame 3.72 -> 3.49 (-6%). As on vkhip, only per-block dataflow (M's `SWIN_DATAFLOW` style, with
+  the write-after-read and mirror-range rules listed above) could take part of it.
+- d3dhip profiles at 1920x1080 -> 3840x2160 (rt-rrh, `D4R_K_DIRECT_INPUTS=1`): K 2.69 ms (input 0.20, network 1.33,
+  output 1.11); M 3.39 (input 0.26, network 1.86, expansion 0.19, reconstruction 0.76, downsample 0.23); L 5.27 (input
+  1.22, network 1.92, expansion 0.89, reconstruction 0.95, downsample 0.23); RR F 8.39 (front 2.05, network 3.66, back
+  2.63). Against NVIDIA's M stages at that size (post 0.836, downsample 0.254, Swin 1.078) M's whole gap is the
+  network (~1.72 ms without the handoff). Two more helper agents: M's Swin HIP layers, RR F's D3D12 back stages.
