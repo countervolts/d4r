@@ -47,3 +47,4 @@ cdc0787 score=- / 1.628 (K cases) / - worst=dx-K-1440 +0.02% K on vkhip in the n
 2291ccc score=- / - / - worst=vk-K-1440 +0.62% full grids for vkhip K on AMD's driver (noise-level cost; did not fix the race, reverted in the next commit)
 ed58f6e score=- / - / - worst=- tool only: vk_pipeline_stats writes the pipeline binary (VKSTATS_ELF)
 7c029f0 score=- / - / - worst=vk-K-4k +0.6% vkhip scratch opt-in: K's Vulkan route back on the Vulkan network, byte-identical to before cdc0787 (vk-K-4k 2.916 -> 2.922)
+79b9ee4 score=2.654 -> 2.557 (d3d12 2.499 -> 2.489, vulkan 2.819 -> 2.628) worst=vk-L-1440 +0.54% K cross-wave barrier (POS_HB_SYNC), Windows flag file, vkhip K default on gfx12: vk-K-1440 -34.36%, vk-K-4k -19.53%, dx-K -1.4..-2.0% identical

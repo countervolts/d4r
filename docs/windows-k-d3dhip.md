@@ -23,6 +23,21 @@ RX 9070 XT, 26.10.1, harness, interleaved: 1.371 -> 1.297 ms at 1280x720 -> 2560
 against f16 accumulation): the output is not byte-identical (57 dB against the DXIL route on the motion scene, the same
 quality-scene PSNR, blinds and flicker).
 
+## Presets M and L through d3dhip: the layer chain (RDNA4, 2026-11-05)
+
+D3D12 M and L take d3dhip by default when the package has HIP layers. The HIP network used to launch M's ten Swin
+layers (L reuses them) as a graph of ordinary kernels, with a full barrier between consecutive layers. Isolated, that
+graph took 956 us against vkhip's 0.80 ms for the same code objects, so d3dhip M was 3% slower than DXIL at 720p ->
+1440p. vkhip chains the layers instead (`D4R_VKHIP_M_CHAIN`): a block sets a flag once its outputs are written, and a
+block of the next layer waits only for the producer blocks it reads. On Windows, `engine/hip_net.cpp` now does the
+same. It uses the same flag layout, launches each consumer layer with `hipExtModuleLaunchKernel(...,
+hipExtAnyOrderLaunch)` (no AQL barrier), and clears the flags before each evaluation; the chained nodes launch
+directly, not through a graph. It applies only to layers built with `SWIN_DATAFLOW` (`d4r_dataflow`);
+`D4R_HIP_M_CHAIN=0` restores the barriers. The isolated graph drops from 956 to 787 us. The output is byte-identical.
+RX 9070 XT, 26.10.1, harness, interleaved: M 1.689 -> 1.534 ms at 720p -> 1440p (DXIL 1.65), 3.431 -> 3.371 at
+1080p -> 4K, 2.208 -> 2.095 at 720p -> 4K; L 2.450 -> 2.334 at 720p -> 1440p, 5.308 -> 5.251 at 1080p -> 4K.
+Preset K's layers are not built with the flags and keep their graph.
+
 ## Results
 
 | | Replay (ms) | Game, average (ms) | Game, range (ms) |

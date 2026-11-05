@@ -9,6 +9,9 @@
 #include "hip_net.h"
 #include <hip/hip_runtime_api.h>
 #ifdef _WIN32
+#include <hip/hip_ext.h>
+#endif
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -66,6 +69,7 @@ struct Node {
     hipFunction_t function = nullptr;
     uint32_t gx = 1, gy = 1, bx = 32, by = 1, bz = 1;
     Params params{};
+    bool anyOrder = false;  // Windows M chain: no barrier before it, its blocks wait for their producers' flags
 };
 uint32_t global32(hipModule_t module, const char* name, uint32_t fallback) {
     hipDeviceptr_t at = nullptr; size_t bytes = 0; uint32_t v = fallback;
@@ -129,6 +133,9 @@ struct HipNetwork::Impl {
     hipEvent_t start = nullptr, stop = nullptr;
     bool pending = false;
     void* outputPtr = nullptr; uint64_t outputBytes = 0;
+    // Windows M chain (D4R_HIP_M_CHAIN, default on): the nodes launch directly, after the flags' clear
+    bool direct = false;
+    void* flags = nullptr; uint64_t flagsBytes = 0;
     ~Impl() {
         if (stream) (void)hipStreamSynchronize(stream);
         for (auto e : executable) if (e) (void)hipGraphExecDestroy(e);
@@ -142,7 +149,19 @@ struct HipNetwork::Impl {
     }
     void run(const Node& n) {
         void* args[] = {const_cast<Params*>(&n.params)};
+#ifdef _WIN32
+        if (n.anyOrder) {
+            HIPCHECK(hipExtModuleLaunchKernel(n.function, n.gx * n.bx, n.gy * n.by, n.bz, n.bx, n.by, n.bz, 0, stream, args,
+                                              nullptr, nullptr, nullptr, hipExtAnyOrderLaunch));
+            return;
+        }
+#endif
         HIPCHECK(hipModuleLaunchKernel(n.function, n.gx, n.gy, 1, n.bx, n.by, n.bz, 0, stream, args, nullptr));
+    }
+    void runPhase(uint32_t phase) {
+        if (!direct) { HIPCHECK(hipGraphLaunch(executable[phase % graphs], stream)); return; }
+        HIPCHECK(hipMemsetAsync(flags, 0, size_t(flagsBytes), stream));
+        for (const auto& node : nodes[phase % graphs]) run(node);
     }
 };
 
@@ -279,6 +298,26 @@ HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t he
             q.in = in[i]; q.skip = skip[i]; q.out = out[i]; q.merged = merged[i];
         }
     }
+    // Windows, preset M: vkhip_net.cpp's barrier-free chain (kernels/m/swin_tok.h in_flags / out_flags). Block
+    // (x, y) of a layer sets its 32-byte flag once its outputs are written and a block of the next layer waits for
+    // the producer blocks that hold its input; the consumers launch with hipExtAnyOrderLaunch (no barrier), and an
+    // AQL queue dispatches a packet's blocks before the next packet's, so the waits cannot starve their producers.
+    // Only with layers built with SWIN_DATAFLOW (d4r_dataflow), which chain all ten. D4R_HIP_M_CHAIN=0: barriers.
+    std::vector<void*> flagsAt(layers, nullptr);
+#ifdef _WIN32
+    if (!kPreset) {
+        const char* chainEnv = std::getenv("D4R_HIP_M_CHAIN");
+        bool dataflow = !chainEnv || std::atoi(chainEnv) != 0;
+        for (uint32_t i = 0; i < layers; ++i) dataflow = dataflow && global32(n.kernels[layerKernel[i]].module, "d4r_dataflow", 0) == 1;
+        if (dataflow) {
+            auto grid = [&](uint32_t i) { return uint64_t((tw / divisor[i] + 2 + 7) / 8 + 1) * ((th / divisor[i] + 2 + 7) / 8 + 1) * 32; };
+            for (uint32_t i = 0; i + 1 < layers; ++i) n.flagsBytes += grid(i);
+            n.flags = allocate(n.flagsBytes);
+            for (uint32_t i = 0, at = 0; i + 1 < layers; at += uint32_t(grid(i)), ++i) flagsAt[i] = static_cast<char*>(n.flags) + at;
+            n.direct = true;
+        }
+    }
+#endif
     // Immutable graphs: preset M has two horizontal window-alignment phases, preset K the eight-frame cycle.
     n.graphs = kPreset ? MaxGraphs : 2;
     for (uint32_t phase = 0; phase < n.graphs; ++phase) {
@@ -304,6 +343,20 @@ HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t he
                     node.gx = (params.k.W + params.k.sx + 7) / 8; node.gy = (params.k.H + params.k.sy + 7) / 8;
                 } else {
                     node.gx = (params.m.tw + params.m.sx + 7) / 8; node.gy = (params.m.th + params.m.sy + 7) / 8;
+                    if (n.direct) {
+                        if (i + 1 < layers) node.params.m.outFlags = flagsAt[i];
+                        if (i > 0) {
+                            // the producer grid, and the mapping: 1 a patch merge (producer at twice the
+                            // resolution), 2 a patch expand (half), 0 the same grid
+                            const int32_t psx = shiftX[i - 1] ^ int32_t(phase * 2), psy = shiftY[i - 1];
+                            const int32_t ptw = int32_t(tw / divisor[i - 1]), pth = int32_t(th / divisor[i - 1]);
+                            const int32_t mode = divisor[i - 1] < divisor[i] ? 1 : divisor[i - 1] > divisor[i] ? 2 : 0;
+                            node.params.m.inFlags = flagsAt[i - 1];
+                            node.params.m.r69 = (ptw + psx + 7) / 8; node.params.m.r70 = (pth + psy + 7) / 8;
+                            node.params.m.r71 = psx | mode << 8; node.params.m.r72 = psy | mode << 8;
+                            node.anyOrder = true;
+                        }
+                    }
                 }
                 node.bz = kernel.blockZ;
                 nodes.push_back(node);
@@ -320,7 +373,7 @@ HipNetwork::HipNetwork(const std::string& directory, uint32_t width, uint32_t he
     }
     for (const auto& prep : n.preps) n.run(prep);
     HIPCHECK(hipStreamSynchronize(n.stream));
-    for (uint32_t phase = 0; phase < n.graphs; ++phase) {
+    for (uint32_t phase = 0; phase < n.graphs && !n.direct; ++phase) {
         HIPCHECK(hipStreamBeginCapture(n.stream, hipStreamCaptureModeRelaxed));
         try {
             for (const auto& node : n.nodes[phase]) n.run(node);
@@ -338,7 +391,7 @@ HipNetwork::~HipNetwork() = default;
 void HipNetwork::launch() {
     auto& n = *impl;
     HIPCHECK(hipEventRecord(n.start, n.stream));
-    HIPCHECK(hipGraphLaunch(n.executable[n.frame % n.graphs], n.stream));
+    n.runPhase(n.frame);
     ++n.frame;
     HIPCHECK(hipEventRecord(n.stop, n.stream));
     n.pending = true;
@@ -392,7 +445,7 @@ float HipNetwork::debugGraphMicros(uint32_t phase, uint32_t trials) {
     auto& n = *impl; std::vector<float> samples;
     hipEvent_t a = nullptr, b = nullptr; HIPCHECK(hipEventCreate(&a)); HIPCHECK(hipEventCreate(&b));
     for (uint32_t t = 0; t < trials + 2; ++t) {
-        HIPCHECK(hipEventRecord(a, n.stream)); HIPCHECK(hipGraphLaunch(n.executable[phase % n.graphs], n.stream));
+        HIPCHECK(hipEventRecord(a, n.stream)); n.runPhase(phase);
         HIPCHECK(hipEventRecord(b, n.stream)); HIPCHECK(hipEventSynchronize(b));
         float ms = 0; HIPCHECK(hipEventElapsedTime(&ms, a, b)); if (t >= 2) samples.push_back(ms * 1000.0f);
     }
