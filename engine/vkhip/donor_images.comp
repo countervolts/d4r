@@ -1,0 +1,27 @@
+#version 460
+// engine/vkhip/donor.comp with descriptor set 0's four storage images (bindings 0 - 3): the donor of a kernel that
+// reads their descriptors (vkhip.h createPipeline's `images`), whose user data then carries the set's table
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x_id=0, local_size_y_id=1, local_size_z_id=2) in;
+layout(constant_id=3) const uint LDS_WORDS=1;
+layout(constant_id=4) const uint PIPELINE_ID=0;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint words[]; };
+layout(push_constant) uniform Push { Words args; } pc;
+layout(set=0, binding=0, rgba8) uniform writeonly image2D image0;
+layout(set=0, binding=1, rgba8) uniform writeonly image2D image1;
+layout(set=0, binding=2, rgba8) uniform writeonly image2D image2;
+layout(set=0, binding=3, rgba8) uniform writeonly image2D image3;
+shared uint scratch[LDS_WORDS];
+void main() {
+    uint tid=gl_LocalInvocationIndex;
+    uint i=gl_WorkGroupID.x + gl_WorkGroupID.y + gl_WorkGroupID.z + tid;
+    uint at=pc.args.words[i];
+    scratch[at % LDS_WORDS]=at + PIPELINE_ID;
+    barrier();
+    const uint v=scratch[(at+1) % LDS_WORDS];
+    const ivec2 c=ivec2(int(v & 0xffffu), int(v >> 16));
+    imageStore(image0, c, vec4(1.0)); imageStore(image1, c, vec4(2.0));
+    imageStore(image2, c, vec4(3.0)); imageStore(image3, c, vec4(4.0));
+    pc.args.words[i]=v;
+}

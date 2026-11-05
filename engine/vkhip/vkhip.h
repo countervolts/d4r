@@ -36,6 +36,9 @@ struct Kernel {
     uint32_t lds = 0, scratch = 0, kernarg = 0, rsrc1 = 0, rsrc2 = 0, rsrc3 = 0, props = 0, preload = 0;
     // the first SGPR of the kernarg pointer: 0, or 4 on gfx10 after the private segment buffer (unread: no scratch)
     uint32_t kernargSgpr = 0;
+    // the kernel also enables the dispatch id SGPRs (after the kernarg pointer): there the pipeline puts the low
+    // dword of its descriptor set 0's table (createPipeline's `images`); glsl_hip.h's glslImageTable reads it
+    bool table = false;
 };
 
 struct Global { uint64_t va = 0, size = 0; };
@@ -90,10 +93,11 @@ struct Device {
 struct Launch { uint32_t bx = 32, by = 1, bz = 1; };
 
 // Creates the pipeline running `kernel` with workgroup size `launch`. `layout` must have exactly one push
-// constant range of 8 bytes (compute stage) and no descriptor sets. `id` must differ between all pipelines
+// constant range of 8 bytes (compute stage) and no descriptor sets, or with `images` (a kernel with Kernel::table,
+// AMD's driver only) set 0 of four storage images, bindings 0 - 3. `id` must differ between all pipelines
 // created on one device (it keys the donor). Returns VK_NULL_HANDLE and sets `error` on failure. With
 // vk.pipelineBinary the driver must be AMD's (an AMDPAL donor binary for the module's GPU), otherwise RADV.
 VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Module& module, const Kernel& kernel,
-                          Launch launch, uint64_t dataAddress, uint32_t id, std::string& error);
+                          Launch launch, uint64_t dataAddress, uint32_t id, std::string& error, bool images = false);
 
 } // namespace vkhip

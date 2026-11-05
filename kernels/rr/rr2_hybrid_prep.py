@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Preset F's hybrid encoder 0 (native-work/enc0/enc0_m.comp after glslangValidator -E) into the GLSL glsl2hip.py
-translates, for a vkhip kernel of the stage (kernels/rr/build_vkhip_f.sh, with --include=glsl_hip_enc0.h).
+"""Preset F's hybrid stages (native-work/<stage>/<stage>_m.comp after glslangValidator -E: encoder 0 after the gather
+pass, decoder 0's pixel tail dec0_1) into the GLSL glsl2hip.py translates, for vkhip kernels of the stages
+(kernels/rr/build_vkhip_f.sh, with --include=glsl_hip_hybrid.h).
 
-With the gather pass (enc0g) the stage reads its window's features from the gather's records in the arena and none
-of the textures, surfaces or extra buffers it declares, so:
-- those declarations and their accessors go, and the functions main does not reach
-- the module-scope rr2_xf becomes rr2_block's parameter
-- gl_NumWorkGroups.x / .y become the grid the runtime dispatches, from the parameter block ((level size + window
-  shift + 7) / 8: words 0 / 1 and 20, engine/runtime_rr2.inc; z is 1)
-- GLSL spellings glsl2hip does not take: hf literals, spirv_instruction declarations (glsl_hip_enc0.h defines the
+- texture, sampler and extra-buffer declarations and their accessors go (encoder 0 reads its window's features from
+  the gather's records; neither stage samples a texture), as do the functions main does not reach
+- the storage images a stage writes (dec0_1's surfaces) become entries of a descriptor table, binding 3 (glsl2hip.py:
+  descriptor set 0's table, which vkhip hands the kernel), in binding order; stores through the hardware's
+  image_store, whose bounds check replaces the shader's own (an image size of 2^30)
+- encoder 0: the module-scope rr2_xf becomes rr2_block's parameter, and gl_NumWorkGroups.x / .y the grid the runtime
+  dispatches, from the parameter block ((level size + window shift + 7) / 8: words 0 / 1 and 20,
+  engine/runtime_rr2.inc; z is 1)
+- GLSL spellings glsl2hip does not take: hf literals, spirv_instruction declarations (glsl_hip_hybrid.h defines the
   functions), a float[N](...) table, vec4 constructors, accumulator element-type conversions, a division by a power
   of two, and an FP8 operand element read as float
 
-usage: enc0_hip_prep.py ENC0_M.preprocessed.comp OUT.comp
+usage: rr2_hybrid_prep.py STAGE_M.preprocessed.comp OUT.comp
 """
 import re
 import sys
@@ -85,20 +88,51 @@ def prune(src):
     return '\n'.join(l for k, l in enumerate(lines) if k not in drop)
 
 
+def two_argument(s, ctor, helper):
+    """ctor(a, b) -> helper(a, b): a constructor with more than one argument (one argument is a conversion, which
+    the cast form already does)."""
+    out, last = [], 0
+    for m in re.finditer(r'\b' + ctor + r'\(', s):
+        depth, i, commas = 1, m.end(), 0
+        while depth:
+            c = s[i]
+            depth += (c == '(') - (c == ')')
+            commas += c == ',' and depth == 1
+            i += 1
+        if commas:
+            out.append(s[last:m.start()] + helper + '(')
+            last = m.end()
+    return ''.join(out) + s[last:]
+
+
+IMAGE = re.compile(r'(?m)^layout\(set = 0, binding = (\d+), \w+\) uniform writeonly image2D (\w+);$')
+
+
 def prep(s):
+    images = sorted(((int(b), n) for b, n in IMAGE.findall(s)))
     s = strip_bindings(s)
-    if s.count('\nuint rr2_xf;\n') != 1 or 'void rr2_block()' not in s or '    rr2_xf = rr2_rec;' not in s:
-        raise SystemExit('enc0_hip_prep: not the gather-split hybrid encoder 0 (engine/rr/gen_rr2_enc0.py --split)')
-    s = s.replace('\nuint rr2_xf;\n', '\n')
-    s = s.replace('void rr2_block()', 'void rr2_block(uint rr2_xf)').replace('rr2_block();', 'rr2_block(rr2_xf);')
-    s = s.replace('    rr2_xf = rr2_rec;', '    uint rr2_xf = rr2_rec;', 1)
-    s = s.replace('gl_NumWorkGroups.x', '((param.w[0] + (param.w[20] & 0xffffu) + 7u) / 8u)')
-    s = s.replace('gl_NumWorkGroups.y', '((param.w[1] + (param.w[20] >> 16u) + 7u) / 8u)')
-    s = s.replace('gl_NumWorkGroups.z', '1u')
+    for k, (_, name) in enumerate(images):
+        s = re.sub(r'\bimageSize\(' + name + r'\)', f'glslImageSize(images.d[{k}])', s)
+        s = re.sub(r'\bimageStore\(' + name + r', ', f'glslImageStore(images.d[{k}], ', s)
+    table = 'layout(set = 0, binding = 3, std430) readonly buffer Images { glslImage d[]; } images;\n'
+    param = 'layout(set = 0, binding = 0, std430) readonly buffer ParamBlock'
+    if images:
+        s = s.replace(param, table + param, 1)
+    if '\nuint rr2_xf;\n' in s:   # encoder 0
+        if s.count('\nuint rr2_xf;\n') != 1 or 'void rr2_block()' not in s or '    rr2_xf = rr2_rec;' not in s:
+            raise SystemExit('rr2_hybrid_prep: not the gather-split hybrid encoder 0 (engine/rr/gen_rr2_enc0.py --split)')
+        s = s.replace('\nuint rr2_xf;\n', '\n')
+        s = s.replace('void rr2_block()', 'void rr2_block(uint rr2_xf)').replace('rr2_block();', 'rr2_block(rr2_xf);')
+        s = s.replace('    rr2_xf = rr2_rec;', '    uint rr2_xf = rr2_rec;', 1)
+        s = s.replace('gl_NumWorkGroups.x', '((param.w[0] + (param.w[20] & 0xffffu) + 7u) / 8u)')
+        s = s.replace('gl_NumWorkGroups.y', '((param.w[1] + (param.w[20] >> 16u) + 7u) / 8u)')
+        s = s.replace('gl_NumWorkGroups.z', '1u')
     s = prune(s)
-    for name in ('sampler2D', 'image2D', 'XBuf', 'gl_NumWorkGroups'):
+    if 'images.d[' not in s:   # encoder 0 declares surfaces it does not write
+        s = s.replace(table, '')
+    for name in ('sampler2D', 'image2D', 'XBuf', 'gl_NumWorkGroups.x', 'gl_NumWorkGroups.y'):
         if name in s:
-            raise SystemExit(f'enc0_hip_prep: {name} still used')
+            raise SystemExit(f'rr2_hybrid_prep: {name} still used')
     s = re.sub(r'\b(\d+\.\d*(?:e[+-]?\d+)?)hf\b', r'float16_t(\1)', s)
     s = re.sub(r'(?m)^spirv_instruction\(set = "GLSL\.std\.450", id = \d+\) [^;]*;\n', '', s)
     s = re.sub(r'(?m)^const float (\w+)\[(\d+)\] = float\[\2\] \((.*)\);$', r'GLSL_TABLE float \1[\2] = {\3};', s)
@@ -108,6 +142,10 @@ def prep(s):
     s = re.sub(r'\bvec4\(', 'glslV4(', s)
     # through the operand's const accessor: the element proxy's float conversion recurses (an out-of-line call)
     s = s.replace('float(qx[wv][m][i])', 'glslF8f(qx[wv][m], i)')
+    s = two_argument(s, 'ivec2', 'glslIV2')
+    # an FP8 weight byte picked from a pair of pairs: byte i & 3 of the word
+    s = s.replace('uintBitsToFloate4m3EXT( ( (uint(i) & 2u) == 0u ? unpack8(xw).xy : unpack8(xw).zw)[uint(i) & 1u])',
+                  'uintBitsToFloate4m3EXT(uint8_t(xw >> (8u * (uint(i) & 3u))))')
     return s
 
 

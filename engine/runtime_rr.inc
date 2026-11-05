@@ -382,6 +382,13 @@ RStageResources REngine::stageResources(unsigned stage) const {
         r.width = e.v3->lw(R3Level[stage]); r.height = e.v3->lh(R3Level[stage]);
         return r;
     }
+    if (e.v2 && stage == R2Dec0B) {   // preset F's dec0_1: its surfaces (engine images, the same for both parities)
+        RStageResources r;
+        const RFrameImages none{};
+        const uint32_t offsets[4] = {176, 184, 192, 200};
+        for (int k = 0; k < 4; ++k) r.surfaceF[k] = e.v2->resolve(R2Dec0B, true, offsets[k], 0, none, VK_NULL_HANDLE).view;
+        return r;
+    }
     if (e.v2 || e.v3 || stage > RDec0) throw std::runtime_error("REngine::stageResources: the network stages of presets D and E only");
     RStageResources r;
     const int l = RLevel[stage];

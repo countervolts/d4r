@@ -254,7 +254,7 @@ int main(int argc, char** argv) try {
         }
         if (model.preset() == 6) {
             for (const char* stage : {"enc0", "enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1", "dec3_0", "dec3_1",
-                                      "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0"}) {
+                                      "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0", "dec0_1"}) {
                 const char* only = std::getenv("D4R_VKHIP_RR_STAGES");
                 if (only && *only && ("," + std::string(only) + ",").find("," + std::string(stage) + ",") == std::string::npos) continue;
                 const std::string name = std::string("rr2_") + stage, path = modelDir + "/hip/" + name + ".hsaco";

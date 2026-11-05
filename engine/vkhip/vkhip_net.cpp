@@ -111,6 +111,14 @@ struct Net {
     PFN_vkCmdWriteTimestamp cmdStamp = nullptr; PFN_vkCreateEvent createEvent = nullptr; PFN_vkDestroyEvent destroyEvent = nullptr;
     PFN_vkResetEvent resetEvent = nullptr; PFN_vkGetEventStatus eventStatus = nullptr; PFN_vkCmdSetEvent cmdSetEvent = nullptr;
     PFN_vkCmdCopyBuffer cmdCopy = nullptr; PFN_vkMapMemory mapMemory = nullptr; PFN_vkDeviceWaitIdle waitIdle = nullptr;
+    // descriptor set 0 of four storage images, for kernels that read its table (Kernel::table: RR F's dec0_1)
+    PFN_vkCreateDescriptorSetLayout createSetLayout = nullptr; PFN_vkDestroyDescriptorSetLayout destroySetLayout = nullptr;
+    PFN_vkCreateDescriptorPool createPool = nullptr; PFN_vkDestroyDescriptorPool destroyPool = nullptr;
+    PFN_vkAllocateDescriptorSets allocateSets = nullptr; PFN_vkUpdateDescriptorSets updateSets = nullptr;
+    PFN_vkCmdBindDescriptorSets cmdBindSets = nullptr;
+    VkDescriptorSetLayout imageSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout imageLayout = VK_NULL_HANDLE;
+    VkDescriptorPool imagePool = VK_NULL_HANDLE;
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer arena = VK_NULL_HANDLE, tokens = VK_NULL_HANDLE, head = VK_NULL_HANDLE;
@@ -201,6 +209,9 @@ struct Net {
         if (stampPool) destroyQueries(device, stampPool, nullptr);
         for (VkPipeline p : pipelines) if (p) vk.destroyPipeline(device, p, nullptr);
         if (layout) destroyLayout(device, layout, nullptr);
+        if (imageLayout) destroyLayout(device, imageLayout, nullptr);
+        if (imagePool) destroyPool(device, imagePool, nullptr);
+        if (imageSetLayout) destroySetLayout(device, imageSetLayout, nullptr);
         for (VkBuffer b : {tokens, head, arena}) if (b) destroyBuffer(device, b, nullptr);
         if (memory) freeMemory(device, memory, nullptr);
     }
@@ -267,6 +278,43 @@ struct Net {
         if (createLayout(device, &lci, nullptr, &layout) != VK_SUCCESS) { error = "pipeline layout"; return false; }
         return true;
     }
+    // The storage-image set layout (bindings 0 - 3, as engine/vkhip/donor_images.comp declares them), its pipeline
+    // layout (that set and the 8-byte push constant) and a pool of `sets` sets
+    bool imageSets(PFN_vkGetDeviceProcAddr proc, uint32_t sets, std::string& error) {
+        if (!(load(proc, createSetLayout, "vkCreateDescriptorSetLayout") && load(proc, destroySetLayout, "vkDestroyDescriptorSetLayout") &&
+              load(proc, createPool, "vkCreateDescriptorPool") && load(proc, destroyPool, "vkDestroyDescriptorPool") &&
+              load(proc, allocateSets, "vkAllocateDescriptorSets") && load(proc, updateSets, "vkUpdateDescriptorSets") &&
+              load(proc, cmdBindSets, "vkCmdBindDescriptorSets"))) { error = "missing Vulkan descriptor entry points"; return false; }
+        VkDescriptorSetLayoutBinding b[4];
+        for (uint32_t i = 0; i < 4; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; sli.bindingCount = 4; sli.pBindings = b;
+        if (createSetLayout(device, &sli, nullptr, &imageSetLayout) != VK_SUCCESS) { error = "image set layout"; return false; }
+        VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        lci.setLayoutCount = 1; lci.pSetLayouts = &imageSetLayout; lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &range;
+        if (createLayout(device, &lci, nullptr, &imageLayout) != VK_SUCCESS) { error = "image pipeline layout"; return false; }
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * sets};
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pci.maxSets = sets; pci.poolSizeCount = 1; pci.pPoolSizes = &size;
+        if (createPool(device, &pci, nullptr, &imagePool) != VK_SUCCESS) { error = "image descriptor pool"; return false; }
+        return true;
+    }
+    // a set of the four storage images (GENERAL)
+    VkDescriptorSet imageSet(const VkImageView (&views)[4], std::string& error) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = imagePool; ai.descriptorSetCount = 1; ai.pSetLayouts = &imageSetLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (allocateSets(device, &ai, &set) != VK_SUCCESS) { error = "image descriptor set"; return VK_NULL_HANDLE; }
+        VkDescriptorImageInfo ii[4];
+        VkWriteDescriptorSet w[4];
+        for (uint32_t i = 0; i < 4; ++i) {
+            ii[i] = {VK_NULL_HANDLE, views[i], VK_IMAGE_LAYOUT_GENERAL};
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[i].pImageInfo = &ii[i];
+        }
+        updateSets(device, 4, w, 0, nullptr);
+        return set;
+    }
     // one pipeline per kernel and launch shape
     VkPipeline pipe(const Module& module, uint64_t dataAt, const std::string& kernel, Launch launch, std::string& error) {
         const std::string key = kernel + "/" + std::to_string(launch.bx) + "/" + std::to_string(launch.by) + "/" + std::to_string(launch.bz);
@@ -276,7 +324,8 @@ struct Net {
         if (k == module.kernels.end()) { error = kernel + " missing"; return VK_NULL_HANDLE; }
         const uint64_t id = nextPipelineId.fetch_add(1, std::memory_order_relaxed);
         if (id > UINT32_MAX) { error = "vkhip pipeline key space exhausted"; return VK_NULL_HANDLE; }
-        VkPipeline p = createPipeline(vk, layout, module, k->second, launch, base + dataAt, uint32_t(id), error);
+        VkPipeline p = createPipeline(vk, k->second.table ? imageLayout : layout, module, k->second, launch, base + dataAt,
+                                      uint32_t(id), error, k->second.table);
         if (p) { pipelines.push_back(p); byKey[key] = p; }
         return p;
     }
@@ -784,6 +833,7 @@ struct RRStages::Stage {
     unsigned index = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint64_t args[2] = {};   // per window shift (RRShifts)
+    VkDescriptorSet set = VK_NULL_HANDLE;  // Kernel::table: descriptor set 0 (Net::imageSet)
     uint32_t groups[2] = {}; // presets A - C: the stage's own grid (its tile height differs from the engine shader's)
 };
 
@@ -854,11 +904,14 @@ bool RRStages::create(VkPhysicalDevice physical, PFN_vkGetInstanceProcAddr insta
     // F network blocks use live device-address parameters and arena guide planes.
     const char* fNames[] = {"enc0", "enc1", "enc2", "enc3", "enc4", "enc5", "dec4_0", "dec4_1",
                             "dec3_0", "dec3_1", "dec2_0", "dec2_1", "dec1_0", "dec1_1", "dec0_0", "dec0_1"};
-    struct FLoaded { unsigned index; std::string name; Module module; std::vector<uint8_t> weights; uint64_t wAt, gAt; uint32_t threads; };
+    struct FLoaded { unsigned index; std::string name; Module module; std::vector<uint8_t> weights; uint64_t wAt, gAt; uint32_t threads; bool images; };
+    // dec0_1 (kernels/rr/rr2_hybrid_prep.py) stores its four surfaces through storage images, descriptor set 0, whose
+    // table the kernel reads itself (Kernel::table): only through pipeline binaries (AMD's driver), otherwise it stays
+    // on the engine's shader
     std::vector<FLoaded> fLoaded;
     uint64_t fUsed = kAlign;
     auto fCarve = [&](uint64_t size) { uint64_t at = fUsed; fUsed = (at + size + kTail + kAlign - 1) / kAlign * kAlign; return at; };
-    for (unsigned i = 0; i < 15; ++i) {
+    for (unsigned i = 0; i < 16; ++i) {
         const std::string name = std::string("rr2_") + fNames[i];
         auto code = files.code.find(name);
         if (code == files.code.end()) continue;
@@ -870,7 +923,11 @@ bool RRStages::create(VkPhysicalDevice physical, PFN_vkGetInstanceProcAddr insta
         }
         if (files.mach && module.mach != files.mach) { error = "preset F code object targets another GPU"; return false; }
         auto k = module.kernels.find(name);
-        if (k == module.kernels.end() || k->second.kernarg != 24) { error = "unexpected preset F kernel ABI"; return false; }
+        if (k == module.kernels.end() || k->second.kernarg != 24 || (k->second.table && i != 15)) {
+            error = "unexpected preset F kernel ABI"; return false;
+        }
+        l.images = k->second.table;
+        if (l.images && !files.pipelineBinary) continue;
         auto w = weights.find(fNames[i]);
         if (w == weights.end()) { error = "missing preset F weights for " + name; return false; }
         l.weights = w->second;
@@ -906,6 +963,8 @@ bool RRStages::create(VkPhysicalDevice physical, PFN_vkGetInstanceProcAddr insta
         VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; ai.buffer = engine.arenaBuffer();
         const uint64_t arena = n.address(device, &ai);
         if (!arena) { error = "preset F arena needs a device address"; return false; }
+        const uint32_t imageStages = uint32_t(std::count_if(fLoaded.begin(), fLoaded.end(), [](const FLoaded& l) { return l.images; }));
+        if (imageStages && !n.imageSets(proc, imageStages, error)) return false;
         std::vector<const Module*> modules;
         std::vector<uint64_t> globals;
         for (const auto& l : fLoaded) {
@@ -917,6 +976,12 @@ bool RRStages::create(VkPhysicalDevice physical, PFN_vkGetInstanceProcAddr insta
             const size_t offset = n.args.size(); n.args.resize(offset + 512);
             std::memcpy(n.args.data() + offset, args, sizeof(args));
             Stage st; st.index = l.index; st.pipeline = pipeline; st.args[0] = st.args[1] = at;
+            if (l.images) {   // surfaces 176, 184, 192, 200: the engine's images, the same for both window shifts
+                const d4r::RStageResources r = engine.stageResources(l.index);
+                for (VkImageView v : r.surfaceF) if (!v) { error = "preset F dec0_1 surfaces missing"; return false; }
+                st.set = n.imageSet(r.surfaceF, error);
+                if (!st.set) return false;
+            }
             stages.push_back(st);
             n.contents.push_back({l.wAt, l.weights});
             modules.push_back(&l.module); globals.push_back(l.gAt);
@@ -1069,7 +1134,8 @@ bool RRStages::recordStage(VkCommandBuffer cb, unsigned stage, uint32_t groupsX,
     n.upload(cb);
     const uint64_t args = it->args[shift == RRShifts[1] ? 1 : 0];
     n.cmdBind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->pipeline);
-    n.cmdPush(cb, n.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
+    if (it->set) n.cmdBindSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, n.imageLayout, 0, 1, &it->set, 0, nullptr);
+    n.cmdPush(cb, it->set ? n.imageLayout : n.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
     if (it->groups[0]) { groupsX = it->groups[0]; groupsY = it->groups[1]; }
     n.cmdDispatch(cb, groupsX, groupsY, 1);
     return true;
