@@ -57,6 +57,9 @@ What's left, largest first:
   0.47, gather 0.40 ms. Their FP8 conversions are now one clamp + one conversion per element on both APIs; the rest is
   translated NVIDIA code (lane shuffles, selects). On Vulkan enc0 / dec0_1 stay SPIR-V: a HIP port needs texture
   sampling on the pipeline-binary path.
+- **RR F's D3D12 network.** The same stages as HIP run 1.61 ms on vkhip against 2.05 ms as DXIL (AMD's D3D12 compiler:
+  per-element clamps the HIP kernels avoid, more registers). d3dhip would carry the HIP version into D3D12 games, but
+  its two cross-API fence waits cost ~0.6 ms here (prototype: 4.13 against 3.87 ms end to end), more than it gains.
 - **K's output stage.** 0.37 ms Vulkan / 0.47 DXIL, about a third of K. AMD's DXIL compiler scalarises half vectors.
 - **K's network.** A per-block dataflow chain for the deep layers is worth at most ~5% end to end (measured bound).
   The deep layers' phase kernels make it a large job.

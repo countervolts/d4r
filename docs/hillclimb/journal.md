@@ -387,3 +387,12 @@ schedule (all slower).
   runs each, 120 frames): the network's 0.4 ms gain is eaten by about 0.6 ms of cross-API handoff (the two fence
   waits; HAGS is block-listed here, so they may resolve on the CPU, and scheduling settings are off limits). Also not
   byte-identical to the DXIL network. The remaining DXIL-vs-HIP gap is per-stage code generation.
+- **D3D12 RR F's phase split** (`D4R_RR2_SPLIT_WINDOWS`, default 48: levels with that many windows or fewer run as
+  four phase dispatches): 0 / 16 / 24 / 48 / 100 give 4.060 / 4.052 / 4.035 / 4.032 / 4.027 ms (single runs, all
+  identical): flat, no lever.
+- **Why F's DXIL stages trail their HIP builds** (enc4: 74 against 39 us): RGA / llvm-objdump of enc4_m.dxil against
+  rr2_enc4.hsaco: 256 VGPRs against 237, 3436 against 2223 static instructions. The HIP kernel sets the saturating FP8
+  mode once and converts with `v_cvt_pk_fp8_f32` alone; the DXIL needs a `v_maxmin` clamp per element (264), because
+  HLSL cannot set MODE and the driver's saturating AGS conversion is slower still (compare + select per element).
+  The rest is address arithmetic (383 `v_add_nc_u32`) and 2x the unrolled WMMA count. That is AMD's D3D12 compiler,
+  not a source-level lever.
