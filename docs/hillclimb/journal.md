@@ -396,3 +396,14 @@ schedule (all slower).
   HLSL cannot set MODE and the driver's saturating AGS conversion is slower still (compare + select per element).
   The rest is address arithmetic (383 `v_add_nc_u32`) and 2x the unrolled WMMA count. That is AMD's D3D12 compiler,
   not a source-level lever.
+- **RR F's enc0 / dec0_1 as vkhip HIP kernels, scoped (not built).** The Vulkan modules come from the hybrid
+  `native-work/<stage>/<stage>_m.comp`, not the 19.6k-line translation. enc0's hybrid touches no texture, image or extra
+  buffer in its body (declarations and an unused `fetch0` only): stripped of those, with `rr2_xf` passed to
+  `rr2_block` and `gl_NumWorkGroups` taken from the parameter block (words 0 / 1 / 20, as the shader's `rr2_gx`),
+  glsl2hip translates it, but its translated-PTX parts need GLSL that `kernels/rr/glsl_hip.h` lacks (`hf` literals,
+  `subgroupBarrier` / `subgroupBallot`, `unpackHalf2x16` / `packHalf2x16`, `mix`, `roundEven`, `findMSB`, `frexp`,
+  `u16vec2`, `ivec4`, float16 accumulator casts, ~30 kinds), and vkhip's F loader takes stages 1-14 only. Estimated
+  gain: LLPC ran the other 14 stages ~33% slower than their HIP builds; enc0 ~0.45 ms -> ~0.30, about 4% of vk-RRF-1440,
+  under the 5% bar. dec0_1's hybrid stores images (`sust_p4` / `sust_b4`) in its body, so it needs image descriptors in
+  vkhip's F kernel ABI (D/E have them through VK_EXT_descriptor_buffer; F's ABI is {param, weights, arena}): with
+  enc0g, post, down and pooled that is the multi-day project the summary lists.
