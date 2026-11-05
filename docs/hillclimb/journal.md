@@ -347,3 +347,24 @@ schedule (all slower).
   - Bench (Vulkan cases, 3 rounds C X X C; control = the RR F commit's runtime, candidate = the two rebuilt L
     modules): vk-L-1440 2.225 -> 2.181 (-1.97%, spread 1.33%), vk-L-4k 5.028 -> 4.886 (-2.82%, spread 0.72%), every
     case identical, the others within their spreads. Vulkan score 2.574 -> 2.561. D3D12 never loads these modules.
+- **Tried, rejected: RR F's gather pass (enc0g) on LLPC**: an empty enc0g saves 0.40 ms of vk-RRF-1440's 3.53 (11%). 8.6k
+  instructions, 293 branches, 139 mode writes: ptx2rr.py's `h2e4m3_hw` (`isnan(h) ? 0x7f : convert(clamp(h))`) is an
+  exec-mask branch per element on LLPC (86 `v_cmpx_o_f16` + `s_cbranch_execz`), one conversion per element. Under
+  `RR_LLPC_SAT` `f16x2_to_e4m3x2` converts both halves in one instruction and selects 0x7f for a NaN half afterwards:
+  the same codes for every input, NaN included. 7.7k instructions, 207 branches, 45 conversions. compile_rr2.py
+  writes `enc0g_llpc.spv` with it on Windows hosts (the runtime loads any stage's `_llpc.spv` on that driver). With the
+  define off every .spv is identical to the previous build; the `*.generated.comp` texts carry the new helper, and
+  their preprocessed text (what the D3D12 build reads) is unchanged apart from whitespace. enc0_llpc / dec0_1_llpc do
+  not change (their few conversions of this kind are dead code there). Single runs: 3.539 -> 3.502 ms (-1.0%),
+  identical.
+  Bench (Vulkan cases, 3 rounds): vk-RRF-1440 3.547 -> 3.513 (-0.96%, spread 1.36%), vk-RRF-4k 7.747 -> 7.700
+  (-0.60%), identical: under the 1% bar. Reverted.
+- **Kept: RR F's gather pass (enc0g) on D3D12, hardware FP8 encode** (dx-RRF-1440, 4.09 ms). An empty enc0g saves
+  0.47 ms; a trivial encoder (wrong output) 0.12 ms. Making the software codec branch-free (86 exec-mask branches
+  gone, 8271 -> 7643 instructions) gave nothing (4.09 -> 4.11, identical). `rr2_pixel_opt._packed_encode` now emits
+  `rrE4x2W` where the wave runs uniformly (main's body or the wave-uniform `if (rr2_valid)`): both halves clamped to
+  +-448 and one AGS conversion (lane-local `v_cvt_pk_fp8_f32`), NaN halves selected back to 0x7f, so every input
+  keeps its code. 53 of enc0g's 54 sites; 6493 instructions. vkd3d keeps its text (`#define rrE4x2W rrE4x2`; the
+  preprocessed enc0g is identical). Full compile_rr_dxil.py rebuild: only enc0g.dxil changes (other .hlsl differ in
+  blank lines only, their DXIL identical). Interleaved single runs (C X, 160 frames): 1440p 4.090/4.018,
+  4.092/4.022, 4.096/4.033 (-1.6%); 4K 9.040 -> 8.888 (-1.7%); identical every time. Full bench matrix still owed.
