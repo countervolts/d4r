@@ -5,6 +5,11 @@
 #error "PWIN_F16ACC_NATIVE needs PWIN_PK_ELEM (the element-wise paths use acc_pair / acc_set_pair)"
 #endif
 #include "pwin_layer.h"
+#ifdef POS_HB_SYNC
+// tells loaders these layers have the attention -> residual barrier (pos_core); vkhip takes spilling gfx12 K layers
+// through pipeline binaries only with it
+extern "C" __device__ __attribute__((used)) uint32_t d4r_pos_hb_sync = 1;
+#endif
 
 template <class L, int MT>
 __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const u4v* __restrict__ bias,
@@ -242,6 +247,12 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
             }
     }
 
+#if defined(POS_HB_SYNC) && !defined(POS_VSHARE) && !defined(POS_VSHARE1)
+    // Without a V share, every wave reads the hb rows of all 64 tokens in the head loop, and the residual below
+    // rewrites this wave's rows: a wave that finishes its heads first can overwrite rows another wave still reads
+    // (seen on gfx1201 as rare run-to-run differences, more often when spills or wave priorities skew the waves).
+    block_sync();
+#endif
     STAMP(3);
 #ifdef PWIN_PROBE_Y
     // diagnostic: the attention output Y (before the residual) to out32 at ((window * 64 + token) * C + channel)
