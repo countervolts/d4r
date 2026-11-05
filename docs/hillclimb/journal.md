@@ -587,3 +587,11 @@ schedule (all slower).
   PF/PFN prefetch, f32 embedding, binary16 MLP residual, MLP weight tiles staged in LDS (slower), removing the four
   group barriers (free already). A constant-address probe was 35% faster only because the compiler deleted half the
   program. Runtime with this package: `C:\d4r-hc\rt-lx` (rt-rrh plus the two files); rt-rrh stays the older control.
+- **Tried, nothing kept: RR F's D3D12 back on d3dhip** (helper agent-rrback; report `C:\d4r-hc\agents\agent-rrback\report.md`).
+  Per-pass timestamps of the back (720p / 1080p input): dec0_1 425 / 942 us, post 497 / 1157, down (12 / 16 tile
+  passes) 135 / 323, pooled 11 / 22; back 1067 / 2445 us. RGA against LLPC: post 114 vs 82 VGPRs, 211 scalar
+  `v_fma_f16` where LLPC has 122 `v_pk_fma_f16`, ~40% more ALU delay padding; dec0_1 192 VGPRs, 5426 instructions,
+  twice its HIP sibling. Measured and rejected: post and dec0_1 at -O3 (neutral), post wave32 (497 -> 516 us,
+  slower, as on Vulkan), dec0_1 wave64 (output 6.7 dB, wrong), other tile geometries, dispatch fixed cost (~0.9 us each, 22
+  us in all), inter-group UAV barriers (~10 us). Post is ~84% issue-bound; removing its loads made it slower. The
+  lever left is dec0_1 in HIP (it is one on vkhip, ffde45b), handed to agent-rrdec01.
