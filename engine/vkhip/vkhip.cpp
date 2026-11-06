@@ -71,10 +71,11 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         return r;
     };
     for (uint32_t i = 0; i < shnum; ++i) s[i].name = str(shstrndx, rd<uint32_t>(f, shoff + 64 * i));
-    int text = -1, symtab = -1;
+    int text = -1, symtab = -1, rodata = -1;
     dataLo = ~0ull; dataHi = 0;
     for (uint32_t i = 0; i < shnum; ++i) {
         if (s[i].name == ".text") text = int(i);
+        if (s[i].name == ".rodata" && s[i].type != SHT_NOBITS) rodata = int(i);
         if (s[i].type == SHT_SYMTAB || (s[i].type == SHT_DYNSYM && symtab < 0)) symtab = int(i);
         const bool data = s[i].name.rfind(".data", 0) == 0 || s[i].name.rfind(".bss", 0) == 0;
         if (data && (s[i].flags & SHF_ALLOC) && (s[i].flags & SHF_WRITE) && s[i].size) {
@@ -121,6 +122,7 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     // PC-relative global addressing
     const uint32_t* w = reinterpret_cast<const uint32_t*>(this->text.data());
     const size_t n = this->text.size() / 4;
+    bool readsRodata = false;
     for (size_t i = 0; i + 4 < n; ++i) {
         if ((w[i] & GETPC_MASK) != GETPC) continue;
         const uint32_t reg = (w[i] >> 16) & 0x7f;
@@ -132,6 +134,9 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         const uint64_t target = textVa + 4 * (i + 1) + uint64_t(offset);
         if (target >= dataLo && target < dataHi) {
             sites.push_back(Site{uint32_t(i), reg, target});
+        } else if (rodata >= 0 && target >= s[rodata].addr && target < s[rodata].addr + s[rodata].size) {
+            sites.push_back(Site{uint32_t(i), reg, target});   // constant tables: mapped below, only for modules that read them
+            readsRodata = true;
         } else if (target >= textVa && target < textVa + this->text.size()) {
             ++textGetpc;
         } else {
@@ -139,6 +144,17 @@ bool Module::parse(const std::vector<uint8_t>& f) {
             return false;
         }
         i += 4;
+    }
+    if (readsRodata) {
+        // the data image starts at .rodata: its contents, then the image so far at its own offset
+        if (dataHi <= dataLo || s[rodata].addr >= dataLo) { error = ".rodata does not precede the data"; return false; }
+        const uint64_t lo = s[rodata].addr;
+        if (dataHi - lo > 256 * 1024 * 1024) { error = "code object data allocation exceeds limit"; return false; }
+        std::vector<uint8_t> image(dataHi - lo, 0);
+        std::memcpy(image.data(), f.data() + s[rodata].offset, s[rodata].size);
+        std::memcpy(image.data() + (dataLo - lo), dataInit.data(), dataInit.size());
+        dataInit = std::move(image);
+        dataLo = lo;
     }
     for (const auto& [name, k] : kernels) {
         if (k.entry < textVa || k.entry >= textVa + this->text.size() || (k.entry - textVa) % 4) { error = name + ": entry outside .text"; return false; }

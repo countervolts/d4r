@@ -31,8 +31,17 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_float_e4m3 : require
 #extension GL_GOOGLE_include_directive : require
+// WIDE: enc0_m.comp's: f16 matrix operands holding FP8 values exactly, FP8 rounding in fp8_soft.glsl, FP8 token bytes
+#ifndef WIDE
+#define WIDE 0
+#endif
+#if WIDE
+#extension GL_EXT_control_flow_attributes : require
+#include "fp8_soft.glsl"
+#else
+#extension GL_EXT_float_e4m3 : require
+#endif
 #endif
 #include "round_half.glsl"
 #include "normalized_store.glsl"
@@ -73,19 +82,35 @@ shared float TS[64];                        // INT8: the rows are 16 int8 words;
 shared f16vec4 EO[64 * 88 / 4];
 float16_t q8(float16_t v) { return e4m3Round(float(v)); }
 #else
+#if WIDE
+layout(set = 0, binding = 7, std430) readonly buffer Tokens { uint a[]; } tok;             // FP8 codes, two planes of 32 channels
+// [80][64] binary16 (runtime_m.inc): a column's 16 K values are contiguous, so an operand is two 16-byte loads
+layout(set = 0, binding = 8, std430) readonly buffer W8 { f16vec4 w[]; } w8;
+#else
 layout(set = 0, binding = 7, std430) readonly buffer Tokens { floate4m3_t a[]; } tok;      // [tokH][tokW][64]
 layout(set = 0, binding = 8, std430) readonly buffer W8 { floate4m3_t w[]; } w8;           // [64][80]: 20 columns per sub-position
+#endif
 layout(set = 0, binding = 9, std430) readonly buffer W16 { f16vec4 w[]; } w16;             // bias, 16 equal rows of 80
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define HACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define RM gl_CooperativeMatrixLayoutRowMajor
+#if WIDE
+#define A8 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B8 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+shared f16vec4 TK[16 * 18];          // the tokens as binary16, row major, rows of 72 with padding
+#else
 #define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define RM gl_CooperativeMatrixLayoutRowMajor
 shared floate4m3_t TK[16 * 72];
-shared f16vec4 EO[16 * 88 / 4];
 float16_t q8(float16_t v) { return float16_t(floate4m3_t(clamp(v, float16_t(-448.0), float16_t(448.0)))); }
 #endif
+shared f16vec4 EO[16 * 88 / 4];
+#endif
+#if WIDE
+f16vec4 q8(f16vec4 v) { return f16vec4(unpackFloat2x16(e4m3RoundHalf2(v.xy)), unpackFloat2x16(e4m3RoundHalf2(v.zw))); }
+#else
 f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
+#endif
 // NVIDIA's expansion GEMM is chained m16n8k32 mma with an f16 accumulator: the bias is the initial C and every
 // 32 products are summed with one f16 rounding (swin_model.py mma_chain; the same k32 step the native kernels'
 // SWIN_EXACT build implements). K32_ROUND reproduces that: after each pair of k16 cooperative products the
@@ -94,6 +119,8 @@ f16vec4 q8(f16vec4 v) { return f16vec4(q8(v.x), q8(v.y), q8(v.z), q8(v.w)); }
 #define K32_ROUND 1
 #endif
 #if DOT2
+#elif K32_ROUND && WIDE
+#define R32(m, column) ROUND_HALF_CVT(m)
 #elif K32_ROUND
 #define R32(m, column) ROUND_HALF_STORE(m, EO, (column) * 4u, 22u)
 #else
@@ -196,31 +223,56 @@ void main()
 #else
     const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;
     const ivec2 t0 = 4 * ivec2(gl_WorkGroupID.xy);
-#if PLANES
+#if PLANES && WIDE
+    // NGX's layout, two planes of 32 channels (the HIP network's output); the dispatch only covers the render size
+    const uint src = (hf * uint(p.tokW) * uint((p.size.y + 31) / 32 * 16) + uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u))) * 32u;
+#elif PLANES
     // NGX's layout, two planes of 32 channels (the HIP network's output); the dispatch covers the token grid
     const uint src = (hf * 16u * gl_NumWorkGroups.x * gl_NumWorkGroups.y + uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u))) * 32u;
 #else
     const uint src = uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u)) * 64u + hf * 32u;
 #endif
+#if WIDE
+    [[unroll]] for (uint d = 0u; d < 8u; ++d)
+    {
+        const uvec2 v = e4m3Unpack4(tok.a[src / 4u + d]);
+        TK[row * 18u + hf * 8u + d] = f16vec4(unpackFloat2x16(v.x), unpackFloat2x16(v.y));
+    }
+#else
     for (uint c = 0u; c < 32u; ++c) TK[row * 72u + hf * 32u + c] = tok.a[src + c];
+#endif
     memoryBarrierShared(); barrier();
+#if WIDE
+#define TK_LOAD(m, t) coopMatLoad(m, TK, (t) * 4u, 18u, RM)
+#define W_LOAD(m, t, n) coopMatLoad(m, w8.w, (n) * 256u + (t) * 4u, 16u, gl_CooperativeMatrixLayoutColumnMajor)
+#else
+#define TK_LOAD(m, t) coopMatLoad(m, TK, (t) * 16u, 72u, RM)
+#define W_LOAD(m, t, n) coopMatLoad(m, w8.w, (t) * 16u * 80u + (n) * 16u, 80u, RM)
+#endif
     // Share each activation tile across three output tiles, then the remaining two.
     // Five live accumulators cost more registers than the saved loads on gfx1201.
     {
+#if WIDE
+        // the bias's rows are equal and a lane holds one column of an accumulator (row is lane & 15)
+        ACC a0 = ACC(0.0), a1 = ACC(0.0), a2 = ACC(0.0);
+        const float b0 = float(w16.w[row >> 2u][row & 3u]), b1 = float(w16.w[4u + (row >> 2u)][row & 3u]), b2 = float(w16.w[8u + (row >> 2u)][row & 3u]);
+        for (int i = 0, n = a0.length(); i < n; ++i) { a0[i] = b0; a1[i] = b1; a2[i] = b2; }
+#else
         HACC b0; coopMatLoad(b0, w16.w, 0u, 20u, RM);
         ACC a0 = ACC(b0);
         HACC b1; coopMatLoad(b1, w16.w, 4u, 20u, RM);
         ACC a1 = ACC(b1);
         HACC b2; coopMatLoad(b2, w16.w, 8u, 20u, RM);
         ACC a2 = ACC(b2);
+#endif
         for (uint kt = 0u; kt < 4u; ++kt)
         {
-            A8 a; coopMatLoad(a, TK, kt * 16u, 72u, RM);
-            B8 w0; coopMatLoad(w0, w8.w, kt * 16u * 80u, 80u, RM);
+            A8 a; TK_LOAD(a, kt);
+            B8 w0; W_LOAD(w0, kt, 0u);
             a0 = coopMatMulAdd(a, w0, a0);
-            B8 w1; coopMatLoad(w1, w8.w, kt * 16u * 80u + 16u, 80u, RM);
+            B8 w1; W_LOAD(w1, kt, 1u);
             a1 = coopMatMulAdd(a, w1, a1);
-            B8 w2; coopMatLoad(w2, w8.w, kt * 16u * 80u + 32u, 80u, RM);
+            B8 w2; W_LOAD(w2, kt, 2u);
             a2 = coopMatMulAdd(a, w2, a2);
             if ((kt & 1u) != 0u) { R32(a0, 0u); R32(a1, 1u); R32(a2, 2u); }
         }
@@ -229,16 +281,22 @@ void main()
         coopMatStore(HACC(a2), EO, 8u, 22u, RM);
     }
     {
+#if WIDE
+        ACC a0 = ACC(0.0), a1 = ACC(0.0);
+        const float b0 = float(w16.w[12u + (row >> 2u)][row & 3u]), b1 = float(w16.w[16u + (row >> 2u)][row & 3u]);
+        for (int i = 0, n = a0.length(); i < n; ++i) { a0[i] = b0; a1[i] = b1; }
+#else
         HACC b0; coopMatLoad(b0, w16.w, 12u, 20u, RM);
         ACC a0 = ACC(b0);
         HACC b1; coopMatLoad(b1, w16.w, 16u, 20u, RM);
         ACC a1 = ACC(b1);
+#endif
         for (uint kt = 0u; kt < 4u; ++kt)
         {
-            A8 a; coopMatLoad(a, TK, kt * 16u, 72u, RM);
-            B8 w0; coopMatLoad(w0, w8.w, kt * 16u * 80u + 48u, 80u, RM);
+            A8 a; TK_LOAD(a, kt);
+            B8 w0; W_LOAD(w0, kt, 3u);
             a0 = coopMatMulAdd(a, w0, a0);
-            B8 w1; coopMatLoad(w1, w8.w, kt * 16u * 80u + 64u, 80u, RM);
+            B8 w1; W_LOAD(w1, kt, 4u);
             a1 = coopMatMulAdd(a, w1, a1);
             if ((kt & 1u) != 0u) { R32(a0, 3u); R32(a1, 4u); }
         }

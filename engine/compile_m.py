@@ -126,6 +126,15 @@ def main():
     glsl('post_m.comp', 'post_m_c.spv', ['-DTILE_W=11', '-DTILE_H=11'] + (['-DLDR=1'] if a.ldr else []))
     # the same stages with the token buffers in NGX's plane layout, for a network that runs outside the engine
     for s in ('enc0_m', 'dec0_m'): glsl(s + '.comp', s + '_planes.spv', ['-DPLANES=1'] + (['-DLDR=1'] if a.ldr and s != 'dec0_m' else []))
+    # the same for GPUs with f16 matrices but no FP8 (RDNA3, whose HIP network runs inside Vulkan: engine/vkhip), and the
+    # final stores of its output formats, in f32
+    for s in ('enc0_m', 'dec0_m'): glsl(s + '.comp', s + '_planes_wide.spv', ['-DPLANES=1', '-DWIDE=1'] + (['-DLDR=1'] if a.ldr and s != 'dec0_m' else []))
+    # its reconstruction writes the half-resolution mean as NGX's surface has it, RGB10A2
+    for out, tile in (('post_m_wide', 10), ('post_m_q_wide', 15), ('post_m_c_wide', 11)):
+        glsl('post_m.comp', out + '.spv', ['-DHALF_RGB10=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + (['-DLDR=1'] if a.ldr else []))
+    for define, store in (('OUTPUT_RGB10', 'rgb10'), ('OUTPUT_RGBA8', 'rgba8'), ('OUTPUT_R11G11B10', 'r11g11b10'),
+                          ('OUTPUT_RGBA32F', 'rgba32f'), ('OUTPUT_BGRA8', 'bgra8'), ('OUTPUT_E5B9G9R9', 'e5b9g9r9')):
+        glsl('down_m.comp', f'down_m_wide_{store}.spv', ['-DWIDE_STORE=1', f'-D{define}=1'] + (['-DLDR=1'] if a.ldr else []))
     # the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2): v_dot2 on the
     # matrices widened to binary16 at load (layer_m_dot2.comp, runtime_m.inc widenM), the relaxed build's arithmetic
     for name, out in SHADERS.items(): glsl('layer_m_dot2.comp', out + '_dot2.spv', dot2_defines(name))
@@ -204,8 +213,23 @@ def compile_l(a, one, R):
         glsl('post_m.comp', out + '.spv', ['-DPRESET_L=1', '-DHALF_RGB10=1', '-DDISPLAY_MV=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr)
     for out, flags in (('down_m_dot2', []), ('down_m_rgb10_dot2', ['-DOUTPUT_RGB10=1'])):
         glsl('down_m.comp', out + '.spv', ['-DSEG=2'] + flags + ldr)
+    # RDNA3, whose native layers and stages run inside Vulkan (engine/vkhip): the texture work of the two stages around
+    # them, and the final stores in f32
+    glsl('enc0_l_gather.comp', 'enc0_l_gather.spv', ldr)
+    glsl('dec0_l_head.comp', 'dec0_l_head.spv')
+    for out, tile in (('post_l_wide', 11), ('post_l_q_wide', 16), ('post_l_c_wide', 12)):
+        glsl('post_m.comp', out + '.spv', ['-DPRESET_L=1', '-DHALF_RGB10=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr)
+    for define, store in (('OUTPUT_RGB10', 'rgb10'), ('OUTPUT_RGBA8', 'rgba8'), ('OUTPUT_R11G11B10', 'r11g11b10'),
+                          ('OUTPUT_RGBA32F', 'rgba32f'), ('OUTPUT_BGRA8', 'bgra8'), ('OUTPUT_E5B9G9R9', 'e5b9g9r9')):
+        glsl('down_m.comp', f'down_m_wide_{store}.spv', ['-DWIDE_STORE=1', f'-D{define}=1'] + ldr)
     if a.hip:
         package_hip(a, Ps)
+        # the stages' weights as NGX uploads them, and their native kernels (kernels/tex/enc0l_net.hip, dec0l_net.hip)
+        for name, kernel in (('enc0l', f'rrlite_enc0_4x4_mvlo_{R}'), ('dec0l', 'rrlite_dec0_4x4')):
+            w = np.ascontiguousarray(blob_of(one(kernel))); w.tofile(a.output / f'{name}_weights.bin')
+            src = a.hip / f'rrlite_{name}_net.hsaco'
+            if not src.exists(): raise ValueError(f'{src} is missing')
+            (a.output / 'hip' / src.name).write_bytes(src.read_bytes())
     marker = a.output / 'ldr'
     if a.ldr: marker.write_text('1\n')
     elif marker.exists(): marker.unlink()

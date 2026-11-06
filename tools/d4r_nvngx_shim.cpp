@@ -2657,6 +2657,7 @@ struct FrameParams
     // copy (or the in-place texture) takes them without the RGBA16F conversion image and blit
     bool packedOutput = false;
     bool packedRgba8 = false; // R8G8B8A8_UNORM after the original half rounding
+    bool outputFloat = false; // NGX's output array and the output buffers hold f32: binary16 cannot hold the game's format
     // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices, copied
     // off the caller's parameter object on the game thread so the worker never reads an
     // object the game may have destroyed by then. A scalar the caller did not set this frame
@@ -2806,6 +2807,8 @@ struct InputSlot
     CudaDevicePtr linearPointer[4] = {};
     UINT linearWidth[4] = {}, linearHeight[4] = {};
     size_t linearPitch[4] = {};
+    uint32_t linearFormat[4] = {};
+    bool planeFloat[4] = {}; // this frame's plane holds f32 (VramCopy::asFloat); indexed as the planes are, colour first
     CudaDevicePtr dilatedMotion = 0;
     size_t dilatedBytes = 0;
     CudaObject dilatedTexture = 0;
@@ -3518,6 +3521,7 @@ struct VulkanInterop
     PFN_vkUnmapMemory unmap = nullptr;
     PFN_vkCmdPipelineBarrier barrier = nullptr;
     PFN_vkCmdCopyImageToBuffer copyImageToBuffer = nullptr;
+    PFN_vkCmdCopyImage copyImage = nullptr;
     PFN_vkCmdCopyBuffer copyBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage copyBufferToImage = nullptr;
     PFN_vkCmdBlitImage blit = nullptr;
@@ -3959,6 +3963,7 @@ static void init_vram_interop()
     load(g_vk.unmap, "vkUnmapMemory");
     load(g_vk.barrier, "vkCmdPipelineBarrier");
     load(g_vk.copyImageToBuffer, "vkCmdCopyImageToBuffer");
+    load(g_vk.copyImage, "vkCmdCopyImage");
     load(g_vk.copyBuffer, "vkCmdCopyBuffer");
     load(g_vk.copyBufferToImage, "vkCmdCopyBufferToImage");
     load(g_vk.blit, "vkCmdBlitImage");
@@ -4141,7 +4146,7 @@ static void destroy_vram_image(VramImage& image)
     image = VramImage{};
 }
 
-static bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format)
+static bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format, bool storage = false)
 {
     VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -4151,7 +4156,7 @@ static bool create_vram_image(VramImage& image, UINT width, UINT height, VkForma
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkResult result = g_vk.createImage(g_vk.device, &info, nullptr, &image.image);
@@ -4178,6 +4183,12 @@ static bool create_vram_image(VramImage& image, UINT width, UINT height, VkForma
     image.height = height;
     image.format = format;
     return true;
+}
+
+// The format of this frame's plane: canonical, or f32 where it holds colour or motion binary16 cannot
+static uint32_t plane_format_in(const InputSlot& slot, int index, Plane plane)
+{
+    return slot.planeFloat[index] ? CUDA_FORMAT_FLOAT : plane_format(plane);
 }
 
 static size_t canonical_texel_bytes(Plane plane)
@@ -4272,6 +4283,8 @@ struct VramCopy
     VkImage image = VK_NULL_HANDLE;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     bool convert = false; // blit to/from the plane's canonical format
+    bool asFloat = false; // colour or motion the plane holds as f32: binary16 cannot hold this format's values
+    VkFormat format = VK_FORMAT_UNDEFINED;
     UINT width = 0, height = 0;
 };
 
@@ -4348,7 +4361,8 @@ static bool vram_motion_blit_supported(VkFormat format)
 
 // Whether `resource` can be copied raw (or, for colour/motion/exposure, blitted)
 // to/from the canonical layout of `plane`.
-static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
+static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false,
+                               bool floatPlanes = false)
 {
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -4364,6 +4378,34 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
     copy.height = desc.Height;
     copy.aspect = (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT)
                       ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.asFloat = false;
+    copy.format = format;
+    // NVIDIA's output kernels store f32 straight into the game's texture
+    if (output && floatPlanes && plane == Plane::Color &&
+        (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM ||
+         format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32B32A32_SFLOAT;
+        return true;
+    }
+    // NVIDIA's kernels read textures as f32, so a value binary16 cannot hold keeps its f32 plane
+    if (!output && floatPlanes && plane == Plane::Color &&
+        (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM ||
+         format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32B32A32_SFLOAT;
+        return !copy.convert || vram_blit_supported(format, VK_FORMAT_R32G32B32A32_SFLOAT);
+    }
+    if (floatPlanes && plane == Plane::Motion &&
+        (format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32_SFLOAT;
+        return !copy.convert || vram_blit_supported(format, VK_FORMAT_R32G32_SFLOAT);
+    }
     if (plane == Plane::Color)
     {
         copy.convert = vram_color_blit_supported(format, output);
@@ -4412,7 +4454,8 @@ static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* 
     }
     auto& slot = feature.fusedColor[slotIndex];
     auto& target = feature.inputs[slotIndex].vram[0];
-    if (slot.image == copy.image && slot.buffer == target.buffer && slot.owner == source) return true;
+    const uint32_t mode = copy.asFloat ? 6 : rgba8 ? 5 : 1;
+    if (slot.image == copy.image && slot.buffer == target.buffer && slot.owner == source && slot.inputMode == mode) return true;
     if (slot.owner != nullptr) feature.retiredFusedColor.push_back(slot);
     slot = {};
     VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -4425,8 +4468,8 @@ static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* 
         g_fusedColorStage.free(slot.set); g_vk.destroyView(g_vk.device, slot.view, nullptr); slot = {}; return false;
     }
     slot.image = copy.image; slot.buffer = target.buffer; slot.owner = source; source->AddRef();
-    slot.inputMode=rgba8 ? 5 : 1;
-    logf("fused %s input conversion active for slot %d", rgba8 ? "RGBA8" : "R11G11B10", slotIndex);
+    slot.inputMode=mode;
+    logf("fused %s input conversion active for slot %d%s", rgba8 ? "RGBA8" : "R11G11B10", slotIndex, copy.asFloat ? " (f32 plane)" : "");
     return true;
 }
 
@@ -4459,7 +4502,8 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &sampled);
             auto& stage = feature.fusedColor[&slot - feature.inputs];
-            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, stage.inputMode, slot.host[0].rowBytes / 8);
+            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, stage.inputMode,
+                                     slot.host[0].rowBytes / (slot.planeFloat[0] ? 16 : 8));
             sampled.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; sampled.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             sampled.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; sampled.newLayout = layout;
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -4469,7 +4513,8 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
         VkBufferImageCopy region = full_region(copy);
         static const Plane kPlanes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
         if (feature.linearInputs)
-            region.bufferRowLength = static_cast<uint32_t>(slot.host[index].rowBytes / canonical_texel_bytes(kPlanes[index]));
+            region.bufferRowLength = static_cast<uint32_t>(slot.host[index].rowBytes /
+                ((slot.planeFloat[index] ? 4 : plane_format(kPlanes[index]) == CUDA_FORMAT_HALF ? 2 : 4) * plane_channels(kPlanes[index])));
         if (!copy.convert)
         {
             g_vk.copyImageToBuffer(cmd, copy.image, layout, slot.vram[index].buffer, 1, &region);
@@ -4569,6 +4614,59 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 
 // Reuse the storage-output shader to combine half decoding and the game's
 // R11G11B10 conversion. Descriptors retain their images through allocator retirement.
+// An f32 result into the game's texture: stored into an image of the texture's bits (the conversion a formatted store
+// does, kernels/support/vulkan_write_f32.comp), which is copied raw. A blit would narrow the values to half.
+static bool record_vram_output_f32(Feature& feature,unsigned slotIndex,ID3D12GraphicsCommandList* list,ID3D12Resource* output,
+                                   D3D12_RESOURCE_STATES outputState,const VramBuffer& buffer,const VramCopy& copy)
+{
+    const VramImage& conversion=feature.outputConversion;
+    auto& slot=feature.fusedOutput[slotIndex];
+    if(slot.owner!=output || slot.image!=conversion.image || slot.buffer!=buffer.buffer)
+    {
+        if(feature.retiredFusedOutput.size()>=64) return false;
+        if(slot.owner) feature.retiredFusedOutput.push_back(slot);
+        slot={};
+        VkImageViewCreateInfo view={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image=conversion.image;view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.format=conversion.format;
+        view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        if(g_vk.createView(g_vk.device,&view,nullptr,&slot.view)!=VK_SUCCESS) return false;
+        if(!g_fusedColorStage.set(slot.set,slot.view,view.format,buffer.buffer,size_t(copy.width)*copy.height*16,true,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,copy.format))
+        {
+            g_fusedColorStage.free(slot.set);g_vk.destroyView(g_vk.device,slot.view,nullptr);slot={};return false;
+        }
+        slot.owner=output;output->AddRef();slot.image=conversion.image;slot.buffer=buffer.buffer;
+        logf("f32 output store active for slot %u (format %d)",slotIndex,int(copy.format));
+    }
+    transition(list,output,outputState,D3D12_RESOURCE_STATE_COPY_DEST);
+    VkCommandBuffer cmd=VK_NULL_HANDLE;
+    bool recorded=SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list,&cmd));
+    if(recorded)
+    {
+        VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
+        g_vk.interop->GetVulkanImageLayout(copy.resource,D3D12_RESOURCE_STATE_COPY_DEST,&layout);
+        VkImageMemoryBarrier image={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        image.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;image.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+        image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        image.image=conversion.image;image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        const VkMemoryBarrier before={VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT};
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,nullptr,1,&image);
+        g_fusedColorStage.record(cmd,slot.set,copy.width,copy.height);
+        image.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        image.oldLayout=VK_IMAGE_LAYOUT_GENERAL;image.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&kBeforeTransfer,0,nullptr,1,&image);
+        VkImageCopy region={};
+        region.srcSubresource=region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        region.extent={copy.width,copy.height,1};
+        g_vk.copyImage(cmd,conversion.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,copy.image,layout,1,&region);
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&kAfterTransfer,0,nullptr,0,nullptr);
+        recorded=SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+    }
+    transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST,outputState);
+    return recorded;
+}
+
 static bool record_feature_vram_output(Feature& feature, unsigned slotIndex, ID3D12GraphicsCommandList* list,
                                       ID3D12Resource* output, D3D12_RESOURCE_STATES outputState,
                                       const VramCopy& copy, uint32_t frame=0)
@@ -4633,6 +4731,8 @@ static bool record_feature_vram_output(Feature& feature, unsigned slotIndex, ID3
         if(recorded) {feature.recordOutputFused=true;return true;}
         feature.fusedOutputAllowed=false;
     }
+    if(copy.asFloat && copy.convert)
+        return record_vram_output_f32(feature,slotIndex,list,output,outputState,buffer,copy);
     transition(list,output,outputState,D3D12_RESOURCE_STATE_COPY_DEST);
     const bool recorded=record_vram_output(list,buffer,copy,feature.outputConversion);
     transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST,outputState);
@@ -4790,14 +4890,15 @@ static bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t byte
     return create_vram_buffer(buffer, bytes);
 }
 
-static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format)
+static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format,
+                                    bool storage = false)
 {
     if (image.image != VK_NULL_HANDLE && image.width == width && image.height == height && image.format == format)
         return true;
     if (image.image != VK_NULL_HANDLE)
         feature.retiredImages.push_back(image);
     image = VramImage{};
-    return create_vram_image(image, width, height, format);
+    return create_vram_image(image, width, height, format, storage);
 }
 
 // Diagnostic first: native inputs travel GPU image/buffer -> per-slot imported
@@ -6980,7 +7081,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
         const VramBuffer& buffer = slot.vram[index];
         if (slot.linearTexture[index] != 0 && slot.linearPointer[index] == buffer.device &&
             slot.linearWidth[index] == geometry.width && slot.linearHeight[index] == geometry.height &&
-            slot.linearPitch[index] == geometry.rowBytes)
+            slot.linearPitch[index] == geometry.rowBytes && slot.linearFormat[index] == plane_format_in(slot, index, planes[index]))
             continue;
         if (slot.linearTexture[index] != 0)
             g.cu.texObjectDestroy(slot.linearTexture[index]);
@@ -6990,7 +7091,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
             CudaDevicePtr pointer;
             uint32_t format, channels;
             size_t width, height, pitch;
-        } pitch2D = {buffer.device, plane_format(planes[index]), plane_channels(planes[index]), geometry.width,
+        } pitch2D = {buffer.device, plane_format_in(slot, index, planes[index]), plane_channels(planes[index]), geometry.width,
                      geometry.height, geometry.rowBytes};
         static_assert(sizeof(Pitch2D) == 40, "CUDA_RESOURCE_DESC pitch2D");
         CudaResourceDesc resource = {};
@@ -7014,6 +7115,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
         slot.linearWidth[index] = geometry.width;
         slot.linearHeight[index] = geometry.height;
         slot.linearPitch[index] = geometry.rowBytes;
+        slot.linearFormat[index] = pitch2D.format;
     }
     return true;
 }
@@ -7148,7 +7250,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
     for (int index = 0; index < count && result == 0; ++index)
     {
         const HostPlane& geometry = slot.host[index];
-        if (!ensure_cuda_image(*images[index], geometry.width, geometry.height, plane_format(planes[index]),
+        if (!ensure_cuda_image(*images[index], geometry.width, geometry.height, plane_format_in(slot, index, planes[index]),
                                plane_channels(planes[index]), false, planes[index] == Plane::Color))
             return false;
         if (verify)
@@ -7385,7 +7487,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         return;
     }
     VramBuffer buffer = feature->outputs[target].vram;
-    const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
+    const size_t rowBytes = static_cast<size_t>(feature->output.width) * (params.outputFloat ? 16 : 8);
     CudaMemcpy2D copy = {};
     copy.srcMemoryType = CUDA_MEMORY_ARRAY;
     copy.srcArray = feature->output.array;
@@ -7898,10 +8000,10 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                 CudaImage* images[] = {&feature->color, &feature->depth, &feature->motion, &feature->exposure};
                 for (int index = 0; index < (params.hasExposure ? 4 : 3) && ready; ++index)
                     ready = ensure_cuda_image(*images[index], slot.host[index].width, slot.host[index].height,
-                        plane_format(planes[index]), plane_channels(planes[index]), false, index == 0);
+                        plane_format_in(slot, index, planes[index]), plane_channels(planes[index]), false, index == 0);
             }
             ready = ready && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight,
-                                               CUDA_FORMAT_HALF, 4, true, false);
+                                               params.outputFloat ? CUDA_FORMAT_FLOAT : CUDA_FORMAT_HALF, 4, true, false);
             if (!ready)
             {
                 slot.busy = false;
@@ -8117,8 +8219,8 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                         upload_plane(Plane::Motion, slot.host[2], feature->motion, frame, stages, 2) &&
                         (!params.hasExposure ||
                          upload_plane(Plane::Exposure, slot.host[3], feature->exposure, frame, stages, 3));
-    ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight, CUDA_FORMAT_HALF, 4,
-                                 true, false);
+    ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight,
+                                 params.outputFloat ? CUDA_FORMAT_FLOAT : CUDA_FORMAT_HALF, 4, true, false);
     const auto dilationStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     // Keep the native field available to repair independently of the field fed
     // to NGX. The opt-in repair-only mode retains the game's flags and MV scale.
@@ -8250,12 +8352,15 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if(!wireHistoryRequested) feature->wireValid=false;
     if(wireHistoryRequested && feature->outputRedirected)
     { g.cu.setArrayRedirect(feature->output.array,0,0);feature->outputRedirected=false; }
+    // An f32 output goes through the array: the redirected stores write RGBA16F or a format's bits through half
+    if(params.outputFloat && feature->outputRedirected)
+    { g.cu.setArrayRedirect(feature->output.array,0,0);feature->outputRedirected=false; }
     static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
     // The redirect is carried out by the native output kernel's stores (ZLUDA's compile of NVIDIA's kernel
     // writes the array), so it is set while the previous frame's output kernel was the native one and
     // undone below when this frame's was not.
     const bool nativeOutput = g.cu.outputKernelNative == nullptr || g.cu.outputKernelNative() == 1;
-    if (!wireHistoryRequested && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
+    if (!wireHistoryRequested && !params.outputFloat && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
         (nativeOutput || feature->outputRedirected))
     {
         // split frames write their own slot; the staged path downloads from outputLinear
@@ -9326,11 +9431,11 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
     // NGX runs the preset of the feature's quality mode.
     feature->preset = presets[d4r_preset_slot(quality)];
     // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
-    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced or
+    // hiluma_engine_output, M = 13 and L = 12 through rrlite_downsample_kernel, their last kernel). Only a forced or
     // OptiScaler-chosen Super Sampling preset qualifies; a Ray Reconstruction preset never does here.
     if (!forced.empty() && !rayReconstruction)
     {
-        char allowed[128] = "11,13";
+        char allowed[128] = "11,12,13";
         if (const std::string list = env_string("D4R_SHIM_OUTPUT_DIRECT_PRESETS"); !list.empty())
             snprintf(allowed, sizeof(allowed), "%s", list.c_str());
         for (char* token = strtok(allowed, ","); token != nullptr; token = strtok(nullptr, ","))
@@ -9449,6 +9554,15 @@ static bool engine_k_refused()
     return engine_k_native_rdna3() && env_uint("D4R_ENGINE_VKHIP", 1) == 0;
 }
 
+// Preset M with its native layers inside the game's command list (engine/vkhip) and FP8-free stages around them, on
+// RDNA3, with [Engine] ExperimentalVkHip (D4R_ENGINE_M_VKHIP=0 turns off M and L). A model without the HIP network, a
+// GPU or driver vkhip refuses, and PreferAccuracy stay on the CUDA backend's kernels. L's stages are native too.
+static bool engine_m_vkhip()
+{
+    return g_vk.matrixF16 && !g_vk.float8 && env_uint("D4R_ENGINE_VKHIP", 1) != 0 && env_uint("D4R_ENGINE_M_VKHIP", 1) != 0 &&
+           env_uint("D4R_PREFER_ACCURACY", 0) == 0 && env_string("D4R_ENGINE_M_NETWORK") != "dot2";
+}
+
 // Presets M and L on the engine's v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp): on GPUs without FP8 and
 // without the f16 matrix tuple (RDNA2), where the CUDA backend's M and L kernels are translated. RDNA3 keeps its
 // native kernels unless D4R_ENGINE_M_NETWORK=dot2.
@@ -9512,7 +9626,7 @@ static void init_engine_vulkan()
     logf("engine backend: f16 matrix tuple %s; FP8 matrix tuple %s", g_vk.matrixF16 ? "supported" : "unsupported",
          g_vk.float8 ? "supported" : "unsupported");
     logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)"
-         : engine_m_dot2() ? "unavailable: M and L run their v_dot2 stages" : "unavailable: M and L run on the CUDA backend");
+         : engine_m_dot2() ? "unavailable: M and L run their v_dot2 stages" : "unavailable: M and L run on vkhip where they can");
     // the features vkd3d-proton created its device with
     const VkPhysicalDeviceFeatures2* features = nullptr;
     if (SUCCEEDED(g_vk.interop->GetDeviceFeatures(&features)) && features != nullptr)
@@ -9607,7 +9721,8 @@ static void prepare_engine_view(Feature& feature, ID3D12Resource* resource, cons
     const bool compatible = desc.DepthOrArraySize == 1 && originSupported && (isOutput ?
         // the final-store formats (K packages a store per format; other models copy what they cannot store)
         (image.format == VK_FORMAT_R16G16B16A16_SFLOAT || image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-         image.format == VK_FORMAT_R8G8B8A8_UNORM || image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
+         image.format == VK_FORMAT_R8G8B8A8_UNORM || image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         image.format == VK_FORMAT_R32G32B32A32_SFLOAT) &&
             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
             (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) :
         !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -9691,7 +9806,8 @@ static void init_engine_backend_m_variant(bool presetL, bool ldr)
     try
     {
         // without FP8 (RDNA2) M and L run their v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp)
-        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !g_vk.float8);
+        const bool wide = engine_m_vkhip();
+        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !g_vk.float8 && !wide, wide);
         if (model->isPresetL() != presetL)
             throw std::runtime_error(presetL ? "the directory holds a preset M model" : "the directory holds a preset L model");
         slot = std::move(model);
@@ -10271,6 +10387,8 @@ static bool record_engine_network_frame(Feature& feature, ID3D12GraphicsCommandL
 
 // Presets M (13) and L (12): record the evaluation into `list`, borrowing compatible inputs and copying only
 // fallbacks. L is M's pipeline with its own input, expansion and reconstruction stages (engine/L_NOTES.md).
+static bool create_engine_vkhip(Feature& feature, const std::string& directory, size_t tokenBytes, size_t headBytes,
+                                bool presetM = false, uint32_t renderWidth = 0, uint32_t renderHeight = 0);
 static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                               ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
                               const FrameParams& p, uint32_t frame)
@@ -10287,7 +10405,8 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     // The FP8 pipelines need VK_EXT_shader_float8: creating them without it crashes the driver (RADV on RDNA3,
     // vkCreateComputePipelines), so never load such a model. M and L load their v_dot2 stages instead where
     // engine_m_dot2().
-    if (!g_vk.float8 && !engine_m_dot2())
+    const bool vkhipM = engine_m_vkhip();
+    if (!g_vk.float8 && !engine_m_dot2() && !vkhipM)
         return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
     std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
     d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
@@ -10370,24 +10489,31 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         if (feature.engineM == nullptr)
         {
             const size_t bytes = static_cast<size_t>(d4r::MEngine::networkBufferBytes(p.renderWidth, p.renderHeight));
-            const bool hip = create_engine_network(feature, g_engineM.directories[presetL][ldr], name,
+            const bool vkhip = vkhipM && create_engine_vkhip(feature, g_engineM.directories[presetL][ldr],
+                presetL ? static_cast<size_t>(d4r::MEngine::lStageBufferBytes(p.renderWidth, p.renderHeight, false)) : bytes,
+                presetL ? static_cast<size_t>(d4r::MEngine::lStageBufferBytes(p.renderWidth, p.renderHeight, true)) : bytes, true,
+                p.renderWidth, p.renderHeight);
+            if (vkhipM && !vkhip) return refuse("vkhip is unavailable");
+            const bool hip = !vkhip && create_engine_network(feature, g_engineM.directories[presetL][ldr], name,
                                                    model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
                                                    bytes, bytes);
-            const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
+            const d4r::ExternalNetwork external = vkhip ?
+                d4r::ExternalNetwork{feature.engineVkHip->tokens(), feature.engineVkHip->head()} :
+                d4r::ExternalNetwork{feature.engineTokens.buffer, feature.engineHead.buffer};
             // The Vulkan network of a dynamic-resolution model reserves the render size the feature was created with
             // (NGX's maximum; at least this frame's), not the output size: at 1280x720 -> 4K that is 1.1 GB less for
             // M and 1.4 GB for L. A larger frame goes to the output-sized engine below (engineMDynamic).
-            const bool dynamic = !hip && model->hasDynamicResolution();
+            const bool dynamic = !hip && !vkhip && model->hasDynamicResolution();
             const uint32_t capacityWidth = dynamic ? std::min(feature.outWidth, std::max(feature.width, p.renderWidth)) : p.renderWidth;
             const uint32_t capacityHeight = dynamic ? std::min(feature.outHeight, std::max(feature.height, p.renderHeight)) : p.renderHeight;
             feature.engineM = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device, feature.outWidth,
                                                                    feature.outHeight, capacityWidth, capacityHeight,
-                                                                   hip ? &external : nullptr);
+                                                                   hip || vkhip ? &external : nullptr);
             feature.engineMRenderWidth = capacityWidth;
             feature.engineMRenderHeight = capacityHeight;
             logf("engine backend (%s): feature %u runs preset %s in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
                  name, feature.handle.Id, name, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
-                 hip ? "the native HIP layers (list split around it)" : "Vulkan",
+                 vkhip ? "vkhip (one Vulkan command list)" : hip ? "the native HIP layers (list split around it)" : "Vulkan",
                  model->hasRgb10Output() && game.output.view != VK_NULL_HANDLE &&
                      game.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
                      game.output.layout == VK_IMAGE_LAYOUT_GENERAL && game.output.image != game.color.image &&
@@ -10401,6 +10527,9 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         return refuse("the engine could not be created");
     }
     d4r::GameUpscalerM* adapter = feature.engineM.get();
+    // vkhip's grid is fixed and this GPU has no FP8 engine to take other sizes
+    if (feature.engineVkHip && (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
+        return refuse("the render size changed, which M's vkhip network does not support yet");
     // the HIP network's grid is fixed; the Vulkan engine takes render sizes up to the one it reserved
     const bool resizedHip = feature.engineNet != nullptr &&
         (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight);
@@ -10479,7 +10608,11 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     {
         try
         {
-            adapter->record(command, game);
+            if (feature.engineVkHip) {
+                adapter->recordFront(command, game);
+                feature.engineVkHip->record(command, game.reset);
+                adapter->recordBack(command, game);
+            } else adapter->record(command, game);
         }
         catch (const std::exception& error)
         {
@@ -10882,7 +11015,7 @@ static void start_engine_preload()
                  "feature ([RayReconstruction] Enable = true loads it at NGX init)");
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
-        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || engine_m_dot2());
+        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || engine_m_dot2() || engine_m_vkhip());
         const bool srK = sr == 11 && !engine_k_refused();
         if (!rr && !srM && !srK)
             return;
@@ -11173,8 +11306,9 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
     return true;
 }
 
+// presetM: M's layers at the frame's render size instead of K's at the output size
 static bool create_engine_vkhip(Feature& feature, const std::string& directory,
-                                size_t tokenBytes, size_t headBytes)
+                                size_t tokenBytes, size_t headBytes, bool presetM, uint32_t renderWidth, uint32_t renderHeight)
 {
     if (env_uint("D4R_ENGINE_VKHIP", 1) == 0) return false;
     auto unavailable = [&](const std::string& reason) {
@@ -11260,7 +11394,24 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     // the CUDA backend, about 0.12 ms slower at 1080p) when the model has them, otherwise the fast set in hip/
     const bool accuracy = env_uint("D4R_PREFER_ACCURACY", 0) != 0 &&
         GetFileAttributesW(widen(directory + "/hip-accuracy/dltss_pwin_enc0_layer.hsaco").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const std::string hipDir = directory + (accuracy ? "/hip-accuracy/" : "/hip/");
+    const std::string hipDir = directory + (accuracy && !presetM ? "/hip-accuracy/" : "/hip/");
+    if (presetM)
+    {
+        for (const char* layer : {"enc1", "enc2", "enc3_tube", "dec2", "dec1"}) {
+            const std::string name = std::string("rrlite_") + layer + "_4x4";
+            if (!load(widen(hipDir + name + ".hsaco"), files.code[name]))
+                return unavailable(name + ".hsaco missing");
+        }
+        // preset L: its native input and expansion stages around the same layers
+        if (feature.preset == 12)
+            for (const char* stage : {"enc0l", "dec0l"}) {
+                const std::string name = std::string("rrlite_") + stage + "_net";
+                if (!load(widen(hipDir + name + ".hsaco"), files.code[name]) ||
+                    !load(widen(directory + "/" + stage + "_weights.bin"), stage[0] == 'e' ? files.enc0lWeights : files.dec0lWeights))
+                    return unavailable(name + " or its weights missing");
+            }
+    }
+    else
     for (const char* layer : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
         const std::string name = std::string("dltss_pwin_") + layer + "_layer";
         if (!load(widen(hipDir + name + ".hsaco"), files.code[name]))
@@ -11268,8 +11419,9 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     }
     auto network = std::make_unique<vkhip::KNetwork>();
     std::string error;
-    if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
-                         feature.outHeight, tokenBytes, headBytes, error)) return unavailable(error);
+    if (!(presetM ? network->createM(g_vk.device, g_vk.deviceProc, g_vk.memory, files, renderWidth, renderHeight, tokenBytes, headBytes, error)
+                  : network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, feature.outWidth,
+                                    feature.outHeight, tokenBytes, headBytes, error))) return unavailable(error);
     logf("experimental vkhip ready on %s: %u native dispatches, %s layers, shared image-format adapter, regular/inverted depth",
          gfx, network->dispatchesPerFrame(), accuracy ? "accuracy" : "fast");
     if (env_uint("D4R_VKHIP_STAMPS", 0) != 0)
@@ -11401,11 +11553,13 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
              game.output.format, model->hasDirectOutput(game.output.format));
     game.settings.renderWidth = p.renderWidth;
     game.settings.renderHeight = p.renderHeight;
-    // The CUDA backend converts other colour and motion formats to binary16 (toward zero) before NGX reads them;
-    // the engine repeats that conversion, which these formats do not need (exact in binary16).
-    game.settings.canonicalColor = game.color.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+    // The CUDA backend converts other colour and motion formats to binary16 (toward zero) before NGX reads them.
+    // Only the accuracy stages repeat that, to stay byte-identical to it, and these formats do not need it (exact in
+    // binary16). The default reads the game's texels as they are, as NVIDIA's kernels do (f32), which is also faster.
+    const bool halfInputs = model->hasAccuracyStages();
+    game.settings.canonicalColor = halfInputs && game.color.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
                                    game.color.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    game.settings.canonicalMotion = game.motion.format != VK_FORMAT_R16G16_SFLOAT &&
+    game.settings.canonicalMotion = halfInputs && game.motion.format != VK_FORMAT_R16G16_SFLOAT &&
                                     game.motion.format != VK_FORMAT_R16G16B16A16_SFLOAT;
     game.settings.jitter[0] = p.jitterX;
     game.settings.jitter[1] = p.jitterY;
@@ -11886,9 +12040,20 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
     // work if the colour output itself stops qualifying.
     if ((!feature->vramDecided || feature->vram) && vram_interop_available())
     {
-        p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
+        // PreferAccuracy keeps the conversion to stay byte-identical to the CUDA reference; the native motion and
+        // Ray Reconstruction passes work on binary16 motion and colour.
+        const bool floatPlanes = env_uint("D4R_PREFER_ACCURACY", 0) == 0 && !feature->rayReconstruction &&
+                                 env_uint("D4R_MOTION_DILATION", 0) == 0 && env_uint("D4R_SHIM_F32_INPUTS", 1) != 0;
+        // The output store runs on the game's list after the wait a split frame gives it
+        const bool floatOutput = floatPlanes && env_uint("D4R_SHIM_F32_OUTPUT", 1) != 0 && g_fusedColorReady &&
+                                 g_vk.copyImage != nullptr && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 && g_vk.split != nullptr &&
+                                 (!feature->vramDecided || feature->split);
+        p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true, floatOutput);
+        if (p.vram && vramOutput.asFloat && (vramOutput.width != feature->outWidth || vramOutput.height != feature->outHeight))
+            p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
+        p.outputFloat = p.vram && vramOutput.asFloat;
         for (int index = 0; index < inputCount && p.vram; ++index)
-            p.vram = describe_vram_copy(inputs[index], planes[index], vramInputs[index]);
+            p.vram = describe_vram_copy(inputs[index], planes[index], vramInputs[index], false, floatPlanes);
     }
     if (!feature->vramDecided)
     {
@@ -11939,18 +12104,19 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
             HostPlane& geometry = slot.host[index]; // geometry only; the bytes stay in VRAM
             geometry.width = vramInputs[index].width;
             geometry.height = vramInputs[index].height;
-            geometry.rowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
+            slot.planeFloat[index] = vramInputs[index].asFloat;
+            geometry.rowBytes = (vramInputs[index].asFloat ? 4 * plane_channels(planes[index]) : canonical_texel_bytes(planes[index])) * geometry.width;
             if (feature->linearInputs)
                 geometry.rowBytes = (geometry.rowBytes + 255) & ~static_cast<size_t>(255); // texture pitch alignment
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
         // M's downsample kernel has only formatted stores, which the native store can pack (kernels/tex/tex_common.h).
-        p.packedOutput = feature->split && feature->outputDirectAllowed && feature->preset == 13 && vramOutput.convert &&
+        p.packedOutput = feature->split && !p.outputFloat && feature->outputDirectAllowed && feature->preset == 13 && vramOutput.convert &&
                          outputDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && vramOutput.width % 2 == 0 &&
                          env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_PACKED", 0) != 0 &&
                          feature->packedReady.load();
-        p.packedRgba8 = feature->split && feature->outputDirectAllowed && feature->preset == 11 &&
+        p.packedRgba8 = feature->split && !p.outputFloat && feature->outputDirectAllowed && feature->preset == 11 &&
                        outputDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && vramOutput.width % 2 == 0 &&
                        env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_RGBA8", 1) != 0 &&
                        feature->rgba8Ready.load();
@@ -11964,7 +12130,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
         }
         InPlaceTexture outputTexture;
         const size_t outputTexelBytes = p.packedOutput ? 4 : 8;
-        if (feature->split && feature->outputDirectAllowed && (!vramOutput.convert || p.packedOutput) &&
+        if (feature->split && !p.outputFloat && feature->outputDirectAllowed && (!vramOutput.convert || p.packedOutput) &&
             env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 &&
             describe_in_place(output, outputTexture) && outputTexture.rowPitch % 8 == 0 &&
             outputTexture.rowPitch / 8 <= 0xffffu &&
@@ -11996,7 +12162,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
         }
         if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
                                                                vramInputs[0].width, vramInputs[0].height,
-                                                               VK_FORMAT_R16G16B16A16_SFLOAT))
+                                                               vramInputs[0].asFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramInputs[1].convert && !ensure_conversion_image(*feature, feature->depthConversion,
                                                                vramInputs[1].width, vramInputs[1].height,
@@ -12004,7 +12170,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
                                                                vramInputs[2].width, vramInputs[2].height,
-                                                               VK_FORMAT_R16G16_SFLOAT))
+                                                               vramInputs[2].asFloat ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R16G16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (inputCount == 4 && vramInputs[3].convert &&
             !ensure_conversion_image(*feature, feature->exposureConversion,
@@ -12012,7 +12178,8 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
                                                              vramOutput.width, vramOutput.height,
-                                                             VK_FORMAT_R16G16B16A16_SFLOAT))
+                                                             vramOutput.asFloat ? D4rVkStaging::f32_store_layout(vramOutput.format)
+                                                                                : VK_FORMAT_R16G16B16A16_SFLOAT, vramOutput.asFloat))
             return NGX_FAIL_PLATFORM_ERROR;
     }
     if ((!p.vram || verify) &&
@@ -12031,7 +12198,7 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
         for (OutputSlot& outputSlot : feature->outputs)
         {
             outputSlot.staging.retire();
-            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * 8 *
+            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * (p.outputFloat ? 16 : 8) *
                                                                             outputDesc.Height)
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
                 return NGX_FAIL_PLATFORM_ERROR;
@@ -12164,6 +12331,13 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
     {
         p.outputInPlace = 0; // only a split frame waits for the result before the game reads its texture
         p.packedOutput = false;
+        if (p.outputFloat)
+        {
+            p.outputFloat = false; // the f32 store needs the split frame's wait
+            describe_vram_copy(output, Plane::Color, vramOutput, true);
+            if (vramOutput.convert)
+                ensure_conversion_image(*feature, feature->outputConversion, vramOutput.width, vramOutput.height, VK_FORMAT_R16G16B16A16_SFLOAT);
+        }
     }
     if (p.split && timestamps)
         profile_timestamp(*feature, list, frame, 2);

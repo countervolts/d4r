@@ -13,8 +13,8 @@
 #endif
 #include <stdint.h>
 #ifdef SWIN_GFX11_ROW
-#if !defined(SWIN_GFX11_SCALED) || !defined(SWIN_EXACT) || defined(D4R_FP8_WMMA)
-#error "SWIN_GFX11_ROW is reserved for the exact scaled-half texture path"
+#if !defined(SWIN_GFX11_SCALED) || !(defined(SWIN_EXACT) || defined(D4R_L_WIDENED)) || defined(D4R_FP8_WMMA)
+#error "SWIN_GFX11_ROW is reserved for the scaled-half texture path"
 #endif
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
 #error "SWIN_GFX11_ROW requires RDNA3"
@@ -592,7 +592,7 @@ __device__ unsigned d4r_k32_bad[4 + 64 * 4];
 // f16 accumulate of one k32 step (NVIDIA m16n8k32 semantics: products summed, one rounding with C)
 __device__ __forceinline__ void k32(T16& acc, gop a0, gop b0, gop a1, gop b1)
 {
-#if defined(SWIN_GFX11_SCALED)
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
     // Match the original ZLUDA texture k32 lowering: scaled FP16 operands,
     // scaled f32 C, two k16 products, then a single half rounding.
     f8v c;

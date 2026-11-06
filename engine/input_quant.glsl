@@ -1,6 +1,7 @@
 // The CUDA backend gives NGX's kernels canonical binary16 colour and motion: the game's textures blitted to
 // RGBA16F / RG16F, a conversion RADV's blit rounds toward zero. The engine reads the game's textures directly, so
-// it applies the same conversion to every colour and motion texel it fetches. Values already exact in binary16
+// the accuracy stages apply the same conversion to every colour and motion texel they fetch; the default stages use
+// the texels as they are. Values already exact in binary16
 // (RGBA16F, RG16F, R11G11B10, unchanged) pass through. Integer and power-of-two operations only: a float
 // f32 -> f16 -> f32 round trip is folded away by the compiler (see round_half.glsl).
 #ifndef D4R_INPUT_QUANT_GL

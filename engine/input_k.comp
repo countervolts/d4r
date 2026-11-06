@@ -10,8 +10,8 @@
 #extension GL_GOOGLE_include_directive : require
 #include "input_quant.glsl"
 // Specialization constant 7 (set by the runtime per pipeline): the frame's colour and motion take the CUDA backend's
-// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
-// pipeline without it carries no conversion code for games whose textures are already in binary16.
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags, which only
+// the accuracy stages set; the pipeline without it carries no conversion code.
 layout(constant_id = 7) const bool CANONICAL_INPUT = true;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params

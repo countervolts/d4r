@@ -19,14 +19,20 @@
 #extension GL_GOOGLE_include_directive : require
 #include "input_quant.glsl"
 // Specialization constant 7 (set by the runtime per pipeline): the frame's colour take the CUDA backend's
-// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
-// pipeline without it carries no conversion code for games whose textures are already in binary16.
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags, which only
+// the accuracy stages set; the pipeline without it carries no conversion code.
 layout(constant_id = 7) const bool CANONICAL_INPUT = true;
 #ifndef MODE
 #define MODE 0
 #endif
 #define LOG_MEAN (MODE == 0 || MODE == 3)   // key * exp(-mean of the log luma)
+#if PASS == 0 && MODE == 0
+// K: 256 threads fetch the block's 1024 terms, four each; the 64 owners then add their 16 in the serial order
+layout(local_size_x = 256) in;
+shared float term[1024];
+#else
 layout(local_size_x = 64) in;
+#endif
 layout(set = 0, binding = 0, std430) readonly buffer Params
 {
     ivec2 origin, size;     // rectangle of the colour texture; the grid maps onto it
@@ -56,6 +62,44 @@ float truncatedHalf(float v)
 #if PASS == 0
 layout(set = 0, binding = 1) uniform sampler2D colorTex;
 layout(set = 0, binding = 2, std430) writeonly buffer Sums { float v[]; } sums;
+#if MODE == 0
+void main()
+{
+    const uint t = gl_LocalInvocationID.x;
+    const ivec2 grid = p.sampleSize;
+    for (uint it = 0u; it < 4u; ++it)
+    {
+        const uint slot = t + 256u * it, owner = slot / 16u, q = slot % 16u;
+        const ivec2 at = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(owner & 7u, owner >> 3) * 4 + ivec2(q % 4u, q / 4u);
+        // a term that is skipped adds +0, which leaves the sum as it was (the sum starts at +0, so it is never -0)
+        float v = 0.0;
+        if (!(at.x >= grid.x || at.y >= grid.y))
+        {
+            const ivec2 sampleAt = ivec2(floor(fma(vec2(at) / vec2(grid - 1), vec2(p.size - 1), vec2(0.5))));
+            const vec3 tx = texelFetch(colorTex, p.origin + sampleAt, 0).rgb;
+            const vec3 c = CANONICAL_INPUT ? canonicalHalf(tx) : tx;
+            precise const float luma = p.scale * fma(c.b, 0.25, fma(c.r, 0.25, 0.5 * c.g));
+            if (luma > 0.0 && !isinf(luma))
+                v = (log2(luma + 1e-6) * uintBitsToFloat(0x3F317218u)) * p.invCount;
+        }
+        term[slot] = v;
+    }
+    memoryBarrierShared(); barrier();
+    if (t < 64u)
+    {
+        float sum = 0.0;
+        for (uint i = 0u; i < 16u; ++i) sum += term[t * 16u + i];
+        part[t] = sum;
+    }
+    memoryBarrierShared(); barrier();
+    if (t == 0u)
+    {
+        float total = 0.0;
+        for (uint i = 0u; i < 64u; ++i) total += part[i];
+        sums.v[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = total;
+    }
+}
+#else
 void main()
 {
     const uint t = gl_LocalInvocationID.x;
@@ -97,6 +141,7 @@ void main()
         sums.v[gl_WorkGroupID.y * p.blocksX + gl_WorkGroupID.x] = total;
     }
 }
+#endif
 #else
 layout(set = 0, binding = 1, std430) readonly buffer Sums { float v[]; } sums;
 layout(set = 0, binding = 2, std430) buffer State { float current, previous; } state;

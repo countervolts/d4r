@@ -61,11 +61,11 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
             {
                 const uint32_t xj = xv[j], gj = gv[j];
-                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
             }
 #else
-                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
             store_row16(hrow + 16 * kt, hv);
         }
@@ -110,11 +110,11 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
             {
                 const uint32_t xj = xv[j], gj = gv[j]; // (see above: no __builtin_bit_cast of a vector subscript)
-                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
             }
 #else
-                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
             store_row16(hrow + 16 * kt, hv);
         }
@@ -285,7 +285,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
                 const hv2 x1 = __builtin_bit_cast(hv2, acc_pair(acc[mi][nt], j)) +
                                __builtin_bit_cast(hv2, wm_op_acc_pair(xv, j));
 #endif
-                mine[j] = __builtin_bit_cast(uint32_t, x1 * (hv2){g2[2 * j], g2[2 * j + 1]});
+                mine[j] = __builtin_bit_cast(uint32_t, PWIN_MLP_INPUT(x1, ((hv2){g2[2 * j], g2[2 * j + 1]})));
                 const hv2 y = x1 + (hv2){b2[2 * j], b2[2 * j + 1]};
                 acc_set_pair(acc[mi][nt], j, y);
             }
@@ -300,7 +300,7 @@ __device__ void pos_core(const PwinParams& p, const u8v* __restrict__ img, const
 #else
                 const half_t x1 = (half_t)acc[mi][nt][i] + wm_op_acc_elem(xv, i);
 #endif
-                mv[i] = x1 * g2[i];
+                mv[i] = PWIN_MLP_INPUT(x1, g2[i]);
                 acc[mi][nt][i] = (float)(half_t)(x1 + b2[i]);
             }
             op_store(&hb[tok][16 * nt], operand_from_dt(mv));

@@ -12,6 +12,10 @@ for format in rgba16f rgba32f r11f_g11f_b10f rgb10_a2 rgba8; do
     glslangValidator -V --target-env vulkan1.0 -DOUTPUT_FORMAT="$format" \
         -o "$OUT/write_$format.spv" "$ROOT/kernels/support/vulkan_write.comp" >/dev/null
 done
+for store in RGBA8:rgba8 BGRA8:bgra8 RGB10:rgb10 R11G11B10:r11g11b10 E5B9G9R9:e5b9g9r9 RGBA32F:rgba32f; do
+    glslangValidator -V --target-env vulkan1.0 "-DOUTPUT_${store%%:*}=1" \
+        -o "$OUT/write_f32_${store#*:}.spv" "$ROOT/kernels/support/vulkan_write_f32.comp" >/dev/null
+done
 python3 - "$OUT" <<'PY'
 from pathlib import Path
 import struct, sys

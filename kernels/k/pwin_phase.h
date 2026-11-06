@@ -78,8 +78,8 @@ __device__ void phase_attn(const PwinParams& p, const u8v* __restrict__ img, con
             u8v hv;
 #pragma unroll
             for (int j = 0; j < 8; ++j)
-                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
             store_row16(hrow + 16 * kt, hv);
         }
         __builtin_amdgcn_wave_barrier();
@@ -176,7 +176,7 @@ __device__ void phase_wo(const PwinParams& p, const u8v* __restrict__ img, const
         for (int i = 0; i < 8; ++i)
         {
             const half_t x1 = (half_t)acc[i] + wm_op_acc_elem(xv, i);
-            mv[i] = x1 * g2[i];
+            mv[i] = PWIN_MLP_INPUT(x1, g2[i]);
             av[i] = (half_t)(x1 + b2[i]);
         }
         const size_t row = ((size_t)wi * 64 + tok) * C + 16 * nt;

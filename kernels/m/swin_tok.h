@@ -80,13 +80,13 @@ __device__ __forceinline__ void tok_acc_store(T16& acc, f8v c)
 __device__ __forceinline__ void tok_weight_k32(T16& acc, h16 a0, gop b0, h16 a1, gop b1)
 {
     f8v c = tok_acc_load(acc);
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
     c *= 0x1p-16f;
 #endif
     c = wm_mma11(__builtin_bit_cast(wm_u8v, a0), TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, b0)), c);
     c = wm_mma11(__builtin_bit_cast(wm_u8v, a1), TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, b1)), c);
     tok_acc_store(acc, c
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
         * 0x1p16f
 #endif
     );
@@ -96,13 +96,13 @@ __device__ __forceinline__ void tok_weight_k32(T16& acc, gop a0, h16 b0, gop a1,
     // Multiplication is commutative per product; swapping operand roles
     // transposes the result, so retain the original roles here.
     f8v c = tok_acc_load(acc);
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
     c *= 0x1p-16f;
 #endif
     c = wm_mma11(TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, a0)), __builtin_bit_cast(wm_u8v, b0), c);
     c = wm_mma11(TOK_SHIM_OPERAND(__builtin_bit_cast(wm_op, a1)), __builtin_bit_cast(wm_u8v, b1), c);
     tok_acc_store(acc, c
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
         * 0x1p16f
 #endif
     );
@@ -310,7 +310,7 @@ __device__ __forceinline__ void expand_tok_weights(const uint8_t* w, wslot* w16,
     for (int j = 0; j < 16; ++j)
     {
         const uint32_t code = (v[j / 4] >> (8 * (j % 4))) & 255u;
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
         const uint32_t magnitude = (code & 127u) | (((code & 127u) + 1u) & 128u);
         expanded[j] = __builtin_bit_cast(half_t, (uint16_t)((magnitude << 7) | ((code & 128u) << 8)));
 #else
@@ -369,7 +369,7 @@ __device__ __forceinline__ hv2 tok_pk16(float a, float b)
 __device__ __forceinline__ h4 tok_decode4(uint32_t bytes)
 {
     h4 r = decode4(bytes);
-#if defined(SWIN_GFX11_SCALED)
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
     typedef uint16_t u4s __attribute__((ext_vector_type(4)));
     u4s bits = __builtin_bit_cast(u4s, r);
 #pragma unroll
@@ -381,7 +381,7 @@ __device__ __forceinline__ h4 tok_decode4(uint32_t bytes)
 }
 __device__ __forceinline__ gop tok_scaled_operand(gop r)
 {
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(SWIN_UNSCALED)
     // The operand quantizer already canonicalizes NaNs as FP8 encode/widen
     // does. Every finite value scales exactly, including half subnormals.
     return r * (half_t)0x1p-8f;
@@ -393,6 +393,9 @@ __device__ __forceinline__ gop tok_scaled_operand(gop r)
 #ifdef SWIN_GFX11_SCALED
 __device__ __forceinline__ h4 tok_scaled4(uint32_t bytes)
 {
+#ifdef SWIN_UNSCALED
+    return decode4(bytes);
+#endif
     uint32_t m = bytes & 0x7f7f7f7fu, sign = bytes & 0x80808080u;
     m |= (m + 0x01010101u) & 0x80808080u;
     const uint32_t lo = (__builtin_amdgcn_perm(0u,m,0x0c010c00u)<<7) |
@@ -403,9 +406,13 @@ __device__ __forceinline__ h4 tok_scaled4(uint32_t bytes)
 }
 __device__ __forceinline__ hv2 tok_quant_pair(hv2 v)
 {
+#ifdef SWIN_NO_Q8
+    return v; // the activations stay f16, as the shared layers' fast numerics
+#else
     // Reuse the existing NaN branch of the exact quantizer; no separate
     // per-operand classification/select or FP8 pack/unpack is necessary.
     return q8x2_exact<0x7f80>(v);
+#endif
 }
 #else
 #define tok_quant_pair q8x2
@@ -656,7 +663,7 @@ __device__ __forceinline__ void swin_tok_core(const h8* const ch, const tok_weig
                 tok_weight_k32(qt[nt], wt(K::qv(hd, 0), 2, kc, 0, nt), hop[kc][0], wt(K::qv(hd, 0), 2, kc, 1, nt), hop[kc][1]);
                 tok_weight_k32(vt[nt], tok_arow(hop[kc][0]), wt(K::qv(hd, 1), 2, kc, 0, nt), tok_arow(hop[kc][1]), wt(K::qv(hd, 1), 2, kc, 1, nt));
             }
-#ifdef SWIN_GFX11_SCALED
+#if defined(SWIN_GFX11_SCALED) && !defined(D4R_L_WIDENED)
         const gop qraw0 = tok_codes(qt[0]), qraw1 = tok_codes(qt[1]);
         const gop q0 = tok_qk_operand(qraw0, qraw1, 0), q1 = tok_qk_operand(qraw0, qraw1, 1);
 #else

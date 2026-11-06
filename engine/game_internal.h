@@ -81,6 +81,7 @@ struct CanonicalInputs {
     Plane color, motion, depth;
     VkBuffer depthStaging = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    bool floatPlanes = false; // the copies keep f32, as NVIDIA's kernels read it, instead of binary16 (K's default stages)
     CanonicalInputs(VkPhysicalDevice p, VkDevice d, uint32_t w, uint32_t h, uint32_t mw, uint32_t mh)
         : physical(p), device(d), width(w), height(h), motionWidth(mw), motionHeight(mh) {}
     ~CanonicalInputs() {
@@ -101,8 +102,8 @@ struct CanonicalInputs {
     void record(VkCommandBuffer cb, const GameImage& col, const GameImage& mv, const GameImage& dep,
                 uint32_t w, uint32_t h, uint32_t mw, uint32_t mh, bool directColor, bool directMotion, bool directDepth) {
         if (directColor && directMotion && directDepth) return;
-        if (!directColor) ensure(cb, color, VK_FORMAT_R16G16B16A16_SFLOAT, width, height);
-        if (!directMotion) ensure(cb, motion, VK_FORMAT_R16G16_SFLOAT, motionWidth, motionHeight);
+        if (!directColor) ensure(cb, color, floatPlanes ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT, width, height);
+        if (!directMotion) ensure(cb, motion, floatPlanes ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R16G16_SFLOAT, motionWidth, motionHeight);
         if (!directDepth) {
             ensure(cb, depth, VK_FORMAT_R32_SFLOAT, width, height);
             if ((dep.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !depthStaging) {
@@ -126,6 +127,16 @@ struct CanonicalInputs {
         if (!directDepth) copyInput(cb, dep, depth.image, w, h, depthStaging);
     }
 };
+// The source already holds the destination's bits (K's copy path), so nothing converts or narrows them.
+inline void copyOutputRaw(VkCommandBuffer cb, VkImage source, const GameImage& destination, uint32_t width, uint32_t height) {
+    VkImageCopy region{};
+    region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffset = {int32_t(destination.x), int32_t(destination.y), 0};
+    region.extent = {width, height, 1};
+    vkCmdCopyImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, destination.image, destination.layout, 1, &region);
+    barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
 inline void copyOutput(VkCommandBuffer cb, VkImage source, const GameImage& destination, uint32_t width, uint32_t height) {
     VkImageBlit region{};
     region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

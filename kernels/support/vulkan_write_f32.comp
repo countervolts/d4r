@@ -1,0 +1,16 @@
+#version 450
+// The final store for an output the CUDA backend keeps in f32, for formats binary16 cannot hold. The same conversion
+// as K's stores (engine/output_store.glsl), into an image holding the destination's bits, which the caller copies raw:
+// a blit would narrow the values to half whatever its source format.
+#extension GL_GOOGLE_include_directive : require
+#define OUTPUT_STORE_F32
+#include "../../engine/output_store.glsl"
+layout(local_size_x=8, local_size_y=8) in;
+layout(FINAL_OUTPUT_FORMAT, set=0, binding=0) uniform writeonly FINAL_OUTPUT_IMAGE destinationImage;
+layout(std430, set=0, binding=1) readonly buffer Pixels { vec4 pixels[]; };
+layout(push_constant) uniform Size { uint width; uint height; } size;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= size.width || p.y >= size.height) return;
+    imageStore(destinationImage, ivec2(p), finalOutputValue(pixels[p.y * size.width + p.x]));
+}

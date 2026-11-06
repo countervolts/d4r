@@ -23,6 +23,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.CmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(deviceProc(device, "vkCmdBindDescriptorSets"))) != nullptr;
     ok &= (vkTable.CmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(deviceProc(device, "vkCmdBindPipeline"))) != nullptr;
     ok &= (vkTable.CmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(deviceProc(device, "vkCmdBlitImage"))) != nullptr;
+    ok &= (vkTable.CmdCopyImage = reinterpret_cast<PFN_vkCmdCopyImage>(deviceProc(device, "vkCmdCopyImage"))) != nullptr;
     ok &= (vkTable.CmdClearColorImage = reinterpret_cast<PFN_vkCmdClearColorImage>(deviceProc(device, "vkCmdClearColorImage"))) != nullptr;
     ok &= (vkTable.CmdCopyBuffer = reinterpret_cast<PFN_vkCmdCopyBuffer>(deviceProc(device, "vkCmdCopyBuffer"))) != nullptr;
     ok &= (vkTable.CmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(deviceProc(device, "vkCmdCopyBufferToImage"))) != nullptr;

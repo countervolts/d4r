@@ -13,6 +13,12 @@ namespace {
 
 struct LayerParamsK { int32_t W, H; uint64_t in, skip, out24, out32, pad40, pad48; int32_t sx, sy; uint64_t w; uint8_t rest[104]; };
 static_assert(sizeof(LayerParamsK) == 176, "K params");
+// preset M's kernels' parameter block (kernels/m/swin_common.h); engine/hip_net.cpp's LayerParamsM
+struct LayerParamsM { uint64_t w; int32_t sx, sy, tw, th; uint64_t in, skip, out, merged; int32_t r69, r70, r71, r72; uint64_t inFlags, outFlags; };
+static_assert(sizeof(LayerParamsM) == 88, "M params");
+// preset L's native stages (kernels/tex/enc0l_net.hip, dec0l_net.hip): a, b, c are features, out, merged or in, skip, out
+struct StageParamsL { uint64_t w; int32_t sx, sy, tw, th; uint64_t a, b, c; };
+static_assert(sizeof(StageParamsL) == 48, "L stage params");
 struct KLayer { const char* name; uint32_t divisor, cin, c, out24ch; int role; };
 constexpr KLayer KPlan[11] = {
     {"enc0", 1, 16, 32, 64, -1}, {"enc1", 2, 64, 64, 64, -1}, {"enc2", 4, 64, 64, 96, -1},
@@ -60,6 +66,40 @@ void trimmedGroups(const int32_t (&size)[2][11], const int32_t (&shift)[2][11], 
             merged = reads(unsigned(i), false);
         }
     }
+}
+// The same rule for presets M and L's ten layers, per axis: nothing reads the block rows and columns past the render size. A
+// block's output is its own tokens and, in the encoders, 16 half-size tokens; size and shift per layer, stageShift is
+// L's expansion stage's (the stage only needs the blocks with a pixel of the render size), below zero for preset M.
+constexpr unsigned MLayerCount = 10;
+void trimmedGroupsM(const int32_t (&size)[MLayerCount], const int32_t (&shift)[MLayerCount], int render, int stageShift, uint32_t (&groups)[MLayerCount]) {
+    auto mirror = [](int v, int n) { v = std::abs(v); return std::min(v, 2 * n - 2 - v); };
+    auto tdiv2 = [](int v) { return v < 0 ? -(-v / 2) : v / 2; };
+    auto reads = [&](unsigned i, bool half) {
+        int last = 0;
+        for (int w = 0; w < int(groups[i]); ++w)
+            for (int t = 0; t < (half ? 4 : 8); ++t) {
+                const int origin = 8 * w - shift[i];
+                last = std::max(last, half ? mirror(tdiv2(origin) + t, size[i] / 2) : mirror(origin + t, size[i]));
+            }
+        return last + 1;
+    };
+    auto windows = [&](unsigned i, int n) { return std::clamp(uint32_t(n + shift[i] + 7) / 8, 1u, uint32_t(size[i] + shift[i] + 7) / 8); };
+    // the last decoder's output: tokens are 2x2 pixels (M), or L's expansion stage reads half-size tokens of them
+    int need = (render + 1) / 2;
+    if (stageShift >= 0) {
+        need = 0;
+        for (int w = 0; w < (render + stageShift + 7) / 8; ++w)
+            for (int t = 0; t < 4; ++t) need = std::max(need, mirror(tdiv2(8 * w - stageShift) + t, size[9]) + 1);
+    }
+    int skip[2] = {};
+    for (unsigned i = 9; i >= 8; --i) {
+        groups[i] = windows(i, need);
+        skip[9 - i] = reads(i, false);
+        need = reads(i, true);
+    }
+    for (unsigned i = 7; i >= 2; --i) { groups[i] = windows(i, need); need = reads(i, false); }
+    groups[1] = windows(1, std::max(skip[1], 2 * need));
+    groups[0] = windows(0, std::max(skip[0], 2 * reads(1, false)));
 }
 uint32_t global32(const Module& m, const std::string& name, uint32_t fallback) {
     auto it = m.globals.find(name);
@@ -112,7 +152,7 @@ struct KNetwork::Impl {
     // contents written once, on the first record: (arena offset, bytes)
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> contents;
     bool uploaded = false;
-    uint32_t frame = 0, windowFrame = 0;
+    uint32_t frame = 0, windowFrame = 0, phases = 8;
     bool resetWindowCycle = false;
 
     // optional per-dispatch timestamps: slot s holds queries [s*stampCount, (s+1)*stampCount)
@@ -194,6 +234,53 @@ struct KNetwork::Impl {
         f = reinterpret_cast<F>(proc(device, name));
         return f != nullptr;
     }
+    bool loadEntries(PFN_vkGetDeviceProcAddr proc) {
+        bool ok = vk.load(device, proc);
+    ok &= load(proc, createBuffer, "vkCreateBuffer") && load(proc, destroyBuffer, "vkDestroyBuffer") &&
+          load(proc, requirements, "vkGetBufferMemoryRequirements") && load(proc, allocate, "vkAllocateMemory") &&
+          load(proc, freeMemory, "vkFreeMemory") && load(proc, bind, "vkBindBufferMemory") &&
+          load(proc, address, "vkGetBufferDeviceAddress") && load(proc, createLayout, "vkCreatePipelineLayout") &&
+          load(proc, destroyLayout, "vkDestroyPipelineLayout") && load(proc, cmdBind, "vkCmdBindPipeline") &&
+          load(proc, cmdPush, "vkCmdPushConstants") && load(proc, cmdDispatch, "vkCmdDispatch") &&
+          load(proc, cmdBarrier, "vkCmdPipelineBarrier") && load(proc, cmdUpdate, "vkCmdUpdateBuffer") &&
+          load(proc, cmdFill, "vkCmdFillBuffer") && load(proc, createQueries, "vkCreateQueryPool") &&
+          load(proc, destroyQueries, "vkDestroyQueryPool") && load(proc, queryResults, "vkGetQueryPoolResults") &&
+          load(proc, cmdResetQueries, "vkCmdResetQueryPool") && load(proc, cmdStamp, "vkCmdWriteTimestamp") &&
+          load(proc, createEvent, "vkCreateEvent") && load(proc, destroyEvent, "vkDestroyEvent") &&
+          load(proc, resetEvent, "vkResetEvent") && load(proc, eventStatus, "vkGetEventStatus") &&
+          load(proc, cmdSetEvent, "vkCmdSetEvent") && load(proc, cmdCopy, "vkCmdCopyBuffer") &&
+          load(proc, mapMemory, "vkMapMemory") && load(proc, waitIdle, "vkDeviceWaitIdle");
+        return ok;
+    }
+    // The arena and the caller's two buffers, in one device-local allocation, and the pipeline layout
+    bool allocateArena(const VkPhysicalDeviceMemoryProperties& memoryProperties, uint64_t tokensSize, uint64_t headSize,
+                       uint64_t tokensAt, uint64_t headAt, std::string& error) {
+        arena = buffer(arenaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        tokens = buffer(tokensSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        head = buffer(headSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        if (!arena || !tokens || !head) { error = "buffers"; return false; }
+        VkMemoryRequirements ra, rt, rh;
+        requirements(device, arena, &ra); requirements(device, tokens, &rt); requirements(device, head, &rh);
+        const uint32_t bits = ra.memoryTypeBits & rt.memoryTypeBits & rh.memoryTypeBits;
+        if (tokensAt % rt.alignment || headAt % rh.alignment) { error = "alias alignment"; return false; }
+        uint32_t type = ~0u;
+        for (uint32_t t = 0; t < memoryProperties.memoryTypeCount && type == ~0u; ++t)
+            if ((bits & (1u << t)) && (memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = t;
+        if (type == ~0u) { error = "no device-local memory type for the network"; return false; }
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO}; flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+        mai.allocationSize = std::max(ra.size, arenaSize); mai.memoryTypeIndex = type;
+        if (allocate(device, &mai, nullptr, &memory) != VK_SUCCESS) { error = "network memory"; return false; }
+        if (bind(device, arena, memory, 0) != VK_SUCCESS || bind(device, tokens, memory, tokensAt) != VK_SUCCESS ||
+            bind(device, head, memory, headAt) != VK_SUCCESS) { error = "bind"; return false; }
+        VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; ai.buffer = arena;
+        base = address(device, &ai);
+        if (!base) { error = "no device address"; return false; }
+        VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &range;
+        if (createLayout(device, &lci, nullptr, &layout) != VK_SUCCESS) { error = "pipeline layout"; return false; }
+        return true;
+    }
     VkBuffer buffer(uint64_t size, VkBufferUsageFlags usage) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size; info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -231,21 +318,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
     auto& n = *impl;
     n.device = device;
     n.memoryProperties = memoryProperties;
-    bool ok = n.vk.load(device, proc);
-    ok &= n.load(proc, n.createBuffer, "vkCreateBuffer") && n.load(proc, n.destroyBuffer, "vkDestroyBuffer") &&
-          n.load(proc, n.requirements, "vkGetBufferMemoryRequirements") && n.load(proc, n.allocate, "vkAllocateMemory") &&
-          n.load(proc, n.freeMemory, "vkFreeMemory") && n.load(proc, n.bind, "vkBindBufferMemory") &&
-          n.load(proc, n.address, "vkGetBufferDeviceAddress") && n.load(proc, n.createLayout, "vkCreatePipelineLayout") &&
-          n.load(proc, n.destroyLayout, "vkDestroyPipelineLayout") && n.load(proc, n.cmdBind, "vkCmdBindPipeline") &&
-          n.load(proc, n.cmdPush, "vkCmdPushConstants") && n.load(proc, n.cmdDispatch, "vkCmdDispatch") &&
-          n.load(proc, n.cmdBarrier, "vkCmdPipelineBarrier") && n.load(proc, n.cmdUpdate, "vkCmdUpdateBuffer") &&
-          n.load(proc, n.cmdFill, "vkCmdFillBuffer") && n.load(proc, n.createQueries, "vkCreateQueryPool") &&
-          n.load(proc, n.destroyQueries, "vkDestroyQueryPool") && n.load(proc, n.queryResults, "vkGetQueryPoolResults") &&
-          n.load(proc, n.cmdResetQueries, "vkCmdResetQueryPool") && n.load(proc, n.cmdStamp, "vkCmdWriteTimestamp") &&
-          n.load(proc, n.createEvent, "vkCreateEvent") && n.load(proc, n.destroyEvent, "vkDestroyEvent") &&
-          n.load(proc, n.resetEvent, "vkResetEvent") && n.load(proc, n.eventStatus, "vkGetEventStatus") &&
-          n.load(proc, n.cmdSetEvent, "vkCmdSetEvent") && n.load(proc, n.cmdCopy, "vkCmdCopyBuffer") &&
-          n.load(proc, n.mapMemory, "vkMapMemory") && n.load(proc, n.waitIdle, "vkDeviceWaitIdle");
+    bool ok = n.loadEntries(proc);
     if (!ok) { error = "missing Vulkan entry points"; return false; }
     const auto& file = files.hipnet;
     uint32_t count = 0;
@@ -295,30 +368,7 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
     const uint64_t argsAt = carve(256 * (11 + 8 * 32));
     n.arenaSize = used + kGuard;
 
-    n.arena = n.buffer(n.arenaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    n.tokens = n.buffer(tokensSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    n.head = n.buffer(headSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    if (!n.arena || !n.tokens || !n.head) { error = "buffers"; return false; }
-    VkMemoryRequirements ra, rt, rh;
-    n.requirements(device, n.arena, &ra); n.requirements(device, n.tokens, &rt); n.requirements(device, n.head, &rh);
-    const uint32_t bits = ra.memoryTypeBits & rt.memoryTypeBits & rh.memoryTypeBits;
-    if (tokensAt % rt.alignment || headAt % rh.alignment) { error = "alias alignment"; return false; }
-    uint32_t type = ~0u;
-    for (uint32_t t = 0; t < memoryProperties.memoryTypeCount && type == ~0u; ++t)
-        if ((bits & (1u << t)) && (memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = t;
-    if (type == ~0u) { error = "no device-local memory type for the network"; return false; }
-    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO}; flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-    mai.allocationSize = std::max(ra.size, n.arenaSize); mai.memoryTypeIndex = type;
-    if (n.allocate(device, &mai, nullptr, &n.memory) != VK_SUCCESS) { error = "network memory"; return false; }
-    if (n.bind(device, n.arena, n.memory, 0) != VK_SUCCESS || n.bind(device, n.tokens, n.memory, tokensAt) != VK_SUCCESS ||
-        n.bind(device, n.head, n.memory, headAt) != VK_SUCCESS) { error = "bind"; return false; }
-    VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; ai.buffer = n.arena;
-    n.base = n.address(device, &ai);
-    if (!n.base) { error = "no device address"; return false; }
-    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
-    VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &range;
-    if (n.createLayout(device, &lci, nullptr, &n.layout) != VK_SUCCESS) { error = "pipeline layout"; return false; }
+    if (!n.allocateArena(memoryProperties, tokensSize, headSize, tokensAt, headAt, error)) return false;
 
     // parameter blocks (hip_net.cpp's wiring)
     std::vector<LayerParamsK> baseParams(11);
@@ -422,6 +472,205 @@ bool KNetwork::create(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhy
     return true;
 }
 
+// Preset M: hip_net.cpp's plan. Ten layers (one code object shared by the six tube blocks, with one weight image per
+// weights pointer in its globals) in two window-alignment phases: NGX alternates the horizontal alignment every evaluation.
+bool KNetwork::createM(VkDevice device, PFN_vkGetDeviceProcAddr proc, const VkPhysicalDeviceMemoryProperties& memoryProperties,
+                       const NetFiles& files, uint32_t width, uint32_t height, uint64_t tokenBytes, uint64_t headBytes,
+                       std::string& error) {
+    auto& n = *impl;
+    n.device = device;
+    n.memoryProperties = memoryProperties;
+    if (!n.loadEntries(proc)) { error = "missing Vulkan entry points"; return false; }
+    constexpr uint32_t Layers = MLayerCount;
+    const auto& file = files.hipnet;
+    uint32_t count = 0;
+    if (file.size() < 16 + 64 * Layers || std::memcmp(file.data(), "D4RMHIP1", 8)) { error = "not a preset M hipnet.bin"; return false; }
+    std::memcpy(&count, file.data() + 8, 4);
+    if (count != Layers) { error = "hipnet.bin does not have ten layers"; return false; }
+    if (width < 64 || height < 64 || width > 8192 || height > 8192) { error = "render dimensions must be 64..8192"; return false; }
+    const uint32_t tw = (width + 31) / 32 * 16, th = (height + 31) / 32 * 16;
+    std::vector<Module> modules;
+    std::vector<std::string> kernelNames;
+    uint32_t layerKernel[Layers]; int32_t shiftX[Layers], shiftY[Layers]; uint32_t divisor[Layers];
+    uint64_t weightAt[Layers], weightBytes[Layers];
+    std::string label[Layers];
+    for (uint32_t i = 0; i < Layers; ++i) {
+        const uint8_t* e = file.data() + 16 + 64 * i;
+        char name[33]{}; std::memcpy(name, e, 32);
+        std::memcpy(&shiftX[i], e + 32, 4); std::memcpy(&shiftY[i], e + 36, 4); std::memcpy(&divisor[i], e + 40, 4);
+        std::memcpy(&weightAt[i], e + 48, 8); std::memcpy(&weightBytes[i], e + 56, 8);
+        if (!divisor[i] || weightAt[i] > file.size() || weightBytes[i] > file.size() - weightAt[i]) { error = "invalid hipnet.bin layer"; return false; }
+        label[i] = std::string(name).substr(7) + "." + std::to_string(i);  // past "rrlite_"
+        uint32_t k = 0;
+        while (k < kernelNames.size() && kernelNames[k] != name) ++k;
+        if (k == kernelNames.size()) {
+            auto it = files.code.find(name);
+            if (it == files.code.end()) { error = std::string(name) + ".hsaco missing"; return false; }
+            modules.emplace_back();
+            if (!modules.back().parse(it->second)) { error = std::string(name) + ": " + modules.back().error; return false; }
+            if (modules.back().mach != (files.mach ? files.mach : modules[0].mach)) {
+                error = std::string(name) + ".hsaco was built for another GPU (rebuild the engine models)"; return false;
+            }
+            kernelNames.emplace_back(name);
+        }
+        layerKernel[i] = k;
+    }
+    for (uint32_t k = 0; k < kernelNames.size(); ++k)
+        if (kernelNames[k].find("tube") != std::string::npos && global32(modules[k], "d4r_prep_key_slots", 0) < 6) {
+            error = kernelNames[k] + ": fewer than six weight image slots"; return false;
+        }
+    uint64_t used = 0;
+    auto carve = [&](uint64_t bytes) { used = (used + kAlign - 1) / kAlign * kAlign; const uint64_t at = used; used += bytes; return at; };
+    n.tokenBytes = tokenBytes; n.headBytes = headBytes;
+    const uint64_t tokensAt = carve(tokenBytes + kTail), headAt = carve(headBytes + kTail);
+    uint64_t wAt[Layers];
+    for (uint32_t i = 0; i < Layers; ++i) wAt[i] = carve(weightBytes[i] + kWeightTail);
+    // preset L: the stages' kernels, weights and pixel-resolution skip, and the network's own tokens and head
+    const bool stages = !files.enc0lWeights.empty();
+    uint32_t stageKernel[2] = {};
+    uint64_t stageW[2] = {}, netTokens = tokensAt, netHead = headAt, skipL = 0;
+    const uint32_t gw = (width + 31) / 32 * 32, gh = (height + 31) / 32 * 32;
+    if (stages) {
+        const std::vector<uint8_t>* const blobs[2] = {&files.enc0lWeights, &files.dec0lWeights};
+        const char* const names[2] = {"rrlite_enc0l_net", "rrlite_dec0l_net"};
+        for (int i = 0; i < 2; ++i) {
+            auto it = files.code.find(names[i]);
+            if (it == files.code.end() || blobs[i]->empty()) { error = std::string(names[i]) + " missing"; return false; }
+            stageKernel[i] = uint32_t(modules.size());
+            modules.emplace_back();
+            if (!modules.back().parse(it->second)) { error = std::string(names[i]) + ": " + modules.back().error; return false; }
+            if (modules.back().mach != (files.mach ? files.mach : modules[0].mach)) {
+                error = std::string(names[i]) + ".hsaco was built for another GPU (rebuild the engine models)"; return false;
+            }
+            kernelNames.emplace_back(names[i]);
+            stageW[i] = carve(blobs[i]->size() + kWeightTail);
+        }
+        const uint64_t planes = uint64_t(tw) * th * 64;
+        netTokens = carve(planes + kTail); netHead = carve(planes + kTail); skipL = carve(uint64_t(gw) * gh * 32 + kTail);
+    }
+    const uint64_t skip1 = carve(uint64_t(tw) * th * 64 + kTail), merged1 = carve(uint64_t(tw / 2) * (th / 2) * 96 + kTail);
+    const uint64_t skip2 = carve(uint64_t(tw / 2) * (th / 2) * 96 + kTail), merged2 = carve(uint64_t(tw / 4) * (th / 4) * 128 + kTail);
+    const uint64_t tubeA = carve(uint64_t(tw / 4) * (th / 4) * 128 + kTail), tubeB = carve(uint64_t(tw / 4) * (th / 4) * 128 + kTail);
+    const uint64_t dec2 = carve(uint64_t(tw / 2) * (th / 2) * 96 + kTail);
+    std::vector<uint64_t> gAt(modules.size());
+    for (size_t k = 0; k < modules.size(); ++k) gAt[k] = carve(modules[k].dataHi - modules[k].dataLo + kTail);
+    const uint64_t argsAt = carve(256 * (Layers * 3 + 8));
+    n.arenaSize = used + kGuard;
+    if (!n.allocateArena(memoryProperties, tokenBytes, headBytes, tokensAt, headAt, error)) return false;
+    // tokens -> enc1 -> enc2 -> six tube blocks (ping-pong) -> dec2 -> dec1
+    const uint64_t in[Layers] = {netTokens, merged1, merged2, tubeA, tubeB, tubeA, tubeB, tubeA, tubeB, dec2};
+    const uint64_t skip[Layers] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, skip2, skip1};
+    const uint64_t out[Layers] = {skip1, skip2, tubeA, tubeB, tubeA, tubeB, tubeA, tubeB, dec2, netHead};
+    const uint64_t merged[Layers] = {merged1, merged2, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    LayerParamsM baseParams[Layers];
+    const auto at = [&](uint64_t offset) { return offset == ~0ull ? 0ull : n.base + offset; };
+    for (uint32_t i = 0; i < Layers; ++i) {
+        auto& q = baseParams[i]; std::memset(&q, 0, sizeof(q));
+        q.w = n.base + wAt[i]; q.sx = shiftX[i]; q.sy = shiftY[i];
+        q.tw = int32_t(tw / divisor[i]); q.th = int32_t(th / divisor[i]);
+        q.in = at(in[i]); q.skip = at(skip[i]); q.out = at(out[i]); q.merged = at(merged[i]);
+    }
+    std::map<std::string, VkPipeline> byKey;
+    auto pipe = [&](uint32_t k, const std::string& kernel, Launch launch) -> VkPipeline {
+        const std::string key = kernel + "/" + std::to_string(launch.bx) + "/" + std::to_string(launch.by) + "/" + std::to_string(launch.bz);
+        auto it = byKey.find(key);
+        if (it != byKey.end()) return it->second;
+        auto found = modules[k].kernels.find(kernel);
+        if (found == modules[k].kernels.end()) { error = kernel + " missing"; return VK_NULL_HANDLE; }
+        const uint64_t id = nextPipelineId.fetch_add(1, std::memory_order_relaxed);
+        if (id > UINT32_MAX) { error = "vkhip pipeline key space exhausted"; return VK_NULL_HANDLE; }
+        VkPipeline p = createPipeline(n.vk, n.layout, modules[k], found->second, launch, n.base + gAt[k], uint32_t(id), error);
+        if (p) { n.pipelines.push_back(p); byKey[key] = p; }
+        return p;
+    };
+    std::vector<uint8_t> args;
+    auto argBlock = [&](const auto& q) {
+        const uint64_t offset = argsAt + args.size();
+        args.resize(args.size() + 256);
+        std::memcpy(args.data() + args.size() - 256, &q, sizeof(q));
+        return n.base + offset;
+    };
+    // the input stage shifts by (2, 2) / (0, 2) and the expansion by (0, 0) / (2, 0), alternating every evaluation
+    const auto stageParams = [&](int stage, uint32_t phase) {
+        StageParamsL q{};
+        q.w = n.base + stageW[stage]; q.tw = int32_t(gw); q.th = int32_t(gh);
+        q.sx = stage == 0 ? 2 ^ int32_t(phase * 2) : int32_t(phase * 2); q.sy = stage == 0 ? 2 : 0;
+        if (stage == 0) { q.a = n.base + tokensAt; q.b = n.base + skipL; q.c = n.base + netTokens; }
+        else { q.a = n.base + netHead; q.b = n.base + skipL; q.c = n.base + headAt; }
+        return q;
+    };
+    if (stages)
+        for (int stage = 0; stage < 2; ++stage) {
+            const uint32_t k = stageKernel[stage];
+            const std::string prep = stage == 0 ? "rrlite_enc0l_net_prep" : "rrlite_dec0_4x4_prep";
+            const uint32_t blocks = global32(modules[k], "d4r_prep_blocks", 0);
+            if (!blocks) { error = kernelNames[k] + ": prep kernel without d4r_prep_blocks"; return false; }
+            VkPipeline p = pipe(k, prep, {128, 1, 1});
+            if (!p) return false;
+            n.preps.push_back({p, blocks, 1, argBlock(stageParams(stage, 0)), prep});
+        }
+    // every layer's weight image, once: a shared code object gets one preparation per weights pointer
+    for (uint32_t i = 0; i < Layers; ++i) {
+        const uint32_t k = layerKernel[i];
+        const std::string prep = kernelNames[k] + "_prep";
+        if (!modules[k].kernels.count(prep)) continue;
+        const uint32_t blocks = global32(modules[k], "d4r_prep_blocks", 0);
+        if (!blocks) { error = kernelNames[k] + ": prep kernel without d4r_prep_blocks"; return false; }
+        VkPipeline p = pipe(k, prep, {128, 1, 1});
+        if (!p) return false;
+        n.preps.push_back({p, blocks, 1, argBlock(baseParams[i]), prep});
+    }
+    n.phases = 2;
+    const auto stageNode = [&](int stage, uint32_t phase) -> bool {
+        const uint32_t k = stageKernel[stage];
+        VkPipeline p = pipe(k, kernelNames[k], {32, 1, global32(modules[k], "d4r_block_z", 4)});
+        if (!p) return false;
+        const StageParamsL q = stageParams(stage, phase);
+        // L's expansion: the blocks dec0_l_head.comp reads
+        const uint32_t gx = stage == 1 ? std::min(uint32_t(q.tw + q.sx + 7) / 8, (width + uint32_t(q.sx) + 7) / 8) : uint32_t(q.tw + q.sx + 7) / 8;
+        const uint32_t gy = stage == 1 ? std::min(uint32_t(q.th + q.sy + 7) / 8, (height + uint32_t(q.sy) + 7) / 8) : uint32_t(q.th + q.sy + 7) / 8;
+        n.nodes[phase].push_back({p, gx, gy, argBlock(q), stage == 0 ? "enc0l" : "dec0l"});
+        return true;
+    };
+    const char* trimEnv = std::getenv("D4R_ENGINE_M_TRIM");
+    const bool trim = !trimEnv || std::strcmp(trimEnv, "0") != 0;
+    for (uint32_t phase = 0; phase < 2; ++phase) {
+        if (stages && !stageNode(0, phase)) return false;
+        int32_t size[2][Layers], shift[2][Layers];
+        for (uint32_t i = 0; i < Layers; ++i) {
+            size[0][i] = baseParams[i].tw; size[1][i] = baseParams[i].th;
+            shift[0][i] = shiftX[i] ^ int32_t(phase * 2); shift[1][i] = shiftY[i];
+        }
+        uint32_t groups[2][Layers];
+        trimmedGroupsM(size[0], shift[0], int(width), stages ? int(phase * 2) : -1, groups[0]);
+        trimmedGroupsM(size[1], shift[1], int(height), stages ? 0 : -1, groups[1]);
+        for (uint32_t i = 0; i < Layers; ++i) {
+            const uint32_t k = layerKernel[i];
+            LayerParamsM params = baseParams[i];
+            params.sx = shiftX[i] ^ int32_t(phase * 2);
+            VkPipeline p = pipe(k, kernelNames[k], {32, 1, global32(modules[k], "d4r_block_z", 4)});
+            if (!p) return false;
+            const uint32_t gx = trim ? groups[0][i] : uint32_t(params.tw + params.sx + 7) / 8, gy = trim ? groups[1][i] : uint32_t(params.th + params.sy + 7) / 8;
+            n.nodes[phase].push_back({p, gx, gy, argBlock(params), label[i]});
+        }
+        if (stages && !stageNode(1, phase)) return false;
+    }
+    if (args.size() > 256 * (Layers * 3 + 8)) { error = "kernarg space"; return false; }
+    for (uint32_t i = 0; i < Layers; ++i)
+        n.contents.push_back({wAt[i], std::vector<uint8_t>(file.begin() + weightAt[i], file.begin() + weightAt[i] + weightBytes[i])});
+    if (stages) {
+        n.contents.push_back({stageW[0], files.enc0lWeights});
+        n.contents.push_back({stageW[1], files.dec0lWeights});
+    }
+    for (size_t k = 0; k < modules.size(); ++k) {
+        auto data = modules[k].dataInit;
+        while (!data.empty() && data.back() == 0) data.pop_back();
+        if (!data.empty()) n.contents.push_back({gAt[k], std::move(data)});
+    }
+    n.contents.push_back({argsAt, std::move(args)});
+    return true;
+}
+
 void KNetwork::record(VkCommandBuffer cb, bool reset) {
     auto& n = *impl;
     if (!n.uploaded) {
@@ -458,7 +707,7 @@ void KNetwork::record(VkCommandBuffer cb, bool reset) {
                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     }
     const uint32_t dumpFrame = n.frame;
-    const auto& list = n.nodes[n.windowFrame % 8];
+    const auto& list = n.nodes[n.windowFrame % n.phases];
     n.stampActive = -1;
     if (n.stampPool) {
         n.collectStamps(list);

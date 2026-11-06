@@ -170,6 +170,7 @@ void GameUpscaler::Impl::inputs(VkCommandBuffer cb, const GameFrame& frame) {
         g.started = true;
     }
     const uint32_t mw = frame.settings.displayMotion ? g.shape.outputWidth : w, mh = frame.settings.displayMotion ? g.shape.outputHeight : h;
+    g.fallback.floatPlanes = !g.model.hasAccuracyStages();
     g.fallback.record(cb, frame.color, frame.motion, frame.depth, w, h, mw, mh, directColor, directMotion, directDepth);
     ExposureControl exposure;
     exposure.size[0] = int32_t(w); exposure.size[1] = int32_t(h);
@@ -187,13 +188,13 @@ void GameUpscaler::Impl::inputs(VkCommandBuffer cb, const GameFrame& frame) {
         gameExposure ? frame.exposure.view : VK_NULL_HANDLE, frame.exposure.layout};
     g.engine.setFrame(images, parameters.input, parameters.output, &windows,
                       (frame.settings.autoExposure || gameExposure) ? &exposure : nullptr,
-                      directOutput ? FrameOutput{frame.output.view, frame.output.format} : FrameOutput{});
+                      FrameOutput{directOutput ? frame.output.view : VK_NULL_HANDLE, frame.output.format});
 }
 // Everything after the network: the copy into the game's output texture when the store was not direct.
 void GameUpscaler::Impl::result(VkCommandBuffer cb, const GameFrame& frame) {
     auto& g = *this;
     if (game_detail::directOutput(frame.output, frame.color, frame.motion, frame.depth, g.model.hasDirectOutput(frame.output.format))) return;
-    game_detail::copyOutput(cb, g.engine.outputImage(), frame.output, g.shape.outputWidth, g.shape.outputHeight);
+    (g.engine.outputCopyIsRaw() ? game_detail::copyOutputRaw : game_detail::copyOutput)(cb, g.engine.outputImage(), frame.output, g.shape.outputWidth, g.shape.outputHeight);
 }
 void GameUpscaler::record(VkCommandBuffer cb, const GameFrame& frame) {
     auto& g = *impl;

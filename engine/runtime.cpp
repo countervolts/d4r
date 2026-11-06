@@ -117,13 +117,13 @@ struct Image {
         if (handle) vkDestroyImage(device->handle, handle, nullptr);
         if (memory) vkFreeMemory(device->handle, memory, nullptr);
     }
-    void create(const Device& d, uint32_t width, uint32_t height, bool luma = false) {
+    void create(const Device& d, uint32_t width, uint32_t height, bool luma = false, VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT) {
         device = &d; w = width; h = height;
         if (!w || !h || w > d.properties.limits.maxImageDimension2D || h > d.properties.limits.maxImageDimension2D)
             throw std::runtime_error("image dimensions exceed device limits");
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = luma ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        info.imageType = VK_IMAGE_TYPE_2D; info.format = luma ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+        info.imageType = VK_IMAGE_TYPE_2D; info.format = luma ? VK_FORMAT_R16_SFLOAT : format;
         info.extent = {w, h, 1}; info.mipLevels = info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VKCHECK(vkCreateImage(d.handle, &info, nullptr, &handle));
@@ -171,7 +171,7 @@ struct Pipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline handle = VK_NULL_HANDLE;
     // K's input, output and exposure stages: the same shader with CANONICAL_INPUT (specialization constant 7)
-    // false, for frames whose colour and motion are already exact in binary16 (no conversion code at all)
+    // false, for frames that do not take the conversion (no conversion code at all): see FrameFlagCanonicalColor
     VkPipeline f16Inputs = VK_NULL_HANDLE;
     ~Pipeline() {
         if (f16Inputs) vkDestroyPipeline(device, f16Inputs, nullptr);
@@ -378,13 +378,23 @@ struct Model::Impl {
     std::vector<char> weightBytes, lutBytes;   // until recordUpload
     std::array<std::array<uint32_t, 108>, KLayers> offsets{};
     std::array<Pipeline, KLayers> network;
-    Pipeline input, output, outputRgb10, outputRgba8, outputR11;
+    Pipeline input, output, outputRgb10, outputRgba8, outputR11, outputRgba32, outputBgra8, outputE5;
     // the final-store pipeline for a borrowed output texture of this format; null when none is packaged
     const Pipeline* outputFor(VkFormat format) const {
         const Pipeline* p = format == VK_FORMAT_R16G16B16A16_SFLOAT ? &output :
             format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? &outputRgb10 : format == VK_FORMAT_R8G8B8A8_UNORM ? &outputRgba8 :
-            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : nullptr;
+            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : format == VK_FORMAT_R32G32B32A32_SFLOAT ? &outputRgba32 : nullptr;
         return p && p->handle ? p : nullptr;
+    }
+    // K's copy path: the store and the image layout whose bits a raw copy puts into a destination of this format, for
+    // every output format the shim accepts. A blit narrows to half: formats or packages with no store fall back to it.
+    struct OwnStore { const Pipeline* store; VkFormat image; };
+    OwnStore ownStoreFor(VkFormat format) const {
+        if (accuracyStages) return {nullptr, VK_FORMAT_UNDEFINED}; // the CUDA backend's half store and blit
+        if (format == VK_FORMAT_B8G8R8A8_UNORM && outputBgra8.handle) return {&outputBgra8, VK_FORMAT_R8G8B8A8_UNORM};
+        if (format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && outputE5.handle) return {&outputE5, VK_FORMAT_R32_UINT};
+        const Pipeline* const p = outputFor(format);
+        return {p, p ? format : VK_FORMAT_UNDEFINED};
     }
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
@@ -494,6 +504,10 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
         m.outputRgba8.create(device, outputFile("output_k_store_rgba8"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(outputFile("output_k_store_r11g11b10")))
         m.outputR11.create(device, outputFile("output_k_store_r11g11b10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    const std::pair<Pipeline*, const char*> copyStores[] = {{&m.outputRgba32, "output_k_store_rgba32f"},
+        {&m.outputBgra8, "output_k_store_bgra8"}, {&m.outputE5, "output_k_store_e5b9g9r9"}};
+    for (const auto& [pipeline, name] : copyStores)
+        if (exists(outputFile(name))) pipeline->create(device, outputFile(name), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
         m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache, 0, nullptr, true);
         const std::string update = directory + (m.accuracyStages && exists(directory + "/exposure_k1_accuracy.spv")
@@ -535,8 +549,12 @@ struct Engine::Impl {
     std::array<Buffer, 5> skip;
     struct History { Image color, luma, feature; };
     std::array<History, 2> history;
-    Image final;   // the engine's own output: only for frames that do not write the caller's image (created on first use)
-    bool finalNew = false;
+    // The engine's own output, only for frames that do not write the caller's image (each created on first use): the
+    // half image for a blit, or one per layout a raw copy takes (Model::Impl::ownStoreFor).
+    Image final;
+    std::map<VkFormat, Image> finalRaw;
+    Image* finalCopy = nullptr;
+    bool finalNew = false, finalCopyRaw = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, KLayers> layerSets{};
     std::array<VkDescriptorSet, 2> inputSets{}, outputSets{};
@@ -747,10 +765,17 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                images.colorLayout == b.colorLayout && images.motionLayout == b.motionLayout && images.depthLayout == b.depthLayout &&
                images.exposure == b.exposure && images.exposureLayout == b.exposureLayout;
     };
-    if (!finalOutput.view && !e.final.handle) {
-        e.final.create(e.model.device, e.shape.outputWidth, e.shape.outputHeight);
-        e.finalNew = true;
+    const auto ownStore = finalOutput.view ? Model::Impl::OwnStore{nullptr, VK_FORMAT_UNDEFINED} : e.model.ownStoreFor(finalOutput.format);
+    if (!finalOutput.view) {
+        Image& own = ownStore.store ? e.finalRaw[ownStore.image] : e.final;
+        if (!own.handle) {
+            own.create(e.model.device, e.shape.outputWidth, e.shape.outputHeight, false,
+                       ownStore.store ? ownStore.image : VK_FORMAT_R16G16B16A16_SFLOAT);
+            e.finalNew = true;
+        }
+        e.finalCopy = &own;
     }
+    e.finalCopyRaw = !finalOutput.view && ownStore.store;
     auto found = std::find_if(e.bindings.begin(), e.bindings.end(), [&](const auto& b) {
         return sameImages(b.images) && finalOutput.view == b.finalOutput.view && finalOutput.format == b.finalOutput.format;
     });
@@ -806,7 +831,7 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                 bindImage(dev, out, 5, images.depth, e.nearest, images.depthLayout);
                 bindImage(dev, out, 6, dest.color.storage); bindImage(dev, out, 7, dest.luma.storage);
                 bindImage(dev, out, 8, dest.feature.storage);
-                bindImage(dev, out, 9, finalOutput.view ? finalOutput.view : e.final.storage);
+                bindImage(dev, out, 9, finalOutput.view ? finalOutput.view : e.finalCopy->storage);
             }
             e.bindings.push_back(binding);
         } catch (...) {
@@ -818,7 +843,7 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     e.inputSets = found->input; e.outputSets = found->output;
     e.exposureSets[0] = found->exposure;
     e.exposureSets[1] = found->exposureUpdate;
-    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : &e.model.output;
+    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : ownStore.store ? ownStore.store : &e.model.output;
     e.reset = (input.flags & FrameFlagReset) != 0; e.frameSet = true;
     e.f16Inputs = (input.flags & (FrameFlagCanonicalColor | FrameFlagCanonicalMotion)) == 0;
 }
@@ -831,7 +856,7 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     if (!e.initialized || !e.model.uploaded || !e.frameSet) throw std::runtime_error("initialize/upload/setFrame before recording inference");
     auto mark = [&](uint32_t boundary) { if (profiler.mark) profiler.mark(cb, boundary, profiler.user); };
     mark(0);
-    if (e.finalNew) { clearNewImage(cb, e.final.handle); e.finalNew = false; }
+    if (e.finalNew) { clearNewImage(cb, e.finalCopy->handle); e.finalNew = false; }
     // Includes reads-to-writes when reusing scratch and histories, and copies made by the caller after the last frame.
     memoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -884,7 +909,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     if (!e.external) throw std::runtime_error("this engine's network is internal: record the whole frame");
     if (!e.initialized || !e.model.uploaded || !e.frameSet || e.frontDone) throw std::runtime_error("initialize/upload/setFrame before recording inference");
     const auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    if (e.finalNew) { clearNewImage(cb, e.final.handle); e.finalNew = false; }
+    if (e.finalNew) { clearNewImage(cb, e.finalCopy->handle); e.finalNew = false; }
     memoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, compute | VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     vkCmdUpdateBuffer(cb, e.inParams.handle, 0, sizeof(InputParams), &e.input);
@@ -930,7 +955,8 @@ void Engine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) 
     stamp(); // after the final store
     e.previous = 1 - e.previous; e.frameSet = false; e.frontDone = false;
 }
-VkImage Engine::outputImage() const { return impl->final.handle; }
+VkImage Engine::outputImage() const { return impl->finalCopy ? impl->finalCopy->handle : VK_NULL_HANDLE; }
+bool Engine::outputCopyIsRaw() const { return impl->finalCopyRaw; }
 HistoryImages Engine::historyImages() const {
     auto& h = impl->history[impl->previous]; return {h.color.handle, h.luma.handle, h.feature.handle};
 }

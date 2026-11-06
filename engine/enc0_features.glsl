@@ -6,17 +6,22 @@
 #ifndef EP
 #define EP p
 #endif
+// ENC0_PAIRS (no FP8 hardware, fp8_soft.glsl, RDNA3's stages): the dither on a pair, in packed binary16, rounded by
+// e4m3RoundHalf2 (equal to the scalar form for every binary16 value): the two values on the FP8 grid, one packFloat2x16
+#ifndef ENC0_PAIRS
+#define ENC0_PAIRS 0
+#endif
 // ENC0_DEDUP: a candidate along the same vector as an earlier one (uniform motion, display-resolution motion) takes
 // that one's sample of the previous result instead of fetching and converting it again (the same value)
 #ifndef ENC0_DEDUP
-#define ENC0_DEDUP 0
+#define ENC0_DEDUP ENC0_PAIRS
 #endif
 #ifndef ENC0_DISPLAY_MV
 #define ENC0_DISPLAY_MV 0
 #endif
 // F8T: the type of an FP8 feature slot; F8OF(h): a binary16 value on the FP8 grid as one. Without FP8 support (the
 // v_dot2 stages, fp8_soft.glsl) the slots are binary16 values on the FP8 grid.
-#ifndef F8T
+#if !ENC0_PAIRS && !defined(F8T)
 #define F8T floate4m3_t
 #define F8OF(h) floate4m3_t(h)
 #endif
@@ -45,6 +50,7 @@ float colour1(float v) { return compress1(isinf(v) || isnan(v) ? 0.0 : min(v, 32
 #endif
 ivec2 texel(ivec2 t) { return ivec2(t.x > 0 ? min(t.x, EP.size.x - 1) : 0, t.y > 0 ? min(t.y, EP.size.y - 1) : 0); }
 vec2 motion(ivec2 t) { return EP.mvScale * (EP.mvOffs + texelFetch(motionTex, texel(t), 0).xy); }
+#if !ENC0_PAIRS
 // NGX's dithered truncation of an f16 value to the FP8 grid
 F8T dither(float v, uint n)
 {
@@ -55,8 +61,23 @@ F8T dither(float v, uint n)
     const float16_t r = uint16BitsToFloat16(uint16_t(uint(float16BitsToUint16(t)) & 0xFF80u));
     return F8OF(clamp(r, float16_t(-448.0), float16_t(448.0)));
 }
+#endif
+#if ENC0_PAIRS
+uint ditherPair(vec2 v, uint n)
+{
+    const bvec2 bad = bvec2(isinf(v.x) || isnan(v.x), isinf(v.y) || isnan(v.y));
+    const f16vec2 h = f16vec2(bad.x ? 0.0 : min(v.x, 1024.0), bad.y ? 0.0 : min(v.y, 1024.0));
+    const u16vec2 e = float16BitsToUint16(h) & u16vec2(0xFC00u);
+    precise const f16vec2 added = h + uint16BitsToFloat16(e | u16vec2(uint16_t(n)));
+    precise const f16vec2 t = added - uint16BitsToFloat16(e);
+    return e4m3RoundHalf2(uint16BitsToFloat16(float16BitsToUint16(t) & u16vec2(0xFF80u)));
+}
+#define ENC0_OUT uint fe[16]
+#else
+#define ENC0_OUT F8T fe[32]
+#endif
 // The 32 dithered FP8 feature slots of block pixel pi (16 per plane) and the motion candidates of the pixel.
-void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, out F8T fe[32])
+void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, out ENC0_OUT)
 {
     const uint px = pi & 7u, py = pi >> 3;
     const ivec2 raw = block + ivec2(px, py), a = abs(raw);
@@ -80,8 +101,8 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     {
         // the neighbours with the smallest and the largest depth
         ivec2 lo = m, hi = m;
-        float dlo = texelFetch(depthTex, texel(m), 0).r, dhi = dlo;
         const ivec2 offs[8] = ivec2[8](ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));
+        float dlo = texelFetch(depthTex, texel(m), 0).r, dhi = dlo;
         for (int k = 0; k < 8; ++k)
         {
             const float d = texelFetch(depthTex, texel(m + offs[k]), 0).r;
@@ -160,10 +181,21 @@ void gatherFeatures(uint pi, ivec2 block, float e1, float e2, bool fusedFourth, 
     const vec3 col = vec3(colour1(c.r), colour1(c.g), colour1(c.b));
     const uint n = uint(noise.n[(EP.frame << 8) | uint((a.y & 15) << 4) | uint(a.x & 15)]) >> 9;
     // 32 slots: 16 per plane
+#if !ENC0_PAIRS
     float v[32];
+#endif
+#if ENC0_PAIRS
+    // the slot pairs in packed binary16; the pairs (10, 11), (14, 15), ..., (30, 31) are always zero: a zero slot's dither
+    // adds n < 128 to the subnormal range and the mask clears it again
+    fe[0] = ditherPair(vec2(col.r, col.g), n); fe[1] = ditherPair(feat.xy, n); fe[2] = ditherPair(vec2(col.b, h[0].r), n); fe[3] = ditherPair(feat.zw, n);
+    fe[4] = ditherPair(vec2(h[0].g, h[0].b), n); fe[5] = 0u; fe[6] = ditherPair(vec2(h[1].r, h[1].g), n); fe[7] = 0u;
+    fe[8] = ditherPair(vec2(h[1].b, h[2].r), n); fe[9] = 0u; fe[10] = ditherPair(vec2(h[2].g, h[2].b), n); fe[11] = 0u;
+    fe[12] = ditherPair(vec2(h[3].r, h[3].g), n); fe[13] = 0u; fe[14] = ditherPair(vec2(h[3].b, mf), n); fe[15] = 0u;
+#else
     for (int k = 0; k < 32; ++k) v[k] = 0.0;
     v[0] = col.r; v[1] = col.g; v[2] = feat.x; v[3] = feat.y; v[4] = col.b; v[5] = h[0].r; v[6] = feat.z; v[7] = feat.w;
     v[8] = h[0].g; v[9] = h[0].b; v[12] = h[1].r; v[13] = h[1].g;
     v[16] = h[1].b; v[17] = h[2].r; v[20] = h[2].g; v[21] = h[2].b; v[24] = h[3].r; v[25] = h[3].g; v[28] = h[3].b; v[29] = mf;
     for (uint k = 0u; k < 32u; ++k) fe[k] = dither(v[k], n);
+#endif
 }

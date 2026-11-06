@@ -1138,15 +1138,25 @@ int main(int argc, char** argv)
     const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
     // D4R_HARNESS_OUTPUT_RGB10A2=1: an R10G10B10A2_UNORM output texture (inputs unchanged), as some games pass
     // D4R_HARNESS_OUTPUT_R11G11B10=1: an R11G11B10_FLOAT output texture instead (the other packed HDR format games pass)
+    // D4R_HARNESS_OUTPUT_DXGI=<DXGI_FORMAT number>: any other output texture, inputs unchanged. D4R_HARNESS_OUTPUT_NO_UAV=1
+    // drops its unordered access and leaves it in COPY_DEST (run with D4R_SHIM_OUTPUT_STATE=0x400); both take K's copy path.
     const bool rgb11 = std::getenv("D4R_HARNESS_OUTPUT_R11G11B10") != nullptr;
     const bool rgb10 = !rgb11 && std::getenv("D4R_HARNESS_OUTPUT_RGB10A2") != nullptr;
-    const DXGI_FORMAT packedOutput = rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
-    if ((rgb10 || rgb11) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
+    const DXGI_FORMAT otherOutput = std::getenv("D4R_HARNESS_OUTPUT_DXGI") != nullptr
+        ? static_cast<DXGI_FORMAT>(std::atoi(std::getenv("D4R_HARNESS_OUTPUT_DXGI"))) : DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT packedOutput = otherOutput != DXGI_FORMAT_UNKNOWN ? otherOutput
+        : rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
+    const UINT packedTexel = otherOutput == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16
+        : otherOutput == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    const bool outputNoUav = std::getenv("D4R_HARNESS_OUTPUT_NO_UAV") != nullptr;
+    const D3D12_RESOURCE_FLAGS outputFlags = outputNoUav ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES outputState = outputNoUav ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if ((rgb10 || rgb11 || otherOutput != DXGI_FORMAT_UNKNOWN) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
     {
         std::fprintf(stderr, "packed (RGB10A2 / R11G11B10) output cannot be combined with RGBA8 or the quality scene\n");
         return 2;
     }
-    const bool packed = rgb10 || rgb11;
+    const bool packed = rgb10 || rgb11 || otherOutput != DXGI_FORMAT_UNKNOWN;
     if (rgba8 && (qualityScene || replayDir != nullptr))
     {
         std::fprintf(stderr, "RGBA8 format probe supports static, motion and jitter scenes\n");
@@ -1414,16 +1424,52 @@ int main(int argc, char** argv)
         std::printf("Ray Reconstruction extra inputs:%s%s\n", hitDistance ? " DLSSD.SpecularHitDistance" : "",
                     disocclusionMask ? " DLSS.DisocclusionMask" : "");
     }
+    // D4R_HARNESS_COLOR_F32=1 / _COLOR_RGB10A2=1 / _COLOR_BGRA8=1: the same colour in that format (the UNORM ones
+    // clamp to [0, 1]). D4R_HARNESS_MV_F32=1: motion in R32G32_FLOAT.
+    const bool colorF32 = std::getenv("D4R_HARNESS_COLOR_F32") != nullptr;
+    const bool colorRgb10 = std::getenv("D4R_HARNESS_COLOR_RGB10A2") != nullptr;
+    const bool colorBgra8 = std::getenv("D4R_HARNESS_COLOR_BGRA8") != nullptr;
+    const bool colorOther = colorF32 || colorRgb10 || colorBgra8;
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
+        colorF32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : colorRgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM : colorBgra8 ? DXGI_FORMAT_B8G8R8A8_UNORM :
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    std::vector<uint32_t> colorConverted;
+    const auto converted_color = [&]() -> const void* {
+        const size_t pixels = static_cast<size_t>(resourceWidth) * inHeight;
+        colorConverted.resize(pixels * (colorF32 ? 4 : 1));
+        const auto half = [&](size_t pixel, int channel) { return static_cast<float>(std::bit_cast<_Float16>(color[pixel * 4 + channel])); };
+        const auto code = [&](size_t pixel, int channel, float top) {
+            return static_cast<uint32_t>(std::lround(std::clamp(half(pixel, channel), 0.0f, 1.0f) * top)); };
+        for (size_t pixel = 0; pixel < pixels; ++pixel)
+        {
+            if (colorF32)
+                for (int channel = 0; channel < 4; ++channel)
+                    colorConverted[pixel * 4 + channel] = std::bit_cast<uint32_t>(half(pixel, channel));
+            else if (colorRgb10)
+                colorConverted[pixel] = code(pixel, 0, 1023.0f) | code(pixel, 1, 1023.0f) << 10 | code(pixel, 2, 1023.0f) << 20 | code(pixel, 3, 3.0f) << 30;
+            else
+                colorConverted[pixel] = code(pixel, 2, 255.0f) | code(pixel, 1, 255.0f) << 8 | code(pixel, 0, 255.0f) << 16 | code(pixel, 3, 255.0f) << 24;
+        }
+        return colorConverted.data();
+    };
+    const UINT colorRowBytes = resourceWidth * (colorF32 ? 16 : colorOther || rgba8 ? 4 : 8);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     // D4R_HARNESS_MV_RGBA16=1: motion vectors in an R16G16B16A16_TYPELESS texture (as some games pass them), the
     // unused components filled with junk that must not reach DLSS.
     const bool mvRgba16 = std::getenv("D4R_HARNESS_MV_RGBA16") != nullptr && std::atoi(std::getenv("D4R_HARNESS_MV_RGBA16")) != 0;
+    const bool mvF32 = std::getenv("D4R_HARNESS_MV_F32") != nullptr;
     ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight,
-        mvRgba16 ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+        mvF32 ? DXGI_FORMAT_R32G32_FLOAT : mvRgba16 ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     std::vector<uint16_t> motionWide;
+    std::vector<float> motionF32;
     auto motion_rows = [&](const uint16_t* rg) -> const void* {
+        if (mvF32)
+        {
+            motionF32.resize(static_cast<size_t>(motionWidth) * motionHeight * 2);
+            for (size_t i = 0; i < motionF32.size(); ++i)
+                motionF32[i] = static_cast<float>(std::bit_cast<_Float16>(rg[i]));
+            return motionF32.data();
+        }
         if (!mvRgba16)
             return rg;
         const size_t pixels = static_cast<size_t>(motionWidth) * motionHeight;
@@ -1437,14 +1483,14 @@ int main(int argc, char** argv)
         }
         return motionWide.data();
     };
-    const UINT motionRowBytes = motionWidth * (mvRgba16 ? 8 : 4);
+    const UINT motionRowBytes = motionWidth * (mvF32 || mvRgba16 ? 8 : 4);
     ID3D12Resource* exposureTexture = create_texture(1, 1,
         exposureRGBA32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
                                                    rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
                                                    : packed ? packedOutput
                                                            : DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                                                   outputFlags);
     // Moving/jittered RGBA8 fixtures quantize the same canonical half input as the initial upload.
     // Never upload the half byte layout into an RGBA8 resource: that would make a format test silently
     // exercise different content instead of checking the conversion/packing route used by the game.
@@ -1453,20 +1499,20 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < color.size(); ++i)
                 color8[i] = static_cast<uint8_t>(std::lround(std::clamp(
                     static_cast<float>(std::bit_cast<_Float16>(color[i])), 0.0f, 1.0f) * 255.0f));
-        update_texture(colorTexture, rgba8 ? static_cast<const void*>(color8.data())
-                                          : static_cast<const void*>(color.data()), resourceWidth * (rgba8 ? 4 : 8), srv);
+        update_texture(colorTexture, colorOther ? converted_color() : rgba8 ? static_cast<const void*>(color8.data())
+                                          : static_cast<const void*>(color.data()), colorRowBytes, srv);
     };
-    upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
-           resourceWidth * (rgba8 ? 4 : 8), srv);
+    upload(colorTexture, colorOther ? converted_color() : rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
+           colorRowBytes, srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
     upload(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
     upload(exposureTexture, exposureRGBA32 ? static_cast<const void*>(exposureRGBA.data())
                                           : static_cast<const void*>(&exposureValue),
            exposureRGBA32 ? 16 : 4, srv);
-    const std::vector<uint8_t> outputInit10(packed ? static_cast<size_t>(outWidth) * outHeight * 4 : 0);
+    const std::vector<uint8_t> outputInit10(packed ? static_cast<size_t>(outWidth) * outHeight * packedTexel : 0);
     upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
                           : packed ? static_cast<const void*>(outputInit10.data()) : static_cast<const void*>(outputInit.data()),
-           outWidth * (rgba8 || packed ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+           outWidth * (rgba8 ? 4 : packed ? packedTexel : 8), outputState);
     std::printf("synthetic inputs uploaded\n");
     trace_stage("synthetic inputs uploaded");
 
@@ -1743,6 +1789,12 @@ int main(int argc, char** argv)
 
     for (int frame = 1; frame <= frames; ++frame)
     {
+        // D4R_HARNESS_RENDER_SHRINK_AT=N: from frame N the render size is 3/4 of the feature's (dynamic resolution)
+        if (const char* shrinkAt = std::getenv("D4R_HARNESS_RENDER_SHRINK_AT"); shrinkAt != nullptr && frame == static_cast<UINT>(std::atoi(shrinkAt)))
+        {
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", inWidth * 3 / 4);
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", inHeight * 3 / 4);
+        }
         // Recreate the game's output between completed frames to exercise imported-memory handle reuse.
         if (frame > 1 && std::getenv("D4R_HARNESS_RECREATE_OUTPUT") != nullptr)
         {
@@ -1750,11 +1802,11 @@ int main(int argc, char** argv)
             outputTexture = create_texture(outWidth, outHeight,
                 rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
                 : packed ? packedOutput : DXGI_FORMAT_R16G16B16A16_FLOAT,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                outputFlags);
             upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
                                   : packed ? static_cast<const void*>(outputInit10.data())
                                           : static_cast<const void*>(outputInit.data()),
-                   outWidth * (rgba8 || packed ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                   outWidth * (rgba8 ? 4 : packed ? packedTexel : 8), outputState);
             d4r_ngx_set_d3d12_resource(parameters, "Output", outputTexture);
         }
         // A replay's guides come from the capture; rewriting them with a pattern would
@@ -2151,7 +2203,7 @@ int main(int argc, char** argv)
             // Luma of the presented result vs the ground truth at this frame's
             // scroll position, and the frame-to-frame change of that error
             // (ideally 0; for a static scene it is the change of the output).
-            const std::vector<uint8_t> raw = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * 8);
+            const std::vector<uint8_t> raw = read_back(outputTexture, outputState, outWidth * 8);
             const uint16_t* halves = reinterpret_cast<const uint16_t*>(raw.data());
             const size_t pixels = static_cast<size_t>(outWidth) * outHeight;
             // The shim presents the previous evaluation's result (one frame of
@@ -2220,7 +2272,7 @@ int main(int argc, char** argv)
         if (saveFrames)
         {
             const std::vector<uint8_t> frameOutput =
-                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 || packed ? 4 : 8));
+                read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
             const std::string framePath = std::string(argv[2]) + ".frame" + std::to_string(frame);
             if (FILE* frameFile = std::fopen(framePath.c_str(), "wb"))
             {
@@ -2242,8 +2294,8 @@ int main(int argc, char** argv)
         }
     }
 
-    const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                  outWidth * (rgba8 || packed ? 4 : 8));
+    const std::vector<uint8_t> output = read_back(outputTexture, outputState,
+                                                  outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
     FILE* file = std::fopen(argv[2], "wb");
     if (file != nullptr)
     {
@@ -2274,7 +2326,7 @@ int main(int argc, char** argv)
             return 1;
         }
         const std::vector<uint8_t> baseline =
-            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+            read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : 8));
         fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight, 0, true, srv, 0.4f);
         if (evaluate_reset_once() != NGX_SUCCESS)
         {
@@ -2282,7 +2334,7 @@ int main(int argc, char** argv)
             return 1;
         }
         const std::vector<uint8_t> shifted =
-            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+            read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : 8));
         const size_t texel = rgba8 ? 4u : 8u;
         double left = 0.0, right = 0.0;
         size_t leftCount = 0, rightCount = 0, nonfinite = 0;
@@ -2509,8 +2561,8 @@ int main(int argc, char** argv)
             submit_and_wait();
             Sleep(frameWaitMs);
         }
-        const std::vector<uint8_t> cycleOutput = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                           outWidth * (rgba8 || packed ? 4 : 8));
+        const std::vector<uint8_t> cycleOutput = read_back(outputTexture, outputState,
+                                                           outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
         if (verifyRecreation)
         {
             auto& reference = recreationReference[cycle % 2];

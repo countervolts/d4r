@@ -6,6 +6,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
+#ifdef WIDE_STORE
+#define OUTPUT_STORE_F32 // the f32 result goes straight to the format's conversion (output_store.glsl), RDNA3's stage set
+#endif
 #include "output_store.glsl"
 // LDR (NGX's *_ldr_* kernel): the packed image is the display-referred colour itself.
 #ifndef LDR
@@ -25,7 +28,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
     float expo;
 } p;
 layout(set = 0, binding = 1) uniform sampler2D colorTex;        // render resolution; its alpha is passed through
-layout(set = 0, binding = 2, FINAL_OUTPUT_FORMAT) uniform writeonly image2D outImg;
+layout(set = 0, binding = 2, FINAL_OUTPUT_FORMAT) uniform writeonly FINAL_OUTPUT_IMAGE outImg;
 layout(set = 0, binding = 3, std430) readonly buffer Src { uint w[]; } src;
 shared f16vec4 rows[TILE_H * BLOCK_X];      // after the horizontal pass
 // The horizontal pass reads the source texels straight into registers, without a shared tile: an invocation filters

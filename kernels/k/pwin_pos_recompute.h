@@ -67,11 +67,11 @@ __device__ void pos_recompute_core(const PwinParams& p, const u8v* __restrict__ 
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
             {
                 const uint32_t xj = xv[j], gj = gv[j];
-                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
             }
 #else
-                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
             store_row16(hrow + 16 * kt, hv);
         }
@@ -231,7 +231,7 @@ __device__ void pos_recompute_core(const PwinParams& p, const u8v* __restrict__ 
             for (int i = 0; i < 8; ++i)
             {
                 const half_t x1 = (half_t)acc[mi][nt][i] + x0[i];
-                mv[i] = x1 * g2[i];
+                mv[i] = PWIN_MLP_INPUT(x1, g2[i]);
                 acc[mi][nt][i] = (float)(half_t)(x1 + b2[i]);
             }
             op_store(&hb[tok][16 * nt], operand_from_dt(mv));
@@ -355,11 +355,11 @@ __device__ void pos_recompute_encoder(const PwinParams& p0, const u8v* __restric
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
                 {
                     const uint32_t xj = xv[j], gj = gv[j];
-                    hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                    hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
                 }
 #else
-                    hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                                  op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                    hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                                  op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
                 store_row16(&hb[tok][16 * kt], hv);
             }

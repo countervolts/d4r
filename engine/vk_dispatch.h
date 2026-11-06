@@ -21,6 +21,7 @@ struct VkTable {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
     PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
     PFN_vkCmdBlitImage CmdBlitImage = nullptr;
+    PFN_vkCmdCopyImage CmdCopyImage = nullptr;
     PFN_vkCmdClearColorImage CmdClearColorImage = nullptr;
     PFN_vkCmdCopyBuffer CmdCopyBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
@@ -74,6 +75,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkCmdBindDescriptorSets ::d4r::vkTable.CmdBindDescriptorSets
 #define vkCmdBindPipeline ::d4r::vkTable.CmdBindPipeline
 #define vkCmdBlitImage ::d4r::vkTable.CmdBlitImage
+#define vkCmdCopyImage ::d4r::vkTable.CmdCopyImage
 #define vkCmdClearColorImage ::d4r::vkTable.CmdClearColorImage
 #define vkCmdCopyBuffer ::d4r::vkTable.CmdCopyBuffer
 #define vkCmdCopyBufferToImage ::d4r::vkTable.CmdCopyBufferToImage

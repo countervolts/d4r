@@ -292,15 +292,18 @@ The caller must enable the device features listed in `runtime.h`. Optional `Fram
 
 [game.h](game.h) is the adapter for game textures: provide `GameImage::view` for compatible sampled inputs and
 an RGBA16F or RGB10A2 storage output (K: also RGBA8 and R11G11B10). It samples inputs and writes the output directly,
-respecting rectangle origins. Null views retain per-plane copies. Other output formats and packages without the matching
-final-store variant retain the final conversion blit (about 0.13 ms at 1440p on an RX 7700 XT);
-input/output image aliasing also uses the output blit. Views and images must outlive the adapter. Input formats
+respecting rectangle origins. Null views retain per-plane copies. Other output formats, textures without unordered access and
+input/output image aliasing store into an image with the destination's bit layout and copy it raw, because a blit narrows to half.
+Packages without the matching final-store variant, and the accuracy stages, retain the final conversion blit (about 0.13 ms at 1440p
+on an RX 7700 XT). Views and images must outlive the adapter. Input formats
 are sampled in their original precision, so f32 colour/motion avoid the former f16 intermediate rounding.
 
 `compile_k.py` and `compile_m.py` package both final-store formats; `hasRgb10Output()` reports the packed variant.
 `compile_k.py` also packages `output_k_store_rgba8.spv` and `output_k_store_r11g11b10.spv` (`Model::hasDirectOutput(format)`;
 the names avoid the PTX-translated `output_k_rgba8.spv` some older experimental model folders carry).
-Both compilers accept `--ldr` for NGX evaluations without the HDR flag. RGB10A2 stores share `output_store.glsl`:
+Both compilers accept `--ldr` for NGX evaluations without the HDR flag. RGB10A2 stores share `output_store.glsl`.
+K's default stores take the f32 result directly (`OUTPUT_STORE_F32`), so they can differ from the blit path by one code.
+K's accuracy stores and M's stores keep the half step:
 the mantissa mask reproduces RADV's truncating RGBA16F store before UNORM conversion, rather than changing rounding
 when removing the intermediate image. A GPU corpus of 324,614 values (all half patterns, signed half ties and their
 adjacent floats, RGB/alpha quantization boundaries, random f32 and low-payload NaNs) matched the old half-store +
@@ -309,7 +312,7 @@ The RGBA8 store uses the same mask; R11G11B10 keeps values below binary16's norm
 toward-zero binary16 conversion of `input_quant.glsl` and the blit's canonical NaN. A 448,512-value corpus (every half
 pattern with its f32 neighbours and midpoints, UNORM quantization boundaries, overflow, Inf, NaN payloads, random
 values) matched the half store + blit for RGB10A2, RGBA8 and R11G11B10, with and without colour-attachment usage
-(RX 7700 XT, RADV); full K frames are byte-identical to the blit path for both kernel sets.
+(RX 7700 XT, RADV). Those half-step stores keep full K frames byte-identical to the blit path.
 
 Paired output-path timing (2026-10-10, LDR 1712×960 → 2560×1440, 20 alternating samples per mode,
 Vulkan network, warm GPU timestamps; not the in-game acceptance number):

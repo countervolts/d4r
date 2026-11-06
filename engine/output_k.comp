@@ -15,12 +15,15 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_GOOGLE_include_directive : require
+#ifndef D4R_ACCURACY
+#define OUTPUT_STORE_F32 // the final store takes the f32 result (output_store.glsl); accuracy keeps the CUDA backend's half
+#endif
 #include "output_store.glsl"
 #include "round_half.glsl"
 #include "input_quant.glsl"
 // Specialization constant 7 (set by the runtime per pipeline): the frame's colour and motion take the CUDA backend's
-// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags; the
-// pipeline without it carries no conversion code for games whose textures are already in binary16.
+// binary16 conversion (input_quant.glsl). The runtime picks the pipeline from the frame's canonical flags, which only
+// the accuracy stages set; the pipeline without it carries no conversion code.
 layout(constant_id = 7) const bool CANONICAL_INPUT = true;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer Params
@@ -48,7 +51,7 @@ layout(set = 0, binding = 5) uniform sampler2D depthTex;
 layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D histOut;
 layout(set = 0, binding = 7, r16ui) uniform writeonly uimage2D hiresOut;
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D tokOut;
-layout(set = 0, binding = 9, FINAL_OUTPUT_FORMAT) uniform writeonly image2D finalOut;
+layout(set = 0, binding = 9, FINAL_OUTPUT_FORMAT) uniform writeonly FINAL_OUTPUT_IMAGE finalOut;
 layout(set = 0, binding = 10, std430) readonly buffer Head { float16_t h[]; } head;       // 40 values per token: 4 sub-blocks x 10
 layout(set = 0, binding = 11, std430) readonly buffer Lut { uvec4 e[]; } lut;
 shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
@@ -149,6 +152,14 @@ float crPass(float t0, float t1, float t2, float t3, CrAxis c)
     t = fma(c.s3, clamp(t3, 0.0, 1.0), t);
     return t;
 }
+// Tile addresses: every operand fits in 24 bits (masked where the compiler cannot tell), which selects the fast multiply
+#ifdef D4R_ACCURACY
+#define TI(y, x) ((y) * 24 + (x))
+#define TJ(j, s) ((j) * (s))
+#else
+#define TI(y, x) (int((uint(y) & 63u) * 24u) + (x))
+#define TJ(j, s) int(uint(j) * uint(s))
+#endif
 void main()
 {
     const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
@@ -160,27 +171,44 @@ void main()
     const ivec2 t0 = ivec2(vec2(roundHalfAway(b0.x), roundHalfAway(b0.y)) - 4.0);
     const ivec2 t1 = ivec2(vec2(roundHalfAway(b1.x), roundHalfAway(b1.y)) + 4.0);
     const int tw = t1.x - t0.x + 1, th = t1.y - t0.y + 1;
+#ifndef D4R_ACCURACY
+    const float rtw = 1.0 / float(tw);
+#endif
     for (int i = int(gl_LocalInvocationIndex); i < tw * th; i += 256)
     {
-        const ivec2 t = ivec2(i % tw, i / tw), g = t + t0;
+#ifdef D4R_ACCURACY
+        const ivec2 t = ivec2(i % tw, i / tw);
+#else
+        // The texel for this slot, without an integer divide: i < 576 and tw <= 24, so i + 0.5 stays far enough from a
+        // multiple of tw for the float quotient to truncate to i / tw. The masks let the compiler use its fast multiply.
+        const uint qy = uint((float(i) + 0.5) * rtw) & 31u;
+        const ivec2 t = ivec2(i - int(qy * (uint(tw) & 63u)), int(qy));
+#endif
+        const ivec2 g = t + t0;
         const vec4 t0c = texelFetch(colorTex, clampOrigin(g, p.colOrigin, p.colMax), 0);
         const vec4 c = CANONICAL_INPUT ? canonicalHalf(t0c) : t0c;
         const vec3 rgb = max(c.rgb, 0.0);
         const float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
         const float L = p.expo * Y;
         const float k = compressK(L);
-        tileC[t.y * 24 + t.x] = f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a);
+        tileC[TI(t.y, t.x)] = f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a);
         // larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones
         if (!displayMv)
         {
             const float depth = texelFetch(depthTex, clampOrigin(g, p.depOrigin, p.depMax), 0).r;
-            tileD[t.y * 24 + t.x] = (p.flags & 2u) != 0u ? -depth : depth;
+            tileD[TI(t.y, t.x)] = (p.flags & 2u) != 0u ? -depth : depth;
         }
     }
     memoryBarrierShared(); barrier();
     // ---------------------------------------------------------------- network outputs of this pixel's 2x2 sub-block
+#ifdef D4R_ACCURACY
     const ivec2 tk = ivec2(vec2(pix) * p.out2tok);
     const uint hbase = uint((tk.y / 2) * p.tokW + tk.x / 2) * 40u + uint((tk.y & 1) * 2 + (tk.x & 1)) * 10u;
+#else
+    // out2tok is 0.5 (Engine::setFrame requires it) and the pixel is not negative, so shifts give the same token
+    const uvec2 tku = uvec2(pix) >> 1u;
+    const uint hbase = (((tku.y >> 1u) & 0x7ffu) * (uint(p.tokW) & 0x3fffu) + (tku.x >> 1u)) * 40u + ((tku.y & 1u) * 2u + (tku.x & 1u)) * 10u;
+#endif
     // sigmoid of a head word (the reference's fma chain: y = x * (x^2 + 27) / fma(x^2, 9, 27), sat(0.5*y + 0.5))
     const float x = 0.5 * float(head.h[hbase + 9u]);
     precise const float x2 = x * x;
@@ -193,7 +221,7 @@ void main()
     {
         const vec2 nr = pc * p.near2rnd + p.rndOffs;
         const ivec2 ni = ivec2(roundHalfAway(nr.x), roundHalfAway(nr.y));
-        const int di = (ni.y - t0.y) * 24 + (ni.x - t0.x);
+        const int di = TI(ni.y - t0.y, ni.x - t0.x);
         const float d0 = tileD[di], dmm = tileD[di - 25], dpp = tileD[di + 25], dpm = tileD[di - 23], dmp = tileD[di + 23];
         ivec2 dsel = ivec2(0);
         if (d0 < 0.5 * (dmm + dpp) - 0.001 * abs(d0) || d0 < 0.5 * (dpm + dmp) - 0.001 * abs(d0))
@@ -298,7 +326,7 @@ void main()
 #endif
     const ivec2 ui = ivec2(floor(vec2(u)));
     const f16vec2 uf = clamp(u - f16vec2(ui), float16_t(0.0), float16_t(1.0)), ug = float16_t(1.0) - uf;
-    const int ci = ui.y * 24 + ui.x;
+    const int ci = TI(ui.y, ui.x);
     f16vec4 curh = tileC[ci] * (ug.x * ug.y);
     curh = fma(tileC[ci + 1], f16vec4(uf.x * ug.y), curh);
     curh = fma(tileC[ci + 24], f16vec4(ug.x * uf.y), curh);
@@ -344,12 +372,16 @@ void main()
         f16vec4 db = float16_t(bs) - subB;
         const f16vec4 cross = dA * e2;
         f16vec4 lin = fma(db, cross, (dA * dA) * e0);
+        #ifdef D4R_ACCURACY
         const int ti = (a0 + r) * stepA + bs * stepB;
+#else
+        const int ti = int((uint(a0 + r) & 63u) * uint(stepA) + (uint(bs) & 63u) * uint(stepB));
+#endif
         for (int j = 0; j < 3; ++j)
         {
             // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
             const f16vec4 E = fma(db * db, f16vec4(e1), lin);
-            const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + j * stepB].x);
+            const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + TJ(j, stepB)].x);
             sumY = fma(w, Y, sumY); sumW += w;
             const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
             eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);

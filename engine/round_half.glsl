@@ -18,6 +18,14 @@ vec4 roundHalfValue(vec4 v) {
     return vec4(roundHalfValue(v.x), roundHalfValue(v.y), roundHalfValue(v.z), roundHalfValue(v.w));
 }
 
+// The hardware conversion, without memory: a binary16 clamp to the infinities keeps RADV from folding the round trip away
+// (ACO still emits the conversion), and clamps nothing. Components of a coopmat in any layout; NaN stays NaN.
+#define ROUND_HALF_CVT(m) { \
+    const float16_t rh_inf_ = uint16BitsToFloat16(uint16_t(0x7c00u)); \
+    for (int rh_i_ = 0, rh_n_ = (m).length(); rh_i_ < rh_n_; ++rh_i_) \
+        (m)[rh_i_] = float(clamp(float16_t((m)[rh_i_]), -rh_inf_, rh_inf_)); \
+}
+
 // The cooperative-matrix store/read-back through a wave-owned row-major region: the cheapest form where the region
 // already exists for the stage's own staging store (dec0 reuses EO). storage/offset/stride are in storage's
 // element units, as in the engine's LD16/ST16.

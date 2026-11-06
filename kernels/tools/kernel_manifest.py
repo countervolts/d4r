@@ -54,7 +54,10 @@ def main(argv):
     if not args.dlls and not args.rr_dll:
         parser.error("at least one SR DLL or --rr-dll is required")
     directory = args.directory
-    names = sorted(name[:-len('.hsaco')] for name in os.listdir(directory) if name.endswith('.hsaco'))
+    # preset L's stages for vkhip (kernels/tex/enc0l_net.hip, dec0l_net.hip): compile_m.py packages them with the engine's
+    # model; they replace no DLSS kernel, so no hash authorizes them and the bridge never serves them
+    vkhip_only = {'rrlite_enc0l_net', 'rrlite_dec0l_net'}
+    names = sorted(name[:-len('.hsaco')] for name in os.listdir(directory) if name.endswith('.hsaco') and name[:-len('.hsaco')] not in vkhip_only)
     lines = ['# d4r native kernels: NAME and the FNV-1a 64 hash of the DLSS PTX module each was written for',
              '# (written by kernels/tools/kernel_manifest.py from:']
     listed = {name: set() for name in names}

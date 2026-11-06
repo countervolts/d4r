@@ -223,7 +223,9 @@ def main():
     # final stores straight into the game's packed output textures (output_store.glsl); RGBA16F is output_k.spv
     # (output_k_rgb10.spv keeps its name; the newer stores are output_k_store_*.spv, so a stale output_k_rgba8.spv
     # left in a model folder by older experimental builds is never picked up)
-    for define, store in (('OUTPUT_RGB10', 'rgb10'), ('OUTPUT_RGBA8', 'store_rgba8'), ('OUTPUT_R11G11B10', 'store_r11g11b10')):
+    # The last three have no accuracy build: the accuracy stages keep the CUDA backend's half store and blit
+    for define, store in (('OUTPUT_RGB10', 'rgb10'), ('OUTPUT_RGBA8', 'store_rgba8'), ('OUTPUT_R11G11B10', 'store_r11g11b10'),
+                          ('OUTPUT_RGBA32F', 'store_rgba32f'), ('OUTPUT_BGRA8', 'store_bgra8'), ('OUTPUT_E5B9G9R9', 'store_e5b9g9r9')):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-D{define}=1',
                         *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
                         '-o', str(a.output / f'output_k_{store}.spv')], check=True)

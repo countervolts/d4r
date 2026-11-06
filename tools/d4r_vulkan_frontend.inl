@@ -59,6 +59,7 @@ struct NativeVkPlane
     CudaDevicePtr cuda = 0;
     void* external = nullptr;
     bool externalOwned = false;
+    bool asFloat = false; // this plane holds f32: binary16 cannot hold the game's format (shared VRAM only)
     D4rVkStagingSet staging;
     // Pitch-linear texture on `cuda`, handed to NGX without a buffer->array copy
     // (worker only). Pooled buffers keep it; the key detects a geometry change.
@@ -252,7 +253,19 @@ static void native_vk_free_frame(NativeVkFrame* frame)
     delete frame;
 }
 
-static bool native_vk_plane(NativeVkPlane& plane, const NgxVkResource* resource, int index, bool allowImport)
+// Whether a plane keeps its f32 values: NVIDIA's kernels read textures and store their output as f32. Accuracy stays
+// byte-identical to the CUDA reference; Ray Reconstruction and motion dilation work on binary16.
+static bool native_vk_float_plane(int index, VkFormat format, bool floatPlanes)
+{
+    if (!floatPlanes) return false;
+    if (index == 0) return format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM ||
+                           format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (index == 2) return format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM;
+    if (index == 4) return format != VK_FORMAT_R16G16B16A16_SFLOAT && env_uint("D4R_SHIM_F32_OUTPUT", 1) != 0;
+    return false;
+}
+
+static bool native_vk_plane(NativeVkPlane& plane, const NgxVkResource* resource, int index, bool allowImport, bool floatPlanes)
 {
     if (!resource || resource->type != 0) return false;
     plane.image = resource->resource.image;
@@ -279,6 +292,34 @@ static bool native_vk_plane(NativeVkPlane& plane, const NgxVkResource* resource,
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     const auto inputLayout = env_uint("D4R_VULKAN_INPUT_GENERAL", 0) != 0
         ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    plane.asFloat = false;
+    // f32 needs shared VRAM: the host routes below read and write the canonical layouts
+    if (native_vk_float_plane(index, image.format, floatPlanes))
+    {
+        const auto half = plane.rowBytes;
+        const size_t floatRow = (index == 2 ? 8 : 16) * size_t(image.width), floatBytes = floatRow * image.height;
+        if (plane.buffer && !(plane.cuda && plane.capacity >= floatBytes))
+        {
+            const auto descriptor = plane.image;
+            const auto format = plane.format;
+            native_vk_free_plane(plane);
+            plane.image = descriptor; plane.format = format; plane.rowBytes = half;
+        }
+        if (plane.buffer || native_vk_vram_plane(plane, floatBytes, allowImport))
+        {
+            plane.asFloat = true;
+            plane.rowBytes = floatRow;
+            return g_nativeVkStaging.set(plane.staging, image.view, image.format, plane.buffer, floatBytes, index == 4,
+                                         inputLayout, index == 4 ? image.format : VK_FORMAT_UNDEFINED);
+        }
+        if (plane.buffer)
+        {
+            const auto descriptor = plane.image;
+            const auto format = plane.format;
+            native_vk_free_plane(plane);
+            plane.image = descriptor; plane.format = format; plane.rowBytes = half;
+        }
+    }
     if (plane.buffer && plane.capacity >= info.size)
         return g_nativeVkStaging.set(plane.staging, image.view, image.format, plane.buffer,
                                     info.size, index == 4, inputLayout);
@@ -376,14 +417,14 @@ static CudaObject native_vk_linear_texture(NativeVkPlane& plane, int index)
     static const bool enabled = env_uint("D4R_SHIM_LINEAR_INPUTS", 0) != 0;
     if (!enabled || !plane.cuda || g.cu.registerLinearTexture == nullptr || plane.rowBytes % 256 != 0)
         return 0;
-    const uint64_t key = (static_cast<uint64_t>(index) << 60) ^ (static_cast<uint64_t>(plane.rowBytes) << 32) ^
+    const uint64_t key = (static_cast<uint64_t>(index) << 60) ^ (static_cast<uint64_t>(plane.asFloat) << 59) ^ (static_cast<uint64_t>(plane.rowBytes) << 32) ^
                          (static_cast<uint64_t>(plane.image.width) << 16) ^ plane.image.height;
     if (plane.texture && plane.textureKey == key) return plane.texture;
     if (plane.texture) g.cu.texObjectDestroy(plane.texture);
     plane.texture = 0;
     const Plane kind = static_cast<Plane>(index);
     struct Pitch2D { CudaDevicePtr pointer; uint32_t format, channels; size_t width, height, pitch; } pitch2D =
-        {plane.cuda, plane_format(kind), plane_channels(kind), plane.image.width, plane.image.height, plane.rowBytes};
+        {plane.cuda, plane.asFloat ? CUDA_FORMAT_FLOAT : plane_format(kind), plane_channels(kind), plane.image.width, plane.image.height, plane.rowBytes};
     static_assert(sizeof(Pitch2D) == 40, "CUDA_RESOURCE_DESC pitch2D");
     CudaResourceDesc resource = {};
     resource.resType = 3; // CU_RESOURCE_TYPE_PITCH2D
@@ -483,14 +524,15 @@ static void native_vk_run(Feature* feature, NativeVkFrame* frame)
                     continue;
                 }
                 ok = ensure_cuda_image(*images[i], plane.image.width, plane.image.height,
-                                       plane_format(static_cast<Plane>(i)), plane_channels(static_cast<Plane>(i)), false, i == 0);
+                                       plane.asFloat ? CUDA_FORMAT_FLOAT : plane_format(static_cast<Plane>(i)), plane_channels(static_cast<Plane>(i)), false, i == 0);
                 CudaMemcpy2D copy = {};
                 copy.srcMemoryType = CUDA_MEMORY_DEVICE; copy.srcDevice = plane.cuda; copy.srcPitch = plane.rowBytes;
                 copy.dstMemoryType = CUDA_MEMORY_ARRAY; copy.dstArray = images[i]->array;
                 copy.WidthInBytes = plane.rowBytes; copy.Height = plane.image.height;
                 if (ok) ok = copy_2d(copy) == 0;
             }
-            ok = ok && ensure_cuda_image(feature->output, feature->outWidth, feature->outHeight, CUDA_FORMAT_HALF, 4, true, false);
+            ok = ok && ensure_cuda_image(feature->output, feature->outWidth, feature->outHeight,
+                                         frame->planes[4].asFloat ? CUDA_FORMAT_FLOAT : CUDA_FORMAT_HALF, 4, true, false);
             CudaObject dilated = ok ? prepare_dilated_motion(*feature, slot, p) : 0;
             // NGX does not evaluate on the copies' stream: they must finish first. Linear
             // inputs were completed by the game's GPU before the input event.
@@ -508,7 +550,12 @@ static void native_vk_run(Feature* feature, NativeVkFrame* frame)
             // undone below when this frame's was not (it then wrote the array).
             static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
             const bool nativeOutput = g.cu.outputKernelNative == nullptr || g.cu.outputKernelNative() == 1;
-            if (outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr &&
+            // An f32 output goes through the array: the redirected stores write RGBA16F
+            if (destination.asFloat && feature->outputRedirected) {
+                g.cu.setArrayRedirect(feature->output.array, 0, 0);
+                feature->outputRedirected = false;
+            }
+            if (!destination.asFloat && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr &&
                 feature->output.array != nullptr && (nativeOutput || feature->outputRedirected)) {
                 const bool redirect = nativeOutput && destination.cuda &&
                     g.cu.setArrayRedirect(feature->output.array, destination.cuda, static_cast<uint32_t>(destination.rowBytes)) == 0;
@@ -996,11 +1043,12 @@ static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* 
         return refuse("a texture format is not implemented");
     }
     // The Vulkan resource contract gives the output STORAGE usage only: the engine's store must write it directly.
-    const bool rgb10 = presetM ? modelM->hasRgb10Output() : model->hasRgb10Output();
+    const bool store = presetM ? modelM->hasRgb10Output() && output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                               : model->hasDirectOutput(output.format);
     const bool direct = output.view != VK_NULL_HANDLE && output.layout == VK_IMAGE_LAYOUT_GENERAL &&
-        (output.format == VK_FORMAT_R16G16B16A16_SFLOAT || (rgb10 && output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32));
+        (output.format == VK_FORMAT_R16G16B16A16_SFLOAT || store);
     if (!direct)
-        return refuse("the output must be an RGBA16F (or RGB10A2) storage image the engine writes directly");
+        return refuse("the output must be a storage image, in a format with a final store, that the engine writes directly");
     if (resources[4]->resource.image.width != feature.outWidth || resources[4]->resource.image.height != feature.outHeight)
         return refuse("the output does not match the feature's output size");
 
@@ -1091,6 +1139,8 @@ static bool native_vk_engine(NativeVkFeature& owner, VkCommandBuffer cmd, void* 
             settings.renderWidth = params.renderWidth; settings.renderHeight = params.renderHeight;
             settings.jitter[0] = params.jitterX; settings.jitter[1] = params.jitterY;
             settings.displayMotion = displayMotion;
+            // as in the D3D12 path: only the accuracy stages repeat the CUDA backend's binary16 conversion
+            settings.canonicalColor = settings.canonicalMotion = model->hasAccuracyStages();
             const float toOutput = displayMotion ? 1.0f : float(feature.outWidth) / float(params.renderWidth);
             const float toOutputY = displayMotion ? 1.0f : float(feature.outHeight) / float(params.renderHeight);
             settings.motionScale[0] = params.mvScaleX * toOutput; settings.motionScale[1] = params.mvScaleY * toOutputY;
@@ -1180,7 +1230,9 @@ D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd, const
         void* resource = nullptr;
         d4r_ngx_get_void(p, names[i], &resource);
         if (i == 3 && !resource) { native_vk_free_plane(frame->planes[3]); continue; }
-        if (!native_vk_plane(frame->planes[i], static_cast<NgxVkResource*>(resource), i, !pending))
+        const bool floatPlanes = env_uint("D4R_PREFER_ACCURACY", 0) == 0 && !owner.feature->rayReconstruction && env_uint("D4R_MOTION_DILATION", 0) == 0 &&
+                                 env_uint("D4R_SHIM_F32_INPUTS", 1) != 0;
+        if (!native_vk_plane(frame->planes[i], static_cast<NgxVkResource*>(resource), i, !pending, floatPlanes))
         {
             if (resource)
             {
@@ -1241,7 +1293,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd, const
         auto& plane = frame->planes[i];
         if (!plane.buffer) continue;
         native_vk_ownership(cmd, plane, false);
-        g_nativeVkStaging.record(cmd, plane.staging, plane.image.width, plane.image.height, i + 1);
+        g_nativeVkStaging.record(cmd, plane.staging, plane.image.width, plane.image.height,
+                                 plane.asFloat ? (i == 0 ? 6 : 7) : i + 1);
     }
     auto& resultPlane = frame->planes[4];
     if (resultPlane.cuda) {

@@ -29,7 +29,8 @@ struct OutputParams {
 };
 constexpr uint32_t FrameFlagReset = 1, FrameFlagRegularDepth = 2, FrameFlagDisplayMotion = 4;
 // The colour / motion texels go through the CUDA backend's binary16 canonical conversion (input_quant.glsl): set
-// for textures whose format is not exact in binary16 (FrameSettings::canonicalColor / canonicalMotion).
+// by the accuracy stages for textures whose format is not exact in binary16 (FrameSettings::canonicalColor /
+// canonicalMotion). The default stages read the texels as they are.
 constexpr uint32_t FrameFlagCanonicalColor = 16, FrameFlagCanonicalMotion = 32;
 // OutputParams::flags only: the reconstruction table of this frame, 0..15 (kReconstructionTable). A model
 // holding a single table ignores it.
@@ -49,7 +50,8 @@ struct FrameImages {
     VkImageView exposure = VK_NULL_HANDLE;
     VkImageLayout exposureLayout = VK_IMAGE_LAYOUT_GENERAL;
 };
-// A borrowed storage view in GENERAL. Its format selects the final store pipeline.
+// A borrowed storage view in GENERAL. Its format selects the final store pipeline. With no view, the frame stores to
+// the engine's own image for the caller to copy from (Engine::outputImage), and format names the copy's destination.
 struct FrameOutput {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -191,7 +193,9 @@ public:
     // two stamps, the first before the store). The caller runs the network on the GPU between the two parts.
     void recordFront(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
     void recordBack(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
-    VkImage outputImage() const; // RGBA16F, GENERAL, ready for a transfer read after recordFrame
+    VkImage outputImage() const; // GENERAL, ready for a transfer read after recordFrame
+    // The frame's image holds the destination's bits, for vkCmdCopyImage; otherwise it is RGBA16F, for a blit (or read)
+    bool outputCopyIsRaw() const;
     HistoryImages historyImages() const; // most recently recorded frame, GENERAL
     VkBuffer headBuffer() const;
     VkDeviceSize headBytes() const;
@@ -224,7 +228,7 @@ public:
     // dot2: the network, input and expansion stages for GPUs without cooperative matrices or FP8 (RDNA2), the
     // model directory's *_dot2.spv (D4R_ENGINE_M_NETWORK=dot2|matrix overrides); presets M and L
     MModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache = VK_NULL_HANDLE,
-           bool dot2 = false);
+           bool dot2 = false, bool wide = false);
     ~MModel();
     MModel(const MModel&) = delete;
     MModel& operator=(const MModel&) = delete;
@@ -232,6 +236,8 @@ public:
     bool uploadRecorded() const;
     bool hasExternalNetworkStages() const; // the model directory has the plane-layout input and expansion stages
     bool hasRgb10Output() const;
+    bool hasDirectOutput(VkFormat format) const; // the final store can write a borrowed output of this format
+    bool hasWideStages() const; // the f16 stage set around a vkhip network (RDNA3)
     bool hasDynamicResolution() const; // active-rectangle sampling: D4RM0004 / D4RL0002
     bool hasDisplayMotion() const;     // display-resolution motion vectors (MFrameSettings::displayMotion): D4RM0005, L's dot2
     bool isPresetL() const;    // a preset L model directory (offsets.bin D4RL0002): MEngine then runs preset L
@@ -251,6 +257,8 @@ public:
     // external networks retain their constructor grid. A size change resets temporal history.
     MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uint32_t outputWidth, uint32_t outputHeight, const ExternalNetwork* external = nullptr);
     static VkDeviceSize networkBufferBytes(uint32_t renderWidth, uint32_t renderHeight);
+    // wide preset L: ExternalNetwork's tokens hold the gathered features and its head the native expansion's blocks
+    static VkDeviceSize lStageBufferBytes(uint32_t renderWidth, uint32_t renderHeight, bool head);
     ~MEngine();
     MEngine(const MEngine&) = delete;
     MEngine& operator=(const MEngine&) = delete;
@@ -265,7 +273,8 @@ public:
     // three stamps) and the back (expansion, reconstruction, downsample; four stamps, the first before the expansion).
     void recordFront(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
     void recordBack(VkCommandBuffer command, VkQueryPool stamps = VK_NULL_HANDLE, uint32_t first = 0);
-    VkImage outputImage() const; // RGBA16F, GENERAL
+    VkImage outputImage() const; // GENERAL; RGBA16F, unless outputCopyIsRaw
+    bool outputCopyIsRaw() const; // the frame's image holds the destination's bits, for vkCmdCopyImage
     // Development: the engine's intermediate buffers and render-resolution images (GENERAL), for replays that compare
     // them with a capture. Valid while the engine lives; read them only after a recorded frame has completed.
     struct DebugResource { const char* name; VkBuffer buffer; VkImage image; VkDeviceSize bytes; uint32_t width, height; };
