@@ -142,6 +142,7 @@ public:
     bool hasGameExposure() const; // packaged shaders read FrameImages::exposure (exposure flag 4)
     bool hasRatioTables() const; // lut.bin holds all sixteen reconstruction tables, not only one ratio's
     bool hasAccuracyStages() const; // reconstruction compiled with D4R_ACCURACY
+    unsigned linearLighting() const;   // 0, 50 or 100: share of the K reconstruction blended in linear light
     bool hasRgb10Output() const; // a packaged RGB10A2 final-store variant is available
     bool hasDirectOutput(VkFormat format) const; // the final store can write a borrowed output of this format
     bool dot2Network() const; // the network runs layer_dot2.comp (no cooperative matrices)

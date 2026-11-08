@@ -30,6 +30,7 @@
  * here from d4r\nvngx.dll, before OptiScaler's file hooks exist.
  * The outcome is written to d4r\d4r_boot.log. */
 #include <windows.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -550,6 +551,112 @@ static void setup_dlssg(void)
 /* [RayReconstruction] Backend = fsr runs AMD's denoiser, whose FP8 matrix shaders need dxil-spirv's RDNA 3 emulation
  * (and enable d4r's vkd3d built-in replacements of its slowest layers): DXIL_SPIRV_CONFIG=wmma_rdna3_workaround,
  * read by vkd3d-proton through GetEnvironmentVariableA after this runs. A value already in the environment wins. */
+/* ---------------------------------------------------------------- experimental: one 64-bit game value */
+
+/* D4R_BOOT_PATCH_U64=VALUE:BITS (hex): a thread waits for VALUE to appear in the game's committed read-write memory,
+ * ORs BITS into every 8-byte-aligned copy (only when there are 1 to 16 of them), and checks again for 30 seconds in
+ * case the game recomputes it. Diagnostics for per-game feature flags (Crimson Desert's "Graphics features value",
+ * where 0x80000 is AMD FSR Ray Regeneration). Memory is read and written through Read/WriteProcessMemory, so a page
+ * that goes away during the scan fails the call instead of faulting. Results go to d4r\d4r_boot.log. */
+static unsigned long long g_patchValue, g_patchBits;
+
+static void patch_log(const char *fmt, ...)
+{
+    wchar_t path[MAX_PATH + 32];
+    _snwprintf(path, MAX_PATH + 32, L"%ls\\d4r\\d4r_boot.log", g_dir);
+    path[MAX_PATH + 31] = 0;
+    FILE *f = _wfopen(path, L"a");
+    if (!f)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static int patch_scan(int write)
+{
+    static unsigned char buffer[1 << 20];
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    unsigned char *at = (unsigned char *)si.lpMinimumApplicationAddress;
+    const unsigned long long patched = g_patchValue | g_patchBits;
+    int hits = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (at < (unsigned char *)si.lpMaximumApplicationAddress && VirtualQuery(at, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        const DWORD p = mbi.Protect;
+        /* the region holding this scan's own buffer is skipped: a copy read into it would count again */
+        const int ownBuffer = buffer >= (unsigned char *)mbi.BaseAddress && buffer < next;
+        if (mbi.State == MEM_COMMIT && !(p & (PAGE_GUARD | PAGE_NOACCESS)) && (p & (PAGE_READWRITE | PAGE_WRITECOPY)) &&
+            !ownBuffer) {
+            for (SIZE_T off = 0; off < mbi.RegionSize; off += sizeof(buffer)) {
+                SIZE_T want = mbi.RegionSize - off < sizeof(buffer) ? mbi.RegionSize - off : sizeof(buffer), got = 0;
+                unsigned char *src = (unsigned char *)mbi.BaseAddress + off;
+                if (!ReadProcessMemory(GetCurrentProcess(), src, buffer, want, &got))
+                    continue;
+                for (SIZE_T i = 0; i + 8 <= got; i += 8) {
+                    unsigned long long v;
+                    memcpy(&v, buffer + i, 8);
+                    if (v != g_patchValue)
+                        continue;
+                    ++hits;
+                    if (write)
+                        WriteProcessMemory(GetCurrentProcess(), src + i, &patched, 8, NULL);
+                }
+            }
+        }
+        at = next;
+    }
+    return hits;
+}
+
+static DWORD WINAPI patch_thread(LPVOID unused)
+{
+    (void)unused;
+    int patchedAt = -1;
+    for (int second = 0; second < 300; ++second) {
+        Sleep(1000);
+        const int hits = patch_scan(0);
+        if (hits == 0) {
+            if (patchedAt >= 0 && second - patchedAt >= 30)
+                break;
+            continue;
+        }
+        if (hits > 16) {
+            patch_log("patch: %d copies of 0x%016llx at %d s; not patching", hits, g_patchValue, second);
+            break;
+        }
+        patch_scan(1);
+        patch_log("patch: %d copies of 0x%016llx at %d s set to 0x%016llx", hits, g_patchValue, second,
+                  g_patchValue | g_patchBits);
+        patchedAt = second;
+    }
+    patch_log("patch: watcher finished");
+    return 0;
+}
+
+static void setup_patch(void)
+{
+    wchar_t spec[96];
+    if (!GetEnvironmentVariableW(L"D4R_BOOT_PATCH_U64", spec, 96))
+        return;
+    wchar_t *colon = wcschr(spec, L':');
+    if (!colon)
+        return;
+    *colon = 0;
+    g_patchValue = wcstoull(spec, NULL, 16);
+    g_patchBits = wcstoull(colon + 1, NULL, 16);
+    if (!g_patchValue || !g_patchBits)
+        return;
+    logf_("patch: watching for 0x%016llx, setting 0x%llx", g_patchValue, g_patchBits);
+    HANDLE thread = CreateThread(NULL, 0, patch_thread, NULL, 0, NULL);
+    if (thread)
+        CloseHandle(thread);
+}
+
 static void setup_fsr_rr(void)
 {
     wchar_t backend[32];
@@ -638,6 +745,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     setup();
     setup_dlssg();
     setup_fsr_rr();
+    setup_patch();
     preload_vkd3d();
     if (g_log) {
         fclose(g_log);

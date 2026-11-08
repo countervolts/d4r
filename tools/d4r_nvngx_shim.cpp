@@ -637,6 +637,16 @@ static void load_portable_config()
         portable_set("D4R_DLSS_PRESET", model);
     // [OptiScaler] FollowPresets: its Render Presets Override picks the model in game (d4r_render_presets.h);
     // Fsr4: OptiScaler and AMD's FidelityFX modules see the real GPU, for its FSR 4 option (d4r_fsr4_identity.h).
+    // [DLSS] LinearLighting: off | half | full (or 0 / 0.5 / 1): preset K's reconstruction blends highlights in
+    // linear light, as preset L does, instead of on range-compressed luma (brighter small lights, a little more
+    // shimmer on thin bright detail). LDR games: undoes a Reinhard tone map around the blend. PreferAccuracy keeps NVIDIA's blend.
+    {
+        const std::string linear = ascii_lower(ini_value(ini, "dlss", "LinearLighting"));
+        if (linear == "half" || linear == "0.5" || linear == "50")
+            portable_set("D4R_ENGINE_K_LINEAR_LIGHTING", "50");
+        else if (linear == "full" || linear == "1" || linear == "on" || linear == "true" || linear == "100")
+            portable_set("D4R_ENGINE_K_LINEAR_LIGHTING", "100");
+    }
     if (ini_flag(ini, "optiscaler", "FollowPresets", 1) == 0)
         portable_set("D4R_FOLLOW_OPTISCALER", "0");
     if (ini_flag(ini, "optiscaler", "Fsr4", 1) == 0)
@@ -9692,7 +9702,8 @@ static void init_engine_backend()
     logf("engine backend: model %s loaded and pipelines compiled in %.0f ms (network: %s)", path.c_str(),
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
          g_engine.model->dot2Network() ? "v_dot2, no cooperative matrices" : "cooperative matrices");
-    logf("engine backend: K reconstruction uses %s stages", g_engine.model->hasAccuracyStages() ? "accuracy" : "fast");
+    logf("engine backend: K reconstruction uses %s stages%s", g_engine.model->hasAccuracyStages() ? "accuracy" : "fast",
+         g_engine.model->linearLighting() == 100 ? ", linear lighting full" : g_engine.model->linearLighting() == 50 ? ", linear lighting half" : "");
 }
 
 static void init_engine_backend_ldr()
@@ -9714,7 +9725,8 @@ static void init_engine_backend_ldr()
                                                          env_uint("D4R_PREFER_ACCURACY", 0) != 0);
         g_engine.directoryLdr = path;
         logf("engine backend: LDR model %s loaded", path.c_str());
-        logf("engine backend: K LDR reconstruction uses %s stages", g_engine.modelLdr->hasAccuracyStages() ? "accuracy" : "fast");
+        logf("engine backend: K LDR reconstruction uses %s stages%s", g_engine.modelLdr->hasAccuracyStages() ? "accuracy" : "fast",
+             g_engine.modelLdr->linearLighting() == 100 ? ", linear lighting full" : g_engine.modelLdr->linearLighting() == 50 ? ", linear lighting half" : "");
     }
     catch (const std::exception& error)
     {

@@ -315,6 +315,11 @@ build_target() {
     for f in "$STAGE/d4r/kernels/$folder"/*.hsaco; do
       # the fast set's native hiluma input kernels have no accuracy build: that set keeps ZLUDA's compile
       [[ "$(basename "$f")" == hiluma_engine_input_* ]] && continue
+      # preset L's vkhip network kernels (kernels/build.sh build_l_net) have one build for both sets
+      if [[ "$(basename "$f")" == rrlite_*l_net.hsaco ]]; then
+        [[ -e "$accurate/$(basename "$f")" ]] || cp "$f" "$accurate/"
+        continue
+      fi
       [[ -f "$accurate/$(basename "$f")" ]] || {
         echo "missing accuracy variant of $(basename "$f") for $folder" >&2; exit 2;
       }

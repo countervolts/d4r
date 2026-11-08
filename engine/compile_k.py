@@ -229,6 +229,15 @@ def main():
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-D{define}=1',
                         *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
                         '-o', str(a.output / f'output_k_{store}.spv')], check=True)
+    # [DLSS] LinearLighting: the fast stages with half and all of the blend in linear light (output_k.comp LIN_BLEND)
+    if True:
+        for blend, suffix in (('0.5', '_lin50'), ('1.0', '_lin100')):
+            for define, store in ((None, 'output_k'), ('OUTPUT_RGB10', 'output_k_rgb10'), ('OUTPUT_RGBA8', 'output_k_store_rgba8'),
+                                  ('OUTPUT_R11G11B10', 'output_k_store_r11g11b10'), ('OUTPUT_RGBA32F', 'output_k_store_rgba32f'),
+                                  ('OUTPUT_BGRA8', 'output_k_store_bgra8'), ('OUTPUT_E5B9G9R9', 'output_k_store_e5b9g9r9')):
+                subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-DLIN_BLEND={blend}',
+                                *([f'-D{define}=1'] if define else []), *(['-DLDR=1'] if a.ldr else []), str(HERE / 'output_k.comp'),
+                                '-o', str(a.output / f'{store}{suffix}.spv')], check=True)
     if a.hip_accuracy:
         for define, store in ((None, ''), ('OUTPUT_RGB10', '_rgb10'), ('OUTPUT_RGBA8', '_store_rgba8'),
                               ('OUTPUT_R11G11B10', '_store_r11g11b10')):

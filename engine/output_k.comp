@@ -56,6 +56,30 @@ layout(set = 0, binding = 10, std430) readonly buffer Head { float16_t h[]; } he
 layout(set = 0, binding = 11, std430) readonly buffer Lut { uvec4 e[]; } lut;
 shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
 shared float tileD[576];
+// LIN_BLEND (0 .. 1, unset by default): how much of the temporal blend and of the 2x2 resolve happens in linear light
+// instead of on the range-compressed luma L / (1 + L). Averaging compressed values loses the energy of anything
+// bright (the curve is concave), which mutes small lights and highlights; 1 blends as light adds up.
+// LIN_FILTER (0 or 1): the network-shaped spatial filter of the current frame's luma also sums linear luma.
+// LDR colour is display-referred, i.e. already tone mapped: LIN_BLEND then undoes a Reinhard curve with a white point
+// (v / (1.02 - v), exactly inverted by 1.02 L / (1 + L)), blends, and maps back. LIN_FILTER is HDR only.
+// Never with D4R_ACCURACY. Unset, both compile to the reference stage.
+#ifndef LIN_FILTER
+#define LIN_FILTER 0
+#endif
+#ifndef LDR
+#define LDR 0
+#endif
+#if !LDR && !defined(D4R_ACCURACY) && LIN_FILTER
+#define K_LIN_FILTER 1
+shared float tileL[576];       // linear exposed luma of the footprint
+#else
+#define K_LIN_FILTER 0
+#endif
+#if !defined(D4R_ACCURACY) && defined(LIN_BLEND)
+#define K_LIN_BLEND 1
+#else
+#define K_LIN_BLEND 0
+#endif
 
 // LDR (NGX's *_ldr_* kernels, the game did not set the HDR flag): display-referred colour, no range compression
 #ifndef LDR
@@ -99,6 +123,15 @@ float expandK(float v)
 }
 #endif
 float roundHalfAway(float x) { const float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
+#if K_LIN_BLEND
+#if LDR
+float linExpand(float v) { const float c = clamp(v, 0.0, 1.0); return c / (1.02 - c); }
+float linCompress(float L) { return (1.02 * L) / (1.0 + L); }
+#else
+float linExpand(float v) { return v * expandK(v); }
+float linCompress(float L) { return L * compressK(L); }
+#endif
+#endif
 ivec2 clampOrigin(ivec2 v, ivec2 origin, ivec2 hi)      // the reference's clamp: origin for v <= 0, else min(v + origin, hi)
 {
     return ivec2(v.x > 0 ? min(v.x + origin.x, hi.x) : origin.x, v.y > 0 ? min(v.y + origin.y, hi.y) : origin.y);
@@ -191,6 +224,9 @@ void main()
         const float Y = 0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
         const float L = p.expo * Y;
         const float k = compressK(L);
+#if K_LIN_FILTER
+        tileL[TI(t.y, t.x)] = L;
+#endif
         tileC[TI(t.y, t.x)] = f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a);
         // larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones
         if (!displayMv)
@@ -364,6 +400,9 @@ void main()
     // that tap as it goes: a second pass over the taps, run only where the sum of weights allowed it, ran for most
     // waves on a Steam Deck (one such pixel suffices) and cost 0.2 ms of 4.3 at 1080p.
     f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0), eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
+#if K_LIN_FILTER
+    vec4 sumL = vec4(0.0);
+#endif
     float16_t line = cB + (float16_t(a0) - cA) * slope;
     for (int r = 0; r < 4; ++r)
     {
@@ -383,13 +422,21 @@ void main()
             const f16vec4 E = fma(db * db, f16vec4(e1), lin);
             const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + TJ(j, stepB)].x);
             sumY = fma(w, Y, sumY); sumW += w;
+#if K_LIN_FILTER
+            sumL = fma(vec4(w), vec4(tileL[ti + TJ(j, stepB)]), sumL);
+#endif
             const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
             eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
             db += float16_t(1.0); lin += cross;
         }
         line += slope;
     }
+#if K_LIN_FILTER
+    vec4 F = sumL / vec4(sumW);
+    for (int s = 0; s < 4; ++s) F[s] *= compressK(F[s]);
+#else
     vec4 F = vec4(sumY) / vec4(sumW);
+#endif
     F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
     // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads
     // it as an f16 value widened to f32 (dlss-0046 converts every lane with cvt.rn.f16.f32 before the
@@ -418,7 +465,21 @@ void main()
     const vec4 bl = vec4(clamp(fma(conf, f16vec4(hv - lo), f16vec4(lo)), float16_t(0.0), float16_t(1.0)));
     if (!(abs(cur.x * F.x * F.y * F.z * F.w) < uintBitsToFloat(0x7F800000u))) { cur.xyz = vec3(0.0); F = vec4(0.0); }
     // a single-rounded fma, as the reference: fma.rn.ftz.f32 N, bl, F - Hq, Hq
+#if K_LIN_BLEND
+    vec4 N = fma(bl, F - Hq, Hq);
+    vec4 NL;                       // linear blend, for the resolve below
+    {
+        vec4 HL, FL, Nl;
+        for (int s = 0; s < 4; ++s) { HL[s] = linExpand(Hq[s]); FL[s] = linExpand(F[s]); }
+        NL = max(fma(bl, FL - HL, HL), 0.0);
+        for (int s = 0; s < 4; ++s) Nl[s] = linCompress(NL[s]);
+        if (LIN_BLEND < 1.0)
+            NL = mix(vec4(linExpand(N.x), linExpand(N.y), linExpand(N.z), linExpand(N.w)), NL, LIN_BLEND);
+        N = mix(N, Nl, LIN_BLEND);
+    }
+#else
     const vec4 N = fma(bl, F - Hq, Hq);
+#endif
     // Native averages the four f32 blend registers, before the encoded half-surface stores.
     {
         const vec4 enc = mix(fma(N - 0.99, vec4(1000.0), vec4(0.99)), N, lessThan(N, vec4(0.99)));
@@ -428,7 +489,16 @@ void main()
     }
     // the reference fuses the history product: fma(hc, 1 - alphaC, alphaC * cur)
     precise const vec3 C = fma(hc, vec3(1.0 - alphaC), alphaC * cur.xyz);
+#if K_LIN_BLEND
+    precise float Nm = 0.25 * (((N.x + N.y) + N.z) + N.w);
+    {
+        // the 2x2 sub-pixels resolve to the output pixel as light adds up, too
+        const float mL = 0.25 * (((NL.x + NL.y) + NL.z) + NL.w);
+        Nm = mix(Nm, linCompress(mL), LIN_BLEND);
+    }
+#else
     precise const float Nm = 0.25 * (((N.x + N.y) + N.z) + N.w);
+#endif
     // the reference's association: (C.Co * rcp(max(C.Y, 1e-5))) * Nm
     precise const float rY = 1.0 / max(C.x, 1e-5);
     precise const vec2 chroma = (C.yz * rY) * Nm;

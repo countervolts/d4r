@@ -13,6 +13,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
+#endif
+// A setting the shim exports from d4r.ini (SetEnvironmentVariable, which the C runtime's getenv may not see).
+static unsigned engine_env_uint(const char* name)
+{
+#ifdef _WIN32
+    char value[32] = {};
+    const unsigned long n = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (n == 0 || n >= sizeof(value)) return 0;
+    return unsigned(std::strtoul(value, nullptr, 10));
+#else
+    const char* v = std::getenv(name);
+    return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0;
+#endif
+}
 
 namespace d4r {
 static_assert(sizeof(InputParams) == 128);
@@ -411,6 +427,7 @@ struct Model::Impl {
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
          hasGameExposure = false, hasRatioTables = false, accuracyStages = false, dot2 = false;
+    unsigned linearLighting = 0;   // percent of the K reconstruction's blend done in linear light (output_k.comp LIN_BLEND)
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
 Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network,
@@ -506,7 +523,16 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     // Older packages retain their existing stage. New accuracy packages provide a separate shader for each
     // final-store format; the fast paths continue to load exactly their original files.
     m.accuracyStages = accuracy && exists(directory + "/output_k_accuracy.spv");
+    // [DLSS] LinearLighting (D4R_ENGINE_K_LINEAR_LIGHTING = 50 or 100): the fast HDR stages built with LIN_BLEND
+    // (output_k*_lin50.spv, _lin100.spv) blend and resolve that share of the luma in linear light. A model folder
+    // without them (LDR, older packages) keeps its own stages.
+    const unsigned linear = engine_env_uint("D4R_ENGINE_K_LINEAR_LIGHTING");
+    const std::string linSuffix = linear >= 75 ? "_lin100" : linear >= 25 ? "_lin50" : "";
+    m.linearLighting = !m.accuracyStages && !linSuffix.empty() && exists(directory + "/output_k" + linSuffix + ".spv")
+                           ? (linear >= 75 ? 100 : 50) : 0;
     const auto outputFile = [&](const char* name) {
+        if (m.linearLighting && exists(directory + "/" + name + linSuffix + ".spv"))
+            return directory + "/" + name + linSuffix + ".spv";
         return directory + "/" + name + (m.accuracyStages ? "_accuracy.spv" : ".spv");
     };
     m.output.create(device, outputFile("output_k"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
@@ -535,6 +561,7 @@ bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
 bool Model::hasAccuracyStages() const { return impl->accuracyStages; }
+unsigned Model::linearLighting() const { return impl->linearLighting; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
 bool Model::hasDirectOutput(VkFormat format) const { return impl->outputFor(format) != nullptr; }
 bool Model::dot2Network() const { return impl->dot2; }

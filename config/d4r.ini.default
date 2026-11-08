@@ -37,6 +37,11 @@ GameExe =
 ; Aliases: CNN = E, DLSS4 = K, DLSS4.5 = M. A/B/C/D/G/J use K in this DLL version.
 ; auto = use the game/OptiScaler choice. Benchmarks: docs/performance.md.
 Model = K
+; LinearLighting: preset K's reconstruction blends highlights in linear light, as preset L does, instead of on
+; range-compressed (or, in LDR games, tone mapped) colour: small lights, neon and bright windows keep their brightness.
+; off (default) | half | full. Costs about 0.005 ms at 1080p/1440p and 0.02 ms at 4K; adds some shimmer on thin,
+; very bright detail (more with full). Most visible below DLAA. PreferAccuracy keeps NVIDIA's blend.
+LinearLighting = off
 
 [RayReconstruction]
 ; Runs NVIDIA's nvngx_dlssd.dll denoiser, separate from Super Resolution.

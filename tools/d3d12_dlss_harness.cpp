@@ -437,8 +437,12 @@ static void render_jittered_background(std::vector<uint16_t>& color, UINT width,
 // detail near and below the render pixel pitch (blinds, thin poles, fine
 // diagonals), rendered like a game feeds DLSS: one jittered point sample per
 // render pixel. Coordinates are in output pixels.
+static float quality_scene_hdr(float x, float y, UINT outWidth, UINT outHeight);
+static bool quality_hdr();
 static float quality_scene(float x, float y, UINT outWidth, UINT outHeight)
 {
+    if (quality_hdr())
+        return quality_scene_hdr(x, y, outWidth, outHeight);
     const float u = x / outWidth, v = y / outHeight;
     auto frac = [](float value) { return value - std::floor(value); };
     if (u > 0.05f && u < 0.45f && v > 0.1f && v < 0.9f) // blinds: 5 px period, 35% slat
@@ -449,6 +453,44 @@ static float quality_scene(float x, float y, UINT outWidth, UINT outHeight)
         return frac((x + y) / 6.0f) < 0.25f ? 0.8f : 0.12f;
     return 0.3f + 0.1f * std::sin(u * 6.0f) * std::cos(v * 5.0f);
 }
+
+// HDR quality scene (D4R_HARNESS_QUALITY_HDR=1 with the quality scene): scene-referred content far above 1, where
+// the space an upscaler accumulates in decides how much light survives. Four regions, in output pixels:
+//   0 sparkles: point lights of radius 0.35 px (value 40) on a 9 px grid over 0.04, far below the render pitch,
+//     so each is sampled only on some jitter phases (specular glints, small lamps);
+//   1 neon: diagonal lines 0.8 px wide (value 6) every 11 px over 0.05;
+//   2 bright blinds: 5 px period, 35% slat at 4.0 over 0.08 (a window against a dark room);
+//   3 gradient: smooth 0.2 .. 8 ramp (content without detail, which should not change).
+// Everything else is the dim 0.3 background. D4R_HARNESS_QUALITY_HDR=2 feeds it tone mapped (x / (1 + x)), as an LDR
+// game does (run it with LDR create flags); the metrics then expand the output with the inverse curve.
+static int quality_hdr_region(float u, float v)
+{
+    if (u > 0.05f && u < 0.45f && v > 0.1f && v < 0.45f) return 0;
+    if (u > 0.55f && u < 0.95f && v > 0.1f && v < 0.45f) return 1;
+    if (u > 0.05f && u < 0.45f && v > 0.55f && v < 0.9f) return 2;
+    if (u > 0.55f && u < 0.95f && v > 0.55f && v < 0.9f) return 3;
+    return -1;
+}
+static float quality_scene_hdr(float x, float y, UINT outWidth, UINT outHeight)
+{
+    const float u = x / outWidth, v = y / outHeight;
+    auto frac = [](float value) { return value - std::floor(value); };
+    switch (quality_hdr_region(u, v))
+    {
+    case 0: { const float dx = frac(x / 9.0f) * 9.0f - 4.5f, dy = frac(y / 9.0f) * 9.0f - 4.5f;
+              return dx * dx + dy * dy < 0.35f * 0.35f ? 40.0f : 0.04f; }
+    case 1: return frac((x - y) / 11.0f) * 11.0f < 0.8f * 1.41421356f ? 6.0f : 0.05f;
+    case 2: return frac(y / 5.0f) < 0.35f ? 4.0f : 0.08f;
+    case 3: return 0.2f * std::pow(40.0f, (u - 0.55f) / 0.4f);
+    default: return 0.3f;
+    }
+}
+static int quality_hdr_mode()
+{
+    static const int mode = std::getenv("D4R_HARNESS_QUALITY_HDR") ? std::atoi(std::getenv("D4R_HARNESS_QUALITY_HDR")) : 0;
+    return mode;
+}
+static bool quality_hdr() { return quality_hdr_mode() != 0; }
 
 // Pole and cable geometry resembling the reported Townfall failure. All
 // positions are in output pixels, so both resource-width cases get identical
@@ -1743,7 +1785,7 @@ int main(int argc, char** argv)
     if (qualityScene && !poleScene)
     {
         truth.resize(static_cast<size_t>(canvasWidth) * canvasHeight);
-        const int truthSamples = poleScene ? 2 : 8;
+        const int truthSamples = poleScene ? 2 : quality_hdr() ? 12 : 8;
         for (int y = 0; y < canvasHeight; ++y)
             for (int x = 0; x < canvasWidth; ++x)
             {
@@ -1839,8 +1881,9 @@ int main(int argc, char** argv)
                     const float value = poleScene
                         ? pole_scene(sampleX, sampleY, outWidth, outHeight)
                         : quality_scene(sampleX, sampleY, outWidth, outHeight);
+                    const float fed = quality_hdr_mode() == 2 ? value / (1.0f + value) : value;
                     const size_t pixel = static_cast<size_t>(y) * resourceWidth + x;
-                    const uint16_t half = std::bit_cast<uint16_t>(static_cast<_Float16>(value));
+                    const uint16_t half = std::bit_cast<uint16_t>(static_cast<_Float16>(fed));
                     color[pixel * 4 + 0] = color[pixel * 4 + 1] = color[pixel * 4 + 2] = half;
                     color[pixel * 4 + 3] = 0x3c00u;
                 }
@@ -2233,6 +2276,64 @@ int main(int argc, char** argv)
                     blindsSquared += static_cast<double>(error[pixel]) * error[pixel];
                     ++blindsPixels;
                 }
+            }
+            if (quality_hdr())
+            {
+                // Scene-referred metrics: unclamped luma per region, its energy against the truth's, and the
+                // error and frame-to-frame change after a Reinhard tone map x / (1 + x) (what a display shows).
+                double outSum[5] = {}, truthSum[5] = {}, tmSquared[5] = {};
+                size_t count[5] = {};
+                double tmChange = 0.0;
+                static std::vector<float> previousTm;
+                std::vector<float> tm(pixels);
+                for (size_t pixel = 0; pixel < pixels; ++pixel)
+                {
+                    float value = 0.0f;
+                    for (int channel = 0; channel < 3; ++channel)
+                        value += static_cast<float>(std::bit_cast<_Float16>(halves[pixel * 4 + channel]));
+                    float luma = std::max(value / 3.0f, 0.0f);
+                    if (quality_hdr_mode() == 2) { const float c = std::min(luma, 0.999f); luma = c / (1.0f - c); }
+                    const int cx = static_cast<int>(pixel % outWidth) - shownFrame * panX;
+                    const int cy = static_cast<int>(pixel / outWidth) - shownFrame * panY;
+                    const float target = truth[static_cast<size_t>(cy - canvasY0) * canvasWidth + (cx - canvasX0)];
+                    const int region = quality_hdr_region(static_cast<float>(cx) / outWidth, static_cast<float>(cy) / outHeight);
+                    const int slot = region < 0 ? 4 : region;
+                    tm[pixel] = luma / (1.0f + luma) - target / (1.0f + target);
+                    outSum[slot] += luma; truthSum[slot] += target;
+                    tmSquared[slot] += static_cast<double>(tm[pixel]) * tm[pixel]; ++count[slot];
+                    if (!previousTm.empty())
+                        tmChange += std::fabs(tm[pixel] - previousTm[pixel]);
+                }
+                if (!previousTm.empty())
+                    tmChange /= static_cast<double>(pixels);
+                const bool haveChange = !previousTm.empty();
+                previousTm = tm;
+                static double accRatio[5], accPsnr[5], accFlicker;
+                static int accFrames, accFlickerFrames;
+                FILE* hdrReport = std::fopen(std::getenv("D4R_HARNESS_QUALITY_SCENE"), "a");
+                if (hdrReport == nullptr)
+                    hdrReport = stdout;
+                std::fprintf(hdrReport, "HDRQ frame=%d", frame);
+                static const char* names[5] = {"sparkle", "neon", "blinds", "gradient", "bg"};
+                for (int r = 0; r < 5; ++r)
+                {
+                    const double ratio = truthSum[r] > 0.0 ? outSum[r] / truthSum[r] : 0.0;
+                    const double psnr = 10.0 * std::log10(1.0 / std::max(tmSquared[r] / std::max<size_t>(count[r], 1), 1e-12));
+                    accRatio[r] += ratio; accPsnr[r] += psnr;
+                    std::fprintf(hdrReport, " %s_energy=%.4f %s_tm_psnr=%.2f", names[r], ratio, names[r], psnr);
+                }
+                ++accFrames;
+                if (haveChange) { accFlicker += tmChange; ++accFlickerFrames; }
+                std::fprintf(hdrReport, " tm_flicker=%.5f\n", tmChange);
+                if (frame == frames)
+                {
+                    std::fprintf(hdrReport, "HDRQ summary");
+                    for (int r = 0; r < 5; ++r)
+                        std::fprintf(hdrReport, " %s_energy=%.4f %s_tm_psnr=%.2f", names[r], accRatio[r] / accFrames, names[r], accPsnr[r] / accFrames);
+                    std::fprintf(hdrReport, " tm_flicker=%.5f\n", accFlickerFrames ? accFlicker / accFlickerFrames : 0.0);
+                }
+                if (hdrReport != stdout)
+                    std::fclose(hdrReport);
             }
             double change = 0.0;
             if (!previousError.empty())
