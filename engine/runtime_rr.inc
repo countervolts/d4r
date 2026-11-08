@@ -88,12 +88,51 @@ struct RModel::Impl {
     std::array<Pipeline, 2> exposure;
     std::vector<uint8_t> enc0Template, hkpnTemplate;
     bool uploaded = false;
+    // vkhip (RDNA3): the Swin stages enc1 ... dec1 as HIP code objects (engine/rr/hip/rr_swin.hip, built for this
+    // model's stage headers) run inside the engine's command buffer: same inputs, outputs and arithmetic as the GLSL
+    // stages. Kernel arguments are one 64-bit push constant (the address of the stage's RHipArgs); images reach the
+    // kernels as the driver's own descriptors (VK_EXT_descriptor_buffer's vkGetDescriptorEXT).
+    struct Hip {
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        std::array<VkPipeline, RStages> pipes{};
+        PFN_vkGetDescriptorEXT getDescriptor = nullptr;
+        bool enabled = false;
+        // encoder 0 on vkhip: the translated feature gather as its own Vulkan stage (MODEL/enc0_gather.spv, generated
+        // by engine/rr/gen_enc0_m.py --gather; enc0's bindings plus binding 23, the gather buffer), then the HIP rest
+        Pipeline gather;
+    } hip;
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
+    ~Impl() {
+        for (VkPipeline p : hip.pipes) if (p) vkDestroyPipeline(device.handle, p, nullptr);
+        if (hip.layout) vkDestroyPipelineLayout(device.handle, hip.layout, nullptr);
+    }
 };
+namespace {
+// D4R_ENGINE_RR_HIP=0 keeps the GLSL stages; otherwise a gfx11 model's Swin stages run from MODEL/hip/STAGE.hsaco
+// (or D4R_ENGINE_RR_HIP_DIR) when every one loads
+std::string rHipDirectory(const std::string& model) {
+    const char* off = std::getenv("D4R_ENGINE_RR_HIP");
+    if (off && std::strcmp(off, "0") == 0) return {};
+    const char* dir = std::getenv("D4R_ENGINE_RR_HIP_DIR");
+    const std::string d = dir && *dir ? std::string(dir) : model + "/hip";
+    return std::ifstream(d + "/enc1.hsaco").good() ? d : std::string();
+}
+// vkhip's donor keys must differ between pipelines and between processes (vkhip_net.cpp firstPipelineId)
+std::atomic<uint64_t> rHipNextId{[] {
+    uint64_t x = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                 uint64_t(std::chrono::system_clock::now().time_since_epoch().count()) ^ 0x52524849ull;
+    x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return ((x ^ (x >> 31)) & 0x7fffffffu) | 0x40000000u;
+}()};
+// a stage's kernel arguments (engine/rr/hip/rr_swin.hip RrArgs)
+struct RHipArgs { uint64_t param, weights, arena, desc; uint32_t weightBytes, arenaBytes; uint64_t aux; uint32_t auxBytes, pad; };
+constexpr uint32_t RHipSlot = 512, RHipDescAt = 64;   // per stage and parity: arguments, then the descriptor table
+} // namespace
 RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, bool int64Atomics,
                bool robustImages)
     : impl(std::make_unique<Impl>(physical, device)) {
     auto& m = *impl;
+    const std::string hipDir = rHipDirectory(directory);
     // the translated stages' specialization constant 0 (engine/rr/ptx2rr.py RR_ROBUST_IMAGES), set for every stage of the
     // model; shaders without it ignore it. Constant 0 is reserved for this: an RR shader must not declare it otherwise.
     const VkBool32 robust = VK_TRUE;
@@ -153,7 +192,7 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
             m.stages[stage].create(device, directory + "/" + shader, types, subgroup, cache, flags, specialization);
             auto blob = read(directory + "/" + weightFile);
             const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            m.weights[stage].create(m.device, blob.size(), usage);
+            m.weights[stage].create(m.device, blob.size(), usage, false, !hipDir.empty());
             m.weightBytes[stage] = std::move(blob);
             ++stage;
         } else if (key == "template") {
@@ -168,6 +207,56 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         throw std::runtime_error("rr.txt: incomplete Ray Reconstruction model");
     m.exposure[0].create(device, directory + "/exposure_rr0.spv", {b, t, b}, 64, cache);
     m.exposure[1].create(device, directory + "/exposure_rr1.spv", {b, b, b, s, s}, 64, cache);
+    if (!hipDir.empty() && m.gfx11) {
+        // every Swin stage or none (a failure keeps the GLSL stages; D4R_ENGINE_RR_HIP_LOG=1 says why)
+        std::string error;
+        auto& h = m.hip;
+        h.getDescriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(vkGetDeviceProcAddr(device, "vkGetDescriptorEXT"));
+        vkhip::Device vk;
+        if (!h.getDescriptor) error = "no VK_EXT_descriptor_buffer";
+        else if (!vk.load(device, vkGetDeviceProcAddr)) error = "vkhip entry points";
+        if (error.empty()) {
+            const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+            VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            li.pushConstantRangeCount = 1; li.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(device, &li, nullptr, &h.layout) != VK_SUCCESS) error = "pipeline layout";
+        }
+        // which stages: D4R_ENGINE_RR_HIP_STAGES (comma-separated names; default all). Each is faster than its GLSL
+        // form on an RX 7700 XT (2026-11-07) with enc4, enc5 and dec4 built from the sixteen-wave rr_swin_wide.hip.
+        const char* list = std::getenv("D4R_ENGINE_RR_HIP_STAGES");
+        const std::string wanted = "," + std::string(list && *list ? list : "all") + ",";
+        for (unsigned st = REnc0; st <= RDec0 && error.empty(); ++st) {
+            if (wanted != ",all," && wanted.find("," + std::string(RNames[st]) + ",") == std::string::npos) continue;
+            if (!std::ifstream(hipDir + "/" + RNames[st] + ".hsaco").good()) continue;   // that stage stays GLSL
+            if (st == REnc0 && !std::ifstream(directory + "/enc0_gather.spv").good()) continue;
+            const auto code = read(hipDir + "/" + RNames[st] + ".hsaco");
+            vkhip::Module module;
+            if (!module.parse(std::vector<uint8_t>(code.begin(), code.end()))) { error = std::string(RNames[st]) + ": " + module.error; break; }
+            // rr_swin_w16: the sixteen-wave form (engine/rr/hip/rr_swin_wide.hip), else rr_swin's four waves
+            uint32_t threads = 512;
+            auto k = module.kernels.find("rr_swin_w16");
+            if (k == module.kernels.end()) { threads = 128; k = module.kernels.find(st == RDec0 ? "rr_dec0" : st == REnc0 ? "rr_enc0" : "rr_swin"); }
+            if (k == module.kernels.end()) { error = std::string(RNames[st]) + ": no rr_swin kernel"; break; }
+            if (!module.sites.empty()) { error = std::string(RNames[st]) + ": the code addresses globals"; break; }
+            h.pipes[st] = vkhip::createPipeline(vk, h.layout, module, k->second, vkhip::Launch{threads, 1, 1}, 0,
+                                                static_cast<uint32_t>(rHipNextId++), error);
+            if (!h.pipes[st]) break;
+            if (st == REnc0) {
+                std::vector<VkDescriptorType> types{b, b, b};
+                types.insert(types.end(), m.textures[REnc0].size(), t);
+                types.insert(types.end(), m.surfaces[REnc0].size(), s);
+                types.push_back(b);
+                h.gather.create(device, directory + "/enc0_gather.spv", types, 32, cache, 0, specialization);
+            }
+        }
+        h.enabled = error.empty();
+        if (!h.enabled) {
+            for (VkPipeline& p : h.pipes) if (p) { vkDestroyPipeline(device, p, nullptr); p = VK_NULL_HANDLE; }
+        }
+        if (const char* log = std::getenv("D4R_ENGINE_RR_HIP_LOG"); log && *log && *log != '0')
+            std::fprintf(stderr, "d4r engine: RR Swin stages %s%s\n", h.enabled ? "on vkhip (" : "on GLSL: ",
+                         h.enabled ? (hipDir + ")").c_str() : error.c_str());
+    }
 }
 RModel::~RModel() = default;
 bool RModel::uploadRecorded() const { return impl->uploaded; }
@@ -193,6 +282,9 @@ struct REngine::Impl {
     std::unique_ptr<R2Engine> v2;   // preset F
     uint32_t rw, rh, ow, oh, w0, h0;
     Buffer arena, expP, expSums, expState;
+    Buffer snaps;   // debugging: D4R_ENGINE_RR_ARENA_SNAP=1, the arena after every network stage (host-visible)
+    Buffer hipArgs; // vkhip stages: RHipSlot bytes per stage and parity (RHipArgs, then the descriptor table)
+    Buffer gather;  // vkhip encoder 0: 4000 bytes per window (the gather stage's sh)
     std::array<Buffer, RStages> params;
     std::array<std::vector<uint8_t>, RStages> blocks;   // this frame's parameter blocks
     std::array<Tex, 6> s112, s120;  // per level: the encoders' surfaces (decoders' skip textures 96, 104)
@@ -307,9 +399,12 @@ REngine::REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     e.rw = renderWidth; e.rh = renderHeight; e.ow = outputWidth; e.oh = outputHeight;
     e.w0 = (renderWidth + 31) & ~31u; e.h0 = (renderHeight + 31) & ~31u;
     const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    e.arena.create(d, e.arenaOffset(RArenaUnits), storage);
+    const bool hip = e.model.hip.enabled;
+    e.arena.create(d, e.arenaOffset(RArenaUnits), storage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false, hip);
+    if (std::getenv("D4R_ENGINE_RR_ARENA_SNAP"))
+        e.snaps.create(d, e.arena.size * (RDec0 + 1), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     for (unsigned i = 0; i < RStages; ++i) {
-        e.params[i].create(d, RParamBytes[i], storage);
+        e.params[i].create(d, RParamBytes[i], storage, false, hip);
         e.blocks[i].assign(RParamBytes[i], 0);
     }
     e.expP.create(d, sizeof(ExposureParams), storage);
@@ -359,6 +454,52 @@ REngine::REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
             if (RArena[stage][k] >= 0) put64(p, offsets[k], e.arenaOffset(RArena[stage][k]));
         putF(p, 136, 1.0f / static_cast<float>(e.lw(l))); putF(p, 140, 1.0f / static_cast<float>(e.lh(l)));
     }
+    if (hip && e.model.hip.pipes[REnc0]) {   // the largest grid of the two window shifts (2 and 6)
+        const uint64_t windows = uint64_t((e.lw(0) + 6 + 7) / 8) * ((e.lh(0) + 6 + 7) / 8);
+        e.gather.create(d, windows * 4000, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, true);
+    }
+    if (hip) {
+        // the Swin stages read and write only the engine's own images, so their descriptors are fixed: per stage and
+        // parity T88 T96 T104 (sampled), S112 S120 S128 (storage), the linear sampler (rr_swin.hip RrArgs)
+        e.hipArgs.create(d, RHipSlot * RStages * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, true);
+        const VkDeviceAddress base = e.hipArgs.address();
+        auto get = [&](VkDescriptorType type, const void* data, uint8_t* to, size_t bytes) {
+            VkDescriptorGetInfoEXT gi{VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+            gi.type = type;
+            VkDescriptorImageInfo ii{};
+            if (type == VK_DESCRIPTOR_TYPE_SAMPLER) gi.data.pSampler = static_cast<const VkSampler*>(data);
+            else {
+                ii.imageView = *static_cast<const VkImageView*>(data); ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                if (type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) gi.data.pSampledImage = &ii; else gi.data.pStorageImage = &ii;
+            }
+            alignas(16) uint8_t tmp[256] = {};
+            e.model.hip.getDescriptor(d.handle, &gi, bytes, tmp);
+            std::memcpy(to, tmp, bytes);
+        };
+        const RFrameImages none{};
+        for (unsigned stage = REnc0; stage <= RDec0; ++stage)
+            for (uint32_t par = 0; par < 2; ++par) {
+                uint8_t* slot = static_cast<uint8_t*>(e.hipArgs.mapped) + RHipSlot * (2 * stage + par);
+                uint8_t* table = slot + RHipDescAt;
+                // decoder 0 writes surface 144 (RGBA8 SNORM, the output stage's ping-pong) in the second slot
+                const uint32_t texOffsets[3] = {88, 96, 104}, surfOffsets[3] = {112, stage == RDec0 ? 144u : 120u, 128};
+                for (int i = 0; i < 3; ++i) {
+                    const auto t = e.resolve(stage, false, texOffsets[i], par, none, VK_NULL_HANDLE);
+                    const VkImageView tv = t.view ? t.view : e.zero.view;
+                    get(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &tv, table + 32 * i, 32);
+                    const auto u = e.resolve(stage, true, surfOffsets[i], par, none, VK_NULL_HANDLE);
+                    const VkImageView uv = u.view ? u.view : e.spare.at(stage == RDec0 && i == 1 ? "rgba8_snorm" : "rgba16f").view;
+                    get(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &uv, table + 96 + 32 * i, 32);
+                }
+                get(VK_DESCRIPTOR_TYPE_SAMPLER, &e.linear, table + 192, 16);
+                const RHipArgs args{e.params[stage].address(), e.model.weights[stage].address(), e.arena.address(),
+                                    base + RHipSlot * (2 * stage + par) + RHipDescAt,
+                                    static_cast<uint32_t>(e.model.weights[stage].size), static_cast<uint32_t>(e.arena.size),
+                                    stage == REnc0 && e.gather.handle ? e.gather.address() : 0,
+                                    stage == REnc0 && e.gather.handle ? static_cast<uint32_t>(e.gather.size) : 0u, 0u};
+                std::memcpy(slot, &args, sizeof(args));
+            }
+    }
 }
 REngine::~REngine() = default;
 VkImage REngine::outputImage() const { return impl->v2 ? impl->v2->out.handle : impl->out.handle; }
@@ -382,6 +523,14 @@ std::vector<REngine::DebugImage> REngine::debugImages() const {
     }
     if (e.out.handle) list.push_back({"out", e.out.handle, half4, e.ow, e.oh});
     return list;
+}
+
+const void* REngine::debugArenaSnapshot(unsigned stage, size_t& bytes) const {
+    const auto& e = *impl;
+    bytes = 0;
+    if (e.v2 || !e.snaps.mapped || stage > RDec0) return nullptr;
+    bytes = e.arena.size;
+    return static_cast<const uint8_t*>(e.snaps.mapped) + e.arena.size * stage;
 }
 
 void REngine::recordInitialize(VkCommandBuffer cb) {
@@ -534,7 +683,7 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
             textures += static_cast<uint32_t>(e.model.textures[stage].size());
             surfaces += static_cast<uint32_t>(e.model.surfaces[stage].size());
         }
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * 3 * RStages + 3},
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * 3 * RStages + 3 + 2},
                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * textures + 1},
                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * surfaces}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -543,7 +692,9 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
         const VkImageView output = frameOutput;
         for (unsigned stage = 0; stage < RStages; ++stage) {
             for (uint32_t par = 0; par < 2; ++par) {
-                VkDescriptorSet set = b.stages[stage][par] = descriptorSet(d.handle, b.pool, e.model.stages[stage].descriptors);
+                const bool gatherStage = stage == REnc0 && e.gather.handle;
+                VkDescriptorSet set = b.stages[stage][par] =
+                    descriptorSet(d.handle, b.pool, gatherStage ? e.model.hip.gather.descriptors : e.model.stages[stage].descriptors);
                 bindBuffer(d.handle, set, 0, e.params[stage]);
                 bindBuffer(d.handle, set, 1, e.model.weights[stage]);
                 bindBuffer(d.handle, set, 2, e.arena);
@@ -557,6 +708,7 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
                     const auto res = e.resolve(stage, true, offset, par, images, output);
                     bindImage(d.handle, set, binding++, res.view ? res.view : e.spare.at(format).view);
                 }
+                if (gatherStage) bindBuffer(d.handle, set, binding, e.gather);
             }
         }
         b.exposure = descriptorSet(d.handle, b.pool, e.model.exposure[0].descriptors);
@@ -585,6 +737,10 @@ void REngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     const auto& b = *e.bound;
     const uint32_t f = e.frame, cur = f & 1u;
     auto stamp = [&](uint32_t n) { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stamps, first + n); };
+    // timing only: D4R_ENGINE_RR_STAGE_STAMPS=1 also stamps after every network stage, from query first + 4 on
+    static const bool stageStamps = std::getenv("D4R_ENGINE_RR_STAGE_STAMPS") != nullptr;
+    uint32_t extra = 4;
+    auto stageStamp = [&] { if (stageStamps) stamp(extra++); };
     auto step = [&] {
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -619,13 +775,33 @@ void REngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
         const int l = RLevel[stage];
         const uint32_t shift = rShift(stage, f), sx = shift & 0xffffu, sy = shift >> 16;
         const VkDescriptorSet set = b.stages[stage][cur];
-        dispatch(cb, e.model.stages[stage], set, (e.lw(l) + sx + 7) / 8, (e.lh(l) + sy + 7) / 8);
+        if (stage == REnc0 && e.gather.handle) {   // vkhip encoder 0: the translated gather first
+            dispatch(cb, e.model.hip.gather, set, (e.lw(l) + sx + 7) / 8, (e.lh(l) + sy + 7) / 8);
+            step();
+            if (stageStamps) stamp(31);   // timing only: the gather's end (D4R_ENGINE_RR_STAGE_STAMPS)
+        }
+        if (const VkPipeline hp = e.model.hip.enabled ? e.model.hip.pipes[stage] : VK_NULL_HANDLE) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, hp);
+            const uint64_t args = e.hipArgs.address() + RHipSlot * (2 * stage + cur);
+            vkCmdPushConstants(cb, e.model.hip.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
+            vkCmdDispatch(cb, (e.lw(l) + sx + 7) / 8, (e.lh(l) + sy + 7) / 8, 1);
+        } else
+            dispatch(cb, e.model.stages[stage], set, (e.lw(l) + sx + 7) / 8, (e.lh(l) + sy + 7) / 8);
         step();
+        stageStamp();
+        if (e.snaps.handle) {
+            memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const VkBufferCopy region{0, e.arena.size * stage, e.arena.size};
+            vkCmdCopyBuffer(cb, e.arena.handle, e.snaps.handle, 1, &region);
+            memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        }
     }
     stamp(2);
     dispatch(cb, e.model.stages[RHkpn], b.stages[RHkpn][cur], (e.ow + 15) / 16, (e.oh + 15) / 16);
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    stageStamp();
     stamp(3);
     ++e.frame;
 }

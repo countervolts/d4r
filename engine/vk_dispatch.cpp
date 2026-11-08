@@ -58,6 +58,8 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))) != nullptr;
     ok &= (vkTable.GetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(deviceProc(device, "vkGetBufferMemoryRequirements"))) != nullptr;
     ok &= (vkTable.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(deviceProc(device, "vkGetBufferDeviceAddress"))) != nullptr;
+    ok &= (vkTable.CmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(deviceProc(device, "vkCmdPushConstants"))) != nullptr;
+    vkTable.GetDeviceProcAddr = deviceProc;
     ok &= (vkTable.GetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(deviceProc(device, "vkGetImageMemoryRequirements"))) != nullptr;
     ok &= (vkTable.MapMemory = reinterpret_cast<PFN_vkMapMemory>(deviceProc(device, "vkMapMemory"))) != nullptr;
     ok &= (vkTable.UnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))) != nullptr;

@@ -1,6 +1,9 @@
 #include "runtime.h"
 #include "vk_dispatch.h"
 #include "rr_camera.h"
+#include "vkhip/vkhip.h"
+#include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -56,10 +59,13 @@ struct Device {
         // CNN stages use the extension-free flavor instead of assuming physical support
         // means VK_KHR_cooperative_matrix was enabled by the application.
     }
-    VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags) const {
+    // address: the memory can back buffers with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (vkhip stages)
+    VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags, bool address = false) const {
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags) {
-                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                VkMemoryAllocateFlagsInfo addressInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+                addressInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &addressInfo : nullptr};
                 info.allocationSize = requirements.size; info.memoryTypeIndex = i;
                 VkDeviceMemory result;
                 VKCHECK(vkAllocateMemory(handle, &info, nullptr, &result));
@@ -84,16 +90,22 @@ struct Buffer {
         if (handle) vkDestroyBuffer(device->handle, handle, nullptr);
         if (memory) vkFreeMemory(device->handle, memory, nullptr);
     }
-    void create(const Device& d, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false) {
+    // address: the buffer has a device address (address()), for the vkhip stages' kernel arguments
+    void create(const Device& d, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false, bool address = false) {
         device = &d; size = std::max<VkDeviceSize>(16, (bytes + 3) & ~VkDeviceSize(3));
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = size; info.usage = usage;
+        info.size = size; info.usage = usage | (address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         VKCHECK(vkCreateBuffer(d.handle, &info, nullptr, &handle));
         VkMemoryRequirements requirements; vkGetBufferMemoryRequirements(d.handle, handle, &requirements);
         memory = d.allocate(requirements, host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, address);
         VKCHECK(vkBindBufferMemory(d.handle, handle, memory, 0));
         if (host) VKCHECK(vkMapMemory(d.handle, memory, 0, VK_WHOLE_SIZE, 0, &mapped));
+    }
+    VkDeviceAddress address() const {
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = handle;
+        return vkGetBufferDeviceAddress(device->handle, &info);
     }
 };
 // A buffer's contents written into the command buffer itself (vkCmdUpdateBuffer, at most 65536 bytes a call), so no

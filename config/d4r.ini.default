@@ -66,6 +66,19 @@ FsrDenoiser = auto
 ; grain; 0 = off (D4R_FSR_RR_DETAIL).
 FsrStabilityBias = auto
 FsrDetail = 0
+; FsrDiffuseSignal: the denoiser path for diffuse light when the game passes no diffuse ray length (Cyberpunk
+; 2077 passes none). auto/direct = AMD's direct path; indirect = the indirect path with an estimated ray length,
+; FsrDiffuseHit: auto/specular = the game's specular ray length, depthK = K times the view depth, or a constant
+; (D4R_FSR_RR_DIFFUSE_SIGNAL, D4R_FSR_RR_DIFFUSE_HIT).
+FsrDiffuseSignal = auto
+FsrDiffuseHit = auto
+; FsrBeforeParticles: auto uses the game's colour before particles (particles skip the denoiser); off ignores
+; it. Cyberpunk 2077 needs off: its copy is far darker than its colour, which left the image noisy
+; (D4R_FSR_RR_BEFORE_PARTICLES).
+FsrBeforeParticles = auto
+; FsrSpecularSignal: auto = AMD's indirect path when the game passes a specular ray length; direct ignores
+; it (Cyberpunk 2077's reads 0) (D4R_FSR_RR_SPECULAR_SIGNAL).
+FsrSpecularSignal = auto
 
 [Latency]
 ; How many frames old the upscaled image the game presents may be.

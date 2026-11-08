@@ -177,6 +177,7 @@ extern "C"
     NgxResult d4r_ngx_get_d3d12_resource(void* parameters, const char* name, ID3D12Resource** value);
     void d4r_ngx_set_d3d12_resource(void* parameters, const char* name, ID3D12Resource* value);
     void* d4r_ngx_parameters_create();
+    unsigned d4r_ngx_parameters_list(void* parameters, void (*visit)(const char*, unsigned, unsigned long long, void*), void* context);
     void d4r_ngx_parameters_destroy(void* parameters);
 }
 
@@ -697,6 +698,22 @@ static void load_portable_config()
     const std::string fsrDetail = ini_value(ini, "rayreconstruction", "FsrDetail");
     if (!fsrDetail.empty())
         portable_set("D4R_FSR_RR_DETAIL", fsrDetail);
+    // FsrDiffuseSignal = auto | direct | indirect and FsrDiffuseHit = auto | specular | depth<K> | <length>: the
+    // denoiser path for diffuse light when the game passes no diffuse ray length (d4r_fsr_rr_backend.inl)
+    const std::string fsrDiffuseSignal = ini_value(ini, "rayreconstruction", "FsrDiffuseSignal");
+    if (!fsrDiffuseSignal.empty())
+        portable_set("D4R_FSR_RR_DIFFUSE_SIGNAL", fsrDiffuseSignal);
+    const std::string fsrDiffuseHit = ini_value(ini, "rayreconstruction", "FsrDiffuseHit");
+    if (!fsrDiffuseHit.empty())
+        portable_set("D4R_FSR_RR_DIFFUSE_HIT", fsrDiffuseHit);
+    // FsrSpecularSignal = auto | direct: direct ignores the game's specular ray length (Cyberpunk 2077's reads 0)
+    const std::string fsrSpecularSignal = ini_value(ini, "rayreconstruction", "FsrSpecularSignal");
+    if (!fsrSpecularSignal.empty())
+        portable_set("D4R_FSR_RR_SPECULAR_SIGNAL", ascii_lower(fsrSpecularSignal));
+    // FsrBeforeParticles = auto | off: off ignores the game's colour before particles (Cyberpunk 2077's is not usable)
+    const std::string fsrBeforeParticles = ini_value(ini, "rayreconstruction", "FsrBeforeParticles");
+    if (!fsrBeforeParticles.empty() && ascii_lower(fsrBeforeParticles) != "auto")
+        portable_set("D4R_FSR_RR_BEFORE_PARTICLES", fsrBeforeParticles);
     const std::string fsrDenoiser = ini_value(ini, "rayreconstruction", "FsrDenoiser");
     portable_set(L"D4R_FSR_RR_DLL", fsrDenoiser.empty() || ascii_lower(fsrDenoiser) == "auto"
                                         ? dir + L"\\amd_fidelityfx_denoiser_dx12.dll"

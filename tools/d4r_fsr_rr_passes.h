@@ -35,6 +35,8 @@ enum D4rFsrRrPrepareFlags : uint32_t
     kFsrRrNormalsUnorm = 64u,
     kFsrRrBeforeParticles = 128u,
     kFsrRrInvalidNormalPassthrough = 256u,
+    kFsrRrDiffuseHitEstimate = 512u,
+    kFsrRrDiffuseHitFromSpecular = 1024u,
 };
 
 // One image a pass reads or writes: the view and the layout the image is in while the pass runs.

@@ -545,6 +545,21 @@ static void setup_dlssg(void)
     HeapFree(GetProcessHeap(), 0, unix_layer);
 }
 
+/* ---------------------------------------------------------------- FSR Ray Regeneration */
+
+/* [RayReconstruction] Backend = fsr runs AMD's denoiser, whose FP8 matrix shaders need dxil-spirv's RDNA 3 emulation
+ * (and enable d4r's vkd3d built-in replacements of its slowest layers): DXIL_SPIRV_CONFIG=wmma_rdna3_workaround,
+ * read by vkd3d-proton through GetEnvironmentVariableA after this runs. A value already in the environment wins. */
+static void setup_fsr_rr(void)
+{
+    wchar_t backend[32];
+    if (!GetEnvironmentVariableW(L"D4R_RR_BACKEND", backend, 32))
+        ini_read_section(L"RayReconstruction", L"Backend", L"dlss", backend, 32);
+    if (_wcsicmp(backend, L"fsr"))
+        return;
+    env_default(L"DXIL_SPIRV_CONFIG", L"wmma_rdna3_workaround");
+}
+
 /* imported by name by the patched OptiScaler DLL */
 /* ---------------------------------------------------------------- vkd3d-proton from d4r\vkd3d */
 
@@ -622,6 +637,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     }
     setup();
     setup_dlssg();
+    setup_fsr_rr();
     preload_vkd3d();
     if (g_log) {
         fclose(g_log);

@@ -56,6 +56,8 @@ struct VkTable {
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
     PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress = nullptr;
+    PFN_vkCmdPushConstants CmdPushConstants = nullptr;
+    PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
     PFN_vkMapMemory MapMemory = nullptr;
     PFN_vkUnmapMemory UnmapMemory = nullptr;
@@ -110,6 +112,8 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkFreeMemory ::d4r::vkTable.FreeMemory
 #define vkGetBufferMemoryRequirements ::d4r::vkTable.GetBufferMemoryRequirements
 #define vkGetBufferDeviceAddress ::d4r::vkTable.GetBufferDeviceAddress
+#define vkCmdPushConstants ::d4r::vkTable.CmdPushConstants
+#define vkGetDeviceProcAddr ::d4r::vkTable.GetDeviceProcAddr
 #define vkGetImageMemoryRequirements ::d4r::vkTable.GetImageMemoryRequirements
 #define vkMapMemory ::d4r::vkTable.MapMemory
 #define vkUnmapMemory ::d4r::vkTable.UnmapMemory

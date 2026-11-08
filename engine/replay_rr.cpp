@@ -122,6 +122,9 @@ int main(int argc, char** argv) try {
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) c.physical = devices[i];
     }
     vkGetPhysicalDeviceMemoryProperties(c.physical, &c.memory);
+    // VK_EXT_descriptor_buffer (as vkd3d-proton enables it where the driver has it): the vkhip Swin stages read the
+    // driver's image descriptors through vkGetDescriptorEXT. Linked in front of the chain below when present.
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT db{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT rb2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT, &rb2};
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &f8};
@@ -157,6 +160,13 @@ int main(int argc, char** argv) try {
     f8.pNext = robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) ? &rb2 : nullptr;
     if (robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && !f8.shaderFloat8) {
         if (cm.cooperativeMatrix) cm.pNext = &rb2; else v13.pNext = &rb2;
+    }
+    if (hasExtension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) && !testFlag("D4R_RR_TEST_NO_DESCRIPTOR_BUFFER")) {
+        VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &db};
+        vkGetPhysicalDeviceFeatures2(c.physical, &q);
+        db.descriptorBufferCaptureReplay = db.descriptorBufferImageLayoutIgnored = VK_FALSE;
+        db.pNext = v11.pNext; v11.pNext = &db;
+        extensions.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
     di.enabledExtensionCount = static_cast<uint32_t>(extensions.size()); di.ppEnabledExtensionNames = extensions.data();
     // D4R_RR_TEST_NO_ROBUST=1: no robust buffer or image access (out-of-bounds reads are undefined)
@@ -257,7 +267,8 @@ int main(int argc, char** argv) try {
                 uint64_t all[32][2];
                 vkGetQueryPoolResults(c.device, stamps, 0, 32, sizeof(all), all, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
                 uint64_t prev = all[1][0];
-                for (uint32_t q = 4; q < 32 && all[q][1]; ++q) {
+                if (all[31][1]) stageBest[27] = std::min(stageBest[27], (all[31][0] - all[1][0]) * ms);   // enc0's gather (vkhip)
+                for (uint32_t q = 4; q < 31 && all[q][1]; ++q) {
                     stageBest[q - 4] = std::min(stageBest[q - 4], (all[q][0] - prev) * ms);
                     prev = all[q][0];
                 }
@@ -270,7 +281,8 @@ int main(int argc, char** argv) try {
                   << ", output " << output << ")\n";
         if (stageTimes) {
             std::cout << "stages (us):";
-            for (double t : stageBest) if (t < 1e29) std::cout << " " << static_cast<int>(t * 1000 + 0.5);
+            for (size_t k = 0; k < 27; ++k) if (stageBest[k] < 1e29) std::cout << " " << static_cast<int>(stageBest[k] * 1000 + 0.5);
+            if (stageBest[27] < 1e29) std::cout << " | enc0 gather " << static_cast<int>(stageBest[27] * 1000 + 0.5);
             std::cout << "\n";
         }
         for (const auto& d : engine.debugImages()) {
@@ -281,6 +293,13 @@ int main(int argc, char** argv) try {
             });
             std::ofstream(outDir + "/" + std::to_string(f) + "-" + d.name + ".bin", std::ios::binary)
                 .write(static_cast<const char*>(staging.mapped), static_cast<std::streamsize>(bytes));
+        }
+        // D4R_ENGINE_RR_ARENA_SNAP=1: the arena after every network stage, F-arena-STAGE.bin (stage 0 = enc0 ... 10 = dec0)
+        for (unsigned st = 0; st <= 10; ++st) {
+            size_t bytes = 0;
+            if (const void* snap = engine.debugArenaSnapshot(st, bytes))
+                std::ofstream(outDir + "/" + std::to_string(f) + "-arena-" + std::to_string(st) + ".bin", std::ios::binary)
+                    .write(static_cast<const char*>(snap), static_cast<std::streamsize>(bytes));
         }
         std::cout << "frame " << f << " done\n";
     }

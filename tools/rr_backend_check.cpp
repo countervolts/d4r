@@ -15,7 +15,7 @@
 // the cut, release and shutdown. Timing: CPU time of each EvaluateFeature call and of submit + wait.
 //
 // usage: rr_backend_check.exe SHIM_DLL OUT_DIR [--render WxH] [--output WxH] [--frames N] [--feature 13|1]
-//                             [--hw-depth] [--separate-roughness] [--specular-hit]
+//                             [--hw-depth] [--separate-roughness] [--specular-hit] [--diffuse-hit]
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -319,12 +319,12 @@ int main(int argc, char** argv)
     if (argc < 3)
     {
         std::printf("usage: rr_backend_check.exe SHIM_DLL OUT_DIR [--render WxH] [--output WxH] [--frames N] "
-                    "[--feature 13|1] [--hw-depth] [--separate-roughness] [--specular-hit] [--separate-eval-params] [--water] [--measure-all]\n");
+                    "[--feature 13|1] [--hw-depth] [--separate-roughness] [--specular-hit] [--diffuse-hit] [--separate-eval-params] [--water] [--measure-all]\n");
         return 2;
     }
     const std::string outDir = argv[2];
     UINT rw = 960, rh = 540, ow = 1920, oh = 1080, frames = 48, featureId = 13;
-    bool hwDepth = false, separateRoughness = false, specularHit = false, separateEvalParams = false, measureAll = false;
+    bool hwDepth = false, separateRoughness = false, specularHit = false, diffuseHit = false, separateEvalParams = false, measureAll = false;
     for (int i = 3; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -342,6 +342,8 @@ int main(int argc, char** argv)
             separateRoughness = true;
         else if (arg == "--specular-hit")
             specularHit = true;
+        else if (arg == "--diffuse-hit")
+            diffuseHit = true;
         else if (arg == "--separate-eval-params")
             separateEvalParams = true;
         else if (arg == "--water")
@@ -452,11 +454,12 @@ int main(int argc, char** argv)
     ID3D12Resource* diffuse = create_texture(rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, srv);
     ID3D12Resource* specular = create_texture(rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, srv);
     ID3D12Resource* hitDistance = create_texture(rw, rh, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE, srv);
+    ID3D12Resource* diffuseHitDistance = create_texture(rw, rh, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE, srv);
     // The output starts out holding a sentinel, so an unwritten texel is detectable.
     ID3D12Resource* output = create_texture(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Uploader uploader;
-    uploader.capacity = 64ull << 20;
+    uploader.capacity = 256ull << 20; // every input of a 1440p-render frame (64 MB overflowed at 1706x960)
     uploader.staging = create_buffer(uploader.capacity, D3D12_HEAP_TYPE_UPLOAD, &uploader.mapped);
     D3D12_RESOURCE_DESC outputDesc = {};
     outputDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -472,7 +475,7 @@ int main(int argc, char** argv)
     g_device->GetCopyableFootprints(&outputDesc, 0, 1, 0, &outputFootprint, &outputRows, &outputRowBytes, &outputTotal);
     uint8_t* readMapped = nullptr;
     ID3D12Resource* readback = create_buffer(outputTotal, D3D12_HEAP_TYPE_READBACK, &readMapped);
-    if (!color || !depth || !motion || !normals || !roughness || !diffuse || !specular || !hitDistance || !output ||
+    if (!color || !depth || !motion || !normals || !roughness || !diffuse || !specular || !hitDistance || !diffuseHitDistance || !output ||
         !uploader.staging || !readback)
     {
         check("resources", false, "texture creation");
@@ -559,6 +562,12 @@ int main(int argc, char** argv)
                     hit[i] = scene.noisy[kIndirectSpecular][i * 4 + 3];
                 uploader.upload(hitDistance, rw, rh, DXGI_FORMAT_R16_FLOAT, hit.data(), 2, srv);
             }
+            if (diffuseHit)
+            {
+                for (size_t i = 0; i < hit.size(); ++i)
+                    hit[i] = scene.noisy[kIndirectDiffuse][i * 4 + 3];
+                uploader.upload(diffuseHitDistance, rw, rh, DXGI_FORMAT_R16_FLOAT, hit.data(), 2, srv);
+            }
         }
         d4r_ngx_set_d3d12_resource(parameters, "Color", color);
         d4r_ngx_set_d3d12_resource(parameters, "Depth", depth);
@@ -578,6 +587,7 @@ int main(int argc, char** argv)
             d4r_ngx_set_d3d12_resource(parameters, "GBuffer.DiffuseAlbedo", diffuse);
             d4r_ngx_set_d3d12_resource(parameters, "GBuffer.SpecularAlbedo", specular);
             d4r_ngx_set_d3d12_resource(parameters, "DLSSD.SpecularHitDistance", specularHit ? hitDistance : nullptr);
+            d4r_ngx_set_d3d12_resource(parameters, "DLSSD.DiffuseHitDistance", diffuseHit ? diffuseHitDistance : nullptr);
             const M4 viewMatrix = view_matrix(camera.eye, camera.target);
             std::memcpy(view.data(), &viewMatrix, 64);
             std::memcpy(clip.data(), &projection, 64);

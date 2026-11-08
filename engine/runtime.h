@@ -346,6 +346,9 @@ public:
     // writes it ("enc1-112", "dec0-144", "q0", ...), GENERAL layout
     struct DebugImage { std::string name; VkImage image; VkFormat format; uint32_t width, height; };
     std::vector<DebugImage> debugImages() const;
+    // Debugging (D4R_ENGINE_RR_ARENA_SNAP=1 at construction, presets D and E): the plane arena as network stage
+    // `stage` (0 = enc0 ... 10 = dec0) left it in the last recorded frame, once that frame has completed
+    const void* debugArenaSnapshot(unsigned stage, size_t& bytes) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

@@ -2,7 +2,10 @@
 """Generate engine/rr/enc0_m.comp's source: encoder 0 with ptx2rr.py's translation of NVIDIA's per-pixel feature gather
 (run by wave 0, as NVIDIA runs it in one warp) and the native rest (engine/rr/enc0_m_decl.glsl, enc0_m_tail.glsl).
 
-usage: gen_enc0_m.py ENC0.generated.comp OUT.comp
+usage: gen_enc0_m.py ENC0.generated.comp OUT.comp [--gather]
+
+--gather: only the translated gather, then each window's shared buffer sh (1000 words: the noise grid, then the two
+feature planes) to binding 23 at word 1000 x (window), for engine/rr/hip/rr_enc0.hip's native rest (vkhip).
 
 The translation's main is cut at its first workgroup barrier: by then the 10 x 10 pixels' features and the noise grid
 are in its shared buffer sh and the state surfaces 304 / 1016 are written. Model data derived from the user's DLL is in
@@ -14,6 +17,7 @@ import sys
 
 def main():
     src, out = sys.argv[1:3]
+    gather = '--gather' in sys.argv[3:]
     lines = open(src).read().split('\n')
     m = next(i for i, l in enumerate(lines) if l.startswith('void main()'))
     head = '\n'.join(lines[:m]).replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
@@ -33,10 +37,22 @@ def main():
     pre = [l.replace(f'{counter} = uint(0u);', f'{counter} = uint(32u * gl_SubgroupID);') for l in prologue[:do_ - 1]]
     post = prologue[end + 1:]
     head = head.replace('shared uint mms[384];', 'shared uint mms[384 * 4];')
-    text = (head + '\n#extension GL_GOOGLE_include_directive : require\n#include "enc0_m_decl.glsl"\n\nvoid main()\n{\n' +
-            '\n'.join(decls) + '\n    // the translated feature gather (NVIDIA\'s one warp, its pixel loop split over the waves)\n' +
-            '\n'.join(pre) + '\n    if (gl_SubgroupID < 3u) {\n' + loop + '\n    }\n    if (gl_SubgroupID == 0u) {\n' +
-            '\n'.join(post) + '\n    }\n#include "enc0_m_tail.glsl"\n}\n')
+    if gather:
+        decl = ('layout(set = 0, binding = 23, std430) writeonly buffer GatherOut { uint g[]; } gout;\n')
+        tail = ('    memoryBarrierShared(); barrier();\n'
+                '    {   // the window\'s sh to the gather buffer\n'
+                '        const uint win = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;\n'
+                '        for (uint i = gl_LocalInvocationIndex; i < 1000u; i += 128u) gout.g[win * 1000u + i] = sh[i];\n'
+                '    }\n')
+        text = (head + '\n' + decl + '\nvoid main()\n{\n' + '\n'.join(decls) +
+                '\n    // the translated feature gather (NVIDIA\'s one warp, its pixel loop split over the waves)\n' +
+                '\n'.join(pre) + '\n    if (gl_SubgroupID < 3u) {\n' + loop + '\n    }\n    if (gl_SubgroupID == 0u) {\n' +
+                '\n'.join(post) + '\n    }\n' + tail + '}\n')
+    else:
+        text = (head + '\n#extension GL_GOOGLE_include_directive : require\n#include "enc0_m_decl.glsl"\n\nvoid main()\n{\n' +
+                '\n'.join(decls) + '\n    // the translated feature gather (NVIDIA\'s one warp, its pixel loop split over the waves)\n' +
+                '\n'.join(pre) + '\n    if (gl_SubgroupID < 3u) {\n' + loop + '\n    }\n    if (gl_SubgroupID == 0u) {\n' +
+                '\n'.join(post) + '\n    }\n#include "enc0_m_tail.glsl"\n}\n')
     open(out, 'w').write(text)
     print(f'{out}: {len(decls)} declaration lines, {len(prologue)} prologue lines')
 
