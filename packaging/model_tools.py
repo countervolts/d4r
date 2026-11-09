@@ -32,6 +32,25 @@ def manifest(directory, write=False):
         raise ValueError(f'{directory}: missing, changed or unexpected model files; rebuild the models')
 
 
+RR_HIP_HEADERS = ('swin_stage.h', 'enc0_m_w.h', 'dec0_m_w.h')
+
+
+def rr_hip_signature(model):
+    """What a Ray Reconstruction model's prebuilt HIP stages (engine/rr/hip, shipped per RDNA 3 target) were compiled
+    against: its preset, its stage headers (weight offsets and shapes) and its weight file sizes (W_WIDE). A model with
+    the same signature can use them; anything else keeps the GLSL stages."""
+    model = Path(model)
+    lines = [line for line in (model / 'rr.txt').read_text().splitlines() if line.split()[:1] in (['preset'], ['arithmetic'])]
+    work = model / 'native-work'
+    for header in sorted(p for p in work.glob('*/*') if p.name in RR_HIP_HEADERS):
+        lines.append(f'header {header.relative_to(work).as_posix()} {digest(header)}')
+    for weights in sorted(model.glob('weights-*m.bin')):
+        lines.append(f'size {weights.name} {weights.stat().st_size}')
+    if not any(line.startswith('header ') for line in lines):
+        raise ValueError(f'{model}: no native-work stage headers (build with D4R_RR_GFX11=1)')
+    return '\n'.join(lines) + '\n'
+
+
 def capture(directory, name, stubbed=False):
     """A completed, finite frame and all files referenced by each network-layer capture. With stubbed (the network's
     kernels replaced by empty ones, stub_ptx) the frame's pixels are not checked: only its launches are used."""
@@ -214,6 +233,8 @@ def main():
     p = sub.add_parser('stub-ptx')
     p.add_argument('dll', type=Path)
     p.add_argument('out', type=Path)
+    p = sub.add_parser('rr-hip-signature')
+    p.add_argument('directory', type=Path)
     p = sub.add_parser('run')
     p.add_argument('--log', required=True)
     p.add_argument('--timeout', type=float, default=900)
@@ -224,6 +245,8 @@ def main():
             return run(a.log, a.timeout, a.command)
         if a.action == 'capture':
             capture(a.directory, a.name, a.stubbed)
+        elif a.action == 'rr-hip-signature':
+            sys.stdout.write(rr_hip_signature(a.directory))
         elif a.action == 'stub-ptx':
             stub_ptx(a.dll, a.out)
         elif a.action == 'manifest':

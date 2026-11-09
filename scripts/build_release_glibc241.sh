@@ -60,15 +60,23 @@ command -v lld >/dev/null || { echo 'missing AMDGPU linker' >&2; exit 2; }
 "$ROOT/scripts/build_d4r_nvngx_shim.sh" > "$BUILD/logs/shim.log" 2>&1
 "$ROOT/scripts/build_wine_nvcuda_bridge.sh" > "$BUILD/logs/bridge.log" 2>&1
 "$ROOT/scripts/check_glibc_compat.sh" 2.41 "$ROOT/build/wine-nvcuda/x86_64-unix/nvcuda.dll.so"
-if [[ ! -f "$BUILD/vkd3d-build/build.ninja" ]]; then
-    meson setup --cross-file "$D4R_VKD3D_SRC/build-win64.txt" --buildtype release \
-        -Denable_tests=false "$BUILD/vkd3d-build" "$D4R_VKD3D_SRC" > "$BUILD/logs/vkd3d.log" 2>&1
+# D4R_VKD3D_FSR_RR=1: the source also carries patches/vkd3d-proton-fsr-rr (AMD FSR Ray Regeneration's RDNA 3 FP8
+# emulation and its faster layers, active only with DXIL_SPIRV_CONFIG=wmma_rdna3_workaround); built separately
+vkd3d_build="$BUILD/vkd3d-build" vkd3d_options=()
+if [[ "${D4R_VKD3D_FSR_RR:-0}" == 1 ]]; then
+    vkd3d_build="$BUILD/vkd3d-build-fsrrr" vkd3d_options=(-Denable_extended_emulation=true)
+    [[ -f "$D4R_VKD3D_SRC/libs/vkd3d-shader/d4r_builtin_shaders.h" ]] ||
+        { echo "D4R_VKD3D_FSR_RR=1: $D4R_VKD3D_SRC lacks patches/vkd3d-proton-fsr-rr" >&2; exit 2; }
 fi
-ninja -j "$CARGO_BUILD_JOBS" -C "$BUILD/vkd3d-build" >> "$BUILD/logs/vkd3d.log" 2>&1
+if [[ ! -f "$vkd3d_build/build.ninja" ]]; then
+    meson setup --cross-file "$D4R_VKD3D_SRC/build-win64.txt" --buildtype release \
+        -Denable_tests=false "${vkd3d_options[@]}" "$vkd3d_build" "$D4R_VKD3D_SRC" > "$BUILD/logs/vkd3d.log" 2>&1
+fi
+ninja -j "$CARGO_BUILD_JOBS" -C "$vkd3d_build" >> "$BUILD/logs/vkd3d.log" 2>&1
 export D4R_VKD3D_DIR="$BUILD/vkd3d"
 mkdir -p "$D4R_VKD3D_DIR"
-x86_64-w64-mingw32-strip -o "$D4R_VKD3D_DIR/d3d12.dll" "$BUILD/vkd3d-build/libs/d3d12/d3d12.dll"
-x86_64-w64-mingw32-strip -o "$D4R_VKD3D_DIR/d3d12core.dll" "$BUILD/vkd3d-build/libs/d3d12core/d3d12core.dll"
+x86_64-w64-mingw32-strip -o "$D4R_VKD3D_DIR/d3d12.dll" "$vkd3d_build/libs/d3d12/d3d12.dll"
+x86_64-w64-mingw32-strip -o "$D4R_VKD3D_DIR/d3d12core.dll" "$vkd3d_build/libs/d3d12core/d3d12core.dll"
 echo 'Shim, bridge and vkd3d-proton rebuilt'
 
 export D4R_BUNDLE_TEX="$BUILD/kernels"

@@ -166,7 +166,17 @@ if (( DO_RR )); then
       if [[ "$arithmetic" == gfx11 ]]; then name+="-gfx11"; gfx11=1; fi
       run "$name.log" env D4R_RR_GFX11="$gfx11" bash "$KIT/engine/rr/build_native_model.sh" \
         --dll "$DLL" "$p" "$WORK/$name"
-      place "$name" "$WORK/$name" $(model_files "$WORK/$name") exposure_rr0.spv exposure_rr1.spv
+      extra=()
+      # RDNA 3: the prebuilt HIP network stages (d4r/kernels/rr-hip, run through vkhip), when built for this layout
+      hip_set="$RUNTIME/kernels/rr-hip/$(gpu_arch)/$name"
+      if (( gfx11 )) && [[ -f "$hip_set/rr-hip.txt" ]]; then
+        if cmp -s "$hip_set/rr-hip.txt" <(python3 "$MODEL_TOOLS" rr-hip-signature "$WORK/$name"); then
+          mkdir -p "$WORK/$name/hip"; cp -- "$hip_set"/*.hsaco "$WORK/$name/hip/"; extra=(hip)
+        else
+          echo "  $name: this model's layout differs from the prebuilt HIP stages; it keeps the Vulkan stages"
+        fi
+      fi
+      place "$name" "$WORK/$name" $(model_files "$WORK/$name") exposure_rr0.spv exposure_rr1.spv "${extra[@]}"
     done
   done
   run ptx-f.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$WORK/ptx-f"

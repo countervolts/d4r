@@ -298,6 +298,8 @@ if [[ "$DO_ENGINE" == ask ]] && ! interactive; then DO_ENGINE=1; fi
 if [[ "$DO_ENGINE" == ask ]]; then
   echo
   echo "Set up d4r's own DLSS engine (recommended)?"
+  echo '  + Fastest on RDNA3: DLSS 4 / 4.5 (K, M and L) and Ray Reconstruction run inside the game'"'"'s own Vulkan'
+  echo '    command list (vkhip), and K'"'"'s [DLSS] LinearLighting needs it.'
   echo '  + Faster on RDNA4: DLSS 4 / 4.5 and Ray Reconstruction run on d4r'"'"'s Vulkan engine instead of NVIDIA'"'"'s kernels'
   echo '    through CUDA emulation (for example Ray Reconstruction at 720p -> 4K in about 3.6 ms per frame).'
   echo '  + On RDNA2 (Steam Deck) it is the route for DLSS 3'"'"'s CNN presets E and F and for DLSS 4 and 4.5 (K, M and L): those run without cooperative matrices.'

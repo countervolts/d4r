@@ -31,6 +31,8 @@
 # those is up to whoever publishes it (they are not covered by d4r's license):
 #   D4R_BUNDLE_DLSS  local nvngx_dlss.dll for texture builds (pinned by install.sh in installer mode)
 #   D4R_BUNDLE_NGX   local _nvngx.dll (only required for D4R_BUNDLE_NVIDIA=1)
+#   D4R_BUNDLE_RR_HIP  optional scripts/build_rr_hip_release.sh output: RR's HIP stages for RDNA 3 (d4r/kernels/rr-hip)
+#   D4R_BUNDLE_FSR_RR_DLL  optional AMD amd_fidelityfx_denoiser_dx12.dll (MIT) for [RayReconstruction] Backend = fsr
 #   D4R_BUNDLE_DLSSD optional nvngx_dlssd.dll to include for Ray Reconstruction (full variant only)
 #   D4R_BUNDLE_TEX   directory with texture-kernel code objects (kernels/build.sh tex), one subdirectory
 #                    per target folder (gfx1101, gfx1201, gfx1201-fp8, ...), or a flat gfx1101 directory for
@@ -153,6 +155,16 @@ cp "$ROOT/packaging/d4r-features.py" "$STAGE/d4r/d4r-features.py"
 # Legacy ASI installs may still use OptiScaler 0.9's external latency router.
 if [[ "$INSTALL_MODE" == asi ]]; then
   cp "$ROOT/build/d4r_nvapi64.dll" "$STAGE/d4r/d4r_nvapi64.dll"
+fi
+# DLSS Ray Reconstruction's HIP network stages for RDNA 3 (scripts/build_rr_hip_release.sh: d4r's own kernels,
+# OUT/<arch>/rr-d-gfx11 and rr-e-gfx11); the model builder installs a set into a model with the same layout
+if [[ -n "${D4R_BUNDLE_RR_HIP:-}" ]]; then
+  for f in "$D4R_BUNDLE_RR_HIP"/gfx110[0-3]/rr-[de]-gfx11/rr-hip.txt; do
+    [[ -f "$f" ]] || { echo "D4R_BUNDLE_RR_HIP=$D4R_BUNDLE_RR_HIP has no <arch>/rr-[de]-gfx11 sets" >&2; exit 1; }
+    set_dir="$(dirname "$f")"; rel="${set_dir#"$D4R_BUNDLE_RR_HIP"/}"
+    mkdir -p "$STAGE/d4r/kernels/rr-hip/$rel"
+    cp "$set_dir"/*.hsaco "$f" "$STAGE/d4r/kernels/rr-hip/$rel/"
+  done
 fi
 # AMD FSR Ray Regeneration 1.2 for [RayReconstruction] Backend = fsr: AMD's unmodified denoiser DLL (MIT)
 if [[ -n "${D4R_BUNDLE_FSR_RR_DLL:-}" ]]; then
