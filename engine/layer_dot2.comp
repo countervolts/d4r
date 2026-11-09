@@ -43,14 +43,43 @@ layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx;
 layout(set = 0, binding = 1, std430) readonly buffer Wb { uint w[]; } wb;
 layout(set = 0, binding = 2, std430) readonly buffer Ib { uint a[]; } inb;
 layout(set = 0, binding = 3, std430) readonly buffer Sb { uint a[]; } skb;
+#if SWZ && KIND == 2
+layout(set = 0, binding = 4, std430) buffer O0 { uint a[]; } out0;          // SWZ: x0 parked in the window's output rows
+#else
 layout(set = 0, binding = 4, std430) writeonly buffer O0 { uint a[]; } out0;
+#endif
 layout(set = 0, binding = 5, std430) writeonly buffer O1 { uint a[]; } out1;
 spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
 float dot2acc(f16vec2 a, f16vec2 b, float c);
 float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
 const uint UC = uint(C), CW = UC / uint(NW), HC = UC / 2u;     // channels per wave; dwords per token row
-// shared memory, in dwords (binary16 pairs). Rows are padded by four dwords.
+// SWZ (C = 64: enc1, enc2, dec1, dec2): unpadded rows whose 16-byte pieces are XOR-swizzled by the row instead (token
+// rows: piece ^ (row & 7); MLP hidden rows of 16 dwords: piece ^ ((row >> 1) & 3)), so that eight lanes reading
+// eight rows' same piece hit 32 different banks. 12 KB of shared memory per window instead of 14: five windows per
+// CU on RDNA2 (64 KB). The block input x0 is read again after attention instead of held in registers (the inputs;
+// the decoders' expanded x0 goes through their output rows first), and the output copy is a loop, so that its
+// addresses are not kept from the input copy: the register peak (attention) fits five waves per SIMD.
+#ifndef SWZ
+#if C == 64 && NW == NH && !HEAD && !EMBED
+#define SWZ 1
+#else
+#define SWZ 0
+#endif
+#endif
+// SEQATT (default with SWZ): attention for the lane's two tokens one after the other (fewer registers, twice the key
+// and value rotations)
+#ifndef SEQATT
+#define SEQATT (SWZ && !POSATTN)
+#endif
+#if SEQATT && (!SWZ || POSATTN)
+#error SEQATT needs SWZ and scores
+#endif
+// shared memory, in dwords (binary16 pairs). Rows are padded by four dwords (SWZ: swizzled).
+#if SWZ
+const uint RS = HC;
+#else
 const uint RS = HC + 4u;                    // token rows: x0, the normalised input, the MLP input, the block output
+#endif
 const uint KR = 20u, RHS = 64u * KR;        // per wave: its head's attention output (64 x 32)
 const uint XA = 0u, RH = 64u * RS;          // token rows, then the heads' areas
 // MLP: G hidden chunks of 32 at a time; each wave computes HW of their columns
@@ -93,7 +122,14 @@ const uint XA = 0u, RH = 64u * RS;          // token rows, then the heads' areas
 #endif
 #define CWM (C / NW)
 #define HWM (32 * G / NW)
+#if SWZ
+#if !AO_ROWS || G != 1 || C != 64
+#error SWZ: C = 64 with the attention outputs in the token rows and one hidden chunk at a time
+#endif
+const uint HW = uint(HWM), HRS = 16u, NCH = UC / 8u;
+#else
 const uint HW = uint(HWM), HRS = 16u * uint(G) + 4u, NCH = UC / 8u;
+#endif
 #if KIND == 2
 const uint LRS = uint(XC) / 2u + 4u;        // low-resolution rows (decoders), in the heads' area before attention
 #endif
@@ -108,6 +144,13 @@ uint lane, wave, gi;
 // use 16-byte accesses
 uvec4 lds4(uint i) { i &= ~3u; return uvec4(L[i], L[i + 1u], L[i + 2u], L[i + 3u]); }
 void sts4(uint i, uvec4 v) { i &= ~3u; L[i] = v.x; L[i + 1u] = v.y; L[i + 2u] = v.z; L[i + 3u] = v.w; }
+// dword d of token row tok / MLP hidden row tok (SWZ: within its swizzled piece)
+#if SWZ
+#define TSW(tok) (((tok) & 7u) << 2)
+#define HSW(tok) ((((tok) >> 1) & 3u) << 2)
+#define TR(tok, d) (XA + (tok) * RS + ((d) ^ TSW(tok)))
+#define HR(tok, d) (RH + (tok) * HRS + ((d) ^ HSW(tok)))
+#endif
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 int tdiv2(int v) { return v < 0 ? -((-v) / 2) : v / 2; }
 float lo(uint v) { return float(unpackFloat2x16(v).x); }
@@ -129,6 +172,29 @@ f16vec2 gelu(f16vec2 x)
 }
 // acc[t][n] += sum over kp < KP of L[ab + tok_t * as + kp] * W2[wbase + kp * ws + n]: this lane's two tokens (rows
 // lane and lane + 32 of a 64-row area), NN outputs from a [K/2][ws] pair matrix whose first column is wbase
+#if SWZ
+// SWZ: dwords off + kp of the rows (the lane's two tokens share their swizzle sw: tok and tok + 32)
+#define GEMM_TOK(NAME, NN) \
+void NAME(inout float acc[2][NN], uint ab, uint as, uint off, uint KP, uint wbase, uint ws, uint sw) \
+{ \
+    [[dont_unroll]] for (uint kp = 0u; kp < KP; kp += 4u) \
+    { \
+        const uint r0 = ab + lane * as + ((off + kp) ^ sw), r1 = r0 + 32u * as; \
+        const uvec4 a0 = lds4(r0); \
+        const uvec4 a1 = lds4(r1); \
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) \
+            [[unroll]] for (uint n = 0u; n < NN; ++n) \
+            { \
+                const uint w = wb.w[wbase + (kp + j) * ws + n]; \
+                acc[0][n] = d2(a0[j], w, acc[0][n]); acc[1][n] = d2(a1[j], w, acc[1][n]); \
+            } \
+    } \
+}
+#define TOKROWS(off) XA, RS, off
+#define TOKSW TSW(lane)
+#define HIDROWS RH, HRS, 0u
+#define HIDSW HSW(lane)
+#else
 #define GEMM_TOK(NAME, NN) \
 void NAME(inout float acc[2][NN], uint ab, uint as, uint KP, uint wbase, uint ws) \
 { \
@@ -145,6 +211,7 @@ void NAME(inout float acc[2][NN], uint ab, uint as, uint KP, uint wbase, uint ws
             } \
     } \
 }
+#endif
 GEMM_TOK(gemm32, 32)
 #if CWM != 32
 GEMM_TOK(gemmCW, CW)
@@ -162,6 +229,11 @@ GEMM_TOK(gemmHW, HW)
 #define STORE_ROWS(NN, acc, ab, as, d0) \
     [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < NN; n += 2u) \
         L[(ab) + (lane + 32u * t) * (as) + (d0) + n / 2u] = pk(acc[t][n], acc[t][n + 1u]);
+// SWZ: the same into the token rows, dword d0 onwards (whole 16-byte pieces: NN a multiple of 8, d0 of 4)
+#define STORE_TOKROWS(NN, acc, d0) \
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < NN; n += 8u) \
+        sts4(TR(lane + 32u * t, (d0) + n / 2u), uvec4(pk(acc[t][n], acc[t][n + 1u]), pk(acc[t][n + 2u], acc[t][n + 3u]), \
+                                                      pk(acc[t][n + 4u], acc[t][n + 5u]), pk(acc[t][n + 6u], acc[t][n + 7u])));
 // Global <-> shared copies move 16 bytes per lane and issue every load of a thread before the first store: one memory
 // latency instead of one per element. PIECES(N): the 16-byte pieces of N dwords, over the workgroup's threads.
 #define PIECES(N) [[unroll]] for (uint pi = 0u; pi < ((N) / 4u + 32u * NW - 1u) / (32u * NW); ++pi)
@@ -173,6 +245,8 @@ uvec4 add4(uvec4 a, uvec4 b)
     return uvec4(packFloat2x16(unpackFloat2x16(a.x) + unpackFloat2x16(b.x)), packFloat2x16(unpackFloat2x16(a.y) + unpackFloat2x16(b.y)),
                  packFloat2x16(unpackFloat2x16(a.z) + unpackFloat2x16(b.z)), packFloat2x16(unpackFloat2x16(a.w) + unpackFloat2x16(b.w)));
 }
+#define INSIDE(tok) (Y0 + int((tok) >> 3) >= 0 && Y0 + int((tok) >> 3) < p.Hh && X0 + int((tok) & 7u) >= 0 && X0 + int((tok) & 7u) < p.W)
+#define DST(tok) uint((Y0 + int((tok) >> 3)) * p.W + X0 + int((tok) & 7u))
 int mirrorToken(int X0, int Y0, uint tok) { return mirror(Y0 + int(tok >> 3), p.Hh) * p.W + mirror(X0 + int(tok & 7u), p.W); }
 void main()
 {
@@ -224,7 +298,11 @@ void main()
             [[unroll]] for (uint r = 0u; r < 16u; ++r)
             {
                 const uint tok = (2u * (r >> 2) + (q >> 1)) * 8u + 2u * (r & 3u) + (q & 1u);
+#if SWZ
+                L[TR(tok, c / 2u)] = pk(e[r][0], e[r][1]);
+#else
                 L[XA + tok * RS + c / 2u] = pk(e[r][0], e[r][1]);
+#endif
             }
         }
         barrier();
@@ -235,7 +313,11 @@ void main()
             PIECES(64u * HC)
             {
                 PIECE(64u * HC, i)
+#if SWZ
+                const uint r = TR(i / (HC / 4u), 4u * (i % (HC / 4u)));
+#else
                 const uint r = XA + i / (HC / 4u) * RS + 4u * (i % (HC / 4u));
+#endif
                 sts4(r, add4(lds4(r), v[pi]));
             }
         }
@@ -271,11 +353,48 @@ void main()
     {
         uvec4 v[(64u * HC / 4u + 32u * NW - 1u) / (32u * NW)];
         PIECES(64u * HC) { PIECE(64u * HC, i) v[pi] = in4(uint(mirrorToken(X0, Y0, i / (HC / 4u))) * HC + 4u * (i % (HC / 4u))); }
+#if SWZ
+        PIECES(64u * HC) { PIECE(64u * HC, i) sts4(TR(i / (HC / 4u), 4u * (i % (HC / 4u))), v[pi]); }
+#else
         PIECES(64u * HC) { PIECE(64u * HC, i) sts4(XA + i / (HC / 4u) * RS + 4u * (i % (HC / 4u)), v[pi]); }
+#endif
     }
 #endif
     barrier();
     // ------------------------------------------------------------ this wave's slice of x0, then x0 * rsqrt(sum x0^2)
+#if SWZ
+    // x0 is read again after attention: the inputs from memory; the decoders' (expand + skip) from their own output
+    // rows, where this thread parks its slice now (tokens inside the image; the others' results are never stored)
+#if KIND == 2
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        const uint tok = lane + 32u * t;
+        if (INSIDE(tok))
+            [[unroll]] for (uint d = 0u; d < CW / 2u; d += 4u)
+            {
+                const uvec4 v = lds4(TR(tok, wave * CW / 2u + d));
+                const uint o = DST(tok) * HC + wave * CW / 2u + d;
+                out0.a[o] = v.x; out0.a[o + 1u] = v.y; out0.a[o + 2u] = v.z; out0.a[o + 3u] = v.w;
+            }
+    }
+#endif
+    barrier();
+    if (gi < 64u)
+    {
+        uvec4 xr[HC / 4u];
+        [[unroll]] for (uint c = 0u; c < HC / 4u; ++c) xr[c] = lds4(TR(gi, 4u * c));
+        vec2 s2 = vec2(0.0);
+        [[unroll]] for (uint d = 0u; d < HC; ++d) { const vec2 f = vec2(unpackFloat2x16(xr[d >> 2][d & 3u])); s2 += f * f; }
+        const float16_t rs = float16_t(inversesqrt(float(float16_t(s2.x + s2.y))));
+        [[unroll]] for (uint c = 0u; c < HC / 4u; ++c)
+        {
+            uvec4 v;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) v[j] = packFloat2x16(unpackFloat2x16(xr[c][j]) * rs);
+            sts4(TR(gi, 4u * c), v);
+        }
+    }
+    barrier();
+#else
     uint res[2][CW / 2];
     [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint d = 0u; d < CW / 2u; ++d) res[t][d] = L[XA + (lane + 32u * t) * RS + wave * CW / 2u + d];
     barrier();
@@ -288,6 +407,7 @@ void main()
         for (uint d = 0u; d < HC; ++d) L[r + d] = packFloat2x16(unpackFloat2x16(L[r + d]) * rs);
     }
     barrier();
+#endif
     // ------------------------------------------------------------ attention, NW heads at a time, each followed by its
     // share of the output projection (the residual stream's channels wave * CW onwards, accumulated in f32)
     float acc[2][CW];
@@ -309,7 +429,11 @@ void main()
         {
             float a[2][32];
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) a[t][n] = 0.0;
+#if SWZ
+            gemm32(a, TOKROWS(0u), HC, p.o[6u + 5u * h] / 2u, 32u, TOKSW);
+#else
             gemm32(a, XA, RS, HC, p.o[6u + 5u * h] / 2u, 32u);
+#endif
             const bool odd = (lane & 1u) != 0u;
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
             {
@@ -322,17 +446,89 @@ void main()
         {
             float a[2][32];
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) a[t][n] = 0.0;
+#if SWZ
+            gemm32(a, TOKROWS(0u), HC, p.o[4u + 5u * h] / 2u, 32u, TOKSW);
+#else
             gemm32(a, XA, RS, HC, p.o[4u + 5u * h] / 2u, 32u);
+#endif
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; n += 2u) q[t][n / 2u] = pk(a[t][n], a[t][n + 1u]);
         }
         {
             float a[2][32];
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) a[t][n] = 0.0;
+#if SWZ
+            gemm32(a, TOKROWS(0u), HC, p.o[5u + 5u * h] / 2u, 32u, TOKSW);
+#else
             gemm32(a, XA, RS, HC, p.o[5u + 5u * h] / 2u, 32u);
+#endif
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; n += 2u) kc[t][n / 2u] = pk(a[t][n], a[t][n + 1u]);
         }
+#if SWZ
+        // every wave has read the normalised rows: the queries wait in this head's 16 dwords of the token rows (where
+        // its attention outputs go next) and are read four K pairs at a time
+        barrier();
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint k4 = 0u; k4 < 16u; k4 += 4u)
+            sts4(TR(lane + 32u * t, 16u * h + k4), uvec4(q[t][k4], q[t][k4 + 1u], q[t][k4 + 2u], q[t][k4 + 3u]));
+#endif
         vec2 sum[2] = vec2[2](vec2(0.0), vec2(0.0));
 #endif
+#if SEQATT
+        // SEQATT: the lane's two tokens one after the other (half the accumulators and scores live at a time), the same
+        // sums in the same order as below. The keys and values are back in place after the four steps, so the second
+        // token's pass starts from the same registers; each pass reads its queries from, and writes its outputs over
+        // them in, this head's 16 dwords of its token row.
+#define BC8(v, r) swizzleInvocationsMaskedAMD(v, uvec3(0x18u, r, 0u))
+        [[unroll]] for (uint t = 0u; t < 2u; ++t)
+        {
+            const uint tok = lane + 32u * t;
+            float o1[32];
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) o1[n] = 0.0;
+            vec2 sum1 = vec2(0.0);
+#define SET_TABLE1(dst, d_, h2_) [[unroll]] for (uint j = 0u; j < 4u; ++j) \
+            dst[j] = wb.w[otab / 2u + tok * 32u + ((((lane & ~7u) + 8u * (d_)) & 31u) + 32u * (h2_)) / 2u + j];
+            uint tn1[4];
+            SET_TABLE1(tn1, 0u, 0u)
+            [[dont_unroll]] for (uint d = 0u; d < 4u; ++d)
+            {
+                [[unroll]] for (uint h2 = 0u; h2 < 2u; ++h2)
+                {
+                    float s1[8];
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) { s1[2u * j] = lo(tn1[j]); s1[2u * j + 1u] = hi(tn1[j]); }
+                    SET_TABLE1(tn1, h2 == 0u ? d : min(d + 1u, 3u), h2 ^ 1u)
+                    [[unroll]] for (uint k4 = 0u; k4 < 16u; k4 += 4u)
+                    {
+                        const uvec4 qv = lds4(TR(tok, 16u * h + k4));
+                        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                        {
+#define SC1(r) s1[r] = d2(BC8(kc[h2][k4 + j], r), qv[j], s1[r]);
+                            SC1(0u) SC1(1u) SC1(2u) SC1(3u) SC1(4u) SC1(5u) SC1(6u) SC1(7u)
+                        }
+                    }
+                    uint e1[4];
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    {
+                        const f16vec2 x = softmax_exp(f16vec2(s1[2u * j], s1[2u * j + 1u]));
+                        sum1 += vec2(x);
+                        e1[j] = packFloat2x16(x);
+                    }
+#define PV1(rp, c) { const uint v = BC8(vc[h2][k], 2u * rp + c); o1[2u * k + c] = d2(v, e1[rp], o1[2u * k + c]); }
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV1(0u, 0u) PV1(0u, 1u) }
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV1(1u, 0u) PV1(1u, 1u) }
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV1(2u, 0u) PV1(2u, 1u) }
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV1(3u, 0u) PV1(3u, 1u) }
+                    [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                    {
+                        kc[h2][k] = subgroupShuffle(kc[h2][k], (lane + 8u) & 31u);
+                        vc[h2][k] = subgroupShuffle(vc[h2][k], (lane + 8u) & 31u);
+                    }
+                }
+            }
+            const float r = float(float16_t(1.0 / float(float16_t(sum1.x + sum1.y))));
+            [[unroll]] for (uint n = 0u; n < 32u; ++n) o1[n] *= r;
+            [[unroll]] for (uint n = 0u; n < 32u; n += 8u)
+                sts4(TR(tok, 16u * h + n / 2u), uvec4(pk(o1[n], o1[n + 1u]), pk(o1[n + 2u], o1[n + 3u]), pk(o1[n + 4u], o1[n + 5u]), pk(o1[n + 6u], o1[n + 7u])));
+        }
+#else
         float o[2][32];
         [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) o[t][n] = 0.0;
         // The 64 keys in eight sets of eight: lane group g (lanes 8g..8g+7) takes the keys and values of group g + d
@@ -393,15 +589,26 @@ void main()
             [[unroll]] for (uint n = 0u; n < 32u; ++n) o[t][n] *= r;
         }
 #endif
-#if AO_ROWS
+#if AO_ROWS && (!SWZ || POSATTN)
         barrier();      // every wave has read the normalised rows
+#endif
+#if AO_ROWS
+#if SWZ
+        STORE_TOKROWS(32u, o, 16u * h)      // over this head's queries (the reads above are this wave's, in order)
+#else
         STORE_ROWS(32u, o, XA, RS, 16u * h)
+#endif
 #else
         STORE_ROWS(32u, o, hb, KR, 0u)
 #endif
+#endif
         }
         barrier();
+#if SWZ
+        for (uint i = 0u; i < min(uint(NW), uint(NH) - h0); ++i) gemmCW(acc, TOKROWS(16u * (h0 + i)), 16u, p.o[8u + 5u * (h0 + i)] / 2u + wave * CW, UC, TOKSW);
+#else
         for (uint i = 0u; i < min(uint(NW), uint(NH) - h0); ++i) gemmCW(acc, AO_ROWS != 0 ? XA + 16u * (h0 + i) : RH + i * RHS, AO_ROWS != 0 ? RS : KR, 16u, p.o[8u + 5u * (h0 + i)] / 2u + wave * CW, UC);
+#endif
         if (h0 + uint(NW) < uint(NH))
             barrier();      // every wave has read the attention outputs before the next round overwrites them
     }
@@ -409,6 +616,36 @@ void main()
     barrier();          // every wave has read the attention outputs
 #endif
     // x0 joins as one binary16 addition; the result is the MLP's input, and the stream continues as it + b2
+#if SWZ
+    [[unroll]] for (uint t = 0u; t < 2u; ++t)
+    {
+        const uint tok = lane + 32u * t;
+#if KIND == 2
+        const bool inImg = INSIDE(tok);
+        const uint src = inImg ? DST(tok) * HC : 0u;
+#else
+        const uint src = uint(mirrorToken(X0, Y0, tok)) * HC;
+#endif
+        [[unroll]] for (uint n = 0u; n < CW; n += 8u)
+        {
+            const uint d = (wave * CW + n) / 2u;
+#if KIND == 2
+            const uvec4 x = inImg ? uvec4(out0.a[src + d], out0.a[src + d + 1u], out0.a[src + d + 2u], out0.a[src + d + 3u]) : uvec4(0u);
+#else
+            const uvec4 x = in4(src + d);
+#endif
+            uvec4 yv;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+            {
+                const f16vec2 y = f16vec2(acc[t][n + 2u * j], acc[t][n + 2u * j + 1u]) + unpackFloat2x16(x[j]);
+                yv[j] = packFloat2x16(y);
+                const vec2 z = vec2(y + unpackFloat2x16(wb.w[(p.o[3] + wave * CW + n + 2u * j) / 2u]));
+                acc[t][n + 2u * j] = z.x; acc[t][n + 2u * j + 1u] = z.y;
+            }
+            sts4(TR(tok, d), yv);
+        }
+    }
+#else
     [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < CW; n += 2u)
     {
         const f16vec2 y = f16vec2(acc[t][n], acc[t][n + 1u]) + unpackFloat2x16(res[t][n / 2u]);
@@ -416,6 +653,7 @@ void main()
         const vec2 z = vec2(y + unpackFloat2x16(wb.w[(p.o[3] + wave * CW + n) / 2u]));
         acc[t][n] = z.x; acc[t][n + 1u] = z.y;
     }
+#endif
     barrier();
     // ------------------------------------------------------------ MLP, G chunks of 32 hidden channels at a time
     for (uint g = 0u; g < NCH; g += uint(G))
@@ -428,20 +666,39 @@ void main()
                 const uint b = wb.w[(p.o[45u + 3u * ch] + col + n) / 2u];
                 hh[t][n] = lo(b); hh[t][n + 1u] = hi(b);
             }
+#if SWZ
+            gemmHW(hh, TOKROWS(0u), HC, p.o[44u + 3u * ch] / 2u + col, 32u, TOKSW);
+#else
             gemmHW(hh, XA, RS, HC, p.o[44u + 3u * ch] / 2u + col, 32u);
+#endif
+#if SWZ
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < HW; n += 8u)
+            {
+                uvec4 v;
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) v[j] = packFloat2x16(gelu(f16vec2(hh[t][n + 2u * j], hh[t][n + 2u * j + 1u])));
+                sts4(HR(lane + 32u * t, (wave * HW + n) / 2u), v);
+            }
+#else
             [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < HW; n += 2u)
                 L[RH + (lane + 32u * t) * HRS + (wave * HW + n) / 2u] = packFloat2x16(gelu(f16vec2(hh[t][n], hh[t][n + 1u])));
+#endif
         }
         barrier();
+#if SWZ
+        gemmCW(acc, HIDROWS, 16u, p.o[46u + 3u * g] / 2u + wave * CW, UC, HIDSW);
+#else
         for (uint i = 0u; i < uint(G); ++i) gemmCW(acc, RH + 16u * i, HRS, 16u, p.o[46u + 3u * (g + i)] / 2u + wave * CW, UC);
+#endif
         barrier();
     }
     // ------------------------------------------------------------ outputs, through the token rows (whole 16-byte
     // pieces of consecutive tokens' channels per lane)
+#if SWZ
+    STORE_TOKROWS(CW, acc, wave * CW / 2u)
+#else
     STORE_ROWS(CW, acc, XA, RS, wave * CW / 2u)
+#endif
     barrier();
-#define INSIDE(tok) (Y0 + int((tok) >> 3) >= 0 && Y0 + int((tok) >> 3) < p.Hh && X0 + int((tok) & 7u) >= 0 && X0 + int((tok) & 7u) < p.W)
-#define DST(tok) uint((Y0 + int((tok) >> 3)) * p.W + X0 + int((tok) & 7u))
 #if HEAD
     {
         // 40 head channels (48 in the weights): wave 0 computes 0..23, wave 1 24..47; rows of 20 dwords in the heads'
@@ -470,6 +727,22 @@ void main()
             PIECE(64u * 20u, i)
             const uint tok = i / 5u, d = 4u * (i % 5u);
             if (INSIDE(tok)) { const uvec4 v = lds4(RH + tok * 20u + d); out0.a[DST(tok) * 20u + d] = v.x; out0.a[DST(tok) * 20u + d + 1u] = v.y; out0.a[DST(tok) * 20u + d + 2u] = v.z; out0.a[DST(tok) * 20u + d + 3u] = v.w; }
+        }
+    }
+#elif SWZ
+    // a loop: its addresses are computed here, not kept from the input copy
+    [[dont_unroll]] for (uint i = gi; i < 64u * HC / 4u; i += 32u * NW)
+    {
+        const uint tok = i / (HC / 4u), d = 4u * (i % (HC / 4u));
+        if (INSIDE(tok))
+        {
+            const uvec4 v = lds4(TR(tok, d));
+            const uint o = DST(tok) * HC + d;
+#if KIND == 1
+            out1.a[o] = v.x; out1.a[o + 1u] = v.y; out1.a[o + 2u] = v.z; out1.a[o + 3u] = v.w;
+#else
+            out0.a[o] = v.x; out0.a[o + 1u] = v.y; out0.a[o + 2u] = v.z; out0.a[o + 3u] = v.w;
+#endif
         }
     }
 #else
@@ -520,7 +793,11 @@ void main()
                     {
                         const uint mr = tg * MT + r;
                         const uint src = 8u * (2u * (mr >> 2) + (sub >> 1)) + 2u * (mr & 3u) + (sub & 1u);
+#if SWZ
+                        const uvec4 a = lds4(TR(src, cd));
+#else
                         const uvec4 a = lds4(XA + src * RS + cd);
+#endif
                         [[unroll]] for (uint j = 0u; j < 4u; ++j) { m[r][0] = d2(a[j], w[k4 + j].x, m[r][0]); m[r][1] = d2(a[j], w[k4 + j].y, m[r][1]); }
                     }
                 }

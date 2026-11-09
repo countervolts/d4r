@@ -61,12 +61,30 @@ float logK(float Y) { precise const float m = max(Y, 0.0); return (log2(fma(m, 1
 float srgb(float v) { const float x = clamp(v, 0.0, 1.0); return x > 0.0031308 ? fma(exp2(log2(x) * (1.0 / 2.4)), 1.055, -0.055) : 12.92 * x; }
 ivec2 nearest(vec2 pixCentre) { const vec2 r = pixCentre * p.out2rnd - 0.5 + p.rndOffs; return ivec2(roundHalfAway(r.x), roundHalfAway(r.y)); }
 // Depth with larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones.
-float depthAt(ivec2 t)
+float depthFetch(ivec2 t)
 {
     const ivec2 hi = p.depOrigin + p.depSize;
     const float d = texelFetch(depthTex, ivec2(clamp1(t.x, p.depOrigin.x, hi.x), clamp1(t.y, p.depOrigin.y, hi.y)), 0).r;
     return (p.flags & 2u) != 0u ? -d : d;
 }
+// STAGE_DEPTH: the group's depth footprint (the nearest render texels of its 32x32 pixels and their diagonal
+// neighbours, up to DT x DT) is fetched once into shared memory; the dilation's five taps per pixel read it there.
+// The same values (depthFetch of the same texel), so the same result; larger footprints fetch directly.
+#ifndef STAGE_DEPTH
+#define STAGE_DEPTH 1
+#endif
+#if STAGE_DEPTH
+const int DT = 36;
+shared float depthTile[DT * DT];
+ivec2 dtOrigin;
+float depthAt(ivec2 t, bool staged)
+{
+    if (staged) { const ivec2 r = t - dtOrigin; return depthTile[r.y * DT + r.x]; }
+    return depthFetch(t);
+}
+#else
+float depthAt(ivec2 t, bool staged) { return depthFetch(t); }
+#endif
 vec2 motionIn(vec2 mv) { return CANONICAL_INPUT ? canonicalHalf(mv) : mv; }
 // motion vector of a texel, clamped to the motion rectangle, in output pixels
 vec2 motionTexel(ivec2 t)
@@ -76,10 +94,11 @@ vec2 motionTexel(ivec2 t)
 }
 // motion of the render texel nearest to a pixel, taken from the nearest of its diagonal depth neighbours;
 // with display-resolution vectors (flag 4) t is the pixel itself, and its own vector is used
-vec2 motionOf(ivec2 t)
+vec2 motionOf(ivec2 t, bool staged)
 {
     if ((p.flags & 4u) != 0u) return motionTexel(t);
-    const float d0 = depthAt(t), dmm = depthAt(t + ivec2(-1, -1)), dpm = depthAt(t + ivec2(1, -1)), dmp = depthAt(t + ivec2(-1, 1)), dpp = depthAt(t + ivec2(1, 1));
+    const float d0 = depthAt(t, staged), dmm = depthAt(t + ivec2(-1, -1), staged), dpm = depthAt(t + ivec2(1, -1), staged),
+                dmp = depthAt(t + ivec2(-1, 1), staged), dpp = depthAt(t + ivec2(1, 1), staged);
     ivec2 d = ivec2(0);
     if (d0 < 0.5 * (dmm + dpp) - 0.001 * abs(d0) || d0 < 0.5 * (dpm + dmp) - 0.001 * abs(d0))
     {
@@ -99,7 +118,33 @@ vec3 colourAt(ivec2 t)       // exposed, non-negative
     return p.expo * max(CANONICAL_INPUT ? canonicalHalf(c) : c, 0.0);
 }
 shared vec4 featShared[16 * 16];  // the token feature seen from each sub-block of the group
+void body(const bool staged);
 void main()
+{
+#if STAGE_DEPTH
+    bool dtUse;
+    {
+        // the group's pixels are 32 x 32 from P0; nearest() is monotonic in each axis
+        const ivec2 P0 = ivec2(gl_WorkGroupID.xy) * 32;
+        const ivec2 n0 = nearest(vec2(P0) + 0.5), n1 = nearest(vec2(P0 + 31) + 0.5);
+        dtOrigin = min(n0, n1) - 1;
+        const ivec2 ext = max(n0, n1) + 2 - dtOrigin;
+        dtUse = (p.flags & 4u) == 0u && ext.x <= DT && ext.y <= DT;
+        if (dtUse)
+            for (int i = int(gl_LocalInvocationIndex); i < ext.x * ext.y; i += 256)
+            {
+                const ivec2 r = ivec2(i % ext.x, i / ext.x);
+                depthTile[r.y * DT + r.x] = depthFetch(dtOrigin + r);
+            }
+        barrier();
+    }
+    // two copies of the stage (the compiler inlines each with its constant), so that neither carries the other's taps
+    if (dtUse) body(true); else body(false);
+#else
+    body(false);
+#endif
+}
+void body(const bool staged)
 {
     const ivec2 tok = ivec2(gl_GlobalInvocationID.xy) >> 1;
     const ivec2 sub = ivec2(gl_GlobalInvocationID.xy) & 1;
@@ -117,7 +162,7 @@ void main()
         {
             const vec2 pc = vec2(X + ivec2(j & 1, j >> 1)) + 0.5;
             // display-resolution vectors belong to the pixel itself; render-resolution ones to its nearest texel
-            dq[j] = motionOf((p.flags & 4u) != 0u ? X + ivec2(j & 1, j >> 1) : nearest(pc));
+            dq[j] = motionOf((p.flags & 4u) != 0u ? X + ivec2(j & 1, j >> 1) : nearest(pc), staged);
             const vec2 q = pc + dq[j], qv = q * p.invValid;
             invalid = invalid || qv.x < 0.0 || qv.x > 1.0 || qv.y < 0.0 || qv.y > 1.0;
             const vec3 h = textureLod(histTex, q * p.invHist, 0.0).rgb;

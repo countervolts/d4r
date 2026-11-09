@@ -271,10 +271,11 @@ void bindImage(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageVi
     write.pImageInfo = &info;
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
-void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false) {
+void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false,
+              uint32_t z = 1) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f16Inputs && pipeline.f16Inputs ? pipeline.f16Inputs : pipeline.handle);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
-    vkCmdDispatch(cb, x, y, 1);
+    vkCmdDispatch(cb, x, y, z);
 }
 constexpr const char* Names[KLayers] = {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"};
 // The windows of each layer (x, y group counts) that the frame's results depend on. A window reads only its own
@@ -406,6 +407,12 @@ struct Model::Impl {
     std::vector<char> weightBytes, lutBytes;   // until recordUpload
     std::array<std::array<uint32_t, 108>, KLayers> offsets{};
     std::array<Pipeline, KLayers> network;
+    // layer_dot2_split.comp: a layer as up to seven dispatches (<layer>_dot2_s1..s7.spv; <layer>_dot2_split.bin holds
+    // each phase's z group count, 0 for none), used when the model folder has it (D4R_ENGINE_K_SPLIT=0 ignores it):
+    // the same results over many more workgroups, for the deep layers' few windows
+    std::array<std::array<Pipeline, 7>, KLayers> phases;
+    std::array<std::array<uint32_t, 7>, KLayers> phaseZ{};
+    std::array<bool, KLayers> split{};
     Pipeline input, output, outputRgb10, outputRgba8, outputR11, outputRgba32, outputBgra8, outputE5;
     // the final-store pipeline for a borrowed output texture of this format; null when none is packaged
     const Pipeline* outputFor(VkFormat format) const {
@@ -511,6 +518,20 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
             throw std::runtime_error("the model has no network shaders for GPUs without cooperative matrices (" + spv +
                                      "): rebuild it with the current compile_k.py");
         m.network[i].create(device, spv, {b,b,b,b,b,b}, 32, cache);
+        const char* splitEnv = std::getenv("D4R_ENGINE_K_SPLIT");
+        const std::string base = directory + "/" + Names[i] + "_dot2_s", zFile = directory + "/" + Names[i] + "_dot2_split.bin";
+        if (m.dot2 && !(splitEnv && !std::strcmp(splitEnv, "0")) && exists(zFile)) {
+            const auto zb = read(zFile);
+            bool all = zb.size() == sizeof(m.phaseZ[i]);
+            if (all) std::memcpy(m.phaseZ[i].data(), zb.data(), zb.size());
+            // all seven zero: the layer runs whole (a folder can turn an earlier split off this way)
+            all = all && std::any_of(m.phaseZ[i].begin(), m.phaseZ[i].end(), [](uint32_t z) { return z != 0; });
+            for (unsigned ph = 0; all && ph < 7; ++ph)
+                all = !m.phaseZ[i][ph] || exists(base + std::to_string(ph + 1) + ".spv");
+            for (unsigned ph = 0; all && ph < 7; ++ph)
+                if (m.phaseZ[i][ph]) m.phases[i][ph].create(device, base + std::to_string(ph + 1) + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+            m.split[i] = all;
+        }
     }
     // The stages around the network run as wave64 (D4R_ENGINE_K_STAGE_WAVE=32|64 forces one size; the outputs are
     // identical). Without cooperative matrices (RDNA2, which issues wave64 in two passes) the input stage and the
@@ -596,6 +617,8 @@ struct Engine::Impl {
     bool finalNew = false, finalCopyRaw = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, KLayers> layerSets{};
+    std::array<VkDescriptorSet, KLayers> phaseSets{};   // split layers: the six bindings + the scratch buffer
+    Buffer scratch;
     std::array<VkDescriptorSet, 2> inputSets{}, outputSets{};
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     unsigned previous = 0;
@@ -672,9 +695,9 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         e.skip[i].create(d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         e.activations += e.skip[i].size;
     }
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, e.external ? 16u : 96u}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 24}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, e.external ? 16u : 96u + 7u * KLayers}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 24}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = e.external ? 6u : 17u; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
+    pi.maxSets = e.external ? 6u : 17u + KLayers; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
     VKCHECK(vkCreateDescriptorPool(dev, &pi, nullptr, &e.pool));
     for (unsigned i = 0; i < KLayers && !e.external; ++i) {
         e.layerParams[i].create(d, sizeof(LayerParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
@@ -686,6 +709,32 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         bindBuffer(dev, set, 3, i >= 6 ? e.skip[10 - i] : e.dummy);
         bindBuffer(dev, set, 4, e.main[(i + 1) % 2]);
         bindBuffer(dev, set, 5, i < 5 ? e.skip[i] : e.dummy);
+    }
+    // the split layers' scratch (layer_dot2_split.comp), binary16, every window of the shifted grid: y, hidden, x0
+    // (C, 4C, C per token), Q K V (3 x 32 per head and token), attention outputs (32 per head)
+    VkDeviceSize scratchBytes = 0;
+    for (unsigned i = 0; i < KLayers && !e.external; ++i)
+        if (e.model.split[i]) {
+            const auto& ls = shape.layers[i];
+            const VkDeviceSize windows = VkDeviceSize((ls.w + ls.sx + 7) / 8) * ((ls.h + ls.sy + 7) / 8);
+            scratchBytes = std::max(scratchBytes, windows * 64 * (Channels[i] * 7 + Heads[i] * 128) * 2);
+        }
+    if (scratchBytes) {
+        if (scratchBytes > d.properties.limits.maxStorageBufferRange) throw std::runtime_error("split scratch exceeds device range");
+        e.scratch.create(d, scratchBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        e.activations += e.scratch.size;
+        for (unsigned i = 0; i < KLayers; ++i) {
+            if (!e.model.split[i]) continue;
+            unsigned first = 0;
+            while (!e.model.phaseZ[i][first]) ++first;
+            auto set = e.phaseSets[i] = descriptorSet(dev, e.pool, e.model.phases[i][first].descriptors);
+            bindBuffer(dev, set, 0, e.layerParams[i]); bindBuffer(dev, set, 1, e.model.weights);
+            bindBuffer(dev, set, 2, e.main[i % 2]);
+            bindBuffer(dev, set, 3, i >= 6 ? e.skip[10 - i] : e.dummy);
+            bindBuffer(dev, set, 4, e.main[(i + 1) % 2]);
+            bindBuffer(dev, set, 5, i < 5 ? e.skip[i] : e.dummy);
+            bindBuffer(dev, set, 6, e.scratch);
+        }
     }
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -930,7 +979,18 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     for (unsigned i = 0; i < KLayers; ++i) {
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
+        if (e.model.split[i] && e.scratch.handle) {
+            const auto& ph = e.model.phases[i];
+            bool first = true;
+            for (unsigned k = 0; k < 7; ++k) {
+                if (!e.model.phaseZ[i][k]) continue;
+                if (!first) memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                dispatch(cb, ph[k], e.phaseSets[i], groups[i][0], groups[i][1], false, e.model.phaseZ[i][k]);
+                first = false;
+            }
+        } else
+            dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
         mark(4 + i);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);

@@ -1,0 +1,411 @@
+#version 460
+// d4r engine, preset K: one Swin block of layer_dot2.comp split into phases (one dispatch each), for the deep layers
+// whose few windows leave most of a GPU idle as one workgroup per window (RDNA2, 32 CUs: enc4/dec4 have 15 windows,
+// dec5 4, enc3/dec3 40). Every phase spreads its window's work over many one-wave workgroups. Same mathematics and
+// the same order of every sum as layer_dot2.comp, so the output is the same bit for bit.
+//   PHASE 1 (decoders): expand + skip -> x0 rows           groups (windows, 2C / 32): 32 column pairs of 16 tokens
+//   PHASE 2: x0 * rsqrt(sum x0^2), V Q K of one head        groups (windows, 3 NH 32 / NN2): two waves
+//   PHASE 3: attention of one head                         groups (windows, NH QS): QS = 2 splits the query tokens
+//   PHASE 4: output projection + x0 -> y rows               groups (windows, C / NN4)
+//   PHASE 5: MLP hidden channels, gelu                      groups (windows, 4 C / NN5)
+//   PHASE 6: y + b2 + hidden x W2 -> the block output       groups (windows, C / NN6)
+//   PHASE 7 (encoders): patch merge                         groups (windows, ceil(X / NN7)): a wave takes the 16
+//                                                           merged tokens of an even window and of the next one
+// Phases 2 and 4 to 7: a lane owns one token (two waves per window: tokens 0..31 and 32..63), reads its own row from
+// memory (16 K pairs at a time, the next two requested ahead; no shared memory, no barriers) and computes NN output
+// channels; weights are wave-uniform (scalar memory), as in layer_dot2.comp.
+// Scratch (binding 6), dwords, chunk-major so that a wave's 32 tokens read and write one block of 2 KB:
+// y [win][C/32][64][16], hidden [win][C/8][64][16], x0 [win][C/32][64][16] (decoders),
+// Q K V [win][NH][3][64][16] (V, Q, K), attention outputs [win][NH][64][16].
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_AMD_shader_ballot : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef FOLD_GAINS
+#define FOLD_GAINS 1
+#endif
+#if !FOLD_GAINS
+#error layer_dot2_split.comp needs gains folded into the weights
+#endif
+#if POSATTN || EMBED || HEAD
+#error layer_dot2_split.comp: the deep layers only (no position-only attention, embedding or head)
+#endif
+#ifndef PHASE
+#error PHASE
+#endif
+#ifndef QS
+#define QS 1
+#endif
+#ifndef NN2
+#define NN2 32
+#endif
+#ifndef NN4
+#define NN4 32
+#endif
+#ifndef NN5
+#define NN5 32
+#endif
+#ifndef NN6
+#define NN6 16
+#endif
+#ifndef NN7
+#define NN7 32
+#endif
+#if PHASE == 2 || PHASE == 4 || PHASE == 5 || PHASE == 6
+layout(local_size_x = 64) in;       // the window's two halves (32 tokens each) share the weights in scalar cache
+#else
+layout(local_size_x = 32) in;
+#endif
+layout(set = 0, binding = 0, std430) readonly buffer Pb { int W; int Hh; int sx; int sy; uint o[108]; } p;
+layout(set = 0, binding = 1, std430) readonly buffer Wb { uint w[]; } wb;
+layout(set = 0, binding = 2, std430) readonly buffer Ib { uint a[]; } inb;
+layout(set = 0, binding = 3, std430) readonly buffer Sb { uint a[]; } skb;
+layout(set = 0, binding = 4, std430) writeonly buffer O0 { uint a[]; } out0;
+#if PHASE == 7
+layout(set = 0, binding = 5, std430) readonly buffer O1 { uint a[]; } out1;
+#else
+layout(set = 0, binding = 5, std430) writeonly buffer O1 { uint a[]; } out1;
+#endif
+layout(set = 0, binding = 6, std430) buffer Scb { uint a[]; } scr;
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2acc(f16vec2 a, f16vec2 b, float c);
+float d2(uint a, uint b, float c) { return dot2acc(unpackFloat2x16(a), unpackFloat2x16(b), c); }
+const uint UC = uint(C), HC = UC / 2u, NHU = uint(NH);
+#if PHASE == 1
+const uint XH = uint(XC) / 2u, LRS = XH + 4u;
+shared uint L[16u * LRS];
+uvec4 lds4(uint i) { i &= ~3u; return uvec4(L[i], L[i + 1u], L[i + 2u], L[i + 3u]); }
+void sts4(uint i, uvec4 v) { i &= ~3u; L[i] = v.x; L[i + 1u] = v.y; L[i + 2u] = v.z; L[i + 3u] = v.w; }
+#endif
+uint lane, gi;
+int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
+int tdiv2(int v) { return v < 0 ? -((-v) / 2) : v / 2; }
+float lo(uint v) { return float(unpackFloat2x16(v).x); }
+float hi(uint v) { return float(unpackFloat2x16(v).y); }
+uint pk(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
+f16vec2 softmax_exp(f16vec2 s)
+{
+    const f16vec2 t = clamp(s, f16vec2(uint16BitsToFloat16(uint16_t(0xCD69))), f16vec2(uint16BitsToFloat16(uint16_t(0x4D69))));
+    const f16vec2 v = fma(t * t, f16vec2(uint16BitsToFloat16(uint16_t(0x91D5))), f16vec2(1.0));
+    return f16vec2(exp2(vec2(fma(t, v, f16vec2(uint16BitsToFloat16(uint16_t(0xC50D)))))));
+}
+f16vec2 gelu(f16vec2 x)
+{
+    const f16vec2 c = clamp(x, f16vec2(-2.0), f16vec2(2.0));
+    precise f16vec2 u = f16vec2(0.41216981) - f16vec2(0.08108133) * abs(c);
+    precise f16vec2 y = f16vec2(0.5) + c * u;
+    return x * y;
+}
+#define PW 1
+#define PIECES(N) [[unroll]] for (uint pi = 0u; pi < ((N) / 4u + 32u * PW - 1u) / (32u * PW); ++pi)
+#define PIECE(N, i) const uint i = gi + pi * 32u * PW; if ((N) % (128u * PW) != 0u && i >= (N) / 4u) break;
+uvec4 in4(uint i) { return uvec4(inb.a[i], inb.a[i + 1u], inb.a[i + 2u], inb.a[i + 3u]); }
+uvec4 sc4(uint i) { return uvec4(scr.a[i], scr.a[i + 1u], scr.a[i + 2u], scr.a[i + 3u]); }
+#if PHASE == 7
+uvec4 o14(uint i) { return uvec4(out1.a[i], out1.a[i + 1u], out1.a[i + 2u], out1.a[i + 3u]); }
+#endif
+int X0, Y0;
+uint wi, nWin, nWx;
+int mirrorToken(uint tok) { return mirror(Y0 + int(tok >> 3), p.Hh) * p.W + mirror(X0 + int(tok & 7u), p.W); }
+#define INSIDE(tok) (Y0 + int((tok) >> 3) >= 0 && Y0 + int((tok) >> 3) < p.Hh && X0 + int((tok) & 7u) >= 0 && X0 + int((tok) & 7u) < p.W)
+#define DST(tok) uint((Y0 + int((tok) >> 3)) * p.W + X0 + int((tok) & 7u))
+uint yBase() { return 0u; }
+uint hBase() { return nWin * 64u * HC; }
+uint x0Base() { return hBase() + nWin * 64u * 2u * UC; }
+uint qkvBase() { return x0Base() + (KIND == 2 ? nWin * 64u * HC : 0u); }
+uint aoBase() { return qkvBase() + nWin * NHU * 3u * 64u * 16u; }
+// dword d of window token tok's row in a chunk-major scratch area of CH 16-dword chunks per token
+uint cm(uint base, uint CH, uint tok, uint d) { return base + ((wi * CH + d / 16u) * 64u + tok) * 16u + (d & 15u); }
+// dwords d .. d + 3 (d a multiple of four) of x0, the block's input, of window token tok
+uvec4 x04(uint tok, uint d)
+{
+#if KIND == 2
+    return sc4(cm(x0Base(), HC / 16u, tok, d));
+#else
+    return in4(uint(mirrorToken(tok)) * HC + d);
+#endif
+}
+uint x0Word(uint tok, uint d)
+{
+#if KIND == 2
+    return scr.a[cm(x0Base(), HC / 16u, tok, d)];
+#else
+    return inb.a[uint(mirrorToken(tok)) * HC + d];
+#endif
+}
+// acc[n] += sum over the lane's row of CH chunks of 16 K pairs (chunk c's 16 dwords at ROWADDR(c), loaded by LD4)
+// times the weights (chunk c's pair k, output n at WADDR(c) + k * WS + n), chunk by chunk in order; the next two
+// chunks are requested while one is used
+#define STREAM_GEMM(acc, NN, CH, LD4, ROWADDR, WADDR, WS) \
+{ \
+    uvec4 c0[4], c1[4], c2[4]; \
+    [[unroll]] for (uint q = 0u; q < 4u; ++q) { c1[q] = LD4(ROWADDR(0u) + 4u * q); c2[q] = LD4(ROWADDR(min(1u, (CH) - 1u)) + 4u * q); } \
+    [[dont_unroll]] for (uint ch = 0u; ch < (CH); ++ch) \
+    { \
+        [[unroll]] for (uint q = 0u; q < 4u; ++q) { c0[q] = c1[q]; c1[q] = c2[q]; } \
+        const uint nx = min(ch + 2u, (CH) - 1u); \
+        [[unroll]] for (uint q = 0u; q < 4u; ++q) c2[q] = LD4(ROWADDR(nx) + 4u * q); \
+        const uint wa = WADDR(ch); \
+        [[unroll]] for (uint k = 0u; k < 16u; ++k) [[unroll]] for (uint n = 0u; n < uint(NN); ++n) \
+            acc[n] = d2(c0[k >> 2][k & 3u], wb.w[wa + k * (WS) + n], acc[n]); \
+    } \
+}
+void main()
+{
+    gi = gl_LocalInvocationID.x; lane = gl_SubgroupInvocationID;
+    nWx = uint(p.W + p.sx + 7) / 8u;
+    nWin = nWx * (uint(p.Hh + p.sy + 7) / 8u);
+    wi = gl_WorkGroupID.y * nWx + gl_WorkGroupID.x;
+    X0 = 8 * int(gl_WorkGroupID.x) - p.sx; Y0 = 8 * int(gl_WorkGroupID.y) - p.sy;
+    const uint z = gl_WorkGroupID.z;
+#if PHASE != 1 && PHASE != 3 && PHASE != 7
+    const uint tok = gl_LocalInvocationID.x, zc = z;
+#endif
+#if PHASE == 1
+    // ------------------------------------------------------------ expand (this wave's 32 column pairs of the 4C) + skip
+#if KIND != 2
+#error phase 1 is the decoders' expand
+#endif
+    {
+        const int W2 = p.W / 2, H2 = p.Hh / 2;
+        {
+            uvec4 v[(16u * XH / 4u + 31u) / 32u];
+            PIECES(16u * XH)
+            {
+                PIECE(16u * XH, i)
+                const uint r = i / (XH / 4u), d = 4u * (i % (XH / 4u));
+                v[pi] = in4(uint(mirror(tdiv2(Y0) + int(r >> 2), H2) * W2 + mirror(tdiv2(X0) + int(r & 3u), W2)) * XH + d);
+            }
+            PIECES(16u * XH) { PIECE(16u * XH, i) sts4(i / (XH / 4u) * LRS + 4u * (i % (XH / 4u)), v[pi]); }
+        }
+        barrier();
+        const uint pb = 32u * z + lane;
+        const uint bias = wb.w[p.o[105] / 2u + pb];
+        float e[16][2];
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) { e[r][0] = lo(bias); e[r][1] = hi(bias); }
+        const uint wbase = p.o[104] / 2u + 2u * pb;
+#define EXPAND_W(dst, k) [[unroll]] for (uint j = 0u; j < 16u; ++j) dst[j] = uvec2(wb.w[wbase + ((k) + j) * 4u * UC], wb.w[wbase + ((k) + j) * 4u * UC + 1u]);
+        uvec2 wn[16];
+        EXPAND_W(wn, 0u)
+        [[dont_unroll]] for (uint kb = 0u; kb < XH; kb += 16u)
+        {
+            uvec2 w[16];
+            [[unroll]] for (uint j = 0u; j < 16u; ++j) w[j] = wn[j];
+            EXPAND_W(wn, min(kb + 16u, XH - 16u))
+            [[unroll]] for (uint k4 = 0u; k4 < 16u; k4 += 4u)
+                [[unroll]] for (uint r = 0u; r < 16u; ++r)
+                {
+                    const uvec4 a = lds4(r * LRS + kb + k4);
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) { e[r][0] = d2(a[j], w[k4 + j].x, e[r][0]); e[r][1] = d2(a[j], w[k4 + j].y, e[r][1]); }
+                }
+        }
+        // column 2 pb is channel c of sub-token q of each low-resolution token; plus the skip connection (binary16)
+        const uint q = 2u * pb / UC, c = 2u * pb % UC;
+        uint sk[16];
+        [[unroll]] for (uint r = 0u; r < 16u; ++r)
+        {
+            const uint tok = (2u * (r >> 2) + (q >> 1)) * 8u + 2u * (r & 3u) + (q & 1u);
+            sk[r] = skb.a[uint(mirrorToken(tok)) * HC + c / 2u];
+        }
+        [[unroll]] for (uint r = 0u; r < 16u; ++r)
+        {
+            const uint tok = (2u * (r >> 2) + (q >> 1)) * 8u + 2u * (r & 3u) + (q & 1u);
+            scr.a[cm(x0Base(), HC / 16u, tok, c / 2u)] =
+                packFloat2x16(unpackFloat2x16(pk(e[r][0], e[r][1])) + unpackFloat2x16(sk[r]));
+        }
+    }
+#elif PHASE == 2
+    // ------------------------------------------------------------ x0 * rsqrt(sum x0^2), then V, Q or K of one head
+    {
+        uvec4 xr[HC / 4u];
+        [[unroll]] for (uint q = 0u; q < HC / 4u; ++q) xr[q] = x04(tok, 4u * q);
+        vec2 s2 = vec2(0.0);
+        [[unroll]] for (uint d = 0u; d < HC; ++d) { const vec2 f = vec2(unpackFloat2x16(xr[d >> 2][d & 3u])); s2 += f * f; }
+        const float16_t rs = float16_t(inversesqrt(float(float16_t(s2.x + s2.y))));
+        [[unroll]] for (uint d = 0u; d < HC; ++d) xr[d >> 2][d & 3u] = packFloat2x16(unpackFloat2x16(xr[d >> 2][d & 3u]) * rs);
+        // zc: head, V Q or K, and which NN2 of its 32 channels
+        const uint part = zc % (32u / uint(NN2)), hm = zc / (32u / uint(NN2)), h = hm / 3u, m = hm % 3u, col = part * uint(NN2);
+        const uint wa = p.o[(m == 0u ? 6u : m == 1u ? 4u : 5u) + 5u * h] / 2u + col;
+        float a[NN2];
+        [[unroll]] for (uint n = 0u; n < uint(NN2); ++n) a[n] = 0.0;
+        [[unroll]] for (uint kp = 0u; kp < HC; ++kp) [[unroll]] for (uint n = 0u; n < uint(NN2); ++n)
+            a[n] = d2(xr[kp >> 2][kp & 3u], wb.w[wa + kp * 32u + n], a[n]);
+        const uint qb = qkvBase() + ((wi * NHU + h) * 3u + m) * 64u * 16u;
+        [[unroll]] for (uint n = 0u; n < uint(NN2); n += 2u) scr.a[qb + tok * 16u + (col + n) / 2u] = pk(a[n], a[n + 1u]);
+    }
+#elif PHASE == 3
+    // ------------------------------------------------------------ attention of head z / QS (layer_dot2.comp's, for
+    // TQ of the lane's two query tokens)
+    {
+        const uint TQ = 2u / uint(QS);
+        const uint h = z / uint(QS), tq0 = (z % uint(QS)) * TQ;
+        const uint otab = p.o[7u + 5u * h];
+        const uint qb = qkvBase() + (wi * NHU + h) * 3u * 64u * 16u;
+        uint kc[2][16], vc[2][16];
+        {
+            const bool odd = (lane & 1u) != 0u;
+            [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n)
+            {
+                const uint own = scr.a[qb + (lane + 32u * t) * 16u + n], other = subgroupShuffleXor(own, 1u);
+                vc[t][n] = odd ? ((other >> 16) | (own & 0xFFFF0000u)) : ((own & 0xFFFFu) | (other << 16));
+            }
+        }
+        uint q[2 / QS][16];
+        [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n)
+            kc[t][n] = scr.a[qb + 2u * 64u * 16u + (lane + 32u * t) * 16u + n];
+        [[unroll]] for (uint t = 0u; t < TQ; ++t) [[unroll]] for (uint n = 0u; n < 16u; ++n)
+            q[t][n] = scr.a[qb + 64u * 16u + (lane + 32u * (tq0 + t)) * 16u + n];
+        vec2 sum[2 / QS];
+        [[unroll]] for (uint t = 0u; t < TQ; ++t) sum[t] = vec2(0.0);
+        float o[2 / QS][32];
+        [[unroll]] for (uint t = 0u; t < TQ; ++t) [[unroll]] for (uint n = 0u; n < 32u; ++n) o[t][n] = 0.0;
+#define BC8(v, r) swizzleInvocationsMaskedAMD(v, uvec3(0x18u, r, 0u))
+#define SET_TABLE(dst, d_, h2_) [[unroll]] for (uint t = 0u; t < TQ; ++t) [[unroll]] for (uint j = 0u; j < 4u; ++j) \
+            dst[t][j] = wb.w[otab / 2u + (lane + 32u * (tq0 + t)) * 32u + ((((lane & ~7u) + 8u * (d_)) & 31u) + 32u * (h2_)) / 2u + j];
+        uint tn[2 / QS][4];
+        SET_TABLE(tn, 0u, 0u)
+        [[dont_unroll]] for (uint d = 0u; d < 4u; ++d)
+        {
+            [[unroll]] for (uint h2 = 0u; h2 < 2u; ++h2)
+            {
+                uint e[2 / QS][4];
+                float s[2 / QS][8];
+                [[unroll]] for (uint t = 0u; t < TQ; ++t) [[unroll]] for (uint j = 0u; j < 4u; ++j) { s[t][2u * j] = lo(tn[t][j]); s[t][2u * j + 1u] = hi(tn[t][j]); }
+                SET_TABLE(tn, h2 == 0u ? d : min(d + 1u, 3u), h2 ^ 1u)
+                [[unroll]] for (uint kp = 0u; kp < 16u; ++kp)
+                {
+#define SC(r) { const uint k = BC8(kc[h2][kp], r); [[unroll]] for (uint t = 0u; t < TQ; ++t) s[t][r] = d2(k, q[t][kp], s[t][r]); }
+                    SC(0u) SC(1u) SC(2u) SC(3u) SC(4u) SC(5u) SC(6u) SC(7u)
+                }
+                [[unroll]] for (uint t = 0u; t < TQ; ++t) [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                {
+                    const f16vec2 x = softmax_exp(f16vec2(s[t][2u * j], s[t][2u * j + 1u]));
+                    sum[t] += vec2(x);
+                    e[t][j] = packFloat2x16(x);
+                }
+#define PV(rp, c) { const uint v = BC8(vc[h2][k], 2u * rp + c); [[unroll]] for (uint t = 0u; t < TQ; ++t) o[t][2u * k + c] = d2(v, e[t][rp], o[t][2u * k + c]); }
+                [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV(0u, 0u) PV(0u, 1u) }
+                [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV(1u, 0u) PV(1u, 1u) }
+                [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV(2u, 0u) PV(2u, 1u) }
+                [[unroll]] for (uint k = 0u; k < 16u; ++k) { PV(3u, 0u) PV(3u, 1u) }
+                [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                {
+                    kc[h2][k] = subgroupShuffle(kc[h2][k], (lane + 8u) & 31u);
+                    vc[h2][k] = subgroupShuffle(vc[h2][k], (lane + 8u) & 31u);
+                }
+            }
+        }
+        const uint ob = aoBase();
+        [[unroll]] for (uint t = 0u; t < TQ; ++t)
+        {
+            const float r = float(float16_t(1.0 / float(float16_t(sum[t].x + sum[t].y))));
+            [[unroll]] for (uint n = 0u; n < 32u; n += 2u)
+                scr.a[ob + ((wi * NHU + h) * 64u + lane + 32u * (tq0 + t)) * 16u + n / 2u] = pk(o[t][n] * r, o[t][n + 1u] * r);
+        }
+    }
+#elif PHASE == 4
+    // ------------------------------------------------------------ bo + attention outputs x wo (heads in order), + x0
+    {
+        const uint col = zc * uint(NN4);
+        float acc[NN4];
+        [[unroll]] for (uint n = 0u; n < uint(NN4); n += 2u)
+        {
+            const uint b = wb.w[(p.o[1] + col + n) / 2u];
+            acc[n] = lo(b); acc[n + 1u] = hi(b);
+        }
+#define AO_ROW(c) (aoBase() + ((wi * NHU + (c)) * 64u + tok) * 16u)
+#define AO_W(c) (p.o[8u + 5u * (c)] / 2u + col)
+        STREAM_GEMM(acc, NN4, NHU, sc4, AO_ROW, AO_W, UC)
+        [[unroll]] for (uint n = 0u; n < uint(NN4); n += 2u)
+        {
+            const f16vec2 y = f16vec2(acc[n], acc[n + 1u]) + unpackFloat2x16(x0Word(tok, (col + n) / 2u));
+            scr.a[cm(yBase(), HC / 16u, tok, (col + n) / 2u)] = packFloat2x16(y);
+        }
+    }
+#elif PHASE == 5
+    // ------------------------------------------------------------ hidden chunk zc (32 channels) of the MLP, gelu
+    {
+        uvec4 yr[HC / 4u];
+        [[unroll]] for (uint q = 0u; q < HC / 4u; ++q) yr[q] = sc4(cm(yBase(), HC / 16u, tok, 4u * q));
+        // zc: hidden chunk and which NN5 of its 32 channels
+        const uint ch = zc / (32u / uint(NN5)), col = (zc % (32u / uint(NN5))) * uint(NN5);
+        float hh[NN5];
+        [[unroll]] for (uint n = 0u; n < uint(NN5); n += 2u)
+        {
+            const uint b = wb.w[(p.o[45u + 3u * ch] + col + n) / 2u];
+            hh[n] = lo(b); hh[n + 1u] = hi(b);
+        }
+        const uint wa = p.o[44u + 3u * ch] / 2u + col;
+        [[unroll]] for (uint kp = 0u; kp < HC; ++kp) [[unroll]] for (uint n = 0u; n < uint(NN5); ++n)
+            hh[n] = d2(yr[kp >> 2][kp & 3u], wb.w[wa + kp * 32u + n], hh[n]);
+        [[unroll]] for (uint n = 0u; n < uint(NN5); n += 2u)
+            scr.a[cm(hBase(), UC / 8u, tok, 16u * ch + (col + n) / 2u)] = packFloat2x16(gelu(f16vec2(hh[n], hh[n + 1u])));
+    }
+#elif PHASE == 6
+    // ------------------------------------------------------------ (y + b2) + hidden x W2, chunk by chunk, -> output
+    {
+        const uint col = zc * uint(NN6);
+        float acc[NN6];
+        [[unroll]] for (uint n = 0u; n < uint(NN6); n += 2u)
+        {
+            const f16vec2 y = unpackFloat2x16(scr.a[cm(yBase(), HC / 16u, tok, (col + n) / 2u)]);
+            const vec2 zz = vec2(y + unpackFloat2x16(wb.w[(p.o[3] + col + n) / 2u]));
+            acc[n] = zz.x; acc[n + 1u] = zz.y;
+        }
+#define H_ROW(c) cm(hBase(), UC / 8u, tok, 16u * (c))
+#define H_W(c) (p.o[46u + 3u * (c)] / 2u + col)
+        STREAM_GEMM(acc, NN6, UC / 8u, sc4, H_ROW, H_W, UC)
+        if (INSIDE(tok))
+            [[unroll]] for (uint n = 0u; n < uint(NN6); n += 2u)
+            {
+#if KIND == 1
+                out1.a[DST(tok) * HC + (col + n) / 2u] = pk(acc[n], acc[n + 1u]);
+#else
+                out0.a[DST(tok) * HC + (col + n) / 2u] = pk(acc[n], acc[n + 1u]);
+#endif
+            }
+    }
+#elif PHASE == 7
+    // ------------------------------------------------------------ patch merge: lanes 0..15 the merged tokens of this
+    // (even) window, 16..31 those of the next window in x; NN7 output channels; K = the 4C channels of the four
+    // tokens, sub-token 2 a + b first to last (layer_dot2.comp's order)
+#if KIND != 1
+#error phase 7 is the encoders' patch merge
+#endif
+#if XC % NN7 != 0 || (C / 2) % 16 != 0
+#error phase 7: X a multiple of NN7, C / 2 of 16
+#endif
+    if ((gl_WorkGroupID.x & 1u) == 0u)
+    {
+        const uint gx = gl_WorkGroupID.x + (lane >> 4);
+        X0 = 8 * int(gx) - p.sx;
+        const bool real = gx < gl_NumWorkGroups.x;
+        const uint r = lane & 15u, MXH = uint(XC) / 2u, col = z * uint(NN7);
+        float m[NN7];
+        [[unroll]] for (uint n = 0u; n < uint(NN7); n += 2u)
+        {
+            const uint b = wb.w[(p.o[105] + col + n) / 2u];
+            m[n] = lo(b); m[n + 1u] = hi(b);
+        }
+        // sub-token s of merged token r: window token 8 (2 (r >> 2) + (s >> 1)) + 2 (r & 3) + (s & 1); rows outside the
+        // image are never part of a stored merged token
+        uint sr[4];
+        [[unroll]] for (uint s = 0u; s < 4u; ++s)
+        {
+            const uint t = 8u * (2u * (r >> 2) + (s >> 1)) + 2u * (r & 3u) + (s & 1u);
+            sr[s] = real && INSIDE(t) ? DST(t) * HC : 0u;
+        }
+        const uint CPS = HC / 16u;      // chunks per sub-token
+#define M_SUB(c) ((c) < CPS ? sr[0] : (c) < 2u * CPS ? sr[1] : (c) < 3u * CPS ? sr[2] : sr[3])
+#define M_ROW(c) (M_SUB(c) + 16u * ((c) % CPS))
+#define M_W(c) (p.o[104] / 2u + 16u * (c) * uint(MERGE_N) + col)
+        STREAM_GEMM(m, NN7, UC / 8u, o14, M_ROW, M_W, uint(MERGE_N))
+        const int ym = tdiv2(Y0) + int(r >> 2), xm = tdiv2(X0) + int(r & 3u);
+        if (real && ym >= 0 && ym < p.Hh / 2 && xm >= 0 && xm < p.W / 2)
+            [[unroll]] for (uint n = 0u; n < uint(NN7); n += 2u)
+                if (col + n < 2u * MXH) out0.a[uint(ym * (p.W / 2) + xm) * MXH + (col + n) / 2u] = pk(m[n], m[n + 1u]);
+    }
+#endif
+}

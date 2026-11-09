@@ -158,6 +158,41 @@ def validate(index, weight_bytes):
                 raise ValueError(f'{name}: tensor at {offset} with {size} elements is outside/alignment-invalid')
 
 
+# layer_dot2_split.comp: the deep layers as up to seven dispatches over many small workgroups (the runtime takes
+# <layer>_dot2_s<k>.spv and <layer>_dot2_split.bin, each phase's z group count, 0 for none; the output is the same bit
+# for bit). Narrow column blocks win (latency-bound), narrower still for the layers with the fewest windows. RDNA2
+# proxy (7700 XT with AMD_CU_MASK=0x3F, 720p -> 1080p): enc3 .147 -> .089, enc4 .130 -> .060, dec5 .149 -> .052,
+# dec4 .120 -> .059, dec3 .132 -> .088 ms. The C = 64 layers stay whole: enc2 split .139 against .127 whole with
+# layer_dot2.comp's SWZ (five windows per CU), dec2 and dec1 are slower split, and enc1's position-only attention has
+# no split. K_DOT2_SPLIT=0 builds none.
+SPLIT_WIDE = {'QS': 2, 'NN2': 16, 'NN4': 8, 'NN5': 16, 'NN6': 8, 'NN7': 8}
+SPLIT_NARROW = {'QS': 2, 'NN2': 8, 'NN4': 4, 'NN5': 8, 'NN6': 4, 'NN7': 4}
+DOT2_SPLIT = {'enc3': SPLIT_WIDE, 'dec3': SPLIT_WIDE,
+              'enc4': SPLIT_NARROW, 'dec5': SPLIT_NARROW, 'dec4': SPLIT_NARROW}
+# layer_dot2.comp defines per layer, before K_DOT2_DEFS. dec1 keeps the padded rows (SWZ=0): its swizzled five-window
+# build is .005 ms slower on the RDNA2 proxy (dec2 gains .028 from it, enc2 .027, enc1 nothing)
+DOT2_DEFS = {'dec1': ['-DSWZ=0']}
+
+
+def split_groups(e, t):
+    """The seven phases' z group counts (layer_dot2_split.comp's header), 0 for a phase the layer does not have."""
+    c, h, x, k = e['C'], e['H'], e['X'], e['kind']
+    return [c // 16 if k == 'dec' else 0, 3 * h * 32 // t['NN2'], h * t['QS'], c // t['NN4'], 4 * c // t['NN5'],
+            c // t['NN6'], -(-x // t['NN7']) if k == 'enc' else 0]
+
+
+def compile_split(output, name, e, extra):
+    t = DOT2_SPLIT[name]
+    z = split_groups(e, t)
+    tuning = [f'-D{key}={value}' for key, value in t.items()]
+    for phase, groups in enumerate(z, 1):
+        if groups:
+            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3',
+                            *defines(e, [*extra, f'-DPHASE={phase}', *tuning]),
+                            str(HERE / 'layer_dot2_split.comp'), '-o', str(output / f'{name}_dot2_s{phase}.spv')], check=True)
+    (output / f'{name}_dot2_split.bin').write_bytes(struct.pack('<7I', *z))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('model_prefix', type=Path)
@@ -214,9 +249,12 @@ def main():
                 nw.append(f"-DMMT={max(m for m in (2, 4, 8, 16) if waves * m % 16 == 0 and busy(m) >= 0.6)}")
             extra = os.environ.get('K_DOT2_DEFS', '').split() + os.environ.get('K_DOT2_DEFS_' + name.upper(), '').split()
             given = {d.split('=')[0] for d in extra}
-            nw = [d for d in nw if d.split('=')[0] not in given]
+            nw = [d for d in nw + DOT2_DEFS.get(name, []) if d.split('=')[0] not in given]
             subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, nw + extra),
                             str(HERE / 'layer_dot2.comp'), '-o', str(a.output / (name + '_dot2.spv'))], check=True)
+            if name in DOT2_SPLIT and os.environ.get('K_DOT2_SPLIT', '1') != '0':
+                compile_split(a.output, name, e, nw + extra)
+
     for name in ('input_k', 'output_k'):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(['-DLDR=1'] if a.ldr else []),
                         str(HERE / (name + '.comp')), '-o', str(a.output / (name + '.spv'))], check=True)
