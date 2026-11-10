@@ -31,8 +31,8 @@ diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_common.cpp b/subprojects/d
  #include "spirv_module.hpp"
 +#include "opcodes/opcodes_llvm_builtins.hpp"
  
- namespace dxil_spv
- {
+ #ifdef _MSC_VER
+ #include <intrin.h>
 @@ -183,6 +184,100 @@
  	return op->id;
  }
