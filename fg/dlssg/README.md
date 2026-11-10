@@ -35,7 +35,8 @@ No NVIDIA code or data is in this folder. The kernel cache is derived from your 
 
 ## Use (d4r release)
 
-With the game closed, from the folder with the game's exe:
+`install.sh` does this when the game ships `nvngx_dlssg.dll` (and again on every run, a no-op unless the DLL changed). By
+hand, with the game closed, from the folder with the game's exe:
 
 ```sh
 python3 d4r/d4r-features.py . --fg dlssg            # --exact, --lite, --dll PATH; --fg off undoes it
@@ -45,7 +46,8 @@ It translates the kernels of the game's `nvngx_dlssg.dll` (needs `python3` and `
 release bundles the latter) into `~/.cache/nvxrt` (RDNA4) or `~/.cache/nvxrt-gfx11` (RDNA3), routes OptiScaler's
 NGX path through the host, sets OptiScaler's `Dxgi` and `SpoofHAGS`, `HwSchMode=2` in the game's Proton prefix, and
 `d4r.ini [FrameGeneration] Backend = dlssg`. At launch `d4r_boot.dll` enables the layer, so no Steam launch options
-are needed. Then enable DLSS Frame Generation in the game. Logs: `d4r/d4r_boot.log`,
+are needed. Then enable DLSS Frame Generation in the game. `d4r.ini [FrameGeneration] Model = lite | full` picks
+NVIDIA's FG Lite or the full model at the next launch (it overrides `dlssg_host.ini` Lite). Logs: `d4r/d4r_boot.log`,
 `d4r/fg/dlssg/dlssg_host.log`, `d4r/fg/dlssg/nvxrt.log`. Run it again after a game update replaces the DLL.
 
 - Tested: DLSS-G 310.7.0 (two builds). All DLSS-G 310.x DLLs on hand translate, including Streamline 2.14.16's

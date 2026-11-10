@@ -10,6 +10,18 @@ DLSSD_SHA256=4bc7ea5fcb2f32cf86bc2cb072e8d2860914a0be511cbdcb2fc206c1d9d83b80
 DRIVER_URL=https://us.download.nvidia.com/Windows/596.36/596.36-desktop-win10-win11-64bit-international-dch-whql.exe
 DRIVER_SHA256=4a1793d2bc7792f43270fe8286ec381ae24409fe29049dbe1eb8530ed89e19cf
 NGX_SHA256=0e3423b3b7afa1019c7ecac053a8408df8e5d9d9d904434705c6aaeacec02fef
+# DLSS Frame Generation 310.9.16 (FG Lite capable; d4r's tuned RDNA3/RDNA4 kernels match it) and the Streamline 2.14.16
+# DLLs that OptiScaler uses for games without DLSS-G of their own: NVIDIA's Streamline SDK release
+SL_URL=https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip
+SL_SHA256=32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b
+SL_FILES=(
+  "nvngx_dlssg.dll 8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7"
+  "sl.interposer.dll b1d7395aebd7b9722841d64dcf7433680020b6a8e421f851c16d5ba0c2182edf"
+  "sl.common.dll 38eea3b4209afc455636ea372b5933d65fcc13becec6c84d101dcfc4d8648f75"
+  "sl.dlss_g.dll 3ed9538df724993bea8a050195a6a78b9c8c8a566d5b05ade477aab3c390e90f"
+  "sl.reflex.dll 443577e869352436ff7ec8f4d9c90418d3e95368436ce219261e0f4f07a38122"
+  "sl.pcl.dll 5698c38e722318681f215c9fe68e45b9bedd51378acc699d8eee26e961e57770"
+)
 
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -21,14 +33,17 @@ usage() {
     '  --engine-only     only the engine models (the DLLs are already installed)' \
     '  --exact           engine models with NVIDIA'"'"'s exact roundings (slower) instead of the fastest builds' \
     '  --rebuild-engine  build the models again even when a cached build fits' \
+    '  --no-fg           do not set up DLSS Frame Generation' \
     '1. Downloads official NVIDIA DLSS 310.7.0 (Super Resolution), DLSS Ray Reconstruction 310.9.1 and NGX from' \
     '   driver 596.36 (~1 GiB, once: verified copies are kept in ~/.cache/d4r/nvidia).' \
     '2. Builds the native engine'"'"'s models from those DLLs into d4r/engine (once per DLL set and builder version:' \
     '   ~/.cache/d4r/engine-models). Faster on RDNA4; d4r.ini [Engine] Enabled = auto uses it.' \
+    '3. Games that ship NVIDIA'"'"'s nvngx_dlssg.dll get DLSS Frame Generation on RDNA3/RDNA4: its kernels are translated' \
+    '   on this machine (~1-2 minutes, once per DLL). Run install.sh again after a game update replaces that DLL.' \
     'Requires Bash, curl, sha256sum, 7zz/7z/7za, python3 with numpy, and a Proton in Steam (or' \
     'D4R_PROTON=/path/to/proton-folder). No sudo needed. NVIDIA license terms apply. D4R_CACHE_DIR moves the cache.'
 }
-DO_DLLS=1 DO_ENGINE=ask EXACT=ask REBUILD=0 YES=0
+DO_DLLS=1 DO_ENGINE=ask EXACT=ask REBUILD=0 YES=0 DO_FG=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -37,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --engine-only) DO_DLLS=0; DO_ENGINE=1; shift ;;
     --exact) EXACT=1; shift ;;
     --rebuild-engine) REBUILD=1; shift ;;
+    --no-fg) DO_FG=0; shift ;;
     -*) usage >&2; exit 2 ;;
     *) break ;;
   esac
@@ -162,7 +178,90 @@ install_dlls() {
 
 # --- the engine's models ---------------------------------------------------------------------------------------
 BUILDER="$RUNTIME/tools/build-engine-models.sh"
+# --- DLSS Frame Generation (fg/dlssg) -------------------------------------------------------------------------------
+# A game that ships NVIDIA's nvngx_dlssg.dll gets it here on RDNA3/RDNA4: d4r-features.py translates the DLL's kernels
+# on this machine (NVIDIA's code: they cannot ship) and routes OptiScaler through the DLSS-G host. After that,
+# d4r.ini [FrameGeneration] Backend (dlssg/off), Model (full/lite) and Exact switch it at the next launch; a Backend =
+# off chosen there survives this step. Fast no-op when the DLL was translated before.
+fg_was_off() {   # set up before (KernelCache written) and switched off by the user since
+  python3 -c 'import configparser, sys
+c = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+c.read(sys.argv[1], encoding="utf-8-sig")
+g = lambda k: c.get("FrameGeneration", k, fallback="").strip().lower()
+sys.exit(0 if g("KernelCache") and g("Backend") == "off" else 1)' "$RUNTIME/d4r.ini"
+}
+fg_gpu() {   # RDNA3 or RDNA4 (the GPUs DLSS-G runs on), as d4r-features.py sees it
+  python3 -c 'import importlib.util, sys
+s = importlib.util.spec_from_file_location("f", sys.argv[1]); f = importlib.util.module_from_spec(s); s.loader.exec_module(f)
+sys.exit(0 if (f.gpu_target() or "").startswith(("gfx11", "gfx12")) else 1)' "$1"
+}
+# NVIDIA's DLSS-G 310.9.16 and Streamline DLLs, verified, in $CACHE/nvidia/dlssg (downloaded once); prints that folder
+fetch_dlssg() {
+  local dir="$CACHE/nvidia/dlssg" f name sum missing=0
+  for f in "${SL_FILES[@]}"; do read -r name sum <<<"$f"; valid "$dir/$name" "$sum" || missing=1; done
+  if (( missing )); then
+    echo "DLSS Frame Generation uses NVIDIA's DLSS-G 310.9.16 from the Streamline SDK, under NVIDIA's license terms:" >&2
+    echo '  https://github.com/NVIDIA-RTX/Streamline/blob/main/license.txt' >&2
+    ask "Download it now (~263 MiB, once: later installs use $dir)?" y >&2 || return 1
+    command -v curl >/dev/null || { echo 'install.sh: missing curl' >&2; return 1; }
+    echo 'Downloading NVIDIA Streamline SDK 2.14.16...' >&2
+    curl --fail --location --show-error --retry 3 --connect-timeout 30 --progress-bar \
+      --proto '=https' --proto-redir '=https' --output "$TMP/sl.zip" "$SL_URL" >&2 || return 1
+    valid "$TMP/sl.zip" "$SL_SHA256" || { echo "install.sh: SHA-256 mismatch for $SL_URL" >&2; return 1; }
+    mkdir -p -- "$TMP/sl"
+    python3 -c 'import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+for n in sys.argv[3:]:
+    open(sys.argv[2] + "/" + n, "wb").write(z.read("bin/x64/" + n))' "$TMP/sl.zip" "$TMP/sl" \
+      $(for f in "${SL_FILES[@]}"; do printf '%s ' "${f%% *}"; done) || return 1
+    rm -f -- "$TMP/sl.zip"
+    for f in "${SL_FILES[@]}"; do
+      read -r name sum <<<"$f"
+      valid "$TMP/sl/$name" "$sum" || { echo "install.sh: SHA-256 mismatch for $name" >&2; return 1; }
+    done
+    mkdir -p -- "$dir"
+    for f in "${SL_FILES[@]}"; do name=${f%% *}; cp -- "$TMP/sl/$name" "$dir/$name.tmp" && mv -f -- "$dir/$name.tmp" "$dir/$name"; done
+  fi
+  printf '%s\n' "$dir"
+}
+setup_fg() {
+  (( DO_FG )) || return 0
+  local game feat="$RUNTIME/d4r-features.py" out was_off=0 sl='' extra=()
+  game=$(dirname -- "$RUNTIME")
+  [[ -f "$feat" && -f "$RUNTIME/fg/dlssg/nvngx.dll_dlssg_host.dll" && -f "$game/OptiScaler.ini" ]] || return 0
+  command -v python3 >/dev/null || { echo 'DLSS Frame Generation: not set up (python3 is missing).'; return 0; }
+  fg_gpu "$feat" || { echo 'DLSS Frame Generation: not set up (it runs on RDNA3 and RDNA4 GPUs).'; return 0; }
+  ! fg_was_off || was_off=1
+  # NVIDIA's DLSS-G 310.9.16 when available (FG Lite, tuned kernels; also for games without DLSS-G), else the game's own
+  if sl=$(fetch_dlssg); then
+    extra=(--dll "$sl/nvngx_dlssg.dll" --streamline "$sl")
+  else
+    echo 'DLSS Frame Generation: no NVIDIA download; using the game'"'"'s own nvngx_dlssg.dll if it has one.'
+  fi
+  echo 'DLSS Frame Generation: translating its kernels for this GPU (a minute or two, once per DLL)...'
+  if out=$(python3 "$feat" "$game" --fg dlssg "${extra[@]}" 2>&1); then
+    if (( was_off )); then
+      # Backend only (the NGX route stays on the DLSS-G host, which passes everything through while it is off)
+      python3 -c 'import importlib.util, sys
+from pathlib import Path
+s = importlib.util.spec_from_file_location("f", sys.argv[1]); f = importlib.util.module_from_spec(s); s.loader.exec_module(f)
+f.set_d4r_ini(Path(sys.argv[2]), "off")' "$feat" "$RUNTIME" || true
+      echo 'DLSS Frame Generation: kernels up to date; left off as d4r/d4r.ini says (Backend = dlssg turns it on).'
+    else
+      if grep -q 'OptiScaler generates the frames' <<<"$out"; then
+        echo 'DLSS Frame Generation: ready. The game has none of its own: select DLSS in the game, then turn on frame'
+        echo '  generation in OptiScaler'"'"'s menu (Insert).'
+      else
+        echo 'DLSS Frame Generation: ready. Turn it on in the game.'
+      fi
+      echo '  d4r/d4r.ini [FrameGeneration]: Model = auto (Lite on RDNA3, full on RDNA4) / full / lite, Backend = off.'
+    fi
+  else
+    echo "DLSS Frame Generation: not set up ($(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1))"
+  fi
+}
 done_msg() {
+  setup_fg
   if [[ -f "$(dirname -- "$RUNTIME")/d4r_boot.dll" ]]; then
     echo 'Done. No Steam launch options are needed; select DLSS in the game (see the included README).'
   else

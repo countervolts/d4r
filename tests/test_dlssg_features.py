@@ -48,6 +48,17 @@ class DlssgFeatureTests(unittest.TestCase):
             self.assertEqual(cfg['FrameGeneration']['Backend'], 'dlssg')
             self.assertEqual(cfg['FrameGeneration']['Exact'], 'false')
             self.assertEqual(cfg['FrameGeneration']['KernelCache'], '/home/u/.cache/nvxrt-gfx11')
+            self.assertEqual(cfg['FrameGeneration']['Model'], 'auto')
+            features.set_d4r_ini(runtime, 'dlssg', False, Path('/c'), lite=True)
+            cfg.read(runtime / 'd4r.ini')
+            self.assertEqual(cfg['FrameGeneration']['Model'], 'lite')
+            # a later setup (install.sh again) keeps the user's Model and Exact
+            text = (runtime / 'd4r.ini').read_text().replace('Exact=false', 'Exact=true').replace('Exact = false', 'Exact = true')
+            (runtime / 'd4r.ini').write_text(text)
+            features.set_d4r_ini(runtime, 'dlssg', False, Path('/c'))
+            cfg.read(runtime / 'd4r.ini')
+            self.assertEqual(cfg['FrameGeneration']['Model'], 'lite')
+            self.assertEqual(cfg['FrameGeneration']['Exact'], 'true')
             features.set_d4r_ini(runtime, 'off')
             cfg.read(runtime / 'd4r.ini')
             self.assertEqual(cfg['FrameGeneration']['Backend'], 'off')
@@ -79,6 +90,36 @@ class DlssgFeatureTests(unittest.TestCase):
             self.assertEqual(features.find_dlssg(game), game / 'sub/nvngx_dlssg.dll')
             self.assertEqual(features.proton_prefix(game), steamapps / 'compatdata/42/pfx')
             self.assertEqual(features.proton_prefix(game / 'sub'), steamapps / 'compatdata/42/pfx')
+
+    def test_optiscaler_dlssg_for_games_without_dlssg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            steamapps = Path(directory) / 'steamapps'
+            game = steamapps / 'common' / 'Game'
+            (game / 'd4r').mkdir(parents=True)
+            self.assertFalse(features.game_streamline(game))
+            (game / 'Engine/Streamline').mkdir(parents=True)
+            (game / 'Engine/Streamline/sl.dlss_g.dll').write_bytes(b'x')
+            self.assertTrue(features.game_streamline(game))
+            other = steamapps / 'common' / 'Other'
+            (other / 'OptiScaler/streamline').mkdir(parents=True)
+            (other / 'OptiScaler/streamline/sl.dlss_g.dll').write_bytes(b'x')   # ours from an earlier run: not the game's
+            self.assertFalse(features.game_streamline(other))
+            ini = other / 'OptiScaler.ini'
+            ini.write_bytes(OPTISCALER_INI.replace('OptiDllPath=d4r', 'OptiDllPath=OptiScaler').encode())
+            src = Path(directory) / 'sl'
+            src.mkdir()
+            for name in features.STREAMLINE_DLLS + ('nvngx_dlssg.dll',):
+                (src / name).write_bytes(name.encode())
+            folder = features.stage_streamline(ini, src)
+            self.assertEqual(folder, other / 'OptiScaler/streamline')
+            self.assertEqual((folder / 'nvngx_dlssg.dll').read_bytes(), b'nvngx_dlssg.dll')
+            (other / 'd4r').mkdir()
+            features.configure(ini, other / 'd4r', 'dlssg', None, 'auto', optifg=True)
+            cfg = read(ini)
+            self.assertEqual(cfg['FrameGen']['Enabled'], 'true')
+            self.assertEqual(cfg['FrameGen']['FGInput'], 'upscaler')
+            self.assertEqual(cfg['FrameGen']['FGOutput'], 'dlssg')
+            self.assertEqual(cfg['Libraries']['NvngxPath'], 'd4r\\fg\\dlssg\\nvngx.dll_dlssg_host.dll')
 
 
 if __name__ == '__main__':

@@ -178,6 +178,32 @@ def main():
         print('t1: %s -> %s' % (fn, m.ENTRY))
     print('t1 applied %d, skipped %d' % (ok, skipped))
     apply_groups(cache, t1dir)
+    apply_wave(cache, t1dir)
+
+
+def apply_wave(cache, t1dir):
+    """T1_DIR/wave64-LAYOUT.txt ("hash-prefix entry" per line): "wave 64" in those kernels' meta (the layer runs them as
+    wave64 when their SPIR-V uses no subgroup feature); every run rewrites the lines, so removed entries go back to 32"""
+    layout = os.environ.get('PTXC_LAYOUT', 'gfx12')
+    want = set()
+    lst = os.path.join(t1dir, 'wave64-%s.txt' % layout)
+    if os.path.exists(lst):
+        for line in open(lst):
+            f = line.split('#')[0].split()
+            if len(f) == 2:
+                want.add((f[0], f[1]))
+    n = 0
+    kdir = os.path.join(cache, 'kernels')
+    for h in sorted(os.listdir(kdir)):
+        for meta in sorted(x for x in os.listdir(os.path.join(kdir, h)) if x.endswith('.meta')):
+            entry = meta[:-5]
+            path = os.path.join(kdir, h, meta)
+            lines = [l for l in open(path).read().splitlines() if not l.startswith('wave ')]
+            if any(h.startswith(p) and entry == e for p, e in want):
+                lines.append('wave 64')
+                n += 1
+            open(path, 'w').write('\n'.join(lines) + '\n')
+    print('wave64: %d kernels' % n)
 
 
 def apply_groups(cache, t1dir):

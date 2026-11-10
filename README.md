@@ -28,7 +28,7 @@ The release zips do not contain NVIDIA's files. Their installers download the pi
 
 The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt). Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)).
 
-DLSS Frame Generation (NVIDIA's own, 2x/3x/4x) runs on RDNA3 and RDNA4: `python3 d4r/d4r-features.py . --fg dlssg` with the game closed, then enable it in the game ([docs/frame-generation.md](docs/frame-generation.md)).
+DLSS Frame Generation (NVIDIA's own, 2x-6x, and FG Lite) runs on RDNA3 and RDNA4: `install.sh` sets it up (it downloads DLSS-G 310.9.16 from NVIDIA's Streamline SDK and translates it on your machine), also for games without DLSS-G of their own through OptiScaler; `d4r.ini [FrameGeneration] Model = auto` uses FG Lite on RDNA3 and the full model on RDNA4 ([docs/frame-generation.md](docs/frame-generation.md)).
 
 Northlight games (Control, Alan Wake 2) keep their original motion vectors by default. Experimental display-resolution motion-vector reconstruction requires `[Interop] NativeMotionVectors = true` in `d4r.ini` and a matching patched driver. It can cause motion artifacts; restart the game after changing it.
 

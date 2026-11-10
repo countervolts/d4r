@@ -48,6 +48,10 @@ namespace nvxrt {
 static FILE *g_log = nullptr;
 static std::mutex g_log_mutex;
 static bool g_trace = false, g_exec = true, g_timing = false, g_serialize = true;
+// Kernels whose SPIR-V uses nothing that depends on the subgroup (KernelMeta::lane_free) may run as wave64, which on
+// RDNA3 issues each VALU instruction for 64 lanes (both ALUs) and halves the scalar work per thread. NVXRT_WAVE64: unset
+// = the kernels the cache marks "wave 64" (measured faster), 1 = every eligible kernel, 0 = none
+static int g_wave64 = 2;
 static std::string g_dump_dir; // NVXRT_DUMP=<dir>: copy every surface after each launch (harness debugging)
 static std::set<uint64_t> g_cap_launches; // NVXRT_CAPTURE=<n,n,...>: params + buffers before/after these launches
 static std::string g_cache_dir;
@@ -69,6 +73,8 @@ static void init_globals()
         g_timing = getenv("NVXRT_TIMING") && atoi(getenv("NVXRT_TIMING")) != 0;
         // CUDA orders kernels launched into one stream; D3D12/Vulkan dispatches are not ordered without a barrier.
         g_serialize = !(getenv("NVXRT_SERIALIZE") && atoi(getenv("NVXRT_SERIALIZE")) == 0);
+        if (getenv("NVXRT_WAVE64") && *getenv("NVXRT_WAVE64"))
+            g_wave64 = atoi(getenv("NVXRT_WAVE64")) != 0;
         if (getenv("NVXRT_DUMP"))
             g_dump_dir = getenv("NVXRT_DUMP");
         if (const char *cl = getenv("NVXRT_CAPTURE")) {
@@ -84,6 +90,9 @@ static void init_globals()
         if (const char *sh = getenv("NVXRT_SHADOW")) {
             if (strchr(sh, 'b') || strchr(sh, 'B')) g_shadow |= 1;
             if (strchr(sh, 'c') || strchr(sh, 'C')) g_shadow |= 2;
+            // r: UI-copy shadows are read without the fp16 fix-up (k/255, < 1 fp16 step off; not exact), which also
+            // enables the roles of DLLs whose readers have no fix-up compiled in
+            if (strchr(sh, 'r') || strchr(sh, 'R')) g_shadow |= 4;
         }
         g_shadow_log = getenv("NVXRT_SHADOW_LOG") ? atoi(getenv("NVXRT_SHADOW_LOG")) : 0;
         g_legacy_slots = getenv("NVXRT_SLOTS") && !strcmp(getenv("NVXRT_SLOTS"), "legacy");
@@ -270,6 +279,8 @@ struct KernelMeta {
     bool huse_info = false, huse_dynamic = false;
     bool shadow8 = false;   // "shadow8 1": built with the class-3 read fix-up and checked stores (UI-copy shadows)
     bool big_params = false; // "big_params 1": parameter block > 248 bytes, read through the address in pc words 60..61
+    bool lane_free = false;  // no subgroup operation, cooperative matrix or subgroup built-in: wave size does not matter
+    bool wave64 = false;     // "wave 64" (t1/wave64-*.txt): measured faster as wave64 on this GPU generation
 };
 enum { kUseTex = 1, kUseSurf = 2, kUseOther = 4 };
 
@@ -447,6 +458,7 @@ struct ShadowRole {
     const char *gkey;   // module hash : entry
     uint32_t psize, off;
     int kind, what;
+    bool raw = false;   // only with NVXRT_SHADOW=r: this DLL's readers of the image have no fix-up (not exact)
 };
 static const ShadowRole kShadowRoles[] = {
     // nvngx_dlssg.dll 310.9.1 (The Witcher 3): BlendCandidatesFused writes its two full-res candidates at 48/56
@@ -456,6 +468,13 @@ static const ShadowRole kShadowRoles[] = {
     {"d80209427f2fccdbeec472f11a91583c2eeadde15e93741ac3579582c73e54f1:Kernel_BlendCandidatesFused", 240, 56, kShadowB, kRoleShadowWrite},
     {"f68d675507dfd4efd74ad484a52eb0f84241190d5dc2598ff65fc8b5f90558b2:Kernel_DownsampleRGBAndEstimateUIFused", 168, 120, kShadowC, kRoleShadowWrite},
     {"f68d675507dfd4efd74ad484a52eb0f84241190d5dc2598ff65fc8b5f90558b2:Kernel_DownsampleRGBAndEstimateUIFused", 168, 160, kShadowC, kRoleOrigWrite},
+    // nvngx_dlssg.dll 310.9.16 (Streamline 2.14.16, FG Lite and full): Downsample writes the hudless/UI copy at 120 (read by
+    // BlendCandidatesFGLite at 0/8 and by the next frame's Downsample at 80) and another full-res 8-bit-valued image at 128
+    // (read by BlendCandidatesFGLite at 176/208). Their readers are compiled without the fix-up, so these apply with
+    // NVXRT_SHADOW=r only: k/255 instead of fp16_rz(k/255). The 128 shadow: Downsample 0.289 -> 0.276 ms (gfx11 1440p),
+    // presented frames byte-identical to the 120-only shadow on the harness and the Ghost of Tsushima capture.
+    {"7947c805931c02ebbd468b4a8f27a7fce1b2a5cd55c1cfa5ffe067581aa14049:Kernel_DownsampleRGBAndEstimateUIFused", 184, 120, kShadowC, kRoleShadowWrite, true},
+    {"7947c805931c02ebbd468b4a8f27a7fce1b2a5cd55c1cfa5ffe067581aa14049:Kernel_DownsampleRGBAndEstimateUIFused", 184, 128, kShadowC, kRoleShadowWrite, true},
 };
 struct Shadow {
     VkImage img = VK_NULL_HANDLE;
@@ -1283,7 +1302,8 @@ static void destroy_shadow(Device &dev, VkImage orig)
 }
 
 // the shadow of an original image, created on its first shadow write (null when the image is not eligible: a 2D,
-// single-mip, single-layer RGBA16F storage+sampled image named through an RGBA16F view). Records the shadow's initial
+// single-mip, single-layer RGBA16F storage+sampled image named through an RGBA16F view; vkd3d's one-layer 2D_ARRAY
+// views of it count). Records the shadow's initial
 // layout transition into cmd (the launch that first writes it). caller holds dev.mutex
 static Shadow *shadow_for(Device &dev, VkCommandBuffer cmd, VkImage orig, const ViewInfo &vi, int kind)
 {
@@ -1296,7 +1316,8 @@ static Shadow *shadow_for(Device &dev, VkCommandBuffer cmd, VkImage orig, const 
     const ImageInfo &im = ii->second;
     const VkImageUsageFlags need = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (im.format != VK_FORMAT_R16G16B16A16_SFLOAT || vi.format != VK_FORMAT_R16G16B16A16_SFLOAT ||
-        im.type != VK_IMAGE_TYPE_2D || vi.type != VK_IMAGE_VIEW_TYPE_2D || im.mips != 1 || im.layers != 1 ||
+        im.type != VK_IMAGE_TYPE_2D || (vi.type != VK_IMAGE_VIEW_TYPE_2D && vi.type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+        im.mips != 1 || im.layers != 1 ||
         im.samples != VK_SAMPLE_COUNT_1_BIT || (im.usage & need) != need) {
         if (g_shadow_log)
             shadow_logf(dev, "%s image %p not eligible (format %d/%d, %ux%u, mips %u layers %u usage 0x%x)",
@@ -1367,7 +1388,7 @@ static Shadow *shadow_for(Device &dev, VkCommandBuffer cmd, VkImage orig, const 
     if (kind == kShadowC) {
         // class 3 on both bindings: exact read fix-up (sampled), checked stores (storage)
         dev.smp_map[kMaxSamplers * 4 + sh.sslot] = 3;
-        dev.smp_map[kMaxSamplers * 4 + kMaxImages + sh.tslot] = 3;
+        dev.smp_map[kMaxSamplers * 4 + kMaxImages + sh.tslot] = (g_shadow & 4) ? 0 : 3;
     }
     VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     ib.srcAccessMask = 0;
@@ -1508,7 +1529,7 @@ static bool shadow_params(Device &dev, VkCommandBuffer cmd, CuFunction &fn, cons
         if (it == dev.shadows.end() || !it->second.in_shadow)
             continue;
         Shadow &sh = it->second;
-        if (sh.kind == kShadowC && !fn.meta.shadow8) {
+        if (sh.kind == kShadowC && !fn.meta.shadow8 && !(g_shadow & 4)) {   // (r: raw reads are the point)
             // a kernel without the exact read fix-up cannot read a UI-copy shadow: original read, no more shadowing
             if (!sh.bad)
                 shadow_logf(dev, "C image %p (content in shadow) read by %s+%u, which has no shadow8 fix-up: image no "
@@ -1689,6 +1710,29 @@ static VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage2(VkCommandBuffer cmd, con
 }
 
 // ---------------------------------------------------------------------------------------------- kernels
+// true when nothing in the module depends on which lanes share a subgroup: no GroupNonUniform*, SubgroupBallotKHR or
+// CooperativeMatrixKHR capability and no subgroup built-in (size, id, invocation id, masks, count)
+static bool spirv_lane_free(const std::vector<uint32_t> &w)
+{
+    for (size_t i = 5; i < w.size();) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > w.size())
+            return false;
+        if (op == 17 /* OpCapability */) {
+            uint32_t c = w[i + 1];
+            if ((c >= 61 && c <= 68) || c == 4423 || c == 6022)
+                return false;
+        }
+        if (op == 71 /* OpDecorate */ && wc >= 4 && w[i + 2] == 11 /* BuiltIn */) {
+            uint32_t b = w[i + 3];
+            if (b == 36 || b == 38 || b == 40 || b == 41 || (b >= 4416 && b <= 4420))
+                return false;
+        }
+        i += wc;
+    }
+    return true;
+}
+
 static bool load_kernel(Device &dev, CuFunction &fn)
 {
     KernelMeta &m = fn.meta;
@@ -1720,6 +1764,7 @@ static bool load_kernel(Device &dev, CuFunction &fn)
     }
     m.spirv.resize(spv.size() / 4);
     memcpy(m.spirv.data(), spv.data(), m.spirv.size() * 4);
+    m.lane_free = spirv_lane_free(m.spirv);
     // plain sscanf parsing: iostream extraction of integers failed inside Wine processes (locale)
     std::string text(meta.begin(), meta.end());
     size_t pos = 0;
@@ -1752,6 +1797,8 @@ static bool load_kernel(Device &dev, CuFunction &fn)
             m.shadow8 = true;
         } else if (!strcmp(key, "big_params")) {
             m.big_params = true;
+        } else if (!strcmp(key, "wave") && sscanf(rest, "%u", &a) == 1) {
+            m.wave64 = a == 64;
         } else if (!strcmp(key, "huse_dynamic")) {
             m.huse_dynamic = m.huse_info = true;
         } else if (!strcmp(key, "t1_fixed") && sscanf(rest, "%u %u %u", &a, &b, &c) == 3) {
@@ -1792,7 +1839,8 @@ static VkPipeline get_pipeline(Device &dev, CuFunction &fn, const PipeKey &k)
         VkSpecializationInfo si{5, me, sizeof(spec), spec};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-        rss.requiredSubgroupSize = 32;
+        const bool w64 = fn.meta.lane_free && (g_wave64 == 1 || (g_wave64 == 2 && fn.meta.wave64));
+        rss.requiredSubgroupSize = w64 ? 64 : 32;
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.pNext = &rss;
@@ -1806,8 +1854,8 @@ static VkPipeline get_pipeline(Device &dev, CuFunction &fn, const PipeKey &k)
             logf("kernel %s: pipeline creation failed (%d) for block %ux%ux%u", fn.name.c_str(), r, k.bx, k.by, k.bz);
             p = VK_NULL_HANDLE;
         } else {
-            logf("kernel %s: pipeline for block %ux%ux%u smem %u (%s)", fn.name.c_str(), k.bx, k.by, k.bz, k.smem,
-                 fn.module ? fn.module->hash.substr(0, 12).c_str() : "group");
+            logf("kernel %s: pipeline for block %ux%ux%u smem %u (%s)%s", fn.name.c_str(), k.bx, k.by, k.bz, k.smem,
+                 fn.module ? fn.module->hash.substr(0, 12).c_str() : "group", w64 ? " wave64" : "");
         }
     }
     fn.pipelines[k] = p;
@@ -1914,7 +1962,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateCuFunctionNVX(VkDevice device, const
     }
     if (g_shadow)
         for (auto &r : kShadowRoles)
-            if (fn->gkey == r.gkey && (g_shadow & r.kind))
+            if (fn->gkey == r.gkey && (g_shadow & r.kind) && (!r.raw || (g_shadow & 4)))
                 fn->shadow_roles.push_back(&r);
     std::lock_guard<std::mutex> lk(dev->mutex);
     bool ok = load_kernel(*dev, *fn);

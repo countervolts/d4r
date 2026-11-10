@@ -262,7 +262,16 @@ void load()
     g_logLevel = iniUInt(L"LogLevel", 1);
     g_timing = iniUInt(L"Timing", 1);
     g_lite = iniUInt(L"Lite", lite ? 1 : 0);
-    logf("settings: %ls (Backend %ls, Model %ls -> %s)", g_d4rIni.empty() ? L"no d4r.ini" : g_d4rIni.c_str(),
+    // Under Proton d4r_boot.dll resolves d4r.ini [FrameGeneration] itself (Model auto: Lite on RDNA3, full on RDNA4)
+    // and passes D4R_DLSSG_ENABLED (0 = pass-through: every feature goes to the next core) and D4R_DLSSG_LITE, which
+    // win over the above. Native Windows has no d4r_boot.dll and leaves them unset.
+    wchar_t fg_env[8] = {};
+    if (GetEnvironmentVariableW(L"D4R_DLSSG_ENABLED", fg_env, 8) && fg_env[0])
+        g_fgEnabled = wcstoul(fg_env, nullptr, 0) != 0;
+    wchar_t lite_env[8] = {};
+    if (GetEnvironmentVariableW(L"D4R_DLSSG_LITE", lite_env, 8) && lite_env[0])
+        g_lite = wcstoul(lite_env, nullptr, 0) != 0;
+    logf("settings:%ls (Backend %ls, Model %ls -> %s)", g_d4rIni.empty() ? L"no d4r.ini" : g_d4rIni.c_str(),
          backend.c_str(), model.c_str(), g_lite ? "lite" : "full");
     g_rrCreateMatrices = iniUInt(L"RrCreateMatrices", 1);
     g_dumpDir = iniString(L"DumpDir", L"");

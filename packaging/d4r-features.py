@@ -100,7 +100,7 @@ def ngx_route(ini, runtime, dlssg):
     return os.path.relpath(target, ini.parent).replace('/', '\\')
 
 
-def configure(ini, runtime, fg, fg_input, latency):
+def configure(ini, runtime, fg, fg_input, latency, optifg=False):
     if ini.is_symlink():
         raise ValueError('OptiScaler.ini must be a regular file, not a symlink')
     source = ini.read_bytes().decode('utf-8-sig')
@@ -122,9 +122,12 @@ def configure(ini, runtime, fg, fg_input, latency):
             raise ValueError('DLSS-G needs OptiScaler v10 (its Reflex provider); this OptiScaler.ini is from an older '
                              'version. Extract the current d4r zip into the game folder first.')
         settings = [x for x in v10_settings(parsed, ini, 'off', None, latency) if x[0] != 'FrameGen']
-        settings += [('FrameGen', 'Enabled', 'false'), ('FrameGen', 'FGInput', 'nofg'),
-                     ('FrameGen', 'FGOutput', 'nofg'), ('Libraries', 'NvngxPath', ngx_route(ini, runtime, True)),
-                     ('Spoofing', 'Dxgi', 'true'), ('Spoofing', 'SpoofHAGS', 'true')]
+        # optifg: the game has no DLSS-G of its own; OptiScaler generates the frames from its upscaler's inputs through
+        # its DLSS-G output (Streamline in OptiScaler/streamline)
+        fg_mode = [('FrameGen', 'Enabled', 'true'), ('FrameGen', 'FGInput', 'upscaler'), ('FrameGen', 'FGOutput', 'dlssg')] \
+            if optifg else [('FrameGen', 'Enabled', 'false'), ('FrameGen', 'FGInput', 'nofg'), ('FrameGen', 'FGOutput', 'nofg')]
+        settings += fg_mode + [('Libraries', 'NvngxPath', ngx_route(ini, runtime, True)),
+                               ('Spoofing', 'Dxgi', 'true'), ('Spoofing', 'SpoofHAGS', 'true')]
         return write_ini(ini, source, settings)
     if fg != 'off' and fg_input is None:
         raise ValueError('--input is required with FG: dlssg, fsrfg, fsrfg30 or upscaler')
@@ -231,6 +234,38 @@ def find_dlssg(game):
     return None
 
 
+STREAMLINE_DLLS = ('sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll')
+
+
+def game_streamline(game):
+    """the game ships Streamline's DLSS-G plugin (sl.dlss_g.dll): it drives DLSS-G itself"""
+    roots = [game] + ([p for p in game.parents][:5] if game.parent.name != 'common' else [])
+    for root in roots:
+        if root.name == 'common':
+            break
+        if any('d4r' not in x.relative_to(root).parts and 'optiscaler' not in str(x).lower()
+               for x in root.rglob('sl.dlss_g.dll')):
+            return True
+        if root.parent.name == 'common':
+            break
+    return False
+
+
+def stage_streamline(ini, src):
+    """OptiScaler's own DLSS-G output (games without DLSS-G): Streamline's DLLs and nvngx_dlssg.dll in its
+    OptiDllPath/streamline folder, where OptiScaler looks for them"""
+    parsed = configparser.ConfigParser(interpolation=None)
+    parsed.read_string(ini.read_text(encoding='utf-8-sig'))
+    main = parsed.get('Libraries', 'OptiDllPath', fallback='auto').strip()
+    folder = ini.parent / ('OptiScaler' if main.lower() == 'auto' else main.replace('\\', '/')) / 'streamline'
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in STREAMLINE_DLLS + ('nvngx_dlssg.dll',):
+        if not (src / name).is_file():
+            raise ValueError(f'missing {src / name}')
+        shutil.copy2(src / name, folder / name)
+    return folder
+
+
 def ini_value(path, section, key, fallback=None):
     parsed = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(';',))
     parsed.read_string(path.read_text(encoding='utf-8-sig'))
@@ -301,6 +336,12 @@ def setup_dlssg(game, runtime, dll, exact, lite, force):
         env['PATH'] = f'{kit}:{env.get("PATH", "")}'
     if subprocess.run(['bash', str(fg / 'tools/dlssg-setup'), str(dll)], env=env).returncode:
         raise ValueError('kernel translation failed; nothing changed (see the message above)')
+    # a DLL from outside the game (install.sh's NVIDIA download) is copied next to the host: the install stays whole
+    if game not in dll.parents:
+        local = fg / 'nvngx_dlssg.dll'
+        if not local.is_file() or local.read_bytes() != dll.read_bytes():
+            shutil.copy2(dll, local)
+        dll = local
     relative = Path(os.path.relpath(dll, game))
     fg_path = (str(relative).replace('/', '\\') if relative.parts.count('..') <= 4
                else 'Z:' + str(dll).replace('/', '\\'))
@@ -313,15 +354,23 @@ def setup_dlssg(game, runtime, dll, exact, lite, force):
     return dll, arch, cache
 
 
-def set_d4r_ini(runtime, backend, exact=False, cache=None):
+def set_d4r_ini(runtime, backend, exact=False, cache=None, lite=False):
     ini = runtime / 'd4r.ini'
     if not ini.is_file():
         return
     settings = [('FrameGeneration', 'Backend', backend)]
-    if backend == 'dlssg':
-        settings.append(('FrameGeneration', 'Exact', 'true' if exact else 'false'))
-        settings.append(('FrameGeneration', 'KernelCache', str(cache)))
     source = ini.read_text(encoding='utf-8-sig')
+    if backend == 'dlssg':
+        # Exact and Model are the user's choices in d4r.ini: set only when asked (--exact, --lite) or still missing
+        parsed = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(';',))
+        parsed.read_string(source)
+        def missing(key):
+            return not parsed.has_option('FrameGeneration', key) or not parsed.get('FrameGeneration', key).strip()
+        if exact or missing('Exact'):
+            settings.append(('FrameGeneration', 'Exact', 'true' if exact else 'false'))
+        settings.append(('FrameGeneration', 'KernelCache', str(cache)))
+        if lite or missing('Model'):
+            settings.append(('FrameGeneration', 'Model', 'lite' if lite else 'auto'))
     result = update(source, settings)
     if result != source:
         ini.write_text(result, encoding='utf-8')
@@ -338,19 +387,26 @@ def main():
                         help='auto: OptiScaler selects latency output; proton: request Reflex (v10) or original NVAPI (0.9)')
     parser.add_argument('--dll', help='dlssg: the DLSS-G DLL to run (default: the game\'s nvngx_dlssg.dll); 310.x only')
     parser.add_argument('--exact', action='store_true',
-                        help='dlssg: bit-exact kernels (default: ~10%% faster, PSNR ~55 dB against exact)')
+                        help='dlssg: bit-exact kernels (default: 15-20%% faster, 58 dB against exact on a game capture)')
     parser.add_argument('--lite', action='store_true', help='dlssg: NVIDIA FG Lite (DLSS-G >= 310.9.16)')
     parser.add_argument('--force', action='store_true', help='dlssg: skip the RDNA3/RDNA4 check')
+    parser.add_argument('--streamline', type=Path,
+                        help='dlssg: folder with Streamline\'s DLLs and nvngx_dlssg.dll (install.sh\'s NVIDIA download): '
+                             'games without DLSS-G of their own get it through OptiScaler\'s DLSS-G output')
     args = parser.parse_args()
     runtime = args.runtime or args.game / 'd4r'
     ini = args.game / 'OptiScaler.ini'
     try:
+        optifg = False
         if args.fg == 'dlssg':
+            optifg = args.streamline is not None and not game_streamline(args.game.resolve())
             dll, arch, cache = setup_dlssg(args.game.resolve(), runtime.resolve(), args.dll, args.exact, args.lite,
                                            args.force)
-        backup = configure(ini, runtime, args.fg, args.input, args.latency)
+            if args.streamline is not None:   # OptiScaler looks for Streamline there (its DLSS-G output, its checks)
+                stage_streamline(ini, args.streamline.resolve())
+        backup = configure(ini, runtime, args.fg, args.input, args.latency, optifg)
         set_d4r_ini(runtime, 'dlssg' if args.fg == 'dlssg' else 'off', args.exact,
-                    cache if args.fg == 'dlssg' else None)
+                    cache if args.fg == 'dlssg' else None, args.lite)
     except (OSError, ValueError, configparser.Error) as error:
         parser.exit(1, f'{error}\n')
     print(f'Backup: {backup}' if backup else 'Already configured.')
@@ -360,12 +416,14 @@ def main():
         print(f'DLSS-G: {dll} ({arch} kernels in {cache}, {"exact" if args.exact else "fast"} mode'
               f'{", FG Lite" if args.lite else ""}).')
         if arch == 'gfx11':
-            print('RDNA3 cost at 1440p (RX 7700 XT): about 5.4 ms of GPU time per real frame for 2x, plus about '
-                  '3 ms per further generated frame (4x: 11.7 ms).')
+            print('RDNA3 cost at 1440p (RX 7700 XT), GPU ms per real frame: FG Lite 2.5 for 2x, 3.3 for 4x; full model 5.0 '
+                  'for 2x, 10.9 for 4x. d4r.ini [FrameGeneration] Model = auto uses Lite on RDNA3.')
         print(f'Hardware GPU scheduling set in {prefix} (backup {hags}).' if hags else
               'Hardware GPU scheduling already set in the prefix.' if prefix else
               'Proton prefix not found: if the game hides DLSS-G, launch it once, then run this again.')
-        print('Start the game and enable DLSS Frame Generation (2x/3x/4x) in its settings; no launch options needed.')
+        print('The game has no DLSS-G of its own: OptiScaler generates the frames (DLSS in the game, FG in OptiScaler\'s '
+              'menu).' if optifg else
+              'Start the game and enable DLSS Frame Generation (2x/3x/4x) in its settings; no launch options needed.')
         print('Logs: d4r/d4r_boot.log, d4r/fg/dlssg/dlssg_host.log, d4r/fg/dlssg/nvxrt.log.')
         print('After a game update replaces nvngx_dlssg.dll, run this again to translate the new kernels.')
         return

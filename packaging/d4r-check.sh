@@ -130,6 +130,10 @@ if [ -f "$INI" ]; then
       z:*) ;;
       *) [ "$external_backend" = true ] || note "relative NvngxPath requires the game's working directory to be this folder" ;;
     esac
+  elif [ "$unique_path" = yes ] && [ "$normalized_path" = 'd4r/fg/dlssg/nvngx.dll_dlssg_host.dll' ]; then
+    # DLSS Frame Generation set up: the DLSS-G host serves frame generation and hands every other feature to the shim
+    ok "OptiScaler NGX routing: NvngxPath=$nvngx_path (DLSS-G host, then the d4r shim)"
+    [ -f "$D4R/fg/dlssg/nvngx.dll_dlssg_host.dll" ] || bad 'd4r/fg/dlssg/nvngx.dll_dlssg_host.dll (run install.sh again)'
   else
     misconfigured 'OptiScaler NGX routing: set [Libraries] NvngxPath=d4r\nvngx.dll (exactly once); OptiDllPath alone can load system _nvngx.dll'
     note 'd4r/ngx/_nvngx.dll is the NVIDIA core for the shim, not the OptiScaler target'

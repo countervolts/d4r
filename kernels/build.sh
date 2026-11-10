@@ -33,6 +33,9 @@
 #   D4R_ZLUDA_EMIT  ZLUDA's d4r_emit (patches/zluda applied; `cargo build --release -p ptx --example d4r_emit`),
 #                   which compiles PTX offline for D4R_GPU_ARCH (no GPU of that kind needed)
 #   D4R_DLSS_PTX_DIR optional pre-extracted PTX directory for parallel per-target builds
+#   D4R_KERNEL_JOBS kernels compiled at once (default: the CPU count, at most 8; each takes up to ~1.2 GB)
+#   D4R_KERNEL_CACHE optional directory caching in_lds2reg.py's results (a pure function of its input, the same
+#                   for every target), shared by concurrent builds; nothing is cached without it
 # Ray Reconstruction (rr) additionally needs D4R_DLSSD_DLL (CUDA-capable
 # nvngx_dlssd.dll); D4R_DLSSD_PTX_DIR may provide its pre-extracted modules.
 set -euo pipefail
@@ -131,9 +134,29 @@ build_hip() {
     rm -rf "$tmp"
 }
 
+# every kernel builds independently (own temporary directory, own output file): run up to JOBS at once
+JOBS="${D4R_KERNEL_JOBS:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "D4R_KERNEL_JOBS must be positive" >&2; exit 2; }
+job_pids=() job_failed=0
+job() {
+    "$@" &
+    job_pids+=("$!")
+    if (( ${#job_pids[@]} >= JOBS )); then
+        wait "${job_pids[0]}" || job_failed=1
+        job_pids=("${job_pids[@]:1}")
+    fi
+}
+drain() {
+    local pid
+    for pid in "${job_pids[@]+"${job_pids[@]}"}"; do wait "$pid" || job_failed=1; done
+    job_pids=()
+    [[ "$job_failed" == 0 ]] || { echo "kernel build failed" >&2; exit 1; }
+}
+
 if [[ "$WHAT" == all || "$WHAT" == k ]]; then
     echo "== DLSS 4 (preset K) transformer layers"
-    for src in "$HERE"/k/dltss_pwin_*.hip; do build_hip "$src"; done
+    for src in "$HERE"/k/dltss_pwin_*.hip; do job build_hip "$src"; done
+    drain
 fi
 if [[ "$RDNA2" == 0 && ( "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ) ]]; then
     echo "== DLSS 4.5 (presets L/M) shared Swin layers"
@@ -144,7 +167,8 @@ if [[ "$RDNA2" == 0 && ( "$WHAT" == all || "$WHAT" == m || "$WHAT" == l ) ]]; th
     # Experimental scheduling/register tuning; appended after per-target flags.
     [[ "${D4R_VKHIP_LAYERS:-0}" == 1 ]] && swin_flags+=" -DSWIN_DATAFLOW -DSWIN_DIRECT_E4M3 -DSWIN_HI_OPSEL"
     swin_flags+=" ${D4R_SWIN_CFLAGS:-}"
-    for src in "$HERE"/m/rrlite_*.hip; do build_hip "$src" "$swin_flags"; done
+    for src in "$HERE"/m/rrlite_*.hip; do job build_hip "$src" "$swin_flags"; done
+    drain
 fi
 if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     echo "== texture kernels (NVIDIA PTX with native parts)"
@@ -244,11 +268,12 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             texture_flags+=" -DSWIN_L_BUFFER_WEIGHTS"
             texture_waves=4
         fi
-        D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_ACCURACY_WAVE64="$w64" \
+        job env D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_ACCURACY_WAVE64="$w64" \
             D4R_ZLUDA_WAVE64="$w64" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
             D4R_TEX_CFLAGS="$texture_flags" D4R_TEX_WAVES="$texture_waves" \
             D4R_TEX_FP8="$FP8" D4R_DLSS_PTX_DIR="$PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" "$src" "$OUT"
     done
+    drain
     if [[ "$WHAT" != l && "$ACCURACY" == 0 ]]; then
         # NVIDIA's PTX translated to HIP (native/ptx2hip.py) and rebuilt natively; the generated sources stay in a
         # temporary directory. They run through the same texture/surface helpers as the other texture kernels
@@ -257,11 +282,13 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
         NAT="$HERE/native"
         NT="$(mktemp -d)"
         trap 'rm -rf "$NT"' EXIT
-        for native_out in "${native_outs[@]}"; do
+        # each translation below is one job; its intermediate files carry the kernel's name
+        native_output() {
+            local native_out="$1" ptx depth_tile wave
             ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
             # hiluma output (path B for Quality..UltraPerf), LDS tile as a function, global-memory redirect stores
-            python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/output_translated.hip"
-            python3 "$NAT/rewrite_output.py" "$NT/output_translated.hip" > "$NT/$native_out.hip"
+            python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/$native_out.translated.hip"
+            python3 "$NAT/rewrite_output.py" "$NT/$native_out.translated.hip" > "$NT/$native_out.hip"
             depth_tile=(); [[ "$native_out" == *_mvhi_* ]] && depth_tile=(-DD4R_K_NO_DEPTH_TILE)
             # RDNA3/4: wave64 (FP32 dual issue; 0.49 -> 0.44 ms on an RX 7700 XT, same bytes). RDNA2 issues wave64
             # in two passes, so it gets wave32 (no stack frame, 96 VGPRs), and WGP mode: a 256-thread workgroup
@@ -270,8 +297,9 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             wave=(); [[ "$RDNA2" == 1 ]] && wave=(WAVE=32 CUMODE=0)
             env "${wave[@]}" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
                 "$OUT/$native_out.hsaco" -DD4R_NATIVE_F2I "${depth_tile[@]}" -DD4R_AS1_STORES
-        done
-        for native_out in "${native_ldr_outs[@]+"${native_ldr_outs[@]}"}"; do
+        }
+        native_ldr_output() {
+            local native_out="$1" ptx
             [[ "$native_out" =~ ^hiluma_engine_output_depth(inv|reg)_mv(hi|lo)_ldr_max_v2_rel$ ]] ||
                 { echo "not an LDR max output kernel: $native_out" >&2; exit 2; }
             ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
@@ -281,12 +309,38 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             # f16 rounding too, so only the folded form reproduces it (f2h_rn: 33 of 60 harness frames differ).
             # Path B's tile fill traverses x/y directly (rewrite_output_ldr.py; no per-texel division): output
             # 0.770 -> 0.763 ms at 1712x960 -> 2560x1440, every harness frame and internal buffer byte-identical.
-            python3 "$NAT/ptx2hip.py" --as1 "$ptx" "$native_out" | sed 's/f2h_rn(/(h1)(/g' > "$NT/translated.hip"
-            python3 "$NAT/rewrite_output_ldr.py" "$NT/translated.hip" > "$NT/$native_out.hip"
+            python3 "$NAT/ptx2hip.py" --as1 "$ptx" "$native_out" | sed 's/f2h_rn(/(h1)(/g' > "$NT/$native_out.translated.hip"
+            python3 "$NAT/rewrite_output_ldr.py" "$NT/$native_out.translated.hip" > "$NT/$native_out.hip"
             sed -i "s/__attribute__((amdgpu_flat_work_group_size(1, 256))) void $native_out(/__attribute__((amdgpu_flat_work_group_size(1, 256), amdgpu_num_vgpr(96))) void $native_out(/" "$NT/$native_out.hip"
             grep -q "amdgpu_num_vgpr(96)" "$NT/$native_out.hip" || { echo "VGPR cap not applied: $native_out" >&2; exit 2; }
             D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" \
                 "$OUT/$native_out.hsaco" -DD4R_NATIVE_F2I -DD4R_AS1_STORES
+        }
+        native_input() {
+            local native_in="$1" ptx key
+            ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
+            # hiluma input: per-thread LDS scratch and local array in registers (in_lds2reg.py), wave32
+            python3 "$NAT/ptx2hip.py" --ifconv --sink "$ptx" "$native_in" > "$NT/$native_in.ifs.hip"
+            if [[ -n "${D4R_KERNEL_CACHE:-}" ]]; then
+                # its proof takes ~20 s and its result depends only on the input and the script: one run per input,
+                # concurrent builds wait for it under the lock
+                mkdir -p "$D4R_KERNEL_CACHE"
+                key="$(cat "$NT/$native_in.ifs.hip" "$NAT/in_lds2reg.py" | sha256sum | cut -c1-32)"
+                flock "$D4R_KERNEL_CACHE/$key.lock" bash -c '
+                    [[ -s "$2" ]] || { python3 "$0" "$1" > "$2.tmp" && mv "$2.tmp" "$2"; }' \
+                    "$NAT/in_lds2reg.py" "$NT/$native_in.ifs.hip" "$D4R_KERNEL_CACHE/$key.hip"
+                cp "$D4R_KERNEL_CACHE/$key.hip" "$NT/$native_in.hip"
+            else
+                python3 "$NAT/in_lds2reg.py" "$NT/$native_in.ifs.hip" > "$NT/$native_in.hip"
+            fi
+            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/$native_in.hip" "$OUT/$native_in.hsaco"
+        }
+        for native_out in "${native_outs[@]}"; do job native_output "$native_out"; done
+        for native_out in "${native_ldr_outs[@]+"${native_ldr_outs[@]}"}"; do job native_ldr_output "$native_out"; done
+        for native_in in "${native_ins[@]}"; do job native_input "$native_in"; done
+        drain
+        # the RGBA8 sidecar, in kernel order once every LDR output is built
+        for native_out in "${native_ldr_outs[@]+"${native_ldr_outs[@]}"}"; do
             python3 - "$OUT" "$native_out" <<'PY'
 from pathlib import Path
 import sys
@@ -299,13 +353,6 @@ rows = path.read_text().splitlines() if path.exists() else ['# RGBA8 store capab
 rows = [row for row in rows if not row.startswith(name + ' ')]
 path.write_text('\n'.join(rows + [f'{name} {value:016x}']) + '\n')
 PY
-        done
-        for native_in in "${native_ins[@]}"; do
-            ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
-            # hiluma input: per-thread LDS scratch and local array in registers (in_lds2reg.py), wave32
-            python3 "$NAT/ptx2hip.py" --ifconv --sink "$ptx" "$native_in" > "$NT/in_ifs.hip"
-            python3 "$NAT/in_lds2reg.py" "$NT/in_ifs.hip" > "$NT/$native_in.hip"
-            D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/$native_in.hip" "$OUT/$native_in.hsaco"
         done
     fi
 fi

@@ -32,7 +32,7 @@ mkdir -p "$CACHE/kernels"
 sum=$(sha256sum "$DLL" | cut -d' ' -f1)
 stamp="$CACHE/setup-done.txt"
 t1files=()
-[[ -d "$T1" ]] && t1files=("$T1"/*.py)
+[[ -d "$T1" ]] && t1files=("$T1"/*.py "$T1"/*.txt)
 if [[ -f "$CACHE/arch" && "$(cat "$CACHE/arch")" != "$ARCH" ]]; then
   echo "dlssg-setup: $CACHE holds $(cat "$CACHE/arch") kernels; use another cache for $ARCH" >&2; exit 1
 fi

@@ -72,6 +72,13 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @installer    (GE-Proton11-3 first, or set D4R_PROTON=/path/to/proton-folder). It takes a minute or two once;
 @installer    the models are kept in ~/.cache/d4r/engine-models for the next game. bash install.sh --help lists
 @installer    options for scripted installs.
+@installer    On RDNA3 and RDNA4 install.sh also sets up NVIDIA's DLSS Frame Generation: it downloads DLSS-G
+@installer    310.9.16 from NVIDIA's Streamline SDK (~263 MiB once, verified, kept in ~/.cache/d4r/nvidia) and
+@installer    translates its kernels on this machine (a minute or two once; they are NVIDIA's code and cannot be
+@installer    shipped). Games with DLSS Frame Generation: turn it on in the game. Games without it: select DLSS
+@installer    in the game and turn on frame generation in OptiScaler's menu (Insert). d4r/d4r.ini
+@installer    [FrameGeneration]: Model = auto (FG Lite on RDNA3, the full model on RDNA4), full or lite;
+@installer    Backend = off turns it off. bash install.sh --no-fg skips this step.
 @installer    RR D/E also have separate gfx11 models; devices without compatible matrix support retain CUDA
 @installer    translation. Builds report progress and time out after 900 seconds per command (override with
 @installer    D4R_MODEL_TIMEOUT). Failed captures and logs are retained under ~/.cache/d4r/model-builds;
@@ -241,8 +248,8 @@ If something goes wrong
   Latency output defaults to OptiScaler's automatic selection. FG is experimental and off
   by default. Each setup change creates an exact INI backup.
   Disable FG and request Proton Reflex output: python3 d4r/d4r-features.py . --fg off --latency proton
-- Not supported: NVIDIA's DLSS Frame Generation network and DirectX 11.
-  OptiScaler can instead convert DLSSG inputs into XeFG or FSR FG as above.
+- NVIDIA's DLSS Frame Generation runs on RDNA3 and RDNA4 (set up by install.sh, see above). On other GPUs,
+  OptiScaler can instead convert DLSSG inputs into XeFG or FSR FG as above. Not supported: DirectX 11.
 - Development builds expose an experimental native Vulkan NGX path using CPU staging.
   Youngblood is the first intended game test; gameplay remains unverified. See the
   project documentation (docs/vulkan.md) for its separate Vulkan setup and limits.

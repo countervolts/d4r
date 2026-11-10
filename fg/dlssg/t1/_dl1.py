@@ -54,24 +54,40 @@ void main() {
         [[unroll]] for (uint i = 0u; i < %(R)du; i++) acc[i] = coopmat<float, %(CM)s, gl_MatrixUseAccumulator>(c16);
     }
     for (uint c = 0u; c < %(NCH)du; c++) {
-        barrier();
-        // input chunk with a 1-pixel halo: 16 channels = two 16-byte halves per pixel; outside the image f16 +0
-        for (uint e = lid; e < %(NIN)du; e += nthr) {
+        // input chunk with a 1-pixel halo: 16 channels = two 16-byte halves per pixel; outside the image f16 +0.
+        // All global loads of the chunk are issued first (addresses clamped into the image, out-of-image values
+        // replaced by 0 afterwards), before the barrier that frees the LDS tile: one memory round trip per chunk
+        // instead of one per load, overlapped with the other warps finishing the previous chunk.
+        uvec4 vin[%(NI)d];
+        [[unroll]] for (uint it = 0u; it < %(NI)du; it++) {
+            uint e = min(lid + it * %(NTHR)du, %(NIN)du - 1u);
             uint hh = e & 1u, p = e >> 1;
-            int gx = x0 - 1 + int(p %% %(TW2)du), gy = y0 - 1 + int(p / %(TW2)du);
-            uvec4 v = uvec4(0u);
-            if (gx >= 0 && gy >= 0 && gx < W && gy < H)
-                v = NvxU32x4a4(ip + uint64_t((uint(gy * W + gx) * %(CIN)du + c * 16u + hh * 8u) * 2u)).v;
-            smv[(p * %(CS)du + hh * 8u) >> 3] = v;
+            int gx0 = x0 - 1 + int(p %% %(TW2)du), gy0 = y0 - 1 + int(p / %(TW2)du);
+            int gx = clamp(gx0, 0, W - 1), gy = clamp(gy0, 0, H - 1);
+            uvec4 v = NvxU32x4a4(ip + uint64_t((uint(gy * W + gx) * %(CIN)du + c * 16u + hh * 8u) * 2u)).v;
+            vin[it] = (gx0 >= 0 && gy0 >= 0 && gx0 < W && gy0 < H) ? v : uvec4(0u);
         }
         // weights of this chunk, unswizzled to column-major 16x16 per (tap, nt): pairs of halves (k, k+1)
-        for (uint e = lid; e < %(NW)du * 4u; e += nthr) {
+        uint wv[%(NWI)d];
+        [[unroll]] for (uint it = 0u; it < %(NWI)du; it++) {
+            uint e = min(lid + it * %(NTHR)du, %(NW)du * 4u - 1u);
             uint kp = e & 7u, n = (e >> 3) & 15u, q = e >> 7, t = q %% %(NT)du, tap = q / %(NT)du;
             uint kx = tap / 3u, ky = tap %% 3u, gg = t * 2u + (n >> 3), k = kp * 2u;
             uint blk = ((gg * 3u + ky) * 3u + kx) * %(NCH)du + c;
             uint pos = 16u * (n & 7u) + 4u * ((k & 7u) >> 1) + ((k & 8u) != 0u ? 2u : 0u);
-            smem[((%(WOFF)du + (tap * %(NT)du + t) * 256u + n * 16u) >> 1) + kp] =
-                NvxU32(wp + uint64_t((blk * 128u + pos) * 2u)).v;
+            wv[it] = NvxU32(wp + uint64_t((blk * 128u + pos) * 2u)).v;
+        }
+        barrier();
+        [[unroll]] for (uint it = 0u; it < %(NI)du; it++) {
+            uint e = lid + it * %(NTHR)du;
+            if (e < %(NIN)du)
+                smv[((e >> 1) * %(CS)du + (e & 1u) * 8u) >> 3] = vin[it];
+        }
+        [[unroll]] for (uint it = 0u; it < %(NWI)du; it++) {
+            uint e = lid + it * %(NTHR)du;
+            uint kp = e & 7u, n = (e >> 3) & 15u, q = e >> 7, t = q %% %(NT)du, tap = q / %(NT)du;
+            if (e < %(NW)du * 4u)
+                smem[((%(WOFF)du + (tap * %(NT)du + t) * 256u + n * 16u) >> 1) + kp] = wv[it];
         }
         barrier();
         [[unroll]] for (uint kx = 0u; kx < 3u; kx++) {
@@ -112,6 +128,9 @@ void main() {
 }
 '''
     g['COUT2'] = COUT // 2
+    g['NTHR'] = 32 * warps
+    g['NI'] = -(-g['NIN'] // g['NTHR'])
+    g['NWI'] = -(-(g['NW'] * 4) // g['NTHR'])
     hk = hooks or {}
     g['EPI_STORE'] = hk.get('epi_store', '') % dict(g, LO='ol', HI='oh', CWX=COUT, ZT='0u')
     g['POST'] = hk.get('post', '') % dict(g, CWX=COUT, CW2X=COUT // 2, ZT='0u', NPOOL=(TW // 2) * (TH // 2) * (COUT // 2),
@@ -119,7 +138,7 @@ void main() {
     return _conv.header(TOT) + body % g, ['t1_block 32 %d 1' % warps]
 
 
-def kconv_g(KS, NCH, NT, NTALL, BIAS, order, TH=16, R=4, warps=8, act='leaky', CINPIX=None, hooks=None):
+def kconv_g(KS, NCH, NT, NTALL, BIAS, order, TH=16, R=4, warps=8, act='leaky', CINPIX=None, hooks=None, PF=0):
     """Generalised k_conv_fp16_nhwc: KS = 3 (padding 1) or 1; order of the chain per output element:
        'ckxky' (chunk, kx, ky), 'kxcky' (kx, chunk, ky) or 'c' (1x1); NT of NTALL 16-channel output tiles per
        workgroup (grid z picks them); act 'leaky' or 'none'.  params (3x3): 0 w, 8 in, 16 W, 20 H, 32 out, 40 W, 44 H;
@@ -140,30 +159,53 @@ def kconv_g(KS, NCH, NT, NTALL, BIAS, order, TH=16, R=4, warps=8, act='leaky', C
     TOT = max(BOFF + NT * 256, TH * TW * CW)
     if KS == 3:
         params = 'uint64_t wp = nvx_p64(0u), ip = nvx_p64(8u), op = nvx_p64(32u);\n    int W = int(nvx_p32(16u)), H = int(nvx_p32(20u)), Wo = int(nvx_p32(40u)), Ho = int(nvx_p32(44u));'
-        blk = '((gg * 3u + ky) * 3u + kx) * %du + c' % NCH
+        blk = '((gg * 3u + ky) * 3u + kx) * %du + cl' % NCH
     else:
         params = 'uint64_t wp = nvx_p64(0u), ip = nvx_p64(8u), op = nvx_p64(24u);\n    int W = int(nvx_p32(16u)), H = int(nvx_p32(20u)), Wo = int(nvx_p32(32u)), Ho = int(nvx_p32(36u));'
-        blk = 'gg * %du + c' % NCH
-    # one staging = input chunk c (+ halo) and its weights for the taps listed in STAGE_TAPS
-    stage = r'''
-        barrier();
-        for (uint e = lid; e < %(NIN)du; e += nthr) {
+        blk = 'gg * %du + cl' % NCH
+    # one staging = input chunk cl (+ halo) and its weights. Its global loads go to registers first (clamped
+    # addresses; out-of-image values are zeroed at the LDS store, so nothing waits for the data before that) and
+    # reach LDS only after the barrier that frees the tile: one
+    # memory round trip per staging instead of one per load. PF=1 issues the loads of the next staging before this
+    # staging's WMMAs (software pipelining; costs NI*4 + NWI VGPRs during the WMMAs). Same values either way: exact.
+    loads = r'''
+        [[unroll]] for (uint it = 0u; it < %(NI)du; it++) {
+            uint e = min(lid + it * %(NTHR)du, %(NIN)du - 1u);
             uint hh = e & 1u, p = e >> 1;
-            int gx = x0 - %(HALO)d + int(p %% %(TW2)du), gy = y0 - %(HALO)d + int(p / %(TW2)du);
-            uvec4 v = uvec4(0u);
-            if (gx >= 0 && gy >= 0 && gx < W && gy < H)
-                v = %(LOADIN)s;
-            smv[(p * %(CS)du + hh * 8u) >> 3] = v;
+            int gx0 = x0 - %(HALO)d + int(p %% %(TW2)du), gy0 = y0 - %(HALO)d + int(p / %(TW2)du);
+            int gx = clamp(gx0, 0, W - 1), gy = clamp(gy0, 0, H - 1);
+            vin[it] = %(LOADIN)s;
+            vok[it] = gx0 >= 0 && gy0 >= 0 && gx0 < W && gy0 < H;
         }
-        for (uint e = lid; e < %(NTAPS)du * %(NT)du * 128u; e += nthr) {
+        [[unroll]] for (uint it = 0u; it < %(NWI)du; it++) {
+            uint e = min(lid + it * %(NTHR)du, %(NTAPS)du * %(NT)du * 128u - 1u);
             uint kp = e & 7u, n = (e >> 3) & 15u, q = e >> 7, t = q %% %(NT)du, tap = q / %(NT)du;
             uint kx = tap / %(KS)du, ky = tap %% %(KS)du, gg = (zt + t) * 2u + (n >> 3), k = kp * 2u;
             uint blk = %(BLK)s;
             uint pos = 16u * (n & 7u) + 4u * ((k & 7u) >> 1) + ((k & 8u) != 0u ? 2u : 0u);
-            smem[((%(WOFF)du + (tap * %(NT)du + t) * 256u + n * 16u) >> 1) + kp] =
-                NvxU32(wp + uint64_t((blk * 128u + pos) * 2u)).v;
+            wv[it] = NvxU32(wp + uint64_t((blk * 128u + pos) * 2u)).v;
+        }'''
+    stores = r'''
+        barrier();
+        [[unroll]] for (uint it = 0u; it < %(NI)du; it++) {
+            uint e = lid + it * %(NTHR)du;
+            if (e < %(NIN)du)
+                smv[((e >> 1) * %(CS)du + (e & 1u) * 8u) >> 3] = vok[it] ? vin[it] : uvec4(0u);
+        }
+        [[unroll]] for (uint it = 0u; it < %(NWI)du; it++) {
+            uint e = lid + it * %(NTHR)du;
+            uint kp = e & 7u, n = (e >> 3) & 15u, q = e >> 7, t = q %% %(NT)du, tap = q / %(NT)du;
+            if (e < %(NTAPS)du * %(NT)du * 128u)
+                smem[((%(WOFF)du + (tap * %(NT)du + t) * 256u + n * 16u) >> 1) + kp] = wv[it];
         }
         barrier();'''
+    if PF:
+        # stagings in order s = 0 .. NST-1 (chunk s %% NCH); the next one is loaded right after this one is in LDS
+        stage = stores + '\n        if (s + 1u < %(NST)du) {\n            uint cl = (s + 1u) %% %(NCH)du;' + loads + '\n        }'
+        pre = '    uvec4 vin[%(NI)d];\n    bool vok[%(NI)d];\n    uint wv[%(NWI)d];\n    {\n        uint cl = 0u;' + loads + '\n    }\n'
+    else:
+        stage = '\n        {\n        uint cl = c;' + loads + '\n        }' + stores
+        pre = '    uvec4 vin[%(NI)d];\n    bool vok[%(NI)d];\n    uint wv[%(NWI)d];\n'
     step = r'''
                 {
                     coopmat<float16_t, %(CM)s, gl_MatrixUseB> b;
@@ -177,14 +219,17 @@ def kconv_g(KS, NCH, NT, NTALL, BIAS, order, TH=16, R=4, warps=8, act='leaky', C
                     }
                 }'''
     if order == 'ckxky':
-        loops = ('    for (uint c = 0u; c < %(NCH)du; c++) {\n' + stage +
+        NST = NCH
+        loops = (pre + '    for (uint c = 0u; c < %(NCH)du; c++) {\n        uint s = c;\n' + stage +
                  '\n        [[unroll]] for (uint kx = 0u; kx < 3u; kx++) {\n            [[unroll]] for (uint ky = 0u; ky < 3u; ky++)' +
                  step + '\n        }\n    }')
     elif order == 'kxcky':
-        loops = ('    for (uint kx_ = 0u; kx_ < 3u; kx_++) {\n    for (uint c = 0u; c < %(NCH)du; c++) {\n' + stage +
+        NST = 3 * NCH
+        loops = (pre + '    for (uint kx_ = 0u; kx_ < 3u; kx_++) {\n    for (uint c = 0u; c < %(NCH)du; c++) {\n        uint s = kx_ * %(NCH)du + c;\n' + stage +
                  '\n        uint kx = kx_;\n            [[unroll]] for (uint ky = 0u; ky < 3u; ky++)' + step + '\n    }\n    }')
     elif order == 'c':
-        loops = ('    for (uint c = 0u; c < %(NCH)du; c++) {\n' + stage +
+        NST = NCH
+        loops = (pre + '    for (uint c = 0u; c < %(NCH)du; c++) {\n        uint s = c;\n' + stage +
                  '\n        uint kx = 0u, ky = 0u;' + step + '\n    }')
     else:
         raise ValueError(order)
@@ -200,10 +245,15 @@ def kconv_g(KS, NCH, NT, NTALL, BIAS, order, TH=16, R=4, warps=8, act='leaky', C
              WOFF=WOFF, BOFF=BOFF, BIAS=BIAS, CM=CM, NROW=TH // R, HALO=HALO, KS=KS, NTAPS=NTAPS, BLK=blk,
              NIN=TW2 * TH2 * 2, NB=NT * 256, NOUT=TH * TW * (CW // 2), CW2=CW // 2, COUT2=COUT // 2,
              ROUND0=ROUND % {'m': 'acc[i]'}, PARAMS=params, EPI=epi)
+    g['NTHR'] = 32 * warps
+    g['NI'] = -(-g['NIN'] // g['NTHR'])
+    g['NWI'] = -(-(NTAPS * NT * 128) // g['NTHR'])
+    g['NST'] = NST
     hk = hooks or {}
-    g['LOADIN'] = hk.get('loadin', 'NvxU32x4a4(ip + uint64_t((uint(gy * W + gx) * %(CINPIX)du + c * 16u + hh * 8u) * 2u)).v') % g
+    g['LOADIN'] = hk.get('loadin', 'NvxU32x4a4(ip + uint64_t((uint(gy * W + gx) * %(CINPIX)du + cl * 16u + hh * 8u) * 2u)).v') % g
     g['LOOPS'] = (loops % g)
     g['EPI_STORE'] = hk.get('epi_store', '') % dict(g, LO='lo', HI='hi', CWX=CW, ZT='zt')
+    g['PRE'] = hk.get('pre', '') % g      # before the bias staging (and its barrier): per-tile setup of a fused loader
     g['POST'] = hk.get('post', '') % dict(g, CWX=CW, CW2X=CW // 2, ZT='zt', NPOOL=(TW // 2) * (TH // 2) * (CW // 2),
                                           TW2H=TW // 2)
     body = r'''
@@ -212,7 +262,7 @@ void main() {
     uint lid = gl_LocalInvocationIndex, nthr = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
     int x0 = int(gl_WorkGroupID.x) * %(TW)d, y0 = int(gl_WorkGroupID.y) * %(TH)d;
     uint zt = gl_WorkGroupID.z * %(NT)du;
-    uint w = gl_SubgroupID, rg = w %% %(NROW)du, nt = w / %(NROW)du;
+    uint w = gl_SubgroupID, rg = w %% %(NROW)du, nt = w / %(NROW)du;%(PRE)s
     for (uint e = lid; e < %(NB)du; e += nthr) {
         uint col = e & 15u, t = e >> 8, gg = (zt + t) * 2u + (col >> 3);
         smh[%(BOFF)du + e] = uint16BitsToFloat16(NvxU16(wp + uint64_t((%(BIAS)du + 128u * gg + (col & 7u)) * 2u)).v);

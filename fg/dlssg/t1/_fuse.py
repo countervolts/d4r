@@ -28,6 +28,36 @@ uint nvx_p8(uint off) { return (nvx_p32(off) >> ((off & 3u) * 8u)) & 0xffu; }
 uint64_t nvx_p64(uint off) { return packUint2x32(uvec2(nvx_p32(off), nvx_p32(off + 4u))); }'''
 
 
+# grid-wide barrier (members of a fused kernel); format with SPIN / SPIN0
+GSYNC = r'''// grid-wide barrier between members. Bounded: a workgroup that waits SPIN polls sets the poison flag (region + 64),
+// after which no barrier of this dispatch waits any more (wrong output for that frame, never a GPU hang); nvxrt sees
+// the flag and disables the group. nvx_resident(): the same at the start of the dispatch with a short bound, so a
+// grid that is not fully co-resident is detected within microseconds.
+void nvx_gsync_(uint64_t reg, uint spin)
+{
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily,
+                   gl_StorageSemanticsBuffer | gl_StorageSemanticsImage | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    if (gl_LocalInvocationIndex == 0u) {
+        uint n = gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z;
+        uint old = atomicAdd(NvxU32A(reg + 128ul).v, 1u, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        uint target = (old / n + 1u) * n;
+        for (uint i = 0u; i < spin; i++) {
+            if (atomicLoad(NvxU32A(reg + 128ul).v, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) >= target)
+                break;
+            if ((i & 31u) == 0u && atomicLoad(NvxU32A(reg + 64ul).v, gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed) != 0u)
+                break;
+            if (i + 1u == spin)
+                atomicStore(NvxU32A(reg + 64ul).v, 1u, gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed);
+        }
+    }
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily,
+                   gl_StorageSemanticsBuffer | gl_StorageSemanticsImage | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+}
+void nvx_gridsync(uint64_t ctr) { nvx_gsync_(ctr - 128ul, %(SPIN)du); }
+void nvx_resident(uint64_t reg) { nvx_gsync_(reg, %(SPIN0)du); }
+'''
+
+
 def group_rt(rt):
     """the runtime for fused kernels: coherent buffer references, params from the region"""
     out = rt
@@ -85,34 +115,7 @@ def fuse(members, rt):
            'shared NvxSMU { uint smem[%d]; };\n'
            'shared NvxSMH { float16_t smh[%d]; };\n'
            'shared NvxSMV { uvec4 smv[%d]; };\n' % (words, words * 2, words // 4) + group_rt(rt))
-    src += r'''
-// grid-wide barrier between members. Bounded: a workgroup that waits SPIN polls sets the poison flag (region + 64),
-// after which no barrier of this dispatch waits any more (wrong output for that frame, never a GPU hang); nvxrt sees
-// the flag and disables the group. nvx_resident(): the same at the start of the dispatch with a short bound, so a
-// grid that is not fully co-resident is detected within microseconds.
-void nvx_gsync_(uint64_t reg, uint spin)
-{
-    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily,
-                   gl_StorageSemanticsBuffer | gl_StorageSemanticsImage | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-    if (gl_LocalInvocationIndex == 0u) {
-        uint n = gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z;
-        uint old = atomicAdd(NvxU32A(reg + 128ul).v, 1u, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
-        uint target = (old / n + 1u) * n;
-        for (uint i = 0u; i < spin; i++) {
-            if (atomicLoad(NvxU32A(reg + 128ul).v, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) >= target)
-                break;
-            if ((i & 31u) == 0u && atomicLoad(NvxU32A(reg + 64ul).v, gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed) != 0u)
-                break;
-            if (i + 1u == spin)
-                atomicStore(NvxU32A(reg + 64ul).v, 1u, gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed);
-        }
-    }
-    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily,
-                   gl_StorageSemanticsBuffer | gl_StorageSemanticsImage | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-}
-void nvx_gridsync(uint64_t ctr) { nvx_gsync_(ctr - 128ul, %(SPIN)du); }
-void nvx_resident(uint64_t reg) { nvx_gsync_(reg, %(SPIN0)du); }
-''' % {'SPIN': SPIN, 'SPIN0': SPIN0}
+    src += GSYNC % {'SPIN': SPIN, 'SPIN0': SPIN0}
     for body, fname in bodies.items():
         src += member_fn(body, fname) + '\n'
     # main: members in order, each over its virtual grid

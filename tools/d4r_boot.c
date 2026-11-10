@@ -196,7 +196,8 @@ static void patch_imports(void *original, void *wrapper)
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)(void *)patch_imports, &self);
     /* the loader's module list, through the PEB */
-    BYTE *peb = (BYTE *)__readgsqword(0x60);
+    BYTE *peb;
+    __asm__("movq %%gs:0x60, %0" : "=r"(peb)); /* not __readgsqword: GCC 14 flags it with -Warray-bounds */
     LIST_ENTRY *head = (LIST_ENTRY *)(*(BYTE **)(peb + 0x18) + 0x10); /* PEB_LDR_DATA.InLoadOrderModuleList */
     for (LIST_ENTRY *e = head->Flink; e != head; e = e->Flink) {
         HMODULE module = *(HMODULE *)((BYTE *)e + 0x30); /* LDR_DATA_TABLE_ENTRY.DllBase */
@@ -455,6 +456,9 @@ static void setup_dlssg(void)
     wchar_t backend[32];
     if (!GetEnvironmentVariableW(L"D4R_FG_BACKEND", backend, 32))
         ini_read_section(L"FrameGeneration", L"Backend", L"off", backend, 32);
+    /* the DLSS-G host (if OptiScaler routes through it) passes everything to d4r's shim unless the layer is enabled
+     * below: D4R_DLSSG_ENABLED stays 0 on every early return */
+    SetEnvironmentVariableW(L"D4R_DLSSG_ENABLED", L"0");
     if (_wcsicmp(backend, L"dlssg"))
         return;
     wchar_t layer[MAX_PATH + 64], shim[MAX_PATH + 32], next[MAX_PATH + 32], bridge[MAX_PATH + 32];
@@ -503,16 +507,41 @@ static void setup_dlssg(void)
     _snprintf(value, sizeof(value), "%s/../nvxrt.log", unix_layer);
     value[sizeof(value) - 1] = 0;
     set_env("NVXRT_LOG", value, 0);
-    /* [FrameGeneration] Exact = false: texture-unit filtering, fp32 accumulation and RGBA8 storage for two
-     * intermediate images, about 10% less GPU time (PSNR ~55 dB against the exact kernels) */
+    /* [FrameGeneration] Exact = false: texture-unit filtering, fp32 accumulation and RGBA8 storage for the hudless copy
+     * and two other intermediates, read without the fp16 fix-up (r), 15-20% less GPU time (Ghost of Tsushima capture:
+     * 58 dB against the exact kernels, 0.004% of pixels off by more than 2/255) */
     wchar_t exact[16];
     ini_read_section(L"FrameGeneration", L"Exact", L"false", exact, 16);
     if (ini_bool(exact) != 1) {
         set_env("NVXRT_TEX", "hw", 0);
         set_env("NVXRT_ACC", "fast", 0);
-        set_env("NVXRT_SHADOW", "b,c", 0);
+        set_env("NVXRT_SHADOW", "b,c,r", 0);
     }
-    logf_("frame generation: DLSS-G layer enabled from %s (%s kernels)", unix_layer, ini_bool(exact) == 1 ? "exact" : "fast");
+    /* [FrameGeneration] Model = auto | full | lite (env D4R_FG_MODEL): NVIDIA's FG Lite needs DLSS-G >= 310.9.16; the
+     * host reads D4R_DLSSG_LITE, which wins over its own dlssg_host.ini Lite. auto: Lite on RDNA3 (the kernel cache was
+     * built for gfx11: about 3.3 instead of 10.9 ms per real frame at 4x), the full model on RDNA4 */
+    wchar_t model[16];
+    if (!GetEnvironmentVariableW(L"D4R_FG_MODEL", model, 16))
+        ini_read_section(L"FrameGeneration", L"Model", L"auto", model, 16);
+    int lite = !_wcsicmp(model, L"lite");
+    if (_wcsicmp(model, L"lite") && _wcsicmp(model, L"full") && cache[0]) {
+        wchar_t arch_path[MAX_PATH + 16], arch[16] = {0};
+        _snwprintf(arch_path, MAX_PATH + 16, L"Z:%ls/arch", cache);
+        arch_path[MAX_PATH + 15] = 0;
+        for (wchar_t *c = arch_path; *c; c++)
+            if (*c == L'/')
+                *c = L'\\';
+        FILE *f = _wfopen(arch_path, L"r");
+        if (f) {
+            if (fgetws(arch, 16, f))
+                lite = !wcsncmp(arch, L"gfx11", 5);
+            fclose(f);
+        }
+    }
+    SetEnvironmentVariableW(L"D4R_DLSSG_LITE", lite ? L"1" : L"0");
+    SetEnvironmentVariableW(L"D4R_DLSSG_ENABLED", L"1");
+    logf_("frame generation: DLSS-G layer enabled from %s (%s kernels, %s model)", unix_layer,
+          ini_bool(exact) == 1 ? "exact" : "fast", lite ? "Lite" : "full");
     HeapFree(GetProcessHeap(), 0, unix_layer);
 }
 
