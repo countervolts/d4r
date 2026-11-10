@@ -47,7 +47,7 @@ never upscaled noisy as if it had been denoised.
   adds upstream dxil-spirv's accepted scalar FP8 fallback (PR 307) and extended emulation.
 - `DXIL_SPIRV_CONFIG=wmma_rdna3_workaround` in the game's environment.
 - Proton's `amdxc64.dll`. vkd3d-proton loads it only when the GPU is reported as AMD, so under
-  `PROTON_FORCE_NVAPI` the shim loads it after confirming through sysfs that the GPU is AMD's.
+  the NVIDIA identity (`d4r_boot.dll` or `PROTON_FORCE_NVAPI`) the shim loads it after confirming through sysfs that the GPU is AMD's.
   Without it, AMD's runtime offers no provider.
 
 ## Tuning

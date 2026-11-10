@@ -80,8 +80,7 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @clean 3. In Steam, open the game's Properties:
 @full 2. In Steam, open the game's Properties:
    - Compatibility: force a Proton version (tested: GE-Proton11-3).
-   - Launch options:
-       PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
+   - No launch options are needed (see "The NVIDIA identity" below).
 @installer 4. Optional: check the install from a terminal in that folder:
 @clean 4. Optional: check the install from a terminal in that folder:
 @full 3. Optional: check the install from a terminal in that folder:
@@ -182,12 +181,18 @@ the frame it belongs to, so there is no added latency.
 @clean This zip lacks the kernels built from NVIDIA's code, so its DLSS 4 is about 3 fps slower.
 
 
-Why the launch options
-----------------------
-- PROTON_FORCE_NVAPI=1 lets Proton's NVAPI run on an AMD GPU and present the GPU as NVIDIA's.
-  OptiScaler only enables DLSS on NVIDIA hardware.
-- DXVK_NVAPI_GPU_ARCH=AD100 reports an RTX 40 series (Ada) GPU. DLSS then loads the network
-  weights that match the kernels d4r runs.
+The NVIDIA identity
+-------------------
+OptiScaler only enables DLSS on NVIDIA hardware, and DLSS picks its network weights by GPU
+architecture. d4r_boot.dll, which this release's dxgi.dll (OptiScaler) loads before anything else,
+handles both inside the game: it lets Proton's NVAPI run on the AMD GPU, reports an RTX 40 series
+(Ada, AD100) GPU, and shows the AMD GPU as NVIDIA's to the game, DXGI and Vulkan the way Proton's
+WINE_HIDE_AMD_GPU does. Older releases needed the launch options
+  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
+for this; they still work and can be removed. d4r/d4r.ini [Identity] SpoofGpu = false turns d4r's
+own identity off (then the launch options are needed again). Each launch writes d4r/d4r_boot.log.
+Keep dxgi.dll and d4r_boot.dll together: this dxgi.dll does not load without d4r_boot.dll. A
+replaced OptiScaler DLL no longer loads it; d4r-check.sh says so.
 
 
 Ray Reconstruction launch options
@@ -197,10 +202,10 @@ On the tested GE-Proton11-3 setup, Wine's builtin ICU libraries abort inside the
 tracing and RR preset D or E), use launch options that prefer the game's native ICU DLLs and the
 game-local d3d12.dll/d3d12core.dll over Wine's copies:
 
-  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 WINEDLLOVERRIDES='icuuc=n,b;icuin=n,b;icudt=n,b;d3d12=n,b;d3d12core=n,b' %command%
+  WINEDLLOVERRIDES='icuuc=n,b;icuin=n,b;icudt=n,b;d3d12=n,b;d3d12core=n,b' %command%
 
 Merge that WINEDLLOVERRIDES value with any overrides another mod needs instead of replacing it.
-Without Ray Reconstruction, the base launch options above are enough. In the game, select DLSS,
+Without Ray Reconstruction, no launch options are needed. In the game, select DLSS,
 then Ray Reconstruction; d4r/d4r.ini ships [RayReconstruction] Enable = auto and
 [Kernels] NativeFp8 = on for RDNA4. Keep the patched d3d12.dll/d3d12core.dll current, including
 game-local copies.
@@ -210,8 +215,8 @@ If something goes wrong
 -----------------------
 - d4r's log is d4r/d4r_nvngx.log. It is rewritten at every launch. Lines starting with "d4r:" and
   "nvcuda bridge:" name missing files or libraries.
-- DLSS missing in the game's menu, or no d4r_nvngx.log: check the launch options and that the
-  files are next to the game's main .exe. Run sh d4r/d4r-check.sh: it checks file presence and
+- DLSS missing in the game's menu, or no d4r_nvngx.log: check d4r/d4r_boot.log (it should end
+  with "AMD GPU shown as NVIDIA") and that the files are next to the game's main .exe. Run sh d4r/d4r-check.sh: it checks file presence and
   OptiScaler's explicit NGX route separately. For OptiScaler's own log, set LogToFile=true in
   OptiScaler.ini's [Log] section. Its later "NVNGXProxy::InitNVNGX Loaded from" line should name
   d4r\nvngx.dll, not C:\windows\system32\_nvngx.dll. The startup "nvngx.dll not found!" warning

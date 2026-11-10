@@ -43,7 +43,7 @@ Game-specific setup:
 
 - **Horizon Zero Dawn Remastered:** the game loads `dxgi.dll` only from the Windows system folder, so OptiScaler is never loaded under that name. Rename `dxgi.dll` to `version.dll` and add `WINEDLLOVERRIDES="version=n,b"` to the launch options. d4r's `d3d12core.dll` is still picked up from the game folder.
 
-- **Ratchet & Clank: Rift Apart:** set `Dxgi=false` in `OptiScaler.ini`. With ray tracing on, OptiScaler's DXGI spoofing crashes the game at startup on AMD GPUs; the `PROTON_FORCE_NVAPI=1` launch option already reports an NVIDIA GPU.
+- **Ratchet & Clank: Rift Apart:** set `Dxgi=false` in `OptiScaler.ini`. With ray tracing on, OptiScaler's DXGI spoofing crashes the game at startup on AMD GPUs; d4r's `d4r_boot.dll` already reports an NVIDIA GPU to the game.
 
 - **Dying Light: The Beast:** use DLSS inputs; with FSR or XeSS inputs the screen stays black. The game passes its motion vectors as `R16G16B16A16_TYPELESS`, which needs a d4r build from 2026-09-28 or later (older builds reject every frame and show a black screen).
 
@@ -57,8 +57,9 @@ Vulkan games (native Vulkan frontend, engine path; see docs/vulkan.md):
   inputs. Install OptiScaler as `dbghelp.dll` (the exe imports it before it creates its Vulkan device; `dxgi.dll` loads
   too late) with `WINEDLLOVERRIDES="dbghelp=n,b"`, and set in `OptiScaler.ini`: `[Upscalers] VulkanUpscaler=dlss`,
   `[Spoofing] Vulkan=true`, `VulkanExtensionSpoofing=false`, `Dxgi=false` (a Vulkan game needs no DXGI spoofing; the
-  verified setup ran without it), and `[InitFlags] AutoExposure=true` (the game sends no exposure; needed for K). The game's motion vectors are `R16G16_SNORM`, which the staging path rejects. Launch options as for
-  D3D12 games (`PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100`). The lsfg-vk layer made the game's swap chain creation
+  verified setup ran without it), and `[InitFlags] AutoExposure=true` (the game sends no exposure; needed for K). The game's motion vectors are `R16G16_SNORM`, which the staging path rejects. Use the release's `dxgi.dll`
+  renamed to `dbghelp.dll` (it loads `d4r_boot.dll`, so no further launch options are needed); another OptiScaler
+  build needs `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100`. The lsfg-vk layer made the game's swap chain creation
   fail under GE-Proton11-7 even without d4r; disable it (`DISABLE_LSFGVK=1`) if the game exits with
   `Graphics_InitializationFailed`.
 

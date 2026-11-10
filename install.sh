@@ -162,7 +162,13 @@ install_dlls() {
 
 # --- the engine's models ---------------------------------------------------------------------------------------
 BUILDER="$RUNTIME/tools/build-engine-models.sh"
-done_msg() { echo 'Done. Follow the included README for Steam launch options.'; }
+done_msg() {
+  if [[ -f "$(dirname -- "$RUNTIME")/d4r_boot.dll" ]]; then
+    echo 'Done. No Steam launch options are needed; select DLSS in the game (see the included README).'
+  else
+    echo 'Done. Follow the included README for Steam launch options.'
+  fi
+}
 if [[ ! -f "$BUILDER" ]]; then
   [[ "$DO_ENGINE" != 1 ]] || fail "missing $BUILDER (this release has no engine-model builder)"
   done_msg; exit 0

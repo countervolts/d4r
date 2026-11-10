@@ -27,10 +27,27 @@ and creates an exact INI backup. It also supports older 0.9 ASI installations.
 
 XeFG needs borderless mode and SDR/HDR10 rather than scRGB/FP16 HDR. Treat D3D12
 under Proton as requiring per-game testing. d4r's native Vulkan route has not been
-validated with FG. NVIDIA's DLSS FG network is not implemented by d4r. The bundled
+validated with FG. NVIDIA's own DLSS FG runs through d4r's DLSS-G backend (see below). The bundled
 Nukem DLL is an alternate DLSSG replacement; v10's DLSSG-output routes additionally
 require matching Streamline files, which d4r does not bundle. The direct XeFG/FSR FG
 routes above are the starting point for testing.
+
+## NVIDIA DLSS Frame Generation (RDNA3/RDNA4)
+
+`d4r/fg/dlssg` runs the game's own `nvngx_dlssg.dll` (2x/3x/4x) next to d4r's DLSS SR/RR, ported from
+[dlssg-amd](https://github.com/itchyfeetleech/dlssg-amd). With the game closed, run this from its executable folder:
+
+```sh
+python3 d4r/d4r-features.py . --fg dlssg       # --exact, --lite, --dll PATH; --fg off undoes it
+```
+
+It translates the DLL's CUDA kernels for this GPU (RDNA4: `~/.cache/nvxrt`, with hand-written network kernels;
+RDNA3: `~/.cache/nvxrt-gfx11`, with the same hand-written kernels in RDNA3's layout), routes OptiScaler's NGX path through the DLSS-G host, sets
+`HwSchMode=2` in the Proton prefix and `[FrameGeneration] Backend = dlssg` in `d4r.ini`. `d4r_boot.dll` enables the
+Vulkan layer at launch: no launch options. Enable DLSS Frame Generation in the game. DLSS-G 310.7.0 is the tested
+version; 3.x DLLs (encrypted PTX) are refused, as are newer 310.x builds the translator cannot handle yet, without
+changing anything (`--dll` can point at a 310.7.0 copy). Cost at 2560x1440: RDNA4 2.2 ms per real frame for 2x
+(upstream, RX 9070); RDNA3 5.4 ms for 2x and 11.7 ms for 4x (RX 7700 XT, harness; Ghost of Tsushima 4x: 10.1 ms). Details: [fg/dlssg/README.md](../fg/dlssg/README.md).
 
 ## Latency and GPU identity
 

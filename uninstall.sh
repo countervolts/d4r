@@ -123,6 +123,7 @@ else
   fi
   if (( ours )); then
     remove "$GAME/dxgi.dll"; remove "$GAME/OptiScaler.ini"; remove "$GAME/OptiScaler.log"; remove "$GAME/OptiScaler"
+    remove "$GAME/d4r_boot.dll"
   elif [[ -f "$GAME/dxgi.dll" ]]; then
     note "kept $GAME/dxgi.dll, OptiScaler.ini and OptiScaler/: that dxgi.dll is not OptiScaler"
   fi
@@ -173,8 +174,8 @@ done
 (( ${#REMOVE[@]} == 0 )) || echo "Removed ${#REMOVE[@]} d4r item(s)."
 if (( PURGE )) && [[ -d "$CACHE" ]]; then rm -rf -- "$CACHE"; echo "Removed the shared cache: $CACHE"; fi
 echo
-echo 'd4r is uninstalled. In Steam, remove PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 (and any D4R_ variables)'
-echo 'from the game'"'"'s launch options. If the game shipped its own dxgi.dll or d3d12.dll, use'
+echo 'd4r is uninstalled. If you added PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 (or D4R_ variables) to the'
+echo 'game'"'"'s Steam launch options for an older release, remove them. If the game shipped its own dxgi.dll or d3d12.dll, use'
 echo 'Properties > Installed Files > Verify integrity of game files to get them back.'
 exit 0
 }

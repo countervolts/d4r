@@ -24,7 +24,11 @@ The release zips do not contain NVIDIA's files. Their installers download the pi
 2. Run `bash install.sh` there. It installs NVIDIA's DLLs into `d4r/` and builds the native engine's models from them. Needs Bash, curl, sha256sum, 7-Zip and python3 with numpy; no sudo, ROCm not required.
 3. In Steam, select a Proton version for the game (tested: GE-Proton11-3). No launch options are needed.
 
+`d4r_boot.dll`, which d4r's `dxgi.dll` loads first, shows the game an NVIDIA GPU (what `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100` did before; those options still work and can be removed). When updating, replace `dxgi.dll`, `d4r_boot.dll`, `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together.
+
 The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt). Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)).
+
+DLSS Frame Generation (NVIDIA's own, 2x/3x/4x) runs on RDNA3 and RDNA4: `python3 d4r/d4r-features.py . --fg dlssg` with the game closed, then enable it in the game ([docs/frame-generation.md](docs/frame-generation.md)).
 
 Northlight games (Control, Alan Wake 2) keep their original motion vectors by default. Experimental display-resolution motion-vector reconstruction requires `[Interop] NativeMotionVectors = true` in `d4r.ini` and a matching patched driver. It can cause motion artifacts; restart the game after changing it.
 

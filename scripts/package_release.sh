@@ -85,6 +85,8 @@ OPTISCALER_LICENSE="${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-o
 if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
   "$ROOT/scripts/build_d4r_nvngx_shim.sh" >/dev/null
   "$ROOT/scripts/build_wine_nvcuda_bridge.sh" >/dev/null
+  "$ROOT/scripts/build_d4r_boot.sh" >/dev/null
+  [[ ! -d "$ROOT/fg/dlssg" || "$INSTALL_MODE" != proxy ]] || "$ROOT/scripts/build_dlssg.sh" >/dev/null
 fi
 
 rm -rf "$STAGE"
@@ -105,7 +107,8 @@ else
     *) echo "D4R_OPTISCALER must be a .7z, a .zip or a folder" >&2; exit 2 ;;
   esac
 fi
-python3 "$ROOT/scripts/stage_optiscaler.py" "$OPTI" "$STAGE"
+# dxgi.dll imports d4r_boot.dll, the in-process NVIDIA identity that replaces the Steam launch options
+python3 "$ROOT/scripts/stage_optiscaler.py" --boot "$ROOT/build/d4r_boot.dll" "$OPTI" "$STAGE"
 else
   cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
   # Same NGX exports and implementation, delivered through the ASI loader.
@@ -128,6 +131,22 @@ cp "$ZLUDA/libnvcuda.so" "$STAGE/d4r/zluda/libcuda.so"
 cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
 "$ROOT/scripts/check_glibc_compat.sh" "${D4R_MAX_GLIBC:-2.41}" \
   "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
+# DLSS frame generation (fg/dlssg, GPL-3.0-only; set up per game with d4r-features.py --fg dlssg): the NGX host,
+# the nvxrt Vulkan layer and the kernel translator with its RDNA4 kernels. Its sources go along, as the GPL asks.
+if [[ -d "$ROOT/fg/dlssg" && "$INSTALL_MODE" == proxy ]]; then
+  SRCFG="$ROOT/fg/dlssg"
+  FG="$STAGE/d4r/fg/dlssg"
+  mkdir -p "$FG/layer" "$FG/tools" "$FG/source/host" "$FG/source/nvxrt"
+  cp "$SRCFG/host/build/nvngx.dll_dlssg_host.dll" "$FG/"
+  cp "$SRCFG/nvxrt/build/libVkLayer_nvxrt.so" "$SRCFG/nvxrt/build/nvxrt_layer.json" "$FG/layer/"
+  cp "$SRCFG/nvxrt/build/nvxrt-scan" "$SRCFG/tools/dlssg-setup" "$FG/tools/"
+  cp -r "$SRCFG/translator" "$SRCFG/t1" "$FG/"
+  find "$FG" -name __pycache__ -prune -exec rm -rf {} +
+  cp "$SRCFG/LICENSE" "$SRCFG/NOTICE" "$SRCFG/README.md" "$FG/"
+  cp "$SRCFG/host/dlssg_host.cpp" "$SRCFG/host/build.sh" "$FG/source/host/"
+  cp "$SRCFG/nvxrt/"*.cpp "$SRCFG/nvxrt/"*.h "$SRCFG/nvxrt/Makefile" "$SRCFG/nvxrt/nvxrt_layer.json" "$FG/source/nvxrt/"
+  "$ROOT/scripts/check_glibc_compat.sh" "${D4R_MAX_GLIBC:-2.41}" "$FG/layer/libVkLayer_nvxrt.so"
+fi
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
 cp "$ROOT/packaging/d4r-features.py" "$STAGE/d4r/d4r-features.py"
