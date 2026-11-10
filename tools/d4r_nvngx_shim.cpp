@@ -14840,12 +14840,18 @@ static ID3D12GraphicsCommandList* native_command_list(ID3D12GraphicsCommandList*
         ID3D12GraphicsCommandList* native = nullptr;
         const HRESULT hr = d4r->GetCommandList(&native);
         d4r->Release();
-        if (SUCCEEDED(hr) && native && native != list)
+        if (SUCCEEDED(hr) && native)
         {
+            // GetCommandList hands out its own reference (COM out-parameter convention); drop it
+            // now, the returned pointer stays valid while the proxy that wraps the list is alive.
+            const bool proxy = native != list;
             native->Release();
-            if (!logged.exchange(true))
-                logf("evaluate: the command list is a proxy; recording into the native list it wraps");
-            return native;
+            if (proxy)
+            {
+                if (!logged.exchange(true))
+                    logf("evaluate: the command list is a proxy; recording into the native list it wraps");
+                return native;
+            }
         }
     }
 
