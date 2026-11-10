@@ -152,8 +152,8 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     : "${D4R_DLSS_DLL:?set D4R_DLSS_DLL to nvngx_dlss.dll (310.7)}"
     # RDNA2 builds only the PTX-to-HIP translations below, which ZLUDA does not compile
     [[ "$RDNA2" == 1 ]] || : "${D4R_ZLUDA_EMIT:?set D4R_ZLUDA_EMIT to d4r_emit from a ZLUDA build with patches/zluda}"
-    if [[ "$ARCH" == gfx110[0-3] && "$ACCURACY" == 0 ]]; then
-        # preset L's native stages as kernels of their own, for vkhip on every RDNA3 target, whichever enc0 and dec0 the
+    if [[ "$ARCH" == gfx11[05][0-3] && "$ACCURACY" == 0 ]]; then
+        # preset L's native stages as kernels of their own, for vkhip on every RDNA3 and RDNA 3.5 target, whichever enc0 and dec0 the
         # CUDA backend gets (engine/vkhip; compile_m.py packages them)
         build_l_net() {
             ("$CLANG" -x hip -std=c++20 -nogpuinc -nogpulib -O3 -mno-wavefrontsize64 --offload-device-only \

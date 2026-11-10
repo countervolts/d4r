@@ -11396,7 +11396,7 @@ static bool create_engine_vkhip(Feature& feature, const std::string& directory,
     const uint32_t mach = vkhip::gfx11Mach(target);
     char gfx[16];
     std::snprintf(gfx, sizeof(gfx), "gfx%u%u%x", target / 10000, target / 100 % 100, target % 100);
-    if (!mach) return unavailable(std::string("requires an RDNA3 GPU (gfx1100-gfx1103), not ") + gfx);
+    if (!mach) return unavailable(std::string("requires an RDNA3 or RDNA 3.5 GPU (gfx1100-gfx1103, gfx1150-gfx1153), not ") + gfx);
     auto properties = g_vk.instanceProc ? reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
         g_vk.instanceProc(g_vk.instance, "vkGetPhysicalDeviceProperties2")) : nullptr;
     if (!properties || !g_vk.deviceProc) return unavailable("Vulkan device properties unavailable");

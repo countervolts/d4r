@@ -41,15 +41,22 @@ uint32_t gfx11Mach(uint32_t gfxTargetVersion) {
     case 110001: return 0x46;  // gfx1101
     case 110002: return 0x47;  // gfx1102
     case 110003: return 0x44;  // gfx1103
+    // RDNA 3.5: the same gfx11 ISA and kernel descriptor, code built for its own target
+    case 110500: return 0x43;  // gfx1150
+    case 110501: return 0x4a;  // gfx1151
+    case 110502: return 0x55;  // gfx1152
+    case 110503: return 0x58;  // gfx1153
     default: return 0;
     }
 }
 
+bool gfx115Mach(uint32_t mach) { return mach == 0x43 || mach == 0x4a || mach == 0x55 || mach == 0x58; }
+
 bool Module::parse(const std::vector<uint8_t>& f) {
     mach = f.size() >= 64 ? rd<uint32_t>(f, 48) & 255 : 0;
     if (f.size() < 64 || std::memcmp(f.data(), "\x7f" "ELF", 4) || f[4] != 2 || f[5] != 1 ||
-        rd<uint16_t>(f, 18) != 224 || (mach != 0x41 && mach != 0x46 && mach != 0x47 && mach != 0x44)) {
-        error = "requires a little-endian gfx1100-gfx1103 AMDGPU ELF64 code object"; return false;
+        rd<uint16_t>(f, 18) != 224 || (mach != 0x41 && mach != 0x46 && mach != 0x47 && mach != 0x44 && !gfx115Mach(mach))) {
+        error = "requires a little-endian gfx1100-gfx1103 or gfx1150-gfx1153 AMDGPU ELF64 code object"; return false;
     }
     const uint64_t shoff = rd<uint64_t>(f, 0x28);
     const uint16_t shentsize = rd<uint16_t>(f, 0x3a), shnum = rd<uint16_t>(f, 0x3c), shstrndx = rd<uint16_t>(f, 0x3e);

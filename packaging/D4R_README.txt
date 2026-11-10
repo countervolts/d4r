@@ -157,9 +157,9 @@ Settings
 
 Each game has its own copy of both files.
 
-vkhip (preset K, RDNA3/RADV): [Engine] ExperimentalVkHip=true is the release
+vkhip (preset K, RDNA3 and RDNA 3.5, RADV): [Engine] ExperimentalVkHip=true is the release
 default. With the local K model's hipnet.bin and hip/ files present (install.sh
-builds them on RDNA3), it runs the native K kernels inside the game's Vulkan
+builds them on RDNA3 and RDNA 3.5), it runs the native K kernels inside the game's Vulkan
 command list; without them, Enabled=auto keeps K on the native kernels. The ordinary engine image adapter handles regular
 and inverted depth and supported color/motion/output formats. This uses the
 existing Vulkan image-stage numerics, not the deleted exact prototype's stages;

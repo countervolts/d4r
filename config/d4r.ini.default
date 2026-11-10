@@ -185,7 +185,7 @@ ModelDir = auto
 ; around the network like a split frame, so it needs VkD3DDir, the CUDA bridge and a model built with --hip; when
 ; they are missing the Vulkan network runs and the log says why. auto = vulkan. (D4R_ENGINE_NETWORK)
 Network = auto
-; Preset-K native HIP kernels inside Vulkan (RDNA3/RADV). On by default; needs the
+; Preset-K native HIP kernels inside Vulkan (RDNA3 and RDNA 3.5, RADV). On by default; needs the
 ; model's hipnet.bin + hip/, and under Enabled = auto K stays on the native kernels without them.
 ; Uses the engine's shared image-format/depth adapter. (D4R_ENGINE_VKHIP)
 ExperimentalVkHip = true

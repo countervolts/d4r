@@ -259,7 +259,7 @@ if (( DO_SR )); then
   # when the release has it, the accuracy set too ([Kernels] PreferAccuracy; byte-identical to the CUDA backend).
   hip_args=()
   arch=$(gpu_arch)
-  if [[ "$arch" == gfx110[0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
+  if [[ "$arch" == gfx11[05][0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
     hip_args=(--hip "$RUNTIME/kernels/$arch" --capture "$WORK/k")
     if [[ -f "$RUNTIME/kernels/accuracy/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
       hip_args+=(--hip-accuracy "$RUNTIME/kernels/accuracy/$arch")
@@ -277,7 +277,7 @@ if (( DO_SR )); then
     for v in "$m" "$m-ldr"; do
       # RDNA3: M's and L's native layers for vkhip, from the same uploads (docs/experimental-vkhip.md)
       m_hip=()
-      [[ "$arch" == gfx110[0-3] && -f "$RUNTIME/kernels/$arch/rrlite_enc1_4x4.hsaco" &&
+      [[ "$arch" == gfx11[05][0-3] && -f "$RUNTIME/kernels/$arch/rrlite_enc1_4x4.hsaco" &&
          ( $m == m || -f "$RUNTIME/kernels/$arch/rrlite_enc0l_net.hsaco" ) ]] && m_hip=(--hip "$RUNTIME/kernels/$arch")
       run "$v.log" python3 "$KIT/engine/compile_m.py" "$WORK/$m" "$WORK/$v-out" "${m_hip[@]}" $([[ $v == *-ldr ]] && echo --ldr)
       place "$v" "$WORK/$v-out" $(ls "$WORK/$v-out")

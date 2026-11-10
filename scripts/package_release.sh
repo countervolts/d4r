@@ -159,7 +159,7 @@ fi
 # DLSS Ray Reconstruction's HIP network stages for RDNA 3 (scripts/build_rr_hip_release.sh: d4r's own kernels,
 # OUT/<arch>/rr-d-gfx11 and rr-e-gfx11); the model builder installs a set into a model with the same layout
 if [[ -n "${D4R_BUNDLE_RR_HIP:-}" ]]; then
-  for f in "$D4R_BUNDLE_RR_HIP"/gfx110[0-3]/rr-[de]-gfx11/rr-hip.txt; do
+  for f in "$D4R_BUNDLE_RR_HIP"/gfx11[05][0-3]/rr-[de]-gfx11/rr-hip.txt; do
     [[ -f "$f" ]] || { echo "D4R_BUNDLE_RR_HIP=$D4R_BUNDLE_RR_HIP has no <arch>/rr-[de]-gfx11 sets" >&2; exit 1; }
     set_dir="$(dirname "$f")"; rel="${set_dir#"$D4R_BUNDLE_RR_HIP"/}"
     mkdir -p "$STAGE/d4r/kernels/rr-hip/$rel"

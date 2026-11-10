@@ -400,6 +400,9 @@ void main()
     // that tap as it goes: a second pass over the taps, run only where the sum of weights allowed it, ran for most
     // waves on a Steam Deck (one such pixel suffices) and cost 0.2 ms of 4.3 at 1080p.
     f16vec4 sumY = f16vec4(0.0), sumW = f16vec4(0.0), eMax = f16vec4(-60000.0), yMax = f16vec4(0.0);
+#ifndef D4R_ACCURACY
+    uvec2 yMaxP = uvec2(0u);       // yMax as two packed pairs (see the tap loop)
+#endif
 #if K_LIN_FILTER
     vec4 sumL = vec4(0.0);
 #endif
@@ -425,8 +428,19 @@ void main()
 #if K_LIN_FILTER
             sumL = fma(vec4(w), vec4(tileL[ti + TJ(j, stepB)]), sumL);
 #endif
+#ifdef D4R_ACCURACY
             const bvec4 gt = not(greaterThan(eMax, E));      // a later tap wins ties
             eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
+#else
+            // The same selection in packed halves. E - eMax has its sign bit set exactly where E < eMax (a rounded
+            // difference keeps the sign, -0 included; an exact tie gives +0, so a later tap still wins ties), and
+            // max(eMax, E) is the select because E is never NaN (finite table entries and positions).
+            const i16vec4 keep = float16BitsToInt16(E - eMax) >> int16_t(15);
+            const uvec2 km = uvec2(pack32(i16vec2(keep.xy)), pack32(i16vec2(keep.zw)));
+            const uint yp = packFloat2x16(f16vec2(Y.x));
+            yMaxP = (km & yMaxP) | (~km & uvec2(yp));
+            eMax = max(eMax, E);
+#endif
             db += float16_t(1.0); lin += cross;
         }
         line += slope;
@@ -436,6 +450,9 @@ void main()
     for (int s = 0; s < 4; ++s) F[s] *= compressK(F[s]);
 #else
     vec4 F = vec4(sumY) / vec4(sumW);
+#endif
+#ifndef D4R_ACCURACY
+    yMax = f16vec4(unpackFloat2x16(yMaxP.x), unpackFloat2x16(yMaxP.y));
 #endif
     F = mix(F, vec4(yMax), lessThan(eMax, f16vec4(-12.0)));
     // The reference holds the filtered current luma in half precision: the blend at the end of the stage reads

@@ -25,7 +25,7 @@ for p in D E; do
         { tail -20 "$WORK/$name.log" >&2; exit 1; }
     python3 "$ROOT/packaging/model_tools.py" rr-hip-signature "$WORK/$name" > "$WORK/$name.sig"
     for arch in ${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103}; do
-        [[ "$arch" == gfx110[0-3] ]] || { echo "$arch: the RR HIP stages are RDNA 3 only" >&2; exit 2; }
+        [[ "$arch" == gfx11[05][0-3] ]] || { echo "$arch: the RR HIP stages are RDNA 3 / 3.5 only" >&2; exit 2; }
         D4R_GPU_ARCH="$arch" D4R_ROCM_RUNTIME='' bash "$ROOT/engine/rr/hip/build.sh" "$WORK/$name" "$OUT/$arch/$name" > /dev/null
         cp "$WORK/$name.sig" "$OUT/$arch/$name/rr-hip.txt"
         echo "$arch/$name: $(ls "$OUT/$arch/$name"/*.hsaco | wc -l) stages"
