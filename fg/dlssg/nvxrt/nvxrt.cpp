@@ -985,10 +985,13 @@ static void init_groups(Device &dev)
             const char *rest = line.c_str() + strlen(key);
             if (!strcmp(key, "member") && sscanf(rest, "%159s %159s", a, b) == 2) {
                 // "member H E [H E ...]": alternatives
-                std::string m, word, h;
-                std::istringstream ws(rest);
+                std::string m, h;
                 std::vector<std::string> words;
-                while (ws >> word) words.push_back(word);
+                for (const char *w = rest; *w;) { // by hand: stream extraction reads locale facets
+                    size_t skip = strspn(w, " \t\r\n"), len = strcspn(w + skip, " \t\r\n");
+                    if (len) words.emplace_back(w + skip, len);
+                    w += skip + len;
+                }
                 for (size_t i = 0; i + 1 < words.size(); i += 2)
                     m += (m.empty() ? "" : "|") + words[i] + ":" + words[i + 1];
                 g->members.push_back(m);

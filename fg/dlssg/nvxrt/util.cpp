@@ -1,9 +1,35 @@
 #include "util.h"
 
 #include <cctype>
-#include <regex>
 
 namespace nvxrt {
+
+// PTX is scanned by hand: std::regex reads locale facets, and inside a game process the libstdc++.so already loaded
+// there can leave this static copy with the wrong facet ids (it crashed in vkCreateCuModuleNVX).
+namespace {
+bool is_ascii_digit(char c) { return c >= '0' && c <= '9'; }
+bool is_ascii_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+size_t skip_ptx_space(const std::string &s, size_t i)
+{
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n' || s[i] == '\f' || s[i] == '\v'))
+        i++;
+    return i;
+}
+// The first ".target sm_NN", or 0.
+uint32_t ptx_target_sm(const std::string &s)
+{
+    for (size_t at = s.find(".target"); at != std::string::npos; at = s.find(".target", at + 1)) {
+        size_t i = skip_ptx_space(s, at + 7);
+        if (i == at + 7 || s.compare(i, 3, "sm_") != 0 || i + 3 >= s.size() || !is_ascii_digit(s[i + 3]))
+            continue;
+        uint32_t sm = 0;
+        for (i += 3; i < s.size() && is_ascii_digit(s[i]); i++)
+            sm = sm * 10 + (uint32_t)(s[i] - '0');
+        return sm;
+    }
+    return 0;
+}
+} // namespace
 
 // ---------------------------------------------------------------------------------------------- SHA-256
 namespace {
@@ -187,10 +213,7 @@ bool parse_cuda_module(const void *data, size_t size, std::vector<FatbinEntry> &
     if (s.find(".version") != std::string::npos && s.find(".entry") != std::string::npos) {
         FatbinEntry e;
         e.kind = 1;
-        std::smatch m;
-        static const std::regex tre("\\.target\\s+sm_(\\d+)");
-        if (std::regex_search(s, m, tre))
-            e.sm = (uint32_t)std::stoul(m[1].str());
+        e.sm = ptx_target_sm(s);
         e.data.assign(s.begin(), s.end());
         entries.push_back(std::move(e));
         return true;
@@ -237,9 +260,16 @@ std::string normalize_ptx(const std::string &ptx)
 std::vector<std::string> ptx_entries(const std::string &ptx)
 {
     std::vector<std::string> names;
-    static const std::regex re("\\.entry\\s+([A-Za-z_$][\\w$]*)");
-    for (std::sregex_iterator it(ptx.begin(), ptx.end(), re), e; it != e; ++it)
-        names.push_back((*it)[1].str());
+    for (size_t at = ptx.find(".entry"); at != std::string::npos; at = ptx.find(".entry", at + 1)) {
+        size_t i = skip_ptx_space(ptx, at + 6);
+        if (i == at + 6 || i >= ptx.size() || !(is_ascii_alpha(ptx[i]) || ptx[i] == '_' || ptx[i] == '$'))
+            continue;
+        size_t end = i + 1;
+        while (end < ptx.size() && (is_ascii_alpha(ptx[end]) || is_ascii_digit(ptx[end]) || ptx[end] == '_' || ptx[end] == '$'))
+            end++;
+        names.push_back(ptx.substr(i, end - i));
+        at = end - 1;
+    }
     return names;
 }
 

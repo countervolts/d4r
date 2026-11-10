@@ -1,6 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* dlinfo */
+#endif
 #include <windows.h>
 #include <dirent.h>
 #include <errno.h>
+#ifndef D4R_NATIVE_WINDOWS
+#include <elf.h>
+#include <link.h>
+#include <sys/mman.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -340,6 +348,71 @@ static void* load_library_resolving(const char* path, int depth)
     return NULL;
 }
 
+#ifndef D4R_NATIVE_WINDOWS
+/* comgr's LLVM installs fault handlers for the whole process while it compiles, and they delete the compiler's temporary
+   files on any fault. Games fault constantly on purpose (anti-tamper, page guards; Wine handles it), so a fault on another
+   thread removed HIP's blit kernel source mid-compile: device setup failed and HIP's cleanup crashed on a null pointer.
+   Wine's handlers stay in place: comgr may read them but not replace them. */
+static int comgr_sigaction(int signal_number, const struct sigaction* action, struct sigaction* previous)
+{
+    if (action == NULL) return sigaction(signal_number, NULL, previous);
+    return previous != NULL ? sigaction(signal_number, NULL, previous) : 0;
+}
+
+static int redirect_sigaction_import(const struct link_map* map, const ElfW(Rela)* table, size_t bytes,
+                                     const ElfW(Sym)* symbols, const char* strings)
+{
+    const long page = sysconf(_SC_PAGESIZE);
+    int redirected = 0;
+    for (size_t i = 0; i < bytes / sizeof(*table); ++i)
+    {
+        const unsigned long type = ELF64_R_TYPE(table[i].r_info);
+        if ((type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) ||
+            strcmp(strings + symbols[ELF64_R_SYM(table[i].r_info)].st_name, "sigaction") != 0)
+            continue;
+        void** slot = (void**)(map->l_addr + table[i].r_offset);
+        void* start = (void*)((uintptr_t)slot & ~(uintptr_t)(page - 1));
+        if (mprotect(start, (size_t)page * 2, PROT_READ | PROT_WRITE) == 0)
+        {
+            *slot = (void*)comgr_sigaction;
+            ++redirected;
+        }
+    }
+    return redirected;
+}
+
+static void keep_comgr_off_signals(void* handle)
+{
+    struct link_map* map = NULL;
+    if (dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || map == NULL)
+        return;
+    const ElfW(Sym)* symbols = NULL;
+    const char* strings = NULL;
+    const ElfW(Rela)* plt = NULL;
+    const ElfW(Rela)* rela = NULL;
+    size_t plt_bytes = 0, rela_bytes = 0;
+    for (const ElfW(Dyn)* entry = map->l_ld; entry->d_tag != DT_NULL; ++entry)
+    {
+        switch (entry->d_tag)
+        {
+        case DT_SYMTAB: symbols = (const ElfW(Sym)*)entry->d_un.d_ptr; break;
+        case DT_STRTAB: strings = (const char*)entry->d_un.d_ptr; break;
+        case DT_JMPREL: plt = (const ElfW(Rela)*)entry->d_un.d_ptr; break;
+        case DT_PLTRELSZ: plt_bytes = entry->d_un.d_val; break;
+        case DT_RELA: rela = (const ElfW(Rela)*)entry->d_un.d_ptr; break;
+        case DT_RELASZ: rela_bytes = entry->d_un.d_val; break;
+        default: break;
+        }
+    }
+    if (symbols == NULL || strings == NULL)
+        return;
+    int redirected = 0;
+    if (plt != NULL) redirected += redirect_sigaction_import(map, plt, plt_bytes, symbols, strings);
+    if (rela != NULL) redirected += redirect_sigaction_import(map, rela, rela_bytes, symbols, strings);
+    tracef("comgr: %d sigaction import(s) redirected, Wine keeps the fault handlers", redirected);
+}
+#endif
+
 /* HIP's runtime and the comgr library HIP opens by name later (ZLUDA itself links only
    libamdhip64). An D4R_ROCM_DIR copy is preferred over one the search path would find. */
 static void preload_rocm(void)
@@ -366,6 +439,10 @@ static void preload_rocm(void)
                 handle = load_library_resolving(name, 0);
         }
         tracef("ROCm %s: %s", libraries[i][0], handle != NULL ? "loaded" : load_error);
+#ifndef D4R_NATIVE_WINDOWS
+        if (handle != NULL && i == 1)
+            keep_comgr_off_signals(handle);
+#endif
     }
 }
 
