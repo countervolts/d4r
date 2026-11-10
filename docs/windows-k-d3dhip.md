@@ -15,13 +15,66 @@ d3dhip's handoff is now GPU-side: the split's front fence is created shared, imp
 semaphore (`HipNetworkDx::useFence`), and `launchAfter(wait, signal)` queues the semaphore wait, the network and the
 signal on HIP's stream; the game's queue waits for the signal before the back. No CPU wait between the parts. Output is
 byte-identical to the CPU-serialized handoff (48 of 48 replay files). `D4R_D3DHIP_SYNC=cpu` restores the old handoff.
-Preset K's d3dhip is opt-in on RDNA3, `D4R_D3DHIP_K=1` (DXIL remains faster on 26.8.1). On RDNA4 it is the default
+Preset K's d3dhip was opt-in on RDNA3, `D4R_D3DHIP_K=1` (DXIL remains faster on 26.8.1); from driver 26.10.1 on it is
+now the default there too (section below). On RDNA4 it is the default
 in the fast set when the package has HIP layers (`compile_k.py --hip` with a gfx1201 kernel folder; the release
 packages have none yet); `D4R_D3DHIP_K=0` keeps the DXIL network, and `[Kernels] PreferAccuracy = true` keeps it too.
 RX 9070 XT, 26.10.1, harness, interleaved: 1.371 -> 1.297 ms at 1280x720 -> 2560x1440, 2.799 -> 2.744 at 1080p ->
 4K, 1.406 -> 1.331 at 1706x960 -> 2560x1440. The HIP network's arithmetic differs from the DXIL network's (f32
 against f16 accumulation): the output is not byte-identical (57 dB against the DXIL route on the motion scene, the same
 quality-scene PSNR, blinds and flicker).
+
+## d3dhip K by default on RDNA3 from driver 26.10.1 (2026-11-10)
+
+The default (`D4R_D3DHIP_K` unset) now takes d3dhip on RDNA3 when the render GPU's driver is 32.0.32015 (AMD Software
+26.10.1) or newer and the package has HIP layers; older drivers keep the DXIL network, the faster one on 26.8.1 (above).
+The driver version comes from the render GPU's PnP driver key (`DriverVersion`), not from DXGI, so OptiScaler's
+spoofing cannot change it; the shim logs it next to the render GPU. RX 7700 XT, 26.10.1, harness,
+`scripts/hillclimb/perf/matrix-rdna3.json`, K packages rebuilt with the current compile_k.py:
+
+| Case | DXIL | d3dhip |
+|---|---:|---:|
+| 1280x720 -> 2560x1440 | 2.48 (another session 2.94) | 2.26 |
+| 1706x960 -> 2560x1440 (Ghost's Quality) | 2.61 | 2.39 |
+| 1920x1080 -> 3840x2160 | 4.87 | 4.76 |
+
+The DXIL network's time moved between sessions (2.48-2.94 ms at 1440p); d3dhip's did not (2.25-2.27).
+Not measured: 26.8.1 (not installed), gfx1100/1102/1103, the game.
+
+The gfx1101 HIP layers are now built without scratch (`kernels/windows-flags.txt`), which also lets vkhip run K in
+native Vulkan games on RDNA3 (docs/experimental-vkhip.md). For d3dhip that flag set is byte-identical and
+time-neutral (dx-K-*-hip within +-1.3%).
+
+## Presets M and L through d3dhip on RDNA3 (2026-11-10)
+
+D3D12 M and L on RDNA3 run the RDNA 3 package (FP16 WMMA, software FP8 storage); its DXIL network was the slow part
+(M 8.3 ms, L 11.4 ms at 720p -> 1440p on an RX 7700 XT). The package's native HIP layers now replace it there, as on
+RDNA4, by default when the package has them (`hipnet.bin`, `hip/`, `rdna3/m_planes.dxil`). The FP8 package's plane
+stages cannot run on RDNA3 (FP8 WMMA), and the windows branch's input / expansion stages have no non-FP8 plane
+variant, so the RDNA 3 engine keeps its own stages and converts between its token-major buffers and the network's
+plane layout: `tokens` ([tok][64] FP8) into the network's input, its head into `dec1`, a byte permutation
+(`engine/d3d12/m_planes.hlsl`, two dispatches). Everything else is the RDNA4 d3dhip machinery: the split list, the
+GPU-fence handoff, one network per render size. `D4R_D3DHIP_M=0` or `D4R_DX_NET=dxil` keeps the DXIL network.
+
+Layers: `D4R_VKHIP_LAYERS=1 kernels/build.sh m DIR` for the gfx110x target (the dataflow set; the release ships it as
+`kernels/<target>-swin-hip`), packaged with `compile_m.py --hip DIR`; `build-engine-models.py` does that on a gfx110x GPU.
+
+RX 7700 XT, 26.10.1, HAGS off, harness, interleaved (bench.py, 3 rounds), same package both ways:
+
+| Case | DXIL | d3dhip |
+|---|---:|---:|
+| M 1280x720 -> 2560x1440 | 8.33 | 5.53 (-33.6%) |
+| M 1920x1080 -> 3840x2160 | 16.86 | 12.60 (-25.3%) |
+| L 1280x720 -> 2560x1440 | 11.36 | 8.91 (-21.5%) |
+| L 1920x1080 -> 3840x2160 | 23.49 | 20.00 (-14.9%) |
+| Ghost of Tsushima, M, 1712x960 -> 2560x1440 LDR (game, gpu_eval) | 13.16 / 13.32 | 8.76 / 8.75 (-34%) |
+| Ghost of Tsushima, L, same (game) | 19.28 | 15.09 (-22%) |
+
+Lane B (the HIP layers' arithmetic): quality-scene truth metrics equal (M psnr 18.59 / 18.58, blinds 21.10 / 21.07,
+flicker 0.01532 / 0.01531; L 18.58 / 18.58, 21.48 / 21.49, 0.01300 / 0.01297); 43.7 dB between the two after 100
+motion frames, the same picture. Vulkan games on RDNA3 are unchanged (their M / L still take the staging path: these
+layers spill and vkhip refuses spilling gfx11 kernels). Not measured: gfx1100 / 1102 / 1103, RDNA4 (untouched: its
+FP8 package path is separate).
 
 ## Presets M and L through d3dhip: the layer chain (RDNA4, 2026-11-05)
 

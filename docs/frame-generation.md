@@ -1,7 +1,7 @@
 # Frame generation and latency reduction (Linux/Proton)
 
 d4r's full proxy package includes OptiScaler **10.0.0-pre1**, pinned to
-[nightly-20261024](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261024).
+[nightly-20261029](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261029).
 This is a prerelease. Its complete `OptiScaler/` dependency folder ships with the
 package, including XeFG, XeLL, AMD FSR frame generation and Nukem's
 `dlssg_to_fsr3_amd_is_better.dll`. Upstream license files are preserved in
@@ -86,4 +86,4 @@ Upstream references:
 
 - [OptiScaler v10 changes](https://github.com/optiscaler/OptiScaler/releases/tag/nightly)
 - [OptiScaler FG setup](https://github.com/optiscaler/OptiScaler/wiki/Frame-Generation-Options)
-- [Pinned source configuration](https://github.com/optiscaler/OptiScaler/blob/fd3a45a6cac6d610a35c570479f80dae95ca4eac/OptiScaler.ini)
+- [Pinned source configuration](https://github.com/optiscaler/OptiScaler/blob/e57377fc75831d5c2fbb58d6a057a75702d78a95/OptiScaler.ini)

@@ -129,3 +129,31 @@ ab6aac7 score=- / - / - (dx-RRF cases, tools/ab.sh 3 rounds, control D4R_HIP_RR_
 a953312 score=- / - / - (dx-L cases, tools/ab.sh 3 rounds, same shim) worst=- L's two d3dhip plane stages with two windows per wave (WPW=2, Windows DXIL only): dx-L-1440 2.354 -> 2.317 (-1.59%), dx-L-4k 5.237 -> 5.154 (-1.59%), byte-identical
 1f8d128 score=- / - / - (dx-K cases, tools/ab.sh 3 rounds, control HEAD output_k with compile_k flags) worst=- K's D3D12 output stage with fewer instructions (Windows FILTER_F32 build only): dx-K-1440 1.3615 -> 1.2615 (-7.34%), dx-K-4k 2.759 -> 2.537 (-8.05%), lane B (43 dB motion, truth metrics equal, game captures 65-68 dB)
 0feb1a0 score=- / - / - (dx-M, dx-L cases, tools/ab.sh 3 rounds, control rt-ke) worst=- M/L HIP Swin layers fetch both k32 weight operands in one 16-byte load (SWIN_TOK_WPAIR, gfx12 Windows only): dx-M-1440 -2.01%, dx-M-4k -1.77%, dx-L-1440 -1.55%, dx-L-4k -1.09%, byte-identical
+
+## RDNA3 (RX 7700 XT, gfx1101, 26.10.1, HAGS off), 2026-11-10 - uncommitted worktree, matrix-rdna3.json
+
+Method as above (bench.py, C X X C, 3 rounds unless noted; self-noise from a control-vs-control run of every case).
+Absolute times moved up to ~20% between sessions on this machine (dx-M-1440 6.94 vs 8.31 ms); only deltas within a
+session are compared. "today" = the origin/windows shim with the release packages installed in Ghost of Tsushima.
+
+| Case | today | after (patches 01-04, fresh packages) | |
+|---|---:|---:|---|
+| dx-K default 1440 | 2.933 (DXIL) | 2.435 (d3dhip) | -17.0% |
+| dx-K default q1440 (Ghost Quality) | 2.597 (DXIL) | 2.642-2.731 (d3dhip, bimodal) | +1.8..+5.1% |
+| dx-K default 4k | 5.792 (DXIL) | 4.809 (d3dhip) | -17.0% |
+| dx-M-1440 / 4k | 8.310 / 16.646 | 8.301 / 16.661 | unchanged (RDNA3 DXIL) |
+| dx-L-1440 / 4k | 10.866 / 23.174 | 10.877 / 23.149 | unchanged; nondeterministic (journal) |
+| dx-RRD-1440 / dx-RRE-1440 | not available | 39.6 / 39.4 | new |
+| vk-K-1440 / 4k | 9.676 / 15.352 | 2.654 / 4.978 | -72.6% / -67.6% |
+| vk-RRD-1440 / vk-RRE-1440 | 24.4-27.7 / 23.5-27.2 | same packages | unchanged |
+
+Patch lines (`../rdna3-patches/NN-*.patch`):
+01 score=- (new capability) dx-RRD-1440 39.6, dx-RRE-1440 39.4 ms; replay 1024x576 -> 2048x1152 D 27.2-27.5 ms against Vulkan 30.7-32.0; 61-67 dB against the Vulkan gfx11 route (lane B). RR D/E on D3D12 for RDNA3.
+02 score=- (no timing change: format check only) RR outputs RGB9E5 / RGB10A2 / R11G11B10 accepted (issue 65): 62.1 / 69.9 / 47.4 dB against the same run's RGBA16F output, i.e. the formats' own precision (lane B by format).
+03 score=- worst=dx-K-4k-hip +1.32% (spread 6.6%, identical) gfx1101 K layers without scratch: vk-K-1440 3.330 -> 2.673 (-19.7%), vk-K-4k 5.280 -> 4.245 (-19.6%) on the same packages otherwise (vkhip instead of the Vulkan network, 64.8 dB against it, lane B); dx-K-*-hip byte-identical within +-1.3% (lane A).
+04 score=- worst=dx-K-q1440-default +1.8% (6 rounds, bimodal d3dhip runs 2.46-3.09 ms in that session) d3dhip K by default on RDNA3 with driver >= 26.10.1: dx-K-1440-default -17.0%, dx-K-4k-default -17.0% (lane B, 57 dB class as on RDNA4). Needs the Ghost of Tsushima game check before it ships.
+Rejected: the doc's full gfx1101 d3dhip flag sweep as is (enc2 / dec2 / dec0 / dec1 spill with clang 24, which also disables vkhip; d3dhip time-neutral, dx-K-*-hip +0.5..+1.3%); ROCm 7.2's clang for the K layers (cannot assemble their inline asm).
+08 score=- worst=- d3dhip M / L on RDNA3 by default (token-major <-> plane conversion around the HIP network): dx-M-1440 -33.6%, dx-M-4k -25.3%, dx-L-1440 -21.5%, dx-L-4k -14.9%; Ghost of Tsushima M -34%, L -22% in game (lane B, truth metrics equal).
+09 score=- worst=- RDNA3 RR: FP8 operand widening two codes at a time (rr_gfx11.glsl): dx-RRD-1440 -11.2%, dx-RRE-1440 -10.8%, vk-RRD-1440 -2.6%, vk-RRE-1440 -2.1%, byte-identical (lane A).
+10 score=- worst=dx-L-up-1440 +1.20% (spread 2.68%: within 2x noise) exact RDNA3 M / L package (D4RML007): M's expansion on f16 WMMA instead of int8, binary16 conversions to nearest even on AGS instead of the driver's toward-zero conversion, f32 output stores, RGBA8 / BGRA8 output. Intended modes: dx-M-1440 (Performance) 5.344 -> 5.246 (-1.84%), dx-M-4k 11.803 -> 11.572 (-1.96%), dx-L-up-1440 (Ultra Performance) 4.275 -> 4.326 (+1.20%, noise), dx-L-up-4k 9.616 -> 9.642 (+0.27%, noise); dx-L-1440 / 4k (Performance) +0.24% / +0.29% (noise). Lane B against the old package; against NVIDIA's kernels through ZLUDA M 38.03 -> 38.06 dB (motion), 45.25 -> 45.86 (jitter), L 36.96 -> 36.93, 49.74 -> 52.09; LDR (RGBA8 output) newly runs, M 38.62, L 36.77 dB (docs/approximations-windows-rdna3.md).
+Rejected for 10: the binary16 rounding emulated in integer arithmetic in every stage (exact form D4R_RNE16_EXACT): dx-M-1440 +7.3%, dx-M-4k +7.2%, dx-L-1440 +4.9%, dx-L-4k +5.4% (input and reconstruction +0.22 ms each at 1440p); M's expansion on the binary16 v_dot2 product (DOT2 without INT8): dx-M-1440 +21%, dx-M-4k +8.7%.

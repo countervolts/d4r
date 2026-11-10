@@ -17,6 +17,9 @@
 #ifndef INT8
 #define INT8 0
 #endif
+#ifndef D4R_M_EXPAND_F16
+#define D4R_M_EXPAND_F16 0
+#endif
 #if DOT2
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
@@ -244,6 +247,62 @@ void main()
 #endif
         [[unroll]] for (uint t = 0u; t < 2u; ++t) [[unroll]] for (uint n = 0u; n < 20u; n += 4u)
             EO[((lane + 32u * t) * 88u + c0 + n) / 4u] = f16vec4(a[t][n], a[t][n + 1u], a[t][n + 2u], a[t][n + 3u]);
+    }
+#elif defined(D4R_HLSL) && D4R_M_EXPAND_F16
+    // RDNA 3 (m_d3d12_build.py f16_expand, D4RML007): no FP8 matrices, so the same product on v_wmma_f32_16x16x16_f16
+    // with the FP8 values widened to binary16 (exact) and NVIDIA's arithmetic kept: the bias as the initial
+    // accumulator, every 32 products summed in f32 and added with one binary16 rounding (to nearest even: dialect_hlsl.h
+    // d4rRne16, D4R_RNE16_EXACT; the driver's own conversion rounds toward zero), the result rounded to FP8 (saturating). gfx11's AGS layouts: an
+    // A / B lane holds row / column lane & 15, element i = k i (both half-waves alike); an accumulator lane column
+    // lane & 15, element i = row 2 i + (lane >> 4). w8: the matrix column-major as binary16, [80][64] (the runtime).
+    const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;
+    const ivec2 t0 = 4 * ivec2(gl_WorkGroupID.xy);
+    {
+#if PLANES
+        const uint tokens = uint(p.tokW) * (((uint(p.size.y) + 31u) / 32u) * 16u);
+        const uint src = (hf * tokens + uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u))) * 32u;
+#else
+        const uint src = uint((t0.y + int(row >> 2)) * p.tokW + t0.x + int(row & 3u)) * 64u + hf * 32u;
+#endif
+        [unroll] for (uint d = 0u; d < 8u; ++d) matrixShared[TK_W + (row * 72u + hf * 32u) / 4u + d] = tok_b.Load(src + 4u * d);
+    }
+    barrier();
+    // A operands: token `row`, k 16 kt .. 16 kt + 15, as binary16 pairs (register j: k 2 j, 2 j + 1)
+    uint4 a[4][2];
+    [unroll] for (uint kt = 0u; kt < 4u; ++kt)
+    {
+        const uint w = TK_W + row * 18u + 4u * kt;
+        const uint2 h0 = fp8Halves(matrixShared[w]), h1 = fp8Halves(matrixShared[w + 1u]);
+        const uint2 h2 = fp8Halves(matrixShared[w + 2u]), h3 = fp8Halves(matrixShared[w + 3u]);
+        a[kt][0] = uint4(h0, h1); a[kt][1] = uint4(h2, h3);
+    }
+    [unroll] for (uint n = 0u; n < 5u; ++n)
+    {
+        const uint col = 16u * n + row;
+        const uint bw = w16.Load((col >> 1) * 4u);
+        const float bias = f16tof32((col & 1u) != 0u ? bw >> 16 : bw);
+        Matrix16 acc;
+        [unroll] for (uint i = 0u; i < 8u; ++i) acc.reg[i] = asuint(bias);
+        [unroll] for (uint kq = 0u; kq < 4u; kq += 2u)
+        {
+            const uint at = (col * 64u + 16u * kq) * 2u;
+            const uint4 b0 = w8.Load4(at), b1 = w8.Load4(at + 16u), b2 = w8.Load4(at + 32u), b3 = w8.Load4(at + 48u);
+            Matrix16 A0, B0, A1, B1;
+            [unroll] for (uint i = 0u; i < 4u; ++i)
+            {
+                A0.reg[i] = a[kq][0][i]; A0.reg[4u + i] = a[kq][1][i]; B0.reg[i] = b0[i]; B0.reg[4u + i] = b1[i];
+                A1.reg[i] = a[kq + 1u][0][i]; A1.reg[4u + i] = a[kq + 1u][1][i]; B1.reg[i] = b2[i]; B1.reg[4u + i] = b3[i];
+            }
+            acc = mmaOp(5u, A1, B1, mmaOp(5u, A0, B0, acc));
+            [unroll] for (uint i = 0u; i < 8u; ++i) acc.reg[i] = asuint(d4rRne16(asfloat(acc.reg[i])));
+        }
+        // FP8 values as binary16 bits (exact), stored row-major into EO: lanes of adjacent columns share a word
+        [unroll] for (uint i = 0u; i < 8u; ++i)
+        {
+            const uint v = f32tof16(e4m3GridF32(asfloat(acc.reg[i])));
+            const uint partner = WaveReadLaneAt(v, lane ^ 1u);
+            if ((lane & 1u) == 0u) matrixShared[EO_W + ((2u * i + hf) * 88u + col) / 2u] = (v & 0xffffu) | (partner << 16);
+        }
     }
 #elif defined(D4R_HLSL)
     const uint lane = gl_LocalInvocationID.x, row = lane & 15u, hf = lane >> 4;

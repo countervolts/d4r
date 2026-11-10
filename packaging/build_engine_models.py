@@ -31,7 +31,11 @@ DLSSD_SHA256 = '4bc7ea5fcb2f32cf86bc2cb072e8d2860914a0be511cbdcb2fc206c1d9d83b80
 # model -> (preset, create flags, the dump the model is compiled from)
 FRAMES = {'k': (11, 0x4b), 'e': (5, 0xa), 'f': (6, 0xa), 'l': (12, 0x4b), 'm': (13, 0x4b)}
 RR_MODELS = ('rr-d', 'rr-e', 'rr-f')
-MODELS = RR_MODELS + ('k', 'k-ldr', 'e', 'f', 'l', 'l-ldr', 'm', 'm-ldr')
+# RDNA3's Ray Reconstruction packages (D and E only: no FP8 matrices; build_native_model.py with D4R_RR_GFX11=1, then
+# compile_rr_dxil.py's gfx11 build). On an RDNA3 GPU they are built with rr-d / rr-e: the Vulkan route and the D3D12
+# engine load them there instead of the FP8 packages (docs/rr-d3d12-rdna3.md).
+RR_GFX11_MODELS = ('rr-d-gfx11', 'rr-e-gfx11')
+MODELS = RR_MODELS + RR_GFX11_MODELS + ('k', 'k-ldr', 'e', 'f', 'l', 'l-ldr', 'm', 'm-ldr')
 # what the native D3D12 engine runs (E and F, DLSS 3's CNN, run on the Vulkan engine only)
 DEFAULT_MODELS = RR_MODELS + ('k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
 
@@ -222,7 +226,15 @@ class Builder:
             self.python('ptx-rr.log', self.kit / 'kernels' / 'tools' / 'extract_dlss_ptx.py', dll, self.work / 'ptx-rr')
             self.python('rr-f.log', engine / 'compile_rr2.py', '--dll', dll, out, '--ptx-dir', self.work / 'ptx-rr')
         else:
-            self.python(f'{name}.log', engine / 'rr' / 'build_native_model.py', '--dll', dll, name[-1].upper(), out)
+            gfx11 = name in RR_GFX11_MODELS
+            previous = os.environ.get('D4R_RR_GFX11')
+            os.environ['D4R_RR_GFX11'] = '1' if gfx11 else '0'
+            try:
+                self.python(f'{name}.log', engine / 'rr' / 'build_native_model.py', '--dll', dll,
+                            name.removesuffix('-gfx11')[-1].upper(), out)
+            finally:
+                if previous is None: os.environ.pop('D4R_RR_GFX11', None)
+                else: os.environ['D4R_RR_GFX11'] = previous
         self.python(f'{name}-d3d12.log', engine / 'compile_rr_dxil.py', out)
         # native-work holds the generated sources the shaders were built from; the runtime reads none of it
         self.place(name, out, ignore=('native-work',))
@@ -252,7 +264,7 @@ def main():
         import numpy  # noqa: F401
     except ImportError:
         fail('numpy is missing (install.ps1 sets up a Python with numpy)')
-    rr_models = [m for m in models if m in RR_MODELS]
+    rr_models = [m for m in models if m in RR_MODELS + RR_GFX11_MODELS]
     sr_models = [m for m in models if m not in RR_MODELS]
     if rr_models:
         dlssd = runtime / 'nvngx_dlssd.dll'
@@ -275,6 +287,12 @@ def main():
             fail(f'{required} is missing from {kit / "bin"} (an incomplete d4r folder; extract the release again)')
     os.environ['D4R_DXC'] = str(kit / 'bin' / 'dxc.exe')
     arch = hip_device_only()
+    # an RDNA3 GPU: its own RR D / E packages beside the FP8 ones (which only an RDNA4 GPU loads)
+    if arch.startswith('gfx110'):
+        for name in ('rr-d', 'rr-e'):
+            if name in models and f'{name}-gfx11' not in models:
+                models.insert(models.index(name) + 1, f'{name}-gfx11')
+        rr_models = [m for m in models if m in RR_MODELS + RR_GFX11_MODELS]
 
     root = Path(os.environ.get('D4R_MODEL_LOG_DIR') or Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()))
                 / 'd4r' / 'model-builds')
@@ -327,10 +345,15 @@ def main():
                                  *(['--ldr'] if v == 'k-ldr' else []))
                         b.place(v, work / f'{v}-out')
             else:
+                # RDNA 3: the ten Swin layers as the native HIP network (the release's kernels/<target>-swin-hip, the
+                # dataflow set), which the D3D12 engine runs between its own stages (d3dhip): M 8.3 -> 5.5 ms, L
+                # 11.4 -> 8.9 ms at 720p -> 1440p on an RX 7700 XT
+                swin = runtime / 'kernels' / f'{arch}-swin-hip'
+                m_hip = ['--hip', swin] if arch.startswith('gfx110') and (swin / 'rrlite_enc1_4x4.hsaco').is_file() else []
                 for v in (name, f'{name}-ldr'):
                     if v in models:
                         b.python(f'{v}.log', engine / 'compile_m.py', work / name, work / f'{v}-out', '--dxil', 'yes',
-                                 *(['--ldr'] if v.endswith('-ldr') else []))
+                                 *(['--ldr'] if v.endswith('-ldr') else []), *m_hip)
                         b.place(v, work / f'{v}-out')
             if not a.keep:
                 shutil.rmtree(work / name, ignore_errors=True)

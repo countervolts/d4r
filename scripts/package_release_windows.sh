@@ -162,6 +162,15 @@ for pid in "${pending[@]}"; do wait "$pid" || failed=1; done
 [[ "$failed" == 0 ]] || { echo "texture kernel build failed; no release ZIP created" >&2; exit 1; }
 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCHS="$ARCHS" D4R_PACKAGE_KERNEL_JOBS="$JOBS" \
   "$ROOT/scripts/stage_native_kernels.sh" "$STAGE/d4r" installer
+# RDNA 3 d3dhip for presets M and L: the ten Swin layers as the native HIP network's dataflow set (flag pointers in
+# their parameter blocks, so never ZLUDA's native set), in kernels/<target>-swin-hip; build-engine-models.py packages
+# them into the M and L models (compile_m.py --hip) on a GPU of that target.
+for arch in $ARCHS; do
+  [[ "$arch" == gfx110* ]] || continue
+  log="$TMP/swin-hip-$arch.log"
+  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_VKHIP_LAYERS=1 "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$arch-swin-hip" \
+    > "$log" 2>&1 || { echo "Swin HIP layers for $arch failed:" >&2; tail -20 "$log" >&2; exit 1; }
+done
 
 # licenses and sources
 L="$STAGE/d4r/licenses"

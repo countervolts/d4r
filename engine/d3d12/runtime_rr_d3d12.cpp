@@ -138,6 +138,9 @@ RModel::RModel(ID3D12Device *device, const std::string &directory) : impl(std::m
     }
     if (line != "D4RR0001")
         throw std::runtime_error("requires an RR model (D4RR0001 or D4RR0002)");
+    // `arithmetic gfx11` in rr-d3d12.txt: compile_rr_dxil.py built the RDNA3 model's RR_GFX11 stages (f16 WMMA, no FP8
+    // instruction); rr.txt's own arithmetic line must then say gfx11 too
+    bool dxGfx11 = false;
     for (const auto &entry : sidecar)
     {
         std::istringstream f(entry);
@@ -146,6 +149,13 @@ RModel::RModel(ID3D12Device *device, const std::string &directory) : impl(std::m
         f >> key >> name;
         if (key.empty())
             continue;
+        if (key == "arithmetic")
+        {
+            if (name != "gfx11")
+                throw std::runtime_error("invalid RR D3D12 arithmetic " + name);
+            dxGfx11 = true;
+            continue;
+        }
         if ((key != "scratch" && key != "weights" && key != "loopzero") || !f)
             throw std::runtime_error("invalid RR D3D12 manifest");
         auto at = std::find(RNames, RNames + RStages, name);
@@ -182,7 +192,14 @@ RModel::RModel(ID3D12Device *device, const std::string &directory) : impl(std::m
         if (key == "preset")
             f >> m.preset;
         else if (key == "arithmetic")
-            throw std::runtime_error("D3D12 RR currently requires gfx12 FP8 weights/arithmetic");
+        {
+            std::string arithmetic;
+            f >> arithmetic;
+            if (arithmetic != "gfx11" || !dxGfx11)
+                throw std::runtime_error(arithmetic == "gfx11" ? "the RR model's gfx11 shaders are missing: rebuild it with compile_rr_dxil.py"
+                                                               : "unknown RR arithmetic " + arithmetic);
+            m.gfx11 = true;
+        }
         else if (key == "stage")
         {
             std::string name, shader, weight, ts, ss;
@@ -562,8 +579,9 @@ void REngine::setFrame(const RFrameImages &images, const RFrameSettings &setting
                     &images.diffuseAlbedo, &images.specularAlbedo})
         if (!t->resource)
             throw std::runtime_error("RR requires color, motion, depth and four guides");
-    if (!output.resource || viewFormat({output.resource, output.format}) != DXGI_FORMAT_R16G16B16A16_FLOAT)
-        throw std::runtime_error("RR output must be RGBA16F");
+    if (!output.resource || !rrOutputFormat({output.resource, output.format}))
+        throw std::runtime_error("RR output must be RGBA16F, RGBA32F, R11G11B10F, RGB9E5, RGB10A2 or RGBA8 "
+                                 "with typed UAV stores (format " + std::to_string(int(output.resource ? viewFormat({output.resource, output.format}) : DXGI_FORMAT_UNKNOWN)) + ")");
     auto od = output.resource->GetDesc();
     if (od.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || od.SampleDesc.Count != 1 || od.Width != e.ow ||
         od.Height != e.oh || !(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))

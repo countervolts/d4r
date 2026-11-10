@@ -5,7 +5,10 @@
 // opaque; access through load/store operations, never assumed lane indices.
 #ifndef D4R_AGS_WMMA
 #define D4R_AGS_WMMA
+#ifndef D4R_AMD_INTRINSIC_UAV   // declared once with d3d12/rne16_ags.hlsli
+#define D4R_AMD_INTRINSIC_UAV
 RWByteAddressBuffer d4rAmdIntrinsic : register(u0, space2147420894);
+#endif
 struct Matrix16 { uint reg[8]; };
 static const uint MatrixA16 = 0x04, MatrixB16 = 0x14, MatrixAcc32 = 0x26, MatrixAcc16 = 0x24;
 

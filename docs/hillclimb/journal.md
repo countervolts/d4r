@@ -705,3 +705,132 @@ schedule (all slower).
   original K enc0). Linux / gfx11 builds re-checked against the parents of the agent-derived commits: M/L kernels for
   gfx1101 (fast and accuracy sets) are ISA-identical across 0feb1a0, and output_k.comp's SPIR-V (three flag sets)
   is byte-identical across 1f8d128.
+
+## RDNA3 parity pass (RX 7700 XT gfx1101, 26.10.1, 2026-11-10; uncommitted worktree off origin/windows fcafd9a)
+
+Environment: Ryzen 9 5900XT, Windows 11 Pro 26300, HAGS off (HwSchMode 1). Bench runtimes in `C:\d4r-rdna3-hc`
+(rt-control = origin/windows shim + the release packages installed in Ghost of Tsushima; rt-final = all patches with
+packages rebuilt from the worktree). Kernels with TheRock clang 24 (`.tools/therock-10.2.0a20260929`, the compiler of
+the installed hsaco), shaders with the Vulkan SDK 1.4.363 dxc.
+
+- **Kept: RR D/E on D3D12 for RDNA3** (patch 01). AGS layout probe first (agsprobe: A/B lane = row/column l & 15, element
+  i = k i; accumulator element i = row 2i + (l >> 4); 255-256/256 exact with a seeded C). rr_hlsl.translate gfx11
+  mode, compile_rr_dxil.py gfx11 build, runtime accepts `arithmetic gfx11` with the sidecar's line, shim loads
+  engine\rr-d-gfx11 / rr-e-gfx11 on RDNA3. Exact build: replay 32.1-33.4 ms at 1024x576 -> 2048x1152 (Vulkan 30.7-32.0);
+  relaxed (relaxed_math as gfx12): 27.2-27.5 ms, kept (61-67 dB against Vulkan either way). Harness 720p -> 1440p:
+  39.6 / 39.4 ms (D / E). First launch compiles for ~47 s at NGX init, 0.6 s from the driver cache after.
+- **Kept: RR output formats** (patch 02, issue 65). Reproduced: RGB9E5 output -> "refused: RR output must be RGBA16F" on
+  the pre-patch shim; after, D and E run into RGB9E5 / RGB10A2 / R11G11B10 outputs (AMD reports typed UAV stores for
+  all of them on RDNA3).
+- **Kept: gfx1101 K layers without scratch** (patch 03). The released gfx1101 enc2 spills, a fresh clang 24 build's dec1
+  spills 96 B; vkhip refuses spilling gfx11 kernels, so native Vulkan games on RDNA3 ran K's Vulkan network (9.7 ms with
+  the released package). dec1 on its generic line has no scratch.
+- **Kept with a caveat: d3dhip K default on RDNA3 from 26.10.1** (patch 04). Ghost's Quality size (1706x960) showed
+  per-process bimodal d3dhip times in one session (2.40-2.52 or 2.88-3.09 ms, both shims alike, outputs identical);
+  an earlier session had 2.39-2.41 steady. 1440p and 4K stable.
+- **Found, not fixed: preset L on RDNA3 (DXIL) is nondeterministic.** Same shim, package and inputs: frames 1-12
+  byte-identical across runs, from 25 frames on different (60 frames: 36.6-38.7 dB between runs, 2.9 M of 3.7 M pixels),
+  with or without 200 ms gaps between frames: an intra-frame race that the history spreads. M (shared Swin layers) is
+  identical over 160 frames, so the candidates are L's own RDNA3 stages (enc0_l / l_patch_dec0 / dec0_l / merge_l).
+- **Measured, not changed: RDNA3 already gets K's faster D3D12 output stage and the f32 reconstruction** with a rebuilt
+  package; together they are time-neutral on RDNA3 (dx-K-q1440 DXIL 2.594 -> 2.611).
+- **Rejected:** the full gfx1101 flag sweep of windows-k-d3dhip.md as is (spills with clang 24; d3dhip within +-1.3%);
+  ROCm 7.2 clang for the K layers (inline asm "operands are not valid for this GPU").
+
+### RDNA3 pass, second session (2026-11-10)
+
+- **Kept: preset L's RDNA3 reconstruction with a 12x12 tile** (`m_d3d12_build.py`, patch 06). The L nondeterminism was
+  localized with per-stage captures (D4R_M_CAPTURE_DIR, every frame): input, network, head, gates, mix and covariance
+  identical across runs; the first difference is `packed` (post_l), a few pixels of one 16x16 block on odd rows of one
+  wave. post_l at 11x11: diverges within 25-160 frames (also built from current source); 12x12, wave64 and unpacked
+  tiles: 3 x 160 frames identical. 11x11 is a texel short for L's -1..+2 taps now and then, and the read runs into shared
+  memory another wave writes later. Time: dx-L-1440 +0.18%, dx-L-4k -0.25% (noise). The RDNA4 (FP8) build's post_l is
+  11x11 too but wave64, which did not reproduce here; check it there.
+- **Kept: the release builder makes rr-d-gfx11 / rr-e-gfx11 on RDNA3** (packaging, patch 07, approved by the user).
+  Checked end to end with the kit's build-engine-models.py on this machine: rr-d, rr-d-gfx11, rr-e, rr-e-gfx11 in 3.5
+  minutes; the D3D12 harness loads the installer-built rr-d-gfx11 and renders.
+- **Game check, Ghost of Tsushima Quality (1712x960 -> 2560x1440, LDR), main menu, D4R_PROFILE gpu_eval, A B B A, 60 s
+  each:** DXIL 3.241 / 3.238 ms, d3dhip (the new default) 2.529 / 2.527 ms: -22%. The shim in this install is
+  d4r\d4r_dlssg_next.dll (the DLSS-G host's next core), not d4r\nvngx.dll; both were swapped and restored (hashes).
+  The game's two start-up dialogs (no GPU / old driver: OptiScaler's spoofed adapter) were answered by posting the
+  dialog's OK button (WM_COMMAND), without focus.
+- **Not viable here: vkhip M / L on RDNA3 (AMD's Windows driver).** The gfx1101 dataflow Swin layers spill (enc1 152 B,
+  enc2 24 B, dec2 188 B at the default bound; with SWIN_WAVES_PER_EU=1 only enc2 still spills, 8-68 B in every flag
+  variant tried), and vkhip refuses spilling gfx11 kernels.
+- **d3dhip M / L on RDNA3: blocked on non-FP8 plane stages.** The windows branch's enc0_m / dec0_m refuse DOT2 with
+  PLANES (#error); the Linux branch has WIDE plane stages (FP8 values in f16 cooperative matrices) that the windows
+  sources (~750-800 lines apart) lack. Needs: the WIDE port, their DXIL through hlsl_build's AGS path, an external-
+  network mode in runtime_m_rdna3.inc, the shim branch. The gfx1101 layers (`D4R_VKHIP_LAYERS=1 kernels/build.sh m`)
+  and an M package with hipnet.bin (`compile_m.py --hip`) build.
+- **d3dhip M on RDNA3, how far it got.** Linux's WIDE plane stages (ef0075f) three-way-merge into the windows enc0_m /
+  dec0_m (two small conflicts), but the merge also changes the existing FP8 variants' SPIR-V (enc0_m, dec0_m, both
+  plane layouts), so it would alter RDNA4 output: kept out of the tree (a copy in the test machine's scratch). In a
+  separate directory the WIDE stages build to DXIL, but under D4R_HLSL both shaders take the hand-written AGS branch
+  (d3d12/enc0_m_wmma.hlsli and dec0's equivalent), which is FP8 only: the preprocessed main still calls mma8 / fp8Of.
+  WIDE exists only in the GLSL cooperative-matrix branch, which the D3D12 build bypasses; making it compile through
+  coopmat_ags.hlsli (as layer.comp does) means rewriting its buffer / shared-memory accesses to that header's
+  wrappers. Remaining: that rewrite (or WIDE versions of the AGS branches), an external-network mode in
+  runtime_m_rdna3.inc, the shim branch, validation. Over a day; stopped here.
+- **Kept: d3dhip M and L on RDNA3 (patch 08), by default.** The RDNA 3 engine keeps its own input / expansion stages
+  and converts its token-major `tokens` / `dec1` to and from the HIP network's plane layout (m_planes.hlsl, a byte
+  permutation), so no FP8 shader is touched; the shim reuses the RDNA4 d3dhip split and GPU-fence handoff. Harness,
+  3 rounds, same package: dx-M-1440 8.327 -> 5.527 (-33.6%), dx-M-4k 16.861 -> 12.596 (-25.3%), dx-L-1440 11.356 ->
+  8.914 (-21.5%), dx-L-4k 23.494 -> 20.004 (-14.9%); quality-scene truth metrics equal (lane B). Ghost of Tsushima,
+  1712x960 -> 1440p LDR, gpu_eval, A B B A: M 13.16 / 13.32 -> 8.76 / 8.75 ms, L 19.28 -> 15.09 ms (one pair); the
+  game's files restored by hash afterwards. Release: package_release_windows.sh builds kernels/<gfx110x>-swin-hip and
+  build-engine-models.py passes it to compile_m.py --hip (checked end to end with the kit builder). Vulkan M on RDNA3
+  unchanged (staging; the layers spill for vkhip).
+- **Measured, not kept: the Swin HIP layers with SWIN_WAVES_PER_EU=1** (fewer spills): byte-identical, dx-M-1440
+  -3.25%, dx-M-4k -0.82% (under the bar); it would also change the Windows CUDA route's kernel builds.
+- **Rejected: faster RR D on RDNA3 by relaxing the gfx11 DXIL further** (replay, 1024x576 -> 2048x1152, 5 repeats,
+  relaxed build 25.2-27.9 ms): no binary16 rounding after each k32 step 27.1-27.8 ms (no gain; 60.7-64.9 dB against
+  the exact Vulkan route, so harmless but useless); attention-head loops unrolled 26.1-30.4 ms (slower; enc1 2.4 ->
+  3.6 ms). The cost is the exact gfx11 FP8 emulation itself: every 16x16 operand is widened from FP8 codes per load
+  (four g11_sc4 per lane) and each k32 step is two f16 WMMAs with scaling. The next lever is keeping the activations
+  widened (binary16) in LDS instead of FP8 codes, a rewrite of the RR_GFX11 operand path (rr_gfx11.glsl and the stage
+  bodies): new kernel work, not started.
+- **Kept: cheaper FP8 operand widening in the RDNA3 RR stages (patch 09, rr_gfx11.glsl g11_sc4), byte-identical.**
+  Bound first (replay, 1024x576 -> 2048x1152, wrong output, timing only): widening and FP8 encode both free 26.5 ->
+  14.3 ms (-46%); the encode alone free: no change; the widening alone free: ~17.7 ms (-33%). The widening now handles
+  two codes per operation (bytes spread, then both halves widened at once), equal to the old form for every pair of
+  codes (exhaustive check). bench.py, 3 rounds: dx-RRD-1440 40.149 -> 35.663 (-11.2%), dx-RRE-1440 40.018 -> 35.681
+  (-10.8%), vk-RRD-1440 28.038 -> 27.316 (-2.6%), vk-RRE-1440 27.348 -> 26.770 (-2.1%), every output identical.
+  Remaining (about another 20% by the bound): keep activations widened in LDS so each is widened once, not at every
+  reuse; a rewrite of the RR_GFX11 staging in swin_m / dec0_m / enc0_m_tail / rr_attn. Not started.
+
+## 2026-11-10: approximations on RDNA3 D3D12 (against the linux branch's docs/approximations.md)
+
+Goal: the fast default kernels without approximations (the linux page's definition: a narrower format than NVIDIA's
+at a step, or a different function), keeping the time saved. Full write-up: docs/approximations-windows-rdna3.md.
+
+- **Found: M's RDNA3 expansion stage was int8** (m_d3d12_build.py built dec0_m.comp DOT2 INT8; runtime widenM
+  stageInt8): tokens and matrix re-quantized to int8 with scales, a real approximation. Fixed in 10: dec0_m.comp
+  D4R_M_EXPAND_F16, the product on v_wmma_f32_16x16x16_f16 with FP8 widened exactly and NVIDIA's binary16 rounding per
+  32 products; weights column-major binary16 (runtime, D4RML007 only). Expansion 0.329 -> 0.271 ms at 1440p.
+  Rejected first: DOT2 without INT8 (+21% dx-M-1440).
+- **Found: AMD's D3D12 compiler converts f32 -> binary16 toward zero.** Probe (cvtprobe, RX 7700 XT, 26.10.1): f32tof16,
+  (float16_t) casts and vector casts equal round-toward-zero on 2^20 of 2^20 inputs; binary16 add / mul / mad round to
+  nearest (mad is one rounding: 100% equal to the correctly rounded fma). The RDNA3 M/L stages, K's D3D12 stages and
+  RDNA4's M reconstruction use the native conversion (D4R_NATIVE_HALF).
+- **Found: dialect_hlsl.h's emulated rounding is wrong for binary16 subnormals** on AMD's D3D12 compiler, which folds
+  `precise float subnormal = (v + 0.75) - 0.75` (half of the inputs under 2^-14 truncated). D4R_RNE16_EXACT (round()
+  for subnormals, overflow to infinity): 100% on the 2^20 inputs. Emulated in every RDNA3 stage it cost +7% (M) / +5%
+  (L), rejected; and in L's enc0_l_network / dec0_l it gave 26 dB against NVIDIA (bisected per shader), not understood.
+- **Kept: AGS's f32 -> f16 matrix conversion rounds to nearest even** (2^20 of 2^20, uniform, divergent branch and
+  divergent loop alike); gfx11's f16 accumulator holds element r in the low half of register r (probe). rne16_ags.hlsli
+  gives every RDNA3 M/L shader that rounding (pipelines bind the AGS UAV in D4RML007 packages). Check: a debug
+  reconstruction computing both AGS's and the exact emulation's result on every conversion found no disagreement and
+  gave the AGS build's frames byte for byte; enc0 / dec0 / down / exposure built either way are byte-identical. The
+  emulated reconstruction alone differs (41 dB from AGS's), cause not found.
+- **Kept: f32 output stores (down_m.comp WIDE_STORE, from the linux branch) and RGBA8 / BGRA8 output** (refused before:
+  the LDR scene's RGBA8 output could not run).
+- **Fixed, latent: rr_wmma.hlsli's AGS pair rounding** read gfx12's layout; on gfx11 the second value came back 0
+  (probe). No RR package's DXIL changes (the calls were dead code).
+- **RR D/E**: relaxed_math on gfx11 reduces to fma16 -> mad (exact on this driver, above) and hkpn without precise
+  (rounding change). Exact and relaxed D3D12 builds are both 61.68 dB from the exact Vulkan build (RR D replay);
+  stage dumps put the first difference at encoder 0's gate sig() (1/x and exp2 lowered differently by the two
+  compilers; NVIDIA uses rcp.approx / ex2.approx there). Not an approximation; left.
+- **Open: K's D3D12 stages** (compile_k.py, shared with RDNA4) still convert toward zero; needs an RDNA4 run.
+- RDNA4: the shared files changed (dialect_hlsl.h, ags_wmma.hlsli, output_store.glsl, down_m.comp, dec0_m.comp) only
+  under new defines; RDNA4's dec0_m, dec0_m_planes, down_m, down_m_rgb10, enc0_m, post_m and layer_m DXIL built from
+  origin/windows and from the worktree are byte-identical.

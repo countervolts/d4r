@@ -1147,15 +1147,18 @@ int main(int argc, char** argv)
     const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
     // D4R_HARNESS_OUTPUT_RGB10A2=1: an R10G10B10A2_UNORM output texture (inputs unchanged), as some games pass
     // D4R_HARNESS_OUTPUT_R11G11B10=1: an R11G11B10_FLOAT output texture instead (the other packed HDR format games pass)
-    const bool rgb11 = std::getenv("D4R_HARNESS_OUTPUT_R11G11B10") != nullptr;
-    const bool rgb10 = !rgb11 && std::getenv("D4R_HARNESS_OUTPUT_RGB10A2") != nullptr;
-    const DXGI_FORMAT packedOutput = rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
-    if ((rgb10 || rgb11) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
+    // D4R_HARNESS_OUTPUT_RGB9E5=1: an R9G9B9E5_SHAREDEXP output texture (Resident Evil Requiem's RR output, issue 65)
+    const bool rgb9 = std::getenv("D4R_HARNESS_OUTPUT_RGB9E5") != nullptr;
+    const bool rgb11 = !rgb9 && std::getenv("D4R_HARNESS_OUTPUT_R11G11B10") != nullptr;
+    const bool rgb10 = !rgb9 && !rgb11 && std::getenv("D4R_HARNESS_OUTPUT_RGB10A2") != nullptr;
+    const DXGI_FORMAT packedOutput = rgb9 ? DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+                                   : rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
+    if ((rgb9 || rgb10 || rgb11) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
     {
         std::fprintf(stderr, "packed (RGB10A2 / R11G11B10) output cannot be combined with RGBA8 or the quality scene\n");
         return 2;
     }
-    const bool packed = rgb10 || rgb11;
+    const bool packed = rgb9 || rgb10 || rgb11;
     if (rgba8 && (qualityScene || replayDir != nullptr))
     {
         std::fprintf(stderr, "RGBA8 format probe supports static, motion and jitter scenes\n");

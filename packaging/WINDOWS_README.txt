@@ -112,7 +112,7 @@ too.
 Licenses
 --------
 d4r is GNU General Public License, version 3 only (GPL-3.0-only). The release also contains ZLUDA (Apache
-2.0 or MIT, patched), OptiScaler 10.0.0-pre1 (GPL 3.0, unmodified; pinned nightly-20261024 prerelease),
+2.0 or MIT, patched), OptiScaler 10.0.0-pre1 (GPL 3.0, unmodified; pinned nightly-20261029 prerelease),
 Khronos' glslangValidator, Microsoft's DirectX Shader Compiler and Visual C++ runtime (for the model
 builder). d4r\source\SOURCES.txt says where each file comes from, and d4r\licenses has the license texts.
 d4r is not affiliated with NVIDIA, AMD or the OptiScaler project, and is provided "as is", without

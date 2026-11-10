@@ -6,6 +6,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
+#ifdef WIDE_STORE
+#define OUTPUT_STORE_F32 // the f32 result goes straight to the format's conversion (output_store.glsl), RDNA3's stage set
+#endif
 #include "output_store.glsl"
 // LDR (NGX's *_ldr_* kernel): the packed image is the display-referred colour itself.
 #ifndef LDR

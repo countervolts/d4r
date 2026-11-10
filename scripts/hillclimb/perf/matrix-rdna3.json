@@ -1,0 +1,308 @@
+{
+ "comment": "RDNA3 cases for bench.py (RX 7700 XT, gfx1101; AMD 26.10.1, HAGS off). Same method and thresholds as matrix.json. size = render W, H, output W, H. dx-K runs DXIL unless the case sets D4R_D3DHIP_K=1 (d3dhip); dx-M/L run the RDNA 3 package (FP16 WMMA); dx-RRD/RRE run the gfx11 packages (engine\\rr-d-gfx11, rr-e-gfx11). dx-K-q1440 is Ghost of Tsushima's Quality case (docs/windows-k-d3dhip.md). The -default K cases set no D4R_D3DHIP_K: they measure the shipped choice of route. dx-L-up-* run preset L at Ultra Performance (a third of the output per axis), its intended mode; dx-M-* are Performance (half).",
+ "tools": "C:/d4r-rdna3-hc/tools",
+ "warmup": 40,
+ "measured": 120,
+ "rounds": 3,
+ "timeout": 600,
+ "noise_multiple": 2.0,
+ "min_gain": 0.01,
+ "max_other_gpu": 10,
+ "benign": "a frame the engine cannot record is logged|CUDA_Init\\(app|IDENTITY_FALLBACK|NGXLoadFromPath|registry query|needs an RDNA 4 GPU|no RDNA 3 package",
+ "cases": [
+  {
+   "id": "dx-K-1440",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "0"
+   },
+   "route": "runs preset K in the game's command list \\(1280x720 -> 2560x1440\\)(?! with its network)"
+  },
+  {
+   "id": "dx-K-1440-hip",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "1"
+   },
+   "route": "runs preset K in the game's command list \\(1280x720 -> 2560x1440\\) with its network on the model's HIP layers"
+  },
+  {
+   "id": "dx-K-q1440",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1706,
+    960,
+    2560,
+    1440
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "0"
+   },
+   "route": "runs preset K in the game's command list \\(1706x960 -> 2560x1440\\)(?! with its network)"
+  },
+  {
+   "id": "dx-K-q1440-hip",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1706,
+    960,
+    2560,
+    1440
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "1"
+   },
+   "route": "runs preset K in the game's command list \\(1706x960 -> 2560x1440\\) with its network on the model's HIP layers"
+  },
+  {
+   "id": "dx-K-4k",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "0"
+   },
+   "route": "runs preset K in the game's command list \\(1920x1080 -> 3840x2160\\)(?! with its network)"
+  },
+  {
+   "id": "dx-K-4k-hip",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "env": {
+    "D4R_D3DHIP_K": "1"
+   },
+   "route": "runs preset K in the game's command list \\(1920x1080 -> 3840x2160\\) with its network on the model's HIP layers"
+  },
+  {
+   "id": "dx-K-1440-default",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "runs preset K in the game's command list \\(1280x720 -> 2560x1440\\)"
+  },
+  {
+   "id": "dx-K-q1440-default",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1706,
+    960,
+    2560,
+    1440
+   ],
+   "route": "runs preset K in the game's command list \\(1706x960 -> 2560x1440\\)"
+  },
+  {
+   "id": "dx-K-4k-default",
+   "api": "d3d12",
+   "preset": "K",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "route": "runs preset K in the game's command list \\(1920x1080 -> 3840x2160\\)"
+  },
+  {
+   "id": "dx-M-1440",
+   "api": "d3d12",
+   "preset": "M",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "runs preset M in the game's command list \\(1280x720 -> 2560x1440(, capacity 1280x720\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-M-4k",
+   "api": "d3d12",
+   "preset": "M",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "route": "runs preset M in the game's command list \\(1920x1080 -> 3840x2160(, capacity 1920x1080\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-L-1440",
+   "api": "d3d12",
+   "preset": "L",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "runs preset L in the game's command list \\(1280x720 -> 2560x1440(, capacity 1280x720\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-L-4k",
+   "api": "d3d12",
+   "preset": "L",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "route": "runs preset L in the game's command list \\(1920x1080 -> 3840x2160(, capacity 1920x1080\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-L-up-1440",
+   "api": "d3d12",
+   "preset": "L",
+   "size": [
+    854,
+    480,
+    2560,
+    1440
+   ],
+   "route": "runs preset L in the game's command list \\(854x480 -> 2560x1440(, capacity 854x480\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-L-up-4k",
+   "api": "d3d12",
+   "preset": "L",
+   "size": [
+    1280,
+    720,
+    3840,
+    2160
+   ],
+   "route": "runs preset L in the game's command list \\(1280x720 -> 3840x2160(, capacity 1280x720\\), FP16 WMMA|\\), RDNA 3, with its network on the model.s HIP layers)"
+  },
+  {
+   "id": "dx-RRD-1440",
+   "api": "d3d12",
+   "preset": "RRD",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "engine frame 3 recorded on D3D12, RR preset D"
+  },
+  {
+   "id": "dx-RRE-1440",
+   "api": "d3d12",
+   "preset": "RRE",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "engine frame 3 recorded on D3D12, RR preset E"
+  },
+  {
+   "id": "vk-K-1440",
+   "api": "vulkan",
+   "preset": "K",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "native Vulkan engine \\(K\\): feature \\d+ runs preset K"
+  },
+  {
+   "id": "vk-K-4k",
+   "api": "vulkan",
+   "preset": "K",
+   "size": [
+    1920,
+    1080,
+    3840,
+    2160
+   ],
+   "route": "native Vulkan engine \\(K\\): feature \\d+ runs preset K"
+  },
+  {
+   "id": "vk-M-1440",
+   "api": "vulkan",
+   "preset": "M",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "runs preset M in the game's command buffer \\(1280x720 -> 2560x1440\\)"
+  },
+  {
+   "id": "vk-L-1440",
+   "api": "vulkan",
+   "preset": "L",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "runs preset L in the game's command buffer \\(1280x720 -> 2560x1440\\)"
+  },
+  {
+   "id": "vk-RRD-1440",
+   "api": "vulkan",
+   "preset": "RRD",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "Ray Reconstruction D\\): feature \\d+ runs in the game's command buffer \\(1280x720 -> 2560x1440\\)"
+  },
+  {
+   "id": "vk-RRE-1440",
+   "api": "vulkan",
+   "preset": "RRE",
+   "size": [
+    1280,
+    720,
+    2560,
+    1440
+   ],
+   "route": "Ray Reconstruction E\\): feature \\d+ runs in the game's command buffer \\(1280x720 -> 2560x1440\\)"
+  }
+ ]
+}

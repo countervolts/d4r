@@ -256,7 +256,7 @@ games with d4r reuse it; --purge-cache deletes it without asking). Clear the lau
 Licenses
 --------
 d4r is GNU General Public License, version 3 only (GPL-3.0-only). The release also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton
-(LGPL 2.1, patched) and OptiScaler 10.0.0-pre1 (GPL 3.0, unmodified; pinned nightly-20261024 prerelease). d4r/source/SOURCES.txt says where
+(LGPL 2.1, patched) and OptiScaler 10.0.0-pre1 (GPL 3.0, unmodified; pinned nightly-20261029 prerelease). d4r/source/SOURCES.txt says where
 each file comes from, and d4r/licenses has the license texts. d4r is not affiliated with NVIDIA,
 AMD or the OptiScaler project, and is provided "as is", without warranty of any kind (GPL-3.0,
 sections 15 and 16).

@@ -232,6 +232,18 @@ the D3D12 engine are unchanged. `tools/vk_pipeline_stats.cpp` prints a SPIR-V co
 scratch use and (`-ir`) its ISA on the installed driver through `VK_KHR_pipeline_executable_properties`, e.g.
 `VKSTATS_WAVE=32 vk_pipeline_stats dec5_llpc.spv -ir b0=ssbo b1=ssbo b2=ssbo b3=ssbo b4=ssbo b5=ssbo`.
 
+## K on RDNA3 in native Vulkan games (AMD's Windows driver, 2026-11-10)
+
+vkhip refuses gfx11 kernels that use scratch (no architected flat scratch; only gfx12 takes spills through the
+pipeline binary), and the gfx1101 K layers spilled: the released set in enc2, a fresh build with TheRock's clang 24 in
+dec1 (96 bytes). Native Vulkan games on RDNA3 therefore ran K's Vulkan network ("experimental vkhip unavailable:
+dltss_pwin_dec1_layer: kernel uses scratch"). `kernels/windows-flags.txt` now gives gfx1101 a set with no scratch in
+any layer (the Windows tuning where it does not spill; dec1 on the generic flag line), and vkhip loads ("14 native
+dispatches"). RX 7700 XT, 26.10.1, vulkan_dlss_harness, interleaved, same packages otherwise: 1280x720 -> 2560x1440
+3.33 -> 2.67 ms, 1920x1080 -> 3840x2160 5.28 -> 4.25 ms (-19.6% both); 64.8 dB against the Vulkan network after 60
+panning frames (the layers' arithmetic, as on RDNA4). The packages built before this (any K package with the
+released gfx1101 layers) keep the Vulkan network; rebuild the models to pick the new layers up.
+
 ## RDNA2 on native Windows (unofficial, 2026-11-02)
 
 Untested on RDNA2 hardware. Preset K takes vkhip on gfx1030-gfx1036 through AMD's driver only

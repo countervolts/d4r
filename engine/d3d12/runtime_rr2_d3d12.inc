@@ -1095,8 +1095,9 @@ struct R2Engine
                 throw std::runtime_error("RR requires color, motion, depth, normals and albedos");
         if (!settings.roughnessPacked && !images.roughness.resource)
             throw std::runtime_error("RR requires roughness unless packed in normals");
-        if (!output.resource || viewFormat({output.resource, output.format}) != DXGI_FORMAT_R16G16B16A16_FLOAT)
-            throw std::runtime_error("RR output must be RGBA16F");
+        if (!output.resource || !rrOutputFormat({output.resource, output.format}))
+            throw std::runtime_error("RR output must be RGBA16F, RGBA32F, R11G11B10F, RGB9E5, RGB10A2 or RGBA8 "
+                                     "with typed UAV stores (format " + std::to_string(int(output.resource ? viewFormat({output.resource, output.format}) : DXGI_FORMAT_UNKNOWN)) + ")");
         auto od = output.resource->GetDesc();
         if (od.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || od.SampleDesc.Count != 1 || od.Width != ow ||
             od.Height != oh || !(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))

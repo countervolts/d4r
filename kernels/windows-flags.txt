@@ -11,6 +11,21 @@ gfx1201 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPW
 gfx1201 dltss_pwin_enc2_layer -DPWIN_VEC_FROM_WEIGHTS -DPWIN_NORM_OWNER -mllvm -amdgpu-set-wave-priority
 gfx1201 dltss_pwin_dec0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_NORM_LANE -DPOS_HB_SYNC
 gfx1201 dltss_pwin_dec4_layer -DPOS_NORM_LANE
+# gfx1101 (RX 7700 XT, AMD 26.10.1, TheRock clang 24 - the compiler the release kernels come from), 2026-11-10: every
+# layer without scratch, so that one set serves d3dhip and vkhip (vkhip refuses spilling gfx11 kernels: no architected
+# flat scratch, engine/vkhip/vkhip.cpp). The one-flag sweep of docs/windows-k-d3dhip.md ("Kernel flags tuned for
+# Windows HIP on gfx1101", byte-identical) where it does not spill with this compiler (enc0, enc1, enc3, enc4, dec5,
+# dec4, dec3); enc2, dec2 and dec0 keep the sources' gfx11 lines (the swept ones spill 68 / 100 / 36 bytes here); dec1
+# takes the generic line (the sources' gfx11 line spills 96 bytes, the swept one 52). -DPOS_HB_SYNC stays on enc0 /
+# dec0. Only gfx1101 was measured: gfx1100/1102/1103 keep the sources' gfx11 lines.
+gfx1101 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DWM_CVT_ASM -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_NORM_LANE -mllvm -amdgpu-set-wave-priority -DPOS_HB_SYNC
+gfx1101 dltss_pwin_enc1_layer -DPOS_VSHARE1 -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPOS_DIRECT_NORM -DWM_HALF_BPERMUTE
+gfx1101 dltss_pwin_enc3_layer -mllvm -amdgpu-set-wave-priority -DWM_HALF_BPERMUTE
+gfx1101 dltss_pwin_enc4_layer -DWM_HALF_BPERMUTE
+gfx1101 dltss_pwin_dec5_layer -DPOS_NORM_LANE -DPWIN_PACKED_RESIDUAL
+gfx1101 dltss_pwin_dec4_layer -DPOS_NORM_LANE
+gfx1101 dltss_pwin_dec3_layer -DWM_HALF_BPERMUTE -mllvm -amdgpu-set-wave-priority -DPWIN_PK_ELEM
+gfx1101 dltss_pwin_dec1_layer -DPWIN_VEC_FROM_WEIGHTS -DPWIN_QKV_SPLIT
 # the other gfx12 targets (gfx1200): the sources' gfx12 lines plus the fix
 gfx12 dltss_pwin_enc0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC
 gfx12 dltss_pwin_dec0_layer -mcumode -DWM_HALF_BPERMUTE -DPWIN_PK_ELEM -DPWIN_PACKED_RESIDUAL -DPOS_HB_SYNC

@@ -17,8 +17,15 @@ float2 d4rRne16(float2 v) {
   Matrix16 m = zero32();
   m.reg[0] = asuint(v.x);
   m.reg[1] = asuint(v.y);
-  const uint h = convert(MatrixAcc32, MatrixAcc16, 0, m).reg[0];
+  const Matrix16 r = convert(MatrixAcc32, MatrixAcc16, 0, m);
+#if RR_GFX11
+  // gfx11's f16 accumulator holds element i in the low half of register i (RX 7700 XT, AGS on 26.10.1); gfx12 packs
+  // the pair into register 0
+  return float2(f16tof32(r.reg[0]), f16tof32(r.reg[1]));
+#else
+  const uint h = r.reg[0];
   return float2(f16tof32(h), f16tof32(h >> 16));
+#endif
 }
 float d4rRne16(float v) { return d4rRne16(float2(v, 0.0)).x; }
 #endif
@@ -250,6 +257,31 @@ RRFloat rrMma(RRHalf a, RRHalf b, RRFloat c) {
   [unroll] for (uint i = 0; i < 8; ++i) v[i] = asfloat(r.reg[i]);
   return v;
 }
+#if RR_GFX11
+// RDNA3 (rr_hlsl.translate gfx11): an f16 A or B operand is a lane's 16 elements (k 0..15 of its row / column), the
+// eight registers of gfx11's v_wmma_f32_16x16x16_f16; AMD's D3D12 driver passes AGS's matrices in that hardware
+// layout. Only f16 operands: no FP8 matrix or conversion may reach an RDNA3 pipeline (it removes the device).
+typedef float16_t RRHalf16[16];
+RRHalf16 rrHalf16(float x) {
+  RRHalf16 r;
+  [unroll] for (uint i = 0; i < 16; ++i) r[i] = float16_t(x);
+  return r;
+}
+RRHalf16 rrHalf16(RRHalf16 x) { return x; }
+Matrix16 rrPack16(RRHalf16 a) {
+  Matrix16 m;
+  [unroll] for (uint i = 0; i < 8; ++i) m.reg[i] = uint(asuint16(a[2 * i])) | (uint(asuint16(a[2 * i + 1])) << 16);
+  return m;
+}
+RRFloat rrMma(RRHalf16 a, RRHalf16 b, RRFloat c) {
+  Matrix16 m;
+  [unroll] for (uint i = 0; i < 8; ++i) m.reg[i] = asuint(c[i]);
+  const Matrix16 r = mmaOp(5, rrPack16(a), rrPack16(b), m);   // f32_16x16x16_f16
+  RRFloat v;
+  [unroll] for (uint i = 0; i < 8; ++i) v[i] = asfloat(r.reg[i]);
+  return v;
+}
+#endif
 #define gl_SubgroupInvocationID WaveGetLaneIndex()
 #define gl_SubgroupID (gl_LocalInvocationIndex / D4R_WAVE_SIZE)
 #define gl_NumSubgroups (D4R_THREADS / D4R_WAVE_SIZE)

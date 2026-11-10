@@ -3,6 +3,8 @@
 // format conversion to the same hardware. For the UNORM formats (RGB10A2, RGBA8) values below binary16's
 // normal range quantize to zero and overflow saturates, so a normal-range mantissa mask suffices; R11G11B10
 // keeps small values (and its 6/5-bit mantissas round the half), so it takes the full conversion.
+// OUTPUT_STORE_F32 (down_m.comp WIDE_STORE, the RDNA 3 D3D12 package): the f32 result goes to the format's
+// conversion, as NVIDIA's formatted store does (the linux branch's output_store.glsl).
 #ifndef OUTPUT_RGB10
 #define OUTPUT_RGB10 0
 #endif
@@ -19,16 +21,24 @@
 #define FINAL_OUTPUT_FORMAT rgba8
 #endif
 #define FINAL_OUTPUT_TYPE unorm float4
+#ifdef OUTPUT_STORE_F32
+#define finalOutputValue(value) (value)
+#else
 vec4 finalOutputValue(vec4 value) {
     vec4 rounded = uintBitsToFloat(floatBitsToUint(value) & 0xffffe000u);
     return mix(rounded, value, isnan(value));
 }
+#endif
 #elif OUTPUT_R11G11B10
 #include "input_quant.glsl"
 #define FINAL_OUTPUT_FORMAT r11f_g11f_b10f
 // The blit turns every NaN into the format's canonical NaN; a direct store would keep the payload's top bits.
 vec4 finalOutputValue(vec4 value) {
+#ifdef OUTPUT_STORE_F32
+    return mix(value, vec4(uintBitsToFloat(0x7fc00000u)), isnan(value));
+#else
     return mix(canonicalHalf(value), vec4(uintBitsToFloat(0x7fc00000u)), isnan(value));
+#endif
 }
 #else
 #define FINAL_OUTPUT_FORMAT rgba16f
