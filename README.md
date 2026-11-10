@@ -26,6 +26,8 @@ The release zips do not contain NVIDIA's files. Their installers download the pi
 
 The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt). Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)).
 
+Northlight games (Control, Alan Wake 2) keep their original motion vectors by default. Experimental display-resolution motion-vector reconstruction requires `[Interop] NativeMotionVectors = true` in `d4r.ini` and a matching patched driver. It can cause motion artifacts; restart the game after changing it.
+
 ### Windows
 
 1. Extract the Windows release zip into the folder that holds the game's main `.exe`. If the folder already has a `dxgi.dll` or `OptiScaler.ini` from another OptiScaler install, move those out of the way first.

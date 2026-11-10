@@ -10,6 +10,56 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShimConfigTests(unittest.TestCase):
+    def test_native_motion_vectors_require_opt_in(self):
+        for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
+            config = configparser.ConfigParser(inline_comment_prefixes=(';',))
+            config.read(ROOT / name)
+            self.assertFalse(config.getboolean('Interop', 'NativeMotionVectors'))
+        with tempfile.TemporaryDirectory() as directory:
+            ini = Path(directory) / 'd4r.ini'
+            env = {k: v for k, v in os.environ.items() if not k.startswith('D4R_')}
+            command = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
+            for value, expected in ((None, '0'), ('false', '0'), ('true', '1'), ('auto', '0')):
+                ini.write_text('[Interop]\n' +
+                               (f'NativeMotionVectors = {value}\n' if value is not None else ''))
+                result = subprocess.run(command, env=env, text=True, capture_output=True, check=True)
+                self.assertIn(f'export D4R_NATIVE_MV_LIVE={expected}\n', result.stdout)
+            ini.write_text('[Interop]\nNativeMotionVectors = invalid\n')
+            self.assertEqual(subprocess.run(command, env=env, capture_output=True).returncode, 2)
+
+    def test_portable_native_motion_opt_in_blocks_old_environment_override(self):
+        source = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
+        begin = source.index('    const bool live=', source.index('static void record_native_gpu_check('))
+        policy = source[begin:source.index(';', begin) + 1]
+        program = r'''
+#include <cassert>
+struct { bool active, nativeMotionVectors; } g_portable;
+struct { bool rayReconstruction; unsigned flags; } feature;
+static unsigned requested;
+static unsigned env_uint(const char*, unsigned) { return requested; }
+static bool enabled() {
+''' + policy + r'''
+    return live;
+}
+int main() {
+    feature = {false, 2};
+    requested = 1;
+    g_portable = {true, false}; assert(!enabled());
+    g_portable = {true, true}; assert(enabled());
+    feature.rayReconstruction = true; assert(!enabled());
+    feature = {false, 0}; assert(!enabled());
+    feature.flags = 2;
+    requested = 0; assert(!enabled());
+    requested = 1;
+    g_portable = {false, false}; assert(enabled());
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / 'native-motion-policy'
+            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-x', 'c++',
+                            '-', '-o', str(runner)], input=program, text=True, capture_output=True, check=True)
+            subprocess.run([str(runner)], check=True)
+
     def test_vkhip_is_on_by_default_and_environment_takes_precedence(self):
         for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
             config = configparser.ConfigParser(inline_comment_prefixes=(';',))
