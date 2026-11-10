@@ -14,8 +14,16 @@ if [[ -z "${VULKAN_INCLUDE:-}" ]]; then
   else VULKAN_INCLUDE=/usr/include; fi
 fi
 mkdir -p build
+# Only the Vulkan headers from the include tree: on a Linux host /usr/include also holds glibc's headers, which break
+# the MinGW build (as scripts/build_d4r_nvngx_shim.sh does).
+rm -rf build/vulkan-include
+mkdir -p build/vulkan-include
+for dir in vulkan vk_video; do
+  [[ -d "$VULKAN_INCLUDE/$dir" ]] || continue
+  ln -s "$VULKAN_INCLUDE/$dir" "build/vulkan-include/$dir" 2>/dev/null || cp -r "$VULKAN_INCLUDE/$dir" "build/vulkan-include/$dir"
+done
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Wno-cast-function-type -Wno-missing-field-initializers -Wno-unused-parameter \
-  -I"$VULKAN_INCLUDE" -shared -static -static-libgcc -static-libstdc++ -o build/nvngx.dll_dlssg_host.dll \
+  -Ibuild/vulkan-include -shared -static -static-libgcc -static-libstdc++ -o build/nvngx.dll_dlssg_host.dll \
   dlssg_host.cpp cubin_d3d12.cpp ../nvxrt/util.cpp -ldxguid -luuid
 "$CXX" -O2 -std=c++17 -Wall -static -o build/nvxrt-scan.exe ../nvxrt/scan.cpp ../nvxrt/util.cpp
 echo "built build/nvngx.dll_dlssg_host.dll"
