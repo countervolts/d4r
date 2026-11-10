@@ -144,3 +144,15 @@ Commits on main, oldest first. The history from 771eea3 on was rewritten to drop
 - A game with R32_UINT depth (#61) on the Vulkan engine.
 - RE Requiem (#59) with DLSS-G.
 - Northlight (Control / Alan Wake 2): original motion vectors by default; `NativeMotionVectors = true` opts in.
+
+## Added to the plan: linux commits after 65646d9
+
+`origin/linux` has two commits the local `linux` branch does not (the local branch is left as is; these are
+ported from `origin/linux`):
+
+- **1dcfa80** (release: ship RR HIP stages and FSR RR; `LinearLighting` defaults to half): `build_rr_hip_release.sh`
+  needs `engine/rr/hip/` (Stage 2), `patches/vkd3d-proton-fsr-rr/0002` applies on top of linux's 0001 (Stage 3),
+  and `[DLSS] LinearLighting = half` needs the key from 65646d9 (Stage 5). Ported at the end of Stage 5.
+- **4286001** (RDNA2 K: deep dot2 layers as phase dispatches, swizzled LDS rows, depth staged in shared memory):
+  builds on ef0075f and 65646d9's `input_k.comp`, `compile_k.py` and `runtime.cpp`. Ported at the end of Stage 5,
+  after 1dcfa80. Windows' native RDNA2 path (LLPC dot2 shaders, 130d119) is checked for an equivalent first.
