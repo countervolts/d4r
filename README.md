@@ -56,12 +56,12 @@ RDNA3, DLSS 4 (K), 2560x1440 output.
 | Performance | 1280x720 | 114.0 | 2.201 ms | 2.208 ms |
 | Ultra Performance | 856x480 | 125.6 | 2.120 ms | 2.124 ms |
 
-Presets M and L, complete-frame replay GPU median (in game is a little lower):
+Presets M and L at their intended modes, RX 7700 XT, network on the native HIP layers (d3dhip). GPU median per upscale from the D3D12 harness (`scripts/hillclimb/perf/bench.py`, 3 interleaved rounds):
 
-| Preset | Mode | Input | GPU time |
-|---|---|---|---:|
-| M | Performance | 1280x720 | 7.00 ms |
-| L | Ultra Performance | 856x480 | 5.44 ms |
+| Preset | Mode | Input | 2560x1440 output | Input (4K) | 3840x2160 output |
+|---|---|---|---:|---|---:|
+| M | Performance | 1280x720 | 5.25 ms | 1920x1080 | 11.57 ms |
+| L | Ultra Performance | 854x480 | 4.33 ms | 1280x720 | 9.64 ms |
 
 **Linux, RX 7700 XT, Ghost of Tsushima**
 
