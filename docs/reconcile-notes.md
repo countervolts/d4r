@@ -62,24 +62,24 @@ hunk expects `namespace dxil_spv`. Its context is rebased. All 17 patches apply 
 
 ## Stage 1: small linux commits
 
-Commits on main, oldest first:
+Commits on main, oldest first. The history from 771eea3 on was rewritten to drop windows' Claude co-author trailers, so main and windows share history only up to fe53aa0:
 
 | main | ports | what |
 |---|---|---|
-| 257e05a | (fix) | shim build on Linux hosts (HIP SDK probe) |
-| 79d6fb0 | 05e19d4 | `[Interop] NativeMotionVectors` opt-in for Northlight motion vectors |
-| 52ca7f5 | 30ed3ec | Linux DLSS-G packaging, `d4r_boot.dll` NVIDIA identity (no launch options), EAC via umu, cubin vkd3d patch |
-| e1c2c29 | #59 (3d7eb97) | NGX parameter object capacity 256 → 4096 (RE Requiem) |
-| 62dac8f | (fix) | DLSS-G host build on Linux hosts (include path) |
-| 311ab09 | 4d88a2e | DLSS-G from install.sh, FG Lite / `Model`, faster RDNA3 FG (t1 decoder groups, wave64), parallel kernel builds |
-| fca87d5 | #61 (f9595f9) | Vulkan engine accepts R32_UINT depth |
-| da82eb3 | #60 (fc05bbe) | unwrap proxied command lists (ReShade); ReShade Wine patch |
-| ff8cb80 | 05dc7a0 | release the reference GetCommandList adds |
-| b2af32c | 970a013 | comgr off Wine's signal handlers, locale-free nvxrt parsing, exposure views outside the cache budget |
-| 6f02def | #62 (432639f) | vkd3d heap-descriptor patches |
-| 758e4a5 | #63 (7d55fa8) | vkd3d-proton 3.2, descriptor heap opt-in, 0011 rebase |
-| 4382f2c | (restore) | Dockerfile.glibc241 |
-| 13328b9 | (README) | linux's OptiScaler/FSR/vkhip/XeFG notes back into the README |
+| 455fde3 | (fix) | shim build on Linux hosts (HIP SDK probe) |
+| 8b6bfbf | 05e19d4 | `[Interop] NativeMotionVectors` opt-in for Northlight motion vectors |
+| e7a7099 | 30ed3ec | Linux DLSS-G packaging, `d4r_boot.dll` NVIDIA identity (no launch options), EAC via umu, cubin vkd3d patch |
+| 7417dd0 | #59 (3d7eb97) | NGX parameter object capacity 256 → 4096 (RE Requiem) |
+| ef0f1c4 | (fix) | DLSS-G host build on Linux hosts (include path) |
+| a54bf93 | 4d88a2e | DLSS-G from install.sh, FG Lite / `Model`, faster RDNA3 FG (t1 decoder groups, wave64), parallel kernel builds |
+| ac97807 | #61 (f9595f9) | Vulkan engine accepts R32_UINT depth |
+| d56fc3b | #60 (fc05bbe) | unwrap proxied command lists (ReShade); ReShade Wine patch |
+| c1e3303 | 05dc7a0 | release the reference GetCommandList adds |
+| 7ae0ac0 | 970a013 | comgr off Wine's signal handlers, locale-free nvxrt parsing, exposure views outside the cache budget |
+| be8399c | #62 (432639f) | vkd3d heap-descriptor patches |
+| b593464 | #63 (7d55fa8) | vkd3d-proton 3.2, descriptor heap opt-in, 0011 rebase |
+| cb94d4a | (restore) | Dockerfile.glibc241 |
+| dcb897b | (README) | linux's OptiScaler/FSR/vkhip/XeFG notes back into the README |
 
 ### Ported, with merge decisions
 
