@@ -72,12 +72,18 @@ HIP_INCLUDES=""
 HIP_SOURCES=""
 HIP_LIBS=""
 ROCM_DIR="${D4R_ROCM_DIR:-}"
+# A HIP SDK for this DLL needs the Windows import library too: Linux ROCm (/opt/rocm) has the headers but no
+# amdhip64.lib, and linking the MinGW DLL against it fails.
+hip_sdk() {
+  [[ -f "$1/include/hip/hip_runtime_api.h" ]] &&
+    { [[ -f "$1/lib/amdhip64.lib" ]] || [[ -f "$1/lib/libamdhip64.dll.a" ]] || [[ -f "$1/lib/libamdhip64.a" ]]; }
+}
 if [[ -z "$ROCM_DIR" ]]; then
   for candidate in ${HIP_PATH:-} ${ROCM_PATH:-} C:/ROCm/*/ /opt/rocm; do
-    if [[ -f "$candidate/include/hip/hip_runtime_api.h" ]]; then ROCM_DIR="$candidate"; fi
+    if hip_sdk "$candidate"; then ROCM_DIR="$candidate"; fi
   done
 fi
-if [[ -n "$ROCM_DIR" && -f "$ROCM_DIR/include/hip/hip_runtime_api.h" ]]; then
+if [[ -n "$ROCM_DIR" ]] && hip_sdk "$ROCM_DIR"; then
   HIP_DEFINES="-DD4R_ENGINE_D3DHIP"
   HIP_INCLUDES="-I$ROCM_DIR/include"
   HIP_SOURCES="$ROOT/engine/hip_net.cpp $ROOT/engine/d3d12/hip_net_d3d12.cpp $ROOT/engine/d3d12/hip_net_rr.cpp"
