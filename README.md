@@ -20,7 +20,7 @@ The release zips do not contain NVIDIA's files. Their installers download the pi
 
 ### Linux (Proton)
 
-1. Extract `d4r-<version>.zip` into the folder that holds the game's main `.exe` (OptiScaler as `dxgi.dll`, the d4r-patched vkd3d-proton, AMD's FSR files and the `d4r` folder).
+1. Extract `d4r-<version>.zip` into the folder that holds the game's main `.exe` (OptiScaler 10.0.0-pre1 as `dxgi.dll` with its `OptiScaler/` dependencies, `d4r_boot.dll`, the d4r-patched vkd3d-proton, AMD's FSR files and the `d4r` folder).
 2. Run `bash install.sh` there. It installs NVIDIA's DLLs into `d4r/` and builds the native engine's models from them. Needs Bash, curl, sha256sum, 7-Zip and python3 with numpy; no sudo, ROCm not required.
 3. In Steam, select a Proton version for the game (tested: GE-Proton11-3). No launch options are needed.
 
@@ -45,7 +45,11 @@ Needs Windows 10 or 11 with a current AMD Adrenalin driver; ROCm and the HIP SDK
 Open OptiScaler's menu (Insert):
 
 - **DLSS model:** under DLSS Settings, tick *Render Presets Override*, pick the preset (E, K, L or M) and press *Apply Changes*. Unticking it returns to `[DLSS] Model` in `d4r/d4r.ini`.
-- **FSR:** set *Upscaler (DX12)* to *FSR 3.X/4*.
+- **FSR:** set *Upscaler (DX12)* to *FSR 3.X/4*. On Linux, RDNA3 and RDNA4 get FSR 4.1 (needs GE-Proton, which supplies AMD's FSR 4 library); other GPUs get FSR 3.1.
+
+Both are on by default; `[OptiScaler] FollowPresets` and `Fsr4` in `d4r.ini` turn them off. Change OptiScaler settings and use **Save INI** normally; d4r's ASI setup preserves your choices after the initial installation.
+
+On Linux the [vkhip backend](docs/experimental-vkhip.md) runs preset K on RDNA3 and is on by default. Experimental [XeFG/FSR frame generation and XeLL/Anti-Lag latency conversion](docs/frame-generation.md) are bundled in the `OptiScaler/` folder: enable FG in OptiScaler's Insert menu or use the per-game setup command with INI backups. Fresh installs keep FG off.
 
 In some games some models can show visible artifacting with native upscaling. For fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` ([native kernel numerics](docs/native-kernels.md#numerics)).
 
