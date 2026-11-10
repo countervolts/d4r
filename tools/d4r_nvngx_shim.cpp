@@ -14831,6 +14831,24 @@ static ID3D12GraphicsCommandList* native_command_list(ID3D12GraphicsCommandList*
     if (!list)
         return list;
     static std::atomic<bool> logged{false};
+
+    // The d4r-patched vkd3d-proton lists implement ID3D12DXVKInteropCommandListD4R. A proxy layer that
+    // forwards unknown interfaces to the wrapped object (ReShade) resolves to the native list through it.
+    ID3D12DXVKInteropCommandListD4R* d4r = nullptr;
+    if (SUCCEEDED(list->QueryInterface(__uuidof(ID3D12DXVKInteropCommandListD4R), reinterpret_cast<void**>(&d4r))) && d4r)
+    {
+        ID3D12GraphicsCommandList* native = nullptr;
+        const HRESULT hr = d4r->GetCommandList(&native);
+        d4r->Release();
+        if (SUCCEEDED(hr) && native && native != list)
+        {
+            native->Release();
+            if (!logged.exchange(true))
+                logf("evaluate: the command list is a proxy; recording into the native list it wraps");
+            return native;
+        }
+    }
+
     IUnknown* base = nullptr;
     if (SUCCEEDED(list->QueryInterface(kStreamlineRetrieveBaseInterface, reinterpret_cast<void**>(&base))) && base)
     {
