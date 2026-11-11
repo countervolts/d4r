@@ -11121,8 +11121,6 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         return refuse("needs the HDR flag and render-resolution motion vectors");
     if ((feature.flags & 0x4) != 0)
         return refuse("jittered motion vectors are not implemented");
-    if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
-        return refuse("the camera matrices are missing");
     // Preset F below 4/3 scaling (DLAA and the like): NGX runs another output filter there, rr2_post_kernel_3_2,
     // which the model does not have (harness runs at 1920x1080 output, 2026-10-13: 1440x810 and smaller render sizes
     // use rr2_post_kernel, 1456x820 and larger rr2_post_kernel_3_2)
@@ -12009,6 +12007,25 @@ static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHan
                 d4r_ngx_get_void(parameters, kAuxMatrices[index], &value) == NGX_SUCCESS && value != nullptr;
             if (p.auxMatrixSet[index])
                 std::memcpy(p.auxMatrix[index], value, sizeof(p.auxMatrix[index]));
+        }
+        // The caller registered no camera matrix for this frame: use identity, the way native
+        // nvngx_dlssd.dll degrades (its WorldToScreenMatrix falls back when the matrices are
+        // absent or not invertible) - temporal reprojection then rests on the motion vectors
+        // alone.
+        if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
+        {
+            static std::atomic<uint32_t> idLogged{0};
+            if (idLogged.fetch_add(1, std::memory_order_relaxed) == 0)
+                logf("engine backend (Ray Reconstruction): the caller registered no camera matrices: "
+                     "using identity, as native nvngx_dlssd.dll does (reprojection then rests on the "
+                     "motion vectors alone)");
+            for (int i = 0; i < 2; ++i)
+                if (!p.auxMatrixSet[i])
+                {
+                    std::memset(p.auxMatrix[i], 0, sizeof p.auxMatrix[i]);
+                    p.auxMatrix[i][0] = p.auxMatrix[i][5] = p.auxMatrix[i][10] = p.auxMatrix[i][15] = 1.0f;
+                    p.auxMatrixSet[i] = true;
+                }
         }
     }
 
