@@ -3380,6 +3380,10 @@ struct Feature
     std::atomic<uint32_t> completedFrames{0};
     uint32_t engineFrames = 0;    // game thread: frames the engine recorded into the game's lists (no CUDA completion)
     uint32_t engineMisses = 0;    // game thread: native D3D12 frames the engine could not record (no fallback there)
+    // game thread: native D3D12 frames skipped because a texture did not cover its rectangle (a transient state, e.g.
+    // a scene or menu transition); the next frame recorded restarts the temporal history
+    uint32_t engineRectMisses = 0;
+    bool engineHistoryLost = false;
     uint32_t evaluatedFrames = 0; // worker only
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.
@@ -12846,6 +12850,22 @@ static void reap_engine_dx()
     }), retired.end());
 }
 
+// A game texture smaller than the rectangle the engine would read or write this frame. That is a per-frame state
+// (Marvel's Spider-Man 2 hands NGX such a frame mid-session, issue #66), not a property of the feature: skip only this
+// frame (the game keeps its own output for it), keep the feature and its engine, and restart the temporal history on
+// the next frame that is recorded. Returns false, as a refusal does.
+static bool engine_dx_skip_uncovered(Feature& feature, const char* path, const char* plane, uint32_t x, uint32_t y,
+                                     uint32_t width, uint32_t height, const D3D12_RESOURCE_DESC& desc, uint32_t frame)
+{
+    feature.engineHistoryLost = true;
+    if (++feature.engineRectMisses <= 3 || feature.engineRectMisses % 600 == 0)
+        logf("engine backend (D3D12%s): the %s texture (%llux%u) does not cover its rectangle (%u,%u %ux%u); feature %u "
+             "skips frame %u (%u such frames so far) and restarts its history on the next one",
+             path, plane, static_cast<unsigned long long>(desc.Width), desc.Height, x, y, width, height,
+             feature.handle.Id, frame, feature.engineRectMisses);
+    return false;
+}
+
 static void release_engine_dx(Feature& feature)
 {
     if (feature.engineDx == nullptr)
@@ -13337,12 +13357,13 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         d4r::dx::GameTexture* texture;
         uint32_t width, height;
         D3D12_RESOURCE_STATES state;
+        const char* plane;
     };
     const Source sources[4] = {
-        {color, &game.color, p.renderWidth, p.renderHeight, inputState},
-        {depth, &game.depth, p.renderWidth, p.renderHeight, depthState},
-        {motion, &game.motion, displayMotion ? feature.outWidth : p.renderWidth, displayMotion ? feature.outHeight : p.renderHeight, inputState},
-        {output, &game.output, feature.outWidth, feature.outHeight, outputState},
+        {color, &game.color, p.renderWidth, p.renderHeight, inputState, "color"},
+        {depth, &game.depth, p.renderWidth, p.renderHeight, depthState, "depth"},
+        {motion, &game.motion, displayMotion ? feature.outWidth : p.renderWidth, displayMotion ? feature.outHeight : p.renderHeight, inputState, "motion"},
+        {output, &game.output, feature.outWidth, feature.outHeight, outputState, "output"},
     };
     for (const Source& source : sources)
     {
@@ -13357,7 +13378,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         if (source.texture == &game.output && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             return refuse("the output does not allow unordered access");
         if (source.width > desc.Width || source.height > desc.Height)
-            return refuse("a texture does not cover its rectangle");
+            return engine_dx_skip_uncovered(feature, ", M", source.plane, 0, 0, source.width, source.height, desc, frame);
     }
     auto& s = game.settings;
     s.renderWidth = p.renderWidth; s.renderHeight = p.renderHeight;
@@ -13369,7 +13390,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         s.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;
         s.motionOffset[1] = (p.jitterY - feature.engineJitter[1]) / p.mvScaleY;
     }
-    s.reset = p.reset != 0 || feature.engineDx == nullptr;
+    s.reset = p.reset != 0 || feature.engineDx == nullptr || feature.engineHistoryLost;
     s.depthInverted = (feature.flags & 0x8) != 0;
     // capacity: the render size the feature was created with (NGX's maximum), at least this frame's; a larger frame
     // starts a new engine at its size
@@ -13527,6 +13548,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         d4r_submit::track(list, {&state, engine_dx_submitted, engine_dx_discarded});
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
+    feature.engineHistoryLost = false;
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded on D3D12, preset %c (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)", frame,
              presetL ? 'L' : 'M', p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY, p.renderWidth, p.renderHeight);
@@ -13763,7 +13785,7 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
             logf("engine backend (D3D12): %s; native feature %u rejected at frame %u", reason, feature.handle.Id, frame);
         else
             logf("engine backend (D3D12): %s; feature %u uses the CUDA backend from frame %u", reason, feature.handle.Id, frame);
-        if (feature.engineDx != nullptr)
+        if (feature.engineDx != nullptr && !feature.nativeD3d12)
             logf("engine backend (D3D12): the temporal history restarts in the CUDA backend");
         release_engine_dx(feature);
         return false;
@@ -13808,14 +13830,15 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
         d4r::dx::GameTexture* texture;
         uint32_t x, y, width, height;
         D3D12_RESOURCE_STATES state;
+        const char* plane;
     };
     const Source sources[5] = {
-        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState},
-        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState},
+        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState, "color"},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState, "depth"},
         {motion, &game.motion, p.mvBaseX, p.mvBaseY, displayMotion ? feature.outWidth : p.renderWidth,
-         displayMotion ? feature.outHeight : p.renderHeight, inputState},
-        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState},
-        {exposure, &game.exposure, 0, 0, 1, 1, inputState},
+         displayMotion ? feature.outHeight : p.renderHeight, inputState, "motion"},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState, "output"},
+        {exposure, &game.exposure, 0, 0, 1, 1, inputState, "exposure"},
     };
     for (size_t index = 0; index < (gameExposure ? 5u : 4u); ++index) // sources[4] (exposure): game exposure only
     {
@@ -13831,15 +13854,17 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
             return refuse(reason);
         D3D12_RESOURCE_DESC desc;
         source.resource->GetDesc(&desc);
-        if (source.x + source.width > desc.Width || source.y + source.height > desc.Height)
-            return refuse("a texture does not cover its rectangle");
+        if (uint64_t(source.x) + source.width > desc.Width || uint64_t(source.y) + source.height > desc.Height)
+            return engine_dx_skip_uncovered(feature, "", source.plane, source.x, source.y, source.width, source.height,
+                                            desc, frame);
     }
 #ifdef D4R_ENGINE_D3DHIP
     // a failed split leaves this frame's engine external: the next frame is created with the DXIL network instead
     if (feature.engineKHipFailed && feature.engineDx != nullptr && feature.engineDx->hip)
         release_engine_dx(feature);
 #endif
-    game.settings = engine_k_settings(feature, p, ldr, displayMotion, autoExposure, feature.engineDx == nullptr);
+    game.settings = engine_k_settings(feature, p, ldr, displayMotion, autoExposure,
+                                      feature.engineDx == nullptr || feature.engineHistoryLost);
     try
     {
 #ifdef D4R_ENGINE_D3DHIP
@@ -13973,6 +13998,9 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
         d4r_submit::track(list, {&state, engine_dx_submitted, engine_dx_discarded});
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
+    if (feature.engineHistoryLost)
+        logf("engine backend (D3D12): feature %u records again at frame %u (history restarted)", feature.handle.Id, frame);
+    feature.engineHistoryLost = false;
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded on D3D12 (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u, "
              "exposure %s, preExposure %.6g, exposureScale %.6g)", frame,

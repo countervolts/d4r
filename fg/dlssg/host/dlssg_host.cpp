@@ -126,7 +126,12 @@ void* g_device = nullptr;
 HANDLE g_log = INVALID_HANDLE_VALUE;
 std::wstring g_base; // this DLL's path without ".dll"
 unsigned g_nextId = 0x7d000;
-struct FgHandle { NgxHandle pub; NgxHandle* inner; };
+struct FgHandle
+{
+    NgxHandle pub;
+    NgxHandle* inner;
+    int uiInputs = -1; // which of HUDLess / UI / UIAlpha the caller passed (bit mask); -1 before the first evaluate
+};
 std::map<const void*, FgHandle*> g_handles; // keyed by the public handle pointer
 
 void logf(const char* fmt, ...)
@@ -1013,6 +1018,37 @@ static NgxResult evalFg(const char* name, void* list, FgHandle* h, void* params,
     uint64_t n = ++g_evals;
     unsigned mfc = 0, idx = 0;
     if (params) { ms::getU(params, "DLSSG.MultiFrameCount", &mfc); ms::getU(params, "DLSSG.MultiFrameIndex", &idx); }
+    if (params) {
+        // The HUD inputs DLSS-G gets decide how it treats the UI (HUD breakup reports): logged on the first evaluate
+        // of each feature and whenever the set changes, e.g. when the caller (OptiScaler's OptiFG input or the
+        // game through Streamline) starts or stops passing one.
+        static const char* names[] = {"HUDLess", "UI", "UIAlpha"};
+        ID3D12Resource* res[3] = {};
+        int mask = 0;
+        for (int i = 0; i < 3; i++) {
+            std::string k = std::string("DLSSG.") + names[i];
+            if (!failed(ms::getD3D12(params, k.c_str(), &res[i])) && res[i]) mask |= 1 << i;
+        }
+        if (mask != h->uiInputs) {
+            std::string t;
+            char b[128];
+            for (int i = 0; i < 3; i++) {
+                if (res[i]) {
+                    D3D12_RESOURCE_DESC d = res[i]->GetDesc();
+                    snprintf(b, sizeof b, " %s %llux%u fmt %u;", names[i], (unsigned long long)d.Width, d.Height,
+                             (unsigned)d.Format);
+                } else {
+                    snprintf(b, sizeof b, " %s none;", names[i]);
+                }
+                t += b;
+            }
+            unsigned recomposition = 0;
+            const bool hasRecomposition = !failed(ms::getU(params, "DLSSG.UserInterfaceRecompositionEnabled", &recomposition));
+            logf("Evaluate(FG) #%llu: HUD inputs from the caller:%s UserInterfaceRecompositionEnabled %s",
+                 (unsigned long long)n, t.c_str(), hasRecomposition ? (recomposition ? "1" : "0") : "not set");
+            h->uiInputs = mask;
+        }
+    }
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
     bool timed = false;
     if (g_timing && cl && g_device) {
