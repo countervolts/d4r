@@ -938,3 +938,24 @@ on the D3D12 queue, handoff_spin.comp on the kernels' compute-only queue), cappe
   OS context switch between them, twice. Only running the kernels inside the game's own D3D12 device removes it
   (DXIL compute on the game's queue: every translated kernel through a DXIL backend; the d3dhip route is a separate
   device again, measured ~0.2 ms per hand-off). Code reverted; not committed.
+
+### 2026-11-11: would d3dhip's hand-off be faster? (owner's question) No
+
+`fg/dlssg/harness/handoff_bench.cpp`: one D3D12 device; a Vulkan device and a HIP device picked by the adapter LUID, the
+shared D3D12 fence imported into both; per iteration D3D12 timestamp, Signal(a), the other device waits a, fills a
+buffer, signals b, D3D12 Wait(b), timestamp; 3 iterations in flight; "none" = the two timestamps alone. Medians of
+3 rounds x 600 iterations (RX 7700 XT, Vulkan graphics queue as the executor uses, driver's amdhip64_7.dll):
+
+| Case | none | Vulkan | HIP |
+|---|---:|---:|---:|
+| idle GPU, 4 KB fill | 10-28 us | 113 us (p90 150) | 109 us (p90 130) |
+| 64 MB D3D12 copy before each, 4 KB fill | 15 us | 129 us (p90 410) | 117 us (p90 190) |
+| idle GPU, 64 MB fill | 10-50 us | 309 us (p90 520) | 309 us (p90 335) |
+
+- HIP saves ~5-12 us per round trip at the median (a better tail under load). Moving FG to HIP would need a
+  PTX -> AMDGPU backend or ZLUDA for every DLSS-G kernel for that: not worth it. Rejected without porting.
+- **Found: a bare round trip is ~0.1 ms, but FG loses ~0.6 ms per list outside its kernels** (kernels' queue 2.57 of
+  3.26 ms at 2x, entry barrier to last dispatch). Most of that is not the hand-off mechanism. Candidates, unmeasured:
+  the batch's entry barrier (ALL_COMMANDS, MEMORY_WRITE -> MEMORY_READ|WRITE) and the tail after the last dispatch
+  (the semaphore signal's cache flushes over the frame's working set), the leading / trailing D3D12 parts beyond the
+  barriers (~0.07 ms measured), and clocks dropping in the gaps (the busy-machine numbers point that way). Next lead.
