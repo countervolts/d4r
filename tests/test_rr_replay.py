@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -36,8 +38,8 @@ class AuxCaptureTests(unittest.TestCase):
     """dump_aux_guides must record the caller's bytes and the descriptor that reads them."""
 
     def test_capture_records_every_guide_in_the_callers_format(self):
-        shim = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
-        tables = extract(shim, 'struct AuxScalar', 'struct FrameParams')
+        shim = shim_source(ROOT)
+        tables = extract(shim, 'struct AuxScalar\n', 'struct FrameParams\n')
         # The forward declaration in that slice has no definition here and nothing uses it.
         tables = tables.replace(
             'static unsigned int get_uint_or(void* parameters, const char* name, unsigned int fallback);\n', '')

@@ -4,12 +4,14 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeMotionRoutingTests(unittest.TestCase):
     def test_independent_repair_and_ngx_motion(self):
-        source = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
+        source = shim_source(ROOT)
         begin = source.index('    CudaObject nativeMotion = 0;')
         end = source.index('    // Ray Reconstruction: the auxiliary', begin)
         block = source[begin:end]

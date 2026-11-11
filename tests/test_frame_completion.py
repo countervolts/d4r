@@ -4,16 +4,18 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class FrameCompletionTests(unittest.TestCase):
     def test_shim_does_not_signal_past_running_producer(self):
-        shim = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
-        start = shim.index('static void release_split_frame(Feature* feature, uint32_t frame)\n{')
+        shim = shim_source(ROOT)
+        start = shim.index('void release_split_frame(Feature* feature, uint32_t frame)\n{')
         end = shim.index('\nstatic void split_watchdog()', start)
         # release_split_frame signals through this helper, defined after the engine network's exports
-        helper = shim.index('\nstatic VkResult signal_split_semaphore(Feature& feature, uint64_t value)\n{')
+        helper = shim.index('\nVkResult signal_split_semaphore(Feature& feature, uint64_t value)\n{')
         helper = shim[helper:shim.index('\n}\n', helper) + 3]
         source = r'''
 #include "d4r_frame_completion.h"
@@ -22,12 +24,16 @@ class FrameCompletionTests(unittest.TestCase):
 #include <cstdarg>
 using VkResult = int;
 constexpr int VK_SUCCESS = 0, VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO = 1;
+constexpr int VK_ERROR_DEVICE_LOST = -1;
 struct VkSemaphoreSignalInfo { int type; int semaphore = 0; uint64_t value = 0; };
+constexpr bool SUCCEEDED(int code) { return code == 0; }
+struct D4rSplitFence { int Signal(uint64_t) { return 0; } }; // native D3D12 only: this test's path stays on nullptr
 struct Feature {
     std::mutex splitMutex;
     D4rFrameCompletion splitCompletion;
     uint64_t splitSignalled = 0;
     int splitSemaphore = 1;
+    D4rSplitFence* splitFence = nullptr; // the native D3D12 timeline: null here, so the Vulkan paths below run
     bool engineNetTimeline = false; // the Vulkan timeline of this test, not the native network's
     int engineNet = 0;
     void* ngxTimeline = nullptr;

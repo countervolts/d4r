@@ -11,7 +11,7 @@ host staging and command-buffer event synchronization; it does not use vkd3d-pro
 | Piece | Where | Role |
 |---|---|---|
 | OptiScaler (in GE-Proton) | external | Hooks the game's upscaler call and forwards DLSS requests to an NGX DLL (`NvngxPath`) |
-| NGX shim `d4r_nvngx.dll` | `tools/d4r_nvngx_shim.cpp` | Implements the NGX D3D12 API. Moves inputs and output between the game's D3D12 resources and CUDA, and drives the official NGX core through its CUDA API |
+| NGX shim `d4r_nvngx.dll` | `tools/d4r_nvngx_shim.cpp` and its units (`tools/d4r_nvngx_shim_*.cpp`, sharing `tools/d4r_nvngx_shim_internal.h`) | Implements the NGX D3D12 API. Moves inputs and output between the game's D3D12 resources and CUDA, and drives the official NGX core through its CUDA API |
 | NGX core + `nvngx_dlss.dll` and optional `nvngx_dlssd.dll` | NVIDIA, supplied by you | The real DLSS: parameter handling, Super Resolution or Ray Reconstruction network selection, and CUDA kernels |
 | CUDA bridge `nvcuda.dll` | `tools/wine_nvcuda_bridge.c` | A Wine builtin whose Windows exports forward to ZLUDA's Linux `libcuda.so`, plus d4r helpers (Vulkan memory import, asynchronous 2D copies, GPU-side waits, output redirect, linear textures) |
 | ZLUDA | `patches/zluda` | CUDA driver API on HIP; compiles NVIDIA's PTX to AMDGPU code; serves native kernels in place of PTX kernels |

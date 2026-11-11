@@ -51,7 +51,7 @@ struct FsrRrGlobal
 };
 static FsrRrGlobal g_fsr;
 
-static RrBackend rr_backend()
+RrBackend rr_backend()
 {
     const std::string value = ascii_lower(env_string("D4R_RR_BACKEND"));
     if (value.empty() || value == "auto" || value == "dlss")
@@ -61,7 +61,7 @@ static RrBackend rr_backend()
     return RrBackend::Invalid;
 }
 
-static const char* rr_backend_name(RrBackend backend)
+const char* rr_backend_name(RrBackend backend)
 {
     return backend == RrBackend::Fsr ? "FSR Ray Regeneration" : backend == RrBackend::Dlss ? "DLSS Ray Reconstruction"
                                                                                            : "invalid";
@@ -157,7 +157,7 @@ static void fsr_rr_message(uint32_t type, const wchar_t* message)
 
 // Loads the runtime and asks it for a provider on the game's device. Called once after NGX Init (the
 // device is known then), with g.mutex held. Cheap: no shader is built until a feature creates its context.
-static void fsr_rr_prepare_runtime()
+void fsr_rr_prepare_runtime()
 {
     d4r_fsr4_identity::OriginalIdentityScope originalIdentity;
     if (g_fsr.attempted)
@@ -202,18 +202,18 @@ static void fsr_rr_prepare_runtime()
          g_fsr.runtime.versionIds.size());
 }
 
-static bool fsr_rr_ready()
+bool fsr_rr_ready()
 {
     return g_fsr.ready;
 }
 
-static const char* fsr_rr_denial_reason()
+const char* fsr_rr_denial_reason()
 {
     return g_fsr.reason.c_str();
 }
 
 // Before Init there is no device to ask: offer the backend when its DLL is where it will be loaded from.
-static bool fsr_rr_present()
+bool fsr_rr_present()
 {
     return file_exists(fsr_rr_dll_path());
 }
@@ -283,11 +283,11 @@ struct FsrRrFeature
 static constexpr int kFsrRrStamps = 5; // before prepare, after prepare, after denoise, after compose, after SR
 
 static NgxResult create_feature_locked(unsigned int featureId, void* parameters, NgxHandle** handle, bool nativeVulkan);
-static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters);
+NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters);
 
 // Feature 13 with Backend = fsr. Called from create_feature with the API lock and g.mutex held, after
 // the feature's creation parameters were read.
-static NgxResult fsr_rr_create(Feature& feature, void* /*parameters: read by create_feature already*/)
+NgxResult fsr_rr_create(Feature& feature, void* /*parameters: read by create_feature already*/)
 {
     if (!fsr_rr_ready())
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
@@ -332,7 +332,7 @@ static NgxResult fsr_rr_create(Feature& feature, void* /*parameters: read by cre
 
 // Called by release_feature before the feature itself drains: the internal Super Sampling feature goes
 // first (it follows the same deferred path as any feature: its resources live until the GPU is done).
-static void fsr_rr_release(Feature& feature)
+void fsr_rr_release(Feature& feature)
 {
     FsrRrFeature* fsr = feature.fsr;
     if (fsr == nullptr || fsr->sr == nullptr)
@@ -344,7 +344,7 @@ static void fsr_rr_release(Feature& feature)
 }
 
 // After the GPU has finished every command list that recorded this feature.
-static void fsr_rr_destroy(Feature& feature)
+void fsr_rr_destroy(Feature& feature)
 {
     d4r_fsr4_identity::OriginalIdentityScope originalIdentity;
     FsrRrFeature* fsr = feature.fsr;
@@ -500,7 +500,7 @@ static bool fsr_rr_borrow(FsrRrFeature& fsr, ID3D12Resource* resource, D3D12_RES
     return true;
 }
 
-static bool fsr_rr_unorm(VkFormat format)
+bool fsr_rr_unorm(VkFormat format)
 {
     switch (format)
     {

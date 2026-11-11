@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -28,8 +30,8 @@ class ShimConfigTests(unittest.TestCase):
             self.assertEqual(subprocess.run(command, env=env, capture_output=True).returncode, 2)
 
     def test_portable_native_motion_opt_in_blocks_old_environment_override(self):
-        source = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
-        begin = source.index('    const bool live=', source.index('static void record_native_gpu_check('))
+        source = shim_source(ROOT)
+        begin = source.index('    const bool live=', source.index('void record_native_gpu_check('))
         policy = source[begin:source.index(';', begin) + 1]
         program = r'''
 #include <cassert>

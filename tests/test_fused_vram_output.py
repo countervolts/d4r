@@ -4,16 +4,16 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import definition_body, shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class FusedVramOutputTests(unittest.TestCase):
     def test_output_lifetime_and_fallback(self):
-        shim=(ROOT/'tools/d4r_nvngx_shim.cpp').read_text()
-        start=shim.index('static bool record_feature_vram_output(')
-        end=shim.index('// --- Split frames',start)
-        input_start=shim.index('static bool ensure_fused_color(')
-        input_end=shim.index('// Records the input copies',input_start)
+        shim=shim_source(ROOT)
+        output=definition_body(shim, 'bool record_feature_vram_output(')
+        colour=definition_body(shim, 'bool ensure_fused_color(')
         program=r'''
 #include <cassert>
 #include <cstddef>
@@ -63,7 +63,7 @@ static struct {
  void free(Set& s){++frees;s={};}
  void record(VkCommandBuffer,const Set&,unsigned,unsigned){++records;}
 } g_fusedColorStage;
-''' + shim[input_start:input_end] + shim[start:end] + r'''
+''' + colour + output + r'''
 int main() {
  ID3D12GraphicsCommandList list;ID3D12Resource output,changed;VramCopy copy;Feature f;
  enabled=false;assert(record_feature_vram_output(f,0,&list,&output,8,copy));assert(legacy==1 && views==0 && records==0);

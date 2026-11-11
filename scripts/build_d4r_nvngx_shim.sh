@@ -49,14 +49,23 @@ mkdir -p "$SPLIT_DIR"
 DXC="${DXC:-$(command -v dxc || true)}"
 [[ -n "$DXC" || -z "${VULKAN_SDK:-}" ]] || DXC="$VULKAN_SDK/Bin/dxc.exe"
 [[ -n "$DXC" && -x "$DXC" ]] || DXC="$(dirname "$VULKAN_INCLUDE")/Bin/dxc.exe"
+# A generated header is replaced only when its bytes changed. The shim's objects live on between runs, and a
+# header rewritten every time would ask every unit to compile again for nothing.
+write_if_changed() {
+  local target="$1" temp="$2"
+  if [[ -f "$target" ]] && cmp -s "$target" "$temp"; then rm -f "$temp"; else mv -f "$temp" "$target"; fi
+}
 if [[ -x "$DXC" ]]; then
-  : > "$SPLIT_DIR/d4r_split_shaders.h"
+  : > "$SPLIT_DIR/d4r_split_shaders.h.new"
   for entry in to_canonical from_canonical; do
-    "$DXC" -nologo -T cs_6_0 -E "$entry" -Vn "g_d4r_$entry" -Fh "$SPLIT_DIR/$entry.h" "$ROOT/tools/d4r_split_shaders.hlsl"
-    printf '#include "%s.h"\n' "$entry" >> "$SPLIT_DIR/d4r_split_shaders.h"
+    "$DXC" -nologo -T cs_6_0 -E "$entry" -Vn "g_d4r_$entry" -Fh "$SPLIT_DIR/$entry.h.new" "$ROOT/tools/d4r_split_shaders.hlsl"
+    write_if_changed "$SPLIT_DIR/$entry.h" "$SPLIT_DIR/$entry.h.new"
+    printf '#include "%s.h"\n' "$entry" >> "$SPLIT_DIR/d4r_split_shaders.h.new"
   done
+  write_if_changed "$SPLIT_DIR/d4r_split_shaders.h" "$SPLIT_DIR/d4r_split_shaders.h.new"
 else
-  printf '// built without dxc: no native D3D12 VRAM path\n#define D4R_NO_SPLIT_SHADERS 1\n' > "$SPLIT_DIR/d4r_split_shaders.h"
+  printf '// built without dxc: no native D3D12 VRAM path\n#define D4R_NO_SPLIT_SHADERS 1\n' > "$SPLIT_DIR/d4r_split_shaders.h.new"
+  write_if_changed "$SPLIT_DIR/d4r_split_shaders.h" "$SPLIT_DIR/d4r_split_shaders.h.new"
 fi
 PARAM_OBJECT="$ROOT/build/d4r_ngx_param_msvc.obj"
 # Dash-style options and a separate -o: MSYS2 (the native Windows build) would rewrite /flags as paths.
@@ -98,8 +107,63 @@ if [[ -n "$HIP_SOURCES" ]]; then
     "$ROOT/engine/d3d12/hip_net_bridge.cpp" $HIP_SOURCES $HIP_LIBS -luuid -ld3d12 -ldxgi -o "$ROOT/build/d4r_hip_net.dll"
   printf 'Built %s\n' "$ROOT/build/d4r_hip_net.dll"
 fi
+# The shim is several translation units sharing tools/d4r_nvngx_shim_internal.h, so an edit to one of them
+# recompiles that one file instead of the whole shim. They are compiled in parallel, their objects kept for
+# the next run, and then linked with the engine sources into one DLL.
+SHIM_FLAGS=(-std=c++20 -O2 -Wall -Wextra -Wno-missing-field-initializers -DD4R_ENGINE_VK_TABLE $HIP_DEFINES
+  -MMD -I"$ROOT/build/vulkan-include" -I"$ROOT/build/vulkan-staging" -I"$SPLIT_DIR")
+SHIM_CORE="$ROOT/tools/d4r_nvngx_shim.cpp"
+SHIM_HEADER="$ROOT/tools/d4r_nvngx_shim_internal.h"
+SHIM_SOURCES=("$ROOT"/tools/d4r_nvngx_shim*.cpp)
+SHIM_OBJ_DIR="$ROOT/build/shim-objects"
+SHIM_ID_FILE="$SHIM_OBJ_DIR/.build-id"
+SHIM_FLAGS_FILE="$SHIM_OBJ_DIR/.flags"
+mkdir -p "$SHIM_OBJ_DIR"
+# Only d4r_nvngx_shim.cpp prints the build id, so only its object is tied to it: an edit to another unit,
+# or to any engine source, costs one recompile. These two files are stamped when their content changes,
+# and an object older than its stamp is compiled again.
+if [[ ! -f "$SHIM_ID_FILE" || "$(cat "$SHIM_ID_FILE")" != "$BUILD_ID" ]]; then
+  printf '%s\n' "$BUILD_ID" > "$SHIM_ID_FILE"
+fi
+shim_flags="${SHIM_FLAGS[*]}"
+if [[ ! -f "$SHIM_FLAGS_FILE" || "$(cat "$SHIM_FLAGS_FILE")" != "$shim_flags" ]]; then
+  printf '%s\n' "$shim_flags" > "$SHIM_FLAGS_FILE"
+fi
+SHIM_JOBS=8
+CPUS="$(nproc 2>/dev/null || echo 8)"
+(( CPUS > SHIM_JOBS )) && SHIM_JOBS=$CPUS
+# An object is kept when nothing it was compiled from is newer than it. What that was is in the -MMD file its
+# last compile wrote; a unit that has none (a first build, or a compiler without -MMD) simply compiles again.
+shim_up_to_date() {
+  local object="$1" prerequisites="${object%.*}.d" file
+  [[ -e "$object" ]] || return 1
+  [[ -e "$prerequisites" ]] || return 1
+  while read -r file; do
+    [[ -n "$file" ]] || continue
+    [[ -e "$file" ]] || return 1                    # a header went away: compile again
+    if [[ "$file" -nt "$object" ]]; then return 1; fi
+  done < <(sed -e '1s/^[^:]*://' -e 's/\\$//' "$prerequisites" | tr -s ' \\\n' '\n')
+  return 0
+}
+SHIM_OBJECTS=()
+shim_compiled=0
+for source in "${SHIM_SOURCES[@]}"; do
+  object="$SHIM_OBJ_DIR/$(basename "${source%.cpp}").obj"
+  SHIM_OBJECTS+=("$object")
+  if shim_up_to_date "$object" && [[ "$object" -nt "$SHIM_FLAGS_FILE" ]] &&
+     { [[ "$source" != "$SHIM_CORE" ]] || [[ "$object" -nt "$SHIM_ID_FILE" ]]; }; then
+    continue
+  fi
+  args=("${SHIM_FLAGS[@]}")
+  [[ "$source" == "$SHIM_CORE" ]] && args+=("-DD4R_RUNTIME_BUILD_ID=\"$BUILD_ID\"")
+  while (( $(jobs -rp | wc -l) >= SHIM_JOBS )); do wait -n; done
+  "$MINGW_CXX" "${args[@]}" -c "$source" -o "$object" &
+  shim_compiled=$((shim_compiled + 1))
+done
+while (( $(jobs -rp | wc -l) > 0 )); do wait -n; done
+printf 'compiled %d of %d shim units\n' "$shim_compiled" "${#SHIM_SOURCES[@]}"
 "$MINGW_CXX" -std=c++20 -O2 -Wall -Wextra -Wno-missing-field-initializers -DD4R_ENGINE_VK_TABLE $HIP_DEFINES "-DD4R_RUNTIME_BUILD_ID=\"$BUILD_ID\"" -I"$ROOT/build/vulkan-include" -I"$ROOT/build/vulkan-staging" -I"$SPLIT_DIR" -shared -static -static-libgcc -static-libstdc++ \
-  "$ROOT/tools/d4r_nvngx_shim.cpp" "$ROOT/tools/d4r_ngx_param_host.cpp" "$PARAM_OBJECT" \
+  "${SHIM_OBJECTS[@]}" "$ROOT/tools/d4r_ngx_param_host.cpp" "$PARAM_OBJECT" \
   -I"$ROOT/build/vkhip" "$ROOT/engine/vkhip/vkhip.cpp" "$ROOT/engine/vkhip/vkhip_net.cpp" \
   "$ROOT/engine/runtime.cpp" "$ROOT/engine/k_frame.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" "$ROOT/engine/game_rr.cpp" "$ROOT/engine/game_e.cpp" "$ROOT/engine/vk_dispatch.cpp" \
   "$ROOT/engine/d3d12/runtime_d3d12.cpp" "$ROOT/engine/d3d12/game_d3d12.cpp" \

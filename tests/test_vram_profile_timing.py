@@ -4,13 +4,15 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT=Path(__file__).resolve().parents[1]
 
 
 class VramProfileTimingTests(unittest.TestCase):
     def test_older_slot_mode_labels(self):
-        source=(ROOT/'tools/d4r_nvngx_shim.cpp').read_text()
-        start=source.index('static void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTiming& timing)\n{')
+        source=shim_source(ROOT)
+        start=source.index('void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTiming& timing)\n{')
         end=source.index('\n}\n',start)+3
         program=r'''
 #include <cassert>

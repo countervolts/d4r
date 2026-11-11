@@ -45,7 +45,11 @@ def main():
         lines.append(f'static const uint32_t d4r_vk_{path.stem}[] = {{')
         lines.extend(','.join(f'0x{w:08x}' for w in words[i:i + 8]) + ',' for i in range(0, len(words), 8))
         lines.append('};')
-    (out / 'd4r_vulkan_staging_spv.h').write_text('\n'.join(lines) + '\n', newline='\n')
+    # written only when it changed, so a rebuild that touched nothing keeps its objects
+    header = out / 'd4r_vulkan_staging_spv.h'
+    text = '\n'.join(lines) + '\n'
+    if not header.exists() or header.read_text() != text:
+        header.write_text(text, newline='\n')
 
 
 if __name__ == '__main__':

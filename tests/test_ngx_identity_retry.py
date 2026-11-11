@@ -5,13 +5,15 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(shutil.which('c++'), 'needs C++ compiler')
 class NgxIdentityRetryTests(unittest.TestCase):
     def test_capability_rejection_shutdown_and_identity_boundaries(self):
-        shim = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
+        shim = shim_source(ROOT)
         block = shim[shim.index('    const bool hasProject = project != nullptr && !project->id.empty();'):]
         block = block[:block.index('    using LoadErrorFn')]
         source = r'''

@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -14,7 +16,7 @@ class ExposureFormatTests(unittest.TestCase):
     def test_multichannel_exposure_uses_red_with_correct_texel_stride(self):
         compiler = shutil.which('c++') or str(
             ROOT / '.tools/llvm-mingw-20261020-ucrt-x86_64/bin/clang++.exe')
-        source = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
+        source = shim_source(ROOT)
         conversions = source[source.index('static uint16_t float_to_half('):
                              source.index('// Formats whose texels')]
         program = r'''

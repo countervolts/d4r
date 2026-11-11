@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -101,9 +103,9 @@ int main() {
 ''')
 
     def test_actual_release_and_drain_helpers_preserve_real_markers_and_ownership(self):
-        shim = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
-        release = function(shim, 'static void release_ngx_input_wait_locked(')
-        complete = function(shim, 'static bool complete_ngx_input_wait(Feature& feature, uint32_t frame, bool abort)\n{')
+        shim = shim_source(ROOT)
+        release = function(shim, 'void release_ngx_input_wait_locked(Feature& feature, const char* reason, bool disable)\n{')
+        complete = function(shim, 'bool complete_ngx_input_wait(Feature& feature, uint32_t frame, bool abort)\n{')
         run(r'''
 #include <atomic>
 #include <cassert>

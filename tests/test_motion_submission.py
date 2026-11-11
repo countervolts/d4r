@@ -4,14 +4,16 @@ import subprocess
 import tempfile
 import unittest
 
+from shim_source import shim_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class MotionSubmissionTests(unittest.TestCase):
     def test_gpu_wait_requires_a_warm_compatible_lds_slot(self):
-        source = (ROOT / 'tools/d4r_nvngx_shim.cpp').read_text()
+        source = shim_source(ROOT)
         begin = source.index('static bool motion_dilation_parameters(')
-        end = source.index('static CudaObject prepare_dilated_motion(', begin)
+        end = source.index('CudaObject prepare_dilated_motion(', begin)
         program = r'''
 #include "d4r_motion_dilation.h"
 #include <cassert>

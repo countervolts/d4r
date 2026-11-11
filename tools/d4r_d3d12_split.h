@@ -50,6 +50,15 @@ inline std::atomic<bool> ready{false};
 } // namespace detail
 } // namespace d4r_split
 
+#if defined(D4R_D3D12_SPLIT_DECL)
+// The stubs and their tables are assembled once, in the unit that owns the DLL entry point; a unit that only
+// redirects through them reads the tables from there.
+extern "C" {
+extern void* d4r_split_original[d4r_split::MaxSlots];  // the used attribute belongs to its definition
+extern void* d4r_split_thunks[d4r_split::MaxSlots];
+void* d4r_split_target(void* self);
+}
+#else
 extern "C" {
 // the original methods, by vtable slot (used by the stubs below)
 __attribute__((used)) void* d4r_split_original[d4r_split::MaxSlots] = {};
@@ -121,6 +130,7 @@ d4r_split_thunks:
     .noaltmacro
     .text
 )");
+#endif  // D4R_D3D12_SPLIT_DECL
 
 namespace d4r_split {
 namespace detail {
