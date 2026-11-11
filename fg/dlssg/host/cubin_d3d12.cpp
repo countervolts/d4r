@@ -366,6 +366,21 @@ struct Exec {
     VkDeviceAddress infoAddr = 0, flagAddr = 0;
 
     ID3D12DescriptorHeap* scratchHeap = nullptr;   // companion SRV/UAV descriptors
+    // DXIL route (spike: CUX_DXIL = folder of compiled kernels, CUX_DXIL_KERNELS = entry names)
+    ID3D12DescriptorHeap* dxViews = nullptr;     // shader visible: textures at slot, surfaces at 65536 + slot
+    ID3D12DescriptorHeap* dxSamplers = nullptr;  // shader visible: samplers at slot
+    uint8_t* dxViewsCpu = nullptr;
+    uint8_t* dxSamplersCpu = nullptr;
+    UINT dxViewInc = 0, dxSmpInc = 0;
+    ID3D12Resource* dxInfo = nullptr;            // upload: the info words
+    uint8_t* dxInfoMap = nullptr;
+    ID3D12Resource* dxCb = nullptr;              // upload: per-launch constant buffers (ring)
+    uint8_t* dxCbMap = nullptr;
+    uint64_t dxCbNext = 0;
+    ID3D12RootSignature* dxRs = nullptr;
+    bool dxTried = false, dxOk = false;
+    uint64_t infoGen = 1, dxInfoGen = 0;
+    uint64_t dxLaunches = 0;
     UINT scratchInc = 0, scratchNext = 0;
 
     std::map<std::string, uint32_t> viewSlots;     // descriptor bytes -> slot
@@ -1056,12 +1071,15 @@ uint32_t viewSlot(D3D12_CPU_DESCRIPTOR_HANDLE h, bool uav)
     VkFormat vf = vkFormat(fmt);
     uint32_t cls = formatClass(vf) | formatRaw(vf) << 8;
     memcpy(g.dmap + g.boff[uav ? 1 : 0] + (size_t)slot * g.imgSize, (const void*)h.ptr, g.imgSize);
+    if (g.dxViewsCpu) memcpy(g.dxViewsCpu + (size_t)((uav ? 65536u : 0u) + slot) * g.dxViewInc, (const void*)h.ptr, g.dxViewInc);
     g.info[kMaxSamplers * 4 + (uav ? 0 : kMaxImages) + slot] = cls;
+    g.infoGen++;
     std::vector<uint8_t> other;
     DXGI_FORMAT ofmt = DXGI_FORMAT_UNKNOWN;
     bool comp = known && companion(v, other, ofmt);
     if (comp) {
         memcpy(g.dmap + g.boff[uav ? 0 : 1] + (size_t)slot * g.imgSize, other.data(), g.imgSize);
+        if (g.dxViewsCpu) memcpy(g.dxViewsCpu + (size_t)((uav ? 0u : 65536u) + slot) * g.dxViewInc, other.data(), g.imgSize);
         VkFormat of = vkFormat(ofmt);
         g.info[kMaxSamplers * 4 + (uav ? kMaxImages : 0) + slot] = formatClass(of) | formatRaw(of) << 8;
     }
@@ -1082,6 +1100,8 @@ uint32_t samplerSlot(D3D12_CPU_DESCRIPTOR_HANDLE h)
     if (g.nextSampler >= kMaxSamplers) return 0;
     uint32_t slot = g.nextSampler++;
     memcpy(g.dmap + g.boff[2] + (size_t)slot * g.smpSize, (const void*)h.ptr, g.smpSize);
+    if (g.dxSamplersCpu && slot < 2048) memcpy(g.dxSamplersCpu + (size_t)slot * g.dxSmpInc, (const void*)h.ptr, g.dxSmpInc);
+    g.infoGen++;
     D3D12_SAMPLER_DESC sd{};
     bool known;
     {
@@ -1197,6 +1217,102 @@ bool patchSlot(void** vtable, size_t slot, void* hook, void** original)
     return true;
 }
 
+// ---- DXIL route, pointer heap: DLSS-G's buffers in heaps of ours, each spanned by one raw buffer, so a CUDA pointer
+// into any of them is an offset into that buffer (ptr - span VA). DLSS-G creates committed default-heap buffers inside
+// its calls (FgScope); those become placed resources here. Fresh heap memory is zeroed, as committed memory is.
+struct PtrHeap { ID3D12Heap* heap = nullptr; ID3D12Resource* span = nullptr; uint64_t va = 0, size = 0, used = 0; };
+std::vector<PtrHeap> g_ptrHeaps;
+std::mutex g_ptrLock;
+bool g_ptrHeapOff = false;
+static const bool g_ptrHeapOn = getenv("CUX_PTRHEAP") != nullptr;
+void* o_committed = nullptr;
+void* o_placed = nullptr;
+static const uint64_t kPtrHeapBytes = 256ull << 20;
+
+HRESULT STDMETHODCALLTYPE pCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                     const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                     REFIID riid, void** ppv)
+{
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                           const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                           REFIID, void**);
+    auto orig = (Fn)o_committed;
+    if (t_fg == 0 || g_ptrHeapOff || !hp || hp->Type != D3D12_HEAP_TYPE_DEFAULT || !d ||
+        d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (f & ~(D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES |
+                                                                     D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)) || !ppv)
+        return orig(dv, hp, f, d, st, cv, riid, ppv);
+    D3D12_RESOURCE_ALLOCATION_INFO ai = dv->GetResourceAllocationInfo(0, 1, d);
+    uint64_t align = std::max<uint64_t>(ai.Alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    PtrHeap* h = nullptr;
+    uint64_t off = 0;
+    for (auto& c : g_ptrHeaps) {
+        uint64_t o = (c.used + align - 1) / align * align;
+        if (o + ai.SizeInBytes <= c.size) { h = &c; off = o; break; }
+    }
+    if (!h) {
+        PtrHeap c;
+        c.size = std::max<uint64_t>(kPtrHeapBytes, (ai.SizeInBytes + 0xffff) & ~0xffffull);
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = c.size;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        D3D12_RESOURCE_DESC sd{};
+        sd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        sd.Width = c.size;
+        sd.Height = sd.DepthOrArraySize = sd.MipLevels = 1;
+        sd.SampleDesc.Count = 1;
+        sd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(dv->CreateHeap(&hd, __uuidof(ID3D12Heap), (void**)&c.heap)) ||
+            FAILED(dv->CreatePlacedResource(c.heap, 0, &sd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                            (void**)&c.span))) {
+            logf("pointer heap: creating a %llu MB heap failed: DLSS-G's buffers stay committed",
+                 (unsigned long long)(c.size >> 20));
+            g_ptrHeapOff = true;
+            return orig(dv, hp, f, d, st, cv, riid, ppv);
+        }
+        c.va = c.span->GetGPUVirtualAddress();
+        g_ptrHeaps.push_back(c);
+        h = &g_ptrHeaps.back();
+        off = 0;
+        logf("pointer heap %zu: %llu MB at 0x%llx", g_ptrHeaps.size() - 1, (unsigned long long)(c.size >> 20),
+             (unsigned long long)c.va);
+    }
+    HRESULT hr = dv->CreatePlacedResource(h->heap, off, d, st, cv, riid, ppv);
+    if (FAILED(hr) || !*ppv) return orig(dv, hp, f, d, st, cv, riid, ppv);
+    ID3D12Resource* r = nullptr;
+    ((IUnknown*)*ppv)->QueryInterface(__uuidof(ID3D12Resource), (void**)&r);
+    uint64_t va = r ? r->GetGPUVirtualAddress() : 0;
+    if (r) r->Release();
+    if (va != h->va + off) {
+        logf("pointer heap: a placed buffer is at 0x%llx, not heap VA + offset 0x%llx: pointer heap off",
+             (unsigned long long)va, (unsigned long long)(h->va + off));
+        g_ptrHeapOff = true;
+    }
+    h->used = off + ai.SizeInBytes;
+    static int logged = 0;
+    if (logged++ < 4)
+        logf("pointer heap: DLSS-G buffer of %llu bytes placed at offset %llu (0x%llx)", (unsigned long long)d->Width,
+             (unsigned long long)off, (unsigned long long)va);
+    return hr;
+}
+
+uint64_t ptrHeapSpanVa()
+{
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    if (g_ptrHeapOff || g_ptrHeaps.size() != 1) return 0;   // spike: one heap
+    return g_ptrHeaps[0].va;
+}
+
+void hookPointerHeap(ID3D12Device* d)
+{
+    void** vt = *reinterpret_cast<void***>(d);
+    bool ok = patchSlot(vt, 27, (void*)&pCommitted, &o_committed);
+    logf("pointer heap: DLSS-G's committed buffers %s", ok ? "redirected into heaps of ours" : "NOT redirected (hook failed)");
+}
+
 void hookDevice(ID3D12Device* d)
 {
     static bool done = false;
@@ -1210,6 +1326,7 @@ void hookDevice(ID3D12Device* d)
               patchSlot(vt, 22, (void*)&hCreateSampler, (void**)&o_createSampler) &&
               patchSlot(vt, 24, (void*)&hCopySimple, (void**)&o_copySimple);
     logf("device %p: descriptor creation hooks %s", (void*)d, ok ? "installed" : "FAILED");
+    if (g_ptrHeapOn) hookPointerHeap(d);
 }
 
 } // namespace
@@ -2193,6 +2310,146 @@ bool installListHooks(ID3D12Device* d3d)
     return ok;
 }
 
+// ------------------------------------------------------------------------------------------------ DXIL route (spike)
+// A kernel compiled to DXIL (fg/dlssg/translator/glsl2hlsl.py + rt.hlsl) runs as a D3D12 dispatch recorded straight
+// into DLSS-G's command list. In the spike it is D3D12 work between two Vulkan batches (the batch ends there, as at
+// any other D3D12 call), so single kernels can be checked against the Vulkan route on the same frames.
+static const char* g_dxDir = getenv("CUX_DXIL");
+static const char* g_dxKernels = getenv("CUX_DXIL_KERNELS");
+struct DxPso { ID3D12PipelineState* pso = nullptr; bool tried = false; };
+std::map<std::string, DxPso> g_dxPsos;
+
+bool dxInit()
+{
+    if (g.dxTried) return g.dxOk;
+    g.dxTried = true;
+    if (!g_dxDir || !g.d3d) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 131072, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.d3d->CreateDescriptorHeap(&vd, __uuidof(ID3D12DescriptorHeap), (void**)&g.dxViews)) ||
+        FAILED(g.d3d->CreateDescriptorHeap(&sd, __uuidof(ID3D12DescriptorHeap), (void**)&g.dxSamplers))) {
+        logf("DXIL route: descriptor heaps failed");
+        return false;
+    }
+    g.dxViewInc = g.d3d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g.dxSmpInc = g.d3d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    g.dxViewsCpu = (uint8_t*)g.dxViews->GetCPUDescriptorHandleForHeapStart().ptr;
+    g.dxSamplersCpu = (uint8_t*)g.dxSamplers->GetCPUDescriptorHandleForHeapStart().ptr;
+    auto upload = [](uint64_t size, ID3D12Resource** r, uint8_t** map) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return SUCCEEDED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                        nullptr, __uuidof(ID3D12Resource), (void**)r)) &&
+               SUCCEEDED((*r)->Map(0, nullptr, (void**)map));
+    };
+    if (!upload(kInfoBytes, &g.dxInfo, &g.dxInfoMap) || !upload(16ull << 20, &g.dxCb, &g.dxCbMap)) {
+        logf("DXIL route: upload buffers failed");
+        return false;
+    }
+    // descriptors registered before the heaps existed
+    for (auto& kv : g.viewSlots) {
+        uint32_t slot = kv.second;
+        bool uav = kv.first[0] == 'u';
+        memcpy(g.dxViewsCpu + (size_t)((uav ? 65536u : 0u) + slot) * g.dxViewInc, g.dmap + g.boff[uav ? 1 : 0] + (size_t)slot * g.imgSize, g.imgSize);
+        memcpy(g.dxViewsCpu + (size_t)((uav ? 0u : 65536u) + slot) * g.dxViewInc, g.dmap + g.boff[uav ? 0 : 1] + (size_t)slot * g.imgSize, g.imgSize);
+    }
+    for (auto& kv : g.samplerSlots)
+        if (kv.second < 2048) memcpy(g.dxSamplersCpu + (size_t)kv.second * g.dxSmpInc, kv.first.data() + 1, std::min<size_t>(g.dxSmpInc, kv.first.size() - 1));
+    g.dxOk = true;
+    logf("DXIL route (spike): kernels from %s: %s", g_dxDir, g_dxKernels ? g_dxKernels : "(none)");
+    return true;
+}
+
+ID3D12PipelineState* dxPso(CuFunction& fn, const uint32_t block[3])
+{
+    bool hw = g_cfg.texHw;
+    char key[64];
+    snprintf(key, sizeof key, ".%ux%ux%u", block[0], block[1], block[2]);
+    std::string k = fn.name + key;
+    DxPso& e = g_dxPsos[k];
+    if (e.tried) return e.pso;
+    e.tried = true;
+    std::vector<uint8_t> blob;
+    std::string base = std::string(g_dxDir) + "/" + fn.module->hash.substr(0, 8) + "_" + fn.name;
+    std::string path = base + (hw ? ".hw" : "") + key + ".dxil";
+    if (!(hw && readFile(path, blob)) && !readFile(path = base + key + ".dxil", blob)) {
+        logf("DXIL route: no %s", path.c_str());
+        return nullptr;
+    }
+    if (!g.dxRs && FAILED(g.d3d->CreateRootSignature(0, blob.data(), blob.size(), __uuidof(ID3D12RootSignature), (void**)&g.dxRs))) {
+        logf("DXIL route: root signature from %s failed", path.c_str());
+        return nullptr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g.dxRs;
+    pd.CS = {blob.data(), blob.size()};
+    HRESULT hr = g.d3d->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), (void**)&e.pso);
+    logf("DXIL route: %s %s (0x%08lx)", path.c_str(), SUCCEEDED(hr) ? "loaded" : "FAILED", (unsigned long)hr);
+    if (FAILED(hr)) e.pso = nullptr;
+    return e.pso;
+}
+
+bool dxWanted(const CuFunction& fn)
+{
+    if (!g_dxDir || !g_dxKernels) return false;
+    std::string list = std::string(",") + g_dxKernels + ",";
+    return list.find("," + fn.name + ",") != std::string::npos || list.find(",*,") != std::string::npos;
+}
+
+// records fn as a D3D12 dispatch into the list (the Vulkan batch ends before it); false: the Vulkan route runs it
+bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
+{
+    if (!dxWanted(fn) || fn.meta.t1_dispatch || psize > 4096 || !dxInit()) return false;
+    if (!g.groups.empty() && g.groupFirst.count(fn.gkey)) return false;
+    uint64_t span = ptrHeapSpanVa();
+    if (!span) return false;
+    ID3D12PipelineState* pso = dxPso(fn, block);
+    if (!pso) return false;
+    Chain* c = chainFor(list, true);
+    if (!c || c->closed) return false;
+    List* t = c->target.load();
+    if (!t) t = c->list.load();
+    c->dirty.store(true);   // the next Vulkan launch starts a batch after this D3D12 work
+    if (g.dxInfoGen != g.infoGen) {
+        memcpy(g.dxInfoMap, g.info, kInfoBytes);
+        g.dxInfoGen = g.infoGen;
+    }
+    if (g.dxCbNext + 4352 > (16ull << 20)) g.dxCbNext = 0;   // ~3800 launches per lap: frames in flight are far fewer
+    uint64_t off = g.dxCbNext;
+    g.dxCbNext += 4352;
+    uint8_t* cb = g.dxCbMap + off;
+    uint32_t ext[8] = {(uint32_t)span, (uint32_t)(span >> 32), 0, 0, grid[0], grid[1], grid[2], 0};
+    memcpy(cb, ext, sizeof ext);
+    if (pbuf && psize) memcpy(cb + 32, pbuf, psize);
+    using SetHeaps = void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*);
+    using SetRs = void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*);
+    using SetPso = void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*);
+    using SetView = void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+    using Disp = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT);
+    using Barrier = void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RESOURCE_BARRIER*);
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    ID3D12DescriptorHeap* heaps[2] = {g.dxViews, g.dxSamplers};
+    orig<SetHeaps>(t, 28)(t, 2, heaps);
+    orig<SetRs>(t, 29)(t, g.dxRs);
+    orig<SetPso>(t, 25)(t, pso);
+    orig<SetView>(t, 37)(t, 0, g.dxCb->GetGPUVirtualAddress() + off);
+    orig<SetView>(t, 41)(t, 1, span);
+    orig<SetView>(t, 39)(t, 2, g.dxInfo->GetGPUVirtualAddress());
+    orig<Disp>(t, 14)(t, grid[0], grid[1], grid[2]);
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    replay(c, t);   // DLSS-G's own heaps, root signature, pipeline and root arguments
+    if (g_splitLog) c->trace += " D:" + fn.name.substr(0, 40);
+    if (g.dxLaunches++ < 4) logf("DXIL route: %s grid %ux%ux%u block %ux%ux%u", fn.name.c_str(), grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    return true;
+}
+
 // ------------------------------------------------------------------------------------------------ launches
 bool ringTake(std::vector<uint32_t>& free, std::vector<uint32_t> Exec::CmdSlots::*which, VkCommandBuffer cmd, uint32_t& slot)
 {
@@ -2304,6 +2561,7 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
         fn.warned = true;
         return;
     }
+    if (dxLaunch(list, fn, grid, block, pbuf, psize)) return;
     Batch* b = batchFor(list);
     if (!b) return;
     if (g_splitLog) if (Chain* tc = findChain(nativeList(list))) tc->trace += " K:" + fn.name.substr(0, 40);

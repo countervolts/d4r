@@ -1038,3 +1038,32 @@ GPU engine counters (harness): graphics family -> "3d" only; compute family -> "
 - Owner: still not as smooth as Linux, where FG and the game share one Vulkan device (no cross-device hand-offs at
   all). What is left on Windows: a ~0.5 ms cross-device round trip per generated frame on the game's compute queue.
   Next: the kernels as D3D12 compute in the game's own queue (DXIL route).
+
+### 2026-11-11: DXIL route, spike (owner's go-ahead; validation by image quality accepted for this route)
+
+Goal: the kernels as D3D12 compute in DLSS-G's own command list (the game's queue): no second device, no hand-offs,
+no Windows scheduling between devices. Off unless enabled; the default route is unchanged (guards byte-identical).
+- **Pointers.** DLSS-G creates only committed resources (no heaps, no placed resources: 204 creations logged), and
+  every pointer its kernels receive lies in one of 36 default-heap buffers (108 MB). Its default-heap buffers created
+  inside its calls (FgScope) now go into 256 MB heaps of ours as placed resources (`CUX_PTRHEAP=1`); a raw buffer
+  spans each heap, and every placed buffer sits at span VA + offset (checked per buffer). A CUDA pointer p is byte
+  p - span VA of one RWByteAddressBuffer. Vulkan route output byte-identical with the redirection on.
+- **Kernels.** `translator/glsl2hlsl.py` converts ptxc's GLSL (rt.glsl inlined verbatim in 156 of 157 files) to HLSL:
+  rt.glsl -> `translator/rt.hlsl` (same helpers on D3D12, SM 6.6 descriptor heaps, exact f32 -> f16 RNE because AMD's
+  D3D12 compiler truncates, the NVX_SW_CLAMP fetch path because D3D12 samplers have no unnormalized coordinates),
+  NvxT(a).v accessors -> functions over the raw buffer, aliased shared-memory blocks -> one groupshared array plus
+  views (`rt_smem.hlsli`), barriers, wave32. dxc 6.6: 75 of 126 kernel files compile (all but the network
+  convolutions: cooperative matrices / T1 kernels).
+- **Executor spike** (`CUX_DXIL=<folder of .dxil>`, `CUX_DXIL_KERNELS=<names>|*`): our shader-visible heaps mirror
+  the descriptors (raw bytes), one constant-buffer ring slot per launch (pointer-heap base, group counts, parameters),
+  the dispatch is recorded into DLSS-G's list with UAV barriers around it and DLSS-G's bound state replayed after.
+  Mixed with the Vulkan route (a DXIL kernel is D3D12 work between two batches).
+- **Results (harness, 4x Lite, --outreal):** all 15 non-network kernels Lite uses on DXIL, the network on Vulkan:
+  Exact=0 (default): generated frames and OutputReal **byte-identical** to the Vulkan route; 3.66 ms per real frame
+  even with the extra hand-offs of the mix. Exact=1: frames 2 and 3 identical, frame 1 differs; bisected to
+  Kernel_DL1Net_Input and Kernel_DownsampleRGBAndEstimateUIFused (suspect: GLSL fma is fused, rt.hlsl maps it to mad).
+- Next: the network. Lite's convolutions run as T1 kernels (fg/dlssg/t1 templates, GLSL cooperative matrices);
+  they need an HLSL form on AMD's WMMA intrinsics, which the engine already reaches on the game's own device through
+  the reserved register space (engine/d3d12/ags_wmma.hlsli, coopmat_ags.hlsli). k_pooling / k_upscale /
+  k_element_wise convert already. Then: run-time compilation and caching (dxcompiler), the whole list on DXIL with
+  no Vulkan batch, the timing in game.
