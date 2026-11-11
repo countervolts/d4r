@@ -1067,3 +1067,36 @@ no Windows scheduling between devices. Off unless enabled; the default route is 
   the reserved register space (engine/d3d12/ags_wmma.hlsli, coopmat_ags.hlsli). k_pooling / k_upscale /
   k_element_wise convert already. Then: run-time compilation and caching (dxcompiler), the whole list on DXIL with
   no Vulkan batch, the timing in game.
+
+### 2026-11-11: DXIL route complete for FG Lite (default mode)
+
+- **The network.** Lite's convolutions (T1 kernels, GLSL cooperative matrices on shared memory) convert to AMD's WMMA
+  intrinsics through the engine's wrappers (engine/d3d12/ags_wmma.hlsli: matrixSharedLoad / Store, matrixConvert,
+  matrixMultiplyAdd; the reserved register space works on the game's own device, no AGS device creation): the kernel's
+  shared memory is AGS's matrixShared, f16 offsets / strides become words, matrix variables keep their type and use.
+  Pointer accessors are parsed with balanced parentheses (addresses nest). A standalone test (wmma_test, plain D3D12
+  device, the route's root signature) checks the product against the CPU; a plain-HLSL emulation (wmma_emul.hlsli,
+  -DNVX_WMMA_EMULATE) passes the same test and serves to tell conversion bugs from AGS ones.
+- **Found: AMD's D3D12 driver packs 2D thread groups into waves in tiles.** Probe (32x8 group, WaveSize 32): the wave
+  holding thread 31 starts at thread 16 (16x2 tiles). Vulkan's subgroups are consecutive invocation indices, which the
+  kernels rely on (subgroup ids, shuffles, matrix operations): the converted convolution came out 5.8 dB, every odd
+  wave wrong (convcmp: one module on Vulkan and on D3D12 with the same random data). A 1D group's waves are
+  consecutive (probe), so every kernel now runs as numthreads(BX*BY*BZ, 1, 1) with the local id rebuilt from the flat
+  index: the convolution module is then **byte-identical** to the Vulkan route's (0 of 32768 outputs differ).
+- **Whole frame on DXIL** (`[Host] Route=dxil`): DLSS-G's buffers in the pointer heap, every kernel a D3D12 dispatch
+  in DLSS-G's own list, clears and the OutputReal copy plain D3D12 commands: **no Vulkan batch, no hand-off**.
+  `translator/build_hlsl.py CACHE` writes every kernel's HLSL into CACHE/hlsl (105 of 128 files; not yet: the full
+  model's T1 kernels with accumulator arrays and the exact-mode convolutions with element access, which keep the
+  Vulkan route); the host compiles each kernel / variant / block shape on first use with `[Host] Dxc` (dxc.exe; 47-687
+  ms each, 40 kernels 5.8 s once) into CACHE/dxil.
+- Output, harness 4x Lite, default mode: generated frames 1-2 and OutputReal byte-identical to the Vulkan route, frame
+  3 118.6 dB (a few bytes off by one). Exact mode: a hybrid for now (convolutions on Vulkan), >= 115 dB.
+- **Speed, harness, --outreal (game-like), A B B A x3, GPU ms per real frame:**
+
+| FG Lite | Vulkan route (default) | DXIL route | target | Linux |
+|---|---:|---:|---:|---:|
+| 2x | 2.880 | 2.522 | <= 2.9 | 2.86 |
+| 4x | 3.824 | 3.494 | <= 3.9 | 3.83 |
+| 6x | 4.931 | 4.473 | <= 4.9 | 4.81 |
+
+  Default route unchanged (guards byte-identical). Next: the game.

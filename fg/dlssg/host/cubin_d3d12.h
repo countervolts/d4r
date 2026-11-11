@@ -20,6 +20,8 @@ struct Config {
                                // graphics queue as Streamline's async compute queue would; else time-sliced with it)
     bool vkCopies = true;    // CopyResource between kernels runs on the kernels' queue where it is exact (no hand-off)
     unsigned queuePriority = 0; // global priority of the kernels' queue: 0 driver default, 1 low, 2 medium, 3 high, 4 realtime
+    bool dxil = false;         // the kernels as D3D12 compute in DLSS-G's own command lists (no Vulkan device)
+    std::wstring dxc;          // dxc.exe that compiles them on first use (CACHE/hlsl -> CACHE/dxil)
     bool splitQueries = false; // timestamps, query resolves to readback memory and PIX markers end a kernel batch
 };
 

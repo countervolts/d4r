@@ -213,6 +213,8 @@ void setupCubin(const std::wstring& dir)
     c.vkClears = iniUInt(L"VkClears", 1) != 0;
     c.vkCopies = iniUInt(L"VkCopies", 1) != 0;
     c.queuePriority = iniUInt(L"QueuePriority", 0);
+    c.dxil = !_wcsicmp(iniString(L"Route", L"vulkan").c_str(), L"dxil");
+    c.dxc = iniString(L"Dxc", (dir + L"dxc\dxc.exe").c_str());
     c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
     c.splitLog = iniUInt(L"SplitLog", 0) != 0;
     c.kernelTiming = iniUInt(L"KernelTiming", 0) != 0;

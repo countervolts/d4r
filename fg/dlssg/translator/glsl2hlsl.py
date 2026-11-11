@@ -68,12 +68,108 @@ def convert_prefix(prefix):
         keep.append(line)
     text = '\n'.join(keep)
     blocks = re.findall(r'#define NVX_SMEM_WORDS_([UVHF])', text)
+    words = None
     if blocks:
-        expr = 'NVX_SMEM_WORDS_%s' % blocks[-1]
+        words = 'NVX_SMEM_WORDS_%s' % blocks[-1]
         for k in reversed(blocks[:-1]):
-            expr = 'NVX_MAXC(NVX_SMEM_WORDS_%s, %s)' % (k, expr)
-        text += '\ngroupshared uint smem[%s];' % expr
-    return text, modes
+            words = 'NVX_MAXC(NVX_SMEM_WORDS_%s, %s)' % (k, words)
+    return text, modes, words
+
+
+# ---------------------------------------------------------------- cooperative matrices (T1 kernels) -> AGS WMMA
+# GLSL_KHR_cooperative_matrix 16x16x16 on shared memory, as the T1 templates use it, on the engine's AGS wrappers
+# (engine/d3d12/ags_wmma.hlsli: matrixSharedLoad / Store, matrixConvert, matrixMultiplyAdd with f32 accumulators).
+# The kernel's shared array is AGS's matrixShared; GLSL offsets and strides count f16 elements, AGS's 32-bit words.
+CM_GLSL = re.compile(r'coopmat<\s*(float16_t|float)\s*,\s*gl_ScopeSubgroup\s*,\s*16\s*,\s*16\s*,\s*gl_MatrixUse(A|B|Accumulator)\s*>')
+CM = re.compile(r'\bNVXCM_(float16_t|float)_(A|B|Accumulator)\b')   # CM_GLSL spellings, as one token
+CODE = {('float16_t', 'A'): 'MatrixA16', ('float16_t', 'B'): 'MatrixB16', ('float16_t', 'Accumulator'): 'MatrixAcc16',
+        ('float', 'Accumulator'): 'MatrixAcc32'}
+LAYOUT = {'gl_CooperativeMatrixLayoutRowMajor': '0u', 'gl_CooperativeMatrixLayoutColumnMajor': '0x80u'}
+
+
+def call_args(s, i):
+    """the top-level arguments of the call whose '(' is at s[i], and the index after its ')'"""
+    j = find_close(s, i, '(', ')')
+    args, depth, start = [], 0, i + 1
+    for k in range(i + 1, j):
+        c = s[k]
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            args.append(s[start:k].strip())
+            start = k + 1
+    args.append(s[start:j].strip())
+    return args, j + 1
+
+
+def convert_coopmat(s):
+    s = CM_GLSL.sub(r'NVXCM_\1_\2', s)   # no commas inside the type: arguments split at top-level commas
+    types = {}
+    for m in re.finditer(CM.pattern + r'\s+(\w+)\s*(?:\[[^\]]*\])?\s*;', s):
+        types[m.group(3)] = CODE[(m.group(1), m.group(2))]
+
+    def type_of(expr):
+        m = re.match(r'(\w+)', expr)
+        t = types.get(m.group(1)) if m else None
+        if not t:
+            raise Err('matrix operand of unknown type: ' + expr)
+        return t
+
+    def conv(expr):
+        """a matrix expression: a variable, or a GLSL type conversion CMTYPE(x) -> matrixConvert"""
+        m = CM.match(expr)
+        if not m:
+            return expr, type_of(expr)
+        to = CODE[(m.group(1), m.group(2))]
+        args, _ = call_args(expr, m.end())
+        inner, frm = conv(args[0])
+        return ('matrixConvert(%s, %s, %s)' % (frm, to, inner) if frm != to else inner), to
+
+    out, i = [], 0
+    pat = re.compile(r'\bcoopMat(Load|Store)\s*\(')
+    while True:
+        m = pat.search(s, i)
+        if not m:
+            out.append(s[i:])
+            break
+        out.append(s[i:m.start()])
+        args, end = call_args(s, m.end() - 1)
+        if len(args) != 5 or args[1] != 'smh' or args[4] not in LAYOUT:
+            raise Err('coopMat%s form: %s' % (m.group(1), ', '.join(args)))
+        off, stride, col = '((%s) / 2u)' % args[2], '((%s) / 2u)' % args[3], LAYOUT[args[4]]
+        if m.group(1) == 'Load':
+            out.append('%s = matrixSharedLoad(%s | %s, %s, %s)' % (args[0], type_of(args[0]), col, off, stride))
+        else:
+            expr, t = conv(args[0])
+            out.append('matrixSharedStore(%s | %s, %s, %s, %s)' % (t, col, off, stride, expr))
+        i = end
+    s = ''.join(out)
+    # remaining conversions (assignments), then declarations, then products
+    out, i = [], 0
+    while True:
+        m = CM.search(s, i)
+        if not m:
+            out.append(s[i:])
+            break
+        out.append(s[i:m.start()])
+        rest = s[m.end():]
+        if rest.lstrip().startswith('('):
+            k = m.end() + (len(rest) - len(rest.lstrip()))
+            args, end = call_args(s, k)
+            inner, frm = conv(args[0])
+            to = CODE[(m.group(1), m.group(2))]
+            out.append('matrixConvert(%s, %s, %s)' % (frm, to, inner) if frm != to else inner)
+            i = end
+        else:
+            out.append('Matrix16')
+            i = m.end()
+    s = ''.join(out)
+    s = re.sub(r'\bcoopMatMulAdd\s*\(', 'matrixMultiplyAdd(', s)
+    if 'coopmat' in s or 'coopMat' in s:
+        raise Err('unconverted cooperative matrix use')
+    return s
 
 
 ARG = r'((?:[^()]|\([^()]*\))*)'   # an argument with at most one level of nested parentheses
@@ -117,18 +213,59 @@ def rewrite_view(s, name, kind):
             i = close + 1
 
 
+PTR = re.compile(r'\b(atomic([A-Za-z]+)|Nvx[A-Za-z0-9]+)\s*\(')
+
+
+def rewrite_ptr(s):
+    """NvxT(a).v = x;  ->  nvx_st_NvxT(a, x);   atomicOp(NvxT(a).v, x)  ->  nvx_atomOp_NvxT(a, x)
+    NvxT(a).v  ->  nvx_ld_NvxT(a); addresses and values are rewritten recursively"""
+    out, i = [], 0
+    while True:
+        m = PTR.search(s, i)
+        if not m:
+            out.append(s[i:])
+            return ''.join(out)
+        out.append(s[i:m.start()])
+        open_at = m.end() - 1
+        if m.group(2):   # an atomic: only those on a pointer operand are ours (shared memory ones are converted later)
+            args, end = call_args(s, open_at)
+            p = re.match(r'(Nvx[A-Za-z0-9]+)\s*\(', args[0])
+            if not p:
+                out.append(s[m.start():open_at + 1])
+                i = open_at + 1
+                continue
+            op = m.group(2)
+            if op not in ATOM:
+                raise Err('atomic ' + op)
+            close = find_close(args[0], p.end() - 1, '(', ')')
+            if args[0][close + 1:].strip() != '.v':
+                raise Err('atomic operand form: ' + args[0])
+            addr = rewrite_ptr(args[0][p.end():close])
+            rest = ', '.join(rewrite_ptr(a) for a in args[1:])
+            out.append('nvx_atom%s_%s(%s, %s)' % (op, p.group(1), addr, rest))
+            i = end
+            continue
+        close = find_close(s, open_at, '(', ')')
+        after = s[close + 1:]
+        if not re.match(r'\.v\b', after):   # not an accessor (a cast to a buffer reference type is not used)
+            out.append(s[m.start():open_at + 1])
+            i = open_at + 1
+            continue
+        addr = rewrite_ptr(s[open_at + 1:close])
+        a = re.match(r'\.v\s*=(?!=)\s*', after)
+        if a:
+            semi = after.index(';', a.end())
+            out.append('nvx_st_%s(%s, %s);' % (m.group(1), addr, rewrite_ptr(after[a.end():semi])))
+            i = close + 1 + semi + 1
+        else:
+            out.append('nvx_ld_%s(%s)' % (m.group(1), addr))
+            i = close + 1 + 2
+
+
 def convert_body(body):
     s = body
-    # memory: stores first (an lvalue), then atomics, then loads
-    s = re.sub(r'\b(Nvx[A-Za-z0-9]+)\(' + ARG + r'\)\.v\s*=(?!=)\s*([^;]+);', r'nvx_st_\1(\2, \3);', s)
-
-    def atom_ptr(m):
-        op = m.group(1)
-        if op not in ATOM:
-            raise Err('atomic ' + op)
-        return 'nvx_atom%s_%s(%s, ' % (op, m.group(2), m.group(3))
-    s = re.sub(r'\batomic([A-Za-z]+)\(\s*(Nvx[A-Za-z0-9]+)\(' + ARG + r'\)\.v\s*,', atom_ptr, s)
-    s = re.sub(r'\b(Nvx[A-Za-z0-9]+)\(' + ARG + r'\)\.v\b', r'nvx_ld_\1(\2)', s)
+    # memory through pointers: NvxT(a).v as a store, an atomic's operand or a load (balanced, nested in any order)
+    s = rewrite_ptr(s)
     # aliased shared-memory views
     for name, kind in (('smv', 'smv'), ('smh', 'smh'), ('smf', 'smf')):
         s = rewrite_view(s, name, kind)
@@ -170,13 +307,16 @@ def convert_body(body):
 
 
 ENTRY = '''
+// A flat group: AMD's D3D12 driver packs 2D / 3D groups into waves in tiles (a 32x8 group's waves are 16x2), while the
+// kernels rely on Vulkan's subgroups of consecutive invocation indices (subgroup ids, shuffles, matrix operations).
+// A 1D group's waves are consecutive (measured), so the local id is rebuilt from the flat index.
 [RootSignature(NVX_RS)]
-[numthreads(NVX_BX, NVX_BY, NVX_BZ)]
+[numthreads(NVX_BX * NVX_BY * NVX_BZ, 1, 1)]
 [WaveSize(32)]
-void main(uint3 nvx_g : SV_GroupID, uint3 nvx_l : SV_GroupThreadID)
+void main(uint3 nvx_g : SV_GroupID, uint nvx_i : SV_GroupIndex)
 {
     nvx_gid = nvx_g;
-    nvx_lid = nvx_l;
+    nvx_lid = uint3(nvx_i % NVX_BX, (nvx_i / NVX_BX) % NVX_BY, nvx_i / (NVX_BX * NVX_BY));
     nvx_ngroups = uint3(nvx_ext.gx, nvx_ext.gy, nvx_ext.gz);
     nvx_main();
 }
@@ -185,14 +325,25 @@ void main(uint3 nvx_g : SV_GroupID, uint3 nvx_l : SV_GroupThreadID)
 
 def convert(src):
     prefix, body = split_kernel(src)
-    pre, modes = convert_prefix(prefix)
+    pre, modes, words = convert_prefix(prefix)
     pre = re.sub(r'^\s*shared\b', 'groupshared', pre, flags=re.M)
+    wmma = 'coopmat' in body
+    if wmma:
+        if not words:
+            raise Err('cooperative matrices without shared memory blocks')
+        body = convert_coopmat(body)
     out = ['// generated by glsl2hlsl.py from a ptxc.py kernel; do not edit',
            '#ifndef NVX_SMEM_DYN', '#define NVX_SMEM_DYN 0u', '#endif']
     defines = [l for l in pre.splitlines() if l.strip().startswith('#')]
     rest = [l for l in pre.splitlines() if not l.strip().startswith('#')]
     out += defines
     out.append('#include "rt.hlsl"')
+    if wmma:
+        # AGS's shared-memory matrix operations work on its own groupshared array: the kernel's shared memory is it
+        out += ['#define D4R_WMMA_SHARED_WORDS (%s)' % words, '#ifdef NVX_WMMA_EMULATE', '#include "wmma_emul.hlsli"',
+                '#else', '#include "ags_wmma.hlsli"', '#endif', '#define smem matrixShared']
+    elif words:
+        out.append('groupshared uint smem[%s];' % words)
     out += rest
     if re.search(r'\bsm[vhf]\[', body):
         out.append('#include "rt_smem.hlsli"')

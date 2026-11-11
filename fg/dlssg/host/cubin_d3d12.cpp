@@ -1224,7 +1224,7 @@ struct PtrHeap { ID3D12Heap* heap = nullptr; ID3D12Resource* span = nullptr; uin
 std::vector<PtrHeap> g_ptrHeaps;
 std::mutex g_ptrLock;
 bool g_ptrHeapOff = false;
-static const bool g_ptrHeapOn = getenv("CUX_PTRHEAP") != nullptr;
+bool g_ptrHeapOn = false;   // set by configure(): [Host] Route=dxil (or CUX_PTRHEAP=1)
 void* o_committed = nullptr;
 void* o_placed = nullptr;
 static const uint64_t kPtrHeapBytes = 256ull << 20;
@@ -2314,8 +2314,11 @@ bool installListHooks(ID3D12Device* d3d)
 // A kernel compiled to DXIL (fg/dlssg/translator/glsl2hlsl.py + rt.hlsl) runs as a D3D12 dispatch recorded straight
 // into DLSS-G's command list. In the spike it is D3D12 work between two Vulkan batches (the batch ends there, as at
 // any other D3D12 call), so single kernels can be checked against the Vulkan route on the same frames.
-static const char* g_dxDir = getenv("CUX_DXIL");
-static const char* g_dxKernels = getenv("CUX_DXIL_KERNELS");
+// configure(): [Host] Route=dxil -> every kernel, DXIL in CACHE/dxil compiled from CACHE/hlsl (build_hlsl.py) by
+// [Host] Dxc on first use; CUX_DXIL / CUX_DXIL_KERNELS (test overrides): a folder of compiled kernels / a name list
+std::string g_dxDirS, g_dxKernelsS, g_hlslDir, g_dxc;
+const char* g_dxDir = nullptr;
+const char* g_dxKernels = nullptr;
 struct DxPso { ID3D12PipelineState* pso = nullptr; bool tried = false; };
 std::map<std::string, DxPso> g_dxPsos;
 
@@ -2361,24 +2364,61 @@ bool dxInit()
     for (auto& kv : g.samplerSlots)
         if (kv.second < 2048) memcpy(g.dxSamplersCpu + (size_t)kv.second * g.dxSmpInc, kv.first.data() + 1, std::min<size_t>(g.dxSmpInc, kv.first.size() - 1));
     g.dxOk = true;
-    logf("DXIL route (spike): kernels from %s: %s", g_dxDir, g_dxKernels ? g_dxKernels : "(none)");
+    logf("DXIL route: kernels from %s (%s)%s%s", g_dxDir, g_dxKernels ? g_dxKernels : "none",
+         g_dxc.empty() ? "" : ", compiled on first use by ", g_dxc.c_str());
     return true;
 }
 
 ID3D12PipelineState* dxPso(CuFunction& fn, const uint32_t block[3])
 {
-    bool hw = g_cfg.texHw;
     char key[64];
     snprintf(key, sizeof key, ".%ux%ux%u", block[0], block[1], block[2]);
-    std::string k = fn.name + key;
+    std::string k = fn.module->hash + fn.name + key;
     DxPso& e = g_dxPsos[k];
     if (e.tried) return e.pso;
     e.tried = true;
     std::vector<uint8_t> blob;
-    std::string base = std::string(g_dxDir) + "/" + fn.module->hash.substr(0, 8) + "_" + fn.name;
-    std::string path = base + (hw ? ".hw" : "") + key + ".dxil";
-    if (!(hw && readFile(path, blob)) && !readFile(path = base + key + ".dxil", blob)) {
-        logf("DXIL route: no %s", path.c_str());
+    // the variant loadKernel picks for the Vulkan route: fp32 accumulation + texture-unit filtering, fa, hw, base
+    std::string base = std::string(g_dxDir) + "/" + fn.module->hash.substr(0, 8) + "_" + fn.name, path;
+    const char* variants[] = {g_cfg.accFast && g_cfg.texHw ? ".fa.hw" : nullptr, g_cfg.accFast ? ".fa" : nullptr,
+                              g_cfg.texHw ? ".hw" : nullptr, ""};
+    bool found = false;
+    for (const char* v : variants)
+        if (v && readFile(path = base + v + key + ".dxil", blob)) { found = true; break; }
+    if (!found && !g_hlslDir.empty() && !g_dxc.empty()) {
+        // compile the variant's source for this block shape (build_hlsl.py: CACHE/hlsl/NAME.hlsl, flags on line 1)
+        std::string name = fn.module->hash.substr(0, 8) + "_" + fn.name;
+        for (const char* v : variants) {
+            if (!v) continue;
+            std::string src = g_hlslDir + "/" + name + v + ".hlsl";
+            std::vector<uint8_t> text;
+            if (!readFile(src, text)) continue;
+            std::string first(text.begin(), std::find(text.begin(), text.end(), (uint8_t)'\n'));
+            std::string flags = first.rfind("// dxc: ", 0) == 0 ? first.substr(8) : "-T cs_6_6 -E main -enable-16bit-types -HV 2021";
+            while (!flags.empty() && (flags.back() == '\r' || flags.back() == ' ')) flags.pop_back();
+            path = base + v + key + ".dxil";
+            char defs[128];
+            snprintf(defs, sizeof defs, " -DNVX_BX=%u -DNVX_BY=%u -DNVX_BZ=%u", block[0], block[1], block[2]);
+            std::string cmd = "\"" + g_dxc + "\" -nologo " + flags + defs + " -I \"" + g_hlslDir + "\" -Fo \"" + path + "\" \"" + src + "\"";
+            std::wstring wcmd = wide(cmd);
+            STARTUPINFOW si{sizeof si};
+            PROCESS_INFORMATION pi{};
+            DWORD code = 1;
+            ULONGLONG t0 = GetTickCount64();
+            if (CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 120000);
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            logf("DXIL route: compiled %s%s for block %ux%ux%u in %llu ms (%s)", name.c_str(), v, block[0], block[1], block[2],
+                 (unsigned long long)(GetTickCount64() - t0), code == 0 ? "ok" : "FAILED: the Vulkan route runs it");
+            found = code == 0 && readFile(path, blob);
+            break;
+        }
+    }
+    if (!found) {
+        logf("DXIL route: no %s%s.dxil", base.c_str(), key);
         return nullptr;
     }
     if (!g.dxRs && FAILED(g.d3d->CreateRootSignature(0, blob.data(), blob.size(), __uuidof(ID3D12RootSignature), (void**)&g.dxRs))) {
@@ -2404,10 +2444,22 @@ bool dxWanted(const CuFunction& fn)
 // records fn as a D3D12 dispatch into the list (the Vulkan batch ends before it); false: the Vulkan route runs it
 bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
 {
-    if (!dxWanted(fn) || fn.meta.t1_dispatch || psize > 4096 || !dxInit()) return false;
+    if (!dxWanted(fn) || psize > 4096 || !dxInit()) return false;
     if (!g.groups.empty() && g.groupFirst.count(fn.gkey)) return false;
     uint64_t span = ptrHeapSpanVa();
     if (!span) return false;
+    // T1 kernels: their own block shape and grid, as launch() computes them for the Vulkan route
+    uint32_t bk[3] = {block[0], block[1], block[2]}, gr[3] = {grid[0], grid[1], grid[2]};
+    const KernelMeta& m = fn.meta;
+    if (m.t1_dispatch) {
+        for (int d = 0; d < 3; d++) {
+            bk[d] = m.t1_block[d];
+            gr[d] = (uint32_t)(((uint64_t)grid[d] * m.t1_num[d] + m.t1_den[d] - 1) / m.t1_den[d]);
+        }
+        if (m.t1_fixed[0] && m.t1_fixed[1] && m.t1_fixed[2]) gr[0] = m.t1_fixed[0], gr[1] = m.t1_fixed[1], gr[2] = m.t1_fixed[2];
+    }
+    grid = gr;
+    block = bk;
     ID3D12PipelineState* pso = dxPso(fn, block);
     if (!pso) return false;
     Chain* c = chainFor(list, true);
@@ -2426,6 +2478,14 @@ bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t
     uint32_t ext[8] = {(uint32_t)span, (uint32_t)(span >> 32), 0, 0, grid[0], grid[1], grid[2], 0};
     memcpy(cb, ext, sizeof ext);
     if (pbuf && psize) memcpy(cb + 32, pbuf, psize);
+    static std::set<std::string> checked;   // spike: pointers outside the pointer heap
+    if (pbuf && checked.insert(fn.module->hash + fn.name).second)
+        for (uint32_t i = 0; i + 8 <= psize; i += 8) {
+            uint64_t v;
+            memcpy(&v, pbuf + i, 8);
+            if (v >= (1ull << 32) && v < (1ull << 40) && (uint32_t)v != 0 && (v < span || v >= span + (256ull << 20)))
+                logf("DXIL route: %s param %u = 0x%llx is outside the pointer heap", fn.name.c_str(), i, (unsigned long long)v);
+        }
     using SetHeaps = void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*);
     using SetRs = void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*);
     using SetPso = void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*);
@@ -2442,6 +2502,7 @@ bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t
     orig<SetView>(t, 37)(t, 0, g.dxCb->GetGPUVirtualAddress() + off);
     orig<SetView>(t, 41)(t, 1, span);
     orig<SetView>(t, 39)(t, 2, g.dxInfo->GetGPUVirtualAddress());
+    orig<SetView>(t, 41)(t, 3, span);   // AMD's intrinsic slot (WMMA); the driver reads the operations, not the buffer
     orig<Disp>(t, 14)(t, grid[0], grid[1], grid[2]);
     orig<Barrier>(t, 26)(t, 1, &ub);
     replay(c, t);   // DLSS-G's own heaps, root signature, pipeline and root arguments
@@ -3207,6 +3268,20 @@ void configure(const Config& config)
     g_cache = utf8(config.cacheDir);
     for (char& c : g_cache) if (c == '\\') c = '/';
     while (!g_cache.empty() && g_cache.back() == '/') g_cache.pop_back();
+    if (const char* e = getenv("CUX_PTRHEAP")) g_ptrHeapOn = *e == '1';
+    if (const char* e = getenv("CUX_DXIL")) g_dxDirS = e;
+    if (const char* e = getenv("CUX_DXIL_KERNELS")) g_dxKernelsS = e;
+    if (config.dxil) {
+        g_ptrHeapOn = true;
+        if (g_dxDirS.empty()) g_dxDirS = g_cache + "/dxil";
+        if (g_dxKernelsS.empty()) g_dxKernelsS = "*";
+        g_hlslDir = g_cache + "/hlsl";
+        g_dxc = utf8(config.dxc);
+        for (char& ch : g_dxc) if (ch == '\\') ch = '/';
+        CreateDirectoryW(wide(g_dxDirS).c_str(), nullptr);
+    }
+    if (!g_dxDirS.empty()) g_dxDir = g_dxDirS.c_str();
+    if (!g_dxKernelsS.empty()) g_dxKernels = g_dxKernelsS.c_str();
     if (g_log == INVALID_HANDLE_VALUE && !config.logPath.empty())
         g_log = CreateFileW(config.logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

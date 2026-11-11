@@ -11,7 +11,7 @@
 // Compile: dxc -T cs_6_6 -E main -enable-16bit-types -HV 2021 -DNVX_BX=.. -DNVX_BY=.. -DNVX_BZ=.. (-denorm ftz)
 #define NVX_UAV_BASE 65536u
 #define NVX_SMPN_BASE 1024u
-#define NVX_RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), CBV(b0), UAV(u0), SRV(t0)"
+#define NVX_RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), CBV(b0), UAV(u0), SRV(t0), UAV(u0, space = 2147420894)"
 
 // ---------------------------------------------------------------- GLSL spellings
 typedef float2 vec2; typedef float3 vec3; typedef float4 vec4;
@@ -79,7 +79,7 @@ static const uint3 NVX_BLOCK = uint3(NVX_BX, NVX_BY, NVX_BZ);
 #define gl_SubgroupInvocationID WaveGetLaneIndex()
 #define gl_SubgroupSize 32u
 #define gl_LocalInvocationIndex (nvx_lid.x + NVX_BX * (nvx_lid.y + NVX_BY * nvx_lid.z))
-#define gl_SubgroupID (gl_LocalInvocationIndex / 32u)
+#define gl_SubgroupID (gl_LocalInvocationIndex / 32u)   // waves are consecutive in the flat group (glsl2hlsl.py)
 #define gl_NumSubgroups NVX_NSUB
 #define NVX_MAXC(a, b) ((a) > (b) ? (a) : (b))   // a constant expression (array sizes); max() is not
 
