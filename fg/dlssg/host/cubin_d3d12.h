@@ -15,6 +15,8 @@ struct Config {
     bool gpuSync = true;     // false: hand-offs between the D3D12 queue and the kernels wait on the CPU
     bool vkClears = true;    // ClearUnorderedAccessView* between kernels run on the kernels' queue (no hand-off)
     bool splitLog = false;   // nvxrt.log: the sequence of kernels and D3D12 calls of a few lists, batch ends marked
+    bool kernelTiming = false; // nvxrt.log: GPU ms per kernel on the kernels' queue (Vulkan timestamps), every 1000 batches
+    bool computeQueue = false; // the kernels on a compute-only queue family (else the graphics family)
     bool splitQueries = false; // timestamps, query resolves to readback memory and PIX markers end a kernel batch
 };
 

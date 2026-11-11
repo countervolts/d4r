@@ -213,6 +213,8 @@ void setupCubin(const std::wstring& dir)
     c.vkClears = iniUInt(L"VkClears", 1) != 0;
     c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
     c.splitLog = iniUInt(L"SplitLog", 0) != 0;
+    c.kernelTiming = iniUInt(L"KernelTiming", 0) != 0;
+    c.computeQueue = iniUInt(L"ComputeQueue", 0) != 0;
     cux::configure(c);
 }
 

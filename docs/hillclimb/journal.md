@@ -873,3 +873,25 @@ Harness: 2560x1440 output, 1280x720 render, 400 frames, `--bench --pipe`, GPU ms
 
   Full model: 2x 5.819 -> 4.947, 4x 11.443 -> 10.439, 6x 16.985 -> 15.692. (3 rounds A B B A for Lite, 2 for full;
   every range within +-0.05 except Lite 6x after, 5.52-5.91.)
+
+### 2026-11-11: noise, the knobs, where the rest goes (lead 3, 4)
+
+- **The machine's state moves the numbers more than most changes do.** At 03:39 Firefox and Discord started; from then on
+  the same builds measured much lower and moved minute to minute (the committed build at 6x: 5.62 before, then 4.52,
+  4.80; 2x: 2.47 and 2.72 in two benches ten minutes apart). Likely clocks: other GPU work keeps the GPU up through
+  the idle hand-off gaps. Only A B B A comparisons in one sitting are trusted below; absolute levels need the game.
+- Baseline vs one-batch build again in the busy state (3 rounds, A B B A): 2x 3.282 -> 2.716, 3x 3.970 -> 3.252,
+  4x 4.630 -> 3.769, 5x 5.290 -> 4.285, 6x 5.990 -> 4.801. The gain holds (-0.57 to -1.19 ms).
+- **New: `[Host] KernelTiming=1`** (Vulkan timestamps after each dispatch, summed per kernel, logged every 1000
+  batches). 2x Lite, quiet state: 2.77 ms on the kernels' queue of 3.35 ms per real frame, so ~0.58 ms is the remaining
+  D3D12 -> Vulkan -> D3D12 round trip plus the D3D12 parts. Kernels per real frame: k_conv_fp16_nhwc 0.904 (16.8
+  launches), DownsampleRGBAndEstimateUIFused 0.390, BlendCandidatesFGLite 0.288, EstimateIntermMvecsScatter 0.272,
+  DL1Net_Input 0.142, k_element_wise 0.130 (4.9), EstimatePrev2CurrScatter 0.100, Prev2CurrUnpackPull 0.085, k_pooling
+  0.085 (4.9), k_upscale 0.082 (4.9), InputMvecProcessing 0.079, the 4 clears 0.077, rest < 0.05 each.
+- **Rejected: kernels on a compute-only queue family** (`[Host] ComputeQueue=1`, family 1, flags 0xe; kept as a knob,
+  default off). The first single run said 2.74 vs 3.35 ms at 2x, a bench minutes later in the changed state said
+  -0.44 / -0.68 / -0.09 ms, a block test and a 4-round A B B A then said +0.16 / +0.19 / +0.25 ms (2x / 4x / 6x).
+  Guard byte-identical. The first numbers were the state change.
+- **Ruled out: the deferred shader-only barriers.** Dropping them (measurement-only hack) saves 0.061 ms at 2x and
+  0.079 ms at 6x per list. Not worth touching D3D12's state tracking.
+- GpuSync=0 (CPU hand-offs) not timed: every hand-off would add a CPU round trip on top of the GPU one.

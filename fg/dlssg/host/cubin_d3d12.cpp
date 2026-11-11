@@ -122,7 +122,8 @@ struct Vk {
     X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdBindPipeline) X(CmdPushConstants) X(CmdDispatch)
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
-    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)
+    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
 #undef X
 } vk;
 
@@ -280,6 +281,7 @@ struct Shader {
 
 static const uint32_t kMaxImages = 1u << 16, kMaxSamplers = 4096, kSlotBase = 32768;
 static const uint32_t kPushBytes = 256;
+static const uint32_t kTsQueries = 16384;   // [Host] KernelTiming
 static const uint32_t kInfoBytes = kMaxSamplers * 16 + kMaxImages * 4 * 2;
 static const uint32_t kBpSlot = 4096, kBpSlots = 1024;
 static const uint32_t kGrpMaxMembers = 48;
@@ -324,6 +326,8 @@ struct Batch {
     uint32_t launches = 0;
     QueueSync* qs = nullptr;   // set once submitted
     uint64_t done = 0;         // qs->fence value after which the command buffer may be reused
+    std::vector<uint32_t> ts;  // [Host] KernelTiming: timestamp queries, the first after the batch's entry barrier
+    std::vector<const std::string*> tsLabel;   // what ran before each further timestamp
 };
 
 struct Part {
@@ -398,6 +402,14 @@ struct Exec {
     VkPipeline clearPipe = VK_NULL_HANDLE;
     bool clearFailed = false;
     uint64_t vkClears = 0;
+    // [Host] KernelTiming
+    VkQueryPool tsPool = VK_NULL_HANDLE;
+    uint32_t tsNext = 0;
+    double tsPeriodMs = 0;
+    std::map<std::string, std::pair<double, uint64_t>> ktime;   // label -> (ms, dispatches)
+    double batchMs = 0, gapMs = 0;
+    uint64_t timedBatches = 0;
+    Batch* cur = nullptr;      // the batch launch() records into (launchGroup's timestamps)
 };
 Exec g;
 std::recursive_mutex g_lock;
@@ -792,6 +804,12 @@ bool initDevice(ID3D12Device* d3d)
         if ((qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) == (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT))
             g.family = i;
     if (g.family == UINT32_MAX) g.family = 0;
+    for (uint32_t i = 0; i < nq; i++)
+        logf("queue family %u: flags 0x%x, %u queues", i, qf[i].queueFlags, qf[i].queueCount);
+    if (g_cfg.computeQueue)
+        for (uint32_t i = 0; i < nq; i++)
+            if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { g.family = i; break; }
+    logf("kernels' queue: family %u", g.family);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo dq{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     dq.queueFamilyIndex = g.family;
@@ -812,7 +830,8 @@ bool initDevice(ID3D12Device* d3d)
     X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdBindPipeline) X(CmdPushConstants) X(CmdDispatch)
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
-    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)
+    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
 #undef X
     vk.GetDeviceQueue(g.dev, g.family, 0, &g.queue);
     g.semImport = vk.ImportSemaphoreWin32HandleKHR != nullptr && g_cfg.gpuSync;
@@ -894,6 +913,16 @@ bool initDevice(ID3D12Device* d3d)
     if (vk.CreateCommandPool(g.dev, &cpi, nullptr, &g.pool) != VK_SUCCESS) return false;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     vk.CreateFence(g.dev, &fci, nullptr, &g.cpuFence);
+    if (g_cfg.kernelTiming) {
+        VkPhysicalDeviceProperties dp{};
+        vk.GetPhysicalDeviceProperties(g.pd, &dp);
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = kTsQueries;
+        if (vk.CreateQueryPool && vk.CreateQueryPool(g.dev, &qi, nullptr, &g.tsPool) != VK_SUCCESS) g.tsPool = VK_NULL_HANDLE;
+        g.tsPeriodMs = dp.limits.timestampPeriod * 1e-6;
+        logf("kernel timing %s (timestamp period %.3f ns)", g.tsPool ? "on" : "unavailable", dp.limits.timestampPeriod);
+    }
     initGroups();
     std::vector<uint8_t> arch;
     readFile(g_cache + "/arch", arch);
@@ -1458,6 +1487,47 @@ void cmdRelease(VkCommandBuffer cmd)
     g.pending.erase(cmd);
 }
 
+const std::string kLabelClear = "(clear)";
+void stamp(Batch* b, const std::string* label)
+{
+    if (!g.tsPool || !b) return;
+    uint32_t q = g.tsNext++ % kTsQueries;
+    vk.CmdResetQueryPool(b->cmd, g.tsPool, q, 1);
+    vk.CmdWriteTimestamp(b->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.tsPool, q);
+    if (!b->ts.empty()) b->tsLabel.push_back(label);
+    b->ts.push_back(q);
+}
+
+// a finished batch's timestamps into the per-kernel totals; a summary every 1000 batches
+void harvest(Batch* b)
+{
+    if (!g.tsPool || b->ts.size() < 2) return;
+    std::vector<uint64_t> t(b->ts.size());
+    for (size_t i = 0; i < b->ts.size(); i++)
+        if (vk.GetQueryPoolResults(g.dev, g.tsPool, b->ts[i], 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    for (size_t i = 1; i < t.size(); i++) {
+        auto& e = g.ktime[*b->tsLabel[i - 1]];
+        e.first += (double)(t[i] - t[i - 1]) * g.tsPeriodMs;
+        e.second++;
+    }
+    g.batchMs += (double)(t.back() - t.front()) * g.tsPeriodMs;
+    if (++g.timedBatches % 1000) return;
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& k : g.ktime) v.push_back({k.second.first, k.first});
+    std::sort(v.rbegin(), v.rend());
+    double n = 1000.0;
+    std::string out;
+    char buf[256];
+    for (auto& e : v) {
+        snprintf(buf, sizeof buf, "\n  %8.4f ms/batch  %6.2f/batch  %s", e.first / n, g.ktime[e.second].second / n, e.second.c_str());
+        out += buf;
+    }
+    logf("kernel timing, last 1000 batches: %.4f ms per batch on the kernels' queue (entry barrier to last dispatch)%s",
+         g.batchMs / n, out.c_str());
+    g.ktime.clear();
+    g.batchMs = 0;
+}
+
 void freeBatch(Batch* b)
 {
     if (b->cmd) {
@@ -1474,6 +1544,7 @@ void recycle()
     for (size_t i = 0; i < g.inflightBatches.size();) {
         Batch* b = g.inflightBatches[i];
         if (b->qs->fence->GetCompletedValue() >= b->done) {
+            harvest(b);
             freeBatch(b);
             g.inflightBatches[i] = g.inflightBatches.back();
             g.inflightBatches.pop_back();
@@ -1522,6 +1593,7 @@ Batch* newBatch()
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vk.CmdPipelineBarrier(b->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                           nullptr, 0, nullptr);
+    stamp(b, nullptr);
     return b;
 }
 
@@ -2020,6 +2092,7 @@ bool launchGroup(VkCommandBuffer cmd, CuFunction& fn, const uint32_t grid[3], co
     vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pc);
     vk.CmdDispatch(cmd, grp->grid[0], grp->grid[1], grp->grid[2]);
+    stamp(g.cur, &grp->name);
     grp->fn->launches++;
     g.grpRecent.push_back({ri, grp});
     if (g.grpRecent.size() > 16) g.grpRecent.pop_front();
@@ -2046,6 +2119,7 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
     if (g_splitLog) if (Chain* tc = findChain(nativeList(list))) tc->trace += " K:" + fn.name.substr(0, 40);
     VkCommandBuffer cmd = b->cmd;
     b->launches++;
+    g.cur = b;
     if (!g.groups.empty() && launchGroup(cmd, fn, grid, block, pbuf, psize)) return;
     PipeKey k{block[0], block[1], block[2], smem};
     uint32_t gx = grid[0], gy = grid[1], gz = grid[2];
@@ -2082,6 +2156,7 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
     vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pc);
     vk.CmdDispatch(cmd, gx, gy, gz);
+    stamp(b, &fn.name);
 }
 
 // ------------------------------------------------------------------------------------------------ clears, resolves
@@ -2161,6 +2236,7 @@ bool recordBufferClear(Chain* c, const ViewRec& v, ID3D12Resource* res, const D3
     vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     uint32_t groups = (uint32_t)((n + 63) / 64), gx = std::min<uint32_t>(groups, 65535), gy = (groups + gx - 1) / gx;
     vk.CmdDispatch(b->cmd, gx, gy, 1);
+    stamp(b, &kLabelClear);
     if (g.vkClears++ < 8)
         logf("clear (%s) of buffer %p, %llu elements from %llu, on the kernels' queue", isFloat ? "float" : "uint",
              (void*)res, (unsigned long long)n, (unsigned long long)first);
@@ -2217,6 +2293,7 @@ bool recordClear(Chain* c, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource* res,
     vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vk.CmdDispatch(b->cmd, (w + 7) / 8, (h + 7) / 8, 1);
+    stamp(b, &kLabelClear);
     if (g.vkClears++ < 4)
         logf("clear (%s) of %p %ux%u format %d on the kernels' queue, slot %u", isFloat ? "float" : "uint", (void*)res, w,
              h, (int)fmt, slot);
