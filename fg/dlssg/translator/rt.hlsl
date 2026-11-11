@@ -65,8 +65,11 @@ uint2 unpackUint2x32(uint64_t v) { return uint2(uint(v), uint(v >> 32)); }
 #define fma(a, b, c) mad(a, b, c)
 
 // ---------------------------------------------------------------- resources
-struct NvxExt { uint memLo, memHi, zero, pad, gx, gy, gz, pad2; };
+struct NvxExt { uint memLo, memHi, zero, memLast, gx, gy, gz, pad2; };   // memLast: heap bytes - 16
 cbuffer NvxCB : register(b0) { NvxExt nvx_ext; uint4 nvx_pcw[256]; };
+// The pointer heap: a root UAV (no bounds, but AMD's fastest loads and stores; a bounded view costs ~0.6 ms per real
+// frame at 4x). Offsets are clamped to the heap (nvx_off), so a stray address stays inside it: the executor sends launches
+// whose pointers lie outside the heap to the Vulkan route, the clamp only keeps a bug from reaching other GPU memory.
 RWByteAddressBuffer nvx_mem : register(u0);
 ByteAddressBuffer nvx_infob : register(t0);
 
@@ -91,7 +94,7 @@ uint nvx_p8(uint off) { return (nvx_pword(off >> 2) >> ((off & 3u) * 8u)) & 0xff
 uint64_t nvx_p64(uint off) { return packUint2x32(uint2(nvx_pword(off >> 2), nvx_pword((off >> 2) + 1u))); }
 
 // ---------------------------------------------------------------- memory through CUDA pointers
-uint nvx_off(uint64_t a) { return uint(a - packUint2x32(uint2(nvx_ext.memLo, nvx_ext.memHi))); }
+uint nvx_off(uint64_t a) { return uint(min(a - packUint2x32(uint2(nvx_ext.memLo, nvx_ext.memHi)), uint64_t(nvx_ext.memLast))); }
 uint nvx_ld_NvxU8(uint64_t a) { uint o = nvx_off(a); return (nvx_mem.Load(o & ~3u) >> ((o & 3u) * 8u)) & 0xffu; }
 int nvx_ld_NvxI8(uint64_t a) { uint o = nvx_off(a); return int(nvx_mem.Load(o & ~3u) << (24u - (o & 3u) * 8u)) >> 24; }
 uint16_t nvx_ld_NvxU16(uint64_t a) { return nvx_mem.Load<uint16_t>(nvx_off(a)); }

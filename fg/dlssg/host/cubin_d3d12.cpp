@@ -1226,7 +1226,6 @@ std::mutex g_ptrLock;
 bool g_ptrHeapOff = false;
 bool g_ptrHeapOn = false;   // set by configure(): [Host] Route=dxil (or CUX_PTRHEAP=1)
 void* o_committed = nullptr;
-void* o_placed = nullptr;
 static const uint64_t kPtrHeapBytes = 256ull << 20;
 
 HRESULT STDMETHODCALLTYPE pCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
@@ -1299,16 +1298,62 @@ HRESULT STDMETHODCALLTYPE pCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTI
     return hr;
 }
 
-uint64_t ptrHeapSpanVa()
+uint64_t ptrHeapSpanVa(ID3D12Resource** span = nullptr, uint64_t* size = nullptr)
 {
     std::lock_guard<std::mutex> l(g_ptrLock);
-    if (g_ptrHeapOff || g_ptrHeaps.size() != 1) return 0;   // spike: one heap
+    if (g_ptrHeapOff || g_ptrHeaps.size() != 1) return 0;   // one heap: one view
+    if (span) *span = g_ptrHeaps[0].span;
+    if (size) *size = g_ptrHeaps[0].size;
     return g_ptrHeaps[0].va;
+}
+
+// the newer creation methods (ID3D12Device4 / 8 / 10): buffers inside DLSS-G's calls go to the same heaps (a buffer's
+// D3D12_RESOURCE_DESC1 starts as D3D12_RESOURCE_DESC); everything else to the original
+void* o_committed1 = nullptr;
+void* o_committed2 = nullptr;
+void* o_committed3 = nullptr;
+bool inPtrHeap(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d)
+{
+    return t_fg != 0 && !g_ptrHeapOff && hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT && d &&
+           d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+           !(f & ~(D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
+}
+HRESULT STDMETHODCALLTYPE pCommitted1(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                      void* ps, REFIID riid, void** ppv)
+{
+    if (!ps && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, st, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, void*, REFIID, void**);
+    return ((Fn)o_committed1)(dv, hp, f, d, st, cv, ps, riid, ppv);
+}
+HRESULT STDMETHODCALLTYPE pCommitted2(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                      void* ps, REFIID riid, void** ppv)
+{
+    if (!ps && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, st, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, void*, REFIID, void**);
+    return ((Fn)o_committed2)(dv, hp, f, d, st, cv, ps, riid, ppv);
+}
+HRESULT STDMETHODCALLTYPE pCommitted3(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, int layout, const D3D12_CLEAR_VALUE* cv, void* ps, UINT nc,
+                                      const void* cf, REFIID riid, void** ppv)
+{
+    // a buffer's initial layout is UNDEFINED; it starts in COMMON, as a placed buffer does
+    if (!ps && !nc && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, D3D12_RESOURCE_STATE_COMMON, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           int, const D3D12_CLEAR_VALUE*, void*, UINT, const void*, REFIID, void**);
+    return ((Fn)o_committed3)(dv, hp, f, d, layout, cv, ps, nc, cf, riid, ppv);
 }
 
 void hookPointerHeap(ID3D12Device* d)
 {
     void** vt = *reinterpret_cast<void***>(d);
+    IUnknown* u = nullptr;
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device4), (void**)&u))) { u->Release(); patchSlot(vt, 53, (void*)&pCommitted1, &o_committed1); }
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device8), (void**)&u))) { u->Release(); patchSlot(vt, 69, (void*)&pCommitted2, &o_committed2); }
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device10), (void**)&u))) { u->Release(); patchSlot(vt, 76, (void*)&pCommitted3, &o_committed3); }
     bool ok = patchSlot(vt, 27, (void*)&pCommitted, &o_committed);
     logf("pointer heap: DLSS-G's committed buffers %s", ok ? "redirected into heaps of ours" : "NOT redirected (hook failed)");
 }
@@ -2442,12 +2487,53 @@ bool dxWanted(const CuFunction& fn)
 }
 
 // records fn as a D3D12 dispatch into the list (the Vulkan batch ends before it); false: the Vulkan route runs it
+bool dxLaunchImpl(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize);
+// [Host] KernelTiming: the CPU time the DXIL route spends per launch (the game's thread records it)
 bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
+{
+    if (!g_cfg.kernelTiming) return dxLaunchImpl(list, fn, grid, block, pbuf, psize);
+    static LARGE_INTEGER f{};
+    static double us = 0, worst = 0;
+    static uint64_t n = 0;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    bool r = dxLaunchImpl(list, fn, grid, block, pbuf, psize);
+    QueryPerformanceCounter(&b);
+    double t = (double)(b.QuadPart - a.QuadPart) * 1e6 / (double)f.QuadPart;
+    if (r) {
+        us += t;
+        worst = std::max(worst, t);
+        if (++n % 5000 == 0) {
+            logf("DXIL route CPU: %.2f us per launch on average, worst %.1f us (last 5000)", us / 5000, worst);
+            us = worst = 0;
+        }
+    }
+    return r;
+}
+bool dxLaunchImpl(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
 {
     if (!dxWanted(fn) || psize > 4096 || !dxInit()) return false;
     if (!g.groups.empty() && g.groupFirst.count(fn.gkey)) return false;
-    uint64_t span = ptrHeapSpanVa();
+    ID3D12Resource* spanRes = nullptr;
+    uint64_t spanSize = 0;
+    uint64_t span = ptrHeapSpanVa(&spanRes, &spanSize);
     if (!span) return false;
+    // A real pointer outside the pointer heap (a buffer not created through the redirection): this launch keeps the
+    // Vulkan route, which reaches any address. Pointers have large low halves; packed integer pairs (0x50_00000002)
+    // do not.
+    if (pbuf)
+        for (uint32_t i = 0; i + 8 <= psize; i += 8) {
+            uint64_t v;
+            memcpy(&v, pbuf + i, 8);
+            if (v >= (1ull << 32) && v < (1ull << 40) && (uint32_t)v >= (1u << 20) && (v < span || v >= span + spanSize)) {
+                static std::set<std::string> told;
+                if (told.insert(fn.module->hash + fn.name).second)
+                    logf("DXIL route: %s param %u = 0x%llx is outside the pointer heap: the Vulkan route runs it",
+                         fn.name.c_str(), i, (unsigned long long)v);
+                return false;
+            }
+        }
     // T1 kernels: their own block shape and grid, as launch() computes them for the Vulkan route
     uint32_t bk[3] = {block[0], block[1], block[2]}, gr[3] = {grid[0], grid[1], grid[2]};
     const KernelMeta& m = fn.meta;
@@ -2475,17 +2561,9 @@ bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t
     uint64_t off = g.dxCbNext;
     g.dxCbNext += 4352;
     uint8_t* cb = g.dxCbMap + off;
-    uint32_t ext[8] = {(uint32_t)span, (uint32_t)(span >> 32), 0, 0, grid[0], grid[1], grid[2], 0};
+    uint32_t ext[8] = {(uint32_t)span, (uint32_t)(span >> 32), 0, (uint32_t)(spanSize - 16), grid[0], grid[1], grid[2], 0};
     memcpy(cb, ext, sizeof ext);
     if (pbuf && psize) memcpy(cb + 32, pbuf, psize);
-    static std::set<std::string> checked;   // spike: pointers outside the pointer heap
-    if (pbuf && checked.insert(fn.module->hash + fn.name).second)
-        for (uint32_t i = 0; i + 8 <= psize; i += 8) {
-            uint64_t v;
-            memcpy(&v, pbuf + i, 8);
-            if (v >= (1ull << 32) && v < (1ull << 40) && (uint32_t)v != 0 && (v < span || v >= span + (256ull << 20)))
-                logf("DXIL route: %s param %u = 0x%llx is outside the pointer heap", fn.name.c_str(), i, (unsigned long long)v);
-        }
     using SetHeaps = void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*);
     using SetRs = void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*);
     using SetPso = void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*);

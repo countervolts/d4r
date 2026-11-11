@@ -1100,3 +1100,28 @@ no Windows scheduling between devices. Off unless enabled; the default route is 
 | 6x | 4.931 | 4.473 | <= 4.9 | 4.81 |
 
   Default route unchanged (guards byte-identical). Next: the game.
+
+### 2026-11-11: in game on the DXIL route; pacing; the GPU hangs
+
+- **Game (owner), 4x, FG on DXIL, upscaler DXIL, HAGS off:** FG's GPU cost per real frame 4.23-4.50 ms, first evaluate
+  p90 3.3-3.4 ms (the Vulkan graphics-family route: 13.0); d4r's Linux figure for this game at 4x is 4.2-4.5 ms. 64 real
+  fps over a 92 fps base: +4.7 ms per real frame, FG's own cost. Owner: still uneven ("frames not evenly paced").
+- **Pacing, PresentMon** (AMD Software's PresentMon-x64.exe, unelevated works for the game): presents are even (4x:
+  3.39 ms +- 0.56) but on-screen times are not (+- 1.38 ms, 1% of frames shown <= 0.18 ms, 1% >= 8 ms). The game runs
+  independent flip, sync interval 0, tearing, no VRR, on a 240 Hz display; 4x presented ~295 fps. At 3x (~196 fps):
+  presents +- 0.53, on screen +- 1.35. The whole difference is the present-to-flip latency, which follows GPU completion:
+  the GPU is busy ~93% of each frame and its work per frame varies (a real frame carries the game, the upscaler and FG's
+  3 ms first evaluate). Not FG overhead: a GPU-bound, uncapped, no-VRR presentation.
+- HAGS on (owner turned it on): presents in bursts (3x: +- 3.07 ms, 18.6% of intervals over twice the median, the
+  zigzag in OptiScaler's frame-time graph). With an AMD Software 180 fps cap: +- 1.49 presents, +- 1.76 on screen,
+  no frame shown under 3.38 ms. Recommended: HAGS off.
+- **GPU hangs (two crashes, DXGI_ERROR_DEVICE_HUNG, LiveKernelEvent 141), both within the first FG frames.** Cause:
+  in game (never in the harness) Kernel_ZeroBuffer and Kernel_InputMvecProcessing get pointers to buffers outside the
+  pointer heap (0x27f71a000, 0x144160000), and a root UAV has no bounds: the access went to arbitrary GPU memory.
+  Fixed: a launch whose pointer lies outside the heap keeps the Vulkan route (pointers: low half >= 1 MB, below 2^40;
+  packed integer pairs such as 0x50_00000002 are not); every offset is clamped into the heap in rt.hlsl (nvx_off), so
+  a stray address cannot leave it; buffers created through CreateCommittedResource1/2/3 inside DLSS-G's calls go to
+  the heap too. A bounded view (descriptor heap or table) was tried instead of the clamp: ~0.6 ms per real frame
+  slower at 4x (AMD's compiler uses faster loads and stores for an unbounded root buffer); rejected.
+- Harness timings of the DXIL route are bimodal in this machine state (4x: median 3.58 in one set of runs, 4.18 with
+  min 3.51 in another, same build; VRAM use 1.2 of 12 GB): not explained yet, the Vulkan route stays ~3.87.
