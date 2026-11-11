@@ -1,7 +1,8 @@
 // handoff_bench: GPU cost of one D3D12 -> other device -> D3D12 round trip on the same adapter, as the FG executor
 // (Vulkan) and d3dhip (HIP) do it: D3D12 Signal(a), the other device waits a, runs a tiny fill, signals b, D3D12 Wait(b).
 // Measured with D3D12 timestamps around the round trip; "none" is the same two timestamps with no hand-off between.
-// Usage: handoff_bench [iterations] [load_mb] [fill_mb]   (load_mb: a D3D12 copy before each round trip, GPU busy;
+// Usage: handoff_bench [iterations] [load_mb] [fill_mb] [vk_cmds] [d3d_barriers]   (load_mb: a D3D12 copy before each
+// round trip, GPU busy; vk_cmds: fills per Vulkan submission; d3d_barriers: UAV barriers in the list after the wait;
 // fill_mb: what the other device writes, default 4 KB). Build (Git Bash, llvm-mingw, Vulkan SDK, ROCm headers):
 //   clang++ -std=c++17 -O2 -I$VULKAN_SDK/Include -I"C:/Program Files/AMD/ROCm/7.2/include" -static
 //     -o handoff_bench.exe handoff_bench.cpp -ld3d12 -ldxgi -ldxguid
@@ -33,6 +34,7 @@ static uint64_t fv = 0, pv = 0;
 static LUID luid;
 static HANDLE fenceHandle;
 static uint64_t fillBytes = 4096;
+static int vkCmds = 1, d3dBarriers = 0;   // argv[4]: Vulkan commands per round trip, argv[5]: UAV barriers in the resuming list
 
 // ---------------------------------------------------------------- Vulkan
 struct Vk {
@@ -141,7 +143,7 @@ static bool vkInit(bool computeFamily)
     VKC(vk.AllocateCommandBuffers(vk.d, &cai, &vk.cmd));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vk.BeginCommandBuffer(vk.cmd, &bi);   // reusable (no ONE_TIME_SUBMIT): submitted once per round trip
-    vk.CmdFillBuffer(vk.cmd, buf, 0, fillBytes, 0x12345678);
+    for (int i = 0; i < vkCmds; i++) vk.CmdFillBuffer(vk.cmd, buf, 0, fillBytes, 0x12345678 + i);
     VKC(vk.EndCommandBuffer(vk.cmd));
     std::printf("Vulkan: queue family %u (%s)\n", fam, computeFamily ? "compute-only" : "graphics");
     return vk.ok = true;
@@ -229,7 +231,9 @@ int main(int argc, char** argv)
 {
     int iters = argc > 1 ? std::atoi(argv[1]) : 1000;
     int loadMb = argc > 2 ? std::atoi(argv[2]) : 0;
-    if (argc > 3) fillBytes = (uint64_t)std::atoi(argv[3]) << 20;
+    if (argc > 3 && std::atoi(argv[3]) > 0) fillBytes = (uint64_t)std::atoi(argv[3]) << 20;
+    if (argc > 4) vkCmds = std::atoi(argv[4]);
+    if (argc > 5) d3dBarriers = std::atoi(argv[5]);
     IDXGIFactory6* fac;
     CHK(CreateDXGIFactory2(0, __uuidof(IDXGIFactory6), (void**)&fac));
     IDXGIAdapter1* ad;
@@ -295,6 +299,12 @@ int main(int argc, char** argv)
             s.l0->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i);
             CHK(s.l0->Close());
             CHK(s.l1->Reset(s.a, nullptr));
+            for (int k = 0; k < d3dBarriers; k++) {
+                D3D12_RESOURCE_BARRIER ub{};
+                ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                ub.UAV.pResource = nullptr;
+                s.l1->ResourceBarrier(1, &ub);
+            }
             s.l1->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i + 1);
             s.l1->ResolveQueryData(qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i, 2, rb, 16ull * i);
             CHK(s.l1->Close());

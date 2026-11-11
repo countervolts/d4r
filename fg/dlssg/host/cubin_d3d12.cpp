@@ -124,7 +124,7 @@ struct Vk {
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
     X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
-    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults) X(GetCalibratedTimestampsEXT)
 #undef X
 } vk;
 
@@ -329,6 +329,8 @@ struct Batch {
     uint64_t done = 0;         // qs->fence value after which the command buffer may be reused
     std::vector<uint32_t> ts;  // [Host] KernelTiming: timestamp queries, the first after the batch's entry barrier
     std::vector<const std::string*> tsLabel;   // what ran before each further timestamp
+    int d3dTs = -1;            // [Host] KernelTiming: D3D12 timestamps (pair) around the hand-off on the game's queue
+    ID3D12CommandQueue* d3dQ = nullptr;
 };
 
 struct Part {
@@ -415,6 +417,14 @@ struct Exec {
     double batchMs = 0, gapMs = 0;
     uint64_t timedBatches = 0;
     Batch* cur = nullptr;      // the batch launch() records into (launchGroup's timestamps)
+    ID3D12QueryHeap* d3dTsHeap = nullptr;
+    ID3D12Resource* d3dTsRb = nullptr;
+    uint64_t* d3dTsMap = nullptr;
+    uint32_t d3dTsNext = 0;
+    double d3dSpanMs = 0, vkSpanMs = 0, lat1Ms = 0, lat2Ms = 0;
+    uint64_t latN = 0;
+    uint64_t d3dTimed = 0;
+    std::map<ID3D12CommandQueue*, double> d3dTsMsPerTick;
 };
 Exec g;
 std::recursive_mutex g_lock;
@@ -740,6 +750,7 @@ bool initDevice(ID3D12Device* d3d)
                           VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME,
                           VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME})
         if (has(e)) exts.push_back(e);
+    if (g_cfg.kernelTiming && has(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) exts.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
     if (!has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) { logf("no VK_EXT_descriptor_buffer"); return false; }
     bool cm = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME), wg = has(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME),
          fc2 = has(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
@@ -836,7 +847,7 @@ bool initDevice(ID3D12Device* d3d)
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
     X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
-    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults) X(GetCalibratedTimestampsEXT)
 #undef X
     vk.GetDeviceQueue(g.dev, g.family, 0, &g.queue);
     g.semImport = vk.ImportSemaphoreWin32HandleKHR != nullptr && g_cfg.gpuSync;
@@ -1513,6 +1524,41 @@ void stamp(Batch* b, const std::string* label)
 }
 
 // a finished batch's timestamps into the per-kernel totals; a summary every 1000 batches
+// [Host] KernelTiming: GPU timestamps of both APIs on the CPU's QueryPerformanceCounter timeline (ms)
+struct Calib { double base = 0, msPerTick = 0; uint64_t tick0 = 0; bool ok = false; };
+Calib vkCalib()
+{
+    Calib c;
+    if (!vk.GetCalibratedTimestampsEXT) return c;
+    VkCalibratedTimestampInfoEXT ci[2] = {{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT},
+                                          {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT}};
+    ci[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+    ci[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+    uint64_t ts[2] = {}, dev = 0;
+    if (vk.GetCalibratedTimestampsEXT(g.dev, 2, ci, ts, &dev) != VK_SUCCESS) return c;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    c.base = (double)ts[1] * 1000.0 / (double)f.QuadPart;
+    c.tick0 = ts[0];
+    c.msPerTick = g.tsPeriodMs;
+    c.ok = true;
+    return c;
+}
+Calib d3dCalib(ID3D12CommandQueue* q)
+{
+    Calib c;
+    UINT64 gpu = 0, cpu = 0, f = 0;
+    if (FAILED(q->GetClockCalibration(&gpu, &cpu)) || FAILED(q->GetTimestampFrequency(&f)) || !f) return c;
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    c.base = (double)cpu * 1000.0 / (double)qf.QuadPart;
+    c.tick0 = gpu;
+    c.msPerTick = 1000.0 / (double)f;
+    c.ok = true;
+    return c;
+}
+double onCpu(const Calib& c, uint64_t t) { return c.base + ((double)(int64_t)(t - c.tick0)) * c.msPerTick; }
+
 void harvest(Batch* b)
 {
     if (!g.tsPool || b->ts.size() < 2) return;
@@ -1525,7 +1571,43 @@ void harvest(Batch* b)
         e.second++;
     }
     g.batchMs += (double)(t.back() - t.front()) * g.tsPeriodMs;
+    if (b->d3dTs >= 0 && g.d3dTsMap) {
+        uint64_t d0 = g.d3dTsMap[b->d3dTs], d1 = g.d3dTsMap[b->d3dTs + 1];
+        if (d1 > d0) {
+            g.d3dSpanMs += (double)(d1 - d0) * g.d3dTsMsPerTick[b->d3dQ];
+            g.vkSpanMs += (double)(t.back() - t.front()) * g.tsPeriodMs;
+            g.d3dTimed++;
+            static Calib vc, dc;
+            static uint64_t calibAt = 0;
+            if (!vc.ok || g.d3dTimed - calibAt > 200 || calibAt > g.d3dTimed) {
+                vc = vkCalib();
+                dc = d3dCalib(b->d3dQ);
+                calibAt = g.d3dTimed;
+            }
+            if (vc.ok && dc.ok) {
+                double l1 = onCpu(vc, t.front()) - onCpu(dc, d0), l2 = onCpu(dc, d1) - onCpu(vc, t.back());
+                if (l1 > -1 && l2 > -1 && l1 < 50 && l2 < 50) {
+                    g.lat1Ms += l1;
+                    g.lat2Ms += l2;
+                    g.latN++;
+                }
+            }
+        }
+    }
     if (++g.timedBatches % 1000) return;
+    if (g.d3dTimed) {
+        double n = (double)g.d3dTimed;
+        logf("hand-off timing, last %llu batches: game queue idle %.4f ms per batch (from the D3D12 work before the kernels "
+             "to the work after them), of which the kernels' batch %.4f ms (its start to its end): %.4f ms per round trip",
+             (unsigned long long)g.d3dTimed, g.d3dSpanMs / n, g.vkSpanMs / n, (g.d3dSpanMs - g.vkSpanMs) / n);
+        if (g.latN)
+            logf("hand-off timing: D3D12 done -> kernels start %.4f ms, kernels done -> D3D12 resumes %.4f ms (calibrated "
+                 "clocks, %llu batches)", g.lat1Ms / g.latN, g.lat2Ms / g.latN, (unsigned long long)g.latN);
+        g.lat1Ms = g.lat2Ms = 0;
+        g.latN = 0;
+        g.d3dSpanMs = g.vkSpanMs = 0;
+        g.d3dTimed = 0;
+    }
     std::vector<std::pair<double, std::string>> v;
     for (auto& k : g.ktime) v.push_back({k.second.first, k.first});
     std::sort(v.rbegin(), v.rend());
@@ -1540,6 +1622,24 @@ void harvest(Batch* b)
          g.batchMs / n, out.c_str());
     g.ktime.clear();
     g.batchMs = 0;
+}
+
+// [Host] KernelTiming: a full barrier and a timestamp at the batch's end, so the cache flush the hand-off does
+// implicitly shows as its own line ("exit barrier")
+void endBatch(Batch* b)
+{
+    if (b->ended) return;
+    if (g.tsPool) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vk.CmdPipelineBarrier(b->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                              nullptr, 0, nullptr);
+        static const std::string kLabelExit = "(exit barrier)";
+        stamp(b, &kLabelExit);
+    }
+    vk.EndCommandBuffer(b->cmd);
+    b->ended = true;
 }
 
 void freeBatch(Batch* b)
@@ -1601,13 +1701,15 @@ Batch* newBatch()
     uint32_t idx = 0;
     VkDeviceSize off = 0;
     vk.CmdSetDescriptorBufferOffsetsEXT(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipeLayout, 0, 1, &idx, &off);
+    stamp(b, nullptr);   // [Host] KernelTiming: the batch's start, before its entry barrier
     // everything the D3D12 queue did before the hand-off is visible (the semaphore wait covers execution; this the caches)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vk.CmdPipelineBarrier(b->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                           nullptr, 0, nullptr);
-    stamp(b, nullptr);
+    static const std::string kLabelEntry = "(entry barrier)";
+    stamp(b, &kLabelEntry);
     return b;
 }
 
@@ -1757,7 +1859,7 @@ HRESULT STDMETHODCALLTYPE hClose(List* list)
                     if (FAILED(r)) worst = r;
                 }
                 for (Batch* b : c->batches)
-                    if (!b->ended) { vk.EndCommandBuffer(b->cmd); b->ended = true; }
+                    endBatch(b);
                 c->closed = true;
                 c->target.store(nullptr);
                 HRESULT r = o_close(list);
@@ -1822,10 +1924,44 @@ QueueSync* syncFor(ID3D12CommandQueue* q)
     return &s;
 }
 
+// [Host] KernelTiming: a one-command D3D12 list writing timestamp `idx` (and resolving the pair when `resolve`)
+bool d3dStamp(ID3D12CommandQueue* q, uint32_t idx, bool resolve, Part& out)
+{
+    if (!g.d3dTsHeap) {
+        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4096};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 4096 * 8;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.d3d->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap), (void**)&g.d3dTsHeap)) ||
+            FAILED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  __uuidof(ID3D12Resource), (void**)&g.d3dTsRb)) ||
+            FAILED(g.d3dTsRb->Map(0, nullptr, (void**)&g.d3dTsMap))) {
+            g.d3dTsMap = nullptr;
+            return false;
+        }
+    }
+    if (!g.d3dTsMap) return false;
+    if (!g.d3dTsMsPerTick.count(q)) {
+        UINT64 f = 0;
+        q->GetTimestampFrequency(&f);
+        g.d3dTsMsPerTick[q] = f ? 1000.0 / (double)f : 0;
+    }
+    Chain tmp;
+    tmp.type = q->GetDesc().Type;
+    if (!newPart(&tmp, g.d3d, out)) return false;
+    out.list->EndQuery(g.d3dTsHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx);
+    if (resolve) out.list->ResolveQueryData(g.d3dTsHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx - 1, 2, g.d3dTsRb, (idx - 1) * 8ull);
+    return SUCCEEDED(out.list->Close());
+}
+
 // runs batch b between the D3D12 work submitted so far and what follows on queue q; g_lock held
 void runBatch(ID3D12CommandQueue* q, QueueSync* s, Batch* b)
 {
-    if (!b->ended) { vk.EndCommandBuffer(b->cmd); b->ended = true; }
+    endBatch(b);
     uint64_t a = ++s->value;
     q->Signal(s->fence, a);
     uint64_t c = ++s->value;
@@ -1881,7 +2017,23 @@ void STDMETHODCALLTYPE hExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList
         if (!c || !c->closed || c->parts.empty()) continue;
         for (size_t k = 0; k < c->parts.size(); k++) {
             o_execute(q, (UINT)chunk.size(), chunk.data());
-            runBatch(q, s, c->batches[k]);
+            Batch* b = c->batches[k];
+            Part t0{}, t1{};
+            bool timed = g.tsPool && d3dStamp(q, (g.d3dTsNext % 2048) * 2, false, t0);
+            if (timed) {
+                ID3D12CommandList* l0 = t0.list;
+                o_execute(q, 1, &l0);
+                parts.push_back(t0);
+            }
+            runBatch(q, s, b);
+            if (timed && d3dStamp(q, (g.d3dTsNext % 2048) * 2 + 1, true, t1)) {
+                ID3D12CommandList* l1 = t1.list;
+                o_execute(q, 1, &l1);
+                parts.push_back(t1);
+                b->d3dTs = (int)((g.d3dTsNext % 2048) * 2);
+                b->d3dQ = q;
+                g.d3dTsNext++;
+            }
             chunk.assign(1, c->parts[k].list);
         }
         if (g_splitLog) {

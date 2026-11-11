@@ -991,3 +991,24 @@ buffer, signals b, D3D12 Wait(b), timestamp; 3 iterations in flight; "none" = th
 | 6x | 5.229 | 4.947 | -0.282 |
 
   Full model with --outreal: 2x 4.588 -> 4.361, 6x 13.381 -> 13.038. (3 / 2 rounds A B B A.)
+
+### 2026-11-11: where the ~0.5 ms per list goes (measured)
+
+New in `[Host] KernelTiming=1`: timestamps at the batch's very start and after an explicit exit barrier, D3D12
+timestamps on the game's queue right after the work before the kernels and right where it resumes, and both clocks
+mapped onto the CPU's QueryPerformanceCounter (VK_EXT_calibrated_timestamps, GetClockCalibration).
+- The batch's entry and exit barriers (full memory barriers) cost ~2 us each: the cache flushes are not it.
+- With OutputReal (the game's case), 2x: the game's queue idles 2.86 ms per list, of which the batch runs 2.36 ms:
+  **0.50 ms per round trip** (0.19 D3D12 done -> kernels start, 0.31 kernels done -> D3D12 resumes); 6x 0.58
+  (0.30 + 0.28); 4x 0.26 + 0.28. The D3D12 parts around it are ~0.12 ms.
+- handoff_bench, the same round trip in a clean process: 0.10 ms; unchanged with 150 Vulkan commands (+5 us), with
+  Vulkan busy for 0.7-2.2 ms (~0.09 ms beyond the fill), with 64 MB written (+~0.04). 150 D3D12 UAV barriers cost
+  ~120 us on their own, hand-off or not.
+- An empty round trip inside the FG process (probe before each batch): **0.21 ms**. So about half of the gap is the
+  process / device state (the FG Vulkan device, DLSS-G's D3D12 work), the other half comes with the real batch,
+  mostly on the way back.
+- **Rejected: signaling the fence from a separate empty submission after the batch** (0.52 vs 0.53 ms).
+- Not found yet: what in the FG process doubles the bare round trip, and what the real batch adds on the way back.
+  Next steps if worth it: grow handoff_bench toward FG (descriptor buffers, host-visible memory, the executor's
+  device features) until its round trip doubles; or an ETW trace of the GPU scheduler (wpr / tracerpt are on the
+  machine) to see which context waits on what.
