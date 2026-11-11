@@ -3,7 +3,8 @@
 // Measured with D3D12 timestamps around the round trip; "none" is the same two timestamps with no hand-off between.
 // Usage: handoff_bench [iterations] [load_mb] [fill_mb]   (load_mb: a D3D12 copy before each round trip, GPU busy;
 // fill_mb: what the other device writes, default 4 KB). Build (Git Bash, llvm-mingw, Vulkan SDK, ROCm headers):
-//   clang++ -std=c++17 -O2 -I$VULKAN_SDK/Include -I"C:/Program Files/AMD/ROCm/7.2/include" -static \n//     -o handoff_bench.exe handoff_bench.cpp -ld3d12 -ldxgi -ldxguid
+//   clang++ -std=c++17 -O2 -I$VULKAN_SDK/Include -I"C:/Program Files/AMD/ROCm/7.2/include" -static
+//     -o handoff_bench.exe handoff_bench.cpp -ld3d12 -ldxgi -ldxguid
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
