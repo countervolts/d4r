@@ -751,6 +751,12 @@ bool initDevice(ID3D12Device* d3d)
                           VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME})
         if (has(e)) exts.push_back(e);
     if (g_cfg.kernelTiming && has(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) exts.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    // [Host] QueuePriority: the kernels' queue's global priority (VK_KHR_global_priority; 1 low, 2 medium, 3 high,
+    // 4 realtime). In a game the game's D3D12 queues, d3dhip's HIP device (the upscaler) and this device take turns on
+    // one GPU engine; the priority decides who goes first when several are ready. No effect without contention
+    // (harness: within +-0.01 ms).
+    const bool gprio = g_cfg.queuePriority && has(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+    if (gprio) exts.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
     if (!has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) { logf("no VK_EXT_descriptor_buffer"); return false; }
     bool cm = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME), wg = has(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME),
          fc2 = has(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
@@ -831,12 +837,28 @@ bool initDevice(ID3D12Device* d3d)
     dq.queueFamilyIndex = g.family;
     dq.queueCount = 1;
     dq.pQueuePriorities = &prio;
+    VkDeviceQueueGlobalPriorityCreateInfoKHR gp{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
+    static const VkQueueGlobalPriorityKHR kPrio[] = {VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR, VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+                                                     VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR, VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
+                                                     VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR};
+    static const char* kPrioName[] = {"default", "low", "medium", "high", "realtime"};
+    gp.globalPriority = kPrio[std::min(g_cfg.queuePriority, 4u)];
+    if (gprio) dq.pNext = &gp;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &dq;
     dci.enabledExtensionCount = (uint32_t)exts.size();
     dci.ppEnabledExtensionNames = exts.data();
     r = vk.CreateDevice(g.pd, &dci, nullptr, &g.dev);
+    if (r != VK_SUCCESS && gprio) {
+        logf("vkCreateDevice with global priority %u failed (%d): default priority", g_cfg.queuePriority, r);
+        dq.pNext = nullptr;
+        exts.pop_back();
+        dci.enabledExtensionCount = (uint32_t)exts.size();
+        r = vk.CreateDevice(g.pd, &dci, nullptr, &g.dev);
+    } else if (gprio) {
+        logf("kernels' queue: global priority %s", kPrioName[std::min(g_cfg.queuePriority, 4u)]);
+    }
     if (r != VK_SUCCESS) { logf("vkCreateDevice failed (%d)", r); return false; }
 #define X(n) vk.n = (PFN_vk##n)vk.GetDeviceProcAddr(g.dev, "vk" #n);
     X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(CreateBuffer) X(GetBufferMemoryRequirements)

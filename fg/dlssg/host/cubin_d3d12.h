@@ -16,8 +16,10 @@ struct Config {
     bool vkClears = true;    // ClearUnorderedAccessView* between kernels run on the kernels' queue (no hand-off)
     bool splitLog = false;   // nvxrt.log: the sequence of kernels and D3D12 calls of a few lists, batch ends marked
     bool kernelTiming = false; // nvxrt.log: GPU ms per kernel on the kernels' queue (Vulkan timestamps), every 1000 batches
-    bool computeQueue = false; // the kernels on a compute-only queue family (else the graphics family)
+    bool computeQueue = true;  // the kernels on a compute-only queue family (Windows' compute engine: overlaps the game's
+                               // graphics queue as Streamline's async compute queue would; else time-sliced with it)
     bool vkCopies = true;    // CopyResource between kernels runs on the kernels' queue where it is exact (no hand-off)
+    unsigned queuePriority = 0; // global priority of the kernels' queue: 0 driver default, 1 low, 2 medium, 3 high, 4 realtime
     bool splitQueries = false; // timestamps, query resolves to readback memory and PIX markers end a kernel batch
 };
 

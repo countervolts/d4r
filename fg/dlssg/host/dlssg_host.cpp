@@ -212,10 +212,11 @@ void setupCubin(const std::wstring& dir)
     c.splitBarriers = iniUInt(L"SplitBarriers", 0) != 0;
     c.vkClears = iniUInt(L"VkClears", 1) != 0;
     c.vkCopies = iniUInt(L"VkCopies", 1) != 0;
+    c.queuePriority = iniUInt(L"QueuePriority", 0);
     c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
     c.splitLog = iniUInt(L"SplitLog", 0) != 0;
     c.kernelTiming = iniUInt(L"KernelTiming", 0) != 0;
-    c.computeQueue = iniUInt(L"ComputeQueue", 0) != 0;
+    c.computeQueue = iniUInt(L"ComputeQueue", 1) != 0;
     cux::configure(c);
 }
 

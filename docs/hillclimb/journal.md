@@ -1012,3 +1012,29 @@ mapped onto the CPU's QueryPerformanceCounter (VK_EXT_calibrated_timestamps, Get
   Next steps if worth it: grow handoff_bench toward FG (descriptor buffers, host-visible memory, the executor's
   device features) until its round trip doubles; or an ETW trace of the GPU scheduler (wpr / tracerpt are on the
   machine) to see which context waits on what.
+
+### 2026-11-11: in game, the stutter is the GPU scheduler; FG on the compute engine (owner's runs)
+
+Owner: "Upscaler GPU time" (OptiScaler overlay, DLSS K DLAA 1440p) is 2.47-2.91 ms without FG and swings 2.51-6.23
+ms with 4x FG: visible stutter. In game Streamline submits FG's lists on a D3D12 **compute** queue (type 2, its async
+queue). The kernels went to the executor's Vulkan device on the graphics queue family, which Windows schedules on the
+same "3D" engine as the game's graphics queue: time-sliced with the game's rendering instead of beside it. Windows'
+GPU engine counters (harness): graphics family -> "3d" only; compute family -> "compute 0" (a separate engine).
+
+| Run (4x, Ghost of Tsushima) | FG queue | Upscaler | Upscaler GPU time | FG [1] median / p90 | FG per real frame |
+|---|---|---|---|---:|---:|
+| first | graphics, realtime priority | d3dhip | 2.51-6.23, avg 3.89 | | |
+| A | graphics, low priority | d3dhip | 2.51-5.91, avg 3.51 | 4.90 / 6.65 | 7.38 |
+| B | graphics, default | d3dhip (`D4R_DX_NET` does not apply to K) | 2.47-6.99, avg 3.88 | 4.48 / 6.46 | 6.91 |
+| B2 | graphics, default | DXIL (`D4R_D3DHIP_K=0`) | 2.61-5.03, avg 3.47 | 4.59 / 13.04 | 6.76 |
+| C | **compute** | DXIL | **2.67-3.89, avg 3.06** | **3.08 / 3.38** | **4.53** |
+
+- **Kept: `[Host] ComputeQueue=1` is the default now.** The harness measured it slower (+0.16-0.25 ms) because
+  there is nothing to overlap with there; in game FG's cost per real frame drops 2.2 ms and its p90 4x. Guards
+  byte-identical (with and without --outreal).
+- `[Host] QueuePriority` (1 low, 2 medium, 3 high, 4 realtime; default: the driver's) kept as a knob. Low vs default
+  on the graphics family: within run-to-run noise in game.
+- Removing the HIP context (DXIL upscaler) alone did not fix the swing (B2); moving FG off the 3D engine did (C).
+- Owner: still not as smooth as Linux, where FG and the game share one Vulkan device (no cross-device hand-offs at
+  all). What is left on Windows: a ~0.5 ms cross-device round trip per generated frame on the game's compute queue.
+  Next: the kernels as D3D12 compute in the game's own queue (DXIL route).
