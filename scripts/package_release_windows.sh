@@ -20,6 +20,9 @@
 #   D4R_GLSLANG_LICENSE  its LICENSE.txt                                             (scripts/stage_engine_kit.sh)
 #   D4R_DXC          DirectX Shader Compiler release archive or folder              (scripts/stage_engine_kit.sh)
 #   D4R_VCRUNTIME_DIR  Visual C++ runtime for glslangValidator.exe                  (scripts/stage_engine_kit.sh)
+# DLSS Frame Generation (d4r\fg\dlssg; install.ps1 downloads NVIDIA's DLLs and translates their kernels):
+#   D4R_SPIRV_VAL    SPIRV-Tools' spirv-val.exe for the kernel translator     default: $VULKAN_SDK/Bin/spirv-val.exe
+#   D4R_SPIRV_TOOLS_LICENSE  its LICENSE (Apache-2.0)                                                       (required)
 # The native kernels (scripts/stage_native_kernels.sh):
 #   D4R_ROCM_DIR     AMD HIP SDK with clang                             default: the newest C:/ROCm/<version>
 #   D4R_GPU_ARCHS    GPU targets                     default gfx1030-gfx1036, gfx1100-gfx1103, gfx1200, gfx1201
@@ -69,6 +72,7 @@ if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
   "$ROOT/scripts/build_windows_nvcuda_bridge.sh" >/dev/null
   "$ROOT/scripts/build_windows_nvapi.sh" >/dev/null
   "$ROOT/scripts/build_vulkan_dlss_harness.sh" >/dev/null
+  "$ROOT/fg/dlssg/host/build.sh" >/dev/null
 fi
 for f in "$ROOT/build/d4r_nvngx.dll" "$ROOT/build/windows-nvcuda/nvcuda.dll" "$ROOT/build/windows-nvapi/nvapi64.dll" \
          "$ROOT/build/vulkan_dlss_harness.exe" "$D4R_ZLUDA_DIR/nvcuda.dll" "$D4R_OPTISCALER_LICENSE" "$D4R_ZLUDA_EMIT" \
@@ -127,6 +131,25 @@ cp "$ROOT/packaging/d4r-check.ps1" "$ROOT/packaging/d4r-check.cmd" "$STAGE/d4r/"
 printf 'install.cmd puts NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder.\r\n' > "$STAGE/d4r/ngx/README.txt"
 cp "$ROOT/install.ps1" "$ROOT/install.cmd" "$STAGE/"
 D4R_KIT_PLATFORM=windows "$ROOT/scripts/stage_engine_kit.sh" "$STAGE/d4r"
+
+# DLSS Frame Generation on RDNA3 / RDNA4: the DLSS-G host with its native D3D12 cubin executor, the PTX scanner, the
+# kernel translator with its T1 kernels and spirv-val; install.ps1 (d4r\tools\fg_install.py) downloads NVIDIA's DLSS-G
+# DLLs and Streamline and translates their kernels on the user's machine. No NVIDIA file is packaged.
+SPIRV_VAL="${D4R_SPIRV_VAL:-${VULKAN_SDK:+$VULKAN_SDK/Bin/spirv-val.exe}}"
+: "${D4R_SPIRV_TOOLS_LICENSE:?set D4R_SPIRV_TOOLS_LICENSE to SPIRV-Tools\' LICENSE (Apache-2.0)}"
+FG="$STAGE/d4r/fg/dlssg"
+for f in "$ROOT/fg/dlssg/host/build/nvngx.dll_dlssg_host.dll" "$ROOT/fg/dlssg/host/build/nvxrt-scan.exe" "$SPIRV_VAL"; do
+  [[ -f "$f" ]] || { echo "missing $f (fg/dlssg/host/build.sh; D4R_SPIRV_VAL)" >&2; exit 2; }
+done
+mkdir -p "$FG/bin" "$FG/tools" "$FG/translator" "$FG/t1"
+cp "$ROOT/fg/dlssg/host/build/nvngx.dll_dlssg_host.dll" "$ROOT/fg/dlssg/host/build/nvxrt-scan.exe" "$FG/"
+cp "$SPIRV_VAL" "$FG/bin/spirv-val.exe"
+cp "$ROOT/fg/dlssg/tools/dlssg_setup.py" "$FG/tools/"
+cp "$ROOT"/fg/dlssg/translator/*.py "$ROOT/fg/dlssg/translator/rt.glsl" "$FG/translator/"
+cp "$ROOT"/fg/dlssg/t1/*.py "$FG/t1/"
+cp "$ROOT/fg/dlssg/LICENSE" "$STAGE/d4r/licenses/dlssg-LICENSE.txt"
+cp "$D4R_SPIRV_TOOLS_LICENSE" "$STAGE/d4r/licenses/SPIRV-Tools-LICENSE.txt"
+cp "$ROOT/packaging/windows/fg_install.py" "$STAGE/d4r/tools/fg_install.py"
 
 # The native kernels for the CUDA path, as in the Linux release. kernels/build.sh extracts the DLLs' PTX into the
 # repository for each target unless given it: once here, which also lets targets build in parallel.

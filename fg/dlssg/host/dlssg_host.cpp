@@ -187,6 +187,34 @@ bool wrapGetProcAddress(HMODULE module);
 bool g_cubin = false; // NVIDIA's cubin interface is served here (native Windows; under Proton dxvk-nvapi does it)
 
 // Native Windows: no vkd3d-proton, so nothing implements the D3D12 cubin calls DLSS-G makes; cubin_d3d12.cpp does.
+// The translated kernels' folder: d4r.ini [FrameGeneration] KernelCache (install.ps1 writes the one it built), or for
+// auto the cache of this GPU's generation, %LOCALAPPDATA%\d4r\nvxrt-gfx11 (RDNA3) or %LOCALAPPDATA%\d4r\nvxrt (RDNA4,
+// when only that one exists). dlssg_host.ini [Host] Cache= overrides it.
+std::wstring fgCacheDir()
+{
+    wchar_t local[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    std::wstring cache = d4rString(L"KernelCache", nullptr, L"");
+    if (cache.empty() || !_wcsicmp(cache.c_str(), L"auto")) {
+        const std::wstring rdna3 = std::wstring(local) + L"\\d4r\\nvxrt-gfx11", rdna4 = std::wstring(local) + L"\\d4r\\nvxrt";
+        const bool only4 = GetFileAttributesW((rdna4 + L"\\arch").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                           GetFileAttributesW((rdna3 + L"\\arch").c_str()) == INVALID_FILE_ATTRIBUTES;
+        cache = only4 ? rdna4 : rdna3;
+    }
+    return iniString(L"Cache", cache.c_str());
+}
+// The GPU generation a cache was translated for (its "arch" file, written by dlssg-setup / dlssg_setup.py): gfx12 is
+// RDNA4, anything else (gfx11, or no file yet) RDNA3
+bool fgCacheRdna4(const std::wstring& cache)
+{
+    FILE* f = _wfopen((cache + L"\\arch").c_str(), L"rb");
+    if (!f) return false;
+    char text[16] = {};
+    fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    return !strncmp(text, "gfx12", 5);
+}
+
 // Cubin=auto (default): on unless running under Wine; 0 / 1 force it.
 void setupCubin(const std::wstring& dir)
 {
@@ -197,11 +225,7 @@ void setupCubin(const std::wstring& dir)
     logf("cubin interface: %s", g_cubin ? "served by this DLL (native D3D12)" : wine ? "left to dxvk-nvapi (Wine)" : "off");
     if (!g_cubin) return;
     cux::Config c;
-    wchar_t local[MAX_PATH] = {};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    std::wstring cache = d4rString(L"KernelCache", nullptr, L"");
-    if (cache.empty() || !_wcsicmp(cache.c_str(), L"auto")) cache = std::wstring(local) + L"\\d4r\\nvxrt-gfx11";
-    c.cacheDir = iniString(L"Cache", cache.c_str());
+    c.cacheDir = fgCacheDir();
     c.logPath = dir + L"nvxrt.log";
     bool exact = iniUInt(L"Exact", d4rBool(L"Exact", false) ? 1 : 0) != 0;
     c.accFast = !exact && iniUInt(L"AccFast", 1) != 0;
@@ -257,11 +281,11 @@ void load()
     // d4r.ini: the game's d4r folder, or two levels above this DLL (d4r\fg\dlssg)
     for (std::wstring p : {exe_dir + L"d4r\\d4r.ini", dir + L"..\\..\\d4r.ini"})
         if (g_d4rIni.empty() && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) g_d4rIni = p;
-    // Model: full (DLSS-G's full model) or lite (NVIDIA FG Lite, DLSS-G >= 310.9.16); auto: Lite (RDNA3, the only
-    // generation the native Windows executor targets so far). Each model has its DLL: fg\dlssg\<model>\nvngx_dlssg.dll
+    // Model: full (DLSS-G's full model) or lite (NVIDIA FG Lite, DLSS-G >= 310.9.16); auto: Lite on RDNA3, full on
+    // RDNA4 (as on Linux), by the kernel cache's generation. Each model has its DLL: fg\dlssg\<model>\nvngx_dlssg.dll
     // (install.ps1 downloads them), else the game's own nvngx_dlssg.dll.
     std::wstring model = d4rString(L"Model", L"D4R_FG_MODEL", L"auto");
-    bool lite = !_wcsicmp(model.c_str(), L"lite") || !_wcsicmp(model.c_str(), L"auto");
+    bool lite = !_wcsicmp(model.c_str(), L"lite") || (!_wcsicmp(model.c_str(), L"auto") && !fgCacheRdna4(fgCacheDir()));
     std::wstring modelDll = dir + (lite ? L"lite\\nvngx_dlssg.dll" : L"full\\nvngx_dlssg.dll");
     if (GetFileAttributesW(modelDll.c_str()) == INVALID_FILE_ATTRIBUTES) modelDll = L"nvngx_dlssg.dll";
     std::wstring fg = resolve(iniString(L"FG", modelDll.c_str()));
