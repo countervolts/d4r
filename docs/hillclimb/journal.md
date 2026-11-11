@@ -921,3 +921,20 @@ invalidates the caches). No OS scheduler in either direction.
 - Risk: a spin that never sees its value hangs the queue it runs on. The polls need an iteration cap, and on expiry
   the frame would use unfinished data. The Vulkan spin can start early and poll through all the game's work queued
   before the evaluate (in game that can be a whole frame). This needs the owner's go-ahead.
+
+### 2026-11-11: GPU-side hand-off tried (owner's go-ahead), rejected
+
+Built as written up, made safer: the OS waits kept but signaled early (D3D12 at the start of the lists ahead of the
+kernels, Vulkan once it reaches the batch), one-thread polls on a D3D12 buffer for the exact moment (handoff_spin.hlsl
+on the D3D12 queue, handoff_spin.comp on the kernels' compute-only queue), capped and counted.
+- The Vulkan-side poll (D3D12 -> kernels) never timed out. The D3D12-side poll (kernels -> D3D12) timed out on every
+  hand-off after the first ~14.
+- Frame time follows the cap: SpinCap 20000 -> 4.88 ms, 50000 -> 8.89 ms, 200000 -> 28.3 ms per real frame at 2x,
+  i.e. ~0.13 us per poll plus ~2.2 ms. The poll time and the kernel time add, they do not overlap: while the D3D12
+  queue runs the poll, the kernels on the Vulkan device make no progress. With the legacy scheduler (HAGS off, not
+  changed) Windows time-slices the Vulkan device's compute queue with the game's D3D12 queue instead of running them
+  side by side. The first ~14 hand-offs worked only because the kernels finished before the poll started.
+- Consequence: a GPU-side hand-off cannot work between two devices here, and the remaining ~0.6 ms per list is the
+  OS context switch between them, twice. Only running the kernels inside the game's own D3D12 device removes it
+  (DXIL compute on the game's queue: every translated kernel through a DXIL backend; the d3dhip route is a separate
+  device again, measured ~0.2 ms per hand-off). Code reverted; not committed.
