@@ -959,3 +959,35 @@ buffer, signals b, D3D12 Wait(b), timestamp; 3 iterations in flight; "none" = th
   the batch's entry barrier (ALL_COMMANDS, MEMORY_WRITE -> MEMORY_READ|WRITE) and the tail after the last dispatch
   (the semaphore signal's cache flushes over the frame's working set), the leading / trailing D3D12 parts beyond the
   barriers (~0.07 ms measured), and clocks dropping in the gaps (the busy-machine numbers point that way). Next lead.
+
+### 2026-11-11: in game (Ghost of Tsushima, owner), and OutputReal's copy
+
+- **Game, one-batch build (f394e94), owner's fps over a 92 fps base** (10.87 ms): 2x 144/72 (+3.0 ms per real frame),
+  3x 194/65 (+4.5), 4x 233/58 (+6.4), 5x 255/50 (+9.1), 6x 280/48 (+10.0). Before (original DLL, 90 fps base):
+  2x +4.3, 3x +5.6, 4x +8.9. 1.1-2.5 ms better.
+- **What the game does differently** (SplitLog): every generated frame is its own list and ExecuteCommandLists
+  (Streamline evaluates and presents them one at a time), so each pays a round trip; the host timer's index 2+
+  evaluates take ~0.7-1.2 ms there against ~0.57 in the harness. Not mergeable. And at MultiFrameIndex 1 DLSS-G records
+  a CopyResource (an internal texture into OutputReal, with COPY_SOURCE / COPY_DEST transitions around it) between
+  WarpBlendingWeights and BlendCandidatesFGLite: one more batch, one more round trip per real frame. The harness never
+  set OutputReal. Game inputs that differ from the harness: no HUDLess, OutputReal set, depth D32S8 typeless and
+  motion vectors at 2560x1440, backbuffer R10G10B10A2 HDR.
+- **Bug, test tool only:** the host's capture (DumpReal) froze the game's FG path after the first parameter file
+  (Dumper::resources transitions every input from ALL_SHADER_RESOURCE, wrong for the game's D32S8 depth / backbuffer).
+  The harness capture works. Not fixed; the game's parameter file was enough.
+- Harness: `--outreal` sets OutputReal at index 1 as Streamline does, and the synthetic mode writes it
+  (f<N>_outreal.ppm, hashed by the guard). Reproduces the game's extra batch; OutputReal costs ~+0.35 ms at 4x.
+- **Kept: CopyResource on the kernels' queue** (`VkCopies=1`, host/copy_res.comp). With a batch open, a buffer copy
+  (32-bit words through the GPU VAs) or a 2D texture copy in a format whose texel round trip is exact (UNORM, UINT,
+  SINT; SRV read, UAV write, both made in the scratch heap) runs in the batch; transitions between shader states and
+  COPY_SOURCE / COPY_DEST go to the next D3D12 part. Anything else stays on D3D12 and ends the batch as before.
+  Back to 1 batch per list with OutputReal. Guards: byte-identical without --outreal (12 modes) and with it (12 modes,
+  OutputReal image included; it holds the real frame, same bytes as the D3D12 copy).
+
+| --outreal, Lite | D3D12 copy | Vulkan copy | delta |
+|---|---:|---:|---:|
+| 2x | 3.050 | 2.956 | -0.094 |
+| 4x | 4.142 | 3.909 | -0.233 |
+| 6x | 5.229 | 4.947 | -0.282 |
+
+  Full model with --outreal: 2x 4.588 -> 4.361, 6x 13.381 -> 13.038. (3 / 2 rounds A B B A.)

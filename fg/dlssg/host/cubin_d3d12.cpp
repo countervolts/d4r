@@ -30,6 +30,7 @@
 #include "cubin_d3d12.h"
 #include "../nvxrt/util.h"
 #include "clear_uav_spv.h"
+#include "copy_res_spv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -401,6 +402,10 @@ struct Exec {
     VkShaderModule clearShader = VK_NULL_HANDLE;
     VkPipeline clearPipe = VK_NULL_HANDLE;
     bool clearFailed = false;
+    VkShaderModule copyShader = VK_NULL_HANDLE;
+    VkPipeline copyPipe = VK_NULL_HANDLE;
+    bool copyFailed = false;
+    uint64_t vkCopies = 0;
     uint64_t vkClears = 0;
     // [Host] KernelTiming
     VkQueryPool tsPool = VK_NULL_HANDLE;
@@ -1370,6 +1375,13 @@ bool shaderOnly(D3D12_RESOURCE_STATES s)
                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return s != 0 && (s & ~ok) == 0;
 }
+// A transition between a shader state and COPY_SOURCE / COPY_DEST around a copy that runs on the kernels' queue
+// (recordCopy): it changes nothing the kernels see either, and goes into the next D3D12 part with the other barriers.
+// A copy that cannot run there ends the batch itself, after these barriers in D3D12 order.
+bool copyOrShader(D3D12_RESOURCE_STATES s)
+{
+    return shaderOnly(s) || s == D3D12_RESOURCE_STATE_COPY_SOURCE || s == D3D12_RESOURCE_STATE_COPY_DEST;
+}
 void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE_BARRIER* b)
 {
     List* t;
@@ -1378,8 +1390,10 @@ void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE
         bool harmless = !g_splitBarriers;
         for (UINT i = 0; i < n && harmless; i++) {
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) continue;
-            harmless = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && shaderOnly(b[i].Transition.StateBefore) &&
-                       shaderOnly(b[i].Transition.StateAfter);
+            const D3D12_RESOURCE_STATES from = b[i].Transition.StateBefore, to = b[i].Transition.StateAfter;
+            harmless = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                       ((shaderOnly(from) && shaderOnly(to)) ||
+                        (g_cfg.vkCopies && copyOrShader(from) && copyOrShader(to) && (shaderOnly(from) || shaderOnly(to))));
         }
         if (!harmless) c->dirty.store(true, std::memory_order_relaxed);
         if (g_splitLog) {
@@ -1898,6 +1912,7 @@ template <bool Float> void STDMETHODCALLTYPE sClearUav(List* self, D3D12_GPU_DES
                                                       ID3D12Resource* res, const void* values, UINT nrects, const D3D12_RECT* rects);
 void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT n,
                                          ID3D12Resource* dst, UINT64 off);
+void STDMETHODCALLTYPE sCopyResource(List* self, ID3D12Resource* dst, ID3D12Resource* src);
 
 std::mutex g_hookLock;
 
@@ -1950,6 +1965,7 @@ bool hookListClass(List* list)
         case 40: hook = (void*)&sSetView<1, 4>; break;
         case 41: hook = (void*)&sSetView<0, 5>; break;
         case 42: hook = (void*)&sSetView<1, 5>; break;
+        case 17: hook = (void*)&sCopyResource; break;
         case 49: hook = (void*)&sClearUav<false>; break;
         case 50: hook = (void*)&sClearUav<true>; break;
         case 54: hook = (void*)&sResolveQueryData; break;
@@ -2340,6 +2356,147 @@ void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D1
     }
     using Fn = void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource*, UINT64);
     orig<Fn>(t, 54)(t, heap, type, start, n, dst, off);
+}
+
+// ------------------------------------------------------------------------------------------------ copies
+// DLSS-G copies its real frame into OutputReal when the caller provides one (Streamline does, at MultiFrameIndex 1):
+// a CopyResource between two launches, which ended the batch (one more D3D12 <-> Vulkan round trip per real frame).
+// With a batch open it runs as a dispatch in the batch instead (copy_res.comp), for buffers (32-bit words through
+// the GPU virtual addresses) and for 2D textures in formats whose texel round trip is exact: UNORM, UINT, SINT.
+// 0 unorm, 1 uint, 2 sint, -1 not here
+int copyKind(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        return 0;
+    default:
+        break;
+    }
+    int k = clearKind(f);
+    return k == 1 || k == 2 ? k : -1;
+}
+
+VkPipeline copyPipeline()
+{
+    if (g.copyPipe || g.copyFailed) return g.copyPipe;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof kCopyResSpv;
+    mi.pCode = kCopyResSpv;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.pName = "main";
+    ci.layout = g.pipeLayout;
+    VkResult r = vk.CreateShaderModule(g.dev, &mi, nullptr, &g.copyShader);
+    if (r == VK_SUCCESS) {
+        ci.stage.module = g.copyShader;
+        r = vk.CreateComputePipelines(g.dev, g.pcache, 1, &ci, nullptr, &g.copyPipe);
+    }
+    if (r != VK_SUCCESS) {
+        logf("copy pipeline creation failed (%d): copies stay on D3D12", r);
+        g.copyPipe = VK_NULL_HANDLE;
+        g.copyFailed = true;
+    }
+    return g.copyPipe;
+}
+
+// a descriptor of `res` in the scratch heap, as a slot of the bindless set
+uint32_t scratchView(ID3D12Resource* res, DXGI_FORMAT fmt, bool uav)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g.scratchHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)(g.scratchNext++ % 4096) * g.scratchInc;
+    if (uav) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+        u.Format = fmt;
+        u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.d3d->CreateUnorderedAccessView(res, nullptr, &u, h);
+    } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        g.d3d->CreateShaderResourceView(res, &v, h);
+    }
+    return viewSlot(h, uav);
+}
+
+// records CopyResource(dst, src) into the open kernel batch of c, or false (D3D12 then; it ends the batch); g_lock held
+bool recordCopy(Chain* c, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    if (c->closed || c->batches.empty() || c->dirty.load() || !dst || !src || dst == src || !g.scratchHeap) return false;
+    D3D12_RESOURCE_DESC d = dst->GetDesc(), s = src->GetDesc();
+    if (d.Dimension != s.Dimension || d.Width != s.Width || d.Height != s.Height || d.DepthOrArraySize != s.DepthOrArraySize ||
+        d.MipLevels != s.MipLevels || d.Format != s.Format || d.SampleDesc.Count != 1 || s.SampleDesc.Count != 1)
+        return false;
+    VkPipeline pipe = copyPipeline();
+    if (!pipe) return false;
+    uint32_t pc[7] = {};
+    uint32_t gx, gy;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (d.Width % 4 || d.Width / 4 > 0xffffffffull) return false;
+        uint64_t da = dst->GetGPUVirtualAddress(), sa = src->GetGPUVirtualAddress(), n = d.Width / 4;
+        uint32_t groups = (uint32_t)((n + 63) / 64);
+        gx = std::min<uint32_t>(groups, 65535);
+        gy = (groups + gx - 1) / gx;
+        uint32_t v[7] = {(uint32_t)da, (uint32_t)(da >> 32), 0, (uint32_t)n, 3, (uint32_t)sa, (uint32_t)(sa >> 32)};
+        memcpy(pc, v, sizeof pc);
+    } else {
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.MipLevels != 1) return false;
+        if (!(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || (s.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+            return false;
+        int kind = copyKind(d.Format);
+        if (kind < 0) return false;
+        static std::map<DXGI_FORMAT, bool> storable;
+        auto st = storable.find(d.Format);
+        if (st == storable.end()) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{d.Format};
+            bool ok = SUCCEEDED(g.d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) &&
+                      (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            st = storable.emplace(d.Format, ok).first;
+        }
+        if (!st->second) return false;
+        uint32_t ss = scratchView(src, s.Format, false), ds = scratchView(dst, d.Format, true);
+        if (!ss || !ds) return false;
+        uint32_t w = (uint32_t)d.Width, h = d.Height;
+        gx = (w + 7) / 8;
+        gy = (h + 7) / 8;
+        uint32_t v[7] = {ss, ds, w, h, (uint32_t)kind, 0, 0};
+        memcpy(pc, v, sizeof pc);
+    }
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the copy
+    serialize(b->cmd);
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vk.CmdDispatch(b->cmd, gx, gy, 1);
+    static const std::string kLabelCopy = "(copy)";
+    stamp(b, &kLabelCopy);
+    if (g.vkCopies++ < 4)
+        logf("copy of %p into %p (%llux%u format %d) on the kernels' queue", (void*)src, (void*)dst,
+             (unsigned long long)d.Width, d.Height, (int)d.Format);
+    return true;
+}
+
+void STDMETHODCALLTYPE sCopyResource(List* self, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[17]++;
+        if (g_cfg.vkCopies) {
+            std::lock_guard<std::recursive_mutex> l(g_lock);
+            if (recordCopy(c, dst, src)) {
+                if (g_splitLog) c->trace += " C17";
+                return;
+            }
+        }
+        if (g_splitLog) c->trace += " s17";
+        c->dirty.store(true, std::memory_order_relaxed);
+    }
+    orig<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, ID3D12Resource*)>(t, 17)(t, dst, src);
 }
 
 // ------------------------------------------------------------------------------------------------ modules

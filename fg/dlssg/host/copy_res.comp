@@ -1,0 +1,36 @@
+// CopyResource on the kernels' Vulkan queue (cubin_d3d12.cpp, recordCopy).
+// Modes 0-2: one 2D texture into another of the same size and format, texel by texel: read through an SRV (binding 0
+// of the bindless set), written through a UAV (binding 1), both raw D3D12 descriptors. Only formats where the round
+// trip is exact take this path: UNORM (mode 0, k / (2^n - 1) converts back to k), UINT (1), SINT (2).
+// Mode 3: `n` 32-bit words from GPU virtual address src to dst (buffers).
+// Regenerate copy_res_spv.h: glslangValidator -V --target-env vulkan1.3 --vn kCopyResSpv -o copy_res_spv.h copy_res.comp
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D ftex[65536];
+layout(set = 0, binding = 0) uniform utexture2D utex[65536];
+layout(set = 0, binding = 0) uniform itexture2D itex[65536];
+layout(set = 0, binding = 1) writeonly uniform image2D fimg[65536];
+layout(set = 0, binding = 1) writeonly uniform uimage2D uimg[65536];
+layout(set = 0, binding = 1) writeonly uniform iimage2D iimg[65536];
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+// textures: a = source slot, b = destination slot; buffers: a/b = destination address, c/d = source address, h = words
+layout(push_constant) uniform P { uint a, b, w, h, mode, c, d; } p;
+void main()
+{
+    if (p.mode == 3) {
+        uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationIndex;
+        if (i >= p.h) return;
+        Words dst = Words(uint64_t(p.a) | (uint64_t(p.b) << 32));
+        Words src = Words(uint64_t(p.c) | (uint64_t(p.d) << 32));
+        dst.w[i] = src.w[i];
+        return;
+    }
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.w) || c.y >= int(p.h)) return;
+    if (p.mode == 0) imageStore(fimg[p.b], c, texelFetch(ftex[p.a], c, 0));
+    else if (p.mode == 1) imageStore(uimg[p.b], c, texelFetch(utex[p.a], c, 0));
+    else imageStore(iimg[p.b], c, texelFetch(itex[p.a], c, 0));
+}

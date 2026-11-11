@@ -211,6 +211,7 @@ void setupCubin(const std::wstring& dir)
     c.gpuSync = iniUInt(L"GpuSync", 1) != 0;
     c.splitBarriers = iniUInt(L"SplitBarriers", 0) != 0;
     c.vkClears = iniUInt(L"VkClears", 1) != 0;
+    c.vkCopies = iniUInt(L"VkCopies", 1) != 0;
     c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
     c.splitLog = iniUInt(L"SplitLog", 0) != 0;
     c.kernelTiming = iniUInt(L"KernelTiming", 0) != 0;

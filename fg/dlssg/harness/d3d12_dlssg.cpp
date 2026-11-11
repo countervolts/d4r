@@ -543,7 +543,7 @@ int main(int argc, char** argv)
     freopen((out + "\\harness.log").c_str(), "w", stderr);
     setvbuf(stderr, nullptr, _IONBF, 0);
     uint32_t W = 2560, H = 1440, RW = 1280, RH = 720, frames = 8, mfc = 1;
-    bool bench = false, compute = false, pipe = false, copyout = false, lite = false;
+    bool bench = false, compute = false, pipe = false, copyout = false, lite = false, outreal = false;
     std::string replay_dir;
     unsigned replay_repeat = 1;
     for (int i = 3; i < argc; i++) {
@@ -558,6 +558,7 @@ int main(int argc, char** argv)
         else if (a == "--bench") bench = true;
         else if (a == "--pipe") pipe = true;   // bench: two frames in flight (the GPU never idles between frames)
         else if (a == "--copyout") copyout = true; // after each evaluate copy the output into a back-buffer-like texture
+        else if (a == "--outreal") outreal = true; // OutputReal at index 1, as Streamline sets it (DLSS-G copies the real frame)
         else if (a == "--replay") replay_dir = nxt();
         else if (a == "--replay-repeat") replay_repeat = std::stoul(nxt());
         else if (a == "--replay-ui") g_replay_ui = std::stoul(nxt());
@@ -644,6 +645,7 @@ int main(int argc, char** argv)
     for (uint32_t k = 0; k < mfc; k++)
         outs.push_back(make_tex(dev, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 4, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     Tex* ins[4] = {&back, &hudless, &depth, &mvec};
+    Tex realOut = make_tex(dev, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 4, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // --copyout: what Streamline does per shown frame (copy the generated frame into a swap chain back buffer)
     std::vector<Tex> bbs;
     if (copyout)
@@ -660,7 +662,7 @@ int main(int argc, char** argv)
     UINT64 upsize = 0, upoff[4];
     for (int i = 0; i < 4; i++) { upoff[i] = upsize; upsize += (ins[i]->total + 511) & ~511ull; }
     ID3D12Resource* up = make_buffer(dev, upsize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    UINT64 rbsize = outs[0].total * mfc + 4096;
+    UINT64 rbsize = outs[0].total * (mfc + 1) + 4096;   // + OutputReal (--outreal)
     ID3D12Resource* rb = make_buffer(dev, rbsize, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     // --pipe: a second upload / timestamp readback set for the frame in flight
     ID3D12Resource* ups[2] = {up, pipe ? make_buffer(dev, upsize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ) : up};
@@ -758,6 +760,7 @@ int main(int argc, char** argv)
             ms::setPtr(p, "DLSSG.Depth", depth.res);
             ms::setPtr(p, "DLSSG.MVecs", mvec.res);
             ms::setPtr(p, "DLSSG.OutputInterpolated", outs[k - 1].res);
+            if (outreal) ms::setPtr(p, "DLSSG.OutputReal", k == 1 ? realOut.res : nullptr);
             ms::setU(p, "DLSSG.MultiFrameCount", mfc);
             ms::setU(p, "DLSSG.MultiFrameIndex", k);
             ms::setU(p, "DLSSG.Reset", f == 0 ? 1u : 0u);
@@ -845,6 +848,7 @@ int main(int argc, char** argv)
             ms::setPtr(p, "DLSSG.Depth", depth.res);
             ms::setPtr(p, "DLSSG.MVecs", mvec.res);
             ms::setPtr(p, "DLSSG.OutputInterpolated", outs[k - 1].res);
+            if (outreal) ms::setPtr(p, "DLSSG.OutputReal", k == 1 ? realOut.res : nullptr);
             ms::setU(p, "DLSSG.MultiFrameCount", mfc);
             ms::setU(p, "DLSSG.MultiFrameIndex", k);
             ms::setU(p, "DLSSG.Reset", f == 0 ? 1u : 0u);
@@ -893,6 +897,15 @@ int main(int argc, char** argv)
                 cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 transition(cl, outs[k], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
+        if (dump && outreal) {
+            transition(cl, realOut, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            src.pResource = realOut.res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = realOut.fp;
+            dst.PlacedFootprint.Offset = 4096 + outs[0].total * mfc;
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(cl, realOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         cl->ResolveQueryData(qh, D3D12_QUERY_TYPE_TIMESTAMP, 0, mfc + 1, rb, 0);
         DWORD t0 = GetTickCount();
         submit_wait();
@@ -921,6 +934,9 @@ int main(int argc, char** argv)
                 write_ppm(out + "\\f" + std::to_string(f) + "_g" + std::to_string(k + 1) + ".ppm",
                           rm + 4096 + outs[0].total * k + outs[k].fp.Offset, W, H, outs[k].fp.Footprint.RowPitch);
             write_ppm(out + "\\f" + std::to_string(f) + "_real.ppm", rgba.data(), W, H, W * 4);
+            if (outreal)
+                write_ppm(out + "\\f" + std::to_string(f) + "_outreal.ppm", rm + 4096 + outs[0].total * mfc + realOut.fp.Offset,
+                          W, H, realOut.fp.Footprint.RowPitch);
             for (uint32_t k = 1; k <= mfc; k++) {
                 std::vector<uint8_t> gt;
                 sc.render((float)f - 1.0f + (float)k / (mfc + 1), gt);
