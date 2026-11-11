@@ -895,3 +895,29 @@ Harness: 2560x1440 output, 1280x720 render, 400 frames, `--bench --pipe`, GPU ms
 - **Ruled out: the deferred shader-only barriers.** Dropping them (measurement-only hack) saves 0.061 ms at 2x and
   0.079 ms at 6x per list. Not worth touching D3D12's state tracking.
 - GpuSync=0 (CPU hand-offs) not timed: every hand-off would add a CPU round trip on top of the GPU one.
+- **Rejected: VK_KHR_global_priority on the kernels' queue** (high, realtime; device creation accepted both).
+  A B B A x3: 2x -0.012 / +0.002, 6x +0.008 / +0.002 ms. Reverted.
+- **Rejected: compute -> compute barriers between dispatches** (serialize() with SHADER_WRITE -> SHADER_READ|WRITE|
+  UNIFORM_READ instead of ALL_COMMANDS with TRANSFER/MEMORY_WRITE): 2x -0.026, 6x -0.004 ms. The barriers are not
+  where the time goes. Reverted.
+- **Where the rest is** (state at 04:08, control 3.26 / 5.54 ms): kernels' queue 2.570 ms at 2x and 4.914 ms at 6x
+  per list, so a constant ~0.65 ms per list is the one remaining D3D12 -> Vulkan -> D3D12 round trip plus ~0.07 ms of
+  D3D12 parts. Per further generated frame the kernels take 0.585 ms (EstimateIntermMvecsScatter 0.26,
+  BlendCandidatesFGLite 0.26, WarpBlendingWeights 0.033, two buffer clears 0.031) against Linux's 0.49 for the whole
+  frame. Same SPIR-V as Linux: the difference is AMD's Windows compiler / driver, or the translator's output on it;
+  changing the translator changes what Linux builds, so not touched.
+
+### Bigger option, written up before starting (not started)
+
+GPU-side hand-off: kernels on a compute-only (ACE) queue, which runs beside the game's graphics queue. D3D12 -> Vulkan:
+the leading part ends with WriteBufferImmediate of a sequence number, the batch starts with a one-wave dispatch that
+polls it (atomic loads). Vulkan -> D3D12: the batch ends with a barrier and a store of a sequence number; the D3D12 queue
+runs a one-wave DXIL compute shader that polls it, in its own small list before the next part (that list's start
+invalidates the caches). No OS scheduler in either direction.
+- Expected gain: most of the ~0.6 ms round trip per list, quiet state: 2x 3.26 -> ~2.7, 4x ~4.4 -> ~3.8, 6x 5.46 ->
+  ~4.95. 6x would still be ~0.05 over target (the per-frame kernel cost above).
+- Cost: a DXIL spin shader + root signature + PSO (dxc is in .tools), sequence buffers, ~300 lines in
+  cubin_d3d12.cpp. The compute queue alone measured +0.16-0.25 ms slower, which the spin must win back first.
+- Risk: a spin that never sees its value hangs the queue it runs on. The polls need an iteration cap, and on expiry
+  the frame would use unfinished data. The Vulkan spin can start early and poll through all the game's work queued
+  before the evaluate (in game that can be a whole frame). This needs the owner's go-ahead.
