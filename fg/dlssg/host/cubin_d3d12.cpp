@@ -14,7 +14,9 @@
 //    into it afterwards goes into a further list this file owns (the vtable redirection of tools/d4r_d3d12_split.h,
 //    generalised to any number of cuts), and ExecuteCommandLists runs the parts in order with a D3D12 fence (shared,
 //    imported as a Vulkan timeline semaphore) between each D3D12 part and the kernels after it. Launches with nothing
-//    recorded in between share one command buffer. The descriptor heaps, root signatures, pipeline state and root
+//    recorded in between share one command buffer; shader-only barriers, UAV clears (run as Vulkan dispatches,
+//    clear_uav.comp), timestamps and markers in between do not end it (each hand-off idles the GPU ~0.15 ms on RDNA3,
+//    docs/hillclimb/journal.md "FG"). The descriptor heaps, root signatures, pipeline state and root
 //    arguments set during DLSS-G's evaluate are replayed into every new part (a cubin launch keeps D3D12 state).
 //
 // Kernels, T1 launch groups and big parameter blocks follow nvxrt.cpp (nvxrt/), which documents them.
@@ -27,6 +29,7 @@
 
 #include "cubin_d3d12.h"
 #include "../nvxrt/util.h"
+#include "clear_uav_spv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -391,6 +394,10 @@ struct Exec {
     std::map<ID3D12CommandQueue*, QueueSync> syncs;
     VkFence cpuFence = VK_NULL_HANDLE;
     uint64_t batchesSubmitted = 0, partsCreated = 0;
+    VkShaderModule clearShader = VK_NULL_HANDLE;
+    VkPipeline clearPipe = VK_NULL_HANDLE;
+    bool clearFailed = false;
+    uint64_t vkClears = 0;
 };
 Exec g;
 std::recursive_mutex g_lock;
@@ -1257,8 +1264,10 @@ struct Chain {
     std::vector<Batch*> batches;   // batches[k] runs after part k-1 (part -1 = the list itself)
     std::vector<Part> parts;
     uint32_t slotCalls[86] = {};
+    std::string trace;   // [Host] SplitLog
 };
 constexpr int kMaxChains = 32;
+bool g_splitLog = false;   // [Host] SplitLog: what ends each kernel batch, for a few lists (nvxrt.log)
 Chain g_chains[kMaxChains];
 std::atomic<int> g_activeChains{0};
 bool g_listHooks = false;
@@ -1287,7 +1296,11 @@ extern "C" void* cux_split_target(void* self, unsigned slot)
     Chain* c = findChain(self);
     if (!c) return self;
     if (slot < 86) c->slotCalls[slot]++;
-    c->dirty.store(true, std::memory_order_relaxed);
+    if (g_splitLog) c->trace += " s" + std::to_string(slot);
+    // EndQuery (53), SetMarker (56), BeginEvent (57), EndEvent (58) touch nothing the kernels read or write: they go
+    // into the next D3D12 part without ending the open kernel batch (a timestamp then lands after the batch)
+    if (!(slot == 53 || slot == 56 || slot == 57 || slot == 58) || g_cfg.splitQueries)
+        c->dirty.store(true, std::memory_order_relaxed);
     ID3D12GraphicsCommandList* t = c->target.load(std::memory_order_acquire);
     return t ? t : self;
 }
@@ -1340,6 +1353,17 @@ void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE
                        shaderOnly(b[i].Transition.StateAfter);
         }
         if (!harmless) c->dirty.store(true, std::memory_order_relaxed);
+        if (g_splitLog) {
+            char t[64];
+            for (UINT i = 0; i < n; i++) {
+                if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) snprintf(t, sizeof t, " u%p", (void*)b[i].UAV.pResource);
+                else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+                    snprintf(t, sizeof t, " t%p:%x>%x", (void*)b[i].Transition.pResource, (unsigned)b[i].Transition.StateBefore,
+                             (unsigned)b[i].Transition.StateAfter);
+                else snprintf(t, sizeof t, " a");
+                c->trace += t;
+            }
+        }
     }
     orig<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RESOURCE_BARRIER*)>(t, 26)(t, n, b);
 }
@@ -1574,6 +1598,7 @@ Chain* chainFor(List* list, bool create)
         c.batches.clear();
         c.parts.clear();
         memset(c.slotCalls, 0, sizeof c.slotCalls);
+        c.trace.clear();
         c.list.store(list, std::memory_order_release);
         g_activeChains.fetch_add(1);
         return &c;
@@ -1613,6 +1638,7 @@ Batch* batchFor(List* list)
     replay(c, p.list);
     // a launch group open in the previous batch cannot continue across D3D12 work
     if (!c->batches.empty()) g.pending.erase(c->batches.back()->cmd);
+    if (g_splitLog) c->trace += " ||";
     c->batches.push_back(b);
     c->parts.push_back(p);
     c->target.store(p.list, std::memory_order_release);
@@ -1772,6 +1798,10 @@ void STDMETHODCALLTYPE hExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList
             runBatch(q, s, c->batches[k]);
             chunk.assign(1, c->parts[k].list);
         }
+        if (g_splitLog) {
+            static int tl = 0;
+            if (g.launchCount > 3000 && tl < 8) { tl++; logf("SPLITLOG list %p: %s", (void*)lists[i], c->trace.c_str()); }
+        }
         static int logged = 0;
         if (logged < 3) {
             logged++;
@@ -1791,6 +1821,11 @@ void STDMETHODCALLTYPE hExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList
     for (Batch* b : batches) { b->done = done; g.inflightBatches.push_back(b); }
     for (Part& p : parts) { p.qs = s; p.done = done; g.inflightParts.push_back(p); }
 }
+
+template <bool Float> void STDMETHODCALLTYPE sClearUav(List* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                                      ID3D12Resource* res, const void* values, UINT nrects, const D3D12_RECT* rects);
+void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT n,
+                                         ID3D12Resource* dst, UINT64 off);
 
 std::mutex g_hookLock;
 
@@ -1843,6 +1878,9 @@ bool hookListClass(List* list)
         case 40: hook = (void*)&sSetView<1, 4>; break;
         case 41: hook = (void*)&sSetView<0, 5>; break;
         case 42: hook = (void*)&sSetView<1, 5>; break;
+        case 49: hook = (void*)&sClearUav<false>; break;
+        case 50: hook = (void*)&sClearUav<true>; break;
+        case 54: hook = (void*)&sResolveQueryData; break;
         default: break;
         }
         void* unused = nullptr;
@@ -2005,6 +2043,7 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
     }
     Batch* b = batchFor(list);
     if (!b) return;
+    if (g_splitLog) if (Chain* tc = findChain(nativeList(list))) tc->trace += " K:" + fn.name.substr(0, 40);
     VkCommandBuffer cmd = b->cmd;
     b->launches++;
     if (!g.groups.empty() && launchGroup(cmd, fn, grid, block, pbuf, psize)) return;
@@ -2043,6 +2082,187 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
     vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pc);
     vk.CmdDispatch(cmd, gx, gy, gz);
+}
+
+// ------------------------------------------------------------------------------------------------ clears, resolves
+// A ClearUnorderedAccessView* between two launches used to end the kernel batch: the clear ran on the D3D12 queue
+// between two hand-offs (each ~0.15 ms of idle GPU on RDNA3). When a batch is open and the clear covers one whole mip
+// of a 2D surface DLSS-G created, it runs instead as a dispatch in the batch (clear_uav.comp), through the same raw
+// D3D12 descriptor the kernels write through, at the same point in the order. Anything else stays on D3D12.
+// 0: float / unorm / snorm, 1: uint, 2: sint, -1: not handled here
+int clearKind(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return 0;
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R8_UINT:
+        return 1;
+    case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT:
+        return 2;
+    default:
+        return -1;
+    }
+}
+
+VkPipeline clearPipeline()
+{
+    if (g.clearPipe || g.clearFailed) return g.clearPipe;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof kClearUavSpv;
+    mi.pCode = kClearUavSpv;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.pName = "main";
+    ci.layout = g.pipeLayout;
+    VkResult r = vk.CreateShaderModule(g.dev, &mi, nullptr, &g.clearShader);
+    if (r == VK_SUCCESS) {
+        ci.stage.module = g.clearShader;
+        r = vk.CreateComputePipelines(g.dev, g.pcache, 1, &ci, nullptr, &g.clearPipe);
+    }
+    if (r != VK_SUCCESS) {
+        logf("clear pipeline creation failed (%d): clears stay on D3D12", r);
+        g.clearPipe = VK_NULL_HANDLE;
+        g.clearFailed = true;
+    }
+    return g.clearPipe;
+}
+
+// a raw (R32_TYPELESS) or 32-bit typed buffer view: its elements written through the GPU virtual address
+bool recordBufferClear(Chain* c, const ViewRec& v, ID3D12Resource* res, const D3D12_RESOURCE_DESC& rd, const uint32_t vals[4],
+                       bool isFloat)
+{
+    if (!v.hasDesc || v.uavDesc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || v.uavDesc.Buffer.StructureByteStride) return false;
+    DXGI_FORMAT f = v.uavDesc.Format;
+    bool raw = (v.uavDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    if (raw ? f != DXGI_FORMAT_R32_TYPELESS : !(f == DXGI_FORMAT_R32_UINT || f == DXGI_FORMAT_R32_SINT || f == DXGI_FORMAT_R32_FLOAT))
+        return false;
+    if (isFloat ? f != DXGI_FORMAT_R32_FLOAT : (f == DXGI_FORMAT_R32_FLOAT && vals[0] != 0)) return false;
+    uint64_t first = v.uavDesc.Buffer.FirstElement, n = v.uavDesc.Buffer.NumElements;
+    if (!n || n > 0xffffffffull || (first + n) * 4 > rd.Width) return false;
+    VkPipeline pipe = clearPipeline();
+    if (!pipe) return false;
+    uint64_t addr = res->GetGPUVirtualAddress() + first * 4;
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the clear
+    serialize(b->cmd);
+    uint32_t pc[8] = {(uint32_t)addr, (uint32_t)(addr >> 32), (uint32_t)n, 3, vals[0], 0, 0, 0};
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    uint32_t groups = (uint32_t)((n + 63) / 64), gx = std::min<uint32_t>(groups, 65535), gy = (groups + gx - 1) / gx;
+    vk.CmdDispatch(b->cmd, gx, gy, 1);
+    if (g.vkClears++ < 8)
+        logf("clear (%s) of buffer %p, %llu elements from %llu, on the kernels' queue", isFloat ? "float" : "uint",
+             (void*)res, (unsigned long long)n, (unsigned long long)first);
+    return true;
+}
+
+// records the clear into the open kernel batch of c, or false (then it goes to D3D12 and ends the batch); g_lock held
+bool recordClear(Chain* c, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource* res, const void* values, bool isFloat)
+{
+    if (c->closed || c->batches.empty() || c->dirty.load() || !res) return false;
+    ViewRec v;
+    if (!lookupView(cpu.ptr, v) || !v.uav || v.res != res) return false;
+    D3D12_RESOURCE_DESC rd = res->GetDesc();
+    uint32_t vals[4];
+    memcpy(vals, values, sizeof vals);
+    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return recordBufferClear(c, v, res, rd, vals, isFloat);
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.SampleDesc.Count != 1) return false;
+    if (v.hasDesc && (v.uavDesc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || v.uavDesc.Texture2D.PlaneSlice != 0))
+        return false;
+    if (!v.hasDesc && rd.DepthOrArraySize != 1) return false;
+    DXGI_FORMAT fmt = v.hasDesc && v.uavDesc.Format != DXGI_FORMAT_UNKNOWN ? v.uavDesc.Format : rd.Format;
+    int kind = clearKind(fmt);
+    if (kind < 0 || vkFormat(fmt) == VK_FORMAT_UNDEFINED) return false;
+    uint32_t mode;
+    if (isFloat) {
+        if (kind != 0) return false;   // float values converted to integers: left to D3D12
+        mode = 0;
+    } else if (kind == 0) {
+        // raw bits into a non-integer format: only zero, which is 0.0 in every float / unorm / snorm format
+        if (vals[0] | vals[1] | vals[2] | vals[3]) return false;
+        mode = 0;
+    } else {
+        mode = (uint32_t)kind;
+    }
+    static std::map<DXGI_FORMAT, bool> storable;
+    auto st = storable.find(fmt);
+    if (st == storable.end()) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{fmt};
+        bool ok = SUCCEEDED(g.d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) &&
+                  (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+        st = storable.emplace(fmt, ok).first;
+    }
+    if (!st->second) return false;
+    VkPipeline pipe = clearPipeline();
+    if (!pipe) return false;
+    uint32_t slot = viewSlot(cpu, true);
+    if (!slot) return false;
+    uint32_t mip = v.hasDesc ? v.uavDesc.Texture2D.MipSlice : 0;
+    uint32_t w = std::max<uint32_t>(1, (uint32_t)(rd.Width >> mip)), h = std::max<uint32_t>(1, rd.Height >> mip);
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the clear
+    serialize(b->cmd);
+    uint32_t pc[8] = {slot, w, h, mode, vals[0], vals[1], vals[2], vals[3]};
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vk.CmdDispatch(b->cmd, (w + 7) / 8, (h + 7) / 8, 1);
+    if (g.vkClears++ < 4)
+        logf("clear (%s) of %p %ux%u format %d on the kernels' queue, slot %u", isFloat ? "float" : "uint", (void*)res, w,
+             h, (int)fmt, slot);
+    return true;
+}
+
+template <bool Float>
+void STDMETHODCALLTYPE sClearUav(List* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                 ID3D12Resource* res, const void* values, UINT nrects, const D3D12_RECT* rects)
+{
+    constexpr unsigned kSlot = Float ? 50 : 49;
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[kSlot]++;
+        if (g_cfg.vkClears && nrects == 0 && values) {
+            std::lock_guard<std::recursive_mutex> l(g_lock);
+            if (recordClear(c, cpu, res, values, Float)) {
+                if (g_splitLog) c->trace += Float ? " C50" : " C49";
+                return;
+            }
+        }
+        if (g_splitLog) c->trace += Float ? " s50" : " s49";
+        c->dirty.store(true, std::memory_order_relaxed);
+    }
+    using Fn = void(STDMETHODCALLTYPE*)(List*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*,
+                                        const void*, UINT, const D3D12_RECT*);
+    orig<Fn>(t, kSlot)(t, gpu, cpu, res, values, nrects, rects);
+}
+
+// a resolve into CPU-read memory (a timer's readback buffer) touches nothing a kernel reads: it does not end the batch
+void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT n,
+                                         ID3D12Resource* dst, UINT64 off)
+{
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[54]++;
+        bool readback = false;
+        D3D12_HEAP_PROPERTIES hp{};
+        if (!g_cfg.splitQueries && dst && SUCCEEDED(dst->GetHeapProperties(&hp, nullptr)))
+            readback = hp.Type == D3D12_HEAP_TYPE_READBACK ||
+                       (hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
+        if (g_splitLog) c->trace += readback ? " R54" : " s54";
+        if (!readback) c->dirty.store(true, std::memory_order_relaxed);
+    }
+    using Fn = void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource*, UINT64);
+    orig<Fn>(t, 54)(t, heap, type, start, n, dst, off);
 }
 
 // ------------------------------------------------------------------------------------------------ modules
@@ -2317,6 +2537,7 @@ void configure(const Config& config)
 {
     g_cfg = config;
     g_splitBarriers = config.splitBarriers;
+    g_splitLog = config.splitLog;
     g_cache = utf8(config.cacheDir);
     for (char& c : g_cache) if (c == '\\') c = '/';
     while (!g_cache.empty() && g_cache.back() == '/') g_cache.pop_back();

@@ -1,0 +1,29 @@
+// ClearUnorderedAccessView{Uint,Float} on the kernels' Vulkan queue (cubin_d3d12.cpp, recordClear).
+// Modes 0-2: every texel of one mip of a 2D surface, through the same raw D3D12 UAV descriptor (binding 1 of the
+// bindless set) the translated kernels write through. Format-less stores convert like D3D12's clear: mode 0 converts
+// floats to the view's format (ClearUnorderedAccessViewFloat), modes 1 and 2 store the integers of UINT / SINT views.
+// Mode 3: `count` 32-bit elements of a buffer view from GPU virtual address `addr` (the kernels' buffer device
+// addresses) set to v.x.
+// Regenerate clear_uav_spv.h: glslangValidator -V --target-env vulkan1.3 --vn kClearUavSpv -o clear_uav_spv.h clear_uav.comp
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) writeonly uniform image2D fimg[65536];
+layout(set = 0, binding = 1) writeonly uniform uimage2D uimg[65536];
+layout(set = 0, binding = 1) writeonly uniform iimage2D iimg[65536];
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Words { uint w[]; };
+layout(push_constant) uniform P { uint slot, w, h, mode; uvec4 v; } p;   // mode 3: slot, w = address, h = count
+void main()
+{
+    if (p.mode == 3) {
+        uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationIndex;
+        if (i < p.h) Words(uint64_t(p.slot) | (uint64_t(p.w) << 32)).w[i] = p.v.x;
+        return;
+    }
+    uvec2 c = gl_GlobalInvocationID.xy;
+    if (c.x >= p.w || c.y >= p.h) return;
+    if (p.mode == 0) imageStore(fimg[p.slot], ivec2(c), uintBitsToFloat(p.v));
+    else if (p.mode == 1) imageStore(uimg[p.slot], ivec2(c), p.v);
+    else imageStore(iimg[p.slot], ivec2(c), ivec4(p.v));
+}

@@ -13,6 +13,9 @@ struct Config {
     bool trace = false;      // every launch in the log
     bool splitBarriers = false; // every ResourceBarrier ends a kernel batch (else only non-shader transitions)
     bool gpuSync = true;     // false: hand-offs between the D3D12 queue and the kernels wait on the CPU
+    bool vkClears = true;    // ClearUnorderedAccessView* between kernels run on the kernels' queue (no hand-off)
+    bool splitLog = false;   // nvxrt.log: the sequence of kernels and D3D12 calls of a few lists, batch ends marked
+    bool splitQueries = false; // timestamps, query resolves to readback memory and PIX markers end a kernel batch
 };
 
 // Once, before the first query: reads the config. The executor itself starts on the first cubin call.

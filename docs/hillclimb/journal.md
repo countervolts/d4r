@@ -834,3 +834,42 @@ at a step, or a different function), keeping the time saved. Full write-up: docs
 - RDNA4: the shared files changed (dialect_hlsl.h, ags_wmma.hlsli, output_store.glsl, down_m.comp, dec0_m.comp) only
   under new defines; RDNA4's dec0_m, dec0_m_planes, down_m, down_m_rgb10, enc0_m, post_m and layer_m DXIL built from
   origin/windows and from the worktree are byte-identical.
+
+## FG
+
+Goal: DLSS Frame Generation (fg/dlssg) on native Windows as fast as on Linux, RX 7700 XT (gfx1101), AMD Software
+26.10.1. Branch `hillclimb/fg` from `windows` f356317 (the owner's uncommitted FG installer work carried, not
+committed). Workspace `D:\d4r-fg`: `rt\` is a portable d4r folder (d4r.ini and fg\dlssg copied from Ghost of Tsushima's
+install), `bin\` the harness + nvapi64.dll, `scripts\run.sh` (one run), `bench.sh` (A B B A, medians), `guard.sh` (sha256
+of the generated images, 60 frames, Lite/full x Exact 0/1 x 2x/4x/6x). The harness's `--lite` alone does not pick the
+Lite DLL; the host's d4r.ini Model does (run.sh sets D4R_FG_MODEL). The guard baseline is deterministic (two runs equal).
+
+Harness: 2560x1440 output, 1280x720 render, 400 frames, `--bench --pipe`, GPU ms per real frame.
+
+### 2026-11-11: hand-offs (lead 1, 2)
+
+- **Measured** with a new `[Host] SplitLog=1` (nvxrt.log: the kernels and D3D12 calls of a few lists, batch ends marked).
+  At 2x one list per real frame is cut into 5 kernel batches; at 4x 7 (all three evaluates in one list). Barriers were
+  already harmless. What ended batches: the first D3D12 work (unavoidable), `ClearUnorderedAccessViewUint/Float` (4 per
+  evaluate: a raw R32 buffer cleared to 0x7fffffff, an R8_UNORM 1280x720 surface cleared to 0.0f), and between the
+  evaluates of one list `EndEvent/EndQuery/ResolveQueryData/BeginEvent` (the host's GPU timer and the harness's
+  timestamps).
+- **Cost of a hand-off**: `SplitBarriers=1` (45 batches instead of 5) +6.0 ms at 2x: ~0.15 ms each. A measurement-only
+  hack that let the clears not split (wrong order): 3.75 -> 3.43 ms at 2x. Hypothesis confirmed.
+- **Kept: clears on the kernels' queue, timestamps and markers do not split** (`VkClears=1`, `SplitQueries=0` defaults).
+  A clear with a batch open runs as a dispatch in the batch (host/clear_uav.comp): 2D surfaces through the same raw
+  D3D12 UAV descriptor the kernels use (format-less store), raw / 32-bit buffers through the GPU VA; anything else
+  stays on D3D12. EndQuery, PIX markers and resolves into readback memory go to the next D3D12 part. Every list is now
+  1 batch (2 parts) at 2x-6x. Side effect: the host's per-MultiFrameIndex GPU times now put the whole list on index 1;
+  their sum (per real frame) is unchanged. Guard: byte-identical, all 12 modes.
+
+| FG (Lite) | before | after | delta |
+|---|---:|---:|---:|
+| 2x | 3.749 | 3.350 | -0.399 |
+| 3x | 4.418 | 3.917 | -0.501 |
+| 4x | 5.361 | 4.429 | -0.931 |
+| 5x | 6.308 | 4.998 | -1.309 |
+| 6x | 7.021 | 5.619 | -1.402 |
+
+  Full model: 2x 5.819 -> 4.947, 4x 11.443 -> 10.439, 6x 16.985 -> 15.692. (3 rounds A B B A for Lite, 2 for full;
+  every range within +-0.05 except Lite 6x after, 5.52-5.91.)

@@ -210,6 +210,9 @@ void setupCubin(const std::wstring& dir)
     c.trace = iniUInt(L"Trace", 0) != 0;
     c.gpuSync = iniUInt(L"GpuSync", 1) != 0;
     c.splitBarriers = iniUInt(L"SplitBarriers", 0) != 0;
+    c.vkClears = iniUInt(L"VkClears", 1) != 0;
+    c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
+    c.splitLog = iniUInt(L"SplitLog", 0) != 0;
     cux::configure(c);
 }
 
