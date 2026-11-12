@@ -33,14 +33,16 @@ DLSS 4 (K) FPS was measured on 2026-10-21, Using no approximations.
  
 Radeon RX 7700 XT, Ghost of Tsushima.
 
-| Mode | DLSS 4 (K) | FSR | DLSS upscale time | FSR upscale time |
-|---|---|---|---|---|
-| Quality | **90.9** | 90.2 | **1.99 ms** | 2.50 ms |
-| Balanced | **93.8** | 93.2 | **1.96 ms** | 2.47 ms |
-| Ultra Performance | 101.7 | **102.5** | **1.91 ms** | 2.36 ms |
+| Mode | DLSS 4 (K) | FSR | DLSS 1% low | FSR 1% low | DLSS upscale time | FSR upscale time |
+|---|---|---|---|---|---|---|
+| Native AA (DLAA / FSR AA) | **56.5** | 53.9 | **51.3** | 48.8 | **1.72 ms** | 2.20 ms |
+| Quality | **73.7** | 70.4 | **67.1** | 63.3 | **1.66 ms** | 2.19 ms |
+| Balanced | **78.0** | 74.1 | **68.3** | 66.7 | **1.64 ms** | 2.16 ms |
+| Performance | **80.8** | 77.1 | **72.2** | 66.4 | **1.61 ms** | 2.14 ms |
+| Ultra Performance | **85.7** | 78.9 | **75.8** | 68.0 | **1.57 ms** | 2.09 ms |
 
-Measured on 2026-10-21, Using no approximations. 
-K and FSR 4.1.1 are within 1% across all three modes, with K slightly ahead at Quality and Balanced and FSR slightly ahead at Ultra Performance.
+Measured on 2026-11-12 at the highest possible graphics using no approximations. 
+K is 4.7–8.6% faster than FSR 4.1.1 at every mode, with upscale times about 0.5 ms lower.
 
 Radeon RX 7700 XT, Cyberpunk 2077.
 
