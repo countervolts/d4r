@@ -224,11 +224,12 @@ def compile_l(a, one, R):
         glsl('down_m.comp', f'down_m_wide_{store}.spv', ['-DWIDE_STORE=1', f'-D{define}=1'] + ldr)
     if a.hip:
         package_hip(a, Ps)
-        # the stages' weights as NGX uploads them, and their native kernels (kernels/tex/enc0l_net.hip, dec0l_net.hip)
+        # the stages' weights as NGX uploads them, and their native kernels (kernels/tex/enc0l_net.hip, dec0l_net.hip),
+        # which kernels/build.sh builds only for the RDNA3 targets that run them (engine/vkhip)
         for name, kernel in (('enc0l', f'rrlite_enc0_4x4_mvlo_{R}'), ('dec0l', 'rrlite_dec0_4x4')):
-            w = np.ascontiguousarray(blob_of(one(kernel))); w.tofile(a.output / f'{name}_weights.bin')
             src = a.hip / f'rrlite_{name}_net.hsaco'
-            if not src.exists(): raise ValueError(f'{src} is missing')
+            if not src.exists(): continue
+            w = np.ascontiguousarray(blob_of(one(kernel))); w.tofile(a.output / f'{name}_weights.bin')
             (a.output / 'hip' / src.name).write_bytes(src.read_bytes())
     marker = a.output / 'ldr'
     if a.ldr: marker.write_text('1\n')
