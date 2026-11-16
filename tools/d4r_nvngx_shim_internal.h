@@ -1152,6 +1152,8 @@ struct ProjectIdentity
 void start_engine_preload();
 bool native_engine_available(bool ldr);
 enum class AmdGeneration { Unknown, Older, Rdna3, Rdna4 }; // ordered: newer compares greater
+// The render GPU's driver version as four 16-bit fields (a.b.c.d), 0 when unknown; set by amd_render_generation.
+inline uint64_t g_renderDriverVersion = 0;
 AmdGeneration amd_render_generation(ID3D12Device* renderDevice);
 d4r::dx::MModel* native_engine_m(bool ldr, bool presetL = false);
 d4r::dx::rdna3::MModel* native_engine_m_rdna3(bool ldr, bool presetL);
@@ -1870,6 +1872,10 @@ struct Feature
     std::atomic<uint32_t> completedFrames{0};
     uint32_t engineFrames = 0;    // game thread: frames the engine recorded into the game's lists (no CUDA completion)
     uint32_t engineMisses = 0;    // game thread: native D3D12 frames the engine could not record (no fallback there)
+    // game thread: native D3D12 frames skipped because a texture did not cover its rectangle (a transient state, e.g.
+    // a scene or menu transition); the next frame recorded restarts the temporal history
+    uint32_t engineRectMisses = 0;
+    bool engineHistoryLost = false;
     uint32_t evaluatedFrames = 0; // worker only
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.

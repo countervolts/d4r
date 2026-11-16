@@ -24,6 +24,9 @@ Built from source by d4r (GPL-3.0-only, d4r/licenses/d4r-LICENSE.txt), d4r commi
                          Microsoft DirectX Shader Compiler @DXC_VERSION@ (unmodified release build),
                          https://github.com/microsoft/DirectXShaderCompiler
                          Licenses: d4r/licenses/dxc-LICENSE-*.txt, d4r/licenses/dxc-LICENCE-MIT.txt
+  d4r/fg/dlssg/bin/spirv-val.exe
+                         Khronos SPIRV-Tools (unmodified release build, from the Vulkan SDK),
+                         https://github.com/KhronosGroup/SPIRV-Tools. License: d4r/licenses/SPIRV-Tools-LICENSE.txt
   d4r/tools/models/bin/msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll
                          Microsoft Visual C++ runtime @VCRUNTIME_VERSION@ (unmodified, from Visual Studio's redistributable
                          folder), which glslangValidator.exe needs; app-local, as Visual Studio's license allows

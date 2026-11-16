@@ -25,6 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PRESET_IDS = {'K': 11, 'L': 12, 'M': 13}
+RR_PRESETS = {'RRD': '4', 'RRE': '5', 'RRF': '6'}  # Ray Reconstruction D, E (RDNA3: the gfx11 packages) and F
 
 
 def load_matrix(path):
@@ -50,8 +51,9 @@ def case_command(case, matrix, runtime, run_dir):
         exe = Path(matrix['tools']) / 'd3d12_dlss_harness.exe'
         env.update({'D4R_HARNESS_GPU_SCENE': '1', 'D4R_HARNESS_MOTION_SCENE': '1', 'D4R_HARNESS_FRAME_WAIT_MS': '0',
                     'D4R_HARNESS_CREATE_FLAGS': '0x6b'})
-        if preset == 'RRF':
-            env.update({'D4R_HARNESS_FEATURE_ID': '13', 'D4R_RR_PRESET': '6', 'D4R_HARNESS_RR_PRESET': '6'})
+        if preset in RR_PRESETS:
+            rr = RR_PRESETS[preset]
+            env.update({'D4R_HARNESS_FEATURE_ID': '13', 'D4R_RR_PRESET': rr, 'D4R_HARNESS_RR_PRESET': rr})
         else:
             env.update({'D4R_HARNESS_DLSS_PRESET': str(PRESET_IDS[preset]), 'D4R_DLSS_PRESET': str(PRESET_IDS[preset])})
         argv = [str(exe), str(Path(runtime) / 'nvngx.dll'), str(out), str(frames), str(w), str(h), str(ow), str(oh)]
@@ -59,8 +61,8 @@ def case_command(case, matrix, runtime, run_dir):
         exe = Path(matrix['tools']) / 'vulkan_dlss_harness.exe'
         env.update({'D4R_HARNESS_ENGINE_DEVICE': '1', 'D4R_HARNESS_PAN': '2', 'D4R_HARNESS_PAN_CANVAS': '1',
                     'D4R_HARNESS_CHECK_EVERY': '1000000', 'D4R_HARNESS_SIZE': f'{w} {h} {ow} {oh}'})
-        if preset == 'RRF':
-            env.update({'D4R_HARNESS_RR': '1', 'D4R_RR_PRESET': '6'})
+        if preset in RR_PRESETS:
+            env.update({'D4R_HARNESS_RR': '1', 'D4R_RR_PRESET': RR_PRESETS[preset]})
         else:
             env['D4R_DLSS_PRESET'] = str(PRESET_IDS[preset])
         argv = [str(exe), str(Path(runtime) / 'nvngx.dll'), str(out), str(frames)]

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Mon, 16 Nov 2026 13:00:00 +0100
+Subject: [PATCH] FSR FG input: aspect ratio from the display size when generationRect is empty
+
+FSR frame generation passes a generationRect of 0x0 to mean the whole swapchain (Ghost of Tsushima does). The
+PREPARE handlers divided that width by that height for the camera aspect ratio, 0 / 0 = NaN, and the NaN went into
+DLSSG's constants (cameraAspectRatio) with all-zero projection matrices, every frame: artifacts in the generated
+frames. Use the context's display size, then the swapchain size, when the rect is empty.
+---
+diff --git a/OptiScaler/inputs/FG/FfxApi_Dx12_FG.cpp b/OptiScaler/inputs/FG/FfxApi_Dx12_FG.cpp
+index b303eebd..dffa6b85 100644
+--- a/OptiScaler/inputs/FG/FfxApi_Dx12_FG.cpp
++++ b/OptiScaler/inputs/FG/FfxApi_Dx12_FG.cpp
+@@ -1088,7 +1088,14 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
+         UINT64 dispWidth = 0;
+         UINT dispHeight = 0;
+         fg->GetInterpolationRect(dispWidth, dispHeight, fIndex);
+-        auto aspectRatio = (float) dispWidth / (float) dispHeight;
++        if (dispWidth == 0 || dispHeight == 0)
++        {
++            // A generationRect of 0x0 means the whole swapchain. Without this the aspect ratio below is 0 / 0 = NaN,
++            // which reached DLSSG as cameraAspectRatio and kept its projection matrices from being built.
++            dispWidth = _fgConst.displayWidth != 0 ? _fgConst.displayWidth : s.currentSwapchainDesc.BufferDesc.Width;
++            dispHeight = _fgConst.displayHeight != 0 ? _fgConst.displayHeight : s.currentSwapchainDesc.BufferDesc.Height;
++        }
++        auto aspectRatio = dispHeight != 0 ? (float) dispWidth / (float) dispHeight : 16.0f / 9.0f;
+         fg->SetCameraValues(cdDesc->cameraNear, cdDesc->cameraFar, cdDesc->cameraFovAngleVertical, aspectRatio, 0.0f,
+                             fIndex);
+ 
+@@ -1180,7 +1187,14 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
+         UINT64 dispWidth = 0;
+         UINT dispHeight = 0;
+         fg->GetInterpolationRect(dispWidth, dispHeight, fIndex);
+-        auto aspectRatio = (float) dispWidth / (float) dispHeight;
++        if (dispWidth == 0 || dispHeight == 0)
++        {
++            // A generationRect of 0x0 means the whole swapchain. Without this the aspect ratio below is 0 / 0 = NaN,
++            // which reached DLSSG as cameraAspectRatio and kept its projection matrices from being built.
++            dispWidth = _fgConst.displayWidth != 0 ? _fgConst.displayWidth : s.currentSwapchainDesc.BufferDesc.Width;
++            dispHeight = _fgConst.displayHeight != 0 ? _fgConst.displayHeight : s.currentSwapchainDesc.BufferDesc.Height;
++        }
++        auto aspectRatio = dispHeight != 0 ? (float) dispWidth / (float) dispHeight : 16.0f / 9.0f;
+         fg->SetCameraValues(cdDesc->cameraNear, cdDesc->cameraFar, cdDesc->cameraFovAngleVertical, aspectRatio, 0.0f,
+                             fIndex);
+ 

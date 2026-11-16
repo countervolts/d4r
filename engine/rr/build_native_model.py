@@ -7,7 +7,8 @@ usage: build_native_model.py --dll NVNGX_DLSSD_DLL D|E OUT_DIR
 The same steps, defaults and outputs as build_native_model.sh --dll: the translated model (engine/compile_rr.py), the
 weights (dll_weights.py), each native stage packed and compiled against its packing's header, rr.txt rewritten to the
 native stages. Builds the default arithmetic only (D4R_RR_RELAXED level 3; D4R_RR_RELAXED=0-2 and D4R_RR_MIX=1 as
-there); the gfx11 (RDNA3) variant and the capture checks stay in the bash script. OUT_DIR/native-work keeps the
+there); D4R_RR_GFX11=1 builds the RDNA3 variant (exact arithmetic, widened weights, as the bash script); the
+capture checks stay in the bash script. OUT_DIR/native-work keeps the
 generated sources compile_rr_dxil.py builds the D3D12 shaders from.
 Everything written is derived from the user's own nvngx_dlssd.dll and stays on their machine.
 """
@@ -68,9 +69,25 @@ def main():
         defs.append(f'-DRR_RELAXED={min(relaxed, 2)}')
         defs += ['-DRR_NATIVE'] if relaxed >= 3 else []
     defs += ['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []
+    # D4R_RR_GFX11=1: RDNA3 (no FP8 matrices): engine/rr/rr_gfx11.glsl's exact arithmetic only, each native weight file
+    # with a widened copy (W_WIDE), `arithmetic gfx11` in rr.txt (compile_rr.py reads the same variable)
+    gfx11 = os.environ.get('D4R_RR_GFX11') == '1'
+    if gfx11:
+        defs = ['-DRR_EXACT_CONVERT', '-DRR_GFX11'] + (['-DRR_PRESET_D'] if preset == '4' else [])
+        relaxed = 0
+        rr_txt.write_text(re.sub(r'^(preset .*)$', r'\1\narithmetic gfx11', rr_txt.read_text(), count=1, flags=re.M),
+                          newline='\n')
 
-    def glsl(spv, source, *includes):
-        run(glslang, '--target-env', 'vulkan1.3', '-V', *defs, *[f'-I{d}' for d in includes], '-o', spv, source,
+    def widen(weights):
+        """RDNA3: append the widened copy and return its -DW_WIDE define (rr/widen_weights.py)"""
+        if not gfx11:
+            return []
+        out_ = subprocess.run([sys.executable, str(RR / 'widen_weights.py'), str(weights)], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        return [f'-DW_WIDE={out_}u']
+
+    def glsl(spv, source, *includes, extra=()):
+        run(glslang, '--target-env', 'vulkan1.3', '-V', *defs, *extra, *[f'-I{d}' for d in includes], '-o', spv, source,
             log=work / 'glsl.log')
         if relaxed < 2:   # from level 2 on the conversions are left to the driver
             python(RR / 'spv_exact_convert.py', spv)
@@ -89,14 +106,14 @@ def main():
         d.mkdir(exist_ok=True)
         shutil.copyfile(work / 'dll' / f'{s}.npz', d / 'weights.npz')
         python(RR / 'swin_pack.py', s, d / 'weights.npz', out / f'weights-{s}m.bin', d / 'swin_stage.h')
-        glsl(out / f'{s}_m.spv', RR / 'swin_m.comp', d, RR)
+        glsl(out / f'{s}_m.spv', RR / 'swin_m.comp', d, RR, extra=widen(out / f'weights-{s}m.bin'))
         native(s, f'weights-{s}m.bin')
 
     d = work / 'dec0'
     d.mkdir(exist_ok=True)
     shutil.copyfile(work / 'dll' / 'dec0.npz', d / 'weights.npz')
     python(RR / 'dec0_pack.py', d / 'weights.npz', out / 'weights-dec0m.bin', d / 'dec0_m_w.h')
-    glsl(out / 'dec0_m.spv', RR / 'dec0_m.comp', d, RR)
+    glsl(out / 'dec0_m.spv', RR / 'dec0_m.comp', d, RR, extra=widen(out / 'weights-dec0m.bin'))
     native('dec0', 'weights-dec0m.bin')
 
     # encoder 0: the translated feature gather + the native rest; preset E's gather dithers with the noise table
@@ -114,7 +131,7 @@ def main():
         blob = noise.read_bytes() + blob
     (out / 'weights-enc0m.bin').write_bytes(blob)
     python(RR / 'gen_enc0_m.py', out / 'enc0.generated.comp', d / 'enc0_m.comp')
-    glsl(out / 'enc0_m.spv', d / 'enc0_m.comp', d, RR)
+    glsl(out / 'enc0_m.spv', d / 'enc0_m.comp', d, RR, extra=widen(out / 'weights-enc0m.bin'))
     native('enc0', 'weights-enc0m.bin')
 
     # the translated output stage has no subgroup operations: 64-wide waves

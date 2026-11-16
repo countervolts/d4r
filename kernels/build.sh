@@ -326,9 +326,13 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
                 # concurrent builds wait for it under the lock
                 mkdir -p "$D4R_KERNEL_CACHE"
                 key="$(cat "$NT/$native_in.ifs.hip" "$NAT/in_lds2reg.py" | sha256sum | cut -c1-32)"
-                flock "$D4R_KERNEL_CACHE/$key.lock" bash -c '
-                    [[ -s "$2" ]] || { python3 "$0" "$1" > "$2.tmp" && mv "$2.tmp" "$2"; }' \
-                    "$NAT/in_lds2reg.py" "$NT/$native_in.ifs.hip" "$D4R_KERNEL_CACHE/$key.hip"
+                # no flock in Git Bash (Windows): each writer renames its own temporary file into place; the result is a
+                # pure function of the input, so concurrent writers leave the same file
+                if [[ ! -s "$D4R_KERNEL_CACHE/$key.hip" ]]; then
+                    tmp_="$D4R_KERNEL_CACHE/$key.hip.$$.$RANDOM"
+                    python3 "$NAT/in_lds2reg.py" "$NT/$native_in.ifs.hip" > "$tmp_" && mv -f "$tmp_" "$D4R_KERNEL_CACHE/$key.hip"
+                    rm -f "$tmp_"
+                fi
                 cp "$D4R_KERNEL_CACHE/$key.hip" "$NT/$native_in.hip"
             else
                 python3 "$NAT/in_lds2reg.py" "$NT/$native_in.ifs.hip" > "$NT/$native_in.hip"

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Mon, 16 Nov 2026 15:00:00 +0100
+Subject: [PATCH] Spoofing.Registry: leave the d4r folder's modules alone
+
+d4r's NGX shim reads the render GPU's DriverVersion from its PnP driver key to pick K's fastest RDNA3 route
+(d3dhip from AMD Software 26.10.1 on). With Registry spoofing it read the spoofed NVIDIA version, 32.0.15.9155, and
+kept the slower route; the NGX core in d4r\ngx ran fine without the spoof before. RegQueryValueExW / A now answer
+callers in the game's d4r folder unspoofed.
+---
+diff --git a/OptiScaler/hooks/Advapi32_Hooks.h b/OptiScaler/hooks/Advapi32_Hooks.h
+index 435af2b3..09f48b78 100644
+--- a/OptiScaler/hooks/Advapi32_Hooks.h
++++ b/OptiScaler/hooks/Advapi32_Hooks.h
+@@ -5,6 +5,8 @@
+ 
+ #include "Hook_Utils.h"
+ 
++#include <intrin.h>
++
+ const HKEY signatureMark = (HKEY) 0xFFFFFFFF13372137;
+ 
+ typedef decltype(&RegOpenKeyExW) PFN_RegOpenKeyExW;
+@@ -354,10 +356,30 @@ static void SpoofMultiSzA(LPBYTE lpData, LPDWORD lpcbData, const std::string& sp
+ 
+ // Original implementation:
+ // https://github.com/artur-graniszewski/dlss-enabler-main/blob/1f8b24722f1b526ffb896ae62b6aa3ca766b0728/Utils/RegistryProxy.cpp#L137
++// d4r's own modules (the game's d4r folder: its NGX shim and the NGX core) identify the real GPU and its driver for
++// themselves; spoofing them hid the AMD GPU and put the native engine off (K through ZLUDA instead).
++static bool IsD4rRegistryCaller(void* address)
++{
++    HMODULE module = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            reinterpret_cast<LPCWSTR>(address), &module))
++        return false;
++
++    wchar_t path[1024] {};
++    if (GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path))) == 0)
++        return false;
++
++    _wcslwr_s(path);
++    return wcsstr(path, L"\\d4r\\") != nullptr;
++}
++
+ VALIDATE_HOOK(hkRegQueryValueExW, PFN_RegQueryValueExW)
+ static LONG hkRegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData,
+                                LPDWORD lpcbData)
+ {
++    if (IsD4rRegistryCaller(_ReturnAddress()))
++        return o_RegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
++
+     static std::wstring vendorId = std::format(L"VEN_{:04X}", Config::Instance()->SpoofedVendorId.value_or_default());
+     static std::wstring deviceId = std::format(L"DEV_{:04X}", Config::Instance()->SpoofedDeviceId.value_or_default());
+     std::wstring valueName = L"";
+@@ -530,6 +552,9 @@ VALIDATE_HOOK(hkRegQueryValueExA, PFN_RegQueryValueExA)
+ LONG WINAPI hkRegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData,
+                                LPDWORD lpcbData)
+ {
++    if (IsD4rRegistryCaller(_ReturnAddress()))
++        return o_RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
++
+     static std::string vendorId = std::format("VEN_{:04X}", Config::Instance()->SpoofedVendorId.value_or_default());
+     static std::string deviceId = std::format("DEV_{:04X}", Config::Instance()->SpoofedDeviceId.value_or_default());
+     std::string valueName = "";

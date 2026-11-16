@@ -90,7 +90,19 @@ def copy_model(model, lines, f_model=False):
     return needed
 
 
-def build_de(model, output, lines, compiler):
+def wide_offset(path):
+    """W_WIDE of a gfx11 native weight file (rr/widen_weights.py appended the widened copy): the original size rounded
+    up to 512 bytes, halved; the file is that rounded size plus twice the original."""
+    total=Path(path).stat().st_size
+    for size in range(max(0,total//3-512),total//3+512):
+        base=(size+511)//512*512
+        if base+2*size==total:return base//2
+    raise ValueError(f'{path}: not a gfx11 (widened) RR weight file')
+
+
+def build_de(model, output, lines, compiler, gfx11=False):
+    """gfx11: an RDNA3 model (build_native_model.sh with D4R_RR_GFX11=1, exact arithmetic): the stages' RR_GFX11
+    sources on f16 WMMA (rr_hlsl.translate gfx11), no FP8 instruction anywhere."""
     preset=int(next(l.split()[1] for l in lines if l.startswith('preset ')))
     if preset not in (4,5):raise ValueError('requires RR D or E')
     if output!=model:
@@ -102,13 +114,31 @@ def build_de(model, output, lines, compiler):
         name,shader,wave=f[1],Path(f[2]).stem,int(f[3])
         if name!='hkpn' and shader!=name+'_m':raise ValueError('model must use native network stages')
         pre=model/(shader+'.preprocessed.comp')
-        if pre.exists():source=pre.read_text()
+        if pre.exists() and not gfx11:source=pre.read_text()
         else:
             work=model/'native-work'/name
             src=(work/'enc0_m.comp') if name=='enc0' else (model/'hkpn.generated.comp') if name=='hkpn' else HERE/'rr'/('dec0_m.comp' if name=='dec0' else 'swin_m.comp')
             defs=['-DRR_EXACT_CONVERT','-DRR_RELAXED=2','-DRR_NATIVE']+(['-DRR_PRESET_D'] if preset==4 else [])
+            if gfx11:
+                # build_native_model.sh's RDNA3 defines; the output stage (translated) takes RR_GFX11 alone, as
+                # compile_rr.py compiles it
+                defs=['-DRR_GFX11'] if name=='hkpn' else ['-DRR_EXACT_CONVERT','-DRR_GFX11',f'-DW_WIDE={wide_offset(model/f[4])}u']+(['-DRR_PRESET_D'] if preset==4 else [])
             exe=shutil.which('glslangValidator') or str(Path(os.environ.get('VULKAN_SDK','C:/VulkanSDK/1.4.341.1'))/'Bin/glslangValidator.exe')
             source=subprocess.check_output([exe,'-E',*defs,'-I'+str(work),'-I'+str(HERE/'rr'),str(src)],text=True)
+        if gfx11:
+            # f16 weights from the widened copy: no transposed FP8 tiles, no attention-bias copy
+            if name!='hkpn':
+                file=Path(f[4]).stem+'-dx.bin'
+                shutil.copy2(model/f[4],output/file)
+                scratch.append(f'weights {name} {file}')
+            scratch.append(f'loopzero {name} {PARAM_BYTES[name]}')
+            translated=translate(source,0,speed=True,loop_zero_offset=PARAM_BYTES[name],precise=name!='hkpn',gfx11=True)
+            hlsl=output/(shader+'.hlsl');hlsl.write_text(translated)
+            words=int(re.search(r'#define RR_SPILL_WORDS (\d+)',translated)[1])
+            if words:scratch.append(f'scratch {name} {words}')
+            compile_dxil(hlsl, output, compiler, wave)
+            print(f'RR {chr(64+preset)} {name}: HLSL (gfx11)',flush=True)
+            continue
         transpose=0
         if name!='hkpn':
             import numpy as np
@@ -136,8 +166,9 @@ def build_de(model, output, lines, compiler):
         compile_dxil(hlsl, output, compiler, wave)
         print(f'RR {chr(64+preset)} {name}: HLSL',flush=True)
     for p in (0,1):hlsl_build.build(HERE/'exposure_k.comp',output/f'exposure_rr{p}.dxil',[f'PASS={p}','MODE=2'],dxc=compiler)
-    (output/'rr-d3d12.txt').write_text('D4RRDX01\n'+'\n'.join(scratch)+'\n',newline='\n')
-    (output/'rr-d3d12.json').write_text(json.dumps({'preset':preset,'arithmetic':'gfx12 relaxed','builder':'compile_rr_dxil.py','shader_model':'6.6'},indent=2)+'\n')
+    # gfx11: the runtime accepts the model's `arithmetic gfx11` only with this line (shaders built for it)
+    (output/'rr-d3d12.txt').write_text('D4RRDX01\n'+('arithmetic gfx11\n' if gfx11 else '')+'\n'.join(scratch)+'\n',newline='\n')
+    (output/'rr-d3d12.json').write_text(json.dumps({'preset':preset,'arithmetic':('gfx11 exact' if os.environ.get('D4R_RR_GFX11_EXACT')=='1' else 'gfx11 relaxed') if gfx11 else 'gfx12 relaxed','builder':'compile_rr_dxil.py','shader_model':'6.6'},indent=2)+'\n')
 
 
 def glslang_path():
@@ -337,8 +368,9 @@ def build(model, output=None, dxc=None, target='windows'):
         if 'arithmetic gfx11' in lines:raise ValueError('requires a gfx12 RR F model')
         build_f(model,output,lines,compiler)
     elif lines[0]=='D4RR0001':
-        if 'arithmetic gfx11' in lines:raise ValueError('requires a native gfx12 RR D/E model')
-        build_de(model,output,lines,compiler)
+        gfx11='arithmetic gfx11' in lines
+        if gfx11 and target=='vkd3d':raise ValueError('a gfx11 RR D/E model is for AMD\'s Windows driver (RADV runs its Vulkan shaders)')
+        build_de(model,output,lines,compiler,gfx11)
     else:raise ValueError('unknown RR model format: '+lines[0])
     for job in _JOBS:job.result()
     _JOBS.clear()

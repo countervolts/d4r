@@ -454,7 +454,12 @@ def int_expr(x):
     return int(eval(x,{'__builtins__':{}},{}))
 
 
-def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=None,precise=True,param_groups=False):
+def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=None,precise=True,param_groups=False,
+              gfx11=False):
+    """gfx11: the RR_GFX11 (RDNA3) build of a stage (engine/rr/rr_gfx11.glsl): f16 A/B operands of 16 elements per lane
+    and RADV's gfx11 register layouts, which AMD's D3D12 driver gives AGS's WMMA too (A/B: lane l holds row/column
+    l & 15, element i = k i; accumulators: lane l holds column l & 15, element i = row 2i + (l >> 4)). No FP8 matrix
+    or conversion reaches the GPU (RDNA3 has none). relaxed_math applies as for gfx12 (D4R_RR_GFX11_EXACT=1: not)."""
     if speed:
         if loop_zero_offset is None or loop_zero_offset <= 0 or loop_zero_offset % 4:
             raise ValueError('optimized translation requires the runtime loop-zero word offset')
@@ -469,7 +474,7 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
             edits.append(m.start())
     for at in reversed(edits):source=source[:at]+'[[unroll]] '+source[at:]
     source,byte_vars=byte_names(source)
-    source=quantize_matrices(source)
+    if not gfx11:source=quantize_matrices(source)   # FP8 matrices only
     # Matrix role is needed only for load/store addressing. Record the declared
     # variables before removing the type; declarations in these stage bodies
     # consistently use each matrix name with one role/type within its scope.
@@ -507,8 +512,15 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
         typ, role = matrix_type(x, m.start())
         if layout not in ('gl_CooperativeMatrixLayoutRowMajor', 'gl_CooperativeMatrixLayoutColumnMajor'):
             raise ValueError(layout)
-        row = '((WaveGetLaneIndex() & 15u))' if role == 'A' else '(ri_ + 8u * (WaveGetLaneIndex() >> 4u))'
-        col = '(ri_ + 8u * (WaveGetLaneIndex() >> 4u))' if role == 'A' else '(WaveGetLaneIndex() & 15u)'
+        count = 8
+        if gfx11:
+            if typ == 'floate4m3_t': raise ValueError('an FP8 matrix in a gfx11 stage')
+            if role == 'A': row, col, count = '(WaveGetLaneIndex() & 15u)', 'ri_', 16
+            elif role == 'B': row, col, count = 'ri_', '(WaveGetLaneIndex() & 15u)', 16
+            else: row, col = '(2u * ri_ + (WaveGetLaneIndex() >> 4u))', '(WaveGetLaneIndex() & 15u)'
+        else:
+            row = '((WaveGetLaneIndex() & 15u))' if role == 'A' else '(ri_ + 8u * (WaveGetLaneIndex() >> 4u))'
+            col = '(ri_ + 8u * (WaveGetLaneIndex() >> 4u))' if role == 'A' else '(WaveGetLaneIndex() & 15u)'
         rr, cc = (row, col) if layout.endswith('RowMajor') else (col, row)
         # A storage array's unit is a scalar (weights/f16 shared) or a packed uint.
         packed = arr not in ('w8.w', 'w16.w') and arr in dword
@@ -566,8 +578,13 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
                 else:
                     raise ValueError('packed FP8 store across lanes')
             else: body = f'{arr}[{index}] = {value};'
-        edits.append((m.start(), end+1, '{ [unroll] for(uint ri_=0;ri_<8;++ri_) { ' + body + ' } }'))
+        if gfx11 and packed and size == 4: raise ValueError('an f32 matrix in packed storage (gfx11)')
+        edits.append((m.start(), end+1, '{ [unroll] for(uint ri_=0;ri_<' + str(count) + ';++ri_) { ' + body + ' } }'))
     for start,end,value in reversed(edits): source=source[:start]+value+source[end:]
+    if gfx11:
+        source = MATRIX.sub(lambda m: ('RRHalf16' if m[2] in ('A', 'B') else 'RRHalf') if m[1] == 'float16_t' else
+                            'RRFloat' if m[1] == 'float' else 'RRByte', source)
+        source = re.sub(r'\bRRHalf16\s*\(', 'rrHalf16(', source)
     source = MATRIX.sub(lambda m: 'RRHalf' if m[1] == 'float16_t' else 'RRByte' if m[1]=='floate4m3_t' else 'RRFloat', source)
     def initialize_bytes(m):
         items=[]
@@ -578,8 +595,21 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
     source=re.sub(r'\bRRByte\s+([^;]+);',initialize_bytes,source)
     source = re.sub(r'\b(RRFloat|RRHalf)\s*\(', lambda m: ('rrFloat' if m[1]=='RRFloat' else 'rrHalf')+'(', source)
     source = source.replace('coopMatMulAdd', 'rrMma')
-    source=byte_accesses(source,byte_vars)
-    source=fp8_batches(source)
+    if gfx11:
+        # a matrix's length() (the GLSL loops over its elements): 16 for an f16 operand, 8 for an accumulator
+        sizes={}
+        for d in re.finditer(r'\b(RRHalf16|RRHalf|RRFloat)\s+([^;(]+);',source):
+            for item in args(d[2]):
+                v=re.match(r'\s*(\w+)',item)
+                if v:sizes[v[1]]=16 if d[1]=='RRHalf16' else 8
+        for d in re.finditer(r'\b(RRHalf16|RRHalf|RRFloat)\s+(\w+)\s*=',source):sizes[d[2]]=16 if d[1]=='RRHalf16' else 8
+        def length(m):
+            if m[1] not in sizes:raise ValueError('length() of an unknown matrix '+m[1])
+            return f'{sizes[m[1]]}'
+        source=re.sub(r'\b(\w+)\.length\(\)',length,source)
+    else:
+        source=byte_accesses(source,byte_vars)
+        source=fp8_batches(source)
     resources = []
     spill = re.search(r'shared uint POOL\[([^;]+)\];',source)
     # The deep decoder's expansion pool exceeds D3D12's 32 KiB group limit.
@@ -678,20 +708,21 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
         pos=0
         while m:=pattern.search(source,pos):
             start=source.index('[',m.start()); end=closing(source,start)
-            index=source[start+1:end]; size={'uint':4,'int':4,'uint64_t':8,'float':4,'uint16_t':2,'float16_t':2,'uint8_t':1,'floate4m3_t':1,'vec2':8,'vec4':16}[typ]
+            index=source[start+1:end]; size={'uint':4,'int':4,'uint64_t':8,'float':4,'uint16_t':2,'float16_t':2,'uint8_t':1,'floate4m3_t':1,'vec2':8,'vec4':16,'uvec2':8,'uvec4':16}[typ]
+            htyp={'uvec2':'uint2','uvec4':'uint4'}.get(typ,typ)  # the gfx11 stages read their weights as uvec4
             at=f'({index}) * {size}u'
             after=source[end+1:]
             store=re.match(r'\s*=\s*(?!=)',after)
             if store:
                 if ro: raise ValueError('write to readonly '+name)
                 stop=source.index(';',end+1); val=source[end+1+store.end():stop]
-                replacement=f'rrB{bind}.Store<{typ}>({at}, {val})'
+                replacement=f'rrB{bind}.Store<{htyp}>({at}, {val})'
                 source=source[:m.start()]+replacement+source[stop:]
             else:
                 if size==1:
                     read=f'((rrB{bind}.Load(({at}) & ~3u) >> ((({at}) & 3u) * 8u)) & 255u)'
                     if typ=='floate4m3_t':read='rrDecode('+read+')'
-                else: read=f'rrB{bind}.Load<{typ}>({at})'
+                else: read=f'rrB{bind}.Load<{htyp}>({at})'
                 replacement=read; source=source[:m.start()]+read+source[end+1:]
             pos=m.start()+len(replacement)
     source=vector_loads(source)
@@ -736,12 +767,15 @@ def translate(source,weight_bytes=0,relaxed=False,speed=False,loop_zero_offset=N
         resources.append('static uint3 rrNumGroups_;')
         init=f'rrNumGroups_ = uint3({scale}, {gy}, 1u); '+init
     result = '\n'.join(['#include "dialect_hlsl.h"',f'#define D4R_THREADS {threads}',f'#define RR_SPILL_WORDS {spill_words}',
+        *(['#define RR_GFX11 1'] if gfx11 else []),
         '#include "rr_wmma.hlsli"',*groups,*resources,*lines,
         '#define D4R_HLSL_INIT_CALL '+init, '#define D4R_ENTRY_SIZE(...) D4R_ENTRY(__VA_ARGS__)', 'D4R_ENTRY_SIZE(D4R_WORKGROUP_SIZE)',''])
     if speed:
         result=re.sub(r'(\[loop\] for \(uint (?:hd|br) = 0u; (?:hd|br) < )([^;]+);',
                       lambda m:m[1]+'('+m[2]+f' + rrB0.Load({loop_zero_offset}u));',result)
-        if not os.environ.get('D4R_TMP_STRICT'): # TMP experiment
+        # gfx11 takes the gfx12 build's relaxations too (RX 7700 XT, RR D 1024x576 -> 2048x1152 replay: 32.1 -> 27.4 ms;
+        # 61-67 dB against the exact Vulkan gfx11 route either way); D4R_RR_GFX11_EXACT=1 keeps the exact stages
+        if not os.environ.get('D4R_TMP_STRICT') and not (gfx11 and os.environ.get('D4R_RR_GFX11_EXACT') == '1'): # TMP experiment
             result=relaxed_math(result,precise)
     return relaxed_math(result,precise) if relaxed and not speed else result
 

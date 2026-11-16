@@ -705,3 +705,423 @@ schedule (all slower).
   original K enc0). Linux / gfx11 builds re-checked against the parents of the agent-derived commits: M/L kernels for
   gfx1101 (fast and accuracy sets) are ISA-identical across 0feb1a0, and output_k.comp's SPIR-V (three flag sets)
   is byte-identical across 1f8d128.
+
+## RDNA3 parity pass (RX 7700 XT gfx1101, 26.10.1, 2026-11-10; uncommitted worktree off origin/windows fcafd9a)
+
+Environment: Ryzen 9 5900XT, Windows 11 Pro 26300, HAGS off (HwSchMode 1). Bench runtimes in `C:\d4r-rdna3-hc`
+(rt-control = origin/windows shim + the release packages installed in Ghost of Tsushima; rt-final = all patches with
+packages rebuilt from the worktree). Kernels with TheRock clang 24 (`.tools/therock-10.2.0a20260929`, the compiler of
+the installed hsaco), shaders with the Vulkan SDK 1.4.363 dxc.
+
+- **Kept: RR D/E on D3D12 for RDNA3** (patch 01). AGS layout probe first (agsprobe: A/B lane = row/column l & 15, element
+  i = k i; accumulator element i = row 2i + (l >> 4); 255-256/256 exact with a seeded C). rr_hlsl.translate gfx11
+  mode, compile_rr_dxil.py gfx11 build, runtime accepts `arithmetic gfx11` with the sidecar's line, shim loads
+  engine\rr-d-gfx11 / rr-e-gfx11 on RDNA3. Exact build: replay 32.1-33.4 ms at 1024x576 -> 2048x1152 (Vulkan 30.7-32.0);
+  relaxed (relaxed_math as gfx12): 27.2-27.5 ms, kept (61-67 dB against Vulkan either way). Harness 720p -> 1440p:
+  39.6 / 39.4 ms (D / E). First launch compiles for ~47 s at NGX init, 0.6 s from the driver cache after.
+- **Kept: RR output formats** (patch 02, issue 65). Reproduced: RGB9E5 output -> "refused: RR output must be RGBA16F" on
+  the pre-patch shim; after, D and E run into RGB9E5 / RGB10A2 / R11G11B10 outputs (AMD reports typed UAV stores for
+  all of them on RDNA3).
+- **Kept: gfx1101 K layers without scratch** (patch 03). The released gfx1101 enc2 spills, a fresh clang 24 build's dec1
+  spills 96 B; vkhip refuses spilling gfx11 kernels, so native Vulkan games on RDNA3 ran K's Vulkan network (9.7 ms with
+  the released package). dec1 on its generic line has no scratch.
+- **Kept with a caveat: d3dhip K default on RDNA3 from 26.10.1** (patch 04). Ghost's Quality size (1706x960) showed
+  per-process bimodal d3dhip times in one session (2.40-2.52 or 2.88-3.09 ms, both shims alike, outputs identical);
+  an earlier session had 2.39-2.41 steady. 1440p and 4K stable.
+- **Found, not fixed: preset L on RDNA3 (DXIL) is nondeterministic.** Same shim, package and inputs: frames 1-12
+  byte-identical across runs, from 25 frames on different (60 frames: 36.6-38.7 dB between runs, 2.9 M of 3.7 M pixels),
+  with or without 200 ms gaps between frames: an intra-frame race that the history spreads. M (shared Swin layers) is
+  identical over 160 frames, so the candidates are L's own RDNA3 stages (enc0_l / l_patch_dec0 / dec0_l / merge_l).
+- **Measured, not changed: RDNA3 already gets K's faster D3D12 output stage and the f32 reconstruction** with a rebuilt
+  package; together they are time-neutral on RDNA3 (dx-K-q1440 DXIL 2.594 -> 2.611).
+- **Rejected:** the full gfx1101 flag sweep of windows-k-d3dhip.md as is (spills with clang 24; d3dhip within +-1.3%);
+  ROCm 7.2 clang for the K layers (inline asm "operands are not valid for this GPU").
+
+### RDNA3 pass, second session (2026-11-10)
+
+- **Kept: preset L's RDNA3 reconstruction with a 12x12 tile** (`m_d3d12_build.py`, patch 06). The L nondeterminism was
+  localized with per-stage captures (D4R_M_CAPTURE_DIR, every frame): input, network, head, gates, mix and covariance
+  identical across runs; the first difference is `packed` (post_l), a few pixels of one 16x16 block on odd rows of one
+  wave. post_l at 11x11: diverges within 25-160 frames (also built from current source); 12x12, wave64 and unpacked
+  tiles: 3 x 160 frames identical. 11x11 is a texel short for L's -1..+2 taps now and then, and the read runs into shared
+  memory another wave writes later. Time: dx-L-1440 +0.18%, dx-L-4k -0.25% (noise). The RDNA4 (FP8) build's post_l is
+  11x11 too but wave64, which did not reproduce here; check it there.
+- **Kept: the release builder makes rr-d-gfx11 / rr-e-gfx11 on RDNA3** (packaging, patch 07, approved by the user).
+  Checked end to end with the kit's build-engine-models.py on this machine: rr-d, rr-d-gfx11, rr-e, rr-e-gfx11 in 3.5
+  minutes; the D3D12 harness loads the installer-built rr-d-gfx11 and renders.
+- **Game check, Ghost of Tsushima Quality (1712x960 -> 2560x1440, LDR), main menu, D4R_PROFILE gpu_eval, A B B A, 60 s
+  each:** DXIL 3.241 / 3.238 ms, d3dhip (the new default) 2.529 / 2.527 ms: -22%. The shim in this install is
+  d4r\d4r_dlssg_next.dll (the DLSS-G host's next core), not d4r\nvngx.dll; both were swapped and restored (hashes).
+  The game's two start-up dialogs (no GPU / old driver: OptiScaler's spoofed adapter) were answered by posting the
+  dialog's OK button (WM_COMMAND), without focus.
+- **Not viable here: vkhip M / L on RDNA3 (AMD's Windows driver).** The gfx1101 dataflow Swin layers spill (enc1 152 B,
+  enc2 24 B, dec2 188 B at the default bound; with SWIN_WAVES_PER_EU=1 only enc2 still spills, 8-68 B in every flag
+  variant tried), and vkhip refuses spilling gfx11 kernels.
+- **d3dhip M / L on RDNA3: blocked on non-FP8 plane stages.** The windows branch's enc0_m / dec0_m refuse DOT2 with
+  PLANES (#error); the Linux branch has WIDE plane stages (FP8 values in f16 cooperative matrices) that the windows
+  sources (~750-800 lines apart) lack. Needs: the WIDE port, their DXIL through hlsl_build's AGS path, an external-
+  network mode in runtime_m_rdna3.inc, the shim branch. The gfx1101 layers (`D4R_VKHIP_LAYERS=1 kernels/build.sh m`)
+  and an M package with hipnet.bin (`compile_m.py --hip`) build.
+- **d3dhip M on RDNA3, how far it got.** Linux's WIDE plane stages (ef0075f) three-way-merge into the windows enc0_m /
+  dec0_m (two small conflicts), but the merge also changes the existing FP8 variants' SPIR-V (enc0_m, dec0_m, both
+  plane layouts), so it would alter RDNA4 output: kept out of the tree (a copy in the test machine's scratch). In a
+  separate directory the WIDE stages build to DXIL, but under D4R_HLSL both shaders take the hand-written AGS branch
+  (d3d12/enc0_m_wmma.hlsli and dec0's equivalent), which is FP8 only: the preprocessed main still calls mma8 / fp8Of.
+  WIDE exists only in the GLSL cooperative-matrix branch, which the D3D12 build bypasses; making it compile through
+  coopmat_ags.hlsli (as layer.comp does) means rewriting its buffer / shared-memory accesses to that header's
+  wrappers. Remaining: that rewrite (or WIDE versions of the AGS branches), an external-network mode in
+  runtime_m_rdna3.inc, the shim branch, validation. Over a day; stopped here.
+- **Kept: d3dhip M and L on RDNA3 (patch 08), by default.** The RDNA 3 engine keeps its own input / expansion stages
+  and converts its token-major `tokens` / `dec1` to and from the HIP network's plane layout (m_planes.hlsl, a byte
+  permutation), so no FP8 shader is touched; the shim reuses the RDNA4 d3dhip split and GPU-fence handoff. Harness,
+  3 rounds, same package: dx-M-1440 8.327 -> 5.527 (-33.6%), dx-M-4k 16.861 -> 12.596 (-25.3%), dx-L-1440 11.356 ->
+  8.914 (-21.5%), dx-L-4k 23.494 -> 20.004 (-14.9%); quality-scene truth metrics equal (lane B). Ghost of Tsushima,
+  1712x960 -> 1440p LDR, gpu_eval, A B B A: M 13.16 / 13.32 -> 8.76 / 8.75 ms, L 19.28 -> 15.09 ms (one pair); the
+  game's files restored by hash afterwards. Release: package_release_windows.sh builds kernels/<gfx110x>-swin-hip and
+  build-engine-models.py passes it to compile_m.py --hip (checked end to end with the kit builder). Vulkan M on RDNA3
+  unchanged (staging; the layers spill for vkhip).
+- **Measured, not kept: the Swin HIP layers with SWIN_WAVES_PER_EU=1** (fewer spills): byte-identical, dx-M-1440
+  -3.25%, dx-M-4k -0.82% (under the bar); it would also change the Windows CUDA route's kernel builds.
+- **Rejected: faster RR D on RDNA3 by relaxing the gfx11 DXIL further** (replay, 1024x576 -> 2048x1152, 5 repeats,
+  relaxed build 25.2-27.9 ms): no binary16 rounding after each k32 step 27.1-27.8 ms (no gain; 60.7-64.9 dB against
+  the exact Vulkan route, so harmless but useless); attention-head loops unrolled 26.1-30.4 ms (slower; enc1 2.4 ->
+  3.6 ms). The cost is the exact gfx11 FP8 emulation itself: every 16x16 operand is widened from FP8 codes per load
+  (four g11_sc4 per lane) and each k32 step is two f16 WMMAs with scaling. The next lever is keeping the activations
+  widened (binary16) in LDS instead of FP8 codes, a rewrite of the RR_GFX11 operand path (rr_gfx11.glsl and the stage
+  bodies): new kernel work, not started.
+- **Kept: cheaper FP8 operand widening in the RDNA3 RR stages (patch 09, rr_gfx11.glsl g11_sc4), byte-identical.**
+  Bound first (replay, 1024x576 -> 2048x1152, wrong output, timing only): widening and FP8 encode both free 26.5 ->
+  14.3 ms (-46%); the encode alone free: no change; the widening alone free: ~17.7 ms (-33%). The widening now handles
+  two codes per operation (bytes spread, then both halves widened at once), equal to the old form for every pair of
+  codes (exhaustive check). bench.py, 3 rounds: dx-RRD-1440 40.149 -> 35.663 (-11.2%), dx-RRE-1440 40.018 -> 35.681
+  (-10.8%), vk-RRD-1440 28.038 -> 27.316 (-2.6%), vk-RRE-1440 27.348 -> 26.770 (-2.1%), every output identical.
+  Remaining (about another 20% by the bound): keep activations widened in LDS so each is widened once, not at every
+  reuse; a rewrite of the RR_GFX11 staging in swin_m / dec0_m / enc0_m_tail / rr_attn. Not started.
+
+## 2026-11-10: approximations on RDNA3 D3D12 (against the linux branch's docs/approximations.md)
+
+Goal: the fast default kernels without approximations (the linux page's definition: a narrower format than NVIDIA's
+at a step, or a different function), keeping the time saved. Full write-up: docs/approximations-windows-rdna3.md.
+
+- **Found: M's RDNA3 expansion stage was int8** (m_d3d12_build.py built dec0_m.comp DOT2 INT8; runtime widenM
+  stageInt8): tokens and matrix re-quantized to int8 with scales, a real approximation. Fixed in 10: dec0_m.comp
+  D4R_M_EXPAND_F16, the product on v_wmma_f32_16x16x16_f16 with FP8 widened exactly and NVIDIA's binary16 rounding per
+  32 products; weights column-major binary16 (runtime, D4RML007 only). Expansion 0.329 -> 0.271 ms at 1440p.
+  Rejected first: DOT2 without INT8 (+21% dx-M-1440).
+- **Found: AMD's D3D12 compiler converts f32 -> binary16 toward zero.** Probe (cvtprobe, RX 7700 XT, 26.10.1): f32tof16,
+  (float16_t) casts and vector casts equal round-toward-zero on 2^20 of 2^20 inputs; binary16 add / mul / mad round to
+  nearest (mad is one rounding: 100% equal to the correctly rounded fma). The RDNA3 M/L stages, K's D3D12 stages and
+  RDNA4's M reconstruction use the native conversion (D4R_NATIVE_HALF).
+- **Found: dialect_hlsl.h's emulated rounding is wrong for binary16 subnormals** on AMD's D3D12 compiler, which folds
+  `precise float subnormal = (v + 0.75) - 0.75` (half of the inputs under 2^-14 truncated). D4R_RNE16_EXACT (round()
+  for subnormals, overflow to infinity): 100% on the 2^20 inputs. Emulated in every RDNA3 stage it cost +7% (M) / +5%
+  (L), rejected; and in L's enc0_l_network / dec0_l it gave 26 dB against NVIDIA (bisected per shader), not understood.
+- **Kept: AGS's f32 -> f16 matrix conversion rounds to nearest even** (2^20 of 2^20, uniform, divergent branch and
+  divergent loop alike); gfx11's f16 accumulator holds element r in the low half of register r (probe). rne16_ags.hlsli
+  gives every RDNA3 M/L shader that rounding (pipelines bind the AGS UAV in D4RML007 packages). Check: a debug
+  reconstruction computing both AGS's and the exact emulation's result on every conversion found no disagreement and
+  gave the AGS build's frames byte for byte; enc0 / dec0 / down / exposure built either way are byte-identical. The
+  emulated reconstruction alone differs (41 dB from AGS's), cause not found.
+- **Kept: f32 output stores (down_m.comp WIDE_STORE, from the linux branch) and RGBA8 / BGRA8 output** (refused before:
+  the LDR scene's RGBA8 output could not run).
+- **Fixed, latent: rr_wmma.hlsli's AGS pair rounding** read gfx12's layout; on gfx11 the second value came back 0
+  (probe). No RR package's DXIL changes (the calls were dead code).
+- **RR D/E**: relaxed_math on gfx11 reduces to fma16 -> mad (exact on this driver, above) and hkpn without precise
+  (rounding change). Exact and relaxed D3D12 builds are both 61.68 dB from the exact Vulkan build (RR D replay);
+  stage dumps put the first difference at encoder 0's gate sig() (1/x and exp2 lowered differently by the two
+  compilers; NVIDIA uses rcp.approx / ex2.approx there). Not an approximation; left.
+- **Open: K's D3D12 stages** (compile_k.py, shared with RDNA4) still convert toward zero; needs an RDNA4 run.
+- RDNA4: the shared files changed (dialect_hlsl.h, ags_wmma.hlsli, output_store.glsl, down_m.comp, dec0_m.comp) only
+  under new defines; RDNA4's dec0_m, dec0_m_planes, down_m, down_m_rgb10, enc0_m, post_m and layer_m DXIL built from
+  origin/windows and from the worktree are byte-identical.
+
+## FG
+
+Goal: DLSS Frame Generation (fg/dlssg) on native Windows as fast as on Linux, RX 7700 XT (gfx1101), AMD Software
+26.10.1. Branch `hillclimb/fg` from `windows` f356317 (the owner's uncommitted FG installer work carried, not
+committed). Workspace `D:\d4r-fg`: `rt\` is a portable d4r folder (d4r.ini and fg\dlssg copied from Ghost of Tsushima's
+install), `bin\` the harness + nvapi64.dll, `scripts\run.sh` (one run), `bench.sh` (A B B A, medians), `guard.sh` (sha256
+of the generated images, 60 frames, Lite/full x Exact 0/1 x 2x/4x/6x). The harness's `--lite` alone does not pick the
+Lite DLL; the host's d4r.ini Model does (run.sh sets D4R_FG_MODEL). The guard baseline is deterministic (two runs equal).
+
+Harness: 2560x1440 output, 1280x720 render, 400 frames, `--bench --pipe`, GPU ms per real frame.
+
+### 2026-11-11: hand-offs (lead 1, 2)
+
+- **Measured** with a new `[Host] SplitLog=1` (nvxrt.log: the kernels and D3D12 calls of a few lists, batch ends marked).
+  At 2x one list per real frame is cut into 5 kernel batches; at 4x 7 (all three evaluates in one list). Barriers were
+  already harmless. What ended batches: the first D3D12 work (unavoidable), `ClearUnorderedAccessViewUint/Float` (4 per
+  evaluate: a raw R32 buffer cleared to 0x7fffffff, an R8_UNORM 1280x720 surface cleared to 0.0f), and between the
+  evaluates of one list `EndEvent/EndQuery/ResolveQueryData/BeginEvent` (the host's GPU timer and the harness's
+  timestamps).
+- **Cost of a hand-off**: `SplitBarriers=1` (45 batches instead of 5) +6.0 ms at 2x: ~0.15 ms each. A measurement-only
+  hack that let the clears not split (wrong order): 3.75 -> 3.43 ms at 2x. Hypothesis confirmed.
+- **Kept: clears on the kernels' queue, timestamps and markers do not split** (`VkClears=1`, `SplitQueries=0` defaults).
+  A clear with a batch open runs as a dispatch in the batch (host/clear_uav.comp): 2D surfaces through the same raw
+  D3D12 UAV descriptor the kernels use (format-less store), raw / 32-bit buffers through the GPU VA; anything else
+  stays on D3D12. EndQuery, PIX markers and resolves into readback memory go to the next D3D12 part. Every list is now
+  1 batch (2 parts) at 2x-6x. Side effect: the host's per-MultiFrameIndex GPU times now put the whole list on index 1;
+  their sum (per real frame) is unchanged. Guard: byte-identical, all 12 modes.
+
+| FG (Lite) | before | after | delta |
+|---|---:|---:|---:|
+| 2x | 3.749 | 3.350 | -0.399 |
+| 3x | 4.418 | 3.917 | -0.501 |
+| 4x | 5.361 | 4.429 | -0.931 |
+| 5x | 6.308 | 4.998 | -1.309 |
+| 6x | 7.021 | 5.619 | -1.402 |
+
+  Full model: 2x 5.819 -> 4.947, 4x 11.443 -> 10.439, 6x 16.985 -> 15.692. (3 rounds A B B A for Lite, 2 for full;
+  every range within +-0.05 except Lite 6x after, 5.52-5.91.)
+
+### 2026-11-11: noise, the knobs, where the rest goes (lead 3, 4)
+
+- **The machine's state moves the numbers more than most changes do.** At 03:39 Firefox and Discord started; from then on
+  the same builds measured much lower and moved minute to minute (the committed build at 6x: 5.62 before, then 4.52,
+  4.80; 2x: 2.47 and 2.72 in two benches ten minutes apart). Likely clocks: other GPU work keeps the GPU up through
+  the idle hand-off gaps. Only A B B A comparisons in one sitting are trusted below; absolute levels need the game.
+- Baseline vs one-batch build again in the busy state (3 rounds, A B B A): 2x 3.282 -> 2.716, 3x 3.970 -> 3.252,
+  4x 4.630 -> 3.769, 5x 5.290 -> 4.285, 6x 5.990 -> 4.801. The gain holds (-0.57 to -1.19 ms).
+- **New: `[Host] KernelTiming=1`** (Vulkan timestamps after each dispatch, summed per kernel, logged every 1000
+  batches). 2x Lite, quiet state: 2.77 ms on the kernels' queue of 3.35 ms per real frame, so ~0.58 ms is the remaining
+  D3D12 -> Vulkan -> D3D12 round trip plus the D3D12 parts. Kernels per real frame: k_conv_fp16_nhwc 0.904 (16.8
+  launches), DownsampleRGBAndEstimateUIFused 0.390, BlendCandidatesFGLite 0.288, EstimateIntermMvecsScatter 0.272,
+  DL1Net_Input 0.142, k_element_wise 0.130 (4.9), EstimatePrev2CurrScatter 0.100, Prev2CurrUnpackPull 0.085, k_pooling
+  0.085 (4.9), k_upscale 0.082 (4.9), InputMvecProcessing 0.079, the 4 clears 0.077, rest < 0.05 each.
+- **Rejected: kernels on a compute-only queue family** (`[Host] ComputeQueue=1`, family 1, flags 0xe; kept as a knob,
+  default off). The first single run said 2.74 vs 3.35 ms at 2x, a bench minutes later in the changed state said
+  -0.44 / -0.68 / -0.09 ms, a block test and a 4-round A B B A then said +0.16 / +0.19 / +0.25 ms (2x / 4x / 6x).
+  Guard byte-identical. The first numbers were the state change.
+- **Ruled out: the deferred shader-only barriers.** Dropping them (measurement-only hack) saves 0.061 ms at 2x and
+  0.079 ms at 6x per list. Not worth touching D3D12's state tracking.
+- GpuSync=0 (CPU hand-offs) not timed: every hand-off would add a CPU round trip on top of the GPU one.
+- **Rejected: VK_KHR_global_priority on the kernels' queue** (high, realtime; device creation accepted both).
+  A B B A x3: 2x -0.012 / +0.002, 6x +0.008 / +0.002 ms. Reverted.
+- **Rejected: compute -> compute barriers between dispatches** (serialize() with SHADER_WRITE -> SHADER_READ|WRITE|
+  UNIFORM_READ instead of ALL_COMMANDS with TRANSFER/MEMORY_WRITE): 2x -0.026, 6x -0.004 ms. The barriers are not
+  where the time goes. Reverted.
+- **Where the rest is** (state at 04:08, control 3.26 / 5.54 ms): kernels' queue 2.570 ms at 2x and 4.914 ms at 6x
+  per list, so a constant ~0.65 ms per list is the one remaining D3D12 -> Vulkan -> D3D12 round trip plus ~0.07 ms of
+  D3D12 parts. Per further generated frame the kernels take 0.585 ms (EstimateIntermMvecsScatter 0.26,
+  BlendCandidatesFGLite 0.26, WarpBlendingWeights 0.033, two buffer clears 0.031) against Linux's 0.49 for the whole
+  frame. Same SPIR-V as Linux: the difference is AMD's Windows compiler / driver, or the translator's output on it;
+  changing the translator changes what Linux builds, so not touched.
+
+### Bigger option, written up before starting (not started)
+
+GPU-side hand-off: kernels on a compute-only (ACE) queue, which runs beside the game's graphics queue. D3D12 -> Vulkan:
+the leading part ends with WriteBufferImmediate of a sequence number, the batch starts with a one-wave dispatch that
+polls it (atomic loads). Vulkan -> D3D12: the batch ends with a barrier and a store of a sequence number; the D3D12 queue
+runs a one-wave DXIL compute shader that polls it, in its own small list before the next part (that list's start
+invalidates the caches). No OS scheduler in either direction.
+- Expected gain: most of the ~0.6 ms round trip per list, quiet state: 2x 3.26 -> ~2.7, 4x ~4.4 -> ~3.8, 6x 5.46 ->
+  ~4.95. 6x would still be ~0.05 over target (the per-frame kernel cost above).
+- Cost: a DXIL spin shader + root signature + PSO (dxc is in .tools), sequence buffers, ~300 lines in
+  cubin_d3d12.cpp. The compute queue alone measured +0.16-0.25 ms slower, which the spin must win back first.
+- Risk: a spin that never sees its value hangs the queue it runs on. The polls need an iteration cap, and on expiry
+  the frame would use unfinished data. The Vulkan spin can start early and poll through all the game's work queued
+  before the evaluate (in game that can be a whole frame). This needs the owner's go-ahead.
+
+### 2026-11-11: GPU-side hand-off tried (owner's go-ahead), rejected
+
+Built as written up, made safer: the OS waits kept but signaled early (D3D12 at the start of the lists ahead of the
+kernels, Vulkan once it reaches the batch), one-thread polls on a D3D12 buffer for the exact moment (handoff_spin.hlsl
+on the D3D12 queue, handoff_spin.comp on the kernels' compute-only queue), capped and counted.
+- The Vulkan-side poll (D3D12 -> kernels) never timed out. The D3D12-side poll (kernels -> D3D12) timed out on every
+  hand-off after the first ~14.
+- Frame time follows the cap: SpinCap 20000 -> 4.88 ms, 50000 -> 8.89 ms, 200000 -> 28.3 ms per real frame at 2x,
+  i.e. ~0.13 us per poll plus ~2.2 ms. The poll time and the kernel time add, they do not overlap: while the D3D12
+  queue runs the poll, the kernels on the Vulkan device make no progress. With the legacy scheduler (HAGS off, not
+  changed) Windows time-slices the Vulkan device's compute queue with the game's D3D12 queue instead of running them
+  side by side. The first ~14 hand-offs worked only because the kernels finished before the poll started.
+- Consequence: a GPU-side hand-off cannot work between two devices here, and the remaining ~0.6 ms per list is the
+  OS context switch between them, twice. Only running the kernels inside the game's own D3D12 device removes it
+  (DXIL compute on the game's queue: every translated kernel through a DXIL backend; the d3dhip route is a separate
+  device again, measured ~0.2 ms per hand-off). Code reverted; not committed.
+
+### 2026-11-11: would d3dhip's hand-off be faster? (owner's question) No
+
+`fg/dlssg/harness/handoff_bench.cpp`: one D3D12 device; a Vulkan device and a HIP device picked by the adapter LUID, the
+shared D3D12 fence imported into both; per iteration D3D12 timestamp, Signal(a), the other device waits a, fills a
+buffer, signals b, D3D12 Wait(b), timestamp; 3 iterations in flight; "none" = the two timestamps alone. Medians of
+3 rounds x 600 iterations (RX 7700 XT, Vulkan graphics queue as the executor uses, driver's amdhip64_7.dll):
+
+| Case | none | Vulkan | HIP |
+|---|---:|---:|---:|
+| idle GPU, 4 KB fill | 10-28 us | 113 us (p90 150) | 109 us (p90 130) |
+| 64 MB D3D12 copy before each, 4 KB fill | 15 us | 129 us (p90 410) | 117 us (p90 190) |
+| idle GPU, 64 MB fill | 10-50 us | 309 us (p90 520) | 309 us (p90 335) |
+
+- HIP saves ~5-12 us per round trip at the median (a better tail under load). Moving FG to HIP would need a
+  PTX -> AMDGPU backend or ZLUDA for every DLSS-G kernel for that: not worth it. Rejected without porting.
+- **Found: a bare round trip is ~0.1 ms, but FG loses ~0.6 ms per list outside its kernels** (kernels' queue 2.57 of
+  3.26 ms at 2x, entry barrier to last dispatch). Most of that is not the hand-off mechanism. Candidates, unmeasured:
+  the batch's entry barrier (ALL_COMMANDS, MEMORY_WRITE -> MEMORY_READ|WRITE) and the tail after the last dispatch
+  (the semaphore signal's cache flushes over the frame's working set), the leading / trailing D3D12 parts beyond the
+  barriers (~0.07 ms measured), and clocks dropping in the gaps (the busy-machine numbers point that way). Next lead.
+
+### 2026-11-11: in game (Ghost of Tsushima, owner), and OutputReal's copy
+
+- **Game, one-batch build (f394e94), owner's fps over a 92 fps base** (10.87 ms): 2x 144/72 (+3.0 ms per real frame),
+  3x 194/65 (+4.5), 4x 233/58 (+6.4), 5x 255/50 (+9.1), 6x 280/48 (+10.0). Before (original DLL, 90 fps base):
+  2x +4.3, 3x +5.6, 4x +8.9. 1.1-2.5 ms better.
+- **What the game does differently** (SplitLog): every generated frame is its own list and ExecuteCommandLists
+  (Streamline evaluates and presents them one at a time), so each pays a round trip; the host timer's index 2+
+  evaluates take ~0.7-1.2 ms there against ~0.57 in the harness. Not mergeable. And at MultiFrameIndex 1 DLSS-G records
+  a CopyResource (an internal texture into OutputReal, with COPY_SOURCE / COPY_DEST transitions around it) between
+  WarpBlendingWeights and BlendCandidatesFGLite: one more batch, one more round trip per real frame. The harness never
+  set OutputReal. Game inputs that differ from the harness: no HUDLess, OutputReal set, depth D32S8 typeless and
+  motion vectors at 2560x1440, backbuffer R10G10B10A2 HDR.
+- **Bug, test tool only:** the host's capture (DumpReal) froze the game's FG path after the first parameter file
+  (Dumper::resources transitions every input from ALL_SHADER_RESOURCE, wrong for the game's D32S8 depth / backbuffer).
+  The harness capture works. Not fixed; the game's parameter file was enough.
+- Harness: `--outreal` sets OutputReal at index 1 as Streamline does, and the synthetic mode writes it
+  (f<N>_outreal.ppm, hashed by the guard). Reproduces the game's extra batch; OutputReal costs ~+0.35 ms at 4x.
+- **Kept: CopyResource on the kernels' queue** (`VkCopies=1`, host/copy_res.comp). With a batch open, a buffer copy
+  (32-bit words through the GPU VAs) or a 2D texture copy in a format whose texel round trip is exact (UNORM, UINT,
+  SINT; SRV read, UAV write, both made in the scratch heap) runs in the batch; transitions between shader states and
+  COPY_SOURCE / COPY_DEST go to the next D3D12 part. Anything else stays on D3D12 and ends the batch as before.
+  Back to 1 batch per list with OutputReal. Guards: byte-identical without --outreal (12 modes) and with it (12 modes,
+  OutputReal image included; it holds the real frame, same bytes as the D3D12 copy).
+
+| --outreal, Lite | D3D12 copy | Vulkan copy | delta |
+|---|---:|---:|---:|
+| 2x | 3.050 | 2.956 | -0.094 |
+| 4x | 4.142 | 3.909 | -0.233 |
+| 6x | 5.229 | 4.947 | -0.282 |
+
+  Full model with --outreal: 2x 4.588 -> 4.361, 6x 13.381 -> 13.038. (3 / 2 rounds A B B A.)
+
+### 2026-11-11: where the ~0.5 ms per list goes (measured)
+
+New in `[Host] KernelTiming=1`: timestamps at the batch's very start and after an explicit exit barrier, D3D12
+timestamps on the game's queue right after the work before the kernels and right where it resumes, and both clocks
+mapped onto the CPU's QueryPerformanceCounter (VK_EXT_calibrated_timestamps, GetClockCalibration).
+- The batch's entry and exit barriers (full memory barriers) cost ~2 us each: the cache flushes are not it.
+- With OutputReal (the game's case), 2x: the game's queue idles 2.86 ms per list, of which the batch runs 2.36 ms:
+  **0.50 ms per round trip** (0.19 D3D12 done -> kernels start, 0.31 kernels done -> D3D12 resumes); 6x 0.58
+  (0.30 + 0.28); 4x 0.26 + 0.28. The D3D12 parts around it are ~0.12 ms.
+- handoff_bench, the same round trip in a clean process: 0.10 ms; unchanged with 150 Vulkan commands (+5 us), with
+  Vulkan busy for 0.7-2.2 ms (~0.09 ms beyond the fill), with 64 MB written (+~0.04). 150 D3D12 UAV barriers cost
+  ~120 us on their own, hand-off or not.
+- An empty round trip inside the FG process (probe before each batch): **0.21 ms**. So about half of the gap is the
+  process / device state (the FG Vulkan device, DLSS-G's D3D12 work), the other half comes with the real batch,
+  mostly on the way back.
+- **Rejected: signaling the fence from a separate empty submission after the batch** (0.52 vs 0.53 ms).
+- Not found yet: what in the FG process doubles the bare round trip, and what the real batch adds on the way back.
+  Next steps if worth it: grow handoff_bench toward FG (descriptor buffers, host-visible memory, the executor's
+  device features) until its round trip doubles; or an ETW trace of the GPU scheduler (wpr / tracerpt are on the
+  machine) to see which context waits on what.
+
+### 2026-11-11: in game, the stutter is the GPU scheduler; FG on the compute engine (owner's runs)
+
+Owner: "Upscaler GPU time" (OptiScaler overlay, DLSS K DLAA 1440p) is 2.47-2.91 ms without FG and swings 2.51-6.23
+ms with 4x FG: visible stutter. In game Streamline submits FG's lists on a D3D12 **compute** queue (type 2, its async
+queue). The kernels went to the executor's Vulkan device on the graphics queue family, which Windows schedules on the
+same "3D" engine as the game's graphics queue: time-sliced with the game's rendering instead of beside it. Windows'
+GPU engine counters (harness): graphics family -> "3d" only; compute family -> "compute 0" (a separate engine).
+
+| Run (4x, Ghost of Tsushima) | FG queue | Upscaler | Upscaler GPU time | FG [1] median / p90 | FG per real frame |
+|---|---|---|---|---:|---:|
+| first | graphics, realtime priority | d3dhip | 2.51-6.23, avg 3.89 | | |
+| A | graphics, low priority | d3dhip | 2.51-5.91, avg 3.51 | 4.90 / 6.65 | 7.38 |
+| B | graphics, default | d3dhip (`D4R_DX_NET` does not apply to K) | 2.47-6.99, avg 3.88 | 4.48 / 6.46 | 6.91 |
+| B2 | graphics, default | DXIL (`D4R_D3DHIP_K=0`) | 2.61-5.03, avg 3.47 | 4.59 / 13.04 | 6.76 |
+| C | **compute** | DXIL | **2.67-3.89, avg 3.06** | **3.08 / 3.38** | **4.53** |
+
+- **Kept: `[Host] ComputeQueue=1` is the default now.** The harness measured it slower (+0.16-0.25 ms) because
+  there is nothing to overlap with there; in game FG's cost per real frame drops 2.2 ms and its p90 4x. Guards
+  byte-identical (with and without --outreal).
+- `[Host] QueuePriority` (1 low, 2 medium, 3 high, 4 realtime; default: the driver's) kept as a knob. Low vs default
+  on the graphics family: within run-to-run noise in game.
+- Removing the HIP context (DXIL upscaler) alone did not fix the swing (B2); moving FG off the 3D engine did (C).
+- Owner: still not as smooth as Linux, where FG and the game share one Vulkan device (no cross-device hand-offs at
+  all). What is left on Windows: a ~0.5 ms cross-device round trip per generated frame on the game's compute queue.
+  Next: the kernels as D3D12 compute in the game's own queue (DXIL route).
+
+### 2026-11-11: DXIL route, spike (owner's go-ahead; validation by image quality accepted for this route)
+
+Goal: the kernels as D3D12 compute in DLSS-G's own command list (the game's queue): no second device, no hand-offs,
+no Windows scheduling between devices. Off unless enabled; the default route is unchanged (guards byte-identical).
+- **Pointers.** DLSS-G creates only committed resources (no heaps, no placed resources: 204 creations logged), and
+  every pointer its kernels receive lies in one of 36 default-heap buffers (108 MB). Its default-heap buffers created
+  inside its calls (FgScope) now go into 256 MB heaps of ours as placed resources (`CUX_PTRHEAP=1`); a raw buffer
+  spans each heap, and every placed buffer sits at span VA + offset (checked per buffer). A CUDA pointer p is byte
+  p - span VA of one RWByteAddressBuffer. Vulkan route output byte-identical with the redirection on.
+- **Kernels.** `translator/glsl2hlsl.py` converts ptxc's GLSL (rt.glsl inlined verbatim in 156 of 157 files) to HLSL:
+  rt.glsl -> `translator/rt.hlsl` (same helpers on D3D12, SM 6.6 descriptor heaps, exact f32 -> f16 RNE because AMD's
+  D3D12 compiler truncates, the NVX_SW_CLAMP fetch path because D3D12 samplers have no unnormalized coordinates),
+  NvxT(a).v accessors -> functions over the raw buffer, aliased shared-memory blocks -> one groupshared array plus
+  views (`rt_smem.hlsli`), barriers, wave32. dxc 6.6: 75 of 126 kernel files compile (all but the network
+  convolutions: cooperative matrices / T1 kernels).
+- **Executor spike** (`CUX_DXIL=<folder of .dxil>`, `CUX_DXIL_KERNELS=<names>|*`): our shader-visible heaps mirror
+  the descriptors (raw bytes), one constant-buffer ring slot per launch (pointer-heap base, group counts, parameters),
+  the dispatch is recorded into DLSS-G's list with UAV barriers around it and DLSS-G's bound state replayed after.
+  Mixed with the Vulkan route (a DXIL kernel is D3D12 work between two batches).
+- **Results (harness, 4x Lite, --outreal):** all 15 non-network kernels Lite uses on DXIL, the network on Vulkan:
+  Exact=0 (default): generated frames and OutputReal **byte-identical** to the Vulkan route; 3.66 ms per real frame
+  even with the extra hand-offs of the mix. Exact=1: frames 2 and 3 identical, frame 1 differs; bisected to
+  Kernel_DL1Net_Input and Kernel_DownsampleRGBAndEstimateUIFused (suspect: GLSL fma is fused, rt.hlsl maps it to mad).
+- Next: the network. Lite's convolutions run as T1 kernels (fg/dlssg/t1 templates, GLSL cooperative matrices);
+  they need an HLSL form on AMD's WMMA intrinsics, which the engine already reaches on the game's own device through
+  the reserved register space (engine/d3d12/ags_wmma.hlsli, coopmat_ags.hlsli). k_pooling / k_upscale /
+  k_element_wise convert already. Then: run-time compilation and caching (dxcompiler), the whole list on DXIL with
+  no Vulkan batch, the timing in game.
+
+### 2026-11-11: DXIL route complete for FG Lite (default mode)
+
+- **The network.** Lite's convolutions (T1 kernels, GLSL cooperative matrices on shared memory) convert to AMD's WMMA
+  intrinsics through the engine's wrappers (engine/d3d12/ags_wmma.hlsli: matrixSharedLoad / Store, matrixConvert,
+  matrixMultiplyAdd; the reserved register space works on the game's own device, no AGS device creation): the kernel's
+  shared memory is AGS's matrixShared, f16 offsets / strides become words, matrix variables keep their type and use.
+  Pointer accessors are parsed with balanced parentheses (addresses nest). A standalone test (wmma_test, plain D3D12
+  device, the route's root signature) checks the product against the CPU; a plain-HLSL emulation (wmma_emul.hlsli,
+  -DNVX_WMMA_EMULATE) passes the same test and serves to tell conversion bugs from AGS ones.
+- **Found: AMD's D3D12 driver packs 2D thread groups into waves in tiles.** Probe (32x8 group, WaveSize 32): the wave
+  holding thread 31 starts at thread 16 (16x2 tiles). Vulkan's subgroups are consecutive invocation indices, which the
+  kernels rely on (subgroup ids, shuffles, matrix operations): the converted convolution came out 5.8 dB, every odd
+  wave wrong (convcmp: one module on Vulkan and on D3D12 with the same random data). A 1D group's waves are
+  consecutive (probe), so every kernel now runs as numthreads(BX*BY*BZ, 1, 1) with the local id rebuilt from the flat
+  index: the convolution module is then **byte-identical** to the Vulkan route's (0 of 32768 outputs differ).
+- **Whole frame on DXIL** (`[Host] Route=dxil`): DLSS-G's buffers in the pointer heap, every kernel a D3D12 dispatch
+  in DLSS-G's own list, clears and the OutputReal copy plain D3D12 commands: **no Vulkan batch, no hand-off**.
+  `translator/build_hlsl.py CACHE` writes every kernel's HLSL into CACHE/hlsl (105 of 128 files; not yet: the full
+  model's T1 kernels with accumulator arrays and the exact-mode convolutions with element access, which keep the
+  Vulkan route); the host compiles each kernel / variant / block shape on first use with `[Host] Dxc` (dxc.exe; 47-687
+  ms each, 40 kernels 5.8 s once) into CACHE/dxil.
+- Output, harness 4x Lite, default mode: generated frames 1-2 and OutputReal byte-identical to the Vulkan route, frame
+  3 118.6 dB (a few bytes off by one). Exact mode: a hybrid for now (convolutions on Vulkan), >= 115 dB.
+- **Speed, harness, --outreal (game-like), A B B A x3, GPU ms per real frame:**
+
+| FG Lite | Vulkan route (default) | DXIL route | target | Linux |
+|---|---:|---:|---:|---:|
+| 2x | 2.880 | 2.522 | <= 2.9 | 2.86 |
+| 4x | 3.824 | 3.494 | <= 3.9 | 3.83 |
+| 6x | 4.931 | 4.473 | <= 4.9 | 4.81 |
+
+  Default route unchanged (guards byte-identical). Next: the game.
+
+### 2026-11-11: in game on the DXIL route; pacing; the GPU hangs
+
+- **Game (owner), 4x, FG on DXIL, upscaler DXIL, HAGS off:** FG's GPU cost per real frame 4.23-4.50 ms, first evaluate
+  p90 3.3-3.4 ms (the Vulkan graphics-family route: 13.0); d4r's Linux figure for this game at 4x is 4.2-4.5 ms. 64 real
+  fps over a 92 fps base: +4.7 ms per real frame, FG's own cost. Owner: still uneven ("frames not evenly paced").
+- **Pacing, PresentMon** (AMD Software's PresentMon-x64.exe, unelevated works for the game): presents are even (4x:
+  3.39 ms +- 0.56) but on-screen times are not (+- 1.38 ms, 1% of frames shown <= 0.18 ms, 1% >= 8 ms). The game runs
+  independent flip, sync interval 0, tearing, no VRR, on a 240 Hz display; 4x presented ~295 fps. At 3x (~196 fps):
+  presents +- 0.53, on screen +- 1.35. The whole difference is the present-to-flip latency, which follows GPU completion:
+  the GPU is busy ~93% of each frame and its work per frame varies (a real frame carries the game, the upscaler and FG's
+  3 ms first evaluate). Not FG overhead: a GPU-bound, uncapped, no-VRR presentation.
+- HAGS on (owner turned it on): presents in bursts (3x: +- 3.07 ms, 18.6% of intervals over twice the median, the
+  zigzag in OptiScaler's frame-time graph). With an AMD Software 180 fps cap: +- 1.49 presents, +- 1.76 on screen,
+  no frame shown under 3.38 ms. Recommended: HAGS off.
+- **GPU hangs (two crashes, DXGI_ERROR_DEVICE_HUNG, LiveKernelEvent 141), both within the first FG frames.** Cause:
+  in game (never in the harness) Kernel_ZeroBuffer and Kernel_InputMvecProcessing get pointers to buffers outside the
+  pointer heap (0x27f71a000, 0x144160000), and a root UAV has no bounds: the access went to arbitrary GPU memory.
+  Fixed: a launch whose pointer lies outside the heap keeps the Vulkan route (pointers: low half >= 1 MB, below 2^40;
+  packed integer pairs such as 0x50_00000002 are not); every offset is clamped into the heap in rt.hlsl (nvx_off), so
+  a stray address cannot leave it; buffers created through CreateCommittedResource1/2/3 inside DLSS-G's calls go to
+  the heap too. A bounded view (descriptor heap or table) was tried instead of the clamp: ~0.6 ms per real frame
+  slower at 4x (AMD's compiler uses faster loads and stores for an unbounded root buffer); rejected.
+- Harness timings of the DXIL route are bimodal in this machine state (4x: median 3.58 in one set of runs, 4.18 with
+  min 3.51 in another, same build; VRAM use 1.2 of 12 GB): not explained yet, the Vulkan route stays ~3.87.

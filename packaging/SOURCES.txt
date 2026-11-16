@@ -52,9 +52,9 @@ Third-party software, unmodified or patched by d4r:
                          sources are Ubuntu's elfutils 0.186-1ubuntu0.1 and numactl 2.0.14-3ubuntu2 source packages.
                          Licenses: d4r/licenses/ROCm-lib*-copyright.txt
   dxgi.dll               OptiScaler 10.0.0-pre1 (GNU GPL 3.0), unmodified OptiScaler.dll renamed.
-                         Pinned nightly-20261024. Exact source, archive digest and per-file hashes:
+                         Pinned nightly-20261029. Exact source, archive digest and per-file hashes:
                          d4r/source/optiscaler.json (custom build inputs are identified separately).
-                         https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261024
+                         https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261029
                          License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
   OptiScaler.ini         Upstream v10 INI with packaging/optiscaler.settings applied.
                          NvngxPath selects d4r; OptiDllPath selects the OptiScaler/ dependency folder.

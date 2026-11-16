@@ -49,14 +49,19 @@ float16_t g11_e4h(uint c)
 
 #ifndef G11_HAVE_FILL
 // four codes -> the scaled binary16 pairs (bytes 0, 1) and (bytes 2, 3), ZLUDA's e4m3x4_to_scaled_f16x2x2
+// Two codes at a time: the pair's bytes are spread to bits 0..7 and 16..23 first (one byte permute), then both halves
+// are widened together: magnitude to bits 7..14 (the NaN code 0x7f gains bit 14 through the +1 carry), sign to bit 15.
+// Bit-identical to the per-byte form for every pair of codes (checked exhaustively); fewer ALU operations per operand,
+// which dominate the gfx11 stages (RX 7700 XT, RR D replay at 1024x576 -> 2048x1152: the widening is ~a third of it).
+uint g11_w2(uint s)
+{
+    const uint m = s & 0x007f007fu;
+    return ((m | ((m + 0x00010001u) & 0x00800080u)) << 7u) | ((s & 0x00800080u) << 8u);
+}
 uvec2 g11_sc4(uint packed)
 {
-    uint mag = packed & 0x7f7f7f7fu;
-    mag |= (mag + 0x01010101u) & 0x80808080u;
-    const uint sign = packed & 0x80808080u;
-    const uint lo = ((mag & 0xffu) << 7u) | ((mag & 0xff00u) << 15u) | ((sign & 0x80u) << 8u) | ((sign & 0x8000u) << 16u);
-    const uint hi = (((mag >> 16u) & 0xffu) << 7u) | ((mag >> 24u) << 23u) | ((sign & 0x800000u) >> 8u) | (sign & 0x80000000u);
-    return uvec2(lo, hi);
+    return uvec2(g11_w2((packed & 0xffu) | ((packed & 0xff00u) << 8u)),
+                 g11_w2(((packed >> 16u) & 0xffu) | ((packed >> 8u) & 0x00ff0000u)));
 }
 // an operand from its lane's 16 codes in k order (four words): positions in ZLUDA's order
 #define G11_FILL(m, w0, w1, w2, w3) { \

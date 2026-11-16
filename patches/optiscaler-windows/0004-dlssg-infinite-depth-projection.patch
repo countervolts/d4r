@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Mon, 16 Nov 2026 12:00:00 +0100
+Subject: [PATCH] DLSSG: projection matrix for infinite far planes
+
+OptiScaler hands real DLSS Frame Generation (DLSSG) the camera as constants. SetConstants set cameraFar to
+infinity when the game created its FSR frame generation context with FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE,
+and then built cameraViewToClip / clipToCameraView only when cameraFar was finite. So with infinite depth the
+matrices stayed all zeros on every frame ("Can't calculate projectionMatrix", once per frame) and DLSSG
+reprojected with no camera: ghosting and smearing around moving objects and at disocclusions.
+
+Build the limit of the perspective matrix for far -> infinity (regular and reverse-Z). The warning now says which
+of near / far / vFov / aspect was unusable, and the first frame logs the camera values and depth flags.
+---
+diff --git a/OptiScaler/framegen/dlssg/DLSSG_Common.cpp b/OptiScaler/framegen/dlssg/DLSSG_Common.cpp
+index 95ca8fc9..498f2650 100644
+--- a/OptiScaler/framegen/dlssg/DLSSG_Common.cpp
++++ b/OptiScaler/framegen/dlssg/DLSSG_Common.cpp
+@@ -175,10 +175,18 @@ bool DLSSG_Common::SetConstants(int fIndex, uint32_t frameId, uint32_t mvWidth,
+         XMMATRIX clipToCameraView {};
+ 
+         float vFov = _cameraVFov[fIndex];
++        float aspectRatio = _cameraAspectRatio[fIndex];
+ 
+-        // XMMatrixPerspectiveFovRH will fail if input values are incorrect
+-        if (cameraNear > 0.f && std::isfinite(cameraFar) && !XMScalarNearEqual(vFov, 0.0f, 0.00001f) &&
+-            !XMScalarNearEqual(_cameraAspectRatio[fIndex], 0.0f, 0.00001f))
++        const bool commonValid = cameraNear > 0.f && std::isfinite(vFov) && std::isfinite(aspectRatio) &&
++                                 !XMScalarNearEqual(vFov, 0.0f, 0.00001f) &&
++                                 !XMScalarNearEqual(aspectRatio, 0.0f, 0.00001f);
++
++        static uint32_t cameraLogCount = 0;
++        if (cameraLogCount == 0)
++            LOG_INFO("Camera for DLSSG: near {}, far {}, vFov {}, aspect {}, infinite depth {}, inverted depth {}",
++                     cameraNear, cameraFar, vFov, aspectRatio, IsInfiniteDepth(), IsInvertedDepth());
++
++        if (commonValid && std::isfinite(cameraFar))
+         {
+             if (XMScalarNearEqual(cameraNear, cameraFar, 0.00001f))
+                 cameraFar++;
+@@ -189,14 +197,46 @@ bool DLSSG_Common::SetConstants(int fIndex, uint32_t frameId, uint32_t mvWidth,
+             auto projectionFar = IsInvertedDepth() ? cameraNear : cameraFar;
+ 
+             cameraViewToClip =
+-                XMMatrixPerspectiveFovRH(vFov, _cameraAspectRatio[fIndex], projectionNear, projectionFar);
++                XMMatrixPerspectiveFovRH(vFov, aspectRatio, projectionNear, projectionFar);
++            clipToCameraView = XMMatrixInverse(nullptr, cameraViewToClip);
++        }
++        else if (commonValid)
++        {
++            // Infinite far plane (FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE): XMMatrixPerspectiveFovRH needs a finite
++            // far plane, so this is its limit for far -> infinity. Without it the matrix stayed all zeros and
++            // DLSSG reprojected with no camera at all.
++            const float h = 1.0f / std::tan(vFov * 0.5f);
++            const float w = h / aspectRatio;
++
++            XMFLOAT4X4 proj {};
++            proj._11 = w;
++            proj._22 = h;
++            proj._34 = -1.0f;
++
++            if (IsInvertedDepth())
++            {
++                // depth = near / distance
++                proj._33 = 0.0f;
++                proj._43 = cameraNear;
++            }
++            else
++            {
++                proj._33 = -1.0f;
++                proj._43 = -cameraNear;
++            }
++
++            cameraViewToClip = XMLoadFloat4x4(&proj);
+             clipToCameraView = XMMatrixInverse(nullptr, cameraViewToClip);
+         }
+         else
+         {
+-            LOG_WARN("Can't calculate projectionMatrix");
++            if (cameraLogCount < 3 || cameraLogCount % 600 == 0)
++                LOG_WARN("Can't calculate projectionMatrix: near {}, far {}, vFov {}, aspect {}, infinite depth {}",
++                         cameraNear, cameraFar, vFov, aspectRatio, IsInfiniteDepth());
+         }
+ 
++        cameraLogCount++;
++
+         // Convert to sl::float4x4 for Streamline
+         XMFLOAT4X4 temp;
+         XMStoreFloat4x4(&temp, cameraViewToClip);

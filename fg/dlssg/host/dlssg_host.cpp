@@ -126,7 +126,12 @@ void* g_device = nullptr;
 HANDLE g_log = INVALID_HANDLE_VALUE;
 std::wstring g_base; // this DLL's path without ".dll"
 unsigned g_nextId = 0x7d000;
-struct FgHandle { NgxHandle pub; NgxHandle* inner; };
+struct FgHandle
+{
+    NgxHandle pub;
+    NgxHandle* inner;
+    int uiInputs = -1; // which of HUDLess / UI / UIAlpha the caller passed (bit mask); -1 before the first evaluate
+};
 std::map<const void*, FgHandle*> g_handles; // keyed by the public handle pointer
 
 void logf(const char* fmt, ...)
@@ -187,6 +192,34 @@ bool wrapGetProcAddress(HMODULE module);
 bool g_cubin = false; // NVIDIA's cubin interface is served here (native Windows; under Proton dxvk-nvapi does it)
 
 // Native Windows: no vkd3d-proton, so nothing implements the D3D12 cubin calls DLSS-G makes; cubin_d3d12.cpp does.
+// The translated kernels' folder: d4r.ini [FrameGeneration] KernelCache (install.ps1 writes the one it built), or for
+// auto the cache of this GPU's generation, %LOCALAPPDATA%\d4r\nvxrt-gfx11 (RDNA3) or %LOCALAPPDATA%\d4r\nvxrt (RDNA4,
+// when only that one exists). dlssg_host.ini [Host] Cache= overrides it.
+std::wstring fgCacheDir()
+{
+    wchar_t local[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    std::wstring cache = d4rString(L"KernelCache", nullptr, L"");
+    if (cache.empty() || !_wcsicmp(cache.c_str(), L"auto")) {
+        const std::wstring rdna3 = std::wstring(local) + L"\\d4r\\nvxrt-gfx11", rdna4 = std::wstring(local) + L"\\d4r\\nvxrt";
+        const bool only4 = GetFileAttributesW((rdna4 + L"\\arch").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                           GetFileAttributesW((rdna3 + L"\\arch").c_str()) == INVALID_FILE_ATTRIBUTES;
+        cache = only4 ? rdna4 : rdna3;
+    }
+    return iniString(L"Cache", cache.c_str());
+}
+// The GPU generation a cache was translated for (its "arch" file, written by dlssg-setup / dlssg_setup.py): gfx12 is
+// RDNA4, anything else (gfx11, or no file yet) RDNA3
+bool fgCacheRdna4(const std::wstring& cache)
+{
+    FILE* f = _wfopen((cache + L"\\arch").c_str(), L"rb");
+    if (!f) return false;
+    char text[16] = {};
+    fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    return !strncmp(text, "gfx12", 5);
+}
+
 // Cubin=auto (default): on unless running under Wine; 0 / 1 force it.
 void setupCubin(const std::wstring& dir)
 {
@@ -197,11 +230,7 @@ void setupCubin(const std::wstring& dir)
     logf("cubin interface: %s", g_cubin ? "served by this DLL (native D3D12)" : wine ? "left to dxvk-nvapi (Wine)" : "off");
     if (!g_cubin) return;
     cux::Config c;
-    wchar_t local[MAX_PATH] = {};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    std::wstring cache = d4rString(L"KernelCache", nullptr, L"");
-    if (cache.empty() || !_wcsicmp(cache.c_str(), L"auto")) cache = std::wstring(local) + L"\\d4r\\nvxrt-gfx11";
-    c.cacheDir = iniString(L"Cache", cache.c_str());
+    c.cacheDir = fgCacheDir();
     c.logPath = dir + L"nvxrt.log";
     bool exact = iniUInt(L"Exact", d4rBool(L"Exact", false) ? 1 : 0) != 0;
     c.accFast = !exact && iniUInt(L"AccFast", 1) != 0;
@@ -210,6 +239,26 @@ void setupCubin(const std::wstring& dir)
     c.trace = iniUInt(L"Trace", 0) != 0;
     c.gpuSync = iniUInt(L"GpuSync", 1) != 0;
     c.splitBarriers = iniUInt(L"SplitBarriers", 0) != 0;
+    c.vkClears = iniUInt(L"VkClears", 1) != 0;
+    c.vkCopies = iniUInt(L"VkCopies", 1) != 0;
+    c.queuePriority = iniUInt(L"QueuePriority", 0);
+    // dxil (default): the kernels as D3D12 compute in DLSS-G's own command lists - no Vulkan hand-off per kernel batch
+    // (faster), and the game's memory stays with the device that owns it. vulkan: every kernel on the private Vulkan
+    // device. A kernel without DXIL (no HLSL from build_hlsl.py, no dxc, a failed compile, a buffer outside the pointer
+    // heap such as Kernel_InputMvecProcessing's and Kernel_ZeroBuffer's in a game) keeps the Vulkan route either way.
+    // Ghost of Tsushima 2026-11-16: clean at 2x-6x once glsl2hlsl.py kept the scatter kernels' 64-bit sentinel 64-bit.
+    c.dxil = !_wcsicmp(iniString(L"Route", L"dxil").c_str(), L"dxil");
+    std::wstring dxc = dir + L"dxc\\dxc.exe";
+    if (GetFileAttributesW(dxc.c_str()) == INVALID_FILE_ATTRIBUTES)
+        dxc = dir + L"..\\..\\tools\\models\\bin\\dxc.exe";   // the release: d4r\tools\models\bin
+    c.dxc = iniString(L"Dxc", dxc.c_str());
+    c.dxilKernels = iniString(L"DxilKernels", L"");
+    c.dxilCompare = iniString(L"DxilCompare", L"");
+    c.dxilCompareOut = iniUInt(L"DxilCompareOut", 128);
+    c.splitQueries = iniUInt(L"SplitQueries", 0) != 0;
+    c.splitLog = iniUInt(L"SplitLog", 0) != 0;
+    c.kernelTiming = iniUInt(L"KernelTiming", 0) != 0;
+    c.computeQueue = iniUInt(L"ComputeQueue", 1) != 0;
     cux::configure(c);
 }
 
@@ -248,11 +297,11 @@ void load()
     // d4r.ini: the game's d4r folder, or two levels above this DLL (d4r\fg\dlssg)
     for (std::wstring p : {exe_dir + L"d4r\\d4r.ini", dir + L"..\\..\\d4r.ini"})
         if (g_d4rIni.empty() && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) g_d4rIni = p;
-    // Model: full (DLSS-G's full model) or lite (NVIDIA FG Lite, DLSS-G >= 310.9.16); auto: Lite (RDNA3, the only
-    // generation the native Windows executor targets so far). Each model has its DLL: fg\dlssg\<model>\nvngx_dlssg.dll
+    // Model: full (DLSS-G's full model) or lite (NVIDIA FG Lite, DLSS-G >= 310.9.16); auto: Lite on RDNA3, full on
+    // RDNA4 (as on Linux), by the kernel cache's generation. Each model has its DLL: fg\dlssg\<model>\nvngx_dlssg.dll
     // (install.ps1 downloads them), else the game's own nvngx_dlssg.dll.
     std::wstring model = d4rString(L"Model", L"D4R_FG_MODEL", L"auto");
-    bool lite = !_wcsicmp(model.c_str(), L"lite") || !_wcsicmp(model.c_str(), L"auto");
+    bool lite = !_wcsicmp(model.c_str(), L"lite") || (!_wcsicmp(model.c_str(), L"auto") && !fgCacheRdna4(fgCacheDir()));
     std::wstring modelDll = dir + (lite ? L"lite\\nvngx_dlssg.dll" : L"full\\nvngx_dlssg.dll");
     if (GetFileAttributesW(modelDll.c_str()) == INVALID_FILE_ATTRIBUTES) modelDll = L"nvngx_dlssg.dll";
     std::wstring fg = resolve(iniString(L"FG", modelDll.c_str()));
@@ -706,6 +755,7 @@ EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(void* list, unsigned int feature,
         NgxHandle* inner = nullptr;
         NgxResult r;
         {
+            if (g_cubin) cux::newFeature();
             cux::FgScope scope;
             r = f ? f(list, feature, params, &inner) : kFail;
         }
@@ -989,6 +1039,37 @@ static NgxResult evalFg(const char* name, void* list, FgHandle* h, void* params,
     uint64_t n = ++g_evals;
     unsigned mfc = 0, idx = 0;
     if (params) { ms::getU(params, "DLSSG.MultiFrameCount", &mfc); ms::getU(params, "DLSSG.MultiFrameIndex", &idx); }
+    if (params) {
+        // The HUD inputs DLSS-G gets decide how it treats the UI (HUD breakup reports): logged on the first evaluate
+        // of each feature and whenever the set changes, e.g. when the caller (OptiScaler's OptiFG input or the
+        // game through Streamline) starts or stops passing one.
+        static const char* names[] = {"HUDLess", "UI", "UIAlpha"};
+        ID3D12Resource* res[3] = {};
+        int mask = 0;
+        for (int i = 0; i < 3; i++) {
+            std::string k = std::string("DLSSG.") + names[i];
+            if (!failed(ms::getD3D12(params, k.c_str(), &res[i])) && res[i]) mask |= 1 << i;
+        }
+        if (mask != h->uiInputs) {
+            std::string t;
+            char b[128];
+            for (int i = 0; i < 3; i++) {
+                if (res[i]) {
+                    D3D12_RESOURCE_DESC d = res[i]->GetDesc();
+                    snprintf(b, sizeof b, " %s %llux%u fmt %u;", names[i], (unsigned long long)d.Width, d.Height,
+                             (unsigned)d.Format);
+                } else {
+                    snprintf(b, sizeof b, " %s none;", names[i]);
+                }
+                t += b;
+            }
+            unsigned recomposition = 0;
+            const bool hasRecomposition = !failed(ms::getU(params, "DLSSG.UserInterfaceRecompositionEnabled", &recomposition));
+            logf("Evaluate(FG) #%llu: HUD inputs from the caller:%s UserInterfaceRecompositionEnabled %s",
+                 (unsigned long long)n, t.c_str(), hasRecomposition ? (recomposition ? "1" : "0") : "not set");
+            h->uiInputs = mask;
+        }
+    }
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
     bool timed = false;
     if (g_timing && cl && g_device) {

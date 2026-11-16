@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Mon, 16 Nov 2026 14:00:00 +0100
+Subject: [PATCH] Spoofing.User32: display adapters in SetupAPI too
+
+Nixxes ports (Ghost of Tsushima) look the adapter DXGI reports up among the display adapters SetupAPI lists, by
+vendor and device ID, and read its driver version from there. With DXGI spoofed as NVIDIA and SetupAPI still
+reporting AMD nothing matched: "No installed graphics card has been detected" and "we strongly recommend newer
+drivers ... (version )" at every start, and the Registry spoof never ran because the lookup failed first.
+
+With User32 spoofing, SetupDiGetDeviceRegistryPropertyW, SetupDiGetDeviceInstanceIdW and SetupDiGetDevicePropertyW
+report display-class devices with the spoofed vendor / device IDs, name, manufacturer and driver version. Other
+device classes are untouched, and so are calls from the game's d4r folder (d4r reads the real GPU there). Each
+spoof is logged.
+---
+diff --git a/OptiScaler/spoofing/User32_Spoofing.cpp b/OptiScaler/spoofing/User32_Spoofing.cpp
+index f4702ccf..af66d7ac 100644
+--- a/OptiScaler/spoofing/User32_Spoofing.cpp
++++ b/OptiScaler/spoofing/User32_Spoofing.cpp
+@@ -5,6 +5,10 @@
+ 
+ #include <detours/detours.h>
+ 
++#include <setupapi.h>
++#include <devpropdef.h>
++#include <intrin.h>
++
+ typedef BOOL(WINAPI* PFN_EnumDisplayDevicesA)(PSTR lpDevice, uint32_t iDevNum, DISPLAY_DEVICEA* lpDisplayDevice,
+                                               uint32_t dwFlags);
+ typedef BOOL(WINAPI* PFN_EnumDisplayDevicesW)(PWSTR lpDevice, uint32_t iDevNum, DISPLAY_DEVICEW* lpDisplayDevice,
+@@ -111,6 +115,194 @@ inline static BOOL WINAPI hkEnumDisplayDevicesW(PWSTR lpDevice, uint32_t iDevNum
+     return result;
+ }
+ 
++// SetupAPI. Nixxes ports (Ghost of Tsushima) look the adapter DXGI reports up among the display adapters SetupAPI
++// lists, by vendor and device ID, then read its DriverVersion. With DXGI spoofed and SetupAPI not, nothing matched:
++// "No installed graphics card has been detected" and "newer drivers ... (version )". These report the display
++// adapters with the spoofed IDs, name and driver version; other device classes are untouched.
++
++typedef BOOL(WINAPI* PFN_SetupDiGetDeviceRegistryPropertyW)(HDEVINFO, PSP_DEVINFO_DATA, DWORD, PDWORD, PBYTE, DWORD,
++                                                            PDWORD);
++typedef BOOL(WINAPI* PFN_SetupDiGetDeviceInstanceIdW)(HDEVINFO, PSP_DEVINFO_DATA, PWSTR, DWORD, PDWORD);
++typedef BOOL(WINAPI* PFN_SetupDiGetDevicePropertyW)(HDEVINFO, PSP_DEVINFO_DATA, const DEVPROPKEY*, DEVPROPTYPE*, PBYTE,
++                                                    DWORD, PDWORD, DWORD);
++
++static PFN_SetupDiGetDeviceRegistryPropertyW o_SetupDiGetDeviceRegistryPropertyW = nullptr;
++static PFN_SetupDiGetDeviceInstanceIdW o_SetupDiGetDeviceInstanceIdW = nullptr;
++static PFN_SetupDiGetDevicePropertyW o_SetupDiGetDevicePropertyW = nullptr;
++
++static const GUID kDisplayClass = { 0x4d36e968, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
++static const GUID kDeviceProps = { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } };
++static const GUID kDriverProps = { 0xa8b865dd, 0x2e3d, 0x4094, { 0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6 } };
++static const GUID kInstanceProps = { 0x78c34fc8, 0x104a, 0x4aca, { 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57 } };
++
++// d4r's own modules (the game's d4r folder: its NGX shim and the NGX core) identify the real GPU and its driver for
++// themselves; spoofing them hid the AMD GPU and put the native engine off (K through ZLUDA instead).
++static bool IsD4rCaller(void* address)
++{
++    HMODULE module = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            reinterpret_cast<LPCWSTR>(address), &module))
++        return false;
++
++    wchar_t path[1024] {};
++    if (GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path))) == 0)
++        return false;
++
++    _wcslwr_s(path);
++    return wcsstr(path, L"\\d4r\\") != nullptr;
++}
++
++static bool IsKey(const DEVPROPKEY* key, const GUID& fmtid, DEVPROPID pid)
++{
++    return key != nullptr && key->pid == pid && IsEqualGUID(key->fmtid, fmtid);
++}
++
++static bool IsDisplayAdapter(PSP_DEVINFO_DATA data)
++{
++    return data != nullptr && data->cbSize >= sizeof(SP_DEVINFO_DATA) && IsEqualGUID(data->ClassGuid, kDisplayClass);
++}
++
++// VEN_1002 / VEN_8086 and the DEV_ after them, in place (same length), in a string or a REG_MULTI_SZ
++static bool SpoofIdsInPlace(wchar_t* text, size_t chars)
++{
++    if (text == nullptr)
++        return false;
++
++    wchar_t vendor[9] {}, device[9] {};
++    swprintf_s(vendor, L"VEN_%04X", Config::Instance()->SpoofedVendorId.value_or_default());
++    swprintf_s(device, L"DEV_%04X", Config::Instance()->SpoofedDeviceId.value_or_default());
++
++    auto copyCase = [](wchar_t* dst, const wchar_t* src, size_t n)
++    {
++        for (size_t k = 0; k < n; ++k)
++            dst[k] = iswlower(dst[k]) ? towlower(src[k]) : src[k];
++    };
++
++    bool changed = false;
++    for (size_t i = 0; i + 8 <= chars; ++i)
++    {
++        if (_wcsnicmp(text + i, L"VEN_1002", 8) != 0 && _wcsnicmp(text + i, L"VEN_8086", 8) != 0)
++            continue;
++
++        copyCase(text + i, vendor, 8);
++        changed = true;
++
++        if (i + 17 <= chars && text[i + 8] == L'&' && _wcsnicmp(text + i + 9, L"DEV_", 4) == 0)
++            copyCase(text + i + 9, device, 8);
++    }
++
++    return changed;
++}
++
++// A string result the caller's buffer may be too small for: the usual two-call size protocol
++static BOOL ReturnString(const std::wstring& value, PBYTE buffer, DWORD size, PDWORD required)
++{
++    const DWORD needed = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
++    if (required != nullptr)
++        *required = needed;
++
++    if (buffer == nullptr || size < needed)
++    {
++        SetLastError(ERROR_INSUFFICIENT_BUFFER);
++        return FALSE;
++    }
++
++    memcpy(buffer, value.c_str(), needed);
++    return TRUE;
++}
++
++static BOOL WINAPI hkSetupDiGetDeviceRegistryPropertyW(HDEVINFO set, PSP_DEVINFO_DATA data, DWORD property,
++                                                       PDWORD type, PBYTE buffer, DWORD size, PDWORD required)
++{
++    if (IsD4rCaller(_ReturnAddress()))
++        return o_SetupDiGetDeviceRegistryPropertyW(set, data, property, type, buffer, size, required);
++
++    auto result = o_SetupDiGetDeviceRegistryPropertyW(set, data, property, type, buffer, size, required);
++
++    if (!IsDisplayAdapter(data))
++        return result;
++
++    if (property == SPDRP_DEVICEDESC || property == SPDRP_FRIENDLYNAME)
++    {
++        if (type != nullptr)
++            *type = REG_SZ;
++        LOG_INFO("SetupAPI: display adapter name ({}) -> spoofed", property);
++        return ReturnString(Config::Instance()->SpoofedGPUName.value_or_default(), buffer, size, required);
++    }
++
++    if (property == SPDRP_MFG)
++    {
++        if (type != nullptr)
++            *type = REG_SZ;
++        return ReturnString(L"NVIDIA", buffer, size, required);
++    }
++
++    if (result && buffer != nullptr && (property == SPDRP_HARDWAREID || property == SPDRP_COMPATIBLEIDS))
++    {
++        if (SpoofIdsInPlace(reinterpret_cast<wchar_t*>(buffer), size / sizeof(wchar_t)))
++            LOG_INFO("SetupAPI: display adapter {}: {}", property == SPDRP_HARDWAREID ? "HardwareID" : "CompatibleIDs",
++                     wstring_to_string(reinterpret_cast<wchar_t*>(buffer)));
++    }
++
++    return result;
++}
++
++static BOOL WINAPI hkSetupDiGetDeviceInstanceIdW(HDEVINFO set, PSP_DEVINFO_DATA data, PWSTR id, DWORD size,
++                                                 PDWORD required)
++{
++    if (IsD4rCaller(_ReturnAddress()))
++        return o_SetupDiGetDeviceInstanceIdW(set, data, id, size, required);
++
++    auto result = o_SetupDiGetDeviceInstanceIdW(set, data, id, size, required);
++
++    if (result && id != nullptr && IsDisplayAdapter(data) && SpoofIdsInPlace(id, wcsnlen(id, size)))
++        LOG_INFO("SetupAPI: display adapter instance ID: {}", wstring_to_string(id));
++
++    return result;
++}
++
++static BOOL WINAPI hkSetupDiGetDevicePropertyW(HDEVINFO set, PSP_DEVINFO_DATA data, const DEVPROPKEY* key,
++                                               DEVPROPTYPE* type, PBYTE buffer, DWORD size, PDWORD required,
++                                               DWORD flags)
++{
++    if (IsD4rCaller(_ReturnAddress()))
++        return o_SetupDiGetDevicePropertyW(set, data, key, type, buffer, size, required, flags);
++
++    auto result = o_SetupDiGetDevicePropertyW(set, data, key, type, buffer, size, required, flags);
++
++    if (!IsDisplayAdapter(data) || key == nullptr)
++        return result;
++
++    const std::wstring* text = nullptr;
++    std::wstring name = Config::Instance()->SpoofedGPUName.value_or_default();
++    std::wstring driver = Config::Instance()->SpoofedDriver.value_or_default();
++    std::wstring maker = L"NVIDIA";
++
++    if (IsKey(key, kDeviceProps, 2) || IsKey(key, kDeviceProps, 14) || IsKey(key, kDriverProps, 4))
++        text = &name; // DeviceDesc, FriendlyName, DriverDesc
++    else if (IsKey(key, kDriverProps, 3))
++        text = &driver; // DriverVersion
++    else if (IsKey(key, kDeviceProps, 13) || IsKey(key, kDriverProps, 9))
++        text = &maker; // Manufacturer, DriverProvider
++
++    if (text != nullptr)
++    {
++        if (type != nullptr)
++            *type = DEVPROP_TYPE_STRING;
++        LOG_INFO("SetupAPI: display adapter property {:08X},{} -> {}", key->fmtid.Data1, key->pid,
++                 wstring_to_string(*text));
++        return ReturnString(*text, buffer, size, required);
++    }
++
++    // HardwareIds, CompatibleIds, InstanceId
++    if (result && buffer != nullptr &&
++        (IsKey(key, kDeviceProps, 3) || IsKey(key, kDeviceProps, 4) || IsKey(key, kInstanceProps, 256)) &&
++        SpoofIdsInPlace(reinterpret_cast<wchar_t*>(buffer), size / sizeof(wchar_t)))
++        LOG_INFO("SetupAPI: display adapter IDs: {}", wstring_to_string(reinterpret_cast<wchar_t*>(buffer)));
++
++    return result;
++}
++
+ void User32Spoofing::Hook()
+ {
+     LOG_FUNC();
+@@ -120,6 +312,15 @@ void User32Spoofing::Hook()
+     o_EnumDisplayDevicesW =
+         reinterpret_cast<PFN_EnumDisplayDevicesW>(DetourFindFunction("User32.dll", "EnumDisplayDevicesW"));
+ 
++    // loaded here so the hooks are in place before the game's first SetupAPI call
++    LoadLibraryW(L"setupapi.dll");
++    o_SetupDiGetDeviceRegistryPropertyW = reinterpret_cast<PFN_SetupDiGetDeviceRegistryPropertyW>(
++        DetourFindFunction("setupapi.dll", "SetupDiGetDeviceRegistryPropertyW"));
++    o_SetupDiGetDeviceInstanceIdW = reinterpret_cast<PFN_SetupDiGetDeviceInstanceIdW>(
++        DetourFindFunction("setupapi.dll", "SetupDiGetDeviceInstanceIdW"));
++    o_SetupDiGetDevicePropertyW = reinterpret_cast<PFN_SetupDiGetDevicePropertyW>(
++        DetourFindFunction("setupapi.dll", "SetupDiGetDevicePropertyW"));
++
+     DetourTransactionBegin();
+     DetourUpdateThread(GetCurrentThread());
+ 
+@@ -129,12 +330,24 @@ void User32Spoofing::Hook()
+     if (o_EnumDisplayDevicesW)
+         DetourAttach(&(PVOID&) o_EnumDisplayDevicesW, hkEnumDisplayDevicesW);
+ 
++    if (o_SetupDiGetDeviceRegistryPropertyW)
++        DetourAttach(&(PVOID&) o_SetupDiGetDeviceRegistryPropertyW, hkSetupDiGetDeviceRegistryPropertyW);
++
++    if (o_SetupDiGetDeviceInstanceIdW)
++        DetourAttach(&(PVOID&) o_SetupDiGetDeviceInstanceIdW, hkSetupDiGetDeviceInstanceIdW);
++
++    if (o_SetupDiGetDevicePropertyW)
++        DetourAttach(&(PVOID&) o_SetupDiGetDevicePropertyW, hkSetupDiGetDevicePropertyW);
++
+     auto detourResult = DetourTransactionCommit();
+     if (detourResult != NO_ERROR)
+     {
+         LOG_ERROR("Failed to install User32 spoofing hooks: {}", detourResult);
+         o_EnumDisplayDevicesA = nullptr;
+         o_EnumDisplayDevicesW = nullptr;
++        o_SetupDiGetDeviceRegistryPropertyW = nullptr;
++        o_SetupDiGetDeviceInstanceIdW = nullptr;
++        o_SetupDiGetDevicePropertyW = nullptr;
+     }
+ }
+ 
+@@ -149,6 +362,15 @@ void User32Spoofing::Unhook()
+     if (o_EnumDisplayDevicesW)
+         DetourDetach(&(PVOID&) o_EnumDisplayDevicesW, hkEnumDisplayDevicesW);
+ 
++    if (o_SetupDiGetDeviceRegistryPropertyW)
++        DetourDetach(&(PVOID&) o_SetupDiGetDeviceRegistryPropertyW, hkSetupDiGetDeviceRegistryPropertyW);
++
++    if (o_SetupDiGetDeviceInstanceIdW)
++        DetourDetach(&(PVOID&) o_SetupDiGetDeviceInstanceIdW, hkSetupDiGetDeviceInstanceIdW);
++
++    if (o_SetupDiGetDevicePropertyW)
++        DetourDetach(&(PVOID&) o_SetupDiGetDevicePropertyW, hkSetupDiGetDevicePropertyW);
++
+     auto detourResult = DetourTransactionCommit();
+     if (detourResult != NO_ERROR)
+     {

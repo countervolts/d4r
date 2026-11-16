@@ -120,7 +120,11 @@ int2 d4rTextureSize(Texture2D<float4> image, int level) { uint w, h, levels; ima
     return source, sorted(bindings, key=lambda b: b['binding'])
 
 
-def build(shader, output, defines=(), wave=32, dxc=None, glslang=None):
+def build(shader, output, defines=(), wave=32, dxc=None, glslang=None, native_half=True, rounding=None):
+    """native_half: binary16 conversions on the driver's own instruction (dialect_hlsl.h D4R_NATIVE_HALF), which
+    rounds toward zero on AMD's D3D12 driver (RX 7700 XT, 26.10.1: every one of 2^20 f32 inputs); False rounds to
+    nearest even as NVIDIA's conversions do (dialect_hlsl.h D4R_RNE16_EXACT). rounding: the DXC defines that select
+    the conversion instead (m_d3d12_build.py)."""
     shader, output = Path(shader).resolve(), Path(output)
     if shader.name not in STAGES:
         raise ValueError('not an M/L frame stage: ' + shader.name)
@@ -131,8 +135,12 @@ def build(shader, output, defines=(), wave=32, dxc=None, glslang=None):
     source, schema = convert(result.stdout)
     with tempfile.TemporaryDirectory(prefix='d4r-ml-stage.') as temp:
         path = Path(temp) / shader.name
+        if rounding is not None and '-DD4R_RNE16_AGS_GFX11=1' in rounding:
+            # glslang has already expanded ags_wmma.hlsli (its D4R_AMD_INTRINSIC_UAV guard unset there): the intrinsic
+            # UAV comes from dialect_hlsl.h's d3d12/rne16_ags.hlsli instead
+            source = source.replace('RWByteAddressBuffer d4rAmdIntrinsic : register(u0, space2147420894);', '')
         path.write_text(source)
-        hlsl_build.build(path, output, ['-DD4R_NATIVE_HALF=1'], wave=wave, dxc=dxc)
+        hlsl_build.build(path, output, list(rounding) if rounding is not None else ['-DD4R_NATIVE_HALF=1'] if native_half else ['-DD4R_RNE16_EXACT=1'], wave=wave, dxc=dxc)
     output.with_suffix('.bindings.json').write_text(json.dumps(schema, indent=2))
     return schema
 

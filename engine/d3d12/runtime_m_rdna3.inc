@@ -8,7 +8,9 @@ constexpr auto MWrite = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 struct MResource {
     ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = MRead;
+    bool external = false;   // an external network's shared buffer: COMMON, accessed through implicit promotion only
     void to(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES next) {
+        if (external) return;
         if (state != next) { auto b = transition(resource.Get(), state, next); list->ResourceBarrier(1, &b); state = next; }
     }
 };
@@ -28,6 +30,9 @@ std::vector<Binding> mExpandBindings(bool l) {
     if (l) return {rw(sizeof(MLayerParams)), MT, MT, MT, MT, MU, N, rw(sizeof(MDec0Params)), MI, MI, MI, MI};
     return {rw(sizeof(MDec0Params)), T, TL, MI, MI, MI, MI, MT, MT, MT};
 }
+// D4RML007's expansion (dec0_m.comp's D4R_HLSL declarations, hlsl_build.py): the parameters, tokens, matrix and bias
+// as raw buffers (t0, t7, t8, t9)
+std::vector<Binding> mExpandF16Bindings() { return {MR, T, TL, MI, MI, MI, MI, MR, MR, MR}; }
 std::vector<Binding> mPostBindings() { return {rw(sizeof(MPostParams)), T, T, T, T, TL, T, T, TL, MI, MI, MU, T}; }
 std::vector<Binding> mDownBindings() { return {rw(sizeof(MDownParams)), T, MI, MT}; }
 void mExecute(ID3D12Device* device, const std::function<void(ID3D12GraphicsCommandList*)>& record) {
@@ -66,11 +71,12 @@ struct MModel::Impl {
     std::array<uint32_t, 74> lEnc0{}, lDec0{};
     uint32_t enc0[3]{}, dec0[2]{}, dither = 0;
     float constants[5]{};
-    bool l = false, ldr = false, cbv = false, split = false, inputWmma = false, vectorIo = false;
+    bool l = false, ldr = false, cbv = false, split = false, inputWmma = false, vectorIo = false, f16Expand = false, exact = false;
     std::array<Pipeline, MLayers> network;
     std::array<Pipeline, 2> merge, exposure, patch;
     Pipeline lPatch;
-    Pipeline input, inputLBlock, expand, headL, post, postQuality, postCompact, down, downRgb10, mergeL;
+    Pipeline input, inputLBlock, expand, headL, post, postQuality, postCompact, down, downRgb10, downRgba8, mergeL;
+    Pipeline planes;   // d3dhip: tokens / dec1 to and from the HIP network's plane layout (optional, m_planes.dxil)
 };
 std::string MModel::missingShaders(const std::string& directory, bool l) {
     std::string missing;
@@ -89,7 +95,11 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
         head.size() != (m.l ? 40 + (MLayers + 2) * 296 : 36 + MLayers * 296))
         throw std::runtime_error("native M/L requires a current D4RM0007 or D4RL0002 model");
     const auto marker = readFile(directory + "/rdna3/d3d12_ml.bin");
-    m.vectorIo = marker.size() == 8 && !std::memcmp(marker.data(), "D4RML006", 8);
+    // D4RML007: D4RML006 as the exact RDNA 3 package (m_d3d12_build.py): binary16 conversions to nearest even on AGS,
+    // so every pipeline binds the AGS intrinsic UAV, and M's expansion on f16 WMMA with binary16 weights
+    m.exact = marker.size() == 8 && !std::memcmp(marker.data(), "D4RML007", 8);
+    m.f16Expand = m.exact && !m.l;
+    m.vectorIo = m.exact || (marker.size() == 8 && !std::memcmp(marker.data(), "D4RML006", 8));
     m.inputWmma = (m.vectorIo && !m.l) || (marker.size() == 8 && !std::memcmp(marker.data(), "D4RML005", 8));
     m.split = m.vectorIo || m.inputWmma || (marker.size() == 8 && !std::memcmp(marker.data(), "D4RML004", 8));
     if (m.inputWmma && m.l) throw std::runtime_error("M WMMA input marker is invalid for L");
@@ -110,7 +120,7 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
     auto inside = [&](const auto& block) { if (block[0] >= n8 || block[1] >= n16 || block[0] % 64 || block[1] % 64) throw std::runtime_error("invalid M/L weight block"); };
     for (const auto& block : m.layers) inside(block);
     if (m.l) { inside(m.lEnc0); inside(m.lDec0); }
-    auto dot = widenM(b8, m.layers, m.enc0, m.dec0, true, true, m.l ? &m.lEnc0 : nullptr, m.l ? &m.lDec0 : nullptr);
+    auto dot = widenM(b8, m.layers, m.enc0, m.dec0, true, !m.f16Expand, m.l ? &m.lEnc0 : nullptr, m.l ? &m.lDec0 : nullptr);
     std::vector<uint16_t> widened(b8.size());
     for (size_t i = 0; i < b8.size(); ++i) {
         const unsigned c = uint8_t(b8[i]), mag = c & 127, sign = (c & 128) << 8;
@@ -118,6 +128,13 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
         if (mag >= 8) bits = (mag << 7) + (8u << 10);
         else if (mag) { unsigned e = 1; while (!((mag << e) & 8)) ++e; bits = (((mag << e) & 7) << 7) | ((9 - e) << 10); }
         widened[i] = uint16_t(sign | bits);
+    }
+    // D4RML007: the expansion matrix W[64][80] (plain, row-major FP8) column-major as exact binary16 values, [80][64],
+    // where widenM put its binary16 pairs: dec0_m.comp's f16 WMMA product loads a column's 16 k values in two loads
+    if (m.f16Expand) {
+        if (size_t(m.dec0[0]) + 64 * 80 > b8.size()) throw std::runtime_error("M expansion matrix out of range");
+        for (unsigned n = 0; n < 80; ++n) for (unsigned k = 0; k < 64; ++k)
+            std::memcpy(dot.data() + size_t(m.dec0[0]) * 2 + (size_t(n) * 64 + k) * 2, &widened[size_t(m.dec0[0]) + k * 80 + n], 2);
     }
     mExecute(device, [&](ID3D12GraphicsCommandList* list) {
         auto upload = [&](MResource& target, const void* data, size_t bytes) {
@@ -140,7 +157,7 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
     }
     for (unsigned i = 0; i < 2; ++i) {
         m.merge[i].create(device, shader("m_merge" + std::to_string(i + 1)), mLayerBindings(true, m.cbv), true, m.cbv);
-        m.exposure[i].create(device, shader("exposure_m" + std::to_string(i)), i == 0 ? std::vector<Binding>{rw(sizeof(ExposureParams)), T, rw(4)} : std::vector<Binding>{rw(sizeof(ExposureParams)), rw(4), rw(8), rw(4), rw(4), rw(4)}, false);
+        m.exposure[i].create(device, shader("exposure_m" + std::to_string(i)), i == 0 ? std::vector<Binding>{rw(sizeof(ExposureParams)), T, rw(4)} : std::vector<Binding>{rw(sizeof(ExposureParams)), rw(4), rw(8), rw(4), rw(4), rw(4)}, m.exact);
     }
     if (m.split) {
         m.patch[0].create(device, shader("m_patch_dec2"), mLayerBindings(false, true), true, true, "m_patch_dec2");
@@ -148,20 +165,25 @@ MModel::MModel(ID3D12Device* device, const std::string& directory) : impl(std::m
         if (m.l) m.lPatch.create(device, shader("l_patch_dec0"), mLayerBindings(false, true), true, true, "l_patch_dec0");
     }
     const std::string suffix = m.l ? "_l" : "_m";
-    m.input.create(device, shader("enc0" + suffix), mInputBindings(m.l, m.inputWmma), m.inputWmma, false, ("enc0" + suffix).c_str());
-    m.expand.create(device, shader("dec0" + suffix), m.l ? mLayerBindings(false, m.cbv) : mExpandBindings(false), m.l, m.l && m.cbv, ("dec0" + suffix).c_str());
+    m.input.create(device, shader("enc0" + suffix), mInputBindings(m.l, m.inputWmma), m.inputWmma || m.exact, false, ("enc0" + suffix).c_str());
+    m.expand.create(device, shader("dec0" + suffix), m.l ? mLayerBindings(false, m.cbv) : m.f16Expand ? mExpandF16Bindings() : mExpandBindings(false), m.l || m.exact, m.l && m.cbv, ("dec0" + suffix).c_str());
     if (m.l) {
         m.inputLBlock.create(device, shader("enc0_l_network"), mLayerBindings(false, m.cbv), true, m.cbv, "enc0_l_network");
-        m.headL.create(device, shader("dec0_l_head"), {rw(sizeof(MDec0Params)), MT, MI, MI, MI, MI}, false, false, "dec0_l_head");
+        m.headL.create(device, shader("dec0_l_head"), {rw(sizeof(MDec0Params)), MT, MI, MI, MI, MI}, m.exact, false, "dec0_l_head");
     }
-    m.post.create(device, shader("post" + suffix), mPostBindings(), false, false, ("post" + suffix).c_str());
-    m.postQuality.create(device, shader("post" + suffix + "_q"), mPostBindings(), false);
-    m.postCompact.create(device, shader("post" + suffix + "_c"), mPostBindings(), false);
-    m.down.create(device, shader("down_m"), mDownBindings(), false);
-    m.downRgb10.create(device, shader("down_m_rgb10"), mDownBindings(), false);
+    m.post.create(device, shader("post" + suffix), mPostBindings(), m.exact, false, ("post" + suffix).c_str());
+    m.postQuality.create(device, shader("post" + suffix + "_q"), mPostBindings(), m.exact);
+    m.postCompact.create(device, shader("post" + suffix + "_c"), mPostBindings(), m.exact);
+    m.down.create(device, shader("down_m"), mDownBindings(), m.exact);
+    m.downRgb10.create(device, shader("down_m_rgb10"), mDownBindings(), m.exact);
+    // the exact package's RGBA8 / BGRA8 output (the view's format orders BGRA8's channels)
+    if (m.exact) m.downRgba8.create(device, shader("down_m_rgba8"), mDownBindings(), true);
     if (m.l) m.mergeL.create(device, shader("merge_l"), mLayerBindings(true, m.cbv), true, m.cbv);
+    if (fileExists(directory + "/rdna3/m_planes.dxil"))
+        m.planes.create(device, shader("m_planes"), {rw(16), MR, {Bind::RwRaw}}, false, false, "m_planes");
 }
 MModel::~MModel() = default;
+bool MModel::hasExternalStages() const { return bool(impl->planes); }
 bool MModel::isPresetL() const { return impl->l; }
 bool MModel::isLdr() const { return impl->ldr; }
 
@@ -179,6 +201,13 @@ struct GameUpscalerM::Impl {
     std::array<MResource, 2> mvA, feature, history, half;
     MResource mvB, mvC, gates, mix, covariance;
     std::vector<MResource*> owned;
+    // d3dhip (an external network): its shared token / head buffers, the conversions' parameters and sets, and the
+    // front's frame for the back
+    bool external = false;
+    MResource extTokens, extHead, planesToP, planesFromP;
+    MSet toPlanes, fromPlanes;
+    MGameFrame frontGame{};
+    bool frontRecorded = false;
     Heap heap;
     UINT nextSlot = 0;
     std::array<MSet, MLayers> layerSets;
@@ -206,6 +235,7 @@ struct GameUpscalerM::Impl {
     void image(MResource& target, UINT w, UINT h, DXGI_FORMAT format) {
         target.resource = texture(device, w, h, format); owned.push_back(&target);
     }
+    static void recordPart(Impl& e, ID3D12GraphicsCommandList* list, const MGameFrame& game, const FrameProfiler& profiler, int part);
     void view(UINT slot, const Binding& binding, const MView& view) {
         auto* resource = view.resource ? view.resource->resource.Get() : nullptr;
         if (!resource) throw std::logic_error("M/L null descriptor resource");
@@ -335,6 +365,26 @@ GameUpscalerM::GameUpscalerM(MModel& model, uint32_t ow, uint32_t oh, uint32_t r
         e.agsDummy.state = MRead; e.agsDummy.to(list, MWrite);
     });
 }
+GameUpscalerM::GameUpscalerM(MModel& model, uint32_t ow, uint32_t oh, uint32_t rw, uint32_t rh, const ExternalNetworkDx* network)
+    : GameUpscalerM(model, ow, oh, rw, rh) {
+    auto& e = *impl; auto& m = e.model;
+    if (!network || !network->tokens || !network->head) throw std::runtime_error("an external network needs its tokens and head buffers");
+    if (!m.planes) throw std::runtime_error("the RDNA 3 package has no plane-layout conversion (m_planes.dxil): rebuild the model");
+    const UINT gw = (rw + 31) / 32 * 32, gh = (rh + 31) / 32 * 32, tokens = gw / 2 * (gh / 2);
+    const UINT64 bytes = UINT64(tokens) * 64;
+    if (network->tokens->GetDesc().Width < bytes || network->head->GetDesc().Width < bytes)
+        throw std::runtime_error("the external network's buffers are smaller than the token grid");
+    e.external = true;
+    e.extTokens.resource = network->tokens; e.extTokens.external = true;
+    e.extHead.resource = network->head; e.extHead.external = true;
+    e.allocate(e.planesToP, 16); e.allocate(e.planesFromP, 16);
+    e.toPlanes = e.set(m.planes, {{&e.planesToP}, {&e.tokens, 0, bytes}, {&e.extTokens, 0, bytes}});
+    e.fromPlanes = e.set(m.planes, {{&e.planesFromP}, {&e.extHead, 0, bytes}, {&e.dec1, 0, bytes}});
+    const uint32_t to[4]{tokens, 1, 0, 0}, from[4]{tokens, 0, 0, 0};
+    mExecute(e.device, [&](ID3D12GraphicsCommandList* list) {
+        mWrite(list, e.planesToP, to, 16); mWrite(list, e.planesFromP, from, 16);
+    });
+}
 GameUpscalerM::~GameUpscalerM() = default;
 
 GameUpscalerM::Impl::Cached& GameUpscalerM::Impl::bindings(const MGameFrame& frame) {
@@ -369,10 +419,28 @@ GameUpscalerM::Impl::Cached& GameUpscalerM::Impl::bindings(const MGameFrame& fra
 }
 
 void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& game, const FrameProfiler& profiler) {
-    auto& e = *impl; auto& m = e.model;
-    if (e.pending) throw std::runtime_error("M/L recording still awaits submitted/discarded");
+    if (impl->external) throw std::runtime_error("this engine's network is external: record the front and the back");
+    Impl::recordPart(*impl, list, game, profiler, 0);
+}
+void GameUpscalerM::recordFront(ID3D12GraphicsCommandList* list, const MGameFrame& game, const FrameProfiler& profiler) {
+    auto& e = *impl;
+    if (!e.external) throw std::runtime_error("recordFront needs an engine with an external network");
+    Impl::recordPart(e, list, game, profiler, 1);
+    e.frontGame = game; e.frontRecorded = true;
+}
+void GameUpscalerM::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& profiler) {
+    auto& e = *impl;
+    if (!e.external || !e.frontRecorded) throw std::runtime_error("recordBack needs a recorded front");
+    e.frontRecorded = false;
+    Impl::recordPart(e, list, e.frontGame, profiler, 2);
+}
+void GameUpscalerM::Impl::recordPart(Impl& e, ID3D12GraphicsCommandList* list, const MGameFrame& game, const FrameProfiler& profiler, int part) {
+    auto& m = e.model;
+    const bool front = part != 2, back = part != 1;
+    if (front && e.pending) throw std::runtime_error("M/L recording still awaits submitted/discarded");
     const auto& s = game.settings;
     const UINT rw = s.renderWidth ? s.renderWidth : e.maxRw, rh = s.renderHeight ? s.renderHeight : e.maxRh;
+    if (e.external && (rw != e.maxRw || rh != e.maxRh)) throw std::runtime_error("an external network's engine has one render size");
     if (rw < 64 || rh < 64 || rw > e.maxRw || rh > e.maxRh || !std::isfinite(s.jitter[0]) || !std::isfinite(s.jitter[1]) ||
         std::abs(s.jitter[0]) > 0.5f || std::abs(s.jitter[1]) > 0.5f)
         throw std::runtime_error("M/L render dimensions or jitter exceed supported bounds");
@@ -392,15 +460,21 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
         else {
             if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) throw std::runtime_error("M/L output does not allow UAV stores");
             const DXGI_FORMAT format = t.format == DXGI_FORMAT_UNKNOWN ? readFormat(desc.Format) : t.format;
-            if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT && format != DXGI_FORMAT_R10G10B10A2_UNORM &&
+            bool eight = false;
+            if (m.exact && (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+                eight = SUCCEEDED(e.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+                        (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            }
+            if (!eight && format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT && format != DXGI_FORMAT_R10G10B10A2_UNORM &&
                 format != DXGI_FORMAT_R11G11B10_FLOAT)
                 throw std::runtime_error("M/L output format is unsupported");
         }
     }
     if (game.output.resource == game.color.resource || game.output.resource == game.depth.resource || game.output.resource == game.motion.resource)
         throw std::runtime_error("M/L input/output texture aliasing is unsupported");
-    auto& b = e.bindings(game); e.retire();
-    for (unsigned i = 0; i < 4; ++i) b.images[i].state = source[i].state;
+    auto& b = e.bindings(game);
+    if (front) { e.retire(); for (unsigned i = 0; i < 4; ++i) b.images[i].state = source[i].state; }
     const UINT gw = (rw + 31) / 32 * 32, gh = (rh + 31) / 32 * 32;
     const bool reset = s.reset || e.frame == 0 || rw != e.rw || rh != e.rh;
     const float fx = float(e.hw) / rw, fy = float(e.hh) / rh;
@@ -425,7 +499,7 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
     // Opt-in first-submission diagnostics. Captures retire on the submission
     // fence; discarded command lists never publish their readback contents.
     std::string capturePath;
-    if (e.uses == 0 && !e.captureDirectory.empty()) {
+    if (front && e.uses == 0 && !e.captureDirectory.empty()) {
         capturePath = e.captureDirectory + "/frame-0";
         const auto base = capturePath;
         for (unsigned suffix = 1; std::filesystem::exists(capturePath); ++suffix)
@@ -440,8 +514,9 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
         if (e.recordingCapture)
             e.recordingCapture->add(e.device, list, resource.resource.Get(), resource.state, capturePath + "/" + name);
     };
-    stamp(0);
     ID3D12DescriptorHeap* heaps[] = {e.heap.gpu.Get()}; list->SetDescriptorHeaps(1, heaps);
+    if (front) {
+    stamp(0);
     mWrite(list, e.inputP, &input, sizeof(input)); mWrite(list, e.expandP, &expand, sizeof(expand));
     mWrite(list, e.postP, &post, sizeof(post)); mWrite(list, e.downP, &down, sizeof(down)); mWrite(list, e.exposureP, &exposure, sizeof(exposure));
     for (unsigned i = 0; i < MLayers; ++i) {
@@ -463,7 +538,12 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
         e.dispatch(list, e.mergeL, (gw / 2 + 3) / 4, (gh / 2 + 3) / 4);
     }
     stamp(3);
-    for (unsigned i = 0; i < MLayers; ++i) {
+    // an external network: the tokens into its plane-layout buffer, then the front ends
+    if (e.external) e.dispatch(list, e.toPlanes, ((gw / 2) * (gh / 2) * 16 + 63) / 64, 1);
+    }
+    if (!back) return;
+    if (e.external) e.dispatch(list, e.fromPlanes, ((gw / 2) * (gh / 2) * 16 + 63) / 64, 1);
+    else for (unsigned i = 0; i < MLayers; ++i) {
         const UINT w = gw / 2 / MScale[i], h = gh / 2 / MScale[i], sx = MShift[i] ^ ((e.frame & 1) * 2);
         if (m.split && i >= 8) e.dispatch(list, e.patchSets[i - 8], (w / 2 + 5) / 4, (h / 2 + 5) / 4);
         e.dispatch(list, e.layerSets[i], (w + sx + 3) / 4, (h + MShift[i] + 3) / 4);
@@ -475,6 +555,8 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
         e.dispatch(list, e.expandLBlock, (rw + (e.frame & 1) * 2 + 3) / 4, (rh + 3) / 4);
         e.dispatch(list, b.expand[e.current], (rw + 7) / 8, (rh + 7) / 8);
     }
+    // the DOT2 expansion runs 2x2 blocks of 4x4 tokens a workgroup, D4RML007's f16 WMMA one block (dec0_m.comp)
+    else if (m.f16Expand) e.dispatch(list, b.expand[e.current], (gw + 7) / 8, (gh + 7) / 8);
     else e.dispatch(list, b.expand[e.current], (gw / 8 + 1) / 2, (gh / 8 + 1) / 2);
     stamp(5);
     capture(e.covariance, "covariance.bin");
@@ -485,7 +567,8 @@ void GameUpscalerM::record(ID3D12GraphicsCommandList* list, const MGameFrame& ga
     e.dispatch(list, b.post[e.current], (e.hw + 15) / 16, (e.hh + 15) / 16, compact ? &m.postCompact : quality ? &m.postQuality : &m.post);
     stamp(6);
     capture(e.packed, "packed.bin");
-    e.dispatch(list, b.down, (e.ow + 7) / 8, (e.oh + 63) / 64, b.formats[3] == DXGI_FORMAT_R10G10B10A2_UNORM ? &m.downRgb10 : &m.down);
+    e.dispatch(list, b.down, (e.ow + 7) / 8, (e.oh + 63) / 64, b.formats[3] == DXGI_FORMAT_R10G10B10A2_UNORM ? &m.downRgb10 :
+               b.formats[3] == DXGI_FORMAT_R8G8B8A8_UNORM || b.formats[3] == DXGI_FORMAT_B8G8R8A8_UNORM ? &m.downRgba8 : &m.down);
     capture(b.images[3], "output.bin");
     for (auto* r : e.owned) if (r != &e.agsDummy) r->to(list, MRead);
     for (unsigned i = 0; i < 4; ++i) b.images[i].to(list, source[i].state);

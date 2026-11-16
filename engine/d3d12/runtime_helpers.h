@@ -100,6 +100,34 @@ DXGI_FORMAT viewFormat(const FrameTexture &t)
 {
     return t.format != DXGI_FORMAT_UNKNOWN ? t.format : readFormat(t.resource->GetDesc().Format);
 }
+// A Ray Reconstruction output the output stage can write: RGBA16F (NGX's own), or another colour format Super Resolution
+// writes too, when the device stores it through a typed UAV (the stage's float4 store converts). Resident Evil Requiem
+// hands RR an R9G9B9E5 output (AMD's driver stores it typed on RDNA3 and RDNA4); it was refused before.
+bool rrOutputFormat(const FrameTexture &t)
+{
+    const DXGI_FORMAT f = viewFormat(t);
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return true;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        break;
+    default:
+        return false;
+    }
+    ComPtr<ID3D12Device> device;
+    if (FAILED(t.resource->GetDevice(IID_PPV_ARGS(&device))))
+        return false;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{f};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+           (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+           (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+}
 
 // ---------------------------------------------------------------- pipelines
 // A stage's binding N is register tN or uN, slot N of its one descriptor table; a texture's sampler is sN.

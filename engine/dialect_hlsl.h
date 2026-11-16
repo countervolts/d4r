@@ -35,7 +35,9 @@
 // D4R_RNE16_EXTERNAL: the including model provides d4rRne16 for float and float2 (rr_wmma.hlsli: the AGS matrix
 // conversion, which rounds to nearest even in one instruction per pair; D3D12 casts and f32tof16 truncate on AMD).
 // Not for vkd3d-proton, whose casts already round to nearest even (below).
-#if D4R_RNE16_EXTERNAL && !D4R_VKD3D
+#if D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_GFX11 && !D4R_VKD3D
+#include "d3d12/rne16_ags.hlsli"
+#elif D4R_RNE16_EXTERNAL && !D4R_VKD3D
 float d4rRne16(float v);
 float2 d4rRne16(float2 v);
 #else
@@ -48,6 +50,17 @@ float d4rRne16(float v)
     return r;
 #elif D4R_NATIVE_HALF
     return f16tof32(f32tof16(v));
+#elif D4R_RNE16_EXACT
+    // RDNA 3 builds (m_d3d12_build.py, compile_rr_dxil.py gfx11): every f32 rounded as NVIDIA's cvt.rn.f16.f32 does.
+    // The form below loses binary16 subnormals on AMD's D3D12 compiler, which folds the precise (v + 0.75) - 0.75 to
+    // v (RX 7700 XT, 26.10.1: half of the inputs under 2^-14 truncated); here they round on round(), DXIL's round_ne,
+    // at their spacing 2^-24 (v * 2^24 is exact), and a result past 65504 becomes the infinity of its sign. Equal to
+    // round-to-nearest-even for all of 2^20 f32 inputs over binary16's range on that GPU.
+    const uint bits = asuint(v);
+    const float subnormal = round(v * 16777216.0) * 5.9604644775390625e-08;
+    const float normal = asfloat((bits + 4095u + ((bits >> 13u) & 1u)) & 0xffffe000u);
+    const float r = abs(v) < 6.103515625e-05 ? subnormal : normal;
+    return abs(r) > 65504.0 && !isnan(r) ? asfloat((bits & 0x80000000u) | 0x7f800000u) : r;
 #else
     const uint bits = asuint(v);
     precise float subnormal = (v + 0.75) - 0.75;

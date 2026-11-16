@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$(realpath -m "${1:-$ROOT/dist/optiscaler-v10}")"
-NAME=d4r-optiscaler-v10-20261024-upgrade
+NAME=d4r-optiscaler-v10-20261029-upgrade
 mkdir -p "$OUT"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

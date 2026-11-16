@@ -14,7 +14,9 @@
 //    into it afterwards goes into a further list this file owns (the vtable redirection of tools/d4r_d3d12_split.h,
 //    generalised to any number of cuts), and ExecuteCommandLists runs the parts in order with a D3D12 fence (shared,
 //    imported as a Vulkan timeline semaphore) between each D3D12 part and the kernels after it. Launches with nothing
-//    recorded in between share one command buffer. The descriptor heaps, root signatures, pipeline state and root
+//    recorded in between share one command buffer; shader-only barriers, UAV clears (run as Vulkan dispatches,
+//    clear_uav.comp), timestamps and markers in between do not end it (each hand-off idles the GPU ~0.15 ms on RDNA3,
+//    docs/hillclimb/journal.md "FG"). The descriptor heaps, root signatures, pipeline state and root
 //    arguments set during DLSS-G's evaluate are replayed into every new part (a cubin launch keeps D3D12 state).
 //
 // Kernels, T1 launch groups and big parameter blocks follow nvxrt.cpp (nvxrt/), which documents them.
@@ -27,6 +29,8 @@
 
 #include "cubin_d3d12.h"
 #include "../nvxrt/util.h"
+#include "clear_uav_spv.h"
+#include "copy_res_spv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -119,7 +123,8 @@ struct Vk {
     X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdBindPipeline) X(CmdPushConstants) X(CmdDispatch)
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
-    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)
+    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults) X(GetCalibratedTimestampsEXT)
 #undef X
 } vk;
 
@@ -277,6 +282,7 @@ struct Shader {
 
 static const uint32_t kMaxImages = 1u << 16, kMaxSamplers = 4096, kSlotBase = 32768;
 static const uint32_t kPushBytes = 256;
+static const uint32_t kTsQueries = 16384;   // [Host] KernelTiming
 static const uint32_t kInfoBytes = kMaxSamplers * 16 + kMaxImages * 4 * 2;
 static const uint32_t kBpSlot = 4096, kBpSlots = 1024;
 static const uint32_t kGrpMaxMembers = 48;
@@ -304,6 +310,7 @@ struct ViewRec {
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
 };
+std::unordered_map<uint32_t, ViewRec> g_slotViews;   // texture slot / 65536 + surface slot -> its view (DxilCompare)
 
 // one D3D12 queue's hand-off fence (shared, imported into Vulkan as a timeline semaphore)
 struct QueueSync {
@@ -321,6 +328,10 @@ struct Batch {
     uint32_t launches = 0;
     QueueSync* qs = nullptr;   // set once submitted
     uint64_t done = 0;         // qs->fence value after which the command buffer may be reused
+    std::vector<uint32_t> ts;  // [Host] KernelTiming: timestamp queries, the first after the batch's entry barrier
+    std::vector<const std::string*> tsLabel;   // what ran before each further timestamp
+    int d3dTs = -1;            // [Host] KernelTiming: D3D12 timestamps (pair) around the hand-off on the game's queue
+    ID3D12CommandQueue* d3dQ = nullptr;
 };
 
 struct Part {
@@ -356,6 +367,21 @@ struct Exec {
     VkDeviceAddress infoAddr = 0, flagAddr = 0;
 
     ID3D12DescriptorHeap* scratchHeap = nullptr;   // companion SRV/UAV descriptors
+    // DXIL route (spike: CUX_DXIL = folder of compiled kernels, CUX_DXIL_KERNELS = entry names)
+    ID3D12DescriptorHeap* dxViews = nullptr;     // shader visible: textures at slot, surfaces at 65536 + slot
+    ID3D12DescriptorHeap* dxSamplers = nullptr;  // shader visible: samplers at slot
+    uint8_t* dxViewsCpu = nullptr;
+    uint8_t* dxSamplersCpu = nullptr;
+    UINT dxViewInc = 0, dxSmpInc = 0;
+    ID3D12Resource* dxInfo = nullptr;            // upload: the info words
+    uint8_t* dxInfoMap = nullptr;
+    ID3D12Resource* dxCb = nullptr;              // upload: per-launch constant buffers (ring)
+    uint8_t* dxCbMap = nullptr;
+    uint64_t dxCbNext = 0;
+    ID3D12RootSignature* dxRs = nullptr;
+    bool dxTried = false, dxOk = false;
+    uint64_t infoGen = 1, dxInfoGen = 0;
+    uint64_t dxLaunches = 0;
     UINT scratchInc = 0, scratchNext = 0;
 
     std::map<std::string, uint32_t> viewSlots;     // descriptor bytes -> slot
@@ -391,6 +417,30 @@ struct Exec {
     std::map<ID3D12CommandQueue*, QueueSync> syncs;
     VkFence cpuFence = VK_NULL_HANDLE;
     uint64_t batchesSubmitted = 0, partsCreated = 0;
+    VkShaderModule clearShader = VK_NULL_HANDLE;
+    VkPipeline clearPipe = VK_NULL_HANDLE;
+    bool clearFailed = false;
+    VkShaderModule copyShader = VK_NULL_HANDLE;
+    VkPipeline copyPipe = VK_NULL_HANDLE;
+    bool copyFailed = false;
+    uint64_t vkCopies = 0;
+    uint64_t vkClears = 0;
+    // [Host] KernelTiming
+    VkQueryPool tsPool = VK_NULL_HANDLE;
+    uint32_t tsNext = 0;
+    double tsPeriodMs = 0;
+    std::map<std::string, std::pair<double, uint64_t>> ktime;   // label -> (ms, dispatches)
+    double batchMs = 0, gapMs = 0;
+    uint64_t timedBatches = 0;
+    Batch* cur = nullptr;      // the batch launch() records into (launchGroup's timestamps)
+    ID3D12QueryHeap* d3dTsHeap = nullptr;
+    ID3D12Resource* d3dTsRb = nullptr;
+    uint64_t* d3dTsMap = nullptr;
+    uint32_t d3dTsNext = 0;
+    double d3dSpanMs = 0, vkSpanMs = 0, lat1Ms = 0, lat2Ms = 0;
+    uint64_t latN = 0;
+    uint64_t d3dTimed = 0;
+    std::map<ID3D12CommandQueue*, double> d3dTsMsPerTick;
 };
 Exec g;
 std::recursive_mutex g_lock;
@@ -716,6 +766,13 @@ bool initDevice(ID3D12Device* d3d)
                           VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME,
                           VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME})
         if (has(e)) exts.push_back(e);
+    if (g_cfg.kernelTiming && has(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) exts.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    // [Host] QueuePriority: the kernels' queue's global priority (VK_KHR_global_priority; 1 low, 2 medium, 3 high,
+    // 4 realtime). In a game the game's D3D12 queues, d3dhip's HIP device (the upscaler) and this device take turns on
+    // one GPU engine; the priority decides who goes first when several are ready. No effect without contention
+    // (harness: within +-0.01 ms).
+    const bool gprio = g_cfg.queuePriority && has(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+    if (gprio) exts.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
     if (!has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) { logf("no VK_EXT_descriptor_buffer"); return false; }
     bool cm = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME), wg = has(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME),
          fc2 = has(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
@@ -785,17 +842,39 @@ bool initDevice(ID3D12Device* d3d)
         if ((qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) == (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT))
             g.family = i;
     if (g.family == UINT32_MAX) g.family = 0;
+    for (uint32_t i = 0; i < nq; i++)
+        logf("queue family %u: flags 0x%x, %u queues", i, qf[i].queueFlags, qf[i].queueCount);
+    if (g_cfg.computeQueue)
+        for (uint32_t i = 0; i < nq; i++)
+            if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { g.family = i; break; }
+    logf("kernels' queue: family %u", g.family);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo dq{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     dq.queueFamilyIndex = g.family;
     dq.queueCount = 1;
     dq.pQueuePriorities = &prio;
+    VkDeviceQueueGlobalPriorityCreateInfoKHR gp{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
+    static const VkQueueGlobalPriorityKHR kPrio[] = {VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR, VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+                                                     VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR, VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
+                                                     VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR};
+    static const char* kPrioName[] = {"default", "low", "medium", "high", "realtime"};
+    gp.globalPriority = kPrio[std::min(g_cfg.queuePriority, 4u)];
+    if (gprio) dq.pNext = &gp;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &dq;
     dci.enabledExtensionCount = (uint32_t)exts.size();
     dci.ppEnabledExtensionNames = exts.data();
     r = vk.CreateDevice(g.pd, &dci, nullptr, &g.dev);
+    if (r != VK_SUCCESS && gprio) {
+        logf("vkCreateDevice with global priority %u failed (%d): default priority", g_cfg.queuePriority, r);
+        dq.pNext = nullptr;
+        exts.pop_back();
+        dci.enabledExtensionCount = (uint32_t)exts.size();
+        r = vk.CreateDevice(g.pd, &dci, nullptr, &g.dev);
+    } else if (gprio) {
+        logf("kernels' queue: global priority %s", kPrioName[std::min(g_cfg.queuePriority, 4u)]);
+    }
     if (r != VK_SUCCESS) { logf("vkCreateDevice failed (%d)", r); return false; }
 #define X(n) vk.n = (PFN_vk##n)vk.GetDeviceProcAddr(g.dev, "vk" #n);
     X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(CreateBuffer) X(GetBufferMemoryRequirements)
@@ -805,7 +884,8 @@ bool initDevice(ID3D12Device* d3d)
     X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdBindPipeline) X(CmdPushConstants) X(CmdDispatch)
     X(CmdPipelineBarrier) X(CreateSemaphore) X(ImportSemaphoreWin32HandleKHR) X(CreateFence) X(WaitForFences)
     X(ResetFences) X(GetDescriptorSetLayoutSizeEXT) X(GetDescriptorSetLayoutBindingOffsetEXT) X(GetDescriptorEXT)
-    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)
+    X(CmdBindDescriptorBuffersEXT) X(CmdSetDescriptorBufferOffsetsEXT) X(GetSemaphoreCounterValue)                    \
+    X(CreateQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults) X(GetCalibratedTimestampsEXT)
 #undef X
     vk.GetDeviceQueue(g.dev, g.family, 0, &g.queue);
     g.semImport = vk.ImportSemaphoreWin32HandleKHR != nullptr && g_cfg.gpuSync;
@@ -887,6 +967,16 @@ bool initDevice(ID3D12Device* d3d)
     if (vk.CreateCommandPool(g.dev, &cpi, nullptr, &g.pool) != VK_SUCCESS) return false;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     vk.CreateFence(g.dev, &fci, nullptr, &g.cpuFence);
+    if (g_cfg.kernelTiming) {
+        VkPhysicalDeviceProperties dp{};
+        vk.GetPhysicalDeviceProperties(g.pd, &dp);
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = kTsQueries;
+        if (vk.CreateQueryPool && vk.CreateQueryPool(g.dev, &qi, nullptr, &g.tsPool) != VK_SUCCESS) g.tsPool = VK_NULL_HANDLE;
+        g.tsPeriodMs = dp.limits.timestampPeriod * 1e-6;
+        logf("kernel timing %s (timestamp period %.3f ns)", g.tsPool ? "on" : "unavailable", dp.limits.timestampPeriod);
+    }
     initGroups();
     std::vector<uint8_t> arch;
     readFile(g_cache + "/arch", arch);
@@ -974,6 +1064,7 @@ uint32_t viewSlot(D3D12_CPU_DESCRIPTOR_HANDLE h, bool uav)
     uint32_t slot = g.nextSlot++;
     ViewRec v;
     bool known = lookupView(h.ptr, v);
+    if (known) g_slotViews[(uav ? 65536u : 0u) + slot] = v;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     if (known) {
         D3D12_RESOURCE_DESC rd = v.res ? v.res->GetDesc() : D3D12_RESOURCE_DESC{};
@@ -982,12 +1073,15 @@ uint32_t viewSlot(D3D12_CPU_DESCRIPTOR_HANDLE h, bool uav)
     VkFormat vf = vkFormat(fmt);
     uint32_t cls = formatClass(vf) | formatRaw(vf) << 8;
     memcpy(g.dmap + g.boff[uav ? 1 : 0] + (size_t)slot * g.imgSize, (const void*)h.ptr, g.imgSize);
+    if (g.dxViewsCpu) memcpy(g.dxViewsCpu + (size_t)((uav ? 65536u : 0u) + slot) * g.dxViewInc, (const void*)h.ptr, g.dxViewInc);
     g.info[kMaxSamplers * 4 + (uav ? 0 : kMaxImages) + slot] = cls;
+    g.infoGen++;
     std::vector<uint8_t> other;
     DXGI_FORMAT ofmt = DXGI_FORMAT_UNKNOWN;
     bool comp = known && companion(v, other, ofmt);
     if (comp) {
         memcpy(g.dmap + g.boff[uav ? 0 : 1] + (size_t)slot * g.imgSize, other.data(), g.imgSize);
+        if (g.dxViewsCpu) memcpy(g.dxViewsCpu + (size_t)((uav ? 0u : 65536u) + slot) * g.dxViewInc, other.data(), g.imgSize);
         VkFormat of = vkFormat(ofmt);
         g.info[kMaxSamplers * 4 + (uav ? kMaxImages : 0) + slot] = formatClass(of) | formatRaw(of) << 8;
     }
@@ -1008,6 +1102,8 @@ uint32_t samplerSlot(D3D12_CPU_DESCRIPTOR_HANDLE h)
     if (g.nextSampler >= kMaxSamplers) return 0;
     uint32_t slot = g.nextSampler++;
     memcpy(g.dmap + g.boff[2] + (size_t)slot * g.smpSize, (const void*)h.ptr, g.smpSize);
+    if (g.dxSamplersCpu && slot < 2048) memcpy(g.dxSamplersCpu + (size_t)slot * g.dxSmpInc, (const void*)h.ptr, g.dxSmpInc);
+    g.infoGen++;
     D3D12_SAMPLER_DESC sd{};
     bool known;
     {
@@ -1123,6 +1219,338 @@ bool patchSlot(void** vtable, size_t slot, void* hook, void** original)
     return true;
 }
 
+// ---- DXIL route, pointer heap: DLSS-G's buffers in heaps of ours, each spanned by one raw buffer, so a CUDA pointer
+// into any of them is an offset into that buffer (ptr - span VA). DLSS-G creates committed default-heap buffers inside
+// its calls (FgScope); those become placed resources here. Fresh heap memory is zeroed, as committed memory is.
+struct PtrHeap
+{
+    ID3D12Heap* heap = nullptr;
+    ID3D12Resource* span = nullptr;
+    uint64_t va = 0, size = 0, used = 0;
+    uint64_t id = 0;     // stable across erases (PtrHeapRef finds its heap by it)
+    uint32_t live = 0;   // DLSS-G buffers placed in it and not destroyed yet
+};
+std::vector<PtrHeap> g_ptrHeaps;
+std::mutex g_ptrLock;
+uint64_t g_ptrHeapIds = 0;
+bool g_ptrHeapFresh = false;   // the next DLSS-G buffer starts a heap (a new FG feature: newFeature())
+
+// A heap is never reused (fresh heap memory is zeroed, reused memory is not): a heap whose buffers are all destroyed
+// is released, so recreating the FG feature (a settings or resolution change) does not leave the old feature's heap
+// behind. More than one heap turns the DXIL route off (ptrHeapSpanVa: one heap, one view) and every kernel then ran
+// on the Vulkan route for the rest of the session. g_ptrLock held.
+void ptrHeapsDropDead(bool keepLast)
+{
+    for (size_t i = 0; i < g_ptrHeaps.size();) {
+        PtrHeap& c = g_ptrHeaps[i];
+        if (c.live != 0 || (keepLast && g_ptrHeaps.size() == 1)) { ++i; continue; }
+        logf("pointer heap: %llu MB at 0x%llx released (its DLSS-G buffers are gone)", (unsigned long long)(c.size >> 20),
+             (unsigned long long)c.va);
+        if (c.span) c.span->Release();
+        if (c.heap) c.heap->Release();
+        g_ptrHeaps.erase(g_ptrHeaps.begin() + i);
+    }
+}
+
+// attached to each placed buffer as private data: D3D12 releases it when the buffer is destroyed
+struct PtrHeapRef final : IUnknown
+{
+    std::atomic<ULONG> refs{1};
+    uint64_t heapId = 0;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = --refs;
+        if (n == 0) {
+            if (heapId != 0) {   // 0: never attached to a buffer (and the caller may hold g_ptrLock)
+                std::lock_guard<std::mutex> l(g_ptrLock);
+                for (auto& c : g_ptrHeaps)
+                    if (c.id == heapId && c.live) { c.live--; break; }
+                ptrHeapsDropDead(true);
+            }
+            delete this;
+        }
+        return n;
+    }
+};
+// {6C1F7A52-3D0B-4E8A-9B61-0D4F2C9E7A13}
+static const GUID kPtrHeapRefGuid = {0x6c1f7a52, 0x3d0b, 0x4e8a, {0x9b, 0x61, 0x0d, 0x4f, 0x2c, 0x9e, 0x7a, 0x13}};
+bool g_ptrHeapOff = false;
+bool g_ptrHeapOn = false;   // set by configure(): [Host] Route=dxil (or CUX_PTRHEAP=1)
+void* o_committed = nullptr;
+static const uint64_t kPtrHeapBytes = 256ull << 20;
+
+// Buffers on the game's device that are not in a pointer heap (any thread, any creator): the DXIL route must not run
+// a launch that reaches one (rt.hlsl clamps every offset into the heap: such an access reads or writes the wrong
+// memory). In the harness DLSS-G creates every buffer itself, inside its calls, so there are none; in a game there are.
+struct OutsideBuf { uint64_t end; std::string how; };
+thread_local int t_inCommitted = 0;   // inside pCommitted: its own placed buffers and spans are not noted (lock held)
+std::map<uint64_t, OutsideBuf> g_outside;   // start VA -> buffer
+std::mutex g_outsideLock;
+
+bool inAnyPtrHeap(uint64_t va)
+{
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    for (const auto& c : g_ptrHeaps)
+        if (va >= c.va && va < c.va + c.size) return true;
+    return false;
+}
+
+std::string moduleOf(void* address)
+{
+    HMODULE m = nullptr;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)address, &m))
+        GetModuleFileNameA(m, path, sizeof path);
+    const char* b = strrchr(path, '\\');
+    return b ? b + 1 : path;
+}
+
+void noteBuffer(HRESULT hr, REFIID riid, void** ppv, const D3D12_RESOURCE_DESC* d, const char* how, int heapType,
+                unsigned heapFlags, void* caller)
+{
+    // only with the DXIL route (its pointer heap), the only user of the registry
+    if (!g_ptrHeapOn || FAILED(hr) || !ppv || !*ppv || !d || d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(((IUnknown*)*ppv)->QueryInterface(__uuidof(ID3D12Resource), (void**)&r)) || !r) return;
+    uint64_t va = r->GetGPUVirtualAddress();
+    r->Release();
+    if (!va || inAnyPtrHeap(va)) return;
+    // Bounded: a game creates buffers all session (streaming) and destroyed ones are not removed (a stale entry only
+    // keeps a launch reaching that address on Vulkan; addresses inside the pointer heap are checked first). The full
+    // description (module, thread) only for the first buffers, which are logged.
+    static const size_t kMaxOutside = 65536;
+    static int logged = 0;
+    std::lock_guard<std::mutex> l(g_outsideLock);
+    if (g_outside.size() >= kMaxOutside && !g_outside.count(va)) {
+        static bool full = false;
+        if (!full) logf("outside the pointer heap: %zu buffers recorded, no more", kMaxOutside);
+        full = true;
+        return;
+    }
+    char b[320];
+    if (logged < 48)
+        snprintf(b, sizeof b, "%s buffer of %llu bytes, heap type %d flags 0x%x, by %s on thread %lu%s", how,
+                 (unsigned long long)d->Width, heapType, heapFlags, moduleOf(caller).c_str(), GetCurrentThreadId(),
+                 t_fg ? " inside DLSS-G's call" : " outside DLSS-G's calls");
+    else
+        snprintf(b, sizeof b, "%s buffer of %llu bytes", how, (unsigned long long)d->Width);
+    g_outside[va] = OutsideBuf{va + d->Width, b};
+    if (logged++ < 48) logf("outside the pointer heap: 0x%llx: %s", (unsigned long long)va, b);
+}
+
+// the outside buffer holding va, or nullptr
+const OutsideBuf* outsideBuf(uint64_t va, uint64_t* start = nullptr)
+{
+    std::lock_guard<std::mutex> l(g_outsideLock);
+    auto it = g_outside.upper_bound(va);
+    if (it == g_outside.begin()) return nullptr;
+    --it;
+    if (va >= it->second.end) return nullptr;
+    if (start) *start = it->first;
+    return &it->second;
+}
+
+HRESULT STDMETHODCALLTYPE pCommittedImpl(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                         const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
+                                         const D3D12_CLEAR_VALUE* cv, REFIID riid, void** ppv);
+
+HRESULT STDMETHODCALLTYPE pCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                     const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                     REFIID riid, void** ppv)
+{
+    t_inCommitted++;
+    HRESULT hr = pCommittedImpl(dv, hp, f, d, st, cv, riid, ppv);
+    t_inCommitted--;
+    noteBuffer(hr, riid, ppv, d, "committed", hp ? (int)hp->Type : -1, (unsigned)f, __builtin_return_address(0));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE pCommittedImpl(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                         const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
+                                         const D3D12_CLEAR_VALUE* cv, REFIID riid, void** ppv)
+{
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                           const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                           REFIID, void**);
+    auto orig = (Fn)o_committed;
+    if (t_fg == 0 || g_ptrHeapOff || !hp || hp->Type != D3D12_HEAP_TYPE_DEFAULT || !d ||
+        d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (f & ~(D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES |
+                                                                     D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)) || !ppv)
+        return orig(dv, hp, f, d, st, cv, riid, ppv);
+    D3D12_RESOURCE_ALLOCATION_INFO ai = dv->GetResourceAllocationInfo(0, 1, d);
+    uint64_t align = std::max<uint64_t>(ai.Alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    PtrHeap* h = nullptr;
+    uint64_t off = 0;
+    // only the newest heap takes buffers: one feature's buffers stay together, and an older feature's heap is not
+    // refilled (it is released once its own buffers are gone)
+    if (!g_ptrHeapFresh && !g_ptrHeaps.empty()) {
+        PtrHeap& c = g_ptrHeaps.back();
+        uint64_t o = (c.used + align - 1) / align * align;
+        if (o + ai.SizeInBytes <= c.size) { h = &c; off = o; }
+    }
+    g_ptrHeapFresh = false;
+    if (!h) {
+        ptrHeapsDropDead(false);   // a released feature's heap: gone before the new one, so one heap stays
+        PtrHeap c;
+        c.id = ++g_ptrHeapIds;
+        c.size = std::max<uint64_t>(kPtrHeapBytes, (ai.SizeInBytes + 0xffff) & ~0xffffull);
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = c.size;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        D3D12_RESOURCE_DESC sd{};
+        sd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        sd.Width = c.size;
+        sd.Height = sd.DepthOrArraySize = sd.MipLevels = 1;
+        sd.SampleDesc.Count = 1;
+        sd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(dv->CreateHeap(&hd, __uuidof(ID3D12Heap), (void**)&c.heap)) ||
+            FAILED(dv->CreatePlacedResource(c.heap, 0, &sd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                            (void**)&c.span))) {
+            logf("pointer heap: creating a %llu MB heap failed: DLSS-G's buffers stay committed",
+                 (unsigned long long)(c.size >> 20));
+            g_ptrHeapOff = true;
+            return orig(dv, hp, f, d, st, cv, riid, ppv);
+        }
+        c.va = c.span->GetGPUVirtualAddress();
+        g_ptrHeaps.push_back(c);
+        h = &g_ptrHeaps.back();
+        off = 0;
+        logf("pointer heap %zu: %llu MB at 0x%llx", g_ptrHeaps.size() - 1, (unsigned long long)(c.size >> 20),
+             (unsigned long long)c.va);
+    }
+    HRESULT hr = dv->CreatePlacedResource(h->heap, off, d, st, cv, riid, ppv);
+    if (FAILED(hr) || !*ppv) return orig(dv, hp, f, d, st, cv, riid, ppv);
+    ID3D12Resource* r = nullptr;
+    ((IUnknown*)*ppv)->QueryInterface(__uuidof(ID3D12Resource), (void**)&r);
+    uint64_t va = r ? r->GetGPUVirtualAddress() : 0;
+    if (r) {
+        auto* ref = new PtrHeapRef();
+        if (SUCCEEDED(r->SetPrivateDataInterface(kPtrHeapRefGuid, ref))) {
+            ref->heapId = h->id;
+            h->live++;
+        }
+        ref->Release();   // the buffer holds it now; if attaching failed it goes here, inert (heapId 0)
+        r->Release();
+    }
+    if (va != h->va + off) {
+        logf("pointer heap: a placed buffer is at 0x%llx, not heap VA + offset 0x%llx: pointer heap off",
+             (unsigned long long)va, (unsigned long long)(h->va + off));
+        g_ptrHeapOff = true;
+    }
+    h->used = off + ai.SizeInBytes;
+    static int logged = 0;
+    if (logged++ < 4)
+        logf("pointer heap: DLSS-G buffer of %llu bytes placed at offset %llu (0x%llx)", (unsigned long long)d->Width,
+             (unsigned long long)off, (unsigned long long)va);
+    return hr;
+}
+
+// the heap (its span) a launch's pointers are in: the one holding va, or the newest for a launch without pointers.
+// One launch, one view: a launch whose pointers are in two heaps keeps the Vulkan route (dxLaunchImpl).
+uint64_t ptrHeapSpanVa(uint64_t va, ID3D12Resource** span = nullptr, uint64_t* size = nullptr)
+{
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    if (g_ptrHeapOff || g_ptrHeaps.empty()) return 0;
+    const PtrHeap* h = &g_ptrHeaps.back();
+    if (va)
+        for (const auto& c : g_ptrHeaps)
+            if (va >= c.va && va < c.va + c.size) { h = &c; break; }
+    if (span) *span = h->span;
+    if (size) *size = h->size;
+    return h->va;
+}
+
+void markNewFeature()
+{
+    std::lock_guard<std::mutex> l(g_ptrLock);
+    g_ptrHeapFresh = true;
+}
+
+// the newer creation methods (ID3D12Device4 / 8 / 10): buffers inside DLSS-G's calls go to the same heaps (a buffer's
+// D3D12_RESOURCE_DESC1 starts as D3D12_RESOURCE_DESC); everything else to the original
+void* o_committed1 = nullptr;
+void* o_committed2 = nullptr;
+void* o_committed3 = nullptr;
+bool inPtrHeap(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d)
+{
+    return t_fg != 0 && !g_ptrHeapOff && hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT && d &&
+           d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+           !(f & ~(D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
+}
+HRESULT STDMETHODCALLTYPE pCommitted1(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                      void* ps, REFIID riid, void** ppv)
+{
+    if (!ps && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, st, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, void*, REFIID, void**);
+    HRESULT hr = ((Fn)o_committed1)(dv, hp, f, d, st, cv, ps, riid, ppv);
+    noteBuffer(hr, riid, ppv, d, "committed1", hp ? (int)hp->Type : -1, (unsigned)f, __builtin_return_address(0));
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE pCommitted2(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                      void* ps, REFIID riid, void** ppv)
+{
+    if (!ps && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, st, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, void*, REFIID, void**);
+    HRESULT hr = ((Fn)o_committed2)(dv, hp, f, d, st, cv, ps, riid, ppv);
+    noteBuffer(hr, riid, ppv, d, "committed2", hp ? (int)hp->Type : -1, (unsigned)f, __builtin_return_address(0));
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE pCommitted3(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f,
+                                      const D3D12_RESOURCE_DESC* d, int layout, const D3D12_CLEAR_VALUE* cv, void* ps, UINT nc,
+                                      const void* cf, REFIID riid, void** ppv)
+{
+    // a buffer's initial layout is UNDEFINED; it starts in COMMON, as a placed buffer does
+    if (!ps && !nc && inPtrHeap(hp, f, d)) return pCommitted(dv, hp, f, d, D3D12_RESOURCE_STATE_COMMON, cv, riid, ppv);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
+                                           int, const D3D12_CLEAR_VALUE*, void*, UINT, const void*, REFIID, void**);
+    HRESULT hr = ((Fn)o_committed3)(dv, hp, f, d, layout, cv, ps, nc, cf, riid, ppv);
+    noteBuffer(hr, riid, ppv, d, "committed3", hp ? (int)hp->Type : -1, (unsigned)f, __builtin_return_address(0));
+    return hr;
+}
+
+void* o_placed = nullptr;
+HRESULT STDMETHODCALLTYPE pPlaced(ID3D12Device* dv, ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC* d,
+                                  D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** ppv)
+{
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*,
+                                           D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+    HRESULT hr = ((Fn)o_placed)(dv, heap, offset, d, st, cv, riid, ppv);
+    if (t_inCommitted) return hr;
+    D3D12_HEAP_DESC hd{};
+    if (heap) hd = heap->GetDesc();
+    noteBuffer(hr, riid, ppv, d, "placed", (int)hd.Properties.Type, (unsigned)hd.Flags, __builtin_return_address(0));
+    return hr;
+}
+
+void hookPointerHeap(ID3D12Device* d)
+{
+    void** vt = *reinterpret_cast<void***>(d);
+    IUnknown* u = nullptr;
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device4), (void**)&u))) { u->Release(); patchSlot(vt, 53, (void*)&pCommitted1, &o_committed1); }
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device8), (void**)&u))) { u->Release(); patchSlot(vt, 69, (void*)&pCommitted2, &o_committed2); }
+    if (SUCCEEDED(d->QueryInterface(__uuidof(ID3D12Device10), (void**)&u))) { u->Release(); patchSlot(vt, 76, (void*)&pCommitted3, &o_committed3); }
+    bool ok = patchSlot(vt, 27, (void*)&pCommitted, &o_committed);
+    patchSlot(vt, 29, (void*)&pPlaced, &o_placed);
+    logf("pointer heap: DLSS-G's committed buffers %s", ok ? "redirected into heaps of ours" : "NOT redirected (hook failed)");
+}
+
 void hookDevice(ID3D12Device* d)
 {
     static bool done = false;
@@ -1136,6 +1564,7 @@ void hookDevice(ID3D12Device* d)
               patchSlot(vt, 22, (void*)&hCreateSampler, (void**)&o_createSampler) &&
               patchSlot(vt, 24, (void*)&hCopySimple, (void**)&o_copySimple);
     logf("device %p: descriptor creation hooks %s", (void*)d, ok ? "installed" : "FAILED");
+    if (g_ptrHeapOn) hookPointerHeap(d);
 }
 
 } // namespace
@@ -1257,8 +1686,10 @@ struct Chain {
     std::vector<Batch*> batches;   // batches[k] runs after part k-1 (part -1 = the list itself)
     std::vector<Part> parts;
     uint32_t slotCalls[86] = {};
+    std::string trace;   // [Host] SplitLog
 };
 constexpr int kMaxChains = 32;
+bool g_splitLog = false;   // [Host] SplitLog: what ends each kernel batch, for a few lists (nvxrt.log)
 Chain g_chains[kMaxChains];
 std::atomic<int> g_activeChains{0};
 bool g_listHooks = false;
@@ -1287,7 +1718,11 @@ extern "C" void* cux_split_target(void* self, unsigned slot)
     Chain* c = findChain(self);
     if (!c) return self;
     if (slot < 86) c->slotCalls[slot]++;
-    c->dirty.store(true, std::memory_order_relaxed);
+    if (g_splitLog) c->trace += " s" + std::to_string(slot);
+    // EndQuery (53), SetMarker (56), BeginEvent (57), EndEvent (58) touch nothing the kernels read or write: they go
+    // into the next D3D12 part without ending the open kernel batch (a timestamp then lands after the batch)
+    if (!(slot == 53 || slot == 56 || slot == 57 || slot == 58) || g_cfg.splitQueries)
+        c->dirty.store(true, std::memory_order_relaxed);
     ID3D12GraphicsCommandList* t = c->target.load(std::memory_order_acquire);
     return t ? t : self;
 }
@@ -1328,6 +1763,13 @@ bool shaderOnly(D3D12_RESOURCE_STATES s)
                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return s != 0 && (s & ~ok) == 0;
 }
+// A transition between a shader state and COPY_SOURCE / COPY_DEST around a copy that runs on the kernels' queue
+// (recordCopy): it changes nothing the kernels see either, and goes into the next D3D12 part with the other barriers.
+// A copy that cannot run there ends the batch itself, after these barriers in D3D12 order.
+bool copyOrShader(D3D12_RESOURCE_STATES s)
+{
+    return shaderOnly(s) || s == D3D12_RESOURCE_STATE_COPY_SOURCE || s == D3D12_RESOURCE_STATE_COPY_DEST;
+}
 void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE_BARRIER* b)
 {
     List* t;
@@ -1336,10 +1778,23 @@ void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE
         bool harmless = !g_splitBarriers;
         for (UINT i = 0; i < n && harmless; i++) {
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) continue;
-            harmless = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && shaderOnly(b[i].Transition.StateBefore) &&
-                       shaderOnly(b[i].Transition.StateAfter);
+            const D3D12_RESOURCE_STATES from = b[i].Transition.StateBefore, to = b[i].Transition.StateAfter;
+            harmless = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                       ((shaderOnly(from) && shaderOnly(to)) ||
+                        (g_cfg.vkCopies && copyOrShader(from) && copyOrShader(to) && (shaderOnly(from) || shaderOnly(to))));
         }
         if (!harmless) c->dirty.store(true, std::memory_order_relaxed);
+        if (g_splitLog) {
+            char t[64];
+            for (UINT i = 0; i < n; i++) {
+                if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) snprintf(t, sizeof t, " u%p", (void*)b[i].UAV.pResource);
+                else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+                    snprintf(t, sizeof t, " t%p:%x>%x", (void*)b[i].Transition.pResource, (unsigned)b[i].Transition.StateBefore,
+                             (unsigned)b[i].Transition.StateAfter);
+                else snprintf(t, sizeof t, " a");
+                c->trace += t;
+            }
+        }
     }
     orig<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RESOURCE_BARRIER*)>(t, 26)(t, n, b);
 }
@@ -1434,6 +1889,136 @@ void cmdRelease(VkCommandBuffer cmd)
     g.pending.erase(cmd);
 }
 
+const std::string kLabelClear = "(clear)";
+void stamp(Batch* b, const std::string* label)
+{
+    if (!g.tsPool || !b) return;
+    uint32_t q = g.tsNext++ % kTsQueries;
+    vk.CmdResetQueryPool(b->cmd, g.tsPool, q, 1);
+    vk.CmdWriteTimestamp(b->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.tsPool, q);
+    if (!b->ts.empty()) b->tsLabel.push_back(label);
+    b->ts.push_back(q);
+}
+
+// a finished batch's timestamps into the per-kernel totals; a summary every 1000 batches
+// [Host] KernelTiming: GPU timestamps of both APIs on the CPU's QueryPerformanceCounter timeline (ms)
+struct Calib { double base = 0, msPerTick = 0; uint64_t tick0 = 0; bool ok = false; };
+Calib vkCalib()
+{
+    Calib c;
+    if (!vk.GetCalibratedTimestampsEXT) return c;
+    VkCalibratedTimestampInfoEXT ci[2] = {{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT},
+                                          {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT}};
+    ci[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+    ci[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+    uint64_t ts[2] = {}, dev = 0;
+    if (vk.GetCalibratedTimestampsEXT(g.dev, 2, ci, ts, &dev) != VK_SUCCESS) return c;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    c.base = (double)ts[1] * 1000.0 / (double)f.QuadPart;
+    c.tick0 = ts[0];
+    c.msPerTick = g.tsPeriodMs;
+    c.ok = true;
+    return c;
+}
+Calib d3dCalib(ID3D12CommandQueue* q)
+{
+    Calib c;
+    UINT64 gpu = 0, cpu = 0, f = 0;
+    if (FAILED(q->GetClockCalibration(&gpu, &cpu)) || FAILED(q->GetTimestampFrequency(&f)) || !f) return c;
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    c.base = (double)cpu * 1000.0 / (double)qf.QuadPart;
+    c.tick0 = gpu;
+    c.msPerTick = 1000.0 / (double)f;
+    c.ok = true;
+    return c;
+}
+double onCpu(const Calib& c, uint64_t t) { return c.base + ((double)(int64_t)(t - c.tick0)) * c.msPerTick; }
+
+void harvest(Batch* b)
+{
+    if (!g.tsPool || b->ts.size() < 2) return;
+    std::vector<uint64_t> t(b->ts.size());
+    for (size_t i = 0; i < b->ts.size(); i++)
+        if (vk.GetQueryPoolResults(g.dev, g.tsPool, b->ts[i], 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    for (size_t i = 1; i < t.size(); i++) {
+        auto& e = g.ktime[*b->tsLabel[i - 1]];
+        e.first += (double)(t[i] - t[i - 1]) * g.tsPeriodMs;
+        e.second++;
+    }
+    g.batchMs += (double)(t.back() - t.front()) * g.tsPeriodMs;
+    if (b->d3dTs >= 0 && g.d3dTsMap) {
+        uint64_t d0 = g.d3dTsMap[b->d3dTs], d1 = g.d3dTsMap[b->d3dTs + 1];
+        if (d1 > d0) {
+            g.d3dSpanMs += (double)(d1 - d0) * g.d3dTsMsPerTick[b->d3dQ];
+            g.vkSpanMs += (double)(t.back() - t.front()) * g.tsPeriodMs;
+            g.d3dTimed++;
+            static Calib vc, dc;
+            static uint64_t calibAt = 0;
+            if (!vc.ok || g.d3dTimed - calibAt > 200 || calibAt > g.d3dTimed) {
+                vc = vkCalib();
+                dc = d3dCalib(b->d3dQ);
+                calibAt = g.d3dTimed;
+            }
+            if (vc.ok && dc.ok) {
+                double l1 = onCpu(vc, t.front()) - onCpu(dc, d0), l2 = onCpu(dc, d1) - onCpu(vc, t.back());
+                if (l1 > -1 && l2 > -1 && l1 < 50 && l2 < 50) {
+                    g.lat1Ms += l1;
+                    g.lat2Ms += l2;
+                    g.latN++;
+                }
+            }
+        }
+    }
+    if (++g.timedBatches % 1000) return;
+    if (g.d3dTimed) {
+        double n = (double)g.d3dTimed;
+        logf("hand-off timing, last %llu batches: game queue idle %.4f ms per batch (from the D3D12 work before the kernels "
+             "to the work after them), of which the kernels' batch %.4f ms (its start to its end): %.4f ms per round trip",
+             (unsigned long long)g.d3dTimed, g.d3dSpanMs / n, g.vkSpanMs / n, (g.d3dSpanMs - g.vkSpanMs) / n);
+        if (g.latN)
+            logf("hand-off timing: D3D12 done -> kernels start %.4f ms, kernels done -> D3D12 resumes %.4f ms (calibrated "
+                 "clocks, %llu batches)", g.lat1Ms / g.latN, g.lat2Ms / g.latN, (unsigned long long)g.latN);
+        g.lat1Ms = g.lat2Ms = 0;
+        g.latN = 0;
+        g.d3dSpanMs = g.vkSpanMs = 0;
+        g.d3dTimed = 0;
+    }
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& k : g.ktime) v.push_back({k.second.first, k.first});
+    std::sort(v.rbegin(), v.rend());
+    double n = 1000.0;
+    std::string out;
+    char buf[256];
+    for (auto& e : v) {
+        snprintf(buf, sizeof buf, "\n  %8.4f ms/batch  %6.2f/batch  %s", e.first / n, g.ktime[e.second].second / n, e.second.c_str());
+        out += buf;
+    }
+    logf("kernel timing, last 1000 batches: %.4f ms per batch on the kernels' queue (entry barrier to last dispatch)%s",
+         g.batchMs / n, out.c_str());
+    g.ktime.clear();
+    g.batchMs = 0;
+}
+
+// [Host] KernelTiming: a full barrier and a timestamp at the batch's end, so the cache flush the hand-off does
+// implicitly shows as its own line ("exit barrier")
+void endBatch(Batch* b)
+{
+    if (b->ended) return;
+    if (g.tsPool) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vk.CmdPipelineBarrier(b->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                              nullptr, 0, nullptr);
+        static const std::string kLabelExit = "(exit barrier)";
+        stamp(b, &kLabelExit);
+    }
+    vk.EndCommandBuffer(b->cmd);
+    b->ended = true;
+}
+
 void freeBatch(Batch* b)
 {
     if (b->cmd) {
@@ -1450,6 +2035,7 @@ void recycle()
     for (size_t i = 0; i < g.inflightBatches.size();) {
         Batch* b = g.inflightBatches[i];
         if (b->qs->fence->GetCompletedValue() >= b->done) {
+            harvest(b);
             freeBatch(b);
             g.inflightBatches[i] = g.inflightBatches.back();
             g.inflightBatches.pop_back();
@@ -1492,12 +2078,15 @@ Batch* newBatch()
     uint32_t idx = 0;
     VkDeviceSize off = 0;
     vk.CmdSetDescriptorBufferOffsetsEXT(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipeLayout, 0, 1, &idx, &off);
+    stamp(b, nullptr);   // [Host] KernelTiming: the batch's start, before its entry barrier
     // everything the D3D12 queue did before the hand-off is visible (the semaphore wait covers execution; this the caches)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vk.CmdPipelineBarrier(b->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                           nullptr, 0, nullptr);
+    static const std::string kLabelEntry = "(entry barrier)";
+    stamp(b, &kLabelEntry);
     return b;
 }
 
@@ -1574,6 +2163,7 @@ Chain* chainFor(List* list, bool create)
         c.batches.clear();
         c.parts.clear();
         memset(c.slotCalls, 0, sizeof c.slotCalls);
+        c.trace.clear();
         c.list.store(list, std::memory_order_release);
         g_activeChains.fetch_add(1);
         return &c;
@@ -1613,6 +2203,7 @@ Batch* batchFor(List* list)
     replay(c, p.list);
     // a launch group open in the previous batch cannot continue across D3D12 work
     if (!c->batches.empty()) g.pending.erase(c->batches.back()->cmd);
+    if (g_splitLog) c->trace += " ||";
     c->batches.push_back(b);
     c->parts.push_back(p);
     c->target.store(p.list, std::memory_order_release);
@@ -1645,7 +2236,7 @@ HRESULT STDMETHODCALLTYPE hClose(List* list)
                     if (FAILED(r)) worst = r;
                 }
                 for (Batch* b : c->batches)
-                    if (!b->ended) { vk.EndCommandBuffer(b->cmd); b->ended = true; }
+                    endBatch(b);
                 c->closed = true;
                 c->target.store(nullptr);
                 HRESULT r = o_close(list);
@@ -1710,10 +2301,44 @@ QueueSync* syncFor(ID3D12CommandQueue* q)
     return &s;
 }
 
+// [Host] KernelTiming: a one-command D3D12 list writing timestamp `idx` (and resolving the pair when `resolve`)
+bool d3dStamp(ID3D12CommandQueue* q, uint32_t idx, bool resolve, Part& out)
+{
+    if (!g.d3dTsHeap) {
+        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4096};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 4096 * 8;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.d3d->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap), (void**)&g.d3dTsHeap)) ||
+            FAILED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  __uuidof(ID3D12Resource), (void**)&g.d3dTsRb)) ||
+            FAILED(g.d3dTsRb->Map(0, nullptr, (void**)&g.d3dTsMap))) {
+            g.d3dTsMap = nullptr;
+            return false;
+        }
+    }
+    if (!g.d3dTsMap) return false;
+    if (!g.d3dTsMsPerTick.count(q)) {
+        UINT64 f = 0;
+        q->GetTimestampFrequency(&f);
+        g.d3dTsMsPerTick[q] = f ? 1000.0 / (double)f : 0;
+    }
+    Chain tmp;
+    tmp.type = q->GetDesc().Type;
+    if (!newPart(&tmp, g.d3d, out)) return false;
+    out.list->EndQuery(g.d3dTsHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx);
+    if (resolve) out.list->ResolveQueryData(g.d3dTsHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx - 1, 2, g.d3dTsRb, (idx - 1) * 8ull);
+    return SUCCEEDED(out.list->Close());
+}
+
 // runs batch b between the D3D12 work submitted so far and what follows on queue q; g_lock held
 void runBatch(ID3D12CommandQueue* q, QueueSync* s, Batch* b)
 {
-    if (!b->ended) { vk.EndCommandBuffer(b->cmd); b->ended = true; }
+    endBatch(b);
     uint64_t a = ++s->value;
     q->Signal(s->fence, a);
     uint64_t c = ++s->value;
@@ -1769,8 +2394,28 @@ void STDMETHODCALLTYPE hExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList
         if (!c || !c->closed || c->parts.empty()) continue;
         for (size_t k = 0; k < c->parts.size(); k++) {
             o_execute(q, (UINT)chunk.size(), chunk.data());
-            runBatch(q, s, c->batches[k]);
+            Batch* b = c->batches[k];
+            Part t0{}, t1{};
+            bool timed = g.tsPool && d3dStamp(q, (g.d3dTsNext % 2048) * 2, false, t0);
+            if (timed) {
+                ID3D12CommandList* l0 = t0.list;
+                o_execute(q, 1, &l0);
+                parts.push_back(t0);
+            }
+            runBatch(q, s, b);
+            if (timed && d3dStamp(q, (g.d3dTsNext % 2048) * 2 + 1, true, t1)) {
+                ID3D12CommandList* l1 = t1.list;
+                o_execute(q, 1, &l1);
+                parts.push_back(t1);
+                b->d3dTs = (int)((g.d3dTsNext % 2048) * 2);
+                b->d3dQ = q;
+                g.d3dTsNext++;
+            }
             chunk.assign(1, c->parts[k].list);
+        }
+        if (g_splitLog) {
+            static int tl = 0;
+            if (g.launchCount > 3000 && tl < 8) { tl++; logf("SPLITLOG list %p: %s", (void*)lists[i], c->trace.c_str()); }
         }
         static int logged = 0;
         if (logged < 3) {
@@ -1791,6 +2436,12 @@ void STDMETHODCALLTYPE hExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList
     for (Batch* b : batches) { b->done = done; g.inflightBatches.push_back(b); }
     for (Part& p : parts) { p.qs = s; p.done = done; g.inflightParts.push_back(p); }
 }
+
+template <bool Float> void STDMETHODCALLTYPE sClearUav(List* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                                      ID3D12Resource* res, const void* values, UINT nrects, const D3D12_RECT* rects);
+void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT n,
+                                         ID3D12Resource* dst, UINT64 off);
+void STDMETHODCALLTYPE sCopyResource(List* self, ID3D12Resource* dst, ID3D12Resource* src);
 
 std::mutex g_hookLock;
 
@@ -1843,6 +2494,10 @@ bool hookListClass(List* list)
         case 40: hook = (void*)&sSetView<1, 4>; break;
         case 41: hook = (void*)&sSetView<0, 5>; break;
         case 42: hook = (void*)&sSetView<1, 5>; break;
+        case 17: hook = (void*)&sCopyResource; break;
+        case 49: hook = (void*)&sClearUav<false>; break;
+        case 50: hook = (void*)&sClearUav<true>; break;
+        case 54: hook = (void*)&sResolveQueryData; break;
         default: break;
         }
         void* unused = nullptr;
@@ -1891,6 +2546,590 @@ bool installListHooks(ID3D12Device* d3d)
     }
     g_listHooks = ok;
     return ok;
+}
+
+// ------------------------------------------------------------------------------------------------ DXIL route (spike)
+// A kernel compiled to DXIL (fg/dlssg/translator/glsl2hlsl.py + rt.hlsl) runs as a D3D12 dispatch recorded straight
+// into DLSS-G's command list. In the spike it is D3D12 work between two Vulkan batches (the batch ends there, as at
+// any other D3D12 call), so single kernels can be checked against the Vulkan route on the same frames.
+// configure(): [Host] Route=dxil -> every kernel, DXIL in CACHE/dxil compiled from CACHE/hlsl (build_hlsl.py) by
+// [Host] Dxc on first use; CUX_DXIL / CUX_DXIL_KERNELS (test overrides): a folder of compiled kernels / a name list
+std::string g_dxDirS, g_dxKernelsS, g_hlslDir, g_dxc;
+std::string g_dxCompare;          // [Host] DxilCompare (see "DXIL compare")
+uint32_t g_dxCompareOut = 128;
+const char* g_dxDir = nullptr;
+const char* g_dxKernels = nullptr;
+struct DxPso { ID3D12PipelineState* pso = nullptr; bool tried = false; };
+std::map<std::string, DxPso> g_dxPsos;
+
+bool dxInit()
+{
+    if (g.dxTried) return g.dxOk;
+    g.dxTried = true;
+    if (!g_dxDir || !g.d3d) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 131072, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.d3d->CreateDescriptorHeap(&vd, __uuidof(ID3D12DescriptorHeap), (void**)&g.dxViews)) ||
+        FAILED(g.d3d->CreateDescriptorHeap(&sd, __uuidof(ID3D12DescriptorHeap), (void**)&g.dxSamplers))) {
+        logf("DXIL route: descriptor heaps failed");
+        return false;
+    }
+    g.dxViewInc = g.d3d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g.dxSmpInc = g.d3d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    g.dxViewsCpu = (uint8_t*)g.dxViews->GetCPUDescriptorHandleForHeapStart().ptr;
+    g.dxSamplersCpu = (uint8_t*)g.dxSamplers->GetCPUDescriptorHandleForHeapStart().ptr;
+    auto upload = [](uint64_t size, ID3D12Resource** r, uint8_t** map) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return SUCCEEDED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                        nullptr, __uuidof(ID3D12Resource), (void**)r)) &&
+               SUCCEEDED((*r)->Map(0, nullptr, (void**)map));
+    };
+    if (!upload(kInfoBytes, &g.dxInfo, &g.dxInfoMap) || !upload(16ull << 20, &g.dxCb, &g.dxCbMap)) {
+        logf("DXIL route: upload buffers failed");
+        return false;
+    }
+    // descriptors registered before the heaps existed
+    for (auto& kv : g.viewSlots) {
+        uint32_t slot = kv.second;
+        bool uav = kv.first[0] == 'u';
+        memcpy(g.dxViewsCpu + (size_t)((uav ? 65536u : 0u) + slot) * g.dxViewInc, g.dmap + g.boff[uav ? 1 : 0] + (size_t)slot * g.imgSize, g.imgSize);
+        memcpy(g.dxViewsCpu + (size_t)((uav ? 0u : 65536u) + slot) * g.dxViewInc, g.dmap + g.boff[uav ? 0 : 1] + (size_t)slot * g.imgSize, g.imgSize);
+    }
+    for (auto& kv : g.samplerSlots)
+        if (kv.second < 2048) memcpy(g.dxSamplersCpu + (size_t)kv.second * g.dxSmpInc, kv.first.data() + 1, std::min<size_t>(g.dxSmpInc, kv.first.size() - 1));
+    g.dxOk = true;
+    logf("DXIL route: kernels from %s (%s)%s%s", g_dxDir, g_dxKernels ? g_dxKernels : "none",
+         g_dxc.empty() ? "" : ", compiled on first use by ", g_dxc.c_str());
+    return true;
+}
+
+ID3D12PipelineState* dxPso(CuFunction& fn, const uint32_t block[3])
+{
+    char key[64];
+    snprintf(key, sizeof key, ".%ux%ux%u", block[0], block[1], block[2]);
+    std::string k = fn.module->hash + fn.name + key;
+    DxPso& e = g_dxPsos[k];
+    if (e.tried) return e.pso;
+    e.tried = true;
+    std::vector<uint8_t> blob;
+    // the variant loadKernel picks for the Vulkan route: fp32 accumulation + texture-unit filtering, fa, hw, base
+    std::string base = std::string(g_dxDir) + "/" + fn.module->hash.substr(0, 8) + "_" + fn.name, path;
+    const char* variants[] = {g_cfg.accFast && g_cfg.texHw ? ".fa.hw" : nullptr, g_cfg.accFast ? ".fa" : nullptr,
+                              g_cfg.texHw ? ".hw" : nullptr, ""};
+    bool found = false;
+    // a compiled kernel older than its source (build_hlsl.py rewrote the HLSL) is compiled again
+    auto stale = [](const std::string& dxil, const std::string& hlsl) {
+        WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+        if (!GetFileAttributesExW(wide(dxil).c_str(), GetFileExInfoStandard, &a) ||
+            !GetFileAttributesExW(wide(hlsl).c_str(), GetFileExInfoStandard, &b))
+            return false;
+        return CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) < 0;
+    };
+    std::string srcBase = g_hlslDir.empty() ? std::string() : g_hlslDir + "/" + fn.module->hash.substr(0, 8) + "_" + fn.name;
+    for (const char* v : variants) {
+        if (!v) continue;
+        path = base + v + key + ".dxil";
+        if (!srcBase.empty() && stale(path, srcBase + v + ".hlsl")) break;   // compiled again below, same variant order
+        if (readFile(path, blob)) { found = true; break; }
+    }
+    if (!found && !g_hlslDir.empty() && !g_dxc.empty()) {
+        // compile the variant's source for this block shape (build_hlsl.py: CACHE/hlsl/NAME.hlsl, flags on line 1)
+        std::string name = fn.module->hash.substr(0, 8) + "_" + fn.name;
+        for (const char* v : variants) {
+            if (!v) continue;
+            std::string src = g_hlslDir + "/" + name + v + ".hlsl";
+            std::vector<uint8_t> text;
+            if (!readFile(src, text)) continue;
+            std::string first(text.begin(), std::find(text.begin(), text.end(), (uint8_t)'\n'));
+            std::string flags = first.rfind("// dxc: ", 0) == 0 ? first.substr(8) : "-T cs_6_6 -E main -enable-16bit-types -HV 2021";
+            while (!flags.empty() && (flags.back() == '\r' || flags.back() == ' ')) flags.pop_back();
+            path = base + v + key + ".dxil";
+            char defs[128];
+            snprintf(defs, sizeof defs, " -DNVX_BX=%u -DNVX_BY=%u -DNVX_BZ=%u", block[0], block[1], block[2]);
+            std::string cmd = "\"" + g_dxc + "\" -nologo " + flags + defs + " -I \"" + g_hlslDir + "\" -Fo \"" + path + "\" \"" + src + "\"";
+            std::wstring wcmd = wide(cmd);
+            STARTUPINFOW si{sizeof si};
+            PROCESS_INFORMATION pi{};
+            DWORD code = 1;
+            ULONGLONG t0 = GetTickCount64();
+            if (CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 120000);
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            logf("DXIL route: compiled %s%s for block %ux%ux%u in %llu ms (%s)", name.c_str(), v, block[0], block[1], block[2],
+                 (unsigned long long)(GetTickCount64() - t0), code == 0 ? "ok" : "FAILED: the Vulkan route runs it");
+            found = code == 0 && readFile(path, blob);
+            break;
+        }
+    }
+    if (!found) {
+        logf("DXIL route: no %s%s.dxil", base.c_str(), key);
+        return nullptr;
+    }
+    if (!g.dxRs && FAILED(g.d3d->CreateRootSignature(0, blob.data(), blob.size(), __uuidof(ID3D12RootSignature), (void**)&g.dxRs))) {
+        logf("DXIL route: root signature from %s failed", path.c_str());
+        return nullptr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g.dxRs;
+    pd.CS = {blob.data(), blob.size()};
+    HRESULT hr = g.d3d->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), (void**)&e.pso);
+    logf("DXIL route: %s %s (0x%08lx)", path.c_str(), SUCCEEDED(hr) ? "loaded" : "FAILED", (unsigned long)hr);
+    if (FAILED(hr)) e.pso = nullptr;
+    return e.pso;
+}
+
+bool dxWanted(const CuFunction& fn)
+{
+    if (!g_dxDir || !g_dxKernels) return false;
+    if (!g_dxCompare.empty() && fn.name == g_dxCompare) return true;
+    std::string list = std::string(",") + g_dxKernels + ",";
+    return list.find("," + fn.name + ",") != std::string::npos || list.find(",*,") != std::string::npos;
+}
+
+// records fn as a D3D12 dispatch into the list (the Vulkan batch ends before it); false: the Vulkan route runs it
+bool dxLaunchImpl(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize);
+// [Host] KernelTiming: the CPU time the DXIL route spends per launch (the game's thread records it)
+bool dxLaunch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
+{
+    if (!g_dxCompare.empty() && fn.name == g_dxCompare) return false;   // DxilCompare: the real launch stays on Vulkan
+    if (!g_cfg.kernelTiming) return dxLaunchImpl(list, fn, grid, block, pbuf, psize);
+    static LARGE_INTEGER f{};
+    static double us = 0, worst = 0;
+    static uint64_t n = 0;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    bool r = dxLaunchImpl(list, fn, grid, block, pbuf, psize);
+    QueryPerformanceCounter(&b);
+    double t = (double)(b.QuadPart - a.QuadPart) * 1e6 / (double)f.QuadPart;
+    if (r) {
+        us += t;
+        worst = std::max(worst, t);
+        if (++n % 5000 == 0) {
+            logf("DXIL route CPU: %.2f us per launch on average, worst %.1f us (last 5000)", us / 5000, worst);
+            us = worst = 0;
+        }
+    }
+    return r;
+}
+bool dxLaunchImpl(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf, uint32_t psize)
+{
+    if (!dxWanted(fn) || psize > 4096 || !dxInit()) return false;
+    if (!g.groups.empty() && g.groupFirst.count(fn.gkey)) return false;
+    ID3D12Resource* spanRes = nullptr;
+    uint64_t spanSize = 0;
+    uint64_t first = 0;   // the first pointer-looking parameter picks the heap (same test as below)
+    if (pbuf)
+        for (uint32_t i = 0; i + 8 <= psize && !first; i += 8) {
+            uint64_t v;
+            memcpy(&v, pbuf + i, 8);
+            if (v >= (1ull << 32) && v < (1ull << 40) && (uint32_t)v >= (1u << 20)) first = v;
+        }
+    uint64_t span = ptrHeapSpanVa(first, &spanRes, &spanSize);
+    if (!span) return false;
+    // A real pointer outside the pointer heap (a buffer not created through the redirection): this launch keeps the
+    // Vulkan route, which reaches any address. Pointers have large low halves; packed integer pairs (0x50_00000002)
+    // do not.
+    if (pbuf)
+        for (uint32_t i = 0; i + 8 <= psize; i += 8) {
+            uint64_t v;
+            memcpy(&v, pbuf + i, 8);
+            if (v < (1ull << 32) || v >= (1ull << 40) || (v >= span && v < span + spanSize)) continue;
+            uint64_t start = 0;
+            const OutsideBuf* ob = outsideBuf(v, &start);
+            if ((uint32_t)v >= (1u << 20) || ob) {
+                static std::set<std::string> told;
+                if (told.insert(fn.module->hash + fn.name + std::to_string(i)).second)
+                    logf("DXIL route: %s param %u = 0x%llx is outside the pointer heap%s%s: the Vulkan route runs it",
+                         fn.name.c_str(), i, (unsigned long long)v, ob ? ", in the " : " (no known buffer)",
+                         ob ? (ob->how + " at offset " + std::to_string(v - start)).c_str() : "");
+                return false;
+            }
+        }
+    // T1 kernels: their own block shape and grid, as launch() computes them for the Vulkan route
+    uint32_t bk[3] = {block[0], block[1], block[2]}, gr[3] = {grid[0], grid[1], grid[2]};
+    const KernelMeta& m = fn.meta;
+    if (m.t1_dispatch) {
+        for (int d = 0; d < 3; d++) {
+            bk[d] = m.t1_block[d];
+            gr[d] = (uint32_t)(((uint64_t)grid[d] * m.t1_num[d] + m.t1_den[d] - 1) / m.t1_den[d]);
+        }
+        if (m.t1_fixed[0] && m.t1_fixed[1] && m.t1_fixed[2]) gr[0] = m.t1_fixed[0], gr[1] = m.t1_fixed[1], gr[2] = m.t1_fixed[2];
+    }
+    grid = gr;
+    block = bk;
+    ID3D12PipelineState* pso = dxPso(fn, block);
+    if (!pso) return false;
+    Chain* c = chainFor(list, true);
+    if (!c || c->closed) return false;
+    List* t = c->target.load();
+    if (!t) t = c->list.load();
+    c->dirty.store(true);   // the next Vulkan launch starts a batch after this D3D12 work
+    if (g.dxInfoGen != g.infoGen) {
+        memcpy(g.dxInfoMap, g.info, kInfoBytes);
+        g.dxInfoGen = g.infoGen;
+    }
+    if (g.dxCbNext + 4352 > (16ull << 20)) g.dxCbNext = 0;   // ~3800 launches per lap: frames in flight are far fewer
+    uint64_t off = g.dxCbNext;
+    g.dxCbNext += 4352;
+    uint8_t* cb = g.dxCbMap + off;
+    uint32_t ext[8] = {(uint32_t)span, (uint32_t)(span >> 32), 0, (uint32_t)(spanSize - 16), grid[0], grid[1], grid[2], 0};
+    memcpy(cb, ext, sizeof ext);
+    if (pbuf && psize) memcpy(cb + 32, pbuf, psize);
+    using SetHeaps = void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*);
+    using SetRs = void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*);
+    using SetPso = void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*);
+    using SetView = void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+    using Disp = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT);
+    using Barrier = void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RESOURCE_BARRIER*);
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    ID3D12DescriptorHeap* heaps[2] = {g.dxViews, g.dxSamplers};
+    orig<SetHeaps>(t, 28)(t, 2, heaps);
+    orig<SetRs>(t, 29)(t, g.dxRs);
+    orig<SetPso>(t, 25)(t, pso);
+    orig<SetView>(t, 37)(t, 0, g.dxCb->GetGPUVirtualAddress() + off);
+    orig<SetView>(t, 41)(t, 1, span);
+    orig<SetView>(t, 39)(t, 2, g.dxInfo->GetGPUVirtualAddress());
+    orig<SetView>(t, 41)(t, 3, span);   // AMD's intrinsic slot (WMMA); the driver reads the operations, not the buffer
+    orig<Disp>(t, 14)(t, grid[0], grid[1], grid[2]);
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    replay(c, t);   // DLSS-G's own heaps, root signature, pipeline and root arguments
+    if (g_splitLog) c->trace += " D:" + fn.name.substr(0, 40);
+    if (g.dxLaunches++ < 4) logf("DXIL route: %s grid %ux%ux%u block %ux%ux%u", fn.name.c_str(), grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    return true;
+}
+
+// ------------------------------------------------------------------------------------------------ DXIL compare
+// [Host] DxilCompare=KERNEL: KERNEL runs on the Vulkan route as usual (the real output), and again on the DXIL route
+// into a shadow of its output surface (the 64-bit parameter at DxilCompareOut bytes). Before the kernel the shadow gets
+// the real output's contents (so pixels the kernel skips match); after both, a compute pass compares them on the GPU.
+// The result (differing pixels, max difference per channel, their bounding box, the first pixels with both values) is
+// read back a few frames later and logged. Finds where a kernel's DXIL translation differs in a game.
+static const uint32_t kShadowSlot = 65535;   // the UAV slot of the shadow (never a DLSS-G slot: those stay below)
+static const char kCompareHlsl[] = R"NVX(#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=8, b0), UAV(u0)"
+cbuffer C : register(b0) { uint realIdx; uint shadowIdx; uint w; uint h; uint mode; uint x0; uint y0; uint pad; };
+RWByteAddressBuffer O : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= w || id.y >= h) return;
+    uint2 p = uint2(x0, y0) + id.xy;
+    RWTexture2D<float4> a = ResourceDescriptorHeap[realIdx];
+    RWTexture2D<float4> b = ResourceDescriptorHeap[shadowIdx];
+    if (mode == 0u) { b[p] = a[p]; return; }
+    float4 x = a[p], y = b[p];
+    float4 d = abs(x - y);
+    if (any(isnan(x) != isnan(y))) d = float4(1e9, 1e9, 1e9, 1e9);
+    float m = max(max(d.x, d.y), max(d.z, d.w));
+    if (!(m > (1.0 / 1024.0))) return;
+    uint n;
+    O.InterlockedAdd(0, 1u, n);
+    O.InterlockedMax(4, asuint(d.x));
+    O.InterlockedMax(8, asuint(d.y));
+    O.InterlockedMax(12, asuint(d.z));
+    O.InterlockedMax(16, asuint(d.w));
+    O.InterlockedMin(20, p.x); O.InterlockedMin(24, p.y); O.InterlockedMax(28, p.x); O.InterlockedMax(32, p.y);
+    if (n < 24u) {
+        uint o = 64u + n * 48u;
+        O.Store4(o, uint4(p, 0u, 0u));
+        O.Store4(o + 16u, asuint(x));
+        O.Store4(o + 32u, asuint(y));
+    }
+}
+)NVX";
+struct DxCompare {
+    bool tried = false, ok = false;
+    ID3D12RootSignature* rs = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12Resource* result = nullptr;   // 4 KB, UAV state between uses
+    ID3D12Resource* zero = nullptr;     // 4 KB of zeros (upload)
+    ID3D12Resource* rb[8] = {};         // readbacks, one per compare in flight
+    uint64_t rbAt[8] = {};              // compare number in each (0: free)
+    ID3D12Resource* shadow = nullptr;
+    D3D12_RESOURCE_DESC shadowDesc{};
+    uint64_t n = 0, logged = 0, nonzero = 0;
+    bool paramsLogged = false;
+};
+DxCompare g_cmp;
+
+bool runDxc(const std::string& args)
+{
+    std::string cmd = "\"" + g_dxc + "\" -nologo " + args;
+    std::wstring wcmd = wide(cmd);
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    DWORD code = 1;
+    if (!CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return false;
+    WaitForSingleObject(pi.hProcess, 120000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code == 0;
+}
+
+bool dxCompareInit()
+{
+    if (g_cmp.tried) return g_cmp.ok;
+    g_cmp.tried = true;
+    if (!dxInit() || g_dxc.empty()) { logf("DxilCompare: needs the DXIL route and dxc"); return false; }
+    std::string src = g_dxDirS + "/compare.hlsl", out = g_dxDirS + "/compare.dxil";
+    HANDLE f = CreateFileW(wide(src).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { logf("DxilCompare: cannot write %s", src.c_str()); return false; }
+    DWORD w = 0;
+    WriteFile(f, kCompareHlsl, (DWORD)strlen(kCompareHlsl), &w, nullptr);
+    CloseHandle(f);
+    std::vector<uint8_t> blob;
+    if (!runDxc("-T cs_6_6 -E main -HV 2021 -Fo \"" + out + "\" \"" + src + "\"") || !readFile(out, blob)) {
+        logf("DxilCompare: compiling %s failed", src.c_str());
+        return false;
+    }
+    if (FAILED(g.d3d->CreateRootSignature(0, blob.data(), blob.size(), __uuidof(ID3D12RootSignature), (void**)&g_cmp.rs))) {
+        logf("DxilCompare: root signature failed");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_cmp.rs;
+    pd.CS = {blob.data(), blob.size()};
+    if (FAILED(g.d3d->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), (void**)&g_cmp.pso))) {
+        logf("DxilCompare: pipeline failed");
+        return false;
+    }
+    auto buffer = [](D3D12_HEAP_TYPE type, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st, ID3D12Resource** r) {
+        D3D12_HEAP_PROPERTIES hp{type};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 4096;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = flags;
+        return SUCCEEDED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                                        __uuidof(ID3D12Resource), (void**)r));
+    };
+    if (!buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                &g_cmp.result) ||
+        !buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &g_cmp.zero)) {
+        logf("DxilCompare: buffers failed");
+        return false;
+    }
+    void* m = nullptr;
+    if (SUCCEEDED(g_cmp.zero->Map(0, nullptr, &m)) && m) {
+        uint32_t init[1024] = {};
+        init[5] = init[6] = 0xffffffffu;   // bounding box minima
+        memcpy(m, init, sizeof init);
+        g_cmp.zero->Unmap(0, nullptr);
+    }
+    for (auto& r : g_cmp.rb)
+        if (!buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &r)) return false;
+    g_cmp.ok = true;
+    logf("DxilCompare: %s, output surface at parameter byte %u", g_dxCompare.c_str(), g_dxCompareOut);
+    return true;
+}
+
+std::string dxSlotInfo(uint32_t idx)
+{
+    auto it = g_slotViews.find(idx);
+    if (it == g_slotViews.end() || !it->second.res) return "?";
+    const ViewRec& v = it->second;
+    D3D12_RESOURCE_DESC d = v.res->GetDesc();
+    int fmt = v.uav ? (v.hasDesc ? v.uavDesc.Format : d.Format) : (v.hasDesc ? v.srv.Format : d.Format);
+    char b[96];
+    snprintf(b, sizeof b, "fmt %d view of fmt %d %llux%u", fmt, (int)d.Format, (unsigned long long)d.Width, d.Height);
+    return b;
+}
+
+// the shadow of the output surface (same description, UAV) in the UAV slot kShadowSlot; g_lock held
+bool dxShadowFor(const ViewRec& v, uint32_t realSlot)
+{
+    D3D12_RESOURCE_DESC d = v.res->GetDesc();
+    if (!g_cmp.shadow || memcmp(&d, &g_cmp.shadowDesc, sizeof d) != 0) {
+        if (g_cmp.shadow) g_cmp.shadow->Release();   // a resize: the old shadow may still be in flight once (debug only)
+        g_cmp.shadow = nullptr;
+        D3D12_RESOURCE_DESC sd = d;
+        sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(g.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                  nullptr, __uuidof(ID3D12Resource), (void**)&g_cmp.shadow))) {
+            logf("DxilCompare: shadow of %llux%u fmt %d failed", (unsigned long long)d.Width, d.Height, (int)d.Format);
+            return false;
+        }
+        g_cmp.shadowDesc = d;
+        logf("DxilCompare: shadow %llux%u fmt %d", (unsigned long long)d.Width, d.Height, (int)d.Format);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h{(SIZE_T)(g.dxViewsCpu + (size_t)(65536u + kShadowSlot) * g.dxViewInc)};
+    g.d3d->CreateUnorderedAccessView(g_cmp.shadow, nullptr, v.hasDesc ? &v.uavDesc : nullptr, h);
+    uint32_t* cls = g.info + kMaxSamplers * 4;
+    if (cls[kShadowSlot] != cls[realSlot]) {
+        cls[kShadowSlot] = cls[realSlot];
+        g.infoGen++;
+    }
+    return true;
+}
+
+// the compare pass (mode 0: copy the real output into the shadow, 1: compare) into list t; then DLSS-G's state back
+void dxComparePass(Chain* c, List* t, uint32_t realSlot, uint32_t mode, uint32_t rbi)
+{
+    using SetHeaps = void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*);
+    using SetRs = void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*);
+    using SetPso = void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*);
+    using SetView = void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+    using SetConsts = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const void*, UINT);
+    using Disp = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT);
+    using Barrier = void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RESOURCE_BARRIER*);
+    using CopyBuf = void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
+    auto transition = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = r;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a;
+        br.Transition.StateAfter = b;
+        orig<Barrier>(t, 26)(t, 1, &br);
+    };
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    if (mode == 1) {
+        transition(g_cmp.result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        orig<CopyBuf>(t, 15)(t, g_cmp.result, 0, g_cmp.zero, 0, 4096);
+        transition(g_cmp.result, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    D3D12_RESOURCE_DESC d = g_cmp.shadowDesc;
+    uint32_t consts[8] = {65536u + realSlot, 65536u + kShadowSlot, (uint32_t)d.Width, d.Height, mode, 0, 0, 0};
+    ID3D12DescriptorHeap* heaps[2] = {g.dxViews, g.dxSamplers};
+    orig<SetHeaps>(t, 28)(t, 2, heaps);
+    orig<SetRs>(t, 29)(t, g_cmp.rs);
+    orig<SetPso>(t, 25)(t, g_cmp.pso);
+    orig<SetConsts>(t, 35)(t, 0, 8, consts, 0);
+    orig<SetView>(t, 41)(t, 1, g_cmp.result->GetGPUVirtualAddress());
+    orig<Disp>(t, 14)(t, ((uint32_t)d.Width + 7) / 8, (d.Height + 7) / 8, 1);
+    orig<Barrier>(t, 26)(t, 1, &ub);
+    if (mode == 1) {
+        transition(g_cmp.result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        orig<CopyBuf>(t, 15)(t, g_cmp.rb[rbi], 0, g_cmp.result, 0, 4096);
+        transition(g_cmp.result, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    replay(c, t);
+}
+
+// results at least 6 compares old: logged
+void dxCompareCollect()
+{
+    for (int i = 0; i < 8; i++) {
+        if (!g_cmp.rbAt[i] || g_cmp.rbAt[i] + 6 > g_cmp.n) continue;
+        uint64_t at = g_cmp.rbAt[i];
+        g_cmp.rbAt[i] = 0;
+        void* m = nullptr;
+        D3D12_RANGE rr{0, 4096};
+        if (FAILED(g_cmp.rb[i]->Map(0, &rr, &m)) || !m) continue;
+        uint32_t r[1024];
+        memcpy(r, m, sizeof r);
+        D3D12_RANGE w{0, 0};
+        g_cmp.rb[i]->Unmap(0, &w);
+        float mx[4];
+        memcpy(mx, r + 1, sizeof mx);
+        bool show = g_cmp.logged < 6 || (r[0] && g_cmp.nonzero < 12) || at % 240 == 0;
+        if (r[0]) g_cmp.nonzero++;
+        if (!show) continue;
+        g_cmp.logged++;
+        std::string s;
+        char b[256];
+        snprintf(b, sizeof b, "DxilCompare #%llu: %u pixels differ (> 1/1024); max |diff| %.6g %.6g %.6g %.6g", (unsigned long long)at,
+                 r[0], mx[0], mx[1], mx[2], mx[3]);
+        s = b;
+        if (r[0]) {
+            snprintf(b, sizeof b, "; box x %u-%u y %u-%u", r[5], r[7], r[6], r[8]);
+            s += b;
+        }
+        logf("%s", s.c_str());
+        for (uint32_t k = 0; k < std::min<uint32_t>(r[0], 8u); k++) {
+            const uint32_t* e = r + 16 + k * 12;
+            float a[4], c[4];
+            memcpy(a, e + 4, sizeof a);
+            memcpy(c, e + 8, sizeof c);
+            logf("  (%u,%u) vulkan %.6g %.6g %.6g %.6g dxil %.6g %.6g %.6g %.6g", e[0], e[1], a[0], a[1], a[2], a[3], c[0], c[1],
+                 c[2], c[3]);
+        }
+    }
+}
+
+// in launch(), for the compare kernel: before = before the Vulkan launch is recorded, after = after batchFor
+void dxCompareBefore(List* list, const uint8_t* pbuf, uint32_t psize, uint32_t& realSlot, bool& go)
+{
+    go = false;
+    if (!pbuf || psize < g_dxCompareOut + 8 || !dxCompareInit()) return;
+    uint64_t hnd;
+    memcpy(&hnd, pbuf + g_dxCompareOut, 8);
+    realSlot = (uint32_t)hnd & 0xfffffu;
+    auto it = g_slotViews.find(65536u + realSlot);
+    if (realSlot == 0 || realSlot >= kShadowSlot || it == g_slotViews.end() || !it->second.res) {
+        static bool told = false;
+        if (!told) logf("DxilCompare: parameter byte %u = 0x%llx is not a known surface", g_dxCompareOut, (unsigned long long)hnd);
+        told = true;
+        return;
+    }
+    if (!g_cmp.paramsLogged) {
+        g_cmp.paramsLogged = true;
+        for (uint32_t i = 0; i + 8 <= psize; i += 8) {
+            uint64_t v;
+            memcpy(&v, pbuf + i, 8);
+            uint32_t s = (uint32_t)v & 0xfffffu;
+            if ((v >> 32) == 0 && s >= 32768u && s < kMaxImages)
+                logf("DxilCompare param %u: 0x%llx: texture slot %u (%s, sampler %u) / surface slot %u (%s)", i,
+                     (unsigned long long)v, s, dxSlotInfo(s).c_str(), (uint32_t)(v >> 20) & 0xfffu, s,
+                     dxSlotInfo(65536u + s).c_str());
+            else
+                logf("DxilCompare param %u: 0x%llx", i, (unsigned long long)v);
+        }
+    }
+    if (!dxShadowFor(it->second, realSlot)) return;
+    Chain* c = chainFor(list, true);
+    if (!c || c->closed) return;
+    List* t = c->target.load();
+    if (!t) t = c->list.load();
+    dxComparePass(c, t, realSlot, 0, 0);   // the shadow starts as the real output
+    go = true;
+}
+
+void dxCompareAfter(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t block[3], const uint8_t* pbuf,
+                    uint32_t psize, uint32_t realSlot)
+{
+    std::vector<uint8_t> p(pbuf, pbuf + psize);
+    uint64_t hnd;
+    memcpy(&hnd, p.data() + g_dxCompareOut, 8);
+    hnd = (hnd & ~0xfffffull) | kShadowSlot;
+    memcpy(p.data() + g_dxCompareOut, &hnd, 8);
+    if (!dxLaunchImpl(list, fn, grid, block, p.data(), psize)) {
+        static bool told = false;
+        if (!told) logf("DxilCompare: %s did not run on the DXIL route (see above): nothing compared", fn.name.c_str());
+        told = true;
+        return;
+    }
+    Chain* c = chainFor(list, true);
+    if (!c) return;
+    List* t = c->target.load();
+    if (!t) t = c->list.load();
+    g_cmp.n++;
+    dxCompareCollect();
+    int rbi = -1;
+    for (int i = 0; i < 8; i++)
+        if (!g_cmp.rbAt[i]) { rbi = i; break; }
+    if (rbi < 0) return;   // all in flight: skip this one
+    dxComparePass(c, t, realSlot, 1, (uint32_t)rbi);
+    g_cmp.rbAt[rbi] = g_cmp.n;
 }
 
 // ------------------------------------------------------------------------------------------------ launches
@@ -1982,6 +3221,7 @@ bool launchGroup(VkCommandBuffer cmd, CuFunction& fn, const uint32_t grid[3], co
     vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pc);
     vk.CmdDispatch(cmd, grp->grid[0], grp->grid[1], grp->grid[2]);
+    stamp(g.cur, &grp->name);
     grp->fn->launches++;
     g.grpRecent.push_back({ri, grp});
     if (g.grpRecent.size() > 16) g.grpRecent.pop_front();
@@ -2003,10 +3243,17 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
         fn.warned = true;
         return;
     }
+    if (dxLaunch(list, fn, grid, block, pbuf, psize)) return;
+    uint32_t cmpSlot = 0;
+    bool cmp = false;
+    if (!g_dxCompare.empty() && fn.name == g_dxCompare) dxCompareBefore(list, pbuf, psize, cmpSlot, cmp);
     Batch* b = batchFor(list);
     if (!b) return;
+    if (cmp) dxCompareAfter(list, fn, grid, block, pbuf, psize, cmpSlot);
+    if (g_splitLog) if (Chain* tc = findChain(nativeList(list))) tc->trace += " K:" + fn.name.substr(0, 40);
     VkCommandBuffer cmd = b->cmd;
     b->launches++;
+    g.cur = b;
     if (!g.groups.empty() && launchGroup(cmd, fn, grid, block, pbuf, psize)) return;
     PipeKey k{block[0], block[1], block[2], smem};
     uint32_t gx = grid[0], gy = grid[1], gz = grid[2];
@@ -2043,6 +3290,331 @@ void launch(List* list, CuFunction& fn, const uint32_t grid[3], const uint32_t b
     vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.CmdPushConstants(cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pc);
     vk.CmdDispatch(cmd, gx, gy, gz);
+    stamp(b, &fn.name);
+}
+
+// ------------------------------------------------------------------------------------------------ clears, resolves
+// A ClearUnorderedAccessView* between two launches used to end the kernel batch: the clear ran on the D3D12 queue
+// between two hand-offs (each ~0.15 ms of idle GPU on RDNA3). When a batch is open and the clear covers one whole mip
+// of a 2D surface DLSS-G created, it runs instead as a dispatch in the batch (clear_uav.comp), through the same raw
+// D3D12 descriptor the kernels write through, at the same point in the order. Anything else stays on D3D12.
+// 0: float / unorm / snorm, 1: uint, 2: sint, -1: not handled here
+int clearKind(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return 0;
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R8_UINT:
+        return 1;
+    case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT:
+        return 2;
+    default:
+        return -1;
+    }
+}
+
+VkPipeline clearPipeline()
+{
+    if (g.clearPipe || g.clearFailed) return g.clearPipe;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof kClearUavSpv;
+    mi.pCode = kClearUavSpv;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.pName = "main";
+    ci.layout = g.pipeLayout;
+    VkResult r = vk.CreateShaderModule(g.dev, &mi, nullptr, &g.clearShader);
+    if (r == VK_SUCCESS) {
+        ci.stage.module = g.clearShader;
+        r = vk.CreateComputePipelines(g.dev, g.pcache, 1, &ci, nullptr, &g.clearPipe);
+    }
+    if (r != VK_SUCCESS) {
+        logf("clear pipeline creation failed (%d): clears stay on D3D12", r);
+        g.clearPipe = VK_NULL_HANDLE;
+        g.clearFailed = true;
+    }
+    return g.clearPipe;
+}
+
+// a raw (R32_TYPELESS) or 32-bit typed buffer view: its elements written through the GPU virtual address
+bool recordBufferClear(Chain* c, const ViewRec& v, ID3D12Resource* res, const D3D12_RESOURCE_DESC& rd, const uint32_t vals[4],
+                       bool isFloat)
+{
+    if (!v.hasDesc || v.uavDesc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || v.uavDesc.Buffer.StructureByteStride) return false;
+    DXGI_FORMAT f = v.uavDesc.Format;
+    bool raw = (v.uavDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    if (raw ? f != DXGI_FORMAT_R32_TYPELESS : !(f == DXGI_FORMAT_R32_UINT || f == DXGI_FORMAT_R32_SINT || f == DXGI_FORMAT_R32_FLOAT))
+        return false;
+    if (isFloat ? f != DXGI_FORMAT_R32_FLOAT : (f == DXGI_FORMAT_R32_FLOAT && vals[0] != 0)) return false;
+    uint64_t first = v.uavDesc.Buffer.FirstElement, n = v.uavDesc.Buffer.NumElements;
+    if (!n || n > 0xffffffffull || (first + n) * 4 > rd.Width) return false;
+    VkPipeline pipe = clearPipeline();
+    if (!pipe) return false;
+    uint64_t addr = res->GetGPUVirtualAddress() + first * 4;
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the clear
+    serialize(b->cmd);
+    uint32_t pc[8] = {(uint32_t)addr, (uint32_t)(addr >> 32), (uint32_t)n, 3, vals[0], 0, 0, 0};
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    uint32_t groups = (uint32_t)((n + 63) / 64), gx = std::min<uint32_t>(groups, 65535), gy = (groups + gx - 1) / gx;
+    vk.CmdDispatch(b->cmd, gx, gy, 1);
+    stamp(b, &kLabelClear);
+    if (g.vkClears++ < 8)
+        logf("clear (%s) of buffer %p, %llu elements from %llu, on the kernels' queue", isFloat ? "float" : "uint",
+             (void*)res, (unsigned long long)n, (unsigned long long)first);
+    return true;
+}
+
+// records the clear into the open kernel batch of c, or false (then it goes to D3D12 and ends the batch); g_lock held
+bool recordClear(Chain* c, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource* res, const void* values, bool isFloat)
+{
+    if (c->closed || c->batches.empty() || c->dirty.load() || !res) return false;
+    ViewRec v;
+    if (!lookupView(cpu.ptr, v) || !v.uav || v.res != res) return false;
+    D3D12_RESOURCE_DESC rd = res->GetDesc();
+    uint32_t vals[4];
+    memcpy(vals, values, sizeof vals);
+    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return recordBufferClear(c, v, res, rd, vals, isFloat);
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.SampleDesc.Count != 1) return false;
+    if (v.hasDesc && (v.uavDesc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || v.uavDesc.Texture2D.PlaneSlice != 0))
+        return false;
+    if (!v.hasDesc && rd.DepthOrArraySize != 1) return false;
+    DXGI_FORMAT fmt = v.hasDesc && v.uavDesc.Format != DXGI_FORMAT_UNKNOWN ? v.uavDesc.Format : rd.Format;
+    int kind = clearKind(fmt);
+    if (kind < 0 || vkFormat(fmt) == VK_FORMAT_UNDEFINED) return false;
+    uint32_t mode;
+    if (isFloat) {
+        if (kind != 0) return false;   // float values converted to integers: left to D3D12
+        mode = 0;
+    } else if (kind == 0) {
+        // raw bits into a non-integer format: only zero, which is 0.0 in every float / unorm / snorm format
+        if (vals[0] | vals[1] | vals[2] | vals[3]) return false;
+        mode = 0;
+    } else {
+        mode = (uint32_t)kind;
+    }
+    static std::map<DXGI_FORMAT, bool> storable;
+    auto st = storable.find(fmt);
+    if (st == storable.end()) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{fmt};
+        bool ok = SUCCEEDED(g.d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) &&
+                  (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+        st = storable.emplace(fmt, ok).first;
+    }
+    if (!st->second) return false;
+    VkPipeline pipe = clearPipeline();
+    if (!pipe) return false;
+    uint32_t slot = viewSlot(cpu, true);
+    if (!slot) return false;
+    uint32_t mip = v.hasDesc ? v.uavDesc.Texture2D.MipSlice : 0;
+    uint32_t w = std::max<uint32_t>(1, (uint32_t)(rd.Width >> mip)), h = std::max<uint32_t>(1, rd.Height >> mip);
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the clear
+    serialize(b->cmd);
+    uint32_t pc[8] = {slot, w, h, mode, vals[0], vals[1], vals[2], vals[3]};
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vk.CmdDispatch(b->cmd, (w + 7) / 8, (h + 7) / 8, 1);
+    stamp(b, &kLabelClear);
+    if (g.vkClears++ < 4)
+        logf("clear (%s) of %p %ux%u format %d on the kernels' queue, slot %u", isFloat ? "float" : "uint", (void*)res, w,
+             h, (int)fmt, slot);
+    return true;
+}
+
+template <bool Float>
+void STDMETHODCALLTYPE sClearUav(List* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                 ID3D12Resource* res, const void* values, UINT nrects, const D3D12_RECT* rects)
+{
+    constexpr unsigned kSlot = Float ? 50 : 49;
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[kSlot]++;
+        if (g_cfg.vkClears && nrects == 0 && values) {
+            std::lock_guard<std::recursive_mutex> l(g_lock);
+            if (recordClear(c, cpu, res, values, Float)) {
+                if (g_splitLog) c->trace += Float ? " C50" : " C49";
+                return;
+            }
+        }
+        if (g_splitLog) c->trace += Float ? " s50" : " s49";
+        c->dirty.store(true, std::memory_order_relaxed);
+    }
+    using Fn = void(STDMETHODCALLTYPE*)(List*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*,
+                                        const void*, UINT, const D3D12_RECT*);
+    orig<Fn>(t, kSlot)(t, gpu, cpu, res, values, nrects, rects);
+}
+
+// a resolve into CPU-read memory (a timer's readback buffer) touches nothing a kernel reads: it does not end the batch
+void STDMETHODCALLTYPE sResolveQueryData(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start, UINT n,
+                                         ID3D12Resource* dst, UINT64 off)
+{
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[54]++;
+        bool readback = false;
+        D3D12_HEAP_PROPERTIES hp{};
+        if (!g_cfg.splitQueries && dst && SUCCEEDED(dst->GetHeapProperties(&hp, nullptr)))
+            readback = hp.Type == D3D12_HEAP_TYPE_READBACK ||
+                       (hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
+        if (g_splitLog) c->trace += readback ? " R54" : " s54";
+        if (!readback) c->dirty.store(true, std::memory_order_relaxed);
+    }
+    using Fn = void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource*, UINT64);
+    orig<Fn>(t, 54)(t, heap, type, start, n, dst, off);
+}
+
+// ------------------------------------------------------------------------------------------------ copies
+// DLSS-G copies its real frame into OutputReal when the caller provides one (Streamline does, at MultiFrameIndex 1):
+// a CopyResource between two launches, which ended the batch (one more D3D12 <-> Vulkan round trip per real frame).
+// With a batch open it runs as a dispatch in the batch instead (copy_res.comp), for buffers (32-bit words through
+// the GPU virtual addresses) and for 2D textures in formats whose texel round trip is exact: UNORM, UINT, SINT.
+// 0 unorm, 1 uint, 2 sint, -1 not here
+int copyKind(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        return 0;
+    default:
+        break;
+    }
+    int k = clearKind(f);
+    return k == 1 || k == 2 ? k : -1;
+}
+
+VkPipeline copyPipeline()
+{
+    if (g.copyPipe || g.copyFailed) return g.copyPipe;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof kCopyResSpv;
+    mi.pCode = kCopyResSpv;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.pName = "main";
+    ci.layout = g.pipeLayout;
+    VkResult r = vk.CreateShaderModule(g.dev, &mi, nullptr, &g.copyShader);
+    if (r == VK_SUCCESS) {
+        ci.stage.module = g.copyShader;
+        r = vk.CreateComputePipelines(g.dev, g.pcache, 1, &ci, nullptr, &g.copyPipe);
+    }
+    if (r != VK_SUCCESS) {
+        logf("copy pipeline creation failed (%d): copies stay on D3D12", r);
+        g.copyPipe = VK_NULL_HANDLE;
+        g.copyFailed = true;
+    }
+    return g.copyPipe;
+}
+
+// a descriptor of `res` in the scratch heap, as a slot of the bindless set
+uint32_t scratchView(ID3D12Resource* res, DXGI_FORMAT fmt, bool uav)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g.scratchHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)(g.scratchNext++ % 4096) * g.scratchInc;
+    if (uav) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+        u.Format = fmt;
+        u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.d3d->CreateUnorderedAccessView(res, nullptr, &u, h);
+    } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        g.d3d->CreateShaderResourceView(res, &v, h);
+    }
+    return viewSlot(h, uav);
+}
+
+// records CopyResource(dst, src) into the open kernel batch of c, or false (D3D12 then; it ends the batch); g_lock held
+bool recordCopy(Chain* c, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    if (c->closed || c->batches.empty() || c->dirty.load() || !dst || !src || dst == src || !g.scratchHeap) return false;
+    D3D12_RESOURCE_DESC d = dst->GetDesc(), s = src->GetDesc();
+    if (d.Dimension != s.Dimension || d.Width != s.Width || d.Height != s.Height || d.DepthOrArraySize != s.DepthOrArraySize ||
+        d.MipLevels != s.MipLevels || d.Format != s.Format || d.SampleDesc.Count != 1 || s.SampleDesc.Count != 1)
+        return false;
+    VkPipeline pipe = copyPipeline();
+    if (!pipe) return false;
+    uint32_t pc[7] = {};
+    uint32_t gx, gy;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (d.Width % 4 || d.Width / 4 > 0xffffffffull) return false;
+        uint64_t da = dst->GetGPUVirtualAddress(), sa = src->GetGPUVirtualAddress(), n = d.Width / 4;
+        uint32_t groups = (uint32_t)((n + 63) / 64);
+        gx = std::min<uint32_t>(groups, 65535);
+        gy = (groups + gx - 1) / gx;
+        uint32_t v[7] = {(uint32_t)da, (uint32_t)(da >> 32), 0, (uint32_t)n, 3, (uint32_t)sa, (uint32_t)(sa >> 32)};
+        memcpy(pc, v, sizeof pc);
+    } else {
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.MipLevels != 1) return false;
+        if (!(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || (s.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+            return false;
+        int kind = copyKind(d.Format);
+        if (kind < 0) return false;
+        static std::map<DXGI_FORMAT, bool> storable;
+        auto st = storable.find(d.Format);
+        if (st == storable.end()) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{d.Format};
+            bool ok = SUCCEEDED(g.d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) &&
+                      (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            st = storable.emplace(d.Format, ok).first;
+        }
+        if (!st->second) return false;
+        uint32_t ss = scratchView(src, s.Format, false), ds = scratchView(dst, d.Format, true);
+        if (!ss || !ds) return false;
+        uint32_t w = (uint32_t)d.Width, h = d.Height;
+        gx = (w + 7) / 8;
+        gy = (h + 7) / 8;
+        uint32_t v[7] = {ss, ds, w, h, (uint32_t)kind, 0, 0};
+        memcpy(pc, v, sizeof pc);
+    }
+    Batch* b = c->batches.back();
+    g.pending.erase(b->cmd);   // a launch group open in this batch cannot take members after the copy
+    serialize(b->cmd);
+    vk.CmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.CmdPushConstants(b->cmd, g.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vk.CmdDispatch(b->cmd, gx, gy, 1);
+    static const std::string kLabelCopy = "(copy)";
+    stamp(b, &kLabelCopy);
+    if (g.vkCopies++ < 4)
+        logf("copy of %p into %p (%llux%u format %d) on the kernels' queue", (void*)src, (void*)dst,
+             (unsigned long long)d.Width, d.Height, (int)d.Format);
+    return true;
+}
+
+void STDMETHODCALLTYPE sCopyResource(List* self, ID3D12Resource* dst, ID3D12Resource* src)
+{
+    List* t;
+    if (Chain* c = stateChain(self, t)) {
+        c->slotCalls[17]++;
+        if (g_cfg.vkCopies) {
+            std::lock_guard<std::recursive_mutex> l(g_lock);
+            if (recordCopy(c, dst, src)) {
+                if (g_splitLog) c->trace += " C17";
+                return;
+            }
+        }
+        if (g_splitLog) c->trace += " s17";
+        c->dirty.store(true, std::memory_order_relaxed);
+    }
+    orig<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, ID3D12Resource*)>(t, 17)(t, dst, src);
 }
 
 // ------------------------------------------------------------------------------------------------ modules
@@ -2317,9 +3889,30 @@ void configure(const Config& config)
 {
     g_cfg = config;
     g_splitBarriers = config.splitBarriers;
+    g_splitLog = config.splitLog;
     g_cache = utf8(config.cacheDir);
     for (char& c : g_cache) if (c == '\\') c = '/';
     while (!g_cache.empty() && g_cache.back() == '/') g_cache.pop_back();
+    if (const char* e = getenv("CUX_PTRHEAP")) g_ptrHeapOn = *e == '1';
+    if (const char* e = getenv("CUX_DXIL")) g_dxDirS = e;
+    if (const char* e = getenv("CUX_DXIL_KERNELS")) g_dxKernelsS = e;
+    if (config.dxil) {
+        g_ptrHeapOn = true;
+        if (g_dxDirS.empty()) g_dxDirS = g_cache + "/dxil";
+        g_dxCompare = utf8(config.dxilCompare);
+        g_dxCompareOut = config.dxilCompareOut;
+        if (g_dxKernelsS.empty() && !config.dxilKernels.empty()) {
+            g_dxKernelsS = utf8(config.dxilKernels);
+            g_dxKernelsS.erase(std::remove(g_dxKernelsS.begin(), g_dxKernelsS.end(), ' '), g_dxKernelsS.end());
+        }
+        if (g_dxKernelsS.empty()) g_dxKernelsS = "*";
+        g_hlslDir = g_cache + "/hlsl";
+        g_dxc = utf8(config.dxc);
+        for (char& ch : g_dxc) if (ch == '\\') ch = '/';
+        CreateDirectoryW(wide(g_dxDirS).c_str(), nullptr);
+    }
+    if (!g_dxDirS.empty()) g_dxDir = g_dxDirS.c_str();
+    if (!g_dxKernelsS.empty()) g_dxKernels = g_dxKernelsS.c_str();
     if (g_log == INVALID_HANDLE_VALUE && !config.logPath.empty())
         g_log = CreateFileW(config.logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2363,6 +3956,8 @@ FgScope::~FgScope()
         if (g.launchCount - saved > 5000) { saved = g.launchCount; savePipelineCache(); }
     }
 }
+
+void newFeature() { markNewFeature(); }
 
 std::string summary()
 {

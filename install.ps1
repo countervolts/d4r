@@ -8,6 +8,7 @@ param(
     [switch]$NoEngine,       # only the NVIDIA DLLs, no engine models
     [switch]$EngineOnly,     # only the engine models (the DLLs are already installed)
     [switch]$RebuildEngine,  # build the models again even when a cached build fits
+    [switch]$NoFrameGeneration,  # leave DLSS Frame Generation (RDNA3 / RDNA4) as it is
     [string]$Folder = $PSScriptRoot
 )
 # Windows PowerShell 5.1 (what install.cmd runs) leaves $PSScriptRoot empty in parameter defaults
@@ -29,6 +30,20 @@ $PythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVer
 $PythonSha256 = 'a93abe456ab01bd96d7a085b3cdb6566b3063f4241360d114142fbdb07f0a310'
 $NumpyUrl = 'https://files.pythonhosted.org/packages/52/9a/e1e512ebc948d5b9dd33b08736760f0ebbed2848fd4eda1f553088a6dcee/numpy-2.5.4-cp314-cp314-win_amd64.whl'
 $NumpySha256 = '2ca144f15135b6212a5c47b1e2aeca6e412f102f95a2d5d88d8aec77eb255de3'
+# DLSS Frame Generation (d4r\fg\dlssg): DLSS-G 310.7.0 from the DLSS repository (the full model) and Streamline
+# 2.14.16's DLSS-G 310.9.16 (FG Lite) with its DLLs for OptiScaler's DLSS-G output, as install.sh pins them
+$DlssgUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/a291cc7d2cc642a51566f3dfd5376f635cd1b284/lib/Windows_x86_64/rel/nvngx_dlssg.dll'
+$DlssgSha256 = '135eaf0733c1e37381a8c28abcf7a862404a54132b81787c04e35d09efc5e36f'
+$SlUrl = 'https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip'
+$SlSha256 = '32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b'
+$SlFiles = [ordered]@{
+    'nvngx_dlssg.dll' = '8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7'
+    'sl.interposer.dll' = 'b1d7395aebd7b9722841d64dcf7433680020b6a8e421f851c16d5ba0c2182edf'
+    'sl.common.dll' = '38eea3b4209afc455636ea372b5933d65fcc13becec6c84d101dcfc4d8648f75'
+    'sl.dlss_g.dll' = '3ed9538df724993bea8a050195a6a78b9c8c8a566d5b05ade477aab3c390e90f'
+    'sl.reflex.dll' = '443577e869352436ff7ec8f4d9c90418d3e95368436ce219261e0f4f07a38122'
+    'sl.pcl.dll' = '5698c38e722318681f215c9fe68e45b9bedd51378acc699d8eee26e961e57770'
+}
 
 function Fail([string]$Message) { Write-Host "install.ps1: $Message" -ForegroundColor Red; exit 1 }
 function Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -217,14 +232,13 @@ function Get-Python {
     return $python
 }
 
-try {
-    if ($EngineOnly) { $NoEngine = $false } else { Install-Dlls }
+function Install-Engine {
     $builder = Join-Path $Runtime 'tools\build-engine-models.py'
     if (-not (Test-Path $builder)) {
         if ($EngineOnly) { Fail "missing $builder (this release has no engine-model builder)" }
-        Write-Host 'Done.'; exit 0
+        return
     }
-    if ($NoEngine) { Write-Host 'No engine models: run the installer again to build them later.'; exit 0 }
+    if ($NoEngine) { Write-Host 'No engine models: run the installer again to build them later.'; return }
     $python = Get-Python
     $env:PYTHONUNBUFFERED = '1'   # the builder's progress in order with its tools' errors
     # what the native D3D12 engine runs: Ray Reconstruction D/E/F and Super Resolution K, M and L
@@ -244,7 +258,7 @@ try {
     $modelTools = Join-Path $tools 'models\model_tools.py'
     $have = { param($dir) Native { & $python $modelTools validate $dir @models 2>$null }; $LASTEXITCODE -eq 0 }
     if (-not $RebuildEngine -and (Test-Path $stamp) -and (Get-Content $stamp) -eq $key -and (& $have $engine)) {
-        Write-Host 'The engine models in this folder are up to date.'; exit 0
+        Write-Host 'The engine models in this folder are up to date.'; return
     }
     $shared = Join-Path $Cache "engine-models\$key"
     if (-not $RebuildEngine -and (Test-Path $shared) -and (& $have $shared)) {
@@ -273,7 +287,68 @@ try {
         Move-Item -LiteralPath "$shared.tmp" -Destination $shared
     }
     Set-Content -LiteralPath $stamp -Value $key -NoNewline
-    Write-Host "Done. The engine models are in $engine."
+    Write-Host "The engine models are in $engine."
+}
+
+# DLSS Frame Generation (d4r\fg\dlssg) on RDNA3 / RDNA4: NVIDIA's DLSS-G DLLs (cached in %LOCALAPPDATA%\d4r\nvidia),
+# their kernels translated for this GPU, and OptiScaler's NGX route through the DLSS-G host (d4r\tools\fg_install.py).
+# A failure here leaves the upscaling set up; it is reported, not fatal.
+function Install-FrameGeneration {
+    $setup = Join-Path $Runtime 'tools\fg_install.py'
+    if ($NoFrameGeneration -or -not (Test-Path $setup) -or -not (Test-Path (Join-Path $Runtime 'fg\dlssg\nvngx.dll_dlssg_host.dll'))) { return }
+    if (-not (Test-Path (Join-Path $Root 'OptiScaler.ini'))) { return }
+    $python = Get-Python
+    Native { & $python $setup $Runtime --check }
+    if ($LASTEXITCODE -ne 0) { return }
+    $dir = Join-Path $Nvidia 'dlssg'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $full = Join-Path $Nvidia 'nvngx_dlssg-310.7.0.dll'
+    $missing = @($SlFiles.Keys | Where-Object { -not (Valid (Join-Path $dir $_) $SlFiles[$_]) })
+    $needFull = -not (Valid $full $DlssgSha256)
+    if ($missing -or $needFull) {
+        Write-Host "DLSS Frame Generation uses NVIDIA's DLSS-G 310.7.0 and the Streamline SDK 2.14.16, under NVIDIA's license terms:"
+        Write-Host '  https://github.com/NVIDIA/DLSS/blob/v310.9.1/LICENSE.txt'
+        Write-Host '  https://github.com/NVIDIA-RTX/Streamline/blob/main/license.txt'
+        $size = $(if ($missing) { 263 } else { 0 }) + $(if ($needFull) { 8 } else { 0 })
+        if (-not (Ask "Download them now (~$size MiB, once: later installs use $Nvidia)?" $true)) {
+            Write-Host 'DLSS Frame Generation: not set up (not downloaded). Run the installer again to set it up.'; return
+        }
+    }
+    if ($needFull) {
+        Write-Host 'Downloading DLSS-G 310.7.0...'
+        $file = Join-Path $Tmp 'nvngx_dlssg.dll'
+        Download $DlssgUrl $file; Verify $file $DlssgSha256; Keep $file 'nvngx_dlssg-310.7.0.dll'
+    }
+    if ($missing) {
+        Write-Host 'Downloading NVIDIA Streamline SDK 2.14.16 (~263 MiB)...'
+        $zip = Join-Path $Tmp 'streamline.zip'
+        Download $SlUrl $zip; Verify $zip $SlSha256
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+        try {
+            foreach ($name in $SlFiles.Keys) {
+                $entry = $archive.GetEntry("bin/x64/$name")
+                if (-not $entry) { Fail "Streamline SDK archive has no bin/x64/$name" }
+                $out = Join-Path $Tmp $name
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $out, $true)
+                Verify $out $SlFiles[$name]
+            }
+        } finally { $archive.Dispose() }
+        Remove-Item -LiteralPath $zip -Force
+        foreach ($name in $SlFiles.Keys) {
+            Copy-Item -LiteralPath (Join-Path $Tmp $name) -Destination (Join-Path $dir "$name.tmp") -Force
+            Move-Item -LiteralPath (Join-Path $dir "$name.tmp") -Destination (Join-Path $dir $name) -Force
+        }
+    }
+    Native { & $python $setup $Runtime --full $full --lite (Join-Path $dir 'nvngx_dlssg.dll') --streamline $dir }
+    if ($LASTEXITCODE -ne 0) { Write-Host 'DLSS Frame Generation: not set up (reason above). Upscaling is unaffected.' -ForegroundColor Yellow }
+}
+
+try {
+    if ($EngineOnly) { $NoEngine = $false } else { Install-Dlls }
+    Install-Engine
+    Install-FrameGeneration
+    Write-Host 'Done.'
 } finally {
     Remove-Item -Recurse -Force -LiteralPath $Tmp -ErrorAction SilentlyContinue
 }

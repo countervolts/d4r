@@ -197,12 +197,27 @@ AmdGeneration amd_render_generation(ID3D12Device* renderDevice)
             {
                 render = found;
                 renderId = device;
+                // the render GPU's driver version ("32.0.32015.7029" is AMD Software 26.10.1), from its PnP driver key:
+                // the real one, whatever DXGI reports to a game OptiScaler spoofs
+                if (const HKEY key = SetupDiOpenDevRegKey(set, &data, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ);
+                    key != INVALID_HANDLE_VALUE)
+                {
+                    wchar_t text[64] = {};
+                    DWORD size = sizeof(text) - sizeof(wchar_t);
+                    unsigned v[4] = {};
+                    if (RegQueryValueExW(key, L"DriverVersion", nullptr, nullptr, reinterpret_cast<LPBYTE>(text), &size) == ERROR_SUCCESS &&
+                        std::swscanf(text, L"%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]) == 4)
+                        g_renderDriverVersion = (uint64_t(v[0]) << 48) | (uint64_t(v[1]) << 32) | (uint64_t(v[2]) << 16) | v[3];
+                    RegCloseKey(key);
+                }
             }
         }
         SetupDiDestroyDeviceInfoList(set);
         const char* names[] = {"unknown", "older than RDNA 3", "RDNA 3", "RDNA 4"};
         if (render != AmdGeneration::Unknown)
-            logf("render GPU: AMD 1002:%04x (%s)", renderId, names[int(render)]);
+            logf("render GPU: AMD 1002:%04x (%s), driver %u.%u.%u.%u", renderId, names[int(render)],
+                 unsigned(g_renderDriverVersion >> 48), unsigned(g_renderDriverVersion >> 32 & 0xffff),
+                 unsigned(g_renderDriverVersion >> 16 & 0xffff), unsigned(g_renderDriverVersion & 0xffff));
         else
             logf("render GPU: not identified (%s); the newest AMD GPU installed is %s",
                  located ? "no PnP device at its PCI address" : "no kernel adapter address", names[int(newest)]);
@@ -276,12 +291,29 @@ d4r::dx::RModel* native_engine_rr(unsigned preset)
     std::call_once(g_engineDx.rrOnce[i],[i,preset]{
         static const char* variables[] = {"D4R_ENGINE_MODEL_RR_D_DIR", "D4R_ENGINE_MODEL_RR_E_DIR", "D4R_ENGINE_MODEL_RR_F_DIR"};
         static const wchar_t* folders[] = {L"\\engine\\rr-d", L"\\engine\\rr-e", L"\\engine\\rr-f"};
-        const auto directory=engine_model_directory(variables[i],folders[i]);
-        if(GetFileAttributesA((directory+"/rr-d3d12.txt").c_str())==INVALID_FILE_ATTRIBUTES)return;
-        // every D3D12 RR package has FP8 WMMA stages (RDNA 4; rr-e's enc0_m too): their pipelines remove the game's
-        // device elsewhere, as M's do (Ghost of Tsushima, RX 7700 XT)
-        if(!rdna4_installed() && env_string("D4R_ENGINE_M_BACKEND")!="fp8"){
-            logf("engine backend (D3D12 RR %c): needs an RDNA 4 GPU (FP8 WMMA); not loaded",char('D'+i));return;}
+        // RDNA 3 (no FP8 matrices): presets D and E from the RDNA 3 packages engine\rr-d-gfx11 / rr-e-gfx11
+        // (build_native_model.sh with D4R_RR_GFX11=1, then compile_rr_dxil.py: f16 WMMA, ZLUDA's gfx11 FP8 arithmetic
+        // exactly, no FP8 instruction), as the Vulkan route takes them; D4R_ENGINE_MODEL_RR_D/E_GFX11_DIR override.
+        // Preset F has no RDNA 3 arithmetic on any route.
+        static const char* gfx11Variables[] = {"D4R_ENGINE_MODEL_RR_D_GFX11_DIR", "D4R_ENGINE_MODEL_RR_E_GFX11_DIR"};
+        static const wchar_t* gfx11Folders[] = {L"\\engine\\rr-d-gfx11", L"\\engine\\rr-e-gfx11"};
+        const bool fp8 = rdna4_installed() || env_string("D4R_ENGINE_M_BACKEND")=="fp8";
+        const bool gfx11 = !fp8 && i < 2 && amd_render_generation(g.device) == AmdGeneration::Rdna3 &&
+                           env_uint("D4R_D3D12_RR_GFX11", 1) != 0;
+        const auto directory=gfx11 ? engine_model_directory(gfx11Variables[i],gfx11Folders[i]) : engine_model_directory(variables[i],folders[i]);
+        if(GetFileAttributesA((directory+"/rr-d3d12.txt").c_str())==INVALID_FILE_ATTRIBUTES){
+            if(gfx11)logf("engine backend (D3D12 RR %c): no RDNA 3 package (%s); not loaded",char('D'+i),directory.c_str());
+            return;}
+        // the package's arithmetic must match the GPU: an FP8 package's pipelines remove an RDNA 3 device (as M's do:
+        // Ghost of Tsushima, RX 7700 XT), and a gfx11 package's register layouts are wrong on RDNA 4
+        std::string metadata;
+        const bool packageGfx11 = read_whole_file(widen(directory + "\\rr.txt"), metadata) &&
+                                  metadata.find("\narithmetic gfx11") != std::string::npos;
+        if(!fp8 && !packageGfx11){
+            logf("engine backend (D3D12 RR %c): needs an RDNA 4 GPU (FP8 WMMA)%s; not loaded",char('D'+i),
+                 i < 2 ? " or an RDNA 3 package (engine\\rr-d-gfx11, rr-e-gfx11)" : "");return;}
+        if(fp8 && packageGfx11){
+            logf("engine backend (D3D12 RR %c): %s is an RDNA 3 package; not loaded on this GPU",char('D'+i),directory.c_str());return;}
         try { auto model=std::make_unique<d4r::dx::RModel>(g.device,directory);
             if(model->preset()!=preset)throw std::runtime_error("RR model preset mismatch");
             g_engineDx.rrModel[i]=std::move(model);logf("engine backend (D3D12 RR %c): loaded %s",char('D'+i),directory.c_str());
@@ -363,6 +395,22 @@ static void reap_engine_dx()
         std::lock_guard<std::mutex> stateLock(state->mutex);
         return !state->pending && (state->idle() || now - state->released > std::chrono::seconds(5));
     }), retired.end());
+}
+
+// A game texture smaller than the rectangle the engine would read or write this frame. That is a per-frame state
+// (Marvel's Spider-Man 2 hands NGX such a frame mid-session, issue #66), not a property of the feature: skip only this
+// frame (the game keeps its own output for it), keep the feature and its engine, and restart the temporal history on
+// the next frame that is recorded. Returns false, as a refusal does.
+static bool engine_dx_skip_uncovered(Feature& feature, const char* path, const char* plane, uint32_t x, uint32_t y,
+                                     uint32_t width, uint32_t height, const D3D12_RESOURCE_DESC& desc, uint32_t frame)
+{
+    feature.engineHistoryLost = true;
+    if (++feature.engineRectMisses <= 3 || feature.engineRectMisses % 600 == 0)
+        logf("engine backend (D3D12%s): the %s texture (%llux%u) does not cover its rectangle (%u,%u %ux%u); feature %u "
+             "skips frame %u (%u such frames so far) and restarts its history on the next one",
+             path, plane, static_cast<unsigned long long>(desc.Width), desc.Height, x, y, width, height,
+             feature.handle.Id, frame, feature.engineRectMisses);
+    return false;
 }
 
 void release_engine_dx(Feature& feature)
@@ -498,8 +546,17 @@ static void engine_dx_end_timing(EngineDxFeature& state, int slot, ID3D12Graphic
     state.pendingTiming = slot;
 }
 
+#ifdef D4R_ENGINE_D3DHIP
+static bool engine_dx_split_ready();
+static void engine_dx_hip_fence(EngineDxFeature& state);
+static void engine_dx_hip_network(void* owner, ID3D12CommandQueue* queue);
+#endif
+
 // Presets M and L on GPUs without FP8 WMMA (engine/d3d12/runtime_m_rdna3.h): the same frame, recorded into the game's
 // command list with FP16 WMMA and software FP8 storage. Same contract as engine_evaluate_d3d12_m.
+// d3dhip (default when the package has them; D4R_D3DHIP_M=0 or D4R_DX_NET=dxil: the DXIL network): the ten Swin layers on the package's native HIP layers (compile_m.py --hip with a gfx110x
+// kernel folder) between the engine's front and back, as for RDNA 4; the RDNA 3 engine converts its token-major
+// tokens / dec1 to and from the network's plane layout (m_planes.hlsl), so its own input and expansion stages stay.
 
 static bool engine_evaluate_d3d12_m_rdna3(Feature& feature, d4r::dx::rdna3::MModel& model, ID3D12GraphicsCommandList* list,
                                           ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
@@ -536,17 +593,69 @@ static bool engine_evaluate_d3d12_m_rdna3(Feature& feature, d4r::dx::rdna3::MMod
         release_engine_dx(feature);
         reset = true;
     }
+#ifdef D4R_ENGINE_D3DHIP
+    // the HIP network's token grid is fixed: another render size needs a new network
+    if (feature.engineDx != nullptr && feature.engineDx->hip != nullptr &&
+        (p.renderWidth != feature.engineDx->hipWidth || p.renderHeight != feature.engineDx->hipHeight))
+    {
+        logf("engine backend (D3D12, RDNA 3 M/L, d3dhip): render size %ux%u, the network's is %ux%u: a new engine (history restarts)",
+             p.renderWidth, p.renderHeight, feature.engineDx->hipWidth, feature.engineDx->hipHeight);
+        release_engine_dx(feature);
+        reset = true;
+    }
+#endif
     try
     {
         if (feature.engineDx == nullptr)
         {
-            auto state = std::make_unique<EngineDxFeature>();
-            state->upscalerRdna3 = std::make_unique<d4r::dx::rdna3::GameUpscalerM>(model, feature.outWidth, feature.outHeight,
-                                                                                    capacityWidth, capacityHeight);
-            feature.engineDx = std::move(state);
-            logf("engine backend (D3D12): feature %u runs preset %c in the game's command list (%ux%u -> %ux%u, capacity %ux%u%s), FP16 WMMA, no CUDA",
-                 feature.handle.Id, presetL ? 'L' : 'M', p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight, capacityWidth,
-                 capacityHeight, ldr ? ", LDR" : "");
+#ifdef D4R_ENGINE_D3DHIP
+            const std::string directory = engine_m_directory(ldr, presetL);
+            const char* net = std::getenv("D4R_DX_NET");
+            const bool hipWanted = env_uint("D4R_D3DHIP_M", 1) != 0 && !(net && !std::strcmp(net, "dxil")) &&
+                                   !feature.engineMHipFailed && model.hasExternalStages() &&
+                                   GetFileAttributesA((directory + "/hipnet.bin").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                                   GetFileAttributesA((directory + "/hip").c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (hipWanted && engine_dx_split_ready() && (feature.splitFence != nullptr || create_native_split(feature)) && load_hip_net())
+            {
+                try
+                {
+                    // the network's two buffers hold the token grid of this render size (as the RDNA 4 engine's)
+                    const uint64_t bytes = d4r::dx::MEngine::networkBufferBytes(p.renderWidth, p.renderHeight);
+                    auto state = std::make_unique<EngineDxFeature>();
+                    char error[256] = {};
+                    state->hip = g_hipApi.create(g.device, directory.c_str(), p.renderWidth, p.renderHeight, bytes, bytes,
+                                                 error, sizeof(error));
+                    if (state->hip == nullptr)
+                        throw std::runtime_error(error[0] != '\0' ? error : "the HIP network could not be created");
+                    engine_dx_hip_fence(*state);
+                    state->hipTokens = g_hipApi.tokens(state->hip);
+                    state->hipHead = g_hipApi.head(state->hip);
+                    const d4r::dx::ExternalNetworkDx external{state->hipTokens.Get(), state->hipHead.Get()};
+                    state->upscalerRdna3 = std::make_unique<d4r::dx::rdna3::GameUpscalerM>(model, feature.outWidth, feature.outHeight,
+                                                                                            p.renderWidth, p.renderHeight, &external);
+                    state->hipWidth = p.renderWidth;
+                    state->hipHeight = p.renderHeight;
+                    feature.engineDx = std::move(state);
+                    logf("engine backend (D3D12): feature %u runs preset %c in the game's command list (%ux%u -> %ux%u%s), RDNA 3, "
+                         "with its network on the model's HIP layers (d3dhip)", feature.handle.Id, presetL ? 'L' : 'M',
+                         p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight, ldr ? ", LDR" : "");
+                }
+                catch (const std::exception& error)
+                {
+                    logf("engine backend (D3D12, RDNA 3 M/L, d3dhip): %s; using the DXIL network", error.what());
+                }
+            }
+#endif
+            if (feature.engineDx == nullptr)
+            {
+                auto state = std::make_unique<EngineDxFeature>();
+                state->upscalerRdna3 = std::make_unique<d4r::dx::rdna3::GameUpscalerM>(model, feature.outWidth, feature.outHeight,
+                                                                                        capacityWidth, capacityHeight);
+                feature.engineDx = std::move(state);
+                logf("engine backend (D3D12): feature %u runs preset %c in the game's command list (%ux%u -> %ux%u, capacity %ux%u%s), FP16 WMMA, no CUDA",
+                     feature.handle.Id, presetL ? 'L' : 'M', p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight, capacityWidth,
+                     capacityHeight, ldr ? ", LDR" : "");
+            }
         }
     }
     catch (const std::exception& error)
@@ -570,21 +679,59 @@ static bool engine_evaluate_d3d12_m_rdna3(Feature& feature, d4r::dx::rdna3::MMod
     s.reset = reset;
     try
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if ((feature.flags & 0x4) != 0 && p.mvScaleX != 0.0f && p.mvScaleY != 0.0f)
+#ifdef D4R_ENGINE_D3DHIP
+        const bool hip = state.hip != nullptr;
+#else
+        const bool hip = false;
+#endif
+        int timing = -1;
+        EngineDxMarks marks{&state, -1, 0};
         {
-            s.motionOffset[0] = (p.jitterX - state.committedJitter[0]) / p.mvScaleX;
-            s.motionOffset[1] = (p.jitterY - state.committedJitter[1]) / p.mvScaleY;
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if ((feature.flags & 0x4) != 0 && p.mvScaleX != 0.0f && p.mvScaleY != 0.0f)
+            {
+                s.motionOffset[0] = (p.jitterX - state.committedJitter[0]) / p.mvScaleX;
+                s.motionOffset[1] = (p.jitterY - state.committedJitter[1]) / p.mvScaleY;
+            }
+            timing = engine_dx_timing(state, frame, presetL ? "L" : "M", kEngineDxStagesMRdna3,
+                                      stage_count(kEngineDxStagesMRdna3), p.renderWidth, p.renderHeight,
+                                      feature.outWidth, feature.outHeight);
+            marks.slot = timing;
+            engine_dx_mark(state, timing, list, 0);
+            if (hip) state.upscalerRdna3->recordFront(list, game, marks.profiler(1));
+            else state.upscalerRdna3->record(list, game, marks.profiler(1));
         }
-        const int timing = engine_dx_timing(state, frame, presetL ? "L" : "M", kEngineDxStagesMRdna3,
-                                            stage_count(kEngineDxStagesMRdna3), p.renderWidth, p.renderHeight,
-                                            feature.outWidth, feature.outHeight);
-        EngineDxMarks marks{&state, timing, 0};
-        engine_dx_mark(state, timing, list, 0);
-        state.upscalerRdna3->record(list, game, marks.profiler(1));
-        engine_dx_end_timing(state, timing, list);
-        state.pendingJitter[0] = p.jitterX; state.pendingJitter[1] = p.jitterY;
-        state.pending = true;
+#ifdef D4R_ENGINE_D3DHIP
+        if (hip)
+        {
+            // as engine_evaluate_d3d12_m: the split's mutex without state.mutex (the between-parts hook takes them the other way)
+            ID3D12GraphicsCommandList* back = nullptr;
+            const bool split = native_split_frame(feature, list, frame, engine_dx_hip_network, &state, &back);
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (split)
+            {
+                state.upscalerRdna3->recordBack(back, marks.profiler(1));
+                engine_dx_end_timing(state, timing, back);
+            }
+            else
+            {
+                logf("engine backend (D3D12, RDNA 3 M/L, d3dhip): feature %u could not split its list at frame %u; the DXIL engine replaces it",
+                     feature.handle.Id, frame);
+                feature.engineMHipFailed = true;
+                state.upscalerRdna3->recordBack(list, marks.profiler(1));
+                engine_dx_end_timing(state, timing, list);
+            }
+            state.pendingJitter[0] = p.jitterX; state.pendingJitter[1] = p.jitterY;
+            state.pending = true;
+        }
+        else
+#endif
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            engine_dx_end_timing(state, timing, list);
+            state.pendingJitter[0] = p.jitterX; state.pendingJitter[1] = p.jitterY;
+            state.pending = true;
+        }
     }
     catch (const std::exception& error)
     {
@@ -756,12 +903,13 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         d4r::dx::GameTexture* texture;
         uint32_t width, height;
         D3D12_RESOURCE_STATES state;
+        const char* plane;
     };
     const Source sources[4] = {
-        {color, &game.color, p.renderWidth, p.renderHeight, inputState},
-        {depth, &game.depth, p.renderWidth, p.renderHeight, depthState},
-        {motion, &game.motion, displayMotion ? feature.outWidth : p.renderWidth, displayMotion ? feature.outHeight : p.renderHeight, inputState},
-        {output, &game.output, feature.outWidth, feature.outHeight, outputState},
+        {color, &game.color, p.renderWidth, p.renderHeight, inputState, "color"},
+        {depth, &game.depth, p.renderWidth, p.renderHeight, depthState, "depth"},
+        {motion, &game.motion, displayMotion ? feature.outWidth : p.renderWidth, displayMotion ? feature.outHeight : p.renderHeight, inputState, "motion"},
+        {output, &game.output, feature.outWidth, feature.outHeight, outputState, "output"},
     };
     for (const Source& source : sources)
     {
@@ -776,7 +924,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         if (source.texture == &game.output && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             return refuse("the output does not allow unordered access");
         if (source.width > desc.Width || source.height > desc.Height)
-            return refuse("a texture does not cover its rectangle");
+            return engine_dx_skip_uncovered(feature, ", M", source.plane, 0, 0, source.width, source.height, desc, frame);
     }
     auto& s = game.settings;
     s.renderWidth = p.renderWidth; s.renderHeight = p.renderHeight;
@@ -788,7 +936,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         s.motionOffset[0] = (p.jitterX - feature.engineJitter[0]) / p.mvScaleX;
         s.motionOffset[1] = (p.jitterY - feature.engineJitter[1]) / p.mvScaleY;
     }
-    s.reset = p.reset != 0 || feature.engineDx == nullptr;
+    s.reset = p.reset != 0 || feature.engineDx == nullptr || feature.engineHistoryLost;
     s.depthInverted = (feature.flags & 0x8) != 0;
     // capacity: the render size the feature was created with (NGX's maximum), at least this frame's; a larger frame
     // starts a new engine at its size
@@ -946,6 +1094,7 @@ static bool engine_evaluate_d3d12_m(Feature& feature, ID3D12GraphicsCommandList*
         d4r_submit::track(list, {&state, engine_dx_submitted, engine_dx_discarded});
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
+    feature.engineHistoryLost = false;
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded on D3D12, preset %c (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u)", frame,
              presetL ? 'L' : 'M', p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY, p.renderWidth, p.renderHeight);
@@ -1182,7 +1331,7 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
             logf("engine backend (D3D12): %s; native feature %u rejected at frame %u", reason, feature.handle.Id, frame);
         else
             logf("engine backend (D3D12): %s; feature %u uses the CUDA backend from frame %u", reason, feature.handle.Id, frame);
-        if (feature.engineDx != nullptr)
+        if (feature.engineDx != nullptr && !feature.nativeD3d12)
             logf("engine backend (D3D12): the temporal history restarts in the CUDA backend");
         release_engine_dx(feature);
         return false;
@@ -1227,14 +1376,15 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
         d4r::dx::GameTexture* texture;
         uint32_t x, y, width, height;
         D3D12_RESOURCE_STATES state;
+        const char* plane;
     };
     const Source sources[5] = {
-        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState},
-        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState},
+        {color, &game.color, p.colorBaseX, p.colorBaseY, p.renderWidth, p.renderHeight, inputState, "color"},
+        {depth, &game.depth, p.depthBaseX, p.depthBaseY, p.renderWidth, p.renderHeight, depthState, "depth"},
         {motion, &game.motion, p.mvBaseX, p.mvBaseY, displayMotion ? feature.outWidth : p.renderWidth,
-         displayMotion ? feature.outHeight : p.renderHeight, inputState},
-        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState},
-        {exposure, &game.exposure, 0, 0, 1, 1, inputState},
+         displayMotion ? feature.outHeight : p.renderHeight, inputState, "motion"},
+        {output, &game.output, p.outputBaseX, p.outputBaseY, feature.outWidth, feature.outHeight, outputState, "output"},
+        {exposure, &game.exposure, 0, 0, 1, 1, inputState, "exposure"},
     };
     for (size_t index = 0; index < (gameExposure ? 5u : 4u); ++index) // sources[4] (exposure): game exposure only
     {
@@ -1250,15 +1400,17 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
             return refuse(reason);
         D3D12_RESOURCE_DESC desc;
         source.resource->GetDesc(&desc);
-        if (source.x + source.width > desc.Width || source.y + source.height > desc.Height)
-            return refuse("a texture does not cover its rectangle");
+        if (uint64_t(source.x) + source.width > desc.Width || uint64_t(source.y) + source.height > desc.Height)
+            return engine_dx_skip_uncovered(feature, "", source.plane, source.x, source.y, source.width, source.height,
+                                            desc, frame);
     }
 #ifdef D4R_ENGINE_D3DHIP
     // a failed split leaves this frame's engine external: the next frame is created with the DXIL network instead
     if (feature.engineKHipFailed && feature.engineDx != nullptr && feature.engineDx->hip)
         release_engine_dx(feature);
 #endif
-    game.settings = engine_k_settings(feature, p, ldr, displayMotion, autoExposure, feature.engineDx == nullptr);
+    game.settings = engine_k_settings(feature, p, ldr, displayMotion, autoExposure,
+                                      feature.engineDx == nullptr || feature.engineHistoryLost);
     try
     {
 #ifdef D4R_ENGINE_D3DHIP
@@ -1266,11 +1418,16 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
         // hip\), between the engine's front and back in the game's split list. Faster than the DXIL network where
         // AMD's driver compiles that network poorly (26.10.1 on RDNA3) and on RDNA4 (RX 9070 XT, 26.10.1: 1.30
         // against 1.38 ms at 720p -> 1440p, 2.70 against 2.77 at 1080p -> 4K), slower on others. Default (2): on
-        // with an RDNA4 GPU in the fast set ([Kernels] PreferAccuracy = false) when the package has the HIP layers;
+        // with an RDNA4 GPU, or an RDNA3 GPU on driver 26.10.1 or newer, in the fast set ([Kernels] PreferAccuracy = false) when the package has the HIP layers;
         // 0 never, 1 on any GPU.
+        // RDNA3 too from AMD Software 26.10.1 (driver 32.0.32015) on, whose shader compiler schedules the DXIL network
+        // about 9% worse than 26.8.1's (docs/windows-k-d3dhip.md): RX 7700 XT, 26.10.1, harness, interleaved:
+        // 2.48 -> 2.26 ms at 720p -> 1440p, 2.61 -> 2.39 at 1706x960 -> 1440p. Older drivers keep the DXIL network.
         const unsigned d3dhipK = env_uint("D4R_D3DHIP_K", 2);
+        const bool rdna3Hip = amd_render_generation(g.device) == AmdGeneration::Rdna3 &&
+                              g_renderDriverVersion >= ((uint64_t(32) << 48) | (uint64_t(32015) << 16));
         if (feature.engineDx == nullptr && !feature.engineKHipFailed &&
-            (d3dhipK == 1 || (d3dhipK == 2 && env_uint("D4R_PREFER_ACCURACY", 0) == 0 && rdna4_installed())))
+            (d3dhipK == 1 || (d3dhipK == 2 && env_uint("D4R_PREFER_ACCURACY", 0) == 0 && (rdna4_installed() || rdna3Hip))))
         {
             const std::string directory = ldr ? engine_model_directory("D4R_ENGINE_MODEL_LDR_DIR", L"\\engine\\k-ldr")
                                               : engine_model_directory("D4R_ENGINE_MODEL_DIR", L"\\engine\\k");
@@ -1387,6 +1544,9 @@ static bool engine_evaluate_d3d12(Feature& feature, ID3D12GraphicsCommandList* l
         d4r_submit::track(list, {&state, engine_dx_submitted, engine_dx_discarded});
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
+    if (feature.engineHistoryLost)
+        logf("engine backend (D3D12): feature %u records again at frame %u (history restarted)", feature.handle.Id, frame);
+    feature.engineHistoryLost = false;
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded on D3D12 (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f, render %ux%u, "
              "exposure %s, preExposure %.6g, exposureScale %.6g)", frame,
