@@ -273,7 +273,7 @@ if [[ ! -f "$BUILDER" ]]; then
   done_msg; exit 0
 fi
 # the builder lists the Super Resolution models it builds (today the same on every GPU)
-models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 $(bash "$BUILDER" --list-sr-models))
+models=(rr-d rr-e rr-f rr-d-gfx11 rr-e-gfx11 rr-f-gfx11 $(bash "$BUILDER" --list-sr-models))
 # One build serves every game with the same DLLs, builder and model set: the key covers them and the accuracy choice.
 key() {   # key EXACT(0|1)
   { echo "exact=$1"

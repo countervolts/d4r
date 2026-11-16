@@ -12,7 +12,7 @@ import sys
 import time
 
 MANIFEST = 'files.sha256.json'
-MODELS = ('rr-d', 'rr-e', 'rr-f', 'rr-d-gfx11', 'rr-e-gfx11', 'e', 'f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
+MODELS = ('rr-d', 'rr-e', 'rr-f', 'rr-d-gfx11', 'rr-e-gfx11', 'rr-f-gfx11', 'e', 'f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
 
 
 def digest(path):

@@ -35,12 +35,33 @@ uint g11_h2e4m3(uint h)
     return s | c;
 }
 #endif
+#ifdef RR_G11_FAST
+// RR_G11_FAST: g11_h2e4m3 without its branches (both forms computed, then selected; the branch made every conversion
+// a divergent region), and no NaN code (a NaN saturates to 0x7e). Normals: the bits less 8 in the exponent (the scaled
+// pattern) rounded to a multiple of 128, nearest even, clamped to 0x7e. Subnormals (steps of 2^-9): |x| * 2^9 < 8 is
+// exact in f32, and adding 2^23 rounds it to an integer (nearest even) in the f32 sum's own rounding.
+uint g11_code(float16_t h)
+{
+    const uint b = uint(float16BitsToUint16(h)), a = b & 0x7fffu, t = a - 0x2000u;
+    const uint cn = min((t + 0x3fu + ((t >> 7u) & 1u)) >> 7u, 0x7eu);
+    precise float m = fma(abs(float(h)), 512.0, 8388608.0);
+    return ((b >> 8u) & 0x80u) | (a >= 0x2400u ? cn : floatBitsToUint(m) - 0x4b000000u);
+}
+uint g11_codef(float x) { return g11_code(float16_t(x)); }
+uint g11_code2f(float x, float y) { return g11_codef(x) | (g11_codef(y) << 8u); }
+#else
 uint g11_code(float16_t h) { return g11_h2e4m3(uint(float16BitsToUint16(h))); }
 // an f32 that holds a binary16 value
 uint g11_codef(float x) { return g11_code(float16_t(x)); }
+uint g11_code2f(float x, float y) { return g11_codef(x) | (g11_codef(y) << 8u); }
+#endif
 // the exact binary16 value of a code (ZLUDA's e4m3_to_f16_bits; NaN -> 0x7fff with the sign)
 float16_t g11_e4h(uint c)
 {
+#ifdef RR_G11_FAST
+    // the scaled pattern times 2^8 (exact: a scaled subnormal becomes a normal); no NaN codes
+    return uint16BitsToFloat16(uint16_t(((c & 0x7fu) << 7u) | ((c & 0x80u) << 8u))) * float16_t(256.0);
+#endif
     const uint m = c & 0x7fu;
     uint h = m >= 8u ? (m << 7u) + 0x2000u : uint(float16BitsToUint16(float16_t(float(m & 7u) * 0.001953125)));
     h = m == 0x7fu ? 0x7fffu : h;
@@ -51,12 +72,21 @@ float16_t g11_e4h(uint c)
 // four codes -> the scaled binary16 pairs (bytes 0, 1) and (bytes 2, 3), ZLUDA's e4m3x4_to_scaled_f16x2x2
 uvec2 g11_sc4(uint packed)
 {
+#ifdef RR_G11_FAST
+    // each code into the high byte of a 16-bit lane (byte permutes), one arithmetic shift per pair moves the magnitude to
+    // bits 7..14 with the sign kept at 15 (and copied to 14, cleared). No NaN codes.
+    const uint lo = ((packed & 0xffu) << 8u) | ((packed & 0xff00u) << 16u);
+    const uint hi = ((packed >> 8u) & 0xff00u) | (packed & 0xff000000u);
+    const i16vec2 l = (i16vec2(unpack16(lo)) >> int16_t(1)) & int16_t(0xbfff), h = (i16vec2(unpack16(hi)) >> int16_t(1)) & int16_t(0xbfff);
+    return uvec2(pack32(l), pack32(h));
+#else
     uint mag = packed & 0x7f7f7f7fu;
     mag |= (mag + 0x01010101u) & 0x80808080u;
     const uint sign = packed & 0x80808080u;
     const uint lo = ((mag & 0xffu) << 7u) | ((mag & 0xff00u) << 15u) | ((sign & 0x80u) << 8u) | ((sign & 0x8000u) << 16u);
     const uint hi = (((mag >> 16u) & 0xffu) << 7u) | ((mag >> 24u) << 23u) | ((sign & 0x800000u) >> 8u) | (sign & 0x80000000u);
     return uvec2(lo, hi);
+#endif
 }
 // an operand from its lane's 16 codes in k order (four words): positions in ZLUDA's order
 #define G11_FILL(m, w0, w1, w2, w3) { \
@@ -82,8 +112,8 @@ uint g11_row(uint r) { return (r >> 1u) | ((r & 1u) << 3u); }
 // FP8 vectors in the accumulator layout: element i of a lane (row i + 8 half) as byte i & 3 of word i >> 2
 #define F8V uvec2
 // the codes of an accumulator that holds binary16 values
-#define G11_CODES(dst, src) { (dst) = uvec2(0u); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) \
-    (dst)[i_ >> 2] |= g11_codef((src)[i_]) << (8u * uint(i_ & 3)); }
+#define G11_CODES(dst, src) { (dst) = uvec2(0u); [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) \
+    (dst)[i_ >> 2] |= g11_code2f(float((src)[i_]), float((src)[i_ + 1])) << (8u * uint(i_ & 3)); }
 // the B operand that is the accumulator-layout codes c (the gfx12 elementwise conversion of an accumulator into B):
 // rows 0..7 are half-wave 0's codes, 8..15 half-wave 1's
 #define G11_B(dst, c) { const uvec2 o_ = uvec2(subgroupShuffleXor((c).x, 16u), subgroupShuffleXor((c).y, 16u)); \

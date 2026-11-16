@@ -102,6 +102,9 @@ int main() {
     assert(d4r_rr_model_compatible(wide, true, false));
     assert(d4r_rr_model_compatible(fp8, true, true));
     assert(!d4r_rr_model_compatible("D4RR0002\npreset 6\n", true, false));
+    assert(d4r_rr_model_compatible("D4RR0002\npreset 6\n", true, true));
+    assert(!d4r_rr_model_compatible("D4RR0002\npreset 6\narithmetic gfx11\n", false, true));
+    assert(d4r_rr_model_compatible("D4RR0002\npreset 6\narithmetic gfx11\n", true, false));
     assert(!d4r_rr_model_compatible("D4RR0001\narithmetic unknown\n", true, true));
     VkCooperativeMatrixPropertiesKHR p{};
     p.MSize=p.NSize=p.KSize=16; p.scope=VK_SCOPE_SUBGROUP_KHR;
