@@ -207,12 +207,18 @@ void GameDenoiser::record(ID3D12GraphicsCommandList *list, const GameFrameR &fra
             throw std::runtime_error("RR input/output aliasing");
         if (t->x || t->y)
             throw std::runtime_error("RR D3D12 requires origin zero");
+        // An input may be larger than the render size (Unreal Engine pads its targets, e.g. 2295x961 in 2296x964, and
+        // keeps pooled targets at their largest extent): the stages read it from the origin over the render size, as
+        // the Vulkan path and NGX itself do. It may not be smaller.
         if (t->resource)
         {
             auto d = t->resource->GetDesc();
-            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || d.Width != g.maxWidth ||
-                d.Height != g.maxHeight)
-                throw std::runtime_error("RR D3D12 input dimensions must match the render size");
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1)
+                throw std::runtime_error("RR D3D12 inputs must be single-sample 2D textures");
+            if (d.Width < g.maxWidth || d.Height < g.maxHeight)
+                throw std::runtime_error("RR D3D12 input " + std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+                                         " is smaller than the render size " + std::to_string(g.maxWidth) + "x" +
+                                         std::to_string(g.maxHeight));
         }
     }
     for (auto *a : inputs)

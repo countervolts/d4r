@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 DLSS_SHA256 = 'be6e434a94ca32499515eb62ca0e6c274526055d568d0426e4c652dcdfb6ee6e'   # nvngx_dlss.dll 310.7.0
 DLSSD_SHA256 = '4bc7ea5fcb2f32cf86bc2cb072e8d2860914a0be511cbdcb2fc206c1d9d83b80'  # nvngx_dlssd.dll 310.9.1
@@ -38,6 +39,19 @@ RR_GFX11_MODELS = ('rr-d-gfx11', 'rr-e-gfx11')
 MODELS = RR_MODELS + RR_GFX11_MODELS + ('k', 'k-ldr', 'e', 'f', 'l', 'l-ldr', 'm', 'm-ldr')
 # what the native D3D12 engine runs (E and F, DLSS 3's CNN, run on the Vulkan engine only)
 DEFAULT_MODELS = RR_MODELS + ('k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
+# RDNA2 (gfx103x): none. Every native D3D12 shader uses WMMA (RDNA 3 and later), so the shim keeps the engine off on
+# older GPUs and takes the CUDA (ZLUDA) route (D4R_ENGINE_GPU_CHECK); building models there took the longest part of
+# an RDNA2 install (ZLUDA test frames) for nothing.
+RDNA2_MODELS = ()
+
+
+def gpu_models(arch):
+    """the models the native D3D12 engine can run on GPU target ARCH (every model when ARCH is unknown)"""
+    return RDNA2_MODELS if arch.startswith('gfx103') else DEFAULT_MODELS
+
+
+def minutes(seconds):
+    return f'{int(seconds // 60)}m {int(seconds % 60):02d}s' if seconds >= 60 else f'{seconds:.0f}s'
 
 
 def fail(message):
@@ -80,12 +94,15 @@ if hip.hipInit(0) == 0:
 '''
 
 
-def hip_device_only():
+def hip_device_only(quiet=False):
     """With more than one AMD GPU (a Ryzen CPU's integrated graphics beside a Radeon card), AMD's Windows HIP runtime
     has crashed in its own worker thread on the frames' first allocations (RX 7900 XTX with an iGPU: 0xC0000005 in
     amdhip64_7.dll at cuMemAlloc). The test frames then see only the card with the most memory - the dedicated one, as
     integrated graphics have a share of system memory - through HIP_VISIBLE_DEVICES. A value the user set is kept.
-    Returns the GPU target of the device the test frames use ("gfx1031"), '' when unknown."""
+    Returns the GPU target of the device the test frames use ("gfx1031"), '' when unknown. D4R_GPU_ARCH overrides
+    the target (not the device selection)."""
+    if os.environ.get('D4R_GPU_ARCH') and quiet:
+        return os.environ['D4R_GPU_ARCH']
     try:
         listed = subprocess.run([sys.executable, '-c', HIP_DEVICES], capture_output=True, text=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
@@ -100,8 +117,9 @@ def hip_device_only():
     # with HIP_VISIBLE_DEVICES set, the listing only has the devices it names
     if len(devices) > 1 and not os.environ.get('HIP_VISIBLE_DEVICES'):
         os.environ['HIP_VISIBLE_DEVICES'] = str(index)
-        print(f'{len(devices)} AMD GPUs: the test frames use HIP device {index} ({name}, {size >> 20} MiB) only')
-    return arch
+        if not quiet:
+            print(f'{len(devices)} AMD GPUs: the test frames use HIP device {index} ({name}, {size >> 20} MiB) only')
+    return os.environ.get('D4R_GPU_ARCH') or arch
 
 
 def stub_network(arch):
@@ -121,6 +139,7 @@ class Builder:
         self.dll = runtime / 'nvngx_dlss.dll'
         self.total, self.done = 0, 0   # models to build and built, for the progress line
         self.stubs = None              # the empty network modules (stub_network), when the frames use them
+        self.timings = []              # (seconds, log) per step, for the summary and WORK/timings.txt
 
     def status(self, log):
         """the progress line for the step that writes LOG: a bar of the models built and the step in words"""
@@ -149,12 +168,27 @@ class Builder:
 
     def run(self, log, *command, env=None, cwd=None, check=True):
         """COMMAND bounded by the timeout, its output in WORK/LOG; False when it failed and not CHECK"""
+        started = time.monotonic()
         result = subprocess.run([sys.executable, str(self.tools), 'run', '--log', str(self.work / log),
                                  '--timeout', str(self.timeout), '--status', self.status(log),
                                  '--', *map(str, command)], env=env, cwd=cwd)
+        self.timings.append((time.monotonic() - started, log))
+        self.write_timings()
         if result.returncode and check:
             fail(f'failed: {log} (see {self.work / log})')
         return not result.returncode
+
+    def write_timings(self):
+        """WORK/timings.txt: every step so far, in order (kept with the logs, also when a step fails)"""
+        lines = [f'{seconds:8.1f} s  {log}' for seconds, log in self.timings]
+        lines.append(f'{sum(s for s, _ in self.timings):8.1f} s  total')
+        (self.work / 'timings.txt').write_text('\n'.join(lines) + '\n')
+
+    def summary(self):
+        """one line: the total and the slowest steps"""
+        total = sum(s for s, _ in self.timings)
+        slowest = ', '.join(f'{log.removesuffix(".log")} {minutes(s)}' for s, log in sorted(self.timings, reverse=True)[:3])
+        return f'{minutes(total)} (slowest: {slowest})' if slowest else minutes(total)
 
     def place(self, name, source, ignore=()):
         """replace RUNTIME/engine/NAME with the built model (renames: safe while a game runs)"""
@@ -243,18 +277,28 @@ class Builder:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('runtime', nargs='?', type=Path, help='the d4r folder (default: the one above tools)')
-    parser.add_argument('--models', default=','.join(DEFAULT_MODELS),
-                        help=f'comma-separated, from {",".join(MODELS)} (default {",".join(DEFAULT_MODELS)})')
+    parser.add_argument('--models', help=f'comma-separated, from {",".join(MODELS)} (default: what this GPU runs, '
+                        f'{",".join(DEFAULT_MODELS)}; none on RDNA2)')
+    parser.add_argument('--list-models', action='store_true',
+                        help='only print the default models for this GPU, comma-separated, or "none" (install.ps1 asks)')
     parser.add_argument('--timeout', type=float, default=float(os.environ.get('D4R_MODEL_TIMEOUT', 3600)),
                         help='seconds allowed for each step (default 3600: the first frame compiles DLSS)')
     parser.add_argument('--keep', action='store_true', help='keep the captures and logs')
     a = parser.parse_args()
+    if a.list_models:
+        print(','.join(gpu_models(hip_device_only(quiet=True))) or 'none')
+        return 0
     if os.name != 'nt':
         fail('this builder renders its frames natively on Windows; on Linux run build-engine-models.sh')
     tools = Path(__file__).resolve().parent
     kit = tools / 'models'
     runtime = (a.runtime or tools.parent).resolve()
-    models = [m for m in a.models.split(',') if m]
+    arch = hip_device_only()
+    models = [m for m in (a.models if a.models is not None else ','.join(gpu_models(arch))).split(',') if m]
+    if a.models is None and not models:
+        print(f'{arch} (RDNA2): no engine models to build (the native engine needs RDNA 3 or later; d4r runs DLSS '
+              'through ZLUDA on this GPU)')
+        return 0
     for model in models:
         if model not in MODELS:
             fail(f'unknown model {model} (choose from {", ".join(MODELS)})')
@@ -286,7 +330,6 @@ def main():
         if not (kit / 'bin' / required).is_file():
             fail(f'{required} is missing from {kit / "bin"} (an incomplete d4r folder; extract the release again)')
     os.environ['D4R_DXC'] = str(kit / 'bin' / 'dxc.exe')
-    arch = hip_device_only()
     # an RDNA3 GPU: its own RR D / E packages beside the FP8 ones (which only an RDNA4 GPU loads)
     if arch.startswith('gfx110'):
         for name in ('rr-d', 'rr-e'):
@@ -360,6 +403,8 @@ def main():
     except BaseException:
         print(f'build-engine-models: failed build and captures preserved at {work}', file=sys.stderr)
         raise
+    if b.timings:
+        print(f'Model build time: {b.summary()} (every step: {work / "timings.txt"})')
     if not a.keep:
         for leftover in work.iterdir():
             if leftover.is_dir() and not any(leftover.rglob('*.log')):

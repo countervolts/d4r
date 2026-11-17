@@ -1149,28 +1149,39 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
         ID3D12Resource *resource;
         d4r::dx::GameTexture *texture;
         D3D12_RESOURCE_STATES state;
+        const char *plane;
     };
     Source sources[] = {
-        {color, &game.color, inputState},
-        {depth, &game.depth, depthState},
-        {motion, &game.motion, inputState},
-        {normals, &game.normals, inputState},
-        {roughness, &game.roughness, inputState},
-        {diffuse, &game.diffuseAlbedo, inputState},
-        {specular, &game.specularAlbedo, inputState},
-        {get_resource(parameters, "DLSSD.SpecularHitDistance"), &game.specularHitDistance, inputState},
-        {get_resource(parameters, "DLSS.DisocclusionMask"), &game.disocclusionMask, inputState},
-        {get_resource(parameters, "DLSSD.ScreenSpaceSubsurfaceScatteringGuide"), &game.subsurfaceGuide, inputState},
-        {get_resource(parameters, "DLSSD.ColorBeforeParticles"), &game.colorBeforeParticles, inputState},
-        {output, &game.output, outputState}};
+        {color, &game.color, inputState, "color"},
+        {depth, &game.depth, depthState, "depth"},
+        {motion, &game.motion, inputState, "motion"},
+        {normals, &game.normals, inputState, "normals"},
+        {roughness, &game.roughness, inputState, "roughness"},
+        {diffuse, &game.diffuseAlbedo, inputState, "diffuse albedo"},
+        {specular, &game.specularAlbedo, inputState, "specular albedo"},
+        {get_resource(parameters, "DLSSD.SpecularHitDistance"), &game.specularHitDistance, inputState, "specular hit distance"},
+        {get_resource(parameters, "DLSS.DisocclusionMask"), &game.disocclusionMask, inputState, "disocclusion mask"},
+        {get_resource(parameters, "DLSSD.ScreenSpaceSubsurfaceScatteringGuide"), &game.subsurfaceGuide, inputState, "subsurface guide"},
+        {get_resource(parameters, "DLSSD.ColorBeforeParticles"), &game.colorBeforeParticles, inputState, "color before particles"},
+        {output, &game.output, outputState, "output"}};
     for (auto &source : sources)
     {
         if (!source.resource)
             continue;
         *source.texture = {source.resource, source.state, DXGI_FORMAT_UNKNOWN, 0, 0};
+        if (source.texture == &game.output)
+            continue;
         const char *why = nullptr;
-        if (source.texture != &game.output && !d4r::dx::gameInputTexture(g.device, *source.texture, &why))
+        if (!d4r::dx::gameInputTexture(g.device, *source.texture, &why))
             return refuse(why);
+        // An input larger than the render size is read from its origin (Unreal Engine pads its targets: 2295x961 in
+        // 2296x964). A smaller one is a per-frame state (a resolution or menu change, issue #71): skip only this frame
+        // and restart the history on the next, as the SR path does (#66), instead of ending the feature.
+        D3D12_RESOURCE_DESC desc;
+        source.resource->GetDesc(&desc);
+        if (desc.Width < p.renderWidth || desc.Height < p.renderHeight)
+            return engine_dx_skip_uncovered(feature, " RR", source.plane, 0, 0, p.renderWidth, p.renderHeight, desc,
+                                            frame);
     }
     auto &s = game.settings;
     s.jitter[0] = p.jitterX;
@@ -1179,7 +1190,7 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
     s.motionScale[1] = p.mvScaleY;
     s.preExposure = p.preExposure;
     s.frameTimeMs = p.frameTime;
-    s.reset = p.reset != 0 || !feature.engineDx;
+    s.reset = p.reset != 0 || !feature.engineDx || feature.engineHistoryLost;
     s.depthInverted = (feature.flags & 8) != 0;
     s.hardwareDepth = p.auxScalar[AuxHardwareDepth] != 0;
     s.roughnessPacked = packed;
@@ -1197,6 +1208,9 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
     if (feature.engineDx &&
         (feature.engineDx->rrWidth != p.renderWidth || feature.engineDx->rrHeight != p.renderHeight))
     {
+        logf("engine backend (D3D12 RR): feature %u render size %ux%u -> %ux%u at frame %u; the engine is rebuilt and "
+             "its history restarts", feature.handle.Id, feature.engineDx->rrWidth, feature.engineDx->rrHeight,
+             p.renderWidth, p.renderHeight, frame);
         release_engine_dx(feature);
         s.reset = true;
     }
@@ -1316,6 +1330,10 @@ static bool engine_evaluate_d3d12_rr(Feature &feature, ID3D12GraphicsCommandList
     {
         return refuse(e.what());
     }
+    if (feature.engineHistoryLost)
+        logf("engine backend (D3D12 RR): feature %u records again at frame %u (history restarted, render %ux%u)",
+             feature.handle.Id, frame, p.renderWidth, p.renderHeight);
+    feature.engineHistoryLost = false;
     if (frame <= 3)
         logf("engine frame %u recorded on D3D12, RR preset %c", frame, char('D' + feature.preset - 4));
     return true;

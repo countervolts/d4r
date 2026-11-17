@@ -241,10 +241,18 @@ function Install-Engine {
     if ($NoEngine) { Write-Host 'No engine models: run the installer again to build them later.'; return }
     $python = Get-Python
     $env:PYTHONUNBUFFERED = '1'   # the builder's progress in order with its tools' errors
-    # what the native D3D12 engine runs: Ray Reconstruction D/E/F and Super Resolution K, M and L
-    $rrModels = @('rr-d', 'rr-e', 'rr-f')
-    $srModels = @('k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
-    $models = $rrModels + $srModels
+    # what the native D3D12 engine runs on this GPU, as the builder decides it: Ray Reconstruction D/E/F and Super
+    # Resolution K, M and L; nothing on RDNA2 (its shaders need WMMA: the shim takes the ZLUDA route there). Every
+    # model when the GPU cannot be read.
+    $models = @('rr-d', 'rr-e', 'rr-f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
+    $listed = Native { & $python $builder --list-models $Runtime 2>$null }
+    if ($LASTEXITCODE -eq 0 -and "$listed".Trim() -eq 'none') {
+        Write-Host 'No engine models for this GPU: the native engine needs RDNA 3 or later, so d4r runs DLSS through ZLUDA here.'
+        return
+    }
+    if ($LASTEXITCODE -eq 0 -and "$listed".Trim() -match '^[a-z0-9-]+(,[a-z0-9-]+)*$') { $models = "$listed".Trim() -split ',' }
+    $rrModels = @($models | Where-Object { $_ -like 'rr-*' })
+    $srModels = @($models | Where-Object { $_ -notlike 'rr-*' })
     # One build serves every game with the same DLLs, builder and models: the key covers them.
     $parts = @("models=$($models -join ',')", (Sha256 (Join-Path $Runtime 'nvngx_dlss.dll')),
         (Sha256 (Join-Path $Runtime 'nvngx_dlssd.dll')))
@@ -269,14 +277,17 @@ function Install-Engine {
             Copy-Item -Recurse -LiteralPath (Join-Path $shared $m) -Destination (Join-Path $engine $m)
         }
     } else {
-        Write-Host "Building the engine's models from NVIDIA's DLLs on this machine: a few minutes. On RDNA2 the first"
-        Write-Host "Super Resolution build can take about half an hour while ZLUDA compiles DLSS's kernels."
+        Write-Host "Building the engine's models from NVIDIA's DLLs on this machine ($($models -join ', ')): a few minutes."
         # separately, as install.sh does: one set failing still builds the other
         $failed = @()
-        Native { & $python $builder --models ($rrModels -join ',') $Runtime }
-        if ($LASTEXITCODE -ne 0) { $failed += 'Ray Reconstruction' }
-        Native { & $python $builder --models ($srModels -join ',') $Runtime }
-        if ($LASTEXITCODE -ne 0) { $failed += 'Super Resolution' }
+        if ($rrModels) {
+            Native { & $python $builder --models ($rrModels -join ',') $Runtime }
+            if ($LASTEXITCODE -ne 0) { $failed += 'Ray Reconstruction' }
+        }
+        if ($srModels) {
+            Native { & $python $builder --models ($srModels -join ',') $Runtime }
+            if ($LASTEXITCODE -ne 0) { $failed += 'Super Resolution' }
+        }
         if ($failed) {
             Fail "the engine models for $($failed -join '/') were not built (reason above). d4r runs those on its normal path; fix the cause and run the installer again."
         }

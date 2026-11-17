@@ -180,8 +180,11 @@ def main():
         newline = '\r\n' if '\r\n' in d4r_text else '\n'
         d4r_text = d4r_text.rstrip('\r\n') + newline * 2 + D4R_INI_SECTION.replace('\n', newline)
     write_text(d4r_ini, update_ini(d4r_text, [('FrameGeneration', 'Backend', 'dlssg'), ('FrameGeneration', 'KernelCache', str(cache))]))
-    # OptiScaler: NGX through the DLSS-G host, and its DLSS-G output on
-    route = 'd4r\\fg\\dlssg\\' + HOST if runtime == game / 'd4r' else str(fg / HOST)
+    # OptiScaler: NGX through the DLSS-G host, and its DLSS-G output on. The path is absolute: OptiScaler builds without
+    # patches/optiscaler/0006 test a relative NvngxPath against the process's working directory, which is not the
+    # executable's folder for every game (Phantom Blade Zero runs PBZ.exe from ...\PBZ\platform\steam with the working
+    # directory ...\PBZ, issue #71), and DLSS then silently falls back to FSR.
+    route = str(fg / HOST)
     write_text(ini, update_ini(text, OPTISCALER + [('Libraries', 'NvngxPath', route)]))
     print(f'DLSS Frame Generation: ready ({"full model" if arch == "gfx12" else "Lite"} by default; kernels in {cache}).')
     print('  Select DLSS in the game, then turn frame generation on in OptiScaler\'s menu (Insert).')
