@@ -4,16 +4,17 @@
 #include <string>
 
 // Inspect metadata before constructing any pipeline. Old default D/E and F models require FP8;
-// only the explicitly marked gfx11 D/E models and the A - C CNN use f16 cooperative matrices.
+// only the explicitly marked gfx11 D/E/F models and the A - C CNN use f16 cooperative matrices.
 inline bool d4r_rr_model_compatible(const std::string& metadata, bool f16Matrices, bool fp8Matrices)
 {
     std::istringstream lines(metadata);
     std::string line;
     if (!std::getline(lines, line)) return false;
     if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line == "D4RR0002") return fp8Matrices;
     if (line == "D4RR0003") return f16Matrices; // presets A - C, the CNN: binary16 matrices only
-    if (line != "D4RR0001") return false;
+    // D4RR0001 (D, E) and D4RR0002 (F): FP8 matrices unless the model says "arithmetic gfx11", the RDNA3 build
+    // whose FP8 products run on binary16 matrices
+    if (line != "D4RR0001" && line != "D4RR0002") return false;
     bool widened = false;
     while (std::getline(lines, line))
     {

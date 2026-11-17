@@ -348,6 +348,14 @@ uint h2e4m3(float f, bool relu)
 // |x| > 448 -> 0x7e, NaN -> 0x7f, the sign kept; .relu first zeroes negative non-NaN halves
 uint g11_h2e4m3(uint h)
 {
+#ifdef RR_G11_FAST
+    {   // branch-free (engine/rr/rr_gfx11.glsl RR_G11_FAST): the same codes for every finite value, NaN -> 0x7e
+        const uint b = h & 0xffffu, a = b & 0x7fffu, t = a - 0x2000u;
+        const uint cn = min((t + 0x3fu + ((t >> 7u) & 1u)) >> 7u, 0x7eu);
+        precise float m = fma(abs(float(uint16BitsToFloat16(uint16_t(b)))), 512.0, 8388608.0);
+        return ((b >> 8u) & 0x80u) | (a >= 0x2400u ? cn : floatBitsToUint(m) - 0x4b000000u);
+    }
+#endif
     const uint s = (h >> 8u) & 0x80u, a = h & 0x7fffu;
     if (a > 0x7c00u) return s | 0x7fu;
     uint c;
@@ -397,6 +405,14 @@ uint f16x2_to_e4m3x2(f16vec2 h, bool relu) { return h2e4m3_hw(h.x, relu) | (h2e4
 #define MMB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 uvec2 g11_sc4(uint packed)
 {
+#ifdef RR_G11_FAST
+    {   // engine/rr/rr_gfx11.glsl RR_G11_FAST: each code in a lane's high byte, one arithmetic shift per pair; no NaN codes
+        const uint lo = ((packed & 0xffu) << 8u) | ((packed & 0xff00u) << 16u);
+        const uint hi = ((packed >> 8u) & 0xff00u) | (packed & 0xff000000u);
+        const i16vec2 l = (i16vec2(unpack16(lo)) >> int16_t(1)) & int16_t(0xbfff), h = (i16vec2(unpack16(hi)) >> int16_t(1)) & int16_t(0xbfff);
+        return uvec2(pack32(l), pack32(h));
+    }
+#endif
     uint mag = packed & 0x7f7f7f7fu;
     mag |= (mag + 0x01010101u) & 0x80808080u;
     const uint sign = packed & 0x80808080u;

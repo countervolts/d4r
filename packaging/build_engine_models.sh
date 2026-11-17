@@ -170,8 +170,12 @@ if (( DO_RR )); then
     done
   done
   run ptx-f.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$WORK/ptx-f"
-  run rr-f.log python3 "$KIT/engine/compile_rr2.py" --dll "$DLL" "$WORK/rr-f" --ptx-dir "$WORK/ptx-f"
-  place rr-f "$WORK/rr-f" $(model_files "$WORK/rr-f") enc0-aux.bin exposure_f0.spv exposure_f1.spv exposure_f2.spv
+  for arithmetic in fp8 gfx11; do   # F as well: RDNA3 has no FP8 matrices and takes rr-f-gfx11 (like rr-d-gfx11)
+    name=rr-f; gfx11=0
+    if [[ "$arithmetic" == gfx11 ]]; then name+=-gfx11; gfx11=1; fi
+    run "$name.log" env D4R_RR_GFX11="$gfx11" python3 "$KIT/engine/compile_rr2.py" --dll "$DLL" "$WORK/$name" --ptx-dir "$WORK/ptx-f"
+    place "$name" "$WORK/$name" $(model_files "$WORK/$name") enc0-aux.bin exposure_f0.spv exposure_f1.spv exposure_f2.spv
+  done
 fi
 
 if (( DO_SR )); then

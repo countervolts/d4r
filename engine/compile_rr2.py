@@ -46,7 +46,21 @@ FUSE_DEFS = ['-DRR_FUSE'] if os.environ.get('D4R_RR_FUSE') == '1' else []
 # level 3 (this GPU's own arithmetic, one wave per window where the shader has it) is the default: the fastest build,
 # as far from an NVIDIA card as two NVIDIA setups are from each other. D4R_RR_RELAXED=0 builds NVIDIA's roundings
 # exactly (bit-identical to the CUDA path through ZLUDA)
-RELAXED = int(os.environ.get('D4R_RR_RELAXED', '3') or 0)
+# D4R_RR_GFX11=1: the model for RDNA3 (gfx11), which has no FP8 matrix instruction and RADV no VK_EXT_shader_float8: the
+# stages reproduce ZLUDA's gfx11 lowering of the FP8 products on f16 cooperative matrices (engine/rr/rr_gfx11.glsl,
+# as for the presets D and E), each weight file carries a widened copy (engine/rr/widen_weights.py) and rr.txt says
+# "arithmetic gfx11". Exact arithmetic only: no relaxed build exists for it yet. RR_G11_FAST: the conversions without
+# branches and without NaN codes (engine/rr/rr_gfx11.glsl), the same codes for every finite value.
+GFX11 = os.environ.get('D4R_RR_GFX11') == '1'
+GFX11_DEFS = ['-DRR_GFX11', '-DRR_G11_FAST'] if GFX11 else []
+# the stages whose shared operand arrays hold widened binary16 instead of FP8 codes (rr2_m.comp RR_G11_WIDE: the same
+# values; faster where the stage's occupancy does not drop; RX 7900 XTX, 1280x720 -> 3840x2160, 2026-11-15)
+GFX11_WIDE = {'enc0', 'enc4', 'dec4_0', 'dec4_1', 'dec0_1'}
+
+
+def gfx11_defs(stage):
+    return GFX11_DEFS + (['-DRR_G11_WIDE'] if GFX11 and stage in GFX11_WIDE else [])
+RELAXED = 0 if GFX11 else int(os.environ.get('D4R_RR_RELAXED', '3') or 0)
 # the stages that have a one-wave shader for level 3 (engine/rr/rr2_w.comp: byte-identical to rr2_m.comp there, faster)
 ONE_WAVE = {'dec0_0', 'enc0'}
 RELAX_DEFS = ([f'-DRR_RELAXED={min(RELAXED, 2)}'] if RELAXED else []) + (['-DRR_NATIVE'] if RELAXED >= 3 else [])
@@ -116,6 +130,15 @@ SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WA
 LLPC_SAT = os.environ.get('D4R_RR_LLPC_SAT', '1' if os.name == 'nt' else '0') == '1'
 
 
+def widen(weights):
+    """-DW_WIDE=<f16 element of the widened copy> after appending that copy to a native stage's weight file (RDNA3)"""
+    if not GFX11:
+        return []
+    offset = subprocess.run([sys.executable, str(HERE / 'rr' / 'widen_weights.py'), str(weights)], check=True,
+                            stdout=subprocess.PIPE, text=True).stdout.strip()
+    return [f'-DW_WIDE={offset}u']
+
+
 def find_module(ptx_dir, kernel):
     for path in sorted(Path(ptx_dir).glob('*.ptx')):
         if f'.entry {kernel}(' in path.read_text(errors='replace'):
@@ -152,7 +175,7 @@ def main():
     # each compiler job in a memory-capped scope where systemd provides one (D4R_NO_SCOPE=1: none)
     if os.environ.get('D4R_NO_SCOPE') == '1' or not shutil.which(capped[0]) or             subprocess.run(capped[:4] + ['true'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL).returncode:
         capped = []
-    lines = ['D4RR0002', 'preset 6']
+    lines = ['D4RR0002', 'preset 6'] + (['arithmetic gfx11'] if GFX11 else [])
     pcap = Capture(a.particles) if a.particles else None
     for stage in STAGES + (['downp'] if pcap or a.dll else []):
         kernel = KERNEL[stage]
@@ -173,7 +196,7 @@ def main():
             weights = f'weights-{stage}m.bin'
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
-            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
+            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS + gfx11_defs(stage) + widen(out / weights)
             phased = stage in PHASED and not (RELAXED >= 3 and stage in ONE_WAVE)
             for phase in [0] + ([1, 2, 3, 4] if phased else []):
                 spv = out / (f'{stage}_m.spv' if phase == 0 else f'{stage}_p{phase}.spv')
@@ -220,7 +243,7 @@ def main():
             weights = f'weights-{stage}m.bin'
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
-            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
+            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS + gfx11_defs(stage) + widen(out / weights)
             # encoder 0 in two passes (gen_rr2_enc0.py --split): its gather as the stage enc0g, whose records' place
             # (three ranges) is six words appended to the argument block
             split = stage == 'enc0' and SPLIT and GROUP == 1
@@ -252,7 +275,7 @@ def main():
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
                                check=True, stdout=subprocess.DEVNULL)
         else:
-            subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', str(generated), '-o',
+            subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *GFX11_DEFS, str(generated), '-o',
                                      str(out / f'{stage}.spv')], check=True, stdout=subprocess.DEVNULL)
             if exact:
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
@@ -263,7 +286,9 @@ def main():
             # module compiles there and reproduces the images (54.9 dB against the DXIL reference), so the model
             # carries <stage>_llpc.spv as well; runtime_rr2.inc loads it only on that driver.
             opt = os.environ.get('D4R_SPIRV_OPT') or shutil.which('spirv-opt') or shutil.which('spirv-opt.exe')
-            if opt:
+            if GFX11:
+                pass   # AMD's Windows driver has no RDNA3 route here
+            elif opt:
                 src = out / f'{stage}.spv'
                 if LLPC_SAT:   # the same shader with LLPC's form of the FP8 conversions (LLPC_SAT above)
                     src = work / f'{stage}_llpc_sat.spv'

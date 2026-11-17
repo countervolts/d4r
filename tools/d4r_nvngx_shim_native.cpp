@@ -1195,7 +1195,7 @@ std::string rr_model_directory(int slot)
         char folder[MAX_PATH * 3] = {};
         WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + folders[slot]).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
-        if (slot < 2 && !g_vk.float8)
+        if (slot < 3 && !g_vk.float8)
             directory += "-gfx11";
     }
     return directory[0] == '/' ? "Z:" + directory : directory;

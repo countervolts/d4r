@@ -402,7 +402,7 @@ void load_portable_config()
         bool on = false;
         if (enabled.empty() || enabled == "auto")
         {
-            for (const wchar_t* model : {L"k", L"k-ldr", L"m", L"m-ldr", L"l", L"l-ldr", L"rr-d", L"rr-e", L"rr-f", L"rr-d-gfx11", L"rr-e-gfx11"})
+            for (const wchar_t* model : {L"k", L"k-ldr", L"m", L"m-ldr", L"l", L"l-ldr", L"rr-d", L"rr-e", L"rr-f", L"rr-d-gfx11", L"rr-e-gfx11", L"rr-f-gfx11"})
             {
                 const DWORD attributes = GetFileAttributesW((dir + L"\\engine\\" + model).c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
