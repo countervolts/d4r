@@ -34,6 +34,9 @@ if [[ "${D4R_VKD3D_FSR_RR:-0}" == 1 ]]; then
     git -C "$DXIL" -c user.name=d4r -c user.email=d4r@localhost cherry-pick -x \
       $(git -C "$DXIL" rev-list --reverse f9f6294f3a6795e071bef3a64d2bee99e7c1b7bc^1..f9f6294f3a6795e071bef3a64d2bee99e7c1b7bc^2)
   fi
+  # Exact replacements for the denoiser's slowest layers; active only with wmma_rdna3_workaround.
+  rm -f "$SRC/libs/vkd3d-shader/d4r_builtin_shaders.h"
+  git -C "$SRC" apply "$ROOT"/patches/vkd3d-proton-fsr-rr/*.patch
   BUILD="$SRC-build-fsrrr"
   EXTRA=(-Denable_extended_emulation=true)
 fi

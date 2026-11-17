@@ -113,6 +113,15 @@ public:
     D4rNgxResult Get(const char* name, void** value) const override { return pointer(name, value); }
     void Reset() override { count_ = 0; }
 
+    // every stored name in order, for diagnostics; d4r_ngx_parameters_list checks the magic first
+    static constexpr unsigned kMagic = 0xd4a7a3f1u;
+    unsigned magic_ = kMagic;
+    template <typename F> void each(F f) const
+    {
+        for (unsigned index = 0; index < count_; ++index)
+            f(entries_[index]);
+    }
+
 private:
     const Entry* find(const char* name) const
     {
@@ -187,6 +196,22 @@ extern "C" void* d4r_ngx_parameters_create()
 {
     void* memory = d4r_host_alloc(sizeof(Parameters));
     return memory != nullptr ? static_cast<D4rNgxParameterAbi*>(new (memory) Parameters()) : nullptr;
+}
+
+// Calls `visit` for every name on a parameter object this file created (others are skipped: returns 0).
+extern "C" unsigned d4r_ngx_parameters_list(void* raw, void (*visit)(const char* name, unsigned type, unsigned long long bits,
+                                                                      void* context),
+                                            void* context)
+{
+    auto* object = static_cast<Parameters*>(static_cast<D4rNgxParameterAbi*>(raw));
+    if (raw == nullptr || object->magic_ != Parameters::kMagic)
+        return 0;
+    unsigned n = 0;
+    object->each([&](const Entry& e) {
+        visit(e.name, e.type, e.value.u, context);
+        ++n;
+    });
+    return n;
 }
 
 extern "C" void d4r_ngx_parameters_destroy(void* parameters)

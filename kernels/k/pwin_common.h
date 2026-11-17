@@ -19,6 +19,30 @@
 #if defined(D4R_ACCURACY) && defined(PWIN_F32ACC)
 #undef PWIN_F32ACC
 #endif
+// PWIN_FOLD_GAINS: the two per-channel gains live in the weights they feed, (x * g) W = x (diag(g) W). The prep kernel
+// multiplies gamma1 into Q, K, V and the MLP gain into fc1, each product rounded once to f16; the layers apply only the
+// per-token reciprocal norm and pass the residual straight to fc1. The accuracy set keeps NVIDIA's separate multiplies.
+#if defined(D4R_ACCURACY) && defined(PWIN_FOLD_GAINS)
+#undef PWIN_FOLD_GAINS
+#endif
+#if defined(D4R_ACCURACY)
+#undef PWIN_FOLD_G1
+#undef PWIN_FOLD_G2
+#endif
+#ifdef PWIN_FOLD_GAINS
+#define PWIN_FOLD_G1
+#define PWIN_FOLD_G2
+#endif
+#ifdef PWIN_FOLD_G1
+#define PWIN_NORM_GAIN(r16, g) (r16)
+#else
+#define PWIN_NORM_GAIN(r16, g) ((r16) * (g))
+#endif
+#ifdef PWIN_FOLD_G2
+#define PWIN_MLP_INPUT(x1, g2) (x1)
+#else
+#define PWIN_MLP_INPUT(x1, g2) ((x1) * (g2))
+#endif
 // D4R_FAST_MATH: the opt-in approximate variant (FMA contraction allowed; not bit-identical to NVIDIA's rounding)
 #ifndef D4R_FAST_MATH
 #pragma clang fp contract(off)

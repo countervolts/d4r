@@ -156,3 +156,83 @@ ported from `origin/linux`):
 - **4286001** (RDNA2 K: deep dot2 layers as phase dispatches, swizzled LDS rows, depth staged in shared memory):
   builds on ef0075f and 65646d9's `input_k.comp`, `compile_k.py` and `runtime.cpp`. Ported at the end of Stage 5,
   after 1dcfa80. Windows' native RDNA2 path (LLPC dot2 shaders, 130d119) is checked for an equivalent first.
+
+## Stages 2-5 and linux up to 4b32f0e (2026-11-17)
+
+Stage 1 had stopped at linux #63 (ad10640). The rest of `origin/linux` is now on main, which makes `linux` fully
+merged. linux's history was rewritten and shares no commit with main, so the ports are content ports. A merge with
+`-s ours` records `origin/linux` as a parent without taking its tree.
+
+- **ef0075f, 1cdb649, 65646d9, 1dcfa80, 4286001, 7ca1e7f** (M and L on vkhip on RDNA3, DLSS and FSR RR on vkhip, K's
+  linear lighting, the RR HIP release stages, RDNA2 K phase dispatches, RDNA 3.5 vkhip): one port of
+  `7d55fa8..7ca1e7f`.
+- **cbdb88e (#70), d6ccaa5 (#67), b4a635b (#69)**: Tk-Glitch's commits, each ported on its own with its author kept.
+- **b912fbf**: the Linux Ghost of Tsushima table in README's Results uses its 2026-11-12 numbers. **793a100** (trailing
+  spaces in the title) is skipped.
+
+### Merge decisions
+
+- **Two `dec0_l_head.comp`s.** main's (the D3D12 RDNA3 L head, m_d3d12_build.py) keeps the name. linux's Vulkan wide
+  head is now `engine/dec0_l_head_wide.comp`. It still compiles to `dec0_l_head.spv`, so linux-built packages load
+  unchanged.
+- **Two M vkhip networks.** main's `vkhip::MNetwork` (create_engine_vkhip_net) and linux's `KNetwork::createM` (preset L's
+  native enc0l/dec0l stages, the RDNA3 "wide" models) both stay. `engine_evaluate_m` takes linux's route for a wide
+  model (engine_m_vkhip; it refuses when vkhip cannot load, as linux does) and main's otherwise. `createM` uses main's
+  `Net` helpers: `loadEntryPoints` (AMD's pipeline binaries), `allocateArena`, `pipe`, `argBlock`, `finishContents`.
+  `create_engine_vkhip_k` takes optional presetM, presetL and render-size arguments, so the native Vulkan frontend's K
+  call is unchanged.
+- **Two encoder-0 gathers.** `gen_enc0_m.py --gather` stays main's (scratch after the arena, kernels/rr/build_vkhip.sh).
+  linux's (binding 23, engine/rr/hip/rr_enc0.hip) is `--gather-hip`. No linux script generates its
+  `enc0_gather.spv` yet, and runtime_rr.inc skips vkhip encoder 0 without it.
+- **RR on vkhip, presets D/E.** In the stage loop the model's own HIP pipelines (linux, RDNA3 packages, `model/hip`) come
+  first, then main's stage recorder (RDNA4), then the Vulkan stage. The arena gets main's gather scratch, linux's
+  TRANSFER_SRC usage and device address when either needs it. `debugArenaSnapshot` answers for D/E only (not v2/v3).
+- **runtime_m.inc.** main creates the network and front stages lazily, so a wide model never compiles the FP8 layers
+  that crash RADV on RDNA3. linux skipped creating them for the same reason. MEngine now refuses a wide model without
+  an external network instead of reaching that path. linux's `downFor` / `downStore` replace main's
+  rgb10Output/r11Output flags: `downFor` covers RGBA16F, RGB10A2, RGBA8, R11G11B10 and RGBA32F, and `hasDirectOutput`
+  uses it. So `game_m.cpp`'s `packedOutput` and the Vulkan frontend's explicit RGB10/R11 checks use `hasDirectOutput`.
+- **K's split dot2 layers (4286001)** are not loaded on AMD's Windows driver: they use the v_dot2 products its LLPC
+  rejects, and there is no `_llpc` build of them, so those layers run whole there (their `_dot2_llpc.spv`).
+- **Shaders shared with the D3D12 build** (hlsl_build.py):
+  - input_k.comp's depth staging (STAGE_DEPTH) defaults off under D4R_HLSL, because the D3D12 stage's workgroups do not
+    cover 32 x 32 pixels.
+  - exposure_k.comp's 256-thread pass 0 is GLSL only.
+  - output_k.comp keeps both reconstructions: main's D3D12 paths (D4R_WIN_OUTPUT's 2D walk, the f32 filter and sums) and
+    linux's fast GLSL stages. Its packed running maximum (K_PACKED_YMAX) is GLSL only, because dialect_hlsl.h has no
+    16-bit integer vectors. The HLSL builds keep the per-lane select, which gives the same values.
+- **L's head functions** (layer_m.comp KIND 4) are `engine/l_head.glsl`, linux's file, with main's `M_AMD_HEAD` variant
+  in it.
+- **vkhip.cpp** accepts gfx1030-1036, gfx1100-1103, gfx1150-1153 and gfx1200/1201 code objects. main's `.rodata` handling
+  (the whole section in the data image) replaces linux's narrower one.
+- **Shim.** linux's 54 hunks were placed into the eight units, hunk by hand where main had changed the lines:
+  - The f32 VRAM planes and outputs went into the vkd3d-proton VRAM branch. main's native Windows VRAM branch is
+    unchanged.
+  - The RDNA 3.5 adapter message is in vkhip_adapter.
+- **Packaging.** linux's L-kernel accuracy rule is in `scripts/stage_native_kernels.sh` (the shared kernel staging),
+  its f32 staging stores are in `scripts/build_vulkan_staging.py`, and `D4R_BUNDLE_RR_HIP` is in package_release.sh.
+
+### Built and tested here (Windows)
+
+- `scripts/build_d4r_nvngx_shim.sh` builds: the shim and ASI, the Vulkan engine (runtime, game*, vkhip, vkhip_net) and
+  d4r_hip_net.dll.
+- Shaders compiled:
+  - **Vulkan (SPIR-V):** input/output/exposure K in the default, LDR, RGB10, E5B9G9R9, linear-lighting and accuracy
+    variants; dec0_m, enc0_m and the planes and wide variants; down_m including the wide stores; dec0_l_head_wide;
+    enc0_l_gather; layer_m's network layers and L's stages, with both plane layouts and M_AMD_HEAD; layer_dot2 whole
+    (also D4R_PORTABLE_DOT2) and split (enc3, enc4, dec5, dec4, dec3).
+  - **D3D12 (DXIL):** K's input, output (Windows and vkd3d targets) and exposure stages; M's enc0/dec0 (dot2), post,
+    down, dec0_l_head, enc0_l_features and exposure.
+- Python tests: no failure that main does not have. Two errors main has (test_dlssg_features route round trip,
+  test_features v10 providers) pass.
+
+### Needs testing on hardware (Linux)
+
+- RDNA3: M and L on vkhip with wide models (install.sh builds them), including L's native input and expansion stages.
+  RR D/E on vkhip with the rr-hip stages (D4R_BUNDLE_RR_HIP), and FSR RR.
+- RDNA2: K with the split dot2 layers (Steam Deck: compare the frame time with 11-08's nightly).
+- RDNA 3.5: K on vkhip.
+- K's LinearLighting = half against the 11-08 nightly.
+- The f32 VRAM planes and outputs on a vkd3d-proton game (D4R_SHIM_F32_INPUTS / D4R_SHIM_F32_OUTPUT).
+- Native Windows: no regression for K, M, L and RR on RDNA3 and RDNA4. The shared shaders and runtime changed, the
+  D3D12 paths did not.

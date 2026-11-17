@@ -1685,11 +1685,13 @@ bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Re
              game.depth.view != VK_NULL_HANDLE, game.output.view != VK_NULL_HANDLE,
              game.output.format, model->hasDirectOutput(game.output.format));
     game.settings = engine_k_settings(feature, p, ldr, displayMotion, autoExposure, feature.engine == nullptr);
-    // The CUDA backend converts other colour and motion formats to binary16 (toward zero) before NGX reads them;
-    // the engine repeats that conversion, which these formats do not need (exact in binary16).
-    game.settings.canonicalColor = game.color.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+    // The CUDA backend converts other colour and motion formats to binary16 (toward zero) before NGX reads them.
+    // Only the accuracy stages repeat that, to stay byte-identical to it, and these formats do not need it (exact in
+    // binary16). The default reads the game's texels as they are, as NVIDIA's kernels do (f32), which is also faster.
+    const bool halfInputs = model->hasAccuracyStages();
+    game.settings.canonicalColor = halfInputs && game.color.format != VK_FORMAT_R16G16B16A16_SFLOAT &&
                                    game.color.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    game.settings.canonicalMotion = game.motion.format != VK_FORMAT_R16G16_SFLOAT &&
+    game.settings.canonicalMotion = halfInputs && game.motion.format != VK_FORMAT_R16G16_SFLOAT &&
                                     game.motion.format != VK_FORMAT_R16G16B16A16_SFLOAT;
     try
     {

@@ -446,8 +446,12 @@ static float pan_scene(float x, float y, int channel)
     return 0.45f * checker + 0.35f * waves + 0.2f * ring;
 }
 
+static float quality_scene_hdr(float x, float y, UINT outWidth, UINT outHeight);
+static bool quality_hdr();
 static float quality_scene(float x, float y, UINT outWidth, UINT outHeight)
 {
+    if (quality_hdr())
+        return quality_scene_hdr(x, y, outWidth, outHeight);
     const float u = x / outWidth, v = y / outHeight;
     auto frac = [](float value) { return value - std::floor(value); };
     if (u > 0.05f && u < 0.45f && v > 0.1f && v < 0.9f) // blinds: 5 px period, 35% slat
@@ -458,6 +462,44 @@ static float quality_scene(float x, float y, UINT outWidth, UINT outHeight)
         return frac((x + y) / 6.0f) < 0.25f ? 0.8f : 0.12f;
     return 0.3f + 0.1f * std::sin(u * 6.0f) * std::cos(v * 5.0f);
 }
+
+// HDR quality scene (D4R_HARNESS_QUALITY_HDR=1 with the quality scene): scene-referred content far above 1, where
+// the space an upscaler accumulates in decides how much light survives. Four regions, in output pixels:
+//   0 sparkles: point lights of radius 0.35 px (value 40) on a 9 px grid over 0.04, far below the render pitch,
+//     so each is sampled only on some jitter phases (specular glints, small lamps);
+//   1 neon: diagonal lines 0.8 px wide (value 6) every 11 px over 0.05;
+//   2 bright blinds: 5 px period, 35% slat at 4.0 over 0.08 (a window against a dark room);
+//   3 gradient: smooth 0.2 .. 8 ramp (content without detail, which should not change).
+// Everything else is the dim 0.3 background. D4R_HARNESS_QUALITY_HDR=2 feeds it tone mapped (x / (1 + x)), as an LDR
+// game does (run it with LDR create flags); the metrics then expand the output with the inverse curve.
+static int quality_hdr_region(float u, float v)
+{
+    if (u > 0.05f && u < 0.45f && v > 0.1f && v < 0.45f) return 0;
+    if (u > 0.55f && u < 0.95f && v > 0.1f && v < 0.45f) return 1;
+    if (u > 0.05f && u < 0.45f && v > 0.55f && v < 0.9f) return 2;
+    if (u > 0.55f && u < 0.95f && v > 0.55f && v < 0.9f) return 3;
+    return -1;
+}
+static float quality_scene_hdr(float x, float y, UINT outWidth, UINT outHeight)
+{
+    const float u = x / outWidth, v = y / outHeight;
+    auto frac = [](float value) { return value - std::floor(value); };
+    switch (quality_hdr_region(u, v))
+    {
+    case 0: { const float dx = frac(x / 9.0f) * 9.0f - 4.5f, dy = frac(y / 9.0f) * 9.0f - 4.5f;
+              return dx * dx + dy * dy < 0.35f * 0.35f ? 40.0f : 0.04f; }
+    case 1: return frac((x - y) / 11.0f) * 11.0f < 0.8f * 1.41421356f ? 6.0f : 0.05f;
+    case 2: return frac(y / 5.0f) < 0.35f ? 4.0f : 0.08f;
+    case 3: return 0.2f * std::pow(40.0f, (u - 0.55f) / 0.4f);
+    default: return 0.3f;
+    }
+}
+static int quality_hdr_mode()
+{
+    static const int mode = std::getenv("D4R_HARNESS_QUALITY_HDR") ? std::atoi(std::getenv("D4R_HARNESS_QUALITY_HDR")) : 0;
+    return mode;
+}
+static bool quality_hdr() { return quality_hdr_mode() != 0; }
 
 // Pole and cable geometry resembling the reported Townfall failure. All
 // positions are in output pixels, so both resource-width cases get identical
@@ -1148,17 +1190,26 @@ int main(int argc, char** argv)
     // D4R_HARNESS_OUTPUT_RGB10A2=1: an R10G10B10A2_UNORM output texture (inputs unchanged), as some games pass
     // D4R_HARNESS_OUTPUT_R11G11B10=1: an R11G11B10_FLOAT output texture instead (the other packed HDR format games pass)
     // D4R_HARNESS_OUTPUT_RGB9E5=1: an R9G9B9E5_SHAREDEXP output texture (Resident Evil Requiem's RR output, issue 65)
+    // D4R_HARNESS_OUTPUT_DXGI=<DXGI_FORMAT number>: any other output texture, inputs unchanged. D4R_HARNESS_OUTPUT_NO_UAV=1
+    // drops its unordered access and leaves it in COPY_DEST (run with D4R_SHIM_OUTPUT_STATE=0x400); both take K's copy path.
     const bool rgb9 = std::getenv("D4R_HARNESS_OUTPUT_RGB9E5") != nullptr;
     const bool rgb11 = !rgb9 && std::getenv("D4R_HARNESS_OUTPUT_R11G11B10") != nullptr;
     const bool rgb10 = !rgb9 && !rgb11 && std::getenv("D4R_HARNESS_OUTPUT_RGB10A2") != nullptr;
-    const DXGI_FORMAT packedOutput = rgb9 ? DXGI_FORMAT_R9G9B9E5_SHAREDEXP
-                                   : rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
-    if ((rgb9 || rgb10 || rgb11) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
+    const DXGI_FORMAT otherOutput = std::getenv("D4R_HARNESS_OUTPUT_DXGI") != nullptr
+        ? static_cast<DXGI_FORMAT>(std::atoi(std::getenv("D4R_HARNESS_OUTPUT_DXGI"))) : DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT packedOutput = otherOutput != DXGI_FORMAT_UNKNOWN ? otherOutput
+        : rgb9 ? DXGI_FORMAT_R9G9B9E5_SHAREDEXP : rgb11 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
+    const UINT packedTexel = otherOutput == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16
+        : otherOutput == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    const bool outputNoUav = std::getenv("D4R_HARNESS_OUTPUT_NO_UAV") != nullptr;
+    const D3D12_RESOURCE_FLAGS outputFlags = outputNoUav ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES outputState = outputNoUav ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if ((rgb9 || rgb10 || rgb11 || otherOutput != DXGI_FORMAT_UNKNOWN) && (rgba8 || std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr))
     {
         std::fprintf(stderr, "packed (RGB10A2 / R11G11B10) output cannot be combined with RGBA8 or the quality scene\n");
         return 2;
     }
-    const bool packed = rgb9 || rgb10 || rgb11;
+    const bool packed = rgb9 || rgb10 || rgb11 || otherOutput != DXGI_FORMAT_UNKNOWN;
     if (rgba8 && (qualityScene || replayDir != nullptr))
     {
         std::fprintf(stderr, "RGBA8 format probe supports static, motion and jitter scenes\n");
@@ -1430,16 +1481,52 @@ int main(int argc, char** argv)
         std::printf("Ray Reconstruction extra inputs:%s%s\n", hitDistance ? " DLSSD.SpecularHitDistance" : "",
                     disocclusionMask ? " DLSS.DisocclusionMask" : "");
     }
+    // D4R_HARNESS_COLOR_F32=1 / _COLOR_RGB10A2=1 / _COLOR_BGRA8=1: the same colour in that format (the UNORM ones
+    // clamp to [0, 1]). D4R_HARNESS_MV_F32=1: motion in R32G32_FLOAT.
+    const bool colorF32 = std::getenv("D4R_HARNESS_COLOR_F32") != nullptr;
+    const bool colorRgb10 = std::getenv("D4R_HARNESS_COLOR_RGB10A2") != nullptr;
+    const bool colorBgra8 = std::getenv("D4R_HARNESS_COLOR_BGRA8") != nullptr;
+    const bool colorOther = colorF32 || colorRgb10 || colorBgra8;
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
+        colorF32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : colorRgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM : colorBgra8 ? DXGI_FORMAT_B8G8R8A8_UNORM :
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    std::vector<uint32_t> colorConverted;
+    const auto converted_color = [&]() -> const void* {
+        const size_t pixels = static_cast<size_t>(resourceWidth) * inHeight;
+        colorConverted.resize(pixels * (colorF32 ? 4 : 1));
+        const auto half = [&](size_t pixel, int channel) { return static_cast<float>(std::bit_cast<_Float16>(color[pixel * 4 + channel])); };
+        const auto code = [&](size_t pixel, int channel, float top) {
+            return static_cast<uint32_t>(std::lround(std::clamp(half(pixel, channel), 0.0f, 1.0f) * top)); };
+        for (size_t pixel = 0; pixel < pixels; ++pixel)
+        {
+            if (colorF32)
+                for (int channel = 0; channel < 4; ++channel)
+                    colorConverted[pixel * 4 + channel] = std::bit_cast<uint32_t>(half(pixel, channel));
+            else if (colorRgb10)
+                colorConverted[pixel] = code(pixel, 0, 1023.0f) | code(pixel, 1, 1023.0f) << 10 | code(pixel, 2, 1023.0f) << 20 | code(pixel, 3, 3.0f) << 30;
+            else
+                colorConverted[pixel] = code(pixel, 2, 255.0f) | code(pixel, 1, 255.0f) << 8 | code(pixel, 0, 255.0f) << 16 | code(pixel, 3, 255.0f) << 24;
+        }
+        return colorConverted.data();
+    };
+    const UINT colorRowBytes = resourceWidth * (colorF32 ? 16 : colorOther || rgba8 ? 4 : 8);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     // D4R_HARNESS_MV_RGBA16=1: motion vectors in an R16G16B16A16_TYPELESS texture (as some games pass them), the
     // unused components filled with junk that must not reach DLSS.
     const bool mvRgba16 = std::getenv("D4R_HARNESS_MV_RGBA16") != nullptr && std::atoi(std::getenv("D4R_HARNESS_MV_RGBA16")) != 0;
+    const bool mvF32 = std::getenv("D4R_HARNESS_MV_F32") != nullptr;
     ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight,
-        mvRgba16 ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+        mvF32 ? DXGI_FORMAT_R32G32_FLOAT : mvRgba16 ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     std::vector<uint16_t> motionWide;
+    std::vector<float> motionF32;
     auto motion_rows = [&](const uint16_t* rg) -> const void* {
+        if (mvF32)
+        {
+            motionF32.resize(static_cast<size_t>(motionWidth) * motionHeight * 2);
+            for (size_t i = 0; i < motionF32.size(); ++i)
+                motionF32[i] = static_cast<float>(std::bit_cast<_Float16>(rg[i]));
+            return motionF32.data();
+        }
         if (!mvRgba16)
             return rg;
         const size_t pixels = static_cast<size_t>(motionWidth) * motionHeight;
@@ -1453,14 +1540,14 @@ int main(int argc, char** argv)
         }
         return motionWide.data();
     };
-    const UINT motionRowBytes = motionWidth * (mvRgba16 ? 8 : 4);
+    const UINT motionRowBytes = motionWidth * (mvF32 || mvRgba16 ? 8 : 4);
     ID3D12Resource* exposureTexture = create_texture(1, 1,
         exposureRGBA32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
                                                    rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
                                                    : packed ? packedOutput
                                                            : DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                                                   outputFlags);
     // Moving/jittered RGBA8 fixtures quantize the same canonical half input as the initial upload.
     // Never upload the half byte layout into an RGBA8 resource: that would make a format test silently
     // exercise different content instead of checking the conversion/packing route used by the game.
@@ -1469,20 +1556,20 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < color.size(); ++i)
                 color8[i] = static_cast<uint8_t>(std::lround(std::clamp(
                     static_cast<float>(std::bit_cast<_Float16>(color[i])), 0.0f, 1.0f) * 255.0f));
-        update_texture(colorTexture, rgba8 ? static_cast<const void*>(color8.data())
-                                          : static_cast<const void*>(color.data()), resourceWidth * (rgba8 ? 4 : 8), srv);
+        update_texture(colorTexture, colorOther ? converted_color() : rgba8 ? static_cast<const void*>(color8.data())
+                                          : static_cast<const void*>(color.data()), colorRowBytes, srv);
     };
-    upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
-           resourceWidth * (rgba8 ? 4 : 8), srv);
+    upload(colorTexture, colorOther ? converted_color() : rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
+           colorRowBytes, srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
     upload(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
     upload(exposureTexture, exposureRGBA32 ? static_cast<const void*>(exposureRGBA.data())
                                           : static_cast<const void*>(&exposureValue),
            exposureRGBA32 ? 16 : 4, srv);
-    const std::vector<uint8_t> outputInit10(packed ? static_cast<size_t>(outWidth) * outHeight * 4 : 0);
+    const std::vector<uint8_t> outputInit10(packed ? static_cast<size_t>(outWidth) * outHeight * packedTexel : 0);
     upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
                           : packed ? static_cast<const void*>(outputInit10.data()) : static_cast<const void*>(outputInit.data()),
-           outWidth * (rgba8 || packed ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+           outWidth * (rgba8 ? 4 : packed ? packedTexel : 8), outputState);
     std::printf("synthetic inputs uploaded\n");
     trace_stage("synthetic inputs uploaded");
 
@@ -1714,7 +1801,7 @@ int main(int argc, char** argv)
     if (qualityScene && !poleScene)
     {
         truth.resize(static_cast<size_t>(canvasWidth) * canvasHeight);
-        const int truthSamples = poleScene ? 2 : 8;
+        const int truthSamples = poleScene ? 2 : quality_hdr() ? 12 : 8;
         for (int y = 0; y < canvasHeight; ++y)
             for (int x = 0; x < canvasWidth; ++x)
             {
@@ -1760,6 +1847,12 @@ int main(int argc, char** argv)
 
     for (int frame = 1; frame <= frames; ++frame)
     {
+        // D4R_HARNESS_RENDER_SHRINK_AT=N: from frame N the render size is 3/4 of the feature's (dynamic resolution)
+        if (const char* shrinkAt = std::getenv("D4R_HARNESS_RENDER_SHRINK_AT"); shrinkAt != nullptr && frame == static_cast<UINT>(std::atoi(shrinkAt)))
+        {
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", inWidth * 3 / 4);
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", inHeight * 3 / 4);
+        }
         // Recreate the game's output between completed frames to exercise imported-memory handle reuse.
         if (frame > 1 && std::getenv("D4R_HARNESS_RECREATE_OUTPUT") != nullptr)
         {
@@ -1767,11 +1860,11 @@ int main(int argc, char** argv)
             outputTexture = create_texture(outWidth, outHeight,
                 rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM
                 : packed ? packedOutput : DXGI_FORMAT_R16G16B16A16_FLOAT,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                outputFlags);
             upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data())
                                   : packed ? static_cast<const void*>(outputInit10.data())
                                           : static_cast<const void*>(outputInit.data()),
-                   outWidth * (rgba8 || packed ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                   outWidth * (rgba8 ? 4 : packed ? packedTexel : 8), outputState);
             d4r_ngx_set_d3d12_resource(parameters, "Output", outputTexture);
         }
         // A replay's guides come from the capture; rewriting them with a pattern would
@@ -1804,8 +1897,9 @@ int main(int argc, char** argv)
                     const float value = poleScene
                         ? pole_scene(sampleX, sampleY, outWidth, outHeight)
                         : quality_scene(sampleX, sampleY, outWidth, outHeight);
+                    const float fed = quality_hdr_mode() == 2 ? value / (1.0f + value) : value;
                     const size_t pixel = static_cast<size_t>(y) * resourceWidth + x;
-                    const uint16_t half = std::bit_cast<uint16_t>(static_cast<_Float16>(value));
+                    const uint16_t half = std::bit_cast<uint16_t>(static_cast<_Float16>(fed));
                     color[pixel * 4 + 0] = color[pixel * 4 + 1] = color[pixel * 4 + 2] = half;
                     color[pixel * 4 + 3] = 0x3c00u;
                 }
@@ -2287,7 +2381,7 @@ int main(int argc, char** argv)
             // Luma of the presented result vs the ground truth at this frame's
             // scroll position, and the frame-to-frame change of that error
             // (ideally 0; for a static scene it is the change of the output).
-            const std::vector<uint8_t> raw = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * 8);
+            const std::vector<uint8_t> raw = read_back(outputTexture, outputState, outWidth * 8);
             const uint16_t* halves = reinterpret_cast<const uint16_t*>(raw.data());
             const size_t pixels = static_cast<size_t>(outWidth) * outHeight;
             // The shim presents the previous evaluation's result (one frame of
@@ -2317,6 +2411,64 @@ int main(int argc, char** argv)
                     blindsSquared += static_cast<double>(error[pixel]) * error[pixel];
                     ++blindsPixels;
                 }
+            }
+            if (quality_hdr())
+            {
+                // Scene-referred metrics: unclamped luma per region, its energy against the truth's, and the
+                // error and frame-to-frame change after a Reinhard tone map x / (1 + x) (what a display shows).
+                double outSum[5] = {}, truthSum[5] = {}, tmSquared[5] = {};
+                size_t count[5] = {};
+                double tmChange = 0.0;
+                static std::vector<float> previousTm;
+                std::vector<float> tm(pixels);
+                for (size_t pixel = 0; pixel < pixels; ++pixel)
+                {
+                    float value = 0.0f;
+                    for (int channel = 0; channel < 3; ++channel)
+                        value += static_cast<float>(std::bit_cast<_Float16>(halves[pixel * 4 + channel]));
+                    float luma = std::max(value / 3.0f, 0.0f);
+                    if (quality_hdr_mode() == 2) { const float c = std::min(luma, 0.999f); luma = c / (1.0f - c); }
+                    const int cx = static_cast<int>(pixel % outWidth) - shownFrame * panX;
+                    const int cy = static_cast<int>(pixel / outWidth) - shownFrame * panY;
+                    const float target = truth[static_cast<size_t>(cy - canvasY0) * canvasWidth + (cx - canvasX0)];
+                    const int region = quality_hdr_region(static_cast<float>(cx) / outWidth, static_cast<float>(cy) / outHeight);
+                    const int slot = region < 0 ? 4 : region;
+                    tm[pixel] = luma / (1.0f + luma) - target / (1.0f + target);
+                    outSum[slot] += luma; truthSum[slot] += target;
+                    tmSquared[slot] += static_cast<double>(tm[pixel]) * tm[pixel]; ++count[slot];
+                    if (!previousTm.empty())
+                        tmChange += std::fabs(tm[pixel] - previousTm[pixel]);
+                }
+                if (!previousTm.empty())
+                    tmChange /= static_cast<double>(pixels);
+                const bool haveChange = !previousTm.empty();
+                previousTm = tm;
+                static double accRatio[5], accPsnr[5], accFlicker;
+                static int accFrames, accFlickerFrames;
+                FILE* hdrReport = std::fopen(std::getenv("D4R_HARNESS_QUALITY_SCENE"), "a");
+                if (hdrReport == nullptr)
+                    hdrReport = stdout;
+                std::fprintf(hdrReport, "HDRQ frame=%d", frame);
+                static const char* names[5] = {"sparkle", "neon", "blinds", "gradient", "bg"};
+                for (int r = 0; r < 5; ++r)
+                {
+                    const double ratio = truthSum[r] > 0.0 ? outSum[r] / truthSum[r] : 0.0;
+                    const double psnr = 10.0 * std::log10(1.0 / std::max(tmSquared[r] / std::max<size_t>(count[r], 1), 1e-12));
+                    accRatio[r] += ratio; accPsnr[r] += psnr;
+                    std::fprintf(hdrReport, " %s_energy=%.4f %s_tm_psnr=%.2f", names[r], ratio, names[r], psnr);
+                }
+                ++accFrames;
+                if (haveChange) { accFlicker += tmChange; ++accFlickerFrames; }
+                std::fprintf(hdrReport, " tm_flicker=%.5f\n", tmChange);
+                if (frame == frames)
+                {
+                    std::fprintf(hdrReport, "HDRQ summary");
+                    for (int r = 0; r < 5; ++r)
+                        std::fprintf(hdrReport, " %s_energy=%.4f %s_tm_psnr=%.2f", names[r], accRatio[r] / accFrames, names[r], accPsnr[r] / accFrames);
+                    std::fprintf(hdrReport, " tm_flicker=%.5f\n", accFlickerFrames ? accFlicker / accFlickerFrames : 0.0);
+                }
+                if (hdrReport != stdout)
+                    std::fclose(hdrReport);
             }
             double change = 0.0;
             if (!previousError.empty())
@@ -2356,7 +2508,7 @@ int main(int argc, char** argv)
         if (saveFrames)
         {
             const std::vector<uint8_t> frameOutput =
-                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 || packed ? 4 : 8));
+                read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
             const std::string framePath = std::string(argv[2]) + ".frame" + std::to_string(frame);
             if (FILE* frameFile = std::fopen(framePath.c_str(), "wb"))
             {
@@ -2378,8 +2530,8 @@ int main(int argc, char** argv)
         }
     }
 
-    const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                  outWidth * (rgba8 || packed ? 4 : 8));
+    const std::vector<uint8_t> output = read_back(outputTexture, outputState,
+                                                  outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
     FILE* file = std::fopen(argv[2], "wb");
     if (file != nullptr)
     {
@@ -2410,7 +2562,7 @@ int main(int argc, char** argv)
             return 1;
         }
         const std::vector<uint8_t> baseline =
-            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+            read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : 8));
         fill_guide_planes(guides, guideSpecs, guideData, resourceWidth, inHeight, 0, true, srv, 0.4f);
         if (evaluate_reset_once() != NGX_SUCCESS)
         {
@@ -2418,7 +2570,7 @@ int main(int argc, char** argv)
             return 1;
         }
         const std::vector<uint8_t> shifted =
-            read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
+            read_back(outputTexture, outputState, outWidth * (rgba8 ? 4 : 8));
         const size_t texel = rgba8 ? 4u : 8u;
         double left = 0.0, right = 0.0;
         size_t leftCount = 0, rightCount = 0, nonfinite = 0;
@@ -2645,8 +2797,8 @@ int main(int argc, char** argv)
             submit_and_wait();
             Sleep(frameWaitMs);
         }
-        const std::vector<uint8_t> cycleOutput = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                           outWidth * (rgba8 || packed ? 4 : 8));
+        const std::vector<uint8_t> cycleOutput = read_back(outputTexture, outputState,
+                                                           outWidth * (rgba8 ? 4 : packed ? packedTexel : 8));
         if (verifyRecreation)
         {
             auto& reference = recreationReference[cycle % 2];

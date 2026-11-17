@@ -1,0 +1,48 @@
+#version 460
+// d4r engine, preset L on GPUs with no FP8 (RDNA3): the expansion stage's output code. The native kernel
+// kernels/tex/dec0l_net.hip leaves each 8x8-pixel block's f16 result in a buffer; this makes the reconstruction's
+// per-pixel inputs from it, as layer_m.comp's KIND 4 does.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "normalized_store.glsl"
+#include "round_half.glsl"
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 size;             // render size
+    int blockShift; uint reset;  // the block grid's x offset: this frame's expansion window shift
+    vec2 rndOffs, rnd2hi, hiSize, histOffs;
+    float sigma, rho;
+    vec2 renderInv;
+} dp;
+layout(set = 0, binding = 3, rgba8_snorm) uniform writeonly image2D featOut;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D gateOut;
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D mixOut;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D covOut;
+layout(set = 0, binding = 7, std430) readonly buffer Block { uint w[]; } block;   // per block d4r_dec0l_block's result image
+#include "l_head.glsl"
+float lhChannel(uint base, uint m, uint r, uint n)
+{
+    const uint t = n >> 4, h = (n >> 3) & 1u, k = (n >> 1) & 3u;
+    const uint word = block.w[base + 32u * (2u * (4u * m + t + 2u * (k & 1u)) + (r >> 3)) + 4u * (r & 7u) + 2u * h + (k >> 1)];
+    return unpackHalf2x16(word)[n & 1u];
+}
+void main()
+{
+    const uint li = gl_LocalInvocationIndex, px = li & 7u, py = li >> 3;
+    const ivec2 at = ivec2(8 * int(gl_WorkGroupID.x) - dp.blockShift + int(px), 8 * int(gl_WorkGroupID.y) + int(py));
+    if (at.x < 0 || at.y < 0 || at.x >= dp.size.x || at.y >= dp.size.y) return;
+    const uint gw = uint(dp.size.x + 31) / 32u * 32u;
+    const uint base = (gl_WorkGroupID.y * ((gw + 9u) / 8u) + gl_WorkGroupID.x) * 1024u;
+    // the pixel's token in the block's window-major order: window m, row r
+    const uint m = (py >> 2) * 2u + (px >> 2), r = (py & 3u) * 4u + (px & 3u);
+    // natural channel n: pair k of tile t of half h (dec0l_block.hip: register R = 2 (4 m + t + 2 (k & 1)) + (r >> 3) of lane
+    // 4 (r & 7) + 2 h + (k >> 1))
+#define V(c) lhChannel(base, m, r, uint(c))
+    imageStore(gateOut, at, unorm8Value(vec4(sigmoidL(V(LH_GATE0)), sigmoidL(V(LH_GATE1)), sigmoidL(V(LH_GATE2)), 0.0)));
+    const vec3 x = vec3(V(LH_MIX0), V(LH_MIX1), V(LH_MIX2)), ex = exp2((x - max(max(x.x, x.y), x.z)) * 1.442695);
+    imageStore(mixOut, at, unorm8Value(vec4(ex * (1.0 / (ex.z + (ex.x + ex.y))), 0.0)));
+    const float a = dp.sigma * sigmoidL(clamp(V(LH_COVA), -20.0, 20.0)), b = dp.sigma * sigmoidL(clamp(V(LH_COVB), -20.0, 20.0));
+    imageStore(covOut, at, vec4(a * a, b * b, a * b * tanhL(V(LH_RHO) * dp.rho), 0.0));
+    imageStore(featOut, at, snorm8Value(vec4(tanhL(V(LH_FEAT0)), tanhL(V(LH_FEAT1)), tanhL(V(LH_FEAT2)), tanhL(V(LH_FEAT3)))));
+}

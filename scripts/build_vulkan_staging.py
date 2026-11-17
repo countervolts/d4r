@@ -35,6 +35,10 @@ def main():
             ('fsr_rr_prepare', 'fsr_rr_prepare.comp', []), ('fsr_rr_compose', 'fsr_rr_compose.comp', [])]
     jobs += [(f'write_{f}', 'vulkan_write.comp', [f'-DOUTPUT_FORMAT={f}'])
              for f in ('rgba16f', 'rgba32f', 'r11f_g11f_b10f', 'rgb10_a2', 'rgba8')]
+    # the f32 stores of the CUDA backend's float planes (vulkan_write_f32.comp), one per destination format
+    jobs += [(f'write_f32_{name}', 'vulkan_write_f32.comp', [f'-DOUTPUT_{define}=1'])
+             for define, name in (('RGBA8', 'rgba8'), ('BGRA8', 'bgra8'), ('RGB10', 'rgb10'), ('R11G11B10', 'r11g11b10'),
+                                  ('E5B9G9R9', 'e5b9g9r9'), ('RGBA32F', 'rgba32f'))]
     for name, source, defines in jobs:
         subprocess.run([compiler, '-V', '--target-env', 'vulkan1.0', *defines, '-o', str(out / f'{name}.spv'),
                         str(SUPPORT / source)], check=True, stdout=subprocess.DEVNULL)

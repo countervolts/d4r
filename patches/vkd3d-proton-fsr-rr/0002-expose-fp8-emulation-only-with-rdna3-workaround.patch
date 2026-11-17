@@ -1,0 +1,52 @@
+From: d4r
+Subject: [PATCH] d4r: expose FP8 emulation only with DXIL_SPIRV_CONFIG=wmma_rdna3_workaround
+
+An -Denable_extended_emulation build otherwise reports FP8 cooperative matrices (and AGS WMMA FP8) on RDNA 3 in every
+game. With this the release can ship one vkd3d-proton: it behaves as a default build unless the workaround is set.
+---
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -35,6 +35,17 @@
+ #include "vkd3d_shader.h"
+ #include "vkd3d_threads.h"
+ #include "vkd3d_platform.h"
++
++#ifdef VKD3D_ENABLE_EXTENDED_EMULATION
++/* d4r: the extended FP8 emulation is exposed only when the RDNA 3 workaround it needs is configured
++ * (DXIL_SPIRV_CONFIG=wmma_rdna3_workaround, which d4r_boot sets for [RayReconstruction] Backend = fsr).
++ * Without it this build reports the same matrix support as a default build. */
++static inline bool vkd3d_extended_emulation_active(void)
++{
++    char env[64];
++    return vkd3d_get_env_var("DXIL_SPIRV_CONFIG", env, sizeof(env)) && !strcmp(env, "wmma_rdna3_workaround");
++}
++#endif
+ #include "vkd3d_swapchain_factory.h"
+ #include "vkd3d_command_list_vkd3d_ext.h"
+ #include "vkd3d_command_queue_vkd3d_ext.h"
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2387,7 +2387,7 @@
+                 supports_8bit_c = true;
+         }
+ #ifdef VKD3D_ENABLE_EXTENDED_EMULATION
+-        else
++        else if (vkd3d_extended_emulation_active())
+         {
+             /* Don't expose this by default in official builds.
+              * The decision is above my paygrade.
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -677,7 +677,11 @@
+             if (!device->device_info.cooperative_matrix_features.cooperativeMatrix)
+                 return false;
+ 
+-#ifndef VKD3D_ENABLE_EXTENDED_EMULATION
++#ifdef VKD3D_ENABLE_EXTENDED_EMULATION
++            if (!vkd3d_extended_emulation_active() &&
++                    !device->device_info.shader_float8_features.shaderFloat8CooperativeMatrix)
++                return false;
++#else
+             if (!device->device_info.shader_float8_features.shaderFloat8CooperativeMatrix)
+                 return false;
+ #endif

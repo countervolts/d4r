@@ -419,6 +419,7 @@ void init_vram_interop()
     load(g_vk.unmap, "vkUnmapMemory");
     load(g_vk.barrier, "vkCmdPipelineBarrier");
     load(g_vk.copyImageToBuffer, "vkCmdCopyImageToBuffer");
+    load(g_vk.copyImage, "vkCmdCopyImage");
     load(g_vk.copyBuffer, "vkCmdCopyBuffer");
     load(g_vk.copyBufferToImage, "vkCmdCopyBufferToImage");
     load(g_vk.blit, "vkCmdBlitImage");
@@ -908,7 +909,7 @@ void destroy_vram_image(VramImage& image)
     image = VramImage{};
 }
 
-bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format)
+bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format, bool storage)
 {
     VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -918,7 +919,7 @@ bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat forma
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkResult result = g_vk.createImage(g_vk.device, &info, nullptr, &image.image);
@@ -945,6 +946,11 @@ bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat forma
     image.height = height;
     image.format = format;
     return true;
+}
+
+uint32_t plane_format_in(const InputSlot& slot, int index, Plane plane)
+{
+    return slot.planeFloat[index] ? CUDA_FORMAT_FLOAT : plane_format(plane);
 }
 
 size_t canonical_texel_bytes(Plane plane)
@@ -1118,7 +1124,7 @@ static bool vram_motion_blit_supported(VkFormat format)
 // Whether `resource` can be copied raw (or, for colour/motion/exposure, blitted)
 // to/from the canonical layout of `plane`.
 
-bool describe_vram_copy(ID3D12Resource* resource,  Plane plane,  VramCopy& copy,  bool output)
+bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output, bool floatPlanes)
 {
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -1134,6 +1140,34 @@ bool describe_vram_copy(ID3D12Resource* resource,  Plane plane,  VramCopy& copy,
     copy.height = desc.Height;
     copy.aspect = (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT)
                       ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.asFloat = false;
+    copy.format = format;
+    // NVIDIA's output kernels store f32 straight into the game's texture
+    if (output && floatPlanes && plane == Plane::Color &&
+        (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM ||
+         format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32B32A32_SFLOAT;
+        return true;
+    }
+    // NVIDIA's kernels read textures as f32, so a value binary16 cannot hold keeps its f32 plane
+    if (!output && floatPlanes && plane == Plane::Color &&
+        (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM ||
+         format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32B32A32_SFLOAT;
+        return !copy.convert || vram_blit_supported(format, VK_FORMAT_R32G32B32A32_SFLOAT);
+    }
+    if (floatPlanes && plane == Plane::Motion &&
+        (format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM))
+    {
+        copy.asFloat = true;
+        copy.convert = format != VK_FORMAT_R32G32_SFLOAT;
+        return !copy.convert || vram_blit_supported(format, VK_FORMAT_R32G32_SFLOAT);
+    }
     if (plane == Plane::Color)
     {
         copy.convert = vram_color_blit_supported(format, output);
@@ -1177,7 +1211,8 @@ bool ensure_fused_color(Feature& feature,  int slotIndex,  ID3D12Resource* sourc
     }
     auto& slot = feature.fusedColor[slotIndex];
     auto& target = feature.inputs[slotIndex].vram[0];
-    if (slot.image == copy.image && slot.buffer == target.buffer && slot.owner == source) return true;
+    const uint32_t mode = copy.asFloat ? 6 : rgba8 ? 5 : 1;
+    if (slot.image == copy.image && slot.buffer == target.buffer && slot.owner == source && slot.inputMode == mode) return true;
     if (slot.owner != nullptr) feature.retiredFusedColor.push_back(slot);
     slot = {};
     VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1190,8 +1225,8 @@ bool ensure_fused_color(Feature& feature,  int slotIndex,  ID3D12Resource* sourc
         g_fusedColorStage.free(slot.set); g_vk.destroyView(g_vk.device, slot.view, nullptr); slot = {}; return false;
     }
     slot.image = copy.image; slot.buffer = target.buffer; slot.owner = source; source->AddRef();
-    slot.inputMode=rgba8 ? 5 : 1;
-    logf("fused %s input conversion active for slot %d", rgba8 ? "RGBA8" : "R11G11B10", slotIndex);
+    slot.inputMode=mode;
+    logf("fused %s input conversion active for slot %d%s", rgba8 ? "RGBA8" : "R11G11B10", slotIndex, copy.asFloat ? " (f32 plane)" : "");
     return true;
 }
 
@@ -1224,7 +1259,8 @@ bool record_vram_inputs(Feature& feature,  ID3D12GraphicsCommandList* list,  Inp
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &sampled);
             auto& stage = feature.fusedColor[&slot - feature.inputs];
-            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, stage.inputMode, slot.host[0].rowBytes / 8);
+            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, stage.inputMode,
+                                     slot.host[0].rowBytes / (slot.planeFloat[0] ? 16 : 8));
             sampled.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; sampled.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             sampled.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; sampled.newLayout = layout;
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1234,7 +1270,8 @@ bool record_vram_inputs(Feature& feature,  ID3D12GraphicsCommandList* list,  Inp
         VkBufferImageCopy region = full_region(copy);
         static const Plane kPlanes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
         if (feature.linearInputs)
-            region.bufferRowLength = static_cast<uint32_t>(slot.host[index].rowBytes / canonical_texel_bytes(kPlanes[index]));
+            region.bufferRowLength = static_cast<uint32_t>(slot.host[index].rowBytes /
+                ((slot.planeFloat[index] ? 4 : plane_format(kPlanes[index]) == CUDA_FORMAT_HALF ? 2 : 4) * plane_channels(kPlanes[index])));
         if (!copy.convert)
         {
             g_vk.copyImageToBuffer(cmd, copy.image, layout, slot.vram[index].buffer, 1, &region);
@@ -1335,6 +1372,59 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 
 // Reuse the storage-output shader to combine half decoding and the game's
 // R11G11B10 conversion. Descriptors retain their images through allocator retirement.
+// An f32 result into the game's texture: stored into an image of the texture's bits (the conversion a formatted store
+// does, kernels/support/vulkan_write_f32.comp), which is copied raw. A blit would narrow the values to half.
+static bool record_vram_output_f32(Feature& feature,unsigned slotIndex,ID3D12GraphicsCommandList* list,ID3D12Resource* output,
+                                   D3D12_RESOURCE_STATES outputState,const VramBuffer& buffer,const VramCopy& copy)
+{
+    const VramImage& conversion=feature.outputConversion;
+    auto& slot=feature.fusedOutput[slotIndex];
+    if(slot.owner!=output || slot.image!=conversion.image || slot.buffer!=buffer.buffer)
+    {
+        if(feature.retiredFusedOutput.size()>=64) return false;
+        if(slot.owner) feature.retiredFusedOutput.push_back(slot);
+        slot={};
+        VkImageViewCreateInfo view={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image=conversion.image;view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.format=conversion.format;
+        view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        if(g_vk.createView(g_vk.device,&view,nullptr,&slot.view)!=VK_SUCCESS) return false;
+        if(!g_fusedColorStage.set(slot.set,slot.view,view.format,buffer.buffer,size_t(copy.width)*copy.height*16,true,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,copy.format))
+        {
+            g_fusedColorStage.free(slot.set);g_vk.destroyView(g_vk.device,slot.view,nullptr);slot={};return false;
+        }
+        slot.owner=output;output->AddRef();slot.image=conversion.image;slot.buffer=buffer.buffer;
+        logf("f32 output store active for slot %u (format %d)",slotIndex,int(copy.format));
+    }
+    transition(list,output,outputState,D3D12_RESOURCE_STATE_COPY_DEST);
+    VkCommandBuffer cmd=VK_NULL_HANDLE;
+    bool recorded=SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list,&cmd));
+    if(recorded)
+    {
+        VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
+        g_vk.interop->GetVulkanImageLayout(copy.resource,D3D12_RESOURCE_STATE_COPY_DEST,&layout);
+        VkImageMemoryBarrier image={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        image.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;image.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+        image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        image.image=conversion.image;image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        const VkMemoryBarrier before={VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT};
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,nullptr,1,&image);
+        g_fusedColorStage.record(cmd,slot.set,copy.width,copy.height);
+        image.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        image.oldLayout=VK_IMAGE_LAYOUT_GENERAL;image.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&kBeforeTransfer,0,nullptr,1,&image);
+        VkImageCopy region={};
+        region.srcSubresource=region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        region.extent={copy.width,copy.height,1};
+        g_vk.copyImage(cmd,conversion.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,copy.image,layout,1,&region);
+        g_vk.barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&kAfterTransfer,0,nullptr,0,nullptr);
+        recorded=SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+    }
+    transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST,outputState);
+    return recorded;
+}
+
 
 bool record_feature_vram_output(Feature& feature,  unsigned slotIndex,  ID3D12GraphicsCommandList* list,  ID3D12Resource* output,  D3D12_RESOURCE_STATES outputState,  const VramCopy& copy,  uint32_t frame)
 {
@@ -1398,6 +1488,8 @@ bool record_feature_vram_output(Feature& feature,  unsigned slotIndex,  ID3D12Gr
         if(recorded) {feature.recordOutputFused=true;return true;}
         feature.fusedOutputAllowed=false;
     }
+    if(copy.asFloat && copy.convert)
+        return record_vram_output_f32(feature,slotIndex,list,output,outputState,buffer,copy);
     transition(list,output,outputState,D3D12_RESOURCE_STATE_COPY_DEST);
     const bool recorded=record_vram_output(list,buffer,copy,feature.outputConversion);
     transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST,outputState);

@@ -30,6 +30,15 @@ bool engine_k_refused()
     return engine_k_native_rdna3() && env_uint("D4R_ENGINE_VKHIP", 1) == 0;
 }
 
+// Preset M with its native layers inside the game's command list (engine/vkhip) and FP8-free stages around them, on
+// RDNA3, with [Engine] ExperimentalVkHip (D4R_ENGINE_M_VKHIP=0 turns off M and L). A model without the HIP network, a
+// GPU or driver vkhip refuses, and PreferAccuracy stay on the CUDA backend's kernels. L's stages are native too.
+static bool engine_m_vkhip()
+{
+    return g_vk.matrixF16 && !g_vk.float8 && env_uint("D4R_ENGINE_VKHIP", 1) != 0 && env_uint("D4R_ENGINE_M_VKHIP", 1) != 0 &&
+           env_uint("D4R_PREFER_ACCURACY", 0) == 0 && env_string("D4R_ENGINE_M_NETWORK") != "dot2";
+}
+
 // Presets M and L on the engine's v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp): on GPUs without FP8 and
 // without the f16 matrix tuple (RDNA2), where the CUDA backend's M and L kernels are translated. RDNA3 keeps its
 // native kernels unless D4R_ENGINE_M_NETWORK=dot2.
@@ -102,7 +111,7 @@ void init_engine_vulkan()
     logf("engine backend: f16 matrix tuple %s; FP8 matrix tuple %s", g_vk.matrixF16 ? "supported" : "unsupported",
          g_vk.float8 ? "supported" : "unsupported");
     logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)"
-         : engine_m_dot2() ? "unavailable: M and L run their v_dot2 stages" : "unavailable: M and L run on the CUDA backend");
+         : engine_m_dot2() ? "unavailable: M and L run their v_dot2 stages" : "unavailable: M and L run on vkhip where they can");
     // the features vkd3d-proton created its device with
     const VkPhysicalDeviceFeatures2* features = nullptr;
     if (SUCCEEDED(g_vk.interop->GetDeviceFeatures(&features)) && features != nullptr)
@@ -151,7 +160,8 @@ void init_engine_backend()
     logf("engine backend: model %s loaded and pipelines compiled in %.0f ms (network: %s)", path.c_str(),
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
          g_engine.model->dot2Network() ? "v_dot2, no cooperative matrices" : "cooperative matrices");
-    logf("engine backend: K reconstruction uses %s stages", g_engine.model->hasAccuracyStages() ? "accuracy" : "fast");
+    logf("engine backend: K reconstruction uses %s stages%s", g_engine.model->hasAccuracyStages() ? "accuracy" : "fast",
+         g_engine.model->linearLighting() == 100 ? ", linear lighting full" : g_engine.model->linearLighting() == 50 ? ", linear lighting half" : "");
 }
 
 void init_engine_backend_ldr()
@@ -173,7 +183,8 @@ void init_engine_backend_ldr()
                                                          env_uint("D4R_PREFER_ACCURACY", 0) != 0);
         g_engine.directoryLdr = path;
         logf("engine backend: LDR model %s loaded", path.c_str());
-        logf("engine backend: K LDR reconstruction uses %s stages", g_engine.modelLdr->hasAccuracyStages() ? "accuracy" : "fast");
+        logf("engine backend: K LDR reconstruction uses %s stages%s", g_engine.modelLdr->hasAccuracyStages() ? "accuracy" : "fast",
+             g_engine.modelLdr->linearLighting() == 100 ? ", linear lighting full" : g_engine.modelLdr->linearLighting() == 50 ? ", linear lighting half" : "");
     }
     catch (const std::exception& error)
     {
@@ -198,7 +209,8 @@ void prepare_engine_view(Feature& feature, ID3D12Resource* resource, const D3D12
     const bool compatible = desc.DepthOrArraySize == 1 && originSupported && (isOutput ?
         // the final-store formats (K packages a store per format; other models copy what they cannot store)
         (image.format == VK_FORMAT_R16G16B16A16_SFLOAT || image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-         image.format == VK_FORMAT_R8G8B8A8_UNORM || image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
+         image.format == VK_FORMAT_R8G8B8A8_UNORM || image.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         image.format == VK_FORMAT_R32G32B32A32_SFLOAT) &&
             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
             (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) :
         !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -272,7 +284,8 @@ void init_engine_backend_m_variant(bool presetL, bool ldr)
     try
     {
         // without FP8 (RDNA2) M and L run their v_dot2 stages (layer_m_dot2.comp, layer_l_dot2.comp)
-        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !g_vk.float8);
+        const bool wide = engine_m_vkhip();
+        auto model = std::make_unique<d4r::MModel>(g_vk.physical, g_vk.device, path, VK_NULL_HANDLE, !g_vk.float8 && !wide, wide);
         if (model->isPresetL() != presetL)
             throw std::runtime_error(presetL ? "the directory holds a preset M model" : "the directory holds a preset L model");
         slot = std::move(model);
@@ -760,7 +773,8 @@ bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12
     // The FP8 pipelines need VK_EXT_shader_float8: creating them without it crashes the driver (RADV on RDNA3,
     // vkCreateComputePipelines), so never load such a model. M and L load their v_dot2 stages instead where
     // engine_m_dot2().
-    if (!g_vk.float8 && !engine_m_dot2())
+    const bool vkhipM = engine_m_vkhip();
+    if (!g_vk.float8 && !engine_m_dot2() && !vkhipM)
         return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
     std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
     d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
@@ -843,17 +857,25 @@ bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12
         if (feature.engineM == nullptr)
         {
             const size_t bytes = static_cast<size_t>(d4r::MEngine::networkBufferBytes(p.renderWidth, p.renderHeight));
-            const bool hip = create_engine_network(feature, g_engineM.directories[presetL][ldr], name,
-                                                   model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
-                                                   bytes, bytes);
+            // RDNA3 without FP8 (engine_m_vkhip: the model's f16 "wide" stage set): M's and L's layers, and L's native
+            // input and expansion stages, through vkhip (KNetwork::createM); nothing else runs that model
+            const bool vkhipWide = vkhipM && create_engine_vkhip(feature, g_engineM.directories[presetL][ldr],
+                presetL ? static_cast<size_t>(d4r::MEngine::lStageBufferBytes(p.renderWidth, p.renderHeight, false)) : bytes,
+                presetL ? static_cast<size_t>(d4r::MEngine::lStageBufferBytes(p.renderWidth, p.renderHeight, true)) : bytes, true,
+                p.renderWidth, p.renderHeight);
+            if (vkhipM && !vkhipWide) return refuse("vkhip is unavailable");
+            const bool hip = !vkhipWide && create_engine_network(feature, g_engineM.directories[presetL][ldr], name,
+                                                                 model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
+                                                                 bytes, bytes);
             // vkhip (D4R_ENGINE_VKHIP): M's and L's native layers in the game's command list, on a fixed grid of
             // this frame's render size; other sizes go to engineMDynamic
-            if (!hip && model->hasExternalNetworkStages())
+            if (!vkhipWide && !hip && model->hasExternalNetworkStages())
                 feature.engineMVkHip = create_engine_vkhip_net(g_engineM.directories[presetL][ldr], p.renderWidth,
                                                                p.renderHeight, bytes);
-            const bool vkhip = feature.engineMVkHip != nullptr;
-            const d4r::ExternalNetwork external = vkhip ?
-                d4r::ExternalNetwork{feature.engineMVkHip->tokens(), feature.engineMVkHip->head()} :
+            const bool vkhip = vkhipWide || feature.engineMVkHip != nullptr;
+            const d4r::ExternalNetwork external = vkhipWide ?
+                d4r::ExternalNetwork{feature.engineVkHip->tokens(), feature.engineVkHip->head()} :
+                feature.engineMVkHip ? d4r::ExternalNetwork{feature.engineMVkHip->tokens(), feature.engineMVkHip->head()} :
                 d4r::ExternalNetwork{feature.engineTokens.buffer, feature.engineHead.buffer};
             // The Vulkan network of a dynamic-resolution model reserves the render size the feature was created with
             // (NGX's maximum; at least this frame's), not the output size: at 1280x720 -> 4K that is 1.1 GB less for
@@ -868,7 +890,8 @@ bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12
             feature.engineMRenderHeight = capacityHeight;
             logf("engine backend (%s): feature %u runs preset %s in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
                  name, feature.handle.Id, name, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
-                 hip ? "the native HIP layers (list split around it)" : vkhip ? "vkhip" : "Vulkan",
+                 vkhipWide ? "vkhip (one Vulkan command list)" : hip ? "the native HIP layers (list split around it)" :
+                 vkhip ? "vkhip" : "Vulkan",
                  model->hasRgb10Output() && game.output.view != VK_NULL_HANDLE &&
                      game.output.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
                      game.output.layout == VK_IMAGE_LAYOUT_GENERAL && game.output.image != game.color.image &&
@@ -883,6 +906,9 @@ bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12
         return refuse("the engine could not be created");
     }
     d4r::GameUpscalerM* adapter = feature.engineM.get();
+    // vkhip's grid is fixed and this GPU has no FP8 engine to take other sizes
+    if (feature.engineVkHip && (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
+        return refuse("the render size changed, which M's vkhip network does not support yet");
     // the HIP and vkhip networks' grids are fixed; the Vulkan engine takes render sizes up to the one it reserved
     const bool fixedGrid = feature.engineNet != nullptr || feature.engineMVkHip != nullptr;
     const bool resizedHip = fixedGrid &&
@@ -962,7 +988,14 @@ bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12
     {
         try
         {
-            if (feature.engineMVkHip && !resizedHip)
+            if (feature.engineVkHip)
+            {
+                // the wide model's vkhip network (KNetwork::createM)
+                adapter->recordFront(command, game);
+                feature.engineVkHip->record(command, game.reset);
+                adapter->recordBack(command, game);
+            }
+            else if (feature.engineMVkHip && !resizedHip)
             {
                 adapter->recordFront(command, game);
                 feature.engineMVkHip->record(command);
@@ -1371,7 +1404,7 @@ void start_engine_preload()
                  "feature ([RayReconstruction] Enable = true loads it at NGX init)");
         const auto forced = d4r_parse_render_preset_override(env_string(d4r_render_preset_variable(false)).c_str());
         const uint32_t sr = forced.enabled ? forced.value : 0;
-        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || engine_m_dot2());
+        const bool srM = (sr == 13 || sr == 12) && (g_vk.float8 || engine_m_dot2() || engine_m_vkhip());
         const bool srK = sr == 11 && !engine_k_refused();
         if (!rr && !srM && !srK)
             return;
@@ -1450,8 +1483,6 @@ bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list, ID3D1
         return refuse("needs the HDR flag and render-resolution motion vectors");
     if ((feature.flags & 0x4) != 0)
         return refuse("jittered motion vectors are not implemented");
-    if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
-        return refuse("the camera matrices are missing");
     // Preset F below 4/3 scaling (DLAA and the like): NGX runs another output filter there, rr2_post_kernel_3_2,
     // which the model does not have (harness runs at 1920x1080 output, 2026-10-13: 1440x810 and smaller render sizes
     // use rr2_post_kernel, 1456x820 and larger rr2_post_kernel_3_2)
@@ -1756,7 +1787,7 @@ static bool vkhip_adapter(bool rdna4, bool amd, uint32_t& mach, bool& binaries, 
     char name[16];
     std::snprintf(name, sizeof(name), "gfx%u%u%x", target / 10000, target / 100 % 100, target % 100);
     gfx = name;
-    if (!mach) return unavailable((rdna4 ? "requires an RDNA3 or RDNA4 GPU, not " : "requires an RDNA3 GPU (gfx1100-gfx1103), not ") + gfx);
+    if (!mach) return unavailable((rdna4 ? "requires an RDNA3 or RDNA4 GPU, not " : "requires an RDNA3 or RDNA 3.5 GPU (gfx1100-gfx1103, gfx1150-gfx1153), not ") + gfx);
     return true;
 }
 
@@ -1896,7 +1927,9 @@ std::unique_ptr<vkhip::MNetwork> create_engine_vkhip_net(const std::string& dire
 // adapter and the native Vulkan frontend (d4r_vulkan_frontend.inl).
 
 std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& directory, uint32_t outWidth,
-                                                              uint32_t outHeight, size_t tokenBytes, size_t headBytes)
+                                                              uint32_t outHeight, size_t tokenBytes, size_t headBytes,
+                                                              bool presetM, bool presetL, uint32_t renderWidth,
+                                                              uint32_t renderHeight)
 {
     if (env_uint("D4R_ENGINE_VKHIP", 1) == 0) return nullptr;
     auto unavailable = [&](const std::string& reason) {
@@ -1919,7 +1952,24 @@ std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& direct
     // the CUDA backend, about 0.12 ms slower at 1080p) when the model has them, otherwise the fast set in hip/
     const bool accuracy = env_uint("D4R_PREFER_ACCURACY", 0) != 0 &&
         GetFileAttributesW(widen(directory + "/hip-accuracy/dltss_pwin_enc0_layer.hsaco").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const std::string hipDir = directory + (accuracy ? "/hip-accuracy/" : "/hip/");
+    const std::string hipDir = directory + (accuracy && !presetM ? "/hip-accuracy/" : "/hip/");
+    if (presetM)
+    {
+        for (const char* layer : {"enc1", "enc2", "enc3_tube", "dec2", "dec1"}) {
+            const std::string name = std::string("rrlite_") + layer + "_4x4";
+            if (!load(widen(hipDir + name + ".hsaco"), files.code[name]))
+                return unavailable(name + ".hsaco missing");
+        }
+        // preset L: its native input and expansion stages around the same layers
+        if (presetL)
+            for (const char* stage : {"enc0l", "dec0l"}) {
+                const std::string name = std::string("rrlite_") + stage + "_net";
+                if (!load(widen(hipDir + name + ".hsaco"), files.code[name]) ||
+                    !load(widen(directory + "/" + stage + "_weights.bin"), stage[0] == 'e' ? files.enc0lWeights : files.dec0lWeights))
+                    return unavailable(name + " or its weights missing");
+            }
+    }
+    else
     for (const char* layer : {"enc0", "enc1", "enc2", "enc3", "enc4", "dec5", "dec4", "dec3", "dec2", "dec1", "dec0"}) {
         const std::string name = std::string("dltss_pwin_") + layer + "_layer";
         if (!load(widen(hipDir + name + ".hsaco"), files.code[name]))
@@ -1927,8 +1977,10 @@ std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& direct
     }
     auto network = std::make_unique<vkhip::KNetwork>();
     std::string error;
-    if (!network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, outWidth,
-                         outHeight, tokenBytes, headBytes, error)) return unavailable(error);
+    if (!(presetM ? network->createM(g_vk.device, g_vk.deviceProc, g_vk.memory, files, renderWidth, renderHeight, tokenBytes,
+                                     headBytes, error)
+                  : network->create(g_vk.device, g_vk.deviceProc, g_vk.memory, files, outWidth, outHeight, tokenBytes,
+                                    headBytes, error))) return unavailable(error);
     logf("experimental vkhip ready on %s: %u native dispatches, %s layers, shared image-format adapter, regular/inverted depth",
          gfx.c_str(), network->dispatchesPerFrame(), accuracy ? "accuracy" : "fast");
     if (env_uint("D4R_VKHIP_STAMPS", 0) != 0)
@@ -1938,10 +1990,11 @@ std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& direct
     return network;
 }
 
-bool create_engine_vkhip(Feature& feature, const std::string& directory,
-                                size_t tokenBytes, size_t headBytes)
+bool create_engine_vkhip(Feature& feature, const std::string& directory, size_t tokenBytes, size_t headBytes,
+                         bool presetM, uint32_t renderWidth, uint32_t renderHeight)
 {
-    feature.engineVkHip = create_engine_vkhip_k(directory, feature.outWidth, feature.outHeight, tokenBytes, headBytes);
+    feature.engineVkHip = create_engine_vkhip_k(directory, feature.outWidth, feature.outHeight, tokenBytes, headBytes,
+                                                presetM, feature.preset == 12, renderWidth, renderHeight);
     return feature.engineVkHip != nullptr;
 }
 

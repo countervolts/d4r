@@ -687,6 +687,15 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
     if (diffuseHit == nullptr && (diffuseHit = get_resource(parameters, "DLSSD.DiffuseRayDirectionHitDistance")))
         diffuseInW = true;
     ID3D12Resource* beforeParticles = get_resource(parameters, "DLSSD.ColorBeforeParticles");
+    ID3D12Resource* const gameBeforeParticles = beforeParticles; // for the diagnostic dump, used or not
+    // [RayReconstruction] FsrBeforeParticles = off (D4R_FSR_RR_BEFORE_PARTICLES=0): ignore the game's colour before
+    // particles. Cyberpunk 2077's is about 1000 times darker than its colour (2026-11-07 dump), so treating it as the
+    // denoised base sent almost all light around the denoiser as "particles", and the image kept all its noise.
+    {
+        const std::string use = ascii_lower(env_string("D4R_FSR_RR_BEFORE_PARTICLES"));
+        if (use == "0" || use == "off" || use == "false")
+            beforeParticles = nullptr;
+    }
     if (get_resource(parameters, "DLSSD.OutputAlpha") != nullptr)
         return refuse("DLSSD.OutputAlpha is requested, and the FSR backend does not produce alpha");
     if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
@@ -711,7 +720,37 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
     if (!specularMode.empty() && specularMode != "auto" && specularMode != "direct")
         return refuse("D4R_FSR_RR_SPECULAR_SIGNAL must be auto or direct");
     const bool useIndirectSpecular = specularHit != nullptr && specularMode != "direct";
-    const uint32_t signals = (diffuseHit ? FFX_DENOISER_SIGNAL_INDIRECT_DIFFUSE : FFX_DENOISER_SIGNAL_DIRECT_DIFFUSE) |
+    // Diffuse ([RayReconstruction] FsrDiffuseSignal, D4R_FSR_RR_DIFFUSE_SIGNAL): with the game's ray length the
+    // indirect path. Without one: auto and direct take the direct path; indirect takes the indirect path with an
+    // estimated length (FsrDiffuseHit, D4R_FSR_RR_DIFFUSE_HIT: auto or specular = the game's specular ray length,
+    // depthK = K times the view depth, or a constant in scene units). Path-traced diffuse is mostly indirect light.
+    // 2026-11-07, synthetic scene: direct, indirect with the true length and every estimate within 0.3% RMSE of
+    // each other, so the default stays direct until a game shows a difference.
+    const std::string diffuseMode = ascii_lower(env_string("D4R_FSR_RR_DIFFUSE_SIGNAL"));
+    if (!diffuseMode.empty() && diffuseMode != "auto" && diffuseMode != "direct" && diffuseMode != "indirect")
+        return refuse("D4R_FSR_RR_DIFFUSE_SIGNAL must be auto, direct or indirect");
+    const bool estimateDiffuseHit = diffuseHit == nullptr && diffuseMode == "indirect";
+    float diffuseHitEstimate = 0.0f;
+    bool diffuseHitFromSpecular = false;
+    if (estimateDiffuseHit)
+    {
+        const std::string how = ascii_lower(env_string("D4R_FSR_RR_DIFFUSE_HIT"));
+        if (how.empty() || how == "auto" || how == "specular")
+            diffuseHitFromSpecular = specularHit != nullptr;
+        if (!diffuseHitFromSpecular)
+        {
+            const bool depth = how.empty() || how == "auto" || how == "specular" || how.rfind("depth", 0) == 0;
+            const std::string number = how.rfind("depth", 0) == 0 ? how.substr(5) : how;
+            float value = depth ? 1.0f : 0.0f;
+            if (!number.empty() && number != "auto" && number != "specular")
+                value = std::strtof(number.c_str(), nullptr);
+            if (!(value > 0.0f) || !(value < 65000.0f))
+                return refuse("D4R_FSR_RR_DIFFUSE_HIT must be auto, specular, depth<K> or a positive length");
+            diffuseHitEstimate = depth ? -value : value;
+        }
+    }
+    const bool useIndirectDiffuse = diffuseHit != nullptr || estimateDiffuseHit;
+    const uint32_t signals = (useIndirectDiffuse ? FFX_DENOISER_SIGNAL_INDIRECT_DIFFUSE : FFX_DENOISER_SIGNAL_DIRECT_DIFFUSE) |
                              (useIndirectSpecular ? FFX_DENOISER_SIGNAL_INDIRECT_SPECULAR : FFX_DENOISER_SIGNAL_DIRECT_SPECULAR);
     if (fsr.context != nullptr && fsr.signals != signals)
     {
@@ -794,7 +833,12 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
         logf("FSR Ray Regeneration: feature %u context created in %.0f ms at max %ux%u (GPU memory %.1f MB, %.1f MB "
              "aliasable); signals: diffuse %s, specular %s",
              feature.handle.Id, ms, feature.width, feature.height, memory.totalUsageInBytes / 1048576.0,
-             memory.aliasableUsageInBytes / 1048576.0, diffuseHit ? "indirect (game hit distance)" : "direct",
+             memory.aliasableUsageInBytes / 1048576.0,
+             diffuseHit ? "indirect (game hit distance)"
+                        : (!estimateDiffuseHit ? "direct"
+                                               : (diffuseHitFromSpecular ? "indirect (estimated: specular hit distance)"
+                                                                         : (diffuseHitEstimate < 0.0f ? "indirect (estimated: view depth multiple)"
+                                                                                                      : "indirect (estimated: constant)"))),
              useIndirectSpecular ? "indirect (game hit distance)" : "direct");
     }
 
@@ -871,6 +915,8 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
     flags |= roughnessPacked ? kFsrRrRoughnessPacked : 0u;
     flags |= specularHit ? uint32_t(kFsrRrSpecularHit) | (specularInW ? uint32_t(kFsrRrSpecularHitInW) : 0u) : 0u;
     flags |= diffuseHit ? uint32_t(kFsrRrDiffuseHit) | (diffuseInW ? uint32_t(kFsrRrDiffuseHitInW) : 0u) : 0u;
+    flags |= estimateDiffuseHit ? uint32_t(kFsrRrDiffuseHitEstimate) | (diffuseHitFromSpecular ? uint32_t(kFsrRrDiffuseHitFromSpecular) : 0u)
+                                : 0u;
     flags |= fsr_rr_unorm(formats[3]) ? kFsrRrNormalsUnorm : 0u;
     flags |= beforeParticles ? kFsrRrBeforeParticles : 0u;
     flags |= env_uint("D4R_FSR_RR_ZERO_NORMAL_PASSTHROUGH", 1) ? kFsrRrInvalidNormalPassthrough : 0u;
@@ -893,18 +939,33 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
         const float floorValue = demodFloor.empty() ? 0.1f : std::strtof(demodFloor.c_str(), nullptr);
         c.detail[0] = share;
         c.detail[1] = floorValue > 1e-3f ? floorValue : 1e-3f;
+        c.detail[2] = diffuseHitEstimate;
     }
     if (!fsr.configurationLogged)
     {
+        // every name the game set on its evaluation parameters (diagnostics: what a game passes beyond what is used)
+        {
+            std::string listed;
+            auto visit = [](const char* name, unsigned type, unsigned long long bits, void* context) {
+                // names and kinds only: a pointer may be a matrix as well as a resource, so nothing is dereferenced
+                std::string& out = *static_cast<std::string*>(context);
+                char item[192];
+                std::snprintf(item, sizeof(item), "%s%s ", name, type == 6u ? (bits != 0 ? "=ptr" : "=null") : "");
+                out += item;
+            };
+            if (d4r_ngx_parameters_list(parameters, visit, &listed) != 0)
+                logf("FSR Ray Regeneration: game parameters: %s", listed.c_str());
+        }
         fsr.configurationLogged = true;
         logf("FSR Ray Regeneration: feature %u inputs: depth %s%s, motion %s-resolution (scale %.3f,%.3f), normals %s "
              "(assumed world space), roughness %s, specular hit distance %s, diffuse hit distance %s, colour before "
-             "particles %s, view z %s in front of the camera; formats colour %d depth %d motion %d normals %d",
+             "particles %s, view z %s in front of the camera; formats colour %d depth %d motion %d normals %d specular hit %d diffuse hit %d",
              feature.handle.Id, hardwareDepth ? "hardware" : "linear", (feature.flags & 0x8) ? " (inverted)" : "",
              lowResMotion ? "render" : "output", p.mvScaleX, p.mvScaleY, (flags & kFsrRrNormalsUnorm) ? "[0,1]" : "signed",
              roughnessPacked ? "packed in the normals' w" : "texture", specularHit ? "bound" : "none",
              diffuseHit ? "bound" : "none", beforeParticles ? "bound (particles bypass the denoiser)" : "none",
-             viewZSign > 0 ? "positive" : "negative", formats[0], formats[1], formats[2], formats[3]);
+             viewZSign > 0 ? "positive" : "negative", formats[0], formats[1], formats[2], formats[3],
+             specularHit ? formats[7] : 0, diffuseHit ? formats[8] : 0);
         logf("FSR Ray Regeneration: feature %u signal split: detail share %.2f, demodulation floor %.3f, halo limit %.2f",
              feature.handle.Id, c.detail[0], c.detail[1], haloLimitSetting());
     }
@@ -941,6 +1002,12 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
                 transition(list, resource, sampled, input.state);
                 break;
             }
+    {   // diagnostics (D4R_FSR_RR_DUMP_DIR): the game's own colour, specular ray length and colour before particles
+        ID3D12Resource* const own[3] = {color, specularHit ? specularHit : color,
+                                        gameBeforeParticles ? gameBeforeParticles : color};
+        static const char* const ownNames[3] = {"game_color", "game_specular_hit", "game_before_particles"};
+        fsr_rr_dp::dump_record(2, g.device, list, frame, 3, own, ownNames, inputState);
+    }
     if (profile)
         fsr_rr_profile(fsr, list, frame, 1, false);
     if (profile)
@@ -951,20 +1018,22 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
     for (int index : {FsrRrFeature::LinearDepth, FsrRrFeature::Motion, FsrRrFeature::Normals, FsrRrFeature::DiffuseAlbedo,
                       FsrRrFeature::SpecularAlbedo, FsrRrFeature::Diffuse, FsrRrFeature::Specular})
         set_state(index, read);
+    if (!env_string("D4R_FSR_RR_DUMP_DIR").empty()) // the residual is dumped with the inputs, from the same state
+        set_state(FsrRrFeature::Residual, read);
     auto ffx = [&](int index, uint32_t state) {
         const FsrRrTexture& texture = fsr.textures[index];
         return fsr_rr_texture(texture.resource, texture.desc, fsr_rr_surface_format(texture.desc.Format), state);
     };
     const uint32_t ffxRead = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
     {
-        ID3D12Resource* const inputs[7] = {
+        ID3D12Resource* const inputs[8] = {
             fsr.textures[FsrRrFeature::LinearDepth].resource, fsr.textures[FsrRrFeature::Motion].resource,
             fsr.textures[FsrRrFeature::Normals].resource,     fsr.textures[FsrRrFeature::DiffuseAlbedo].resource,
             fsr.textures[FsrRrFeature::SpecularAlbedo].resource, fsr.textures[FsrRrFeature::Diffuse].resource,
-            fsr.textures[FsrRrFeature::Specular].resource};
-        static const char* const names[7] = {"in_depth", "in_motion", "in_normals", "in_diffuse_albedo",
-                                             "in_specular_albedo", "in_diffuse", "in_specular"};
-        fsr_rr_dp::dump_record(0, g.device, list, frame, 7, inputs, names, read);
+            fsr.textures[FsrRrFeature::Specular].resource, fsr.textures[FsrRrFeature::Residual].resource};
+        static const char* const names[8] = {"in_depth", "in_motion", "in_normals", "in_diffuse_albedo",
+                                             "in_specular_albedo", "in_diffuse", "in_specular", "in_residual"};
+        fsr_rr_dp::dump_record(0, g.device, list, frame, 8, inputs, names, read);
     }
     ffxDispatchDescDenoiser desc = {};
     desc.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER;
@@ -1002,7 +1071,7 @@ static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* li
     FfxApiDenoiserSignal* diffuseSignal;
     FfxApiDenoiserSignal* specularSignal;
     ffxApiHeader *diffuseHeader, *specularHeader;
-    if (diffuseHit)
+    if (useIndirectDiffuse)
     {
         indirectDiffuse.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_INDIRECT_DIFFUSE;
         diffuseSignal = &indirectDiffuse.signal, diffuseHeader = &indirectDiffuse.header;

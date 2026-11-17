@@ -1673,11 +1673,11 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
         }
     }
     // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
-    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced or
+    // hiluma_engine_output, M = 13 and L = 12 through rrlite_downsample_kernel, their last kernel). Only a forced or
     // OptiScaler-chosen Super Sampling preset qualifies; a Ray Reconstruction preset never does here.
     if (!forced.empty() && !rayReconstruction)
     {
-        char allowed[128] = "11,13";
+        char allowed[128] = "11,12,13";
         if (const std::string list = env_string("D4R_SHIM_OUTPUT_DIRECT_PRESETS"); !list.empty())
             snprintf(allowed, sizeof(allowed), "%s", list.c_str());
         for (char* token = strtok(allowed, ","); token != nullptr; token = strtok(nullptr, ","))
@@ -1881,6 +1881,25 @@ static void read_rr_params(const Feature& feature, void* parameters, FrameParams
             d4r_ngx_get_void(parameters, kAuxMatrices[index], &value) == NGX_SUCCESS && value != nullptr;
         if (p.auxMatrixSet[index])
             std::memcpy(p.auxMatrix[index], value, sizeof(p.auxMatrix[index]));
+    }
+    // The caller registered no camera matrix for this frame: use identity, the way native
+    // nvngx_dlssd.dll degrades (its WorldToScreenMatrix falls back when the matrices are
+    // absent or not invertible) - temporal reprojection then rests on the motion vectors
+    // alone.
+    if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
+    {
+        static std::atomic<uint32_t> idLogged{0};
+        if (idLogged.fetch_add(1, std::memory_order_relaxed) == 0)
+            logf("engine backend (Ray Reconstruction): the caller registered no camera matrices: "
+                 "using identity, as native nvngx_dlssd.dll does (reprojection then rests on the "
+                 "motion vectors alone)");
+        for (int i = 0; i < 2; ++i)
+            if (!p.auxMatrixSet[i])
+            {
+                std::memset(p.auxMatrix[i], 0, sizeof p.auxMatrix[i]);
+                p.auxMatrix[i][0] = p.auxMatrix[i][5] = p.auxMatrix[i][10] = p.auxMatrix[i][15] = 1.0f;
+                p.auxMatrixSet[i] = true;
+            }
     }
 }
 
@@ -2102,9 +2121,20 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
     }
     else if ((!feature->vramDecided || feature->vram) && vram_interop_available())
     {
-        p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
+        // PreferAccuracy keeps the conversion to stay byte-identical to the CUDA reference; the native motion and
+        // Ray Reconstruction passes work on binary16 motion and colour.
+        const bool floatPlanes = env_uint("D4R_PREFER_ACCURACY", 0) == 0 && !feature->rayReconstruction &&
+                                 env_uint("D4R_MOTION_DILATION", 0) == 0 && env_uint("D4R_SHIM_F32_INPUTS", 1) != 0;
+        // The output store runs on the game's list after the wait a split frame gives it
+        const bool floatOutput = floatPlanes && env_uint("D4R_SHIM_F32_OUTPUT", 1) != 0 && g_fusedColorReady &&
+                                 g_vk.copyImage != nullptr && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 && g_vk.split != nullptr &&
+                                 (!feature->vramDecided || feature->split);
+        p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true, floatOutput);
+        if (p.vram && vramOutput.asFloat && (vramOutput.width != feature->outWidth || vramOutput.height != feature->outHeight))
+            p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
+        p.outputFloat = p.vram && vramOutput.asFloat;
         for (int index = 0; index < inputCount && p.vram; ++index)
-            p.vram = describe_vram_copy(inputs[index], planes[index], vramInputs[index]);
+            p.vram = describe_vram_copy(inputs[index], planes[index], vramInputs[index], false, floatPlanes);
     }
     if (!feature->vramDecided)
     {
@@ -2157,18 +2187,19 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
             HostPlane& geometry = slot.host[index]; // geometry only; the bytes stay in VRAM
             geometry.width = vramInputs[index].width;
             geometry.height = vramInputs[index].height;
-            geometry.rowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
+            slot.planeFloat[index] = vramInputs[index].asFloat;
+            geometry.rowBytes = (vramInputs[index].asFloat ? 4 * plane_channels(planes[index]) : canonical_texel_bytes(planes[index])) * geometry.width;
             if (feature->linearInputs)
                 geometry.rowBytes = (geometry.rowBytes + 255) & ~static_cast<size_t>(255); // texture pitch alignment
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
         // M's downsample kernel has only formatted stores, which the native store can pack (kernels/tex/tex_common.h).
-        p.packedOutput = feature->split && !nativeVram && feature->outputDirectAllowed && feature->preset == 13 && vramOutput.convert &&
+        p.packedOutput = feature->split && !nativeVram && !p.outputFloat && feature->outputDirectAllowed && feature->preset == 13 && vramOutput.convert &&
                          outputDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && vramOutput.width % 2 == 0 &&
                          env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_PACKED", 0) != 0 &&
                          feature->packedReady.load();
-        p.packedRgba8 = feature->split && !nativeVram && feature->outputDirectAllowed && feature->preset == 11 &&
+        p.packedRgba8 = feature->split && !nativeVram && !p.outputFloat && feature->outputDirectAllowed && feature->preset == 11 &&
                        outputDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && vramOutput.width % 2 == 0 &&
                        env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_RGBA8", 1) != 0 &&
                        feature->rgba8Ready.load();
@@ -2182,7 +2213,7 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
         }
         InPlaceTexture outputTexture;
         const size_t outputTexelBytes = p.packedOutput ? 4 : 8;
-        if (feature->split && !nativeVram && feature->outputDirectAllowed && (!vramOutput.convert || p.packedOutput) &&
+        if (feature->split && !nativeVram && !p.outputFloat && feature->outputDirectAllowed && (!vramOutput.convert || p.packedOutput) &&
             env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 &&
             describe_in_place(output, outputTexture) && outputTexture.rowPitch % 8 == 0 &&
             outputTexture.rowPitch / 8 <= 0xffffu &&
@@ -2214,7 +2245,7 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
         }
         if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
                                                                vramInputs[0].width, vramInputs[0].height,
-                                                               VK_FORMAT_R16G16B16A16_SFLOAT))
+                                                               vramInputs[0].asFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramInputs[1].convert && !ensure_conversion_image(*feature, feature->depthConversion,
                                                                vramInputs[1].width, vramInputs[1].height,
@@ -2222,7 +2253,7 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
                                                                vramInputs[2].width, vramInputs[2].height,
-                                                               VK_FORMAT_R16G16_SFLOAT))
+                                                               vramInputs[2].asFloat ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R16G16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (inputCount == 4 && vramInputs[3].convert &&
             !ensure_conversion_image(*feature, feature->exposureConversion,
@@ -2230,7 +2261,8 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
                                                              vramOutput.width, vramOutput.height,
-                                                             VK_FORMAT_R16G16B16A16_SFLOAT))
+                                                             vramOutput.asFloat ? D4rVkStaging::f32_store_layout(vramOutput.format)
+                                                                                : VK_FORMAT_R16G16B16A16_SFLOAT, vramOutput.asFloat))
             return NGX_FAIL_PLATFORM_ERROR;
     }
     if ((!p.vram || verify) &&
@@ -2249,7 +2281,7 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
         for (OutputSlot& outputSlot : feature->outputs)
         {
             outputSlot.staging.retire();
-            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * 8 *
+            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * (p.outputFloat ? 16 : 8) *
                                                                             outputDesc.Height)
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
                 return NGX_FAIL_PLATFORM_ERROR;
@@ -2389,6 +2421,13 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
     {
         p.outputInPlace = 0; // only a split frame waits for the result before the game reads its texture
         p.packedOutput = false;
+        if (p.outputFloat)
+        {
+            p.outputFloat = false; // the f32 store needs the split frame's wait
+            describe_vram_copy(output, Plane::Color, vramOutput, true);
+            if (vramOutput.convert)
+                ensure_conversion_image(*feature, feature->outputConversion, vramOutput.width, vramOutput.height, VK_FORMAT_R16G16B16A16_SFLOAT);
+        }
     }
     if (p.split && timestamps)
         profile_timestamp(*feature, list, frame, 2);

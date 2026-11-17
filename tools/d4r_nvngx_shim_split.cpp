@@ -147,14 +147,14 @@ bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t bytes)
     return g_vk.interop == nullptr ? create_native_vram_buffer(buffer, bytes) : create_vram_buffer(buffer, bytes);
 }
 
-bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format)
+bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format, bool storage)
 {
     if (image.image != VK_NULL_HANDLE && image.width == width && image.height == height && image.format == format)
         return true;
     if (image.image != VK_NULL_HANDLE)
         feature.retiredImages.push_back(image);
     image = VramImage{};
-    return create_vram_image(image, width, height, format);
+    return create_vram_image(image, width, height, format, storage);
 }
 
 // Diagnostic first: native inputs travel GPU image/buffer -> per-slot imported

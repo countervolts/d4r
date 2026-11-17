@@ -4,6 +4,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/build/native-engine}"
 CXX="${CXX:-g++}"
 mkdir -p "$OUT"
+# vkhip's donor shader (build/vkhip/donor_spv.h)
+python3 "$ROOT/scripts/build_vkhip_donor.py" "$ROOT/build/vkhip" > /dev/null
 # The native HIP network (hip_net.h) is shared by both runners when ROCm is installed; without it they fall back
 # to the engine's own Vulkan network. The library itself never links HIP.
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
@@ -11,15 +13,10 @@ HIP=()
 if [[ -f "$ROCM/include/hip/hip_runtime_api.h" ]]; then
     HIP=(-DD4R_ENGINE_HIP "$ROOT/engine/hip_net.cpp" -I"$ROCM/include" -L"$ROCM/lib" -lamdhip64 "-Wl,-rpath,$ROCM/lib")
 fi
-# vkhip (vkhip/vkhip_net.h) for d4r-m's `vkhip` argument: the HIP code objects as pipelines in the engine's command
-# buffer; needs only glslangValidator for its donor shader
-VKHIP=()
-if command -v glslangValidator >/dev/null; then
-    python3 "$ROOT/scripts/build_vkhip_donor.py" "$OUT/vkhip" >/dev/null
-    VKHIP=(-DD4R_ENGINE_VKHIP -std=c++20 -I"$OUT/vkhip" "$ROOT/engine/vkhip/vkhip.cpp" "$ROOT/engine/vkhip/vkhip_net.cpp")
-fi
-"$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers -fPIC -shared \
-    "$ROOT/engine/runtime.cpp" "$ROOT/engine/k_frame.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" "$ROOT/engine/game_rr.cpp" "$ROOT/engine/game_e.cpp" -lvulkan -o "$OUT/libd4r_engine.so"
+# vkhip_net.cpp (vkhip/vkhip_net.h) for d4r-m's and d4r-rr's `vkhip` argument: the HIP code objects as pipelines in the
+# engine's command buffer. vkhip.cpp itself is in the library (the engine's RR stages use it).
+VKHIP=(-DD4R_ENGINE_VKHIP -std=c++20 -I"$ROOT/build/vkhip" "$ROOT/engine/vkhip/vkhip_net.cpp")
+"$CXX" -std=c++20 -O3 -Wall -Wextra -Wno-missing-field-initializers -fPIC -shared     -I"$ROOT/build/vkhip" "$ROOT/engine/vkhip/vkhip.cpp"     "$ROOT/engine/runtime.cpp" "$ROOT/engine/k_frame.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" "$ROOT/engine/game_rr.cpp" "$ROOT/engine/game_e.cpp" -lvulkan -o "$OUT/libd4r_engine.so"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers \
     "$ROOT/engine/replay.cpp" "${HIP[@]}" -L"$OUT" -ld4r_engine -lvulkan '-Wl,-rpath,$ORIGIN' -o "$OUT/d4r-k"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Wno-missing-field-initializers \

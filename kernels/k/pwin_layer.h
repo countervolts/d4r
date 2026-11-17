@@ -117,6 +117,19 @@ __device__ __forceinline__ u8v img_tile(const uint8_t* w, int src, int n)
     return r;
 }
 
+#if defined(PWIN_FOLD_G1) || defined(PWIN_FOLD_G2)
+// the same tile with row k multiplied by the gain of input channel k (16 gains at `gain`): rounded once to f16
+__device__ __forceinline__ u8v img_tile_gained(const uint8_t* w, int src, int n, int gain)
+{
+    u8v r;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        r[j] = pack2(wload(w, src + frag_offset(2 * j, n)) * wload(w, gain + 4 * j),
+                     wload(w, src + frag_offset(2 * j + 1, n)) * wload(w, gain + 4 * j + 2));
+    return r;
+}
+#endif
+
 // one (vector, half) slot of the f32 vector table: the 8 rows wm_acc_row_h(i, h) of the 16 halves at src, as floats
 __device__ __forceinline__ void vec_slot(u8v* img, int slot, const uint8_t* src, int h)
 {
@@ -214,6 +227,22 @@ template <class L> __device__ void pwin_prep_at(const PwinParams& p, u8v* img, u
     residual_vector_prep<L>(w, idx);
     if (idx < L::T_END * 16)
     {
+#ifdef PWIN_FOLD_G1
+        if ((idx >> 4) < L::T_WO)
+        {
+            const int tile = idx >> 4;
+            img[idx] = img_tile_gained(w, L::src_of(tile), idx & 15, L::G1 + 32 * ((tile >> 1) % L::KT));
+            return;
+        }
+#endif
+#ifdef PWIN_FOLD_G2
+        if ((idx >> 4) >= L::T_W1 && (idx >> 4) < L::T_W2)
+        {
+            const int tile = idx >> 4;
+            img[idx] = img_tile_gained(w, L::src_of(tile), idx & 15, L::G2 + 32 * (((tile - L::T_W1) >> 1) % L::KT));
+            return;
+        }
+#endif
         img[idx] = img_tile(w, L::src_of(idx >> 4), idx & 15);
         return;
     }
@@ -629,11 +658,11 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
             {
                 const uint32_t xj = xv[j], gj = gv[j];
-                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+                hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
             }
 #else
-                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                              op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+                hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                              op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
             store_row16(normH + 16 * kt, hv);
         }
@@ -672,11 +701,11 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
 #if defined(PWIN_PK_ELEM) && !defined(PWIN_PK_NO_APPLY)
         {
             const uint32_t xj = xv[j], gj = gv[j];
-            hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * ((hv2)r16 * __builtin_bit_cast(hv2, gj)));
+            hv[j] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, xj) * PWIN_NORM_GAIN((hv2)r16, __builtin_bit_cast(hv2, gj)));
         }
 #else
-            hv[j] = pack2(op_get(xv, 2 * j) * (half_t)(r16 * op_get(gv, 2 * j)),
-                          op_get(xv, 2 * j + 1) * (half_t)(r16 * op_get(gv, 2 * j + 1)));
+            hv[j] = pack2(op_get(xv, 2 * j) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j)),
+                          op_get(xv, 2 * j + 1) * (half_t)PWIN_NORM_GAIN(r16, op_get(gv, 2 * j + 1)));
 #endif
         store_row16(hrow + 16 * kt, hv);
     }
@@ -926,7 +955,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         {
             const hv2 x1 = __builtin_bit_cast(hv2, wm_cvt2(acc[nt][2 * j], acc[nt][2 * j + 1])) +
                            __builtin_bit_cast(hv2, wm_op_acc_pair(xv, j));
-            mine[j] = __builtin_bit_cast(uint32_t, x1 * (hv2){g2[2 * j], g2[2 * j + 1]});
+            mine[j] = __builtin_bit_cast(uint32_t, PWIN_MLP_INPUT(x1, ((hv2){g2[2 * j], g2[2 * j + 1]})));
             const hv2 y = x1 + (hv2){b2[2 * j], b2[2 * j + 1]};
             acc[nt][2 * j] = (float)y[0];
             acc[nt][2 * j + 1] = (float)y[1];
@@ -938,7 +967,7 @@ __device__ void pwin_core(const PwinParams& p, const u8v* __restrict__ img, cons
         for (int i = 0; i < 8; ++i)
         {
             const half_t x1 = (half_t)acc[nt][i] + wm_op_acc_elem(xv, i);
-            mv[i] = x1 * g2[i];
+            mv[i] = PWIN_MLP_INPUT(x1, g2[i]);
             acc[nt][i] = (float)(half_t)(x1 + b2[i]);
         }
         op_store(hrow + 16 * nt, operand_from_dt(mv));

@@ -24,7 +24,8 @@ struct OutputParams {
 };
 constexpr uint32_t FrameFlagReset = 1, FrameFlagRegularDepth = 2, FrameFlagDisplayMotion = 4;
 // The colour / motion texels go through the CUDA backend's binary16 canonical conversion (input_quant.glsl): set
-// for textures whose format is not exact in binary16 (FrameSettings::canonicalColor / canonicalMotion).
+// by the accuracy stages for textures whose format is not exact in binary16 (FrameSettings::canonicalColor /
+// canonicalMotion). The default stages read the texels as they are.
 constexpr uint32_t FrameFlagCanonicalColor = 16, FrameFlagCanonicalMotion = 32;
 // OutputParams::flags only: the reconstruction table of this frame, 0..15 (kReconstructionTable). A model
 // holding a single table ignores it.

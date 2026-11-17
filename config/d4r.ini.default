@@ -37,6 +37,11 @@ GameExe =
 ; Aliases: CNN = E, DLSS4 = K, DLSS4.5 = M. A/B/C/D/G/J use K in this DLL version.
 ; auto = use the game/OptiScaler choice. Benchmarks: docs/performance.md.
 Model = K
+; LinearLighting: preset K's reconstruction blends highlights in linear light, as preset L does, instead of on
+; range-compressed (or, in LDR games, tone mapped) colour: small lights, neon and bright windows keep their brightness.
+; off (default) | half | full. Costs about 0.005 ms at 1080p/1440p and 0.02 ms at 4K; adds some shimmer on thin,
+; very bright detail (more with full). Most visible below DLAA. PreferAccuracy keeps NVIDIA's blend.
+LinearLighting = off
 
 [RayReconstruction]
 ; Runs NVIDIA's nvngx_dlssd.dll denoiser, separate from Super Resolution.
@@ -66,6 +71,19 @@ FsrDenoiser = auto
 ; grain; 0 = off (D4R_FSR_RR_DETAIL).
 FsrStabilityBias = auto
 FsrDetail = 0
+; FsrDiffuseSignal: the denoiser path for diffuse light when the game passes no diffuse ray length (Cyberpunk
+; 2077 passes none). auto/direct = AMD's direct path; indirect = the indirect path with an estimated ray length,
+; FsrDiffuseHit: auto/specular = the game's specular ray length, depthK = K times the view depth, or a constant
+; (D4R_FSR_RR_DIFFUSE_SIGNAL, D4R_FSR_RR_DIFFUSE_HIT).
+FsrDiffuseSignal = auto
+FsrDiffuseHit = auto
+; FsrBeforeParticles: auto uses the game's colour before particles (particles skip the denoiser); off ignores
+; it. Cyberpunk 2077 needs off: its copy is far darker than its colour, which left the image noisy
+; (D4R_FSR_RR_BEFORE_PARTICLES).
+FsrBeforeParticles = auto
+; FsrSpecularSignal: auto = AMD's indirect path when the game passes a specular ray length; direct ignores
+; it (Cyberpunk 2077's reads 0) (D4R_FSR_RR_SPECULAR_SIGNAL).
+FsrSpecularSignal = auto
 
 [Latency]
 ; How many frames old the upscaled image the game presents may be.
@@ -170,11 +188,12 @@ Network = auto
 ; Native Windows D3D12 games have no Vulkan command list: preset M runs the same HIP layers through d4r_hip_net.dll
 ; (beside nvngx.dll) when d4r\engine\m and m-ldr came from compile_m.py --hip ... --dxil yes (add --ldr for the LDR
 ; package). D4R_DX_NET=dxil forces the engine's DXIL network there.
-; Native HIP kernels inside Vulkan (RDNA3/RDNA4, RADV or AMD's driver). On by default; needs the model's
-; hipnet.bin and hip/ layers (compile_k.py for K, compile_m.py --hip for M and L); without them the engine's own
-; shaders run and the log says why. K uses the engine's shared image-format/depth adapter. Presets M and L run their
-; ten shared Swin layers as injected pipelines instead of the engine's cooperative-matrix shader, on the fixed render
-; size the feature was created with; other sizes keep the engine's Vulkan network. (D4R_ENGINE_VKHIP)
+; Native HIP kernels inside Vulkan (RDNA3, RDNA 3.5 and RDNA4; RADV, or AMD's driver). On by default; needs the
+; model's hipnet.bin and hip/ layers (compile_k.py for K, compile_m.py --hip for M and L); without them the engine's
+; own shaders run and the log says why (under Enabled = auto K then stays on the native kernels). K uses the
+; engine's shared image-format/depth adapter. Presets M and L run their ten shared Swin layers as injected pipelines
+; instead of the engine's cooperative-matrix shader, on the fixed render size the feature was created with; other
+; sizes keep the engine's Vulkan network. (D4R_ENGINE_VKHIP)
 ExperimentalVkHip = true
 ; Ray Reconstruction's network stages on native HIP code objects inside the engine's command list (RDNA4 only).
 ; auto = presets A - C and D - E use them (8x and 8% faster than their Vulkan shaders), and preset F does on AMD's

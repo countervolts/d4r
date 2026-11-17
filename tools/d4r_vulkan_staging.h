@@ -20,7 +20,7 @@ struct D4rVkStaging {
     VkDescriptorSetLayout waitSet = VK_NULL_HANDLE;
     VkPipelineLayout waitLayout = VK_NULL_HANDLE;
     VkPipeline waitPipeline = VK_NULL_HANDLE;
-    struct OutputPipeline { VkFormat format; VkPipeline pipeline; } outputs[5] = {};
+    struct OutputPipeline { VkFormat format; VkPipeline pipeline; } outputs[5] = {}, outputsF32[6] = {};
     PFN_vkCreateSampler createSampler = nullptr;
     PFN_vkDestroySampler destroySampler = nullptr;
     PFN_vkCreateDescriptorSetLayout createSetLayout = nullptr;
@@ -150,10 +150,12 @@ struct D4rVkStaging {
         }
         return VK_NULL_HANDLE;
     }
+    // f32Destination: the output's format when the buffer holds f32 (f32_pipeline), and image has f32_store_layout's format
     bool set(D4rVkStagingSet& result, VkImageView image, VkFormat format, VkBuffer buffer,
-             VkDeviceSize bytes, bool output, VkImageLayout inputLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+             VkDeviceSize bytes, bool output, VkImageLayout inputLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+             VkFormat f32Destination = VK_FORMAT_UNDEFINED) {
         result.output = output;
-        result.pipeline = output ? output_pipeline(format) : readPipeline;
+        result.pipeline = f32Destination != VK_FORMAT_UNDEFINED ? f32_pipeline(f32Destination) : output ? output_pipeline(format) : readPipeline;
         if (!result.pipeline) return false;
         VkDescriptorPoolSize sizes[] = {{output ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
@@ -177,6 +179,31 @@ struct D4rVkStaging {
         updateSets(device, 2, writes, 0, nullptr);
         return true;
     }
+    // An f32 buffer to an image of the destination's bits: destination is the game's format, image the store's layout.
+    static VkFormat f32_store_layout(VkFormat destination) {
+        return destination == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_R8G8B8A8_UNORM :
+               destination == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ? VK_FORMAT_R32_UINT : destination;
+    }
+    VkPipeline f32_pipeline(VkFormat destination) {
+        for (auto& item : outputsF32) if (item.pipeline && item.format == destination) return item.pipeline;
+        const uint32_t* code = nullptr; size_t bytes = 0;
+#define D4R_CODE(name) code = d4r_vk_write_f32_##name; bytes = sizeof(d4r_vk_write_f32_##name)
+        switch (destination) {
+        case VK_FORMAT_R8G8B8A8_UNORM: D4R_CODE(rgba8); break;
+        case VK_FORMAT_B8G8R8A8_UNORM: D4R_CODE(bgra8); break;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: D4R_CODE(rgb10); break;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: D4R_CODE(r11g11b10); break;
+        case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: D4R_CODE(e5b9g9r9); break;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: D4R_CODE(rgba32f); break;
+        default: return VK_NULL_HANDLE;
+        }
+#undef D4R_CODE
+        for (auto& item : outputsF32) if (!item.pipeline) {
+            if (!pipeline(code, bytes, writeLayout, item.pipeline)) return VK_NULL_HANDLE;
+            item.format = destination; return item.pipeline;
+        }
+        return VK_NULL_HANDLE;
+    }
     void record(VkCommandBuffer cmd, const D4rVkStagingSet& set, uint32_t width, uint32_t height, uint32_t inputMode = 0, uint32_t stride = 0) {
         const auto layout = set.output ? writeLayout : readLayout;
         bindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, set.pipeline);
@@ -191,6 +218,7 @@ struct D4rVkStaging {
     }
     void destroy() {
         if (readPipeline) destroyPipeline(device, readPipeline, nullptr);
+        for (auto& item : outputsF32) if (item.pipeline) destroyPipeline(device, item.pipeline, nullptr);
         if (waitPipeline) destroyPipeline(device, waitPipeline, nullptr);
         if (waitLayout) destroyLayout(device, waitLayout, nullptr);
         if (waitSet) destroySetLayout(device, waitSet, nullptr);

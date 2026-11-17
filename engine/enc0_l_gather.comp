@@ -1,0 +1,52 @@
+#version 460
+// d4r engine, preset L on GPUs with no FP8 (RDNA3): the input stage's texture work. It gathers the 32 FP8 feature slots
+// of every pixel (enc0_features.glsl) into a buffer, and the native kernel kernels/tex/enc0l_net.hip does the rest, in
+// the same command list (engine/vkhip). One workgroup is an 8x8-pixel block, two pixels per lane.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "fp8_soft.glsl"
+#define ENC0_PAIRS 1
+#include "round_half.glsl"
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Params
+{
+    ivec2 size;             // render size
+    ivec2 shift;            // pixels the block grid is shifted by
+    ivec2 tok;              // token grid
+    vec2 jitter, prevJitter;
+    vec2 mvScale, mvOffs;   // motion texel -> pixels of the 3x image
+    vec2 rnd2hi, hi2rnd;
+    vec2 hiSize;
+    float changeScale, changeGain;
+    uint depthFlag, reset, frame;
+    float expo, expoPrev;
+    float halfInvX, halfInvY, renderInvX, renderInvY; // host-rounded CUDA texture coordinates
+    uint displayMv;
+    ivec2 mvMax;
+    vec2 mvPix;
+} p;
+#define ENC0_DISPLAY_MV 1
+layout(set = 0, binding = 1) uniform sampler2D colorTex;
+layout(set = 0, binding = 2) uniform sampler2D motionTex;
+layout(set = 0, binding = 3) uniform sampler2D depthTex;
+layout(set = 0, binding = 4) uniform sampler2D prevMvTex;
+layout(set = 0, binding = 5) uniform sampler2D halfTex;
+layout(set = 0, binding = 6) uniform sampler2D featTex;
+layout(set = 0, binding = 7, rg16f) uniform writeonly image2D mvAOut;
+layout(set = 0, binding = 8, rg16f) uniform writeonly image2D mvBOut;
+layout(set = 0, binding = 9, rg16f) uniform writeonly image2D mvCOut;
+layout(set = 0, binding = 12, std430) readonly buffer Noise { uint16_t n[]; } noise;   // 8 x 16 x 16
+layout(set = 0, binding = 13, std430) writeonly buffer Out { uint a[]; } outb;         // per block the tail's 2048 bytes
+#include "enc0_features.glsl"
+void main()
+{
+    const uint li = gl_LocalInvocationIndex, px = li & 7u, py = li >> 3;
+    const float e1 = p.expo == 0.0 ? 1.0 : p.expo, e2 = p.expoPrev == 0.0 ? 1.0 : p.expoPrev;
+    uint fe[16];
+    // NGX stages two pixels per lane of one wave (rows y and y + 4); the first of them fuses its fourth history coordinate
+    gatherFeatures(li, 8 * ivec2(gl_WorkGroupID.xy) - p.shift, e1, e2, li < 32u, fe);
+    const uint block = (gl_WorkGroupID.y * uint((2 * p.tok.x + 9) / 8) + gl_WorkGroupID.x) * 512u;
+    for (uint k = 0u; k < 16u; k += 2u)
+        outb.a[block + (1024u * (k >> 3) + 128u * py + 16u * px + 2u * (k & 7u)) / 4u] = e4m3CodesHalf2(fe[k]) | (e4m3CodesHalf2(fe[k + 1u]) << 16);
+}

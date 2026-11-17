@@ -44,7 +44,8 @@ layout(push_constant) uniform Constants
     uvec4 motionBaseFlags;    // motion subrect origin xy, flags, unused
     vec4 depthParams;         // x: sign of view z in front of the camera, y: sky depth (hardware), z: far marker
     vec4 detail;              // x: share of the colour that bypasses the denoiser (0: none); y: smallest albedo a
-                              // signal is divided by
+                              // signal is divided by; z: estimated diffuse hit distance (kDiffuseHitEstimate): > 0 a
+                              // constant, < 0 that many times the view depth
 } pc;
 
 const uint kHardwareDepth = 1u;
@@ -56,6 +57,8 @@ const uint kDiffuseHitInW = 32u;
 const uint kNormalsUnorm = 64u;    // [0,1]-encoded normals (UNORM formats)
 const uint kBeforeParticles = 128u;
 const uint kInvalidNormalPassthrough = 256u;
+const uint kDiffuseHitEstimate = 512u;     // no game distance: indirect diffuse with an estimated ray length
+const uint kDiffuseHitFromSpecular = 1024u; // the estimate is the specular hit distance
 
 const float kHalfMax = 65000.0;
 
@@ -187,6 +190,13 @@ void main()
     {
         const vec4 hit = texelFetch(inDiffuseHit, px, 0);
         diffuseHit = clamp((flags & kDiffuseHitInW) != 0u ? hit.w : hit.x, 0.0, kHalfMax);
+    }
+    else if ((flags & kDiffuseHitEstimate) != 0u)
+    {
+        if ((flags & kDiffuseHitFromSpecular) != 0u)
+            diffuseHit = specularHit;
+        else
+            diffuseHit = clamp(pc.detail.z > 0.0 ? pc.detail.z : -pc.detail.z * abs(viewPos.z), 0.0, kHalfMax);
     }
     imageStore(outDiffuse, px, vec4(diffuse, diffuseHit));
     imageStore(outSpecular, px, vec4(specular, specularHit));

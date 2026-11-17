@@ -25,6 +25,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.CmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(deviceProc(device, "vkCmdBindDescriptorSets"))) != nullptr;
     ok &= (vkTable.CmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(deviceProc(device, "vkCmdBindPipeline"))) != nullptr;
     ok &= (vkTable.CmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(deviceProc(device, "vkCmdBlitImage"))) != nullptr;
+    ok &= (vkTable.CmdCopyImage = reinterpret_cast<PFN_vkCmdCopyImage>(deviceProc(device, "vkCmdCopyImage"))) != nullptr;
     ok &= (vkTable.CmdClearColorImage = reinterpret_cast<PFN_vkCmdClearColorImage>(deviceProc(device, "vkCmdClearColorImage"))) != nullptr;
     ok &= (vkTable.CmdCopyBuffer = reinterpret_cast<PFN_vkCmdCopyBuffer>(deviceProc(device, "vkCmdCopyBuffer"))) != nullptr;
     ok &= (vkTable.CmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(deviceProc(device, "vkCmdCopyBufferToImage"))) != nullptr;
@@ -59,6 +60,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
     ok &= (vkTable.FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))) != nullptr;
     ok &= (vkTable.GetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(deviceProc(device, "vkGetBufferMemoryRequirements"))) != nullptr;
     ok &= (vkTable.GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(deviceProc(device, "vkGetBufferDeviceAddress"))) != nullptr;
+    ok &= (vkTable.CmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(deviceProc(device, "vkCmdPushConstants"))) != nullptr;
     ok &= (vkTable.GetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(deviceProc(device, "vkGetImageMemoryRequirements"))) != nullptr;
     ok &= (vkTable.MapMemory = reinterpret_cast<PFN_vkMapMemory>(deviceProc(device, "vkMapMemory"))) != nullptr;
     ok &= (vkTable.UnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))) != nullptr;

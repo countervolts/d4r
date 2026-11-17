@@ -166,7 +166,17 @@ if (( DO_RR )); then
       if [[ "$arithmetic" == gfx11 ]]; then name+="-gfx11"; gfx11=1; fi
       run "$name.log" env D4R_RR_GFX11="$gfx11" bash "$KIT/engine/rr/build_native_model.sh" \
         --dll "$DLL" "$p" "$WORK/$name"
-      place "$name" "$WORK/$name" $(model_files "$WORK/$name") exposure_rr0.spv exposure_rr1.spv
+      extra=()
+      # RDNA 3: the prebuilt HIP network stages (d4r/kernels/rr-hip, run through vkhip), when built for this layout
+      hip_set="$RUNTIME/kernels/rr-hip/$(gpu_arch)/$name"
+      if (( gfx11 )) && [[ -f "$hip_set/rr-hip.txt" ]]; then
+        if cmp -s "$hip_set/rr-hip.txt" <(python3 "$MODEL_TOOLS" rr-hip-signature "$WORK/$name"); then
+          mkdir -p "$WORK/$name/hip"; cp -- "$hip_set"/*.hsaco "$WORK/$name/hip/"; extra=(hip)
+        else
+          echo "  $name: this model's layout differs from the prebuilt HIP stages; it keeps the Vulkan stages"
+        fi
+      fi
+      place "$name" "$WORK/$name" $(model_files "$WORK/$name") exposure_rr0.spv exposure_rr1.spv "${extra[@]}"
     done
   done
   run ptx-f.log python3 "$KIT/kernels/tools/extract_dlss_ptx.py" "$DLL" "$WORK/ptx-f"
@@ -253,7 +263,7 @@ if (( DO_SR )); then
   # when the release has it, the accuracy set too ([Kernels] PreferAccuracy; byte-identical to the CUDA backend).
   hip_args=()
   arch=$(gpu_arch)
-  if [[ "$arch" == gfx110[0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
+  if [[ "$arch" == gfx11[05][0-3] && -f "$RUNTIME/kernels/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
     hip_args=(--hip "$RUNTIME/kernels/$arch" --capture "$WORK/k")
     if [[ -f "$RUNTIME/kernels/accuracy/$arch/dltss_pwin_enc0_layer.hsaco" ]]; then
       hip_args+=(--hip-accuracy "$RUNTIME/kernels/accuracy/$arch")
@@ -269,7 +279,11 @@ if (( DO_SR )); then
     [[ "$models" == *" $m "* ]] || continue
     finish "$m"
     for v in "$m" "$m-ldr"; do
-      run "$v.log" python3 "$KIT/engine/compile_m.py" "$WORK/$m" "$WORK/$v-out" $([[ $v == *-ldr ]] && echo --ldr)
+      # RDNA3: M's and L's native layers for vkhip, from the same uploads (docs/experimental-vkhip.md)
+      m_hip=()
+      [[ "$arch" == gfx11[05][0-3] && -f "$RUNTIME/kernels/$arch/rrlite_enc1_4x4.hsaco" &&
+         ( $m == m || -f "$RUNTIME/kernels/$arch/rrlite_enc0l_net.hsaco" ) ]] && m_hip=(--hip "$RUNTIME/kernels/$arch")
+      run "$v.log" python3 "$KIT/engine/compile_m.py" "$WORK/$m" "$WORK/$v-out" "${m_hip[@]}" $([[ $v == *-ldr ]] && echo --ldr)
       place "$v" "$WORK/$v-out" $(ls "$WORK/$v-out")
     done
     rm -rf -- "${WORK:?}/$m"

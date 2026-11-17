@@ -3,6 +3,9 @@
 #include "m_shared.h"
 #include "vk_dispatch.h"
 #include "rr_camera.h"
+#include "vkhip/vkhip.h"
+#include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +16,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
+#endif
+// A setting the shim exports from d4r.ini (SetEnvironmentVariable, which the C runtime's getenv may not see).
+static unsigned engine_env_uint(const char* name)
+{
+#ifdef _WIN32
+    char value[32] = {};
+    const unsigned long n = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (n == 0 || n >= sizeof(value)) return 0;
+    return unsigned(std::strtoul(value, nullptr, 10));
+#else
+    const char* v = std::getenv(name);
+    return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0;
+#endif
+}
 
 namespace d4r {
 namespace {
@@ -62,12 +81,13 @@ struct Device {
         // CNN stages use the extension-free flavor instead of assuming physical support
         // means VK_KHR_cooperative_matrix was enabled by the application.
     }
+    // address: the memory can back buffers with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (vkhip stages)
     VkDeviceMemory allocate(VkMemoryRequirements requirements, VkMemoryPropertyFlags flags, bool address = false) const {
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags) {
-                VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-                addressFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &addressFlags : nullptr};
+                VkMemoryAllocateFlagsInfo addressInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+                addressInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &addressInfo : nullptr};
                 info.allocationSize = requirements.size; info.memoryTypeIndex = i;
                 VkDeviceMemory result;
                 VKCHECK(vkAllocateMemory(handle, &info, nullptr, &result));
@@ -92,7 +112,7 @@ struct Buffer {
         if (handle) vkDestroyBuffer(device->handle, handle, nullptr);
         if (memory) vkFreeMemory(device->handle, memory, nullptr);
     }
-    // address: the buffer has a device address (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    // address: the buffer has a device address (address()), for the vkhip stages' kernel arguments
     void create(const Device& d, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false, bool address = false) {
         device = &d; size = std::max<VkDeviceSize>(16, (bytes + 3) & ~VkDeviceSize(3));
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -103,6 +123,11 @@ struct Buffer {
                                              : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, address);
         VKCHECK(vkBindBufferMemory(d.handle, handle, memory, 0));
         if (host) VKCHECK(vkMapMemory(d.handle, memory, 0, VK_WHOLE_SIZE, 0, &mapped));
+    }
+    VkDeviceAddress address() const {
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = handle;
+        return vkGetBufferDeviceAddress(device->handle, &info);
     }
 };
 // A buffer's contents written into the command buffer itself (vkCmdUpdateBuffer, at most 65536 bytes a call), so no
@@ -126,13 +151,13 @@ struct Image {
         if (handle) vkDestroyImage(device->handle, handle, nullptr);
         if (memory) vkFreeMemory(device->handle, memory, nullptr);
     }
-    void create(const Device& d, uint32_t width, uint32_t height, bool luma = false) {
+    void create(const Device& d, uint32_t width, uint32_t height, bool luma = false, VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT) {
         device = &d; w = width; h = height;
         if (!w || !h || w > d.properties.limits.maxImageDimension2D || h > d.properties.limits.maxImageDimension2D)
             throw std::runtime_error("image dimensions exceed device limits");
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = luma ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        info.imageType = VK_IMAGE_TYPE_2D; info.format = luma ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+        info.imageType = VK_IMAGE_TYPE_2D; info.format = luma ? VK_FORMAT_R16_SFLOAT : format;
         info.extent = {w, h, 1}; info.mipLevels = info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VKCHECK(vkCreateImage(d.handle, &info, nullptr, &handle));
@@ -180,7 +205,7 @@ struct Pipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline handle = VK_NULL_HANDLE;
     // K's input, output and exposure stages: the same shader with CANONICAL_INPUT (specialization constant 7)
-    // false, for frames whose colour and motion are already exact in binary16 (no conversion code at all)
+    // false, for frames that do not take the conversion (no conversion code at all): see FrameFlagCanonicalColor
     VkPipeline f16Inputs = VK_NULL_HANDLE;
     ~Pipeline() {
         if (f16Inputs) vkDestroyPipeline(device, f16Inputs, nullptr);
@@ -267,10 +292,11 @@ void bindImage(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageVi
     write.pImageInfo = &info;
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
-void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false) {
+void dispatch(VkCommandBuffer cb, const Pipeline& pipeline, VkDescriptorSet set, uint32_t x, uint32_t y, bool f16Inputs = false,
+              uint32_t z = 1) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f16Inputs && pipeline.f16Inputs ? pipeline.f16Inputs : pipeline.handle);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
-    vkCmdDispatch(cb, x, y, 1);
+    vkCmdDispatch(cb, x, y, z);
 }
 } // namespace
 void setBufferRobustnessDisabled(bool disabled) { noBufferRobustness = disabled; }
@@ -282,17 +308,34 @@ struct Model::Impl {
     std::vector<char> weightBytes, lutBytes;   // until recordUpload
     std::array<std::array<uint32_t, 108>, KLayers> offsets{};
     std::array<Pipeline, KLayers> network;
-    Pipeline input, output, outputRgb10, outputRgba8, outputR11;
+    // layer_dot2_split.comp: a layer as up to seven dispatches (<layer>_dot2_s1..s7.spv; <layer>_dot2_split.bin holds
+    // each phase's z group count, 0 for none), used when the model folder has it (D4R_ENGINE_K_SPLIT=0 ignores it):
+    // the same results over many more workgroups, for the deep layers' few windows
+    std::array<std::array<Pipeline, 7>, KLayers> phases;
+    std::array<std::array<uint32_t, 7>, KLayers> phaseZ{};
+    std::array<bool, KLayers> split{};
+    Pipeline input, output, outputRgb10, outputRgba8, outputR11, outputRgba32, outputBgra8, outputE5;
     // the final-store pipeline for a borrowed output texture of this format; null when none is packaged
     const Pipeline* outputFor(VkFormat format) const {
         const Pipeline* p = format == VK_FORMAT_R16G16B16A16_SFLOAT ? &output :
             format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? &outputRgb10 : format == VK_FORMAT_R8G8B8A8_UNORM ? &outputRgba8 :
-            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : nullptr;
+            format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? &outputR11 : format == VK_FORMAT_R32G32B32A32_SFLOAT ? &outputRgba32 : nullptr;
         return p && p->handle ? p : nullptr;
+    }
+    // K's copy path: the store and the image layout whose bits a raw copy puts into a destination of this format, for
+    // every output format the shim accepts. A blit narrows to half: formats or packages with no store fall back to it.
+    struct OwnStore { const Pipeline* store; VkFormat image; };
+    OwnStore ownStoreFor(VkFormat format) const {
+        if (accuracyStages) return {nullptr, VK_FORMAT_UNDEFINED}; // the CUDA backend's half store and blit
+        if (format == VK_FORMAT_B8G8R8A8_UNORM && outputBgra8.handle) return {&outputBgra8, VK_FORMAT_R8G8B8A8_UNORM};
+        if (format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && outputE5.handle) return {&outputE5, VK_FORMAT_R32_UINT};
+        const Pipeline* const p = outputFor(format);
+        return {p, p ? format : VK_FORMAT_UNDEFINED};
     }
     std::array<Pipeline, 2> exposure;
     bool uploaded = false, hasExposure = false, hasDirectOrigins = false, hasRegularDepth = false, hasDisplayMotion = false,
          hasGameExposure = false, hasRatioTables = false, accuracyStages = false, dot2 = false;
+    unsigned linearLighting = 0;   // percent of the K reconstruction's blend done in linear light (output_k.comp LIN_BLEND)
     Impl(VkPhysicalDevice physical, VkDevice dev) : device(physical, dev) {}
 };
 Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& directory, VkPipelineCache cache, KNetwork network,
@@ -341,6 +384,23 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
             throw std::runtime_error("the model has no network shaders for GPUs without cooperative matrices (" + spv +
                                      "): rebuild it with the current compile_k.py");
         m.network[i].create(device, spv, {b,b,b,b,b,b}, 32, cache);
+        const char* splitEnv = std::getenv("D4R_ENGINE_K_SPLIT");
+        const std::string base = directory + "/" + Names[i] + "_dot2_s", zFile = directory + "/" + Names[i] + "_dot2_split.bin";
+        // not on AMD's Windows driver: the split phases use the same v_dot2 products its LLPC rejects (no _llpc build
+        // of them), so the layer runs whole there, as its _dot2_llpc.spv
+        if (m.dot2 && !(splitEnv && !std::strcmp(splitEnv, "0")) && exists(zFile) &&
+            driverId(physical) != VK_DRIVER_ID_AMD_PROPRIETARY) {
+            const auto zb = read(zFile);
+            bool all = zb.size() == sizeof(m.phaseZ[i]);
+            if (all) std::memcpy(m.phaseZ[i].data(), zb.data(), zb.size());
+            // all seven zero: the layer runs whole (a folder can turn an earlier split off this way)
+            all = all && std::any_of(m.phaseZ[i].begin(), m.phaseZ[i].end(), [](uint32_t z) { return z != 0; });
+            for (unsigned ph = 0; all && ph < 7; ++ph)
+                all = !m.phaseZ[i][ph] || exists(base + std::to_string(ph + 1) + ".spv");
+            for (unsigned ph = 0; all && ph < 7; ++ph)
+                if (m.phaseZ[i][ph]) m.phases[i][ph].create(device, base + std::to_string(ph + 1) + ".spv", {b,b,b,b,b,b,b}, 32, cache);
+            m.split[i] = all;
+        }
     }
     // The stages around the network run as wave64 (D4R_ENGINE_K_STAGE_WAVE=32|64 forces one size; the outputs are
     // identical). Without cooperative matrices (RDNA2, which issues wave64 in two passes) the input stage and the
@@ -353,7 +413,16 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
     // Older packages retain their existing stage. New accuracy packages provide a separate shader for each
     // final-store format; the fast paths continue to load exactly their original files.
     m.accuracyStages = accuracy && exists(directory + "/output_k_accuracy.spv");
+    // [DLSS] LinearLighting (D4R_ENGINE_K_LINEAR_LIGHTING = 50 or 100): the fast HDR stages built with LIN_BLEND
+    // (output_k*_lin50.spv, _lin100.spv) blend and resolve that share of the luma in linear light. A model folder
+    // without them (LDR, older packages) keeps its own stages.
+    const unsigned linear = engine_env_uint("D4R_ENGINE_K_LINEAR_LIGHTING");
+    const std::string linSuffix = linear >= 75 ? "_lin100" : linear >= 25 ? "_lin50" : "";
+    m.linearLighting = !m.accuracyStages && !linSuffix.empty() && exists(directory + "/output_k" + linSuffix + ".spv")
+                           ? (linear >= 75 ? 100 : 50) : 0;
     const auto outputFile = [&](const char* name) {
+        if (m.linearLighting && exists(directory + "/" + name + linSuffix + ".spv"))
+            return directory + "/" + name + linSuffix + ".spv";
         return directory + "/" + name + (m.accuracyStages ? "_accuracy.spv" : ".spv");
     };
     m.output.create(device, outputFile("output_k"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
@@ -363,6 +432,10 @@ Model::Model(VkPhysicalDevice physical, VkDevice device, const std::string& dire
         m.outputRgba8.create(device, outputFile("output_k_store_rgba8"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(outputFile("output_k_store_r11g11b10")))
         m.outputR11.create(device, outputFile("output_k_store_r11g11b10"), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
+    const std::pair<Pipeline*, const char*> copyStores[] = {{&m.outputRgba32, "output_k_store_rgba32f"},
+        {&m.outputBgra8, "output_k_store_bgra8"}, {&m.outputE5, "output_k_store_e5b9g9r9"}};
+    for (const auto& [pipeline, name] : copyStores)
+        if (exists(outputFile(name))) pipeline->create(device, outputFile(name), {b,t,t,t,t,t,s,s,s,s,b,b}, stageWave, cache, 0, nullptr, true);
     if (exists(directory + "/exposure_k0.spv") && exists(directory + "/exposure_k1.spv")) {
         m.exposure[0].create(device, directory + "/exposure_k0.spv", {b,t,b}, wave, cache, 0, nullptr, true);
         const std::string update = directory + (m.accuracyStages && exists(directory + "/exposure_k1_accuracy.spv")
@@ -378,6 +451,7 @@ bool Model::hasDisplayMotion() const { return impl->hasDisplayMotion; }
 bool Model::hasGameExposure() const { return impl->hasGameExposure; }
 bool Model::hasRatioTables() const { return impl->hasRatioTables; }
 bool Model::hasAccuracyStages() const { return impl->accuracyStages; }
+unsigned Model::linearLighting() const { return impl->linearLighting; }
 bool Model::hasRgb10Output() const { return impl->outputRgb10.handle != VK_NULL_HANDLE; }
 bool Model::hasDirectOutput(VkFormat format) const { return impl->outputFor(format) != nullptr; }
 bool Model::dot2Network() const { return impl->dot2; }
@@ -404,10 +478,16 @@ struct Engine::Impl {
     std::array<Buffer, 5> skip;
     struct History { Image color, luma, feature; };
     std::array<History, 2> history;
-    Image final;   // the engine's own output: only for frames that do not write the caller's image (created on first use)
-    bool finalNew = false;
+    // The engine's own output, only for frames that do not write the caller's image (each created on first use): the
+    // half image for a blit, or one per layout a raw copy takes (Model::Impl::ownStoreFor).
+    Image final;
+    std::map<VkFormat, Image> finalRaw;
+    Image* finalCopy = nullptr;
+    bool finalNew = false, finalCopyRaw = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, KLayers> layerSets{};
+    std::array<VkDescriptorSet, KLayers> phaseSets{};   // split layers: the six bindings + the scratch buffer
+    Buffer scratch;
     std::array<VkDescriptorSet, 2> inputSets{}, outputSets{};
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     unsigned previous = 0;
@@ -475,9 +555,9 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         e.skip[i].create(d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         e.activations += e.skip[i].size;
     }
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, e.external ? 16u : 96u}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 24}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, e.external ? 16u : 96u + 7u * KLayers}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 24}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = e.external ? 6u : 17u; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
+    pi.maxSets = e.external ? 6u : 17u + KLayers; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
     VKCHECK(vkCreateDescriptorPool(dev, &pi, nullptr, &e.pool));
     for (unsigned i = 0; i < KLayers && !e.external; ++i) {
         e.layerParams[i].create(d, sizeof(LayerParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
@@ -489,6 +569,32 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetwork* external
         bindBuffer(dev, set, 3, i >= 6 ? e.skip[10 - i] : e.dummy);
         bindBuffer(dev, set, 4, e.main[(i + 1) % 2]);
         bindBuffer(dev, set, 5, i < 5 ? e.skip[i] : e.dummy);
+    }
+    // the split layers' scratch (layer_dot2_split.comp), binary16, every window of the shifted grid: y, hidden, x0
+    // (C, 4C, C per token), Q K V (3 x 32 per head and token), attention outputs (32 per head)
+    VkDeviceSize scratchBytes = 0;
+    for (unsigned i = 0; i < KLayers && !e.external; ++i)
+        if (e.model.split[i]) {
+            const auto& ls = shape.layers[i];
+            const VkDeviceSize windows = VkDeviceSize((ls.w + ls.sx + 7) / 8) * ((ls.h + ls.sy + 7) / 8);
+            scratchBytes = std::max(scratchBytes, windows * 64 * (Channels[i] * 7 + KHeads[i] * 128) * 2);
+        }
+    if (scratchBytes) {
+        if (scratchBytes > d.properties.limits.maxStorageBufferRange) throw std::runtime_error("split scratch exceeds device range");
+        e.scratch.create(d, scratchBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        e.activations += e.scratch.size;
+        for (unsigned i = 0; i < KLayers; ++i) {
+            if (!e.model.split[i]) continue;
+            unsigned first = 0;
+            while (!e.model.phaseZ[i][first]) ++first;
+            auto set = e.phaseSets[i] = descriptorSet(dev, e.pool, e.model.phases[i][first].descriptors);
+            bindBuffer(dev, set, 0, e.layerParams[i]); bindBuffer(dev, set, 1, e.model.weights);
+            bindBuffer(dev, set, 2, e.main[i % 2]);
+            bindBuffer(dev, set, 3, i >= 6 ? e.skip[10 - i] : e.dummy);
+            bindBuffer(dev, set, 4, e.main[(i + 1) % 2]);
+            bindBuffer(dev, set, 5, i < 5 ? e.skip[i] : e.dummy);
+            bindBuffer(dev, set, 6, e.scratch);
+        }
     }
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -580,10 +686,17 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                images.colorLayout == b.colorLayout && images.motionLayout == b.motionLayout && images.depthLayout == b.depthLayout &&
                images.exposure == b.exposure && images.exposureLayout == b.exposureLayout;
     };
-    if (!finalOutput.view && !e.final.handle) {
-        e.final.create(e.model.device, e.shape.outputWidth, e.shape.outputHeight);
-        e.finalNew = true;
+    const auto ownStore = finalOutput.view ? Model::Impl::OwnStore{nullptr, VK_FORMAT_UNDEFINED} : e.model.ownStoreFor(finalOutput.format);
+    if (!finalOutput.view) {
+        Image& own = ownStore.store ? e.finalRaw[ownStore.image] : e.final;
+        if (!own.handle) {
+            own.create(e.model.device, e.shape.outputWidth, e.shape.outputHeight, false,
+                       ownStore.store ? ownStore.image : VK_FORMAT_R16G16B16A16_SFLOAT);
+            e.finalNew = true;
+        }
+        e.finalCopy = &own;
     }
+    e.finalCopyRaw = !finalOutput.view && ownStore.store;
     auto found = std::find_if(e.bindings.begin(), e.bindings.end(), [&](const auto& b) {
         return sameImages(b.images) && finalOutput.view == b.finalOutput.view && finalOutput.format == b.finalOutput.format;
     });
@@ -639,7 +752,7 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
                 bindImage(dev, out, 5, images.depth, e.nearest, images.depthLayout);
                 bindImage(dev, out, 6, dest.color.storage); bindImage(dev, out, 7, dest.luma.storage);
                 bindImage(dev, out, 8, dest.feature.storage);
-                bindImage(dev, out, 9, finalOutput.view ? finalOutput.view : e.final.storage);
+                bindImage(dev, out, 9, finalOutput.view ? finalOutput.view : e.finalCopy->storage);
             }
             e.bindings.push_back(binding);
         } catch (...) {
@@ -651,7 +764,7 @@ void Engine::setFrame(const FrameImages& images, const InputParams& input, const
     e.inputSets = found->input; e.outputSets = found->output;
     e.exposureSets[0] = found->exposure;
     e.exposureSets[1] = found->exposureUpdate;
-    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : &e.model.output;
+    e.finalStore = finalOutput.view ? e.model.outputFor(finalOutput.format) : ownStore.store ? ownStore.store : &e.model.output;
     e.reset = (input.flags & FrameFlagReset) != 0; e.frameSet = true;
     e.f16Inputs = (input.flags & (FrameFlagCanonicalColor | FrameFlagCanonicalMotion)) == 0;
 }
@@ -664,7 +777,7 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     if (!e.initialized || !e.model.uploaded || !e.frameSet) throw std::runtime_error("initialize/upload/setFrame before recording inference");
     auto mark = [&](uint32_t boundary) { if (profiler.mark) profiler.mark(cb, boundary, profiler.user); };
     mark(0);
-    if (e.finalNew) { clearNewImage(cb, e.final.handle); e.finalNew = false; }
+    if (e.finalNew) { clearNewImage(cb, e.finalCopy->handle); e.finalNew = false; }
     // Includes reads-to-writes when reusing scratch and histories, and copies made by the caller after the last frame.
     memoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -700,7 +813,18 @@ void Engine::recordFrame(VkCommandBuffer cb, const FrameProfiler& profiler) {
     for (unsigned i = 0; i < layers; ++i) {
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
+        if (e.model.split[i] && e.scratch.handle) {
+            const auto& ph = e.model.phases[i];
+            bool first = true;
+            for (unsigned k = 0; k < 7; ++k) {
+                if (!e.model.phaseZ[i][k]) continue;
+                if (!first) memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                dispatch(cb, ph[k], e.phaseSets[i], groups[i][0], groups[i][1], false, e.model.phaseZ[i][k]);
+                first = false;
+            }
+        } else
+            dispatch(cb, e.model.network[i], e.layerSets[i], groups[i][0], groups[i][1]);
         mark(4 + i);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -718,7 +842,7 @@ void Engine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first)
     if (!e.external) throw std::runtime_error("this engine's network is internal: record the whole frame");
     if (!e.initialized || !e.model.uploaded || !e.frameSet || e.frontDone) throw std::runtime_error("initialize/upload/setFrame before recording inference");
     const auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    if (e.finalNew) { clearNewImage(cb, e.final.handle); e.finalNew = false; }
+    if (e.finalNew) { clearNewImage(cb, e.finalCopy->handle); e.finalNew = false; }
     memoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, compute | VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     vkCmdUpdateBuffer(cb, e.inParams.handle, 0, sizeof(InputParams), &e.input);
@@ -764,7 +888,8 @@ void Engine::recordBack(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) 
     stamp(); // after the final store
     e.previous = 1 - e.previous; e.frameSet = false; e.frontDone = false;
 }
-VkImage Engine::outputImage() const { return impl->final.handle; }
+VkImage Engine::outputImage() const { return impl->finalCopy ? impl->finalCopy->handle : VK_NULL_HANDLE; }
+bool Engine::outputCopyIsRaw() const { return impl->finalCopyRaw; }
 HistoryImages Engine::historyImages() const {
     auto& h = impl->history[impl->previous]; return {h.color.handle, h.luma.handle, h.feature.handle};
 }

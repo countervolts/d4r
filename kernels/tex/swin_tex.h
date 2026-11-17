@@ -32,6 +32,16 @@ __attribute__((device, used)) float d4r_swin_one = 1.0f;
 
 namespace d4r_swin
 {
+#ifdef D4R_L_WIDENED
+// The vkhip stages (enc0l_net.hip, dec0l_net.hip): the numerics of the shared layers (docs/approximations.md), which keep
+// more precision than NVIDIA's: f32 accumulators through the GEMM chains, f16 intermediate activations, FP8 only where a
+// result is stored. The P V key order and Q's K grouping stay out: they only move rare f32 roundings.
+#define SWIN_F32ACC
+#define SWIN_NO_Q8
+#define SWIN_TOK_NATURAL
+#define SWIN_APPROX_RECIP
+#define SWIN_UNSCALED // true f16 operands: no 2^-16 and 2^16 factors around every k32 step
+#else
 #define SWIN_EXACT
 // The original code is ZLUDA's compile of the PTX; these make the f32 arithmetic the same instruction for
 // instruction where it is not exact (see ../m/swin_tok.h, ../m/swin_common.h): the K order and the C operand of
@@ -42,6 +52,7 @@ namespace d4r_swin
 #endif
 #define SWIN_PV_ZLUDA_ORDER
 #define SWIN_APPROX_RECIP
+#endif
 #ifdef D4R_TEX_GFX11
 #ifdef D4R_TEX_GFX11_SCALED
 #define SWIN_GFX11_ROW

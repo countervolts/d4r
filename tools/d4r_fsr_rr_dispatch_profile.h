@@ -541,6 +541,8 @@ inline void end(ID3D12GraphicsCommandList* list)
 }
 // D4R_FSR_RR_DUMP_DIR=<Windows dir>: also copy the denoiser's two outputs of every frame (RGBA16F, rows packed)
 // to <dir>/denoised_<frame>_<diffuse|specular>.raw, for checking replacement shaders against the original.
+// D4R_FSR_RR_DUMP_FIRST / D4R_FSR_RR_DUMP_COUNT: only frames FIRST .. FIRST + COUNT - 1 (default every frame); a
+// game writes about 60 MB a frame at 720p.
 // The copies are written once the frame has retired (4 frames later, or at teardown).
 struct Dump
 {
@@ -555,7 +557,7 @@ struct Dump
 };
 inline std::vector<Dump>& dumps(int set)
 {
-    static std::vector<Dump> d[2] = {std::vector<Dump>(8), std::vector<Dump>(8)};
+    static std::vector<Dump> d[3] = {std::vector<Dump>(8), std::vector<Dump>(8), std::vector<Dump>(8)};
     return d[set];
 }
 
@@ -583,12 +585,32 @@ inline void dump_write(Dump& d)
     d.buffer->Unmap(0, nullptr);
 }
 
-// set 0/1: independent rings (e.g. the denoiser's inputs and its outputs). Textures are in `state` and return to it.
+// set 0/1/2: independent rings (the denoiser's inputs, its outputs, the game's own textures). Textures are in `state` and return to it.
 inline void dump_record(int set, ID3D12Device* device, ID3D12GraphicsCommandList* list, uint32_t frame, UINT count,
                         ID3D12Resource* const* textures, const char* const* names, const D3D12_RESOURCE_STATES state)
 {
     static const bool on = !env_string("D4R_FSR_RR_DUMP_DIR").empty();
+    static const bool triggered = env_uint("D4R_FSR_RR_DUMP_TRIGGER", 0) != 0;
+    static uint32_t first = triggered ? UINT32_MAX : env_uint("D4R_FSR_RR_DUMP_FIRST", 0);
+    static uint32_t dumpCount = triggered ? 0 : env_uint("D4R_FSR_RR_DUMP_COUNT", 0);
     if (!on || count > 8)
+        return;
+    if (triggered && set == 0 && frame % 15 == 0 && (dumpCount == 0 || frame - first >= dumpCount + 8))
+    {
+        // D4R_FSR_RR_DUMP_TRIGGER=1: nothing is dumped until <dir>\dump.now exists; then the next two frames are, and
+        // the file is deleted
+        const std::string trigger = env_string("D4R_FSR_RR_DUMP_DIR") + "\\dump.now";
+        if (GetFileAttributesA(trigger.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            DeleteFileA(trigger.c_str());
+            first = frame + 1, dumpCount = 2;
+            logf("D4R_FSR_RR_DUMP: frames %u and %u requested", first, first + 1);
+        }
+    }
+    for (Dump& old : dumps(set)) // copies of retired frames, without waiting for their slot's reuse or teardown
+        if (old.pending && frame >= old.frame + 4u)
+            dump_write(old);
+    if (frame < first || (dumpCount != 0 && frame - first >= dumpCount))
         return;
     Dump& d = dumps(set)[frame % dumps(set).size()];
     dump_write(d); // the frame that used this slot has retired
@@ -770,7 +792,7 @@ inline void snapshot_flush()
 inline void dump_flush()
 {
     snapshot_flush();
-    for (int set = 0; set < 2; ++set)
+    for (int set = 0; set < 3; ++set)
         for (Dump& d : dumps(set))
             dump_write(d);
 }

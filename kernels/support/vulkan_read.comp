@@ -40,7 +40,15 @@ void main() {
     uint index = p.y * size.stride + p.x;
     vec4 value = all(lessThan(ivec2(p), extent))
         ? texelFetch(sourceImage, ivec2(p), 0) : vec4(0.0);
-    if (size.mode == 5u) {
+    if (size.mode == 7u) { // f32 motion
+        pixels[index * 2u] = floatBitsToUint(value.x);
+        pixels[index * 2u + 1u] = floatBitsToUint(value.y);
+    } else if (size.mode == 6u) { // f32 colour, for formats binary16 cannot hold: the sampled value as it is
+        pixels[index * 4u] = floatBitsToUint(value.x);
+        pixels[index * 4u + 1u] = floatBitsToUint(value.y);
+        pixels[index * 4u + 2u] = floatBitsToUint(value.z);
+        pixels[index * 4u + 3u] = floatBitsToUint(value.w);
+    } else if (size.mode == 5u) {
         pixels[index * 2u] = halfRtz(value.x) | (halfRtz(value.y) << 16);
         pixels[index * 2u + 1u] = halfRtz(value.z) | (halfRtz(value.w) << 16);
     } else if (size.mode == 1u) { // canonical RGBA16F color

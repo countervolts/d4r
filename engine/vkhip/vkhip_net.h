@@ -11,6 +11,7 @@ struct NetFiles {
     // the device enabled VK_KHR_pipeline_binary and VK_KHR_maintenance5: AMD's own drivers (Windows), where the
     // pipelines are injected through pipeline binaries (vkhip.h); RADV otherwise
     bool pipelineBinary = false;
+    std::vector<uint8_t> enc0lWeights, dec0lWeights;  // preset L: its native input and expansion stages' weights
 };
 namespace detail { struct Net; }
 class KNetwork {
@@ -23,6 +24,13 @@ public:
                 const VkPhysicalDeviceMemoryProperties& memory, const NetFiles& files,
                 uint32_t width, uint32_t height, uint64_t tokenBytes, uint64_t headBytes,
                 std::string& error);
+    // Preset M instead: width and height are the render size, which fixes the token grid (hipnet.bin "D4RMHIP1"). With
+    // NetFiles' enc0lWeights preset L: its native stages run around the layers, and tokens() and head() are the buffers
+    // the Vulkan stages use (MEngine::lStageBufferBytes); the network's own tokens and head are internal.
+    bool createM(VkDevice device, PFN_vkGetDeviceProcAddr proc,
+                 const VkPhysicalDeviceMemoryProperties& memory, const NetFiles& files,
+                 uint32_t width, uint32_t height, uint64_t tokenBytes, uint64_t headBytes,
+                 std::string& error);
     VkBuffer tokens() const;
     VkBuffer head() const;
     uint32_t dispatchesPerFrame() const;

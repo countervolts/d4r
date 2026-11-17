@@ -268,6 +268,16 @@ void load_portable_config()
         portable_set("D4R_DLSS_PRESET", model);
     // [OptiScaler] FollowPresets: its Render Presets Override picks the model in game (d4r_render_presets.h);
     // Fsr4: OptiScaler and AMD's FidelityFX modules see the real GPU, for its FSR 4 option (d4r_fsr4_identity.h).
+    // [DLSS] LinearLighting: off | half | full (or 0 / 0.5 / 1): preset K's reconstruction blends highlights in
+    // linear light, as preset L does, instead of on range-compressed luma (brighter small lights, a little more
+    // shimmer on thin bright detail). LDR games: undoes a Reinhard tone map around the blend. PreferAccuracy keeps NVIDIA's blend.
+    {
+        const std::string linear = ascii_lower(ini_value(ini, "dlss", "LinearLighting"));
+        if (linear == "half" || linear == "0.5" || linear == "50")
+            portable_set("D4R_ENGINE_K_LINEAR_LIGHTING", "50");
+        else if (linear == "full" || linear == "1" || linear == "on" || linear == "true" || linear == "100")
+            portable_set("D4R_ENGINE_K_LINEAR_LIGHTING", "100");
+    }
     if (ini_flag(ini, "optiscaler", "FollowPresets", 1) == 0)
         portable_set("D4R_FOLLOW_OPTISCALER", "0");
     if (ini_flag(ini, "optiscaler", "Fsr4", 1) == 0)
@@ -331,6 +341,22 @@ void load_portable_config()
     const std::string fsrDetail = ini_value(ini, "rayreconstruction", "FsrDetail");
     if (!fsrDetail.empty())
         portable_set("D4R_FSR_RR_DETAIL", fsrDetail);
+    // FsrDiffuseSignal = auto | direct | indirect and FsrDiffuseHit = auto | specular | depth<K> | <length>: the
+    // denoiser path for diffuse light when the game passes no diffuse ray length (d4r_fsr_rr_backend.inl)
+    const std::string fsrDiffuseSignal = ini_value(ini, "rayreconstruction", "FsrDiffuseSignal");
+    if (!fsrDiffuseSignal.empty())
+        portable_set("D4R_FSR_RR_DIFFUSE_SIGNAL", fsrDiffuseSignal);
+    const std::string fsrDiffuseHit = ini_value(ini, "rayreconstruction", "FsrDiffuseHit");
+    if (!fsrDiffuseHit.empty())
+        portable_set("D4R_FSR_RR_DIFFUSE_HIT", fsrDiffuseHit);
+    // FsrSpecularSignal = auto | direct: direct ignores the game's specular ray length (Cyberpunk 2077's reads 0)
+    const std::string fsrSpecularSignal = ini_value(ini, "rayreconstruction", "FsrSpecularSignal");
+    if (!fsrSpecularSignal.empty())
+        portable_set("D4R_FSR_RR_SPECULAR_SIGNAL", ascii_lower(fsrSpecularSignal));
+    // FsrBeforeParticles = auto | off: off ignores the game's colour before particles (Cyberpunk 2077's is not usable)
+    const std::string fsrBeforeParticles = ini_value(ini, "rayreconstruction", "FsrBeforeParticles");
+    if (!fsrBeforeParticles.empty() && ascii_lower(fsrBeforeParticles) != "auto")
+        portable_set("D4R_FSR_RR_BEFORE_PARTICLES", fsrBeforeParticles);
     const std::string fsrDenoiser = ini_value(ini, "rayreconstruction", "FsrDenoiser");
     portable_set(L"D4R_FSR_RR_DLL", fsrDenoiser.empty() || ascii_lower(fsrDenoiser) == "auto"
                                         ? dir + L"\\amd_fidelityfx_denoiser_dx12.dll"

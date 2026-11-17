@@ -23,6 +23,7 @@ struct VkTable {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
     PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
     PFN_vkCmdBlitImage CmdBlitImage = nullptr;
+    PFN_vkCmdCopyImage CmdCopyImage = nullptr;
     PFN_vkCmdClearColorImage CmdClearColorImage = nullptr;
     PFN_vkCmdCopyBuffer CmdCopyBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
@@ -57,6 +58,7 @@ struct VkTable {
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
     PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress = nullptr;
+    PFN_vkCmdPushConstants CmdPushConstants = nullptr;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
     PFN_vkMapMemory MapMemory = nullptr;
     PFN_vkUnmapMemory UnmapMemory = nullptr;
@@ -78,6 +80,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkCmdBindDescriptorSets ::d4r::vkTable.CmdBindDescriptorSets
 #define vkCmdBindPipeline ::d4r::vkTable.CmdBindPipeline
 #define vkCmdBlitImage ::d4r::vkTable.CmdBlitImage
+#define vkCmdCopyImage ::d4r::vkTable.CmdCopyImage
 #define vkCmdClearColorImage ::d4r::vkTable.CmdClearColorImage
 #define vkCmdCopyBuffer ::d4r::vkTable.CmdCopyBuffer
 #define vkCmdCopyBufferToImage ::d4r::vkTable.CmdCopyBufferToImage
@@ -112,6 +115,7 @@ bool loadVulkan(PFN_vkGetInstanceProcAddr instanceProc, VkInstance instance, VkD
 #define vkFreeMemory ::d4r::vkTable.FreeMemory
 #define vkGetBufferMemoryRequirements ::d4r::vkTable.GetBufferMemoryRequirements
 #define vkGetBufferDeviceAddress ::d4r::vkTable.GetBufferDeviceAddress
+#define vkCmdPushConstants ::d4r::vkTable.CmdPushConstants
 #define vkGetImageMemoryRequirements ::d4r::vkTable.GetImageMemoryRequirements
 #define vkMapMemory ::d4r::vkTable.MapMemory
 #define vkUnmapMemory ::d4r::vkTable.UnmapMemory

@@ -177,6 +177,8 @@ void reserve_host(HostPlane& host, size_t bytes);
 void release_host(HostPlane& host);
 bool ensure_linear(CudaDevicePtr& buffer, size_t& capacity, size_t bytes);
 uint32_t plane_format(Plane plane);
+// The format of this frame's plane: canonical, or f32 where it holds colour or motion binary16 cannot
+uint32_t plane_format_in(const InputSlot& slot, int index, Plane plane);
 uint32_t plane_channels(Plane plane);
 bool record_owned_motion_constants(ID3D12GraphicsCommandList* list, Staging& target, ID3D12Resource* motion,uint32_t guidValue,uint64_t expectedBytes);
 void record_native_motion_capture(ID3D12GraphicsCommandList* list, InputSlot& slot, ID3D12Resource* motion, uint32_t frame);
@@ -195,12 +197,13 @@ bool create_vram_buffer(VramBuffer& target, size_t bytes, bool importNow = true)
 void recycle_vram_buffer(VramBuffer& buffer);
 void free_vram_pool();
 void destroy_vram_image(VramImage& image);
-bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format);
+bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format, bool storage = false);
 size_t canonical_texel_bytes(Plane plane);
 bool describe_in_place(ID3D12Resource* resource, InPlaceTexture& texture);
 bool describe_native_vram(ID3D12Resource* resource, VramCopy& copy, bool output = false);
 bool vram_blit_supported(VkFormat source, VkFormat destination);
-bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false);
+bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false,
+                        bool floatPlanes = false);
 VkBufferImageCopy full_region(const VramCopy& copy);
 bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* source, const VramCopy& copy, uint32_t frame=0);
 bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot, const VramCopy* copies, int count, bool fusedColor = false);
@@ -209,7 +212,8 @@ void release_ngx_input_wait_locked(Feature& feature, const char* reason, bool di
 void ngx_input_watchdog();
 bool create_split_semaphore(Feature& feature);
 bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t bytes);
-bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format);
+bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format,
+                             bool storage = false);
 void record_native_gpu_check(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot, ID3D12Resource* motion);
 void release_vram(Feature& feature);
 void stage_plane(Plane plane, const Staging& staging, HostPlane& host, FrameTiming* timing, int timingIndex, size_t rowPitch);
@@ -264,8 +268,13 @@ std::unique_ptr<vkhip::RRStages> create_engine_rr_vkhip(const std::string& direc
 bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output, void* parameters, const FrameParams& p, uint32_t frame);
 std::unique_ptr<vkhip::RRStages> create_engine_rr_vkhip(const std::string& directory, d4r::REngine& engine, int slot);
 std::unique_ptr<vkhip::MNetwork> create_engine_vkhip_net(const std::string& directory, uint32_t renderWidth, uint32_t renderHeight, uint64_t bufferBytes);
-std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& directory, uint32_t outWidth, uint32_t outHeight, size_t tokenBytes, size_t headBytes);
-bool create_engine_vkhip(Feature& feature, const std::string& directory, size_t tokenBytes, size_t headBytes);
+// presetM: M's or L's layers (presetL: with L's native input and expansion stages) at the frame's render size
+// (KNetwork::createM: the RDNA3 "wide" models) instead of K's at the output size
+std::unique_ptr<vkhip::KNetwork> create_engine_vkhip_k(const std::string& directory, uint32_t outWidth, uint32_t outHeight,
+                                                       size_t tokenBytes, size_t headBytes, bool presetM = false,
+                                                       bool presetL = false, uint32_t renderWidth = 0, uint32_t renderHeight = 0);
+bool create_engine_vkhip(Feature& feature, const std::string& directory, size_t tokenBytes, size_t headBytes,
+                         bool presetM = false, uint32_t renderWidth = 0, uint32_t renderHeight = 0);
 d4r::FrameSettings engine_k_settings(const Feature& feature, const FrameParams& p, bool ldr, bool displayMotion, bool autoExposure, bool first);
 void release_engine_dx(Feature& feature);
 void engine_dx_mark(EngineDxFeature& state, int slot, ID3D12GraphicsCommandList* list, uint32_t boundary);
@@ -326,6 +335,7 @@ extern "C"
     NgxResult d4r_ngx_get_d3d12_resource(void* parameters, const char* name, ID3D12Resource** value);
     void d4r_ngx_set_d3d12_resource(void* parameters, const char* name, ID3D12Resource* value);
     void* d4r_ngx_parameters_create();
+    unsigned d4r_ngx_parameters_list(void* parameters, void (*visit)(const char*, unsigned, unsigned long long, void*), void* context);
     void d4r_ngx_parameters_destroy(void* parameters);
 }
 // --- CUDA driver API (through nvcuda.dll, the Wine bridge to ZLUDA) --------
@@ -1402,6 +1412,7 @@ struct FrameParams
     // copy (or the in-place texture) takes them without the RGBA16F conversion image and blit
     bool packedOutput = false;
     bool packedRgba8 = false; // R8G8B8A8_UNORM after the original half rounding
+    bool outputFloat = false; // NGX's output array and the output buffers hold f32: binary16 cannot hold the game's format
     // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices, copied
     // off the caller's parameter object on the game thread so the worker never reads an
     // object the game may have destroyed by then. A scalar the caller did not set this frame
@@ -1546,6 +1557,8 @@ struct InputSlot
     CudaDevicePtr linearPointer[4] = {};
     UINT linearWidth[4] = {}, linearHeight[4] = {};
     size_t linearPitch[4] = {};
+    uint32_t linearFormat[4] = {};
+    bool planeFloat[4] = {}; // this frame's plane holds f32 (VramCopy::asFloat); indexed as the planes are, colour first
     CudaDevicePtr dilatedMotion = 0;
     size_t dilatedBytes = 0;
     CudaObject dilatedTexture = 0;
@@ -2094,6 +2107,7 @@ struct VulkanInterop
     PFN_vkUnmapMemory unmap = nullptr;
     PFN_vkCmdPipelineBarrier barrier = nullptr;
     PFN_vkCmdCopyImageToBuffer copyImageToBuffer = nullptr;
+    PFN_vkCmdCopyImage copyImage = nullptr;
     PFN_vkCmdCopyBuffer copyBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage copyBufferToImage = nullptr;
     PFN_vkCmdBlitImage blit = nullptr;
@@ -2181,6 +2195,8 @@ struct VramCopy
     VkImage image = VK_NULL_HANDLE;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     bool convert = false; // blit to/from the plane's canonical format
+    bool asFloat = false; // colour or motion the plane holds as f32: binary16 cannot hold this format's values
+    VkFormat format = VK_FORMAT_UNDEFINED;
     UINT width = 0, height = 0;
 };
 inline const VkMemoryBarrier kBeforeTransfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,

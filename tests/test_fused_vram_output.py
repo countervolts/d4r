@@ -39,7 +39,7 @@ struct ID3D12GraphicsCommandList {};
 struct Set {int pool=0;};
 struct FusedColorInput {VkImage image=0;VkImageView view=0;VkBuffer buffer=0;Set set;ID3D12Resource* owner=nullptr;uint32_t inputMode=5;};
 struct VramBuffer {VkBuffer buffer=1;size_t bytes=800;};
-struct VramCopy {bool convert=true;unsigned width=10,height=10;VkImage image=10;};
+struct VramCopy {bool asFloat=false;bool convert=true;unsigned width=10,height=10;VkImage image=10;};
 struct Feature {bool fusedOutputAllowed=true,recordOutputFused=false,fusedColorAllowed=true;
  struct {VramBuffer vram[1];struct {size_t size(){return 800;}} host[1];} inputs[3];
  FusedColorInput fusedColor[3];std::vector<FusedColorInput> retiredFusedColor;struct {VramBuffer vram;} outputs[4];FusedColorInput fusedOutput[4];std::vector<FusedColorInput> retiredFusedOutput;int outputConversion=0;};
@@ -51,6 +51,7 @@ static void logf(const char*,...) {}
 static std::vector<int> transitions;
 static void transition(ID3D12GraphicsCommandList*,ID3D12Resource*,int,int after){transitions.push_back(after);}
 static bool record_vram_output(ID3D12GraphicsCommandList*,const VramBuffer&,const VramCopy&,int){++legacy;return true;}
+static bool record_vram_output_f32(Feature&,unsigned,ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES,const VramBuffer&,const VramCopy&){assert(false);return false;}
 struct Interop {int BeginVkCommandBufferInterop(ID3D12GraphicsCommandList*,VkCommandBuffer* c){*c=1;return beginOk?0:-1;}int EndVkCommandBufferInterop(ID3D12GraphicsCommandList*){return endOk?0:-1;}} interop;
 static struct {
  int device=0;Interop* interop=&::interop;

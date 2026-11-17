@@ -227,9 +227,17 @@ int main(int argc, char** argv)
     VkDeviceMemory allocations[4];
     // D4R_HARNESS_R11_OUTPUT=1: an R11G11B10F output, as Indiana Jones's; read back widened to RGBA16F
     const bool r11Output = std::getenv("D4R_HARNESS_R11_OUTPUT") != nullptr;
-    NgxVkResource images[] = {make_image(W,H,VK_FORMAT_R16G16B16A16_SFLOAT,allocations[0]),
-        make_image(W,H,VK_FORMAT_R32_SFLOAT,allocations[1]), make_image(W,H,VK_FORMAT_R16G16_SFLOAT,allocations[2]),
-        make_image(OW,OH,r11Output ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT,allocations[3])};
+    // D4R_HARNESS_VK_COLOR / _VK_MOTION / _VK_OUTPUT=<VkFormat number>: those textures in another format. The cleared inputs
+    // stay the same values; the output's texel size is D4R_HARNESS_VK_OUTPUT_BYTES (default 8, 4 with R11_OUTPUT).
+    const auto vk_format = [](const char* name, VkFormat fallback) {
+        return std::getenv(name) ? static_cast<VkFormat>(std::atoi(std::getenv(name))) : fallback; };
+    const VkFormat outputFormat = vk_format("D4R_HARNESS_VK_OUTPUT",
+                                            r11Output ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT);
+    const unsigned outputBytes = std::getenv("D4R_HARNESS_VK_OUTPUT_BYTES") ? std::atoi(std::getenv("D4R_HARNESS_VK_OUTPUT_BYTES"))
+                                                                            : r11Output ? 4 : 8;
+    NgxVkResource images[] = {make_image(W,H,vk_format("D4R_HARNESS_VK_COLOR",VK_FORMAT_R16G16B16A16_SFLOAT),allocations[0]),
+        make_image(W,H,VK_FORMAT_R32_SFLOAT,allocations[1]), make_image(W,H,vk_format("D4R_HARNESS_VK_MOTION",VK_FORMAT_R16G16_SFLOAT),allocations[2]),
+        make_image(OW,OH,outputFormat,allocations[3])};
     const char* names[] = {"Color","Depth","MotionVectors","Output"};
     // D4R_HARNESS_DEPTH_ASPECT=1: label the R32F depth image with the depth aspect, as Indiana Jones
     // (through Streamline/OptiScaler) does; the harness keeps the real colour range for its own barriers.
@@ -262,7 +270,7 @@ int main(int argc, char** argv)
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
         check(vkCreateFence(device,&fi,nullptr,&fences[i]),"fence");
     }
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size=OW*OH*8; bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size=OW*OH*outputBytes; bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer readback; check(vkCreateBuffer(device,&bi,nullptr,&readback),"readback");
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(device,readback,&req);
     VkDeviceMemory readMemory=allocate(req,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -450,11 +458,19 @@ int main(int argc, char** argv)
             values=widened.data();
         }
         unsigned nonzero=0, nonfinite=0;
-        for (unsigned j=0;j<OW*OH*4;++j) { nonzero += (values[j]&0x7fff)!=0; nonfinite += (values[j]&0x7c00)==0x7c00; }
+        if (outputFormat == VK_FORMAT_R16G16B16A16_SFLOAT || r11Output)
+            for (unsigned j=0;j<OW*OH*4;++j) { nonzero += (values[j]&0x7fff)!=0; nonfinite += (values[j]&0x7c00)==0x7c00; }
+        else
+            nonzero = 1;
         std::printf("frame %u: nonzero=%u nonfinite=%u center=%04x,%04x,%04x,%04x\n",n,nonzero,nonfinite,values[((OH/2)*OW+OW/2)*4],values[((OH/2)*OW+OW/2)*4+1],values[((OH/2)*OW+OW/2)*4+2],values[((OH/2)*OW+OW/2)*4+3]);
         // D4R_HARNESS_ALLOW_BLACK=1: a black frame is reported but not fatal (NGX's K starts black on the reset frame here).
         if (nonfinite || (!nonzero && !std::getenv("D4R_HARNESS_ALLOW_BLACK"))) return 1;
-        if (n+1==frames) { FILE* out=std::fopen(argv[2],"wb"); if (!out) return 1; const auto written=std::fwrite(values,1,OW*OH*8,out); std::fclose(out); if (written!=OW*OH*8) return 1; }
+        if (n+1==frames) {
+            // R11_OUTPUT writes the widened RGBA16F copy, any other format its own texels
+            const void* bytes = r11Output ? static_cast<const void*>(values) : data;
+            const size_t size = size_t(OW)*OH*(r11Output ? 8 : outputBytes);
+            FILE* out=std::fopen(argv[2],"wb"); if (!out) return 1; const auto written=std::fwrite(bytes,1,size,out); std::fclose(out); if (written!=size) return 1;
+        }
         vkUnmapMemory(device,readMemory);
     }
     check(vkQueueWaitIdle(queue),"drain");

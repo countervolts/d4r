@@ -47,7 +47,8 @@ struct Global { uint64_t va = 0, size = 0; };
 struct Module {
     std::vector<uint8_t> text;
     uint64_t textVa = 0;
-    uint32_t mach = 0;                // EF_AMDGPU_MACH_* (gfx1100 0x41, gfx1101 0x46, gfx1102 0x47, gfx1103 0x44)
+    uint32_t mach = 0;                // EF_AMDGPU_MACH_* (gfx1100 0x41, gfx1101 0x46, gfx1102 0x47, gfx1103 0x44,
+                                      // gfx1150 0x43, gfx1151 0x4a, gfx1152 0x55, gfx1153 0x58)
     uint64_t dataLo = 0, dataHi = 0;  // the .data/.bss range
     std::vector<uint8_t> dataInit;    // initial contents of [dataLo, dataHi)
     std::map<std::string, Kernel> kernels;
@@ -66,8 +67,10 @@ struct Module {
 // Likewise for RDNA2 (100300 = gfx1030: 0x36); 0 outside gfx1030-gfx1036. Unofficial: only AMD's own driver
 // (VK_KHR_pipeline_binary) takes RDNA2 code objects; the RADV path stays RDNA3/4.
 uint32_t gfx10Mach(uint32_t gfxTargetVersion);
-// The ELF machine of code objects for a KFD gfx_target_version (110001 = gfx1101); 0 outside RDNA3.
+// The ELF machine of code objects for a KFD gfx_target_version (110001 = gfx1101); 0 outside RDNA3 and RDNA 3.5.
 uint32_t gfx11Mach(uint32_t gfxTargetVersion);
+// RDNA 3.5 (gfx1150-gfx1153) code-object machines
+bool gfx115Mach(uint32_t mach);
 // Likewise for RDNA4 (120001 = gfx1201: 0x4e); 0 outside gfx1200/gfx1201. gfx12 code addresses its globals with an
 // extra s_sext_i32_i16 after s_getpc_b64 and its workgroup ids arrive in ttmp7/ttmp9 (as RADV's own shaders' do).
 uint32_t gfx12Mach(uint32_t gfxTargetVersion);

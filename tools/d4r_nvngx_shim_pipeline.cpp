@@ -837,7 +837,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
         const VramBuffer& buffer = slot.vram[index];
         if (slot.linearTexture[index] != 0 && slot.linearPointer[index] == buffer.device &&
             slot.linearWidth[index] == geometry.width && slot.linearHeight[index] == geometry.height &&
-            slot.linearPitch[index] == geometry.rowBytes)
+            slot.linearPitch[index] == geometry.rowBytes && slot.linearFormat[index] == plane_format_in(slot, index, planes[index]))
             continue;
         if (slot.linearTexture[index] != 0)
             g.cu.texObjectDestroy(slot.linearTexture[index]);
@@ -847,7 +847,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
             CudaDevicePtr pointer;
             uint32_t format, channels;
             size_t width, height, pitch;
-        } pitch2D = {buffer.device, plane_format(planes[index]), plane_channels(planes[index]), geometry.width,
+        } pitch2D = {buffer.device, plane_format_in(slot, index, planes[index]), plane_channels(planes[index]), geometry.width,
                      geometry.height, geometry.rowBytes};
         static_assert(sizeof(Pitch2D) == 40, "CUDA_RESOURCE_DESC pitch2D");
         CudaResourceDesc resource = {};
@@ -871,6 +871,7 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
         slot.linearWidth[index] = geometry.width;
         slot.linearHeight[index] = geometry.height;
         slot.linearPitch[index] = geometry.rowBytes;
+        slot.linearFormat[index] = pitch2D.format;
     }
     return true;
 }
@@ -1008,7 +1009,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
     for (int index = 0; index < count && result == 0; ++index)
     {
         const HostPlane& geometry = slot.host[index];
-        if (!ensure_cuda_image(*images[index], geometry.width, geometry.height, plane_format(planes[index]),
+        if (!ensure_cuda_image(*images[index], geometry.width, geometry.height, plane_format_in(slot, index, planes[index]),
                                plane_channels(planes[index]), false, planes[index] == Plane::Color))
             return false;
         if (verify)
@@ -1249,7 +1250,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         return;
     }
     VramBuffer buffer = feature->outputs[target].vram;
-    const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
+    const size_t rowBytes = static_cast<size_t>(feature->output.width) * (params.outputFloat ? 16 : 8);
     CudaMemcpy2D copy = {};
     copy.srcMemoryType = CUDA_MEMORY_ARRAY;
     copy.srcArray = feature->output.array;
@@ -1766,10 +1767,10 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                 CudaImage* images[] = {&feature->color, &feature->depth, &feature->motion, &feature->exposure};
                 for (int index = 0; index < (params.hasExposure ? 4 : 3) && ready; ++index)
                     ready = ensure_cuda_image(*images[index], slot.host[index].width, slot.host[index].height,
-                        plane_format(planes[index]), plane_channels(planes[index]), false, index == 0);
+                        plane_format_in(slot, index, planes[index]), plane_channels(planes[index]), false, index == 0);
             }
             ready = ready && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight,
-                                               CUDA_FORMAT_HALF, 4, true, false);
+                                               params.outputFloat ? CUDA_FORMAT_FLOAT : CUDA_FORMAT_HALF, 4, true, false);
             if (!ready)
             {
                 slot.busy = false;
@@ -1985,8 +1986,8 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                         upload_plane(Plane::Motion, slot.host[2], feature->motion, frame, stages, 2) &&
                         (!params.hasExposure ||
                          upload_plane(Plane::Exposure, slot.host[3], feature->exposure, frame, stages, 3));
-    ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight, CUDA_FORMAT_HALF, 4,
-                                 true, false);
+    ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight,
+                                 params.outputFloat ? CUDA_FORMAT_FLOAT : CUDA_FORMAT_HALF, 4, true, false);
     const auto dilationStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     // Keep the native field available to repair independently of the field fed
     // to NGX. The opt-in repair-only mode retains the game's flags and MV scale.
@@ -2118,12 +2119,15 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if(!wireHistoryRequested) feature->wireValid=false;
     if(wireHistoryRequested && feature->outputRedirected)
     { g.cu.setArrayRedirect(feature->output.array,0,0);feature->outputRedirected=false; }
+    // An f32 output goes through the array: the redirected stores write RGBA16F or a format's bits through half
+    if(params.outputFloat && feature->outputRedirected)
+    { g.cu.setArrayRedirect(feature->output.array,0,0);feature->outputRedirected=false; }
     static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
     // The redirect is carried out by the native output kernel's stores (ZLUDA's compile of NVIDIA's kernel
     // writes the array), so it is set while the previous frame's output kernel was the native one and
     // undone below when this frame's was not.
     const bool nativeOutput = g.cu.outputKernelNative == nullptr || g.cu.outputKernelNative() == 1;
-    if (!wireHistoryRequested && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
+    if (!wireHistoryRequested && !params.outputFloat && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
         (nativeOutput || feature->outputRedirected))
     {
         // split frames write their own slot; the staged path downloads from outputLinear

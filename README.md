@@ -73,13 +73,17 @@ Presets M and L at their intended modes, RX 7700 XT, network on the native HIP l
 | M | Performance | 1280x720 | 5.25 ms | 1920x1080 | 11.57 ms |
 | L | Ultra Performance | 854x480 | 4.33 ms | 1280x720 | 9.64 ms |
 
-**Linux, RX 7700 XT, Ghost of Tsushima**
+**Linux, RX 7700 XT, Ghost of Tsushima** (2026-11-12, highest graphics settings, no approximations)
 
-| Mode | FPS | K GPU time |
-|---|---:|---:|
-| Quality | 90.9 | 1.99 ms |
-| Balanced | 93.8 | 1.96 ms |
-| Ultra Performance | 101.7 | 1.91 ms |
+| Mode | FPS | 1% low | K GPU time | FSR 4.1.1 FPS | FSR 1% low | FSR GPU time |
+|---|---:|---:|---:|---:|---:|---:|
+| Native AA (DLAA / FSR AA) | 56.5 | 51.3 | 1.72 ms | 53.9 | 48.8 | 2.20 ms |
+| Quality | 73.7 | 67.1 | 1.66 ms | 70.4 | 63.3 | 2.19 ms |
+| Balanced | 78.0 | 68.3 | 1.64 ms | 74.1 | 66.7 | 2.16 ms |
+| Performance | 80.8 | 72.2 | 1.61 ms | 77.1 | 66.4 | 2.14 ms |
+| Ultra Performance | 85.7 | 75.8 | 1.57 ms | 78.9 | 68.0 | 2.09 ms |
+
+K is 4.7–8.6% faster than FSR 4.1.1 at every mode, with upscale times about 0.5 ms lower.
 
 The Windows and Linux runs used different benchmark runs and probably different settings, so compare within a table rather than across them. More measurements: [performance](docs/performance.md), [videos](docs/videos.md).
 

@@ -1,0 +1,20 @@
+diff --git a/OptiScaler/hooks/LibraryLoad_Hooks.cpp b/OptiScaler/hooks/LibraryLoad_Hooks.cpp
+index 357dafe8..b45e205a 100644
+--- a/OptiScaler/hooks/LibraryLoad_Hooks.cpp
++++ b/OptiScaler/hooks/LibraryLoad_Hooks.cpp
+@@ -66,7 +66,15 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
+ 
+     const bool pathInsideExePath = Util::IsSubpath(path, Util::ExePath().parent_path());
+ 
++    // Never intercept loads of files from our own install dir (e.g. an external backend's
++    // NGX core at <OptiDllPath>\ngx\_nvngx.dll), they must load the real file
++    const bool pathInsideOptiPath = Util::IsSubpath(path, std::filesystem::path(Config::Instance()->MainDllPath.value()));
++
++    if (pathInsideOptiPath && CheckDllNameW(&libName, &nvngxNamesW))
++        LOG_DEBUG("Not redirecting nvngx load from Opti path: {}", libNameA);
++
+     if (Config::Instance()->EnableDlssInputs.value_or_default() && CheckDllNameW(&libName, &nvngxNamesW) &&
++        !pathInsideOptiPath &&
+         (!Config::Instance()->HookOriginalNvngxOnly.value_or_default() || !pathInsideExePath))
+     {
+         LOG_INFO("nvngx call: {0}, returning this dll!", libNameA);
