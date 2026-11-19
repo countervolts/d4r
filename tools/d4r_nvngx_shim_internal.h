@@ -1889,6 +1889,7 @@ struct Feature
     // a scene or menu transition); the next frame recorded restarts the temporal history
     uint32_t engineRectMisses = 0;
     bool engineHistoryLost = false;
+    bool engineFrameSkipped = false; // this frame was skipped for an uncovered texture (not a failure of the feature)
     uint32_t evaluatedFrames = 0; // worker only
     // D4R_ENGINE: d4r's own inference, recorded into the game's command lists (game thread only). Recorded
     // lists retain `resources`, so this is destroyed only once the GPU has finished with them.

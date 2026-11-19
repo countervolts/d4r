@@ -405,6 +405,7 @@ static bool engine_dx_skip_uncovered(Feature& feature, const char* path, const c
                                      uint32_t width, uint32_t height, const D3D12_RESOURCE_DESC& desc, uint32_t frame)
 {
     feature.engineHistoryLost = true;
+    feature.engineFrameSkipped = true;
     if (++feature.engineRectMisses <= 3 || feature.engineRectMisses % 600 == 0)
         logf("engine backend (D3D12%s): the %s texture (%llux%u) does not cover its rectangle (%u,%u %ux%u); feature %u "
              "skips frame %u (%u such frames so far) and restarts its history on the next one",

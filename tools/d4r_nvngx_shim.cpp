@@ -2047,9 +2047,18 @@ NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* ha
     if (feature->fsr != nullptr)
         return fsr_rr_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame);
 
+    feature->engineFrameSkipped = false;
     if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame))
     {
         ++feature->engineFrames;
+        return NGX_SUCCESS;
+    }
+    if (feature->nativeD3d12 && feature->engineFrameSkipped)
+    {
+        // A frame whose textures are smaller than their rectangles (Spider-Man 2 passes a 4x4 placeholder motion
+        // texture while its pause menu is open, issues #66 and #73) is a frame the game does not show an upscale of.
+        // Reporting a failure makes OptiScaler print "Upscaler failed to run!" for every such frame; the feature is
+        // fine and its history restarts on the next recorded frame, so report success and leave the output as is.
         return NGX_SUCCESS;
     }
     if (feature->nativeD3d12)
