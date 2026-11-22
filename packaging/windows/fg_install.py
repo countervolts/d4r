@@ -42,6 +42,9 @@ Model = auto
 ; Folder of the translated kernels for this GPU (install.cmd writes it). auto: %LOCALAPPDATA%\\d4r\\nvxrt-gfx11 on
 ; RDNA3, %LOCALAPPDATA%\\d4r\\nvxrt on RDNA4
 KernelCache = auto
+; Generated frames per real frame offered to the game (Streamline / OptiScaler cap their frame count with it). auto:
+; what DLSS-G reports, kept at its highest for the session; 1-5 forces it (3 = up to 4x). Env: D4R_FG_MULTI_FRAME_MAX
+MultiFrameCountMax = auto
 """
 
 # HIP's devices through AMD's driver runtime (as packaging/build_engine_models.py lists them): "bytes target" each

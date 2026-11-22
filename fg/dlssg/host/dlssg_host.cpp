@@ -24,6 +24,9 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
+#include <setupapi.h>
+#include <devguid.h>
+#include <cwchar>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdint>
@@ -122,6 +125,8 @@ unsigned g_rrCreateMatrices = 1; // RrCreateMatrices=1: camera matrices on Ray R
 unsigned g_lite = 0;             // Lite=1: create DLSS-G with DLSSG.LiteCandidateBlendingEnabled (DLSS-G >= 310.9.16)
 std::wstring g_dumpDir;          // DumpDir=<dir>: write the inputs + parameters of DumpReal real frames (test captures)
 unsigned g_dumpAt = 600, g_dumpReal = 0;
+unsigned g_mfcOverride = 0;      // d4r.ini [FrameGeneration] MultiFrameCountMax (0 = auto): the multi-frame capability published
+unsigned g_mfcSeen = 0;          // the highest DLSSG.MultiFrameCountMax DLSS-G reported in this process
 void* g_device = nullptr;
 HANDLE g_log = INVALID_HANDLE_VALUE;
 std::wstring g_base; // this DLL's path without ".dll"
@@ -131,6 +136,7 @@ struct FgHandle
     NgxHandle pub;
     NgxHandle* inner;
     int uiInputs = -1; // which of HUDLess / UI / UIAlpha the caller passed (bit mask); -1 before the first evaluate
+    unsigned frames = ~0u; // DLSSG.MultiFrameCount of the last evaluate (generated frames per real frame)
 };
 std::map<const void*, FgHandle*> g_handles; // keyed by the public handle pointer
 
@@ -195,6 +201,7 @@ bool g_cubin = false; // NVIDIA's cubin interface is served here (native Windows
 // The translated kernels' folder: d4r.ini [FrameGeneration] KernelCache (install.ps1 writes the one it built), or for
 // auto the cache of this GPU's generation, %LOCALAPPDATA%\d4r\nvxrt-gfx11 (RDNA3) or %LOCALAPPDATA%\d4r\nvxrt (RDNA4,
 // when only that one exists). dlssg_host.ini [Host] Cache= overrides it.
+int gpuGeneration();
 std::wstring fgCacheDir()
 {
     wchar_t local[MAX_PATH] = {};
@@ -202,9 +209,12 @@ std::wstring fgCacheDir()
     std::wstring cache = d4rString(L"KernelCache", nullptr, L"");
     if (cache.empty() || !_wcsicmp(cache.c_str(), L"auto")) {
         const std::wstring rdna3 = std::wstring(local) + L"\\d4r\\nvxrt-gfx11", rdna4 = std::wstring(local) + L"\\d4r\\nvxrt";
+        // the GPU's own generation when the PnP tree names it (an RDNA4 GPU with an old RDNA3 cache beside its own
+        // took the RDNA3 one), else the cache that is there alone
+        const int generation = gpuGeneration();
         const bool only4 = GetFileAttributesW((rdna4 + L"\\arch").c_str()) != INVALID_FILE_ATTRIBUTES &&
                            GetFileAttributesW((rdna3 + L"\\arch").c_str()) == INVALID_FILE_ATTRIBUTES;
-        cache = only4 ? rdna4 : rdna3;
+        cache = (generation >= 3 ? generation == 4 : only4) ? rdna4 : rdna3;
     }
     return iniString(L"Cache", cache.c_str());
 }
@@ -218,6 +228,42 @@ bool fgCacheRdna4(const std::wstring& cache)
     fread(text, 1, sizeof(text) - 1, f);
     fclose(f);
     return !strncmp(text, "gfx12", 5);
+}
+
+// The newest AMD GPU generation in the PnP tree: 4 (RDNA4), 3 (RDNA 3/3.5), 2 (an older AMD GPU), 0 (none / unreadable).
+// Model auto used to go by the kernel cache's arch file alone, so an RDNA4 GPU whose cache was not there yet (or had
+// an RDNA3 cache beside it) got the Lite model, which generates one frame: the game was offered 1 generated frame in
+// one run and 5 in the next (#71). OptiScaler's SetupAPI spoofing leaves callers in the d4r folder alone.
+int pnpAmdGeneration()
+{
+    const HDEVINFO set = SetupDiGetClassDevsW(nullptr, L"PCI", nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (set == INVALID_HANDLE_VALUE) return 0;
+    int newest = 0;
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    for (DWORD index = 0; SetupDiEnumDeviceInfo(set, index, &data); ++index) {
+        wchar_t ids[512] = {};
+        unsigned vendor = 0, device = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_HARDWAREID, nullptr, reinterpret_cast<PBYTE>(ids),
+                                               sizeof(ids) - sizeof(wchar_t), nullptr) ||
+            swscanf(ids, L"PCI\\VEN_%4x&DEV_%4x", &vendor, &device) != 2 || vendor != 0x1002)
+            continue;
+        // the same ids as the NGX shim's amd_generation (tools/d4r_nvngx_shim_native_d3d12.cpp); only display devices
+        // count as "older" (an AMD chipset's PCI functions share the vendor id)
+        int generation = 0;
+        if (device == 0x7550 || device == 0x7551 || device == 0x7590) generation = 4;
+        else if ((device >= 0x7440 && device <= 0x749f) || device == 0x15bf || device == 0x15c8 || device == 0x1900 ||
+                 device == 0x1901 || device == 0x150e || device == 0x1586 || device == 0x1114) generation = 3;
+        else if (IsEqualGUID(data.ClassGuid, GUID_DEVCLASS_DISPLAY)) generation = 2;
+        newest = std::max(newest, generation);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return newest;
+}
+int gpuGeneration()
+{
+    static const int generation = pnpAmdGeneration();
+    return generation;
 }
 
 // Cubin=auto (default): on unless running under Wine; 0 / 1 force it.
@@ -298,10 +344,15 @@ void load()
     for (std::wstring p : {exe_dir + L"d4r\\d4r.ini", dir + L"..\\..\\d4r.ini"})
         if (g_d4rIni.empty() && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) g_d4rIni = p;
     // Model: full (DLSS-G's full model) or lite (NVIDIA FG Lite, DLSS-G >= 310.9.16); auto: Lite on RDNA3, full on
-    // RDNA4 (as on Linux), by the kernel cache's generation. Each model has its DLL: fg\dlssg\<model>\nvngx_dlssg.dll
-    // (install.ps1 downloads them), else the game's own nvngx_dlssg.dll.
+    // RDNA4 (as on Linux), by the GPU in the PnP tree, else by the kernel cache's generation. Each model has its DLL:
+    // fg\dlssg\<model>\nvngx_dlssg.dll (install.ps1 downloads them), else the game's own nvngx_dlssg.dll.
     std::wstring model = d4rString(L"Model", L"D4R_FG_MODEL", L"auto");
-    bool lite = !_wcsicmp(model.c_str(), L"lite") || (!_wcsicmp(model.c_str(), L"auto") && !fgCacheRdna4(fgCacheDir()));
+    const int generation = gpuGeneration();
+    const bool autoRdna4 = generation >= 3 ? generation == 4 : fgCacheRdna4(fgCacheDir());
+    bool lite = !_wcsicmp(model.c_str(), L"lite") || (!_wcsicmp(model.c_str(), L"auto") && !autoRdna4);
+    logf("GPU: %s; Model auto would be %s", generation == 4 ? "RDNA4" : generation == 3 ? "RDNA 3" :
+         generation == 2 ? "AMD, older than RDNA 3" : "not identified (by the kernel cache instead)",
+         autoRdna4 ? "full" : "lite");
     std::wstring modelDll = dir + (lite ? L"lite\\nvngx_dlssg.dll" : L"full\\nvngx_dlssg.dll");
     if (GetFileAttributesW(modelDll.c_str()) == INVALID_FILE_ATTRIBUTES) modelDll = L"nvngx_dlssg.dll";
     std::wstring fg = resolve(iniString(L"FG", modelDll.c_str()));
@@ -326,6 +377,16 @@ void load()
     g_dumpDir = iniString(L"DumpDir", L"");
     g_dumpAt = iniUInt(L"DumpAt", 600);
     g_dumpReal = iniUInt(L"DumpReal", 0);
+    {
+        const std::wstring frames = d4rString(L"MultiFrameCountMax", L"D4R_FG_MULTI_FRAME_MAX", L"auto");
+        wchar_t* end = nullptr;
+        const unsigned long value = wcstoul(frames.c_str(), &end, 10);
+        if (_wcsicmp(frames.c_str(), L"auto") && end != frames.c_str() && *end == 0 && value >= 1 && value <= 5)
+            g_mfcOverride = (unsigned)value;
+        else if (_wcsicmp(frames.c_str(), L"auto"))
+            logf("d4r.ini [FrameGeneration] MultiFrameCountMax must be auto or 1-5, not '%ls'; using auto", frames.c_str());
+        g_mfcOverride = iniUInt(L"MultiFrameCountMax", g_mfcOverride);
+    }
     setupCubin(dir);
     // Next=none: no next core (test harness); this DLL then hands out its own parameter maps
     g_standalone = _wcsicmp(next.c_str(), L"none") == 0;
@@ -524,11 +585,22 @@ void addFgCaps(void* params)
     unsigned mfc = 0, model = 0;
     ms::getU(params, "DLSSG.MultiFrameCountMax", &mfc);
     ms::getU(params, "DLSSG.ModelVersion", &model);
-    static bool once = false;
-    if (!once || failed(r)) {
-        once = true;
-        logf("capabilities: dlssg PopulateParameters_Impl -> 0x%08X, MultiFrameCountMax %u, ModelVersion %u", r, mfc,
-             model);
+    // One capability for the whole session (#71): Streamline and OptiScaler read it once and cap the game's (and
+    // OptiScaler's override) frame count with it, and DLSS-G answered 1 in some calls and 5 in others. Publish the
+    // highest value DLSS-G reported in this process, or d4r.ini [FrameGeneration] MultiFrameCountMax.
+    unsigned published = 0;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        if (!failed(r)) g_mfcSeen = std::max(g_mfcSeen, mfc);
+        published = g_mfcOverride ? g_mfcOverride : std::max(g_mfcSeen, mfc);
+    }
+    if (published && published != mfc) ms::setU(params, "DLSSG.MultiFrameCountMax", published);
+    static unsigned lastReported = ~0u, lastPublished = ~0u;
+    if (mfc != lastReported || published != lastPublished || failed(r)) {
+        lastReported = mfc;
+        lastPublished = published;
+        logf("capabilities: dlssg PopulateParameters_Impl -> 0x%08X, MultiFrameCountMax %u (published %u%s), "
+             "ModelVersion %u", r, mfc, published, g_mfcOverride ? ", d4r.ini MultiFrameCountMax" : "", model);
     }
 }
 
@@ -897,6 +969,8 @@ struct Dumper {
     bool active(unsigned idx)
     {
         if (!g_dumpReal || g_dumpDir.empty()) return false;
+        // the inputs' real states, from the game's barriers, for resources() (seen from now until the trigger)
+        if (!first && g_cubin) cux::trackResourceStates(true);
         if (idx <= 1) real++;
         if (real < g_dumpAt) return false;
         if (!first) {
@@ -908,7 +982,8 @@ struct Dumper {
             first = real;
             logf("dump: triggered at real frame %llu", (unsigned long long)real);
         }
-        return real < first + g_dumpReal;
+        if (real >= first + g_dumpReal) { cux::trackResourceStates(false); return false; }
+        return true;
     }
     static std::string narrow(const std::wstring& w) { std::string r; for (wchar_t c : w) r += (char)c; return r; }
     void writeFile(const std::string& name, const void* data, size_t n)
@@ -971,8 +1046,11 @@ struct Dumper {
             ID3D12Resource* r = nullptr; std::string k = std::string("DLSSG.") + n;
             if (!failed(ms::getD3D12(p, k.c_str(), &r)) && r) {
                 D3D12_RESOURCE_DESC d = r->GetDesc();
-                snprintf(b, sizeof b, "r %s %p %llux%u fmt %u flags 0x%x\n", k.c_str(), (void*)r, (unsigned long long)d.Width,
-                         d.Height, (unsigned)d.Format, (unsigned)d.Flags);
+                unsigned state = 0;
+                const bool known = cux::resourceState(r, &state);
+                snprintf(b, sizeof b, "r %s %p %llux%u fmt %u flags 0x%x state %s0x%x\n", k.c_str(), (void*)r,
+                         (unsigned long long)d.Width, d.Height, (unsigned)d.Format, (unsigned)d.Flags,
+                         known ? "" : "unknown ", state);
                 t += b;
             }
         }
@@ -986,7 +1064,22 @@ struct Dumper {
         for (auto n : res) {
             ID3D12Resource* r = nullptr; std::string k = std::string("DLSSG.") + n;
             if (failed(ms::getD3D12(p, k.c_str(), &r)) || !r) continue;
+            // The copy needs the resource's real state. This assumed ALL_SHADER_RESOURCE, but a backbuffer is often in
+            // PRESENT/RENDER_TARGET and depth in DEPTH_*: the mismatched transition hung the GPU right after
+            // "dump: triggered" (#72, only the params files were written). Unknown state: skip the copy, never guess.
+            unsigned tracked = 0;
+            if (!cux::resourceState(r, &tracked)) {
+                logf("dump: %s skipped (no transition of it seen, its state is unknown)", n);
+                continue;
+            }
+            const auto state = (D3D12_RESOURCE_STATES)tracked;
+            // COMMON promotes to COPY_SOURCE by itself; a read state that includes COPY_SOURCE needs no transition
+            const bool transition = state != D3D12_RESOURCE_STATE_COMMON && !(state & D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_RESOURCE_DESC d = r->GetDesc();
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1) {
+                logf("dump: %s skipped (not a single-sample 2D texture)", n);
+                continue;
+            }
             Pending pe{}; UINT64 total = 0;
             dev->GetCopyableFootprints(&d, 0, 1, 0, &pe.fp, &pe.rows, &pe.rowBytes, &total);
             D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -997,15 +1090,15 @@ struct Dumper {
                                                     IID_ID3D12Resource, (void**)&pe.rb))) { logf("dump: readback alloc failed"); continue; }
             D3D12_RESOURCE_BARRIER br{}; br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             br.Transition.pResource = r; br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            br.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+            br.Transition.StateBefore = state;
             br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            cl->ResourceBarrier(1, &br);
+            if (transition) cl->ResourceBarrier(1, &br);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = pe.rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = pe.fp;
             src.pResource = r; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
             cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
-            cl->ResourceBarrier(1, &br);
+            if (transition) cl->ResourceBarrier(1, &br);
             char b[256];
             snprintf(b, sizeof b, "res_r%02u_%s_%llux%u_fmt%u_pitch%u.bin", rf, n, (unsigned long long)d.Width, d.Height,
                      (unsigned)d.Format, pe.fp.Footprint.RowPitch);
@@ -1069,6 +1162,18 @@ static NgxResult evalFg(const char* name, void* list, FgHandle* h, void* params,
                  (unsigned long long)n, t.c_str(), hasRecomposition ? (recomposition ? "1" : "0") : "not set");
             h->uiInputs = mask;
         }
+    }
+    if (params && mfc != h->frames) {
+        // what the caller (the game through Streamline, or OptiScaler's override) applies, next to what was offered
+        unsigned published = 0;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            published = g_mfcOverride ? g_mfcOverride : g_mfcSeen;
+        }
+        const unsigned frames = mfc ? mfc : 1; // DLSSG.MultiFrameCount unset: one generated frame
+        logf("Evaluate(FG) #%llu: the caller generates %u frame%s per real frame (%ux); capability published: %u",
+             (unsigned long long)n, frames, frames == 1 ? "" : "s", frames + 1, published);
+        h->frames = mfc;
     }
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
     bool timed = false;

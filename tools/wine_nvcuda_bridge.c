@@ -264,11 +264,19 @@ static void make_directories(const char* path)
 {
     char partial[1024];
     snprintf(partial, sizeof(partial), "%s", path);
-    for (char* slash = strchr(partial + 1, '/'); slash != NULL; slash = strchr(slash + 1, '/'))
+    /* Windows paths (CacheDir, %LOCALAPPDATA%) separate with backslashes, often mixed with the '/' added here */
+#ifdef D4R_NATIVE_WINDOWS
+    const char* separators = "/\\";
+#else
+    const char* separators = "/";
+#endif
+    for (char* slash = partial[0] != '\0' ? strpbrk(partial + 1, separators) : NULL; slash != NULL;
+         slash = strpbrk(slash + 1, separators))
     {
+        const char separator = *slash;
         *slash = '\0';
         mkdir(partial, 0755);
-        *slash = '/';
+        *slash = separator;
     }
     mkdir(partial, 0755);
 }
@@ -500,6 +508,9 @@ static void remove_directory(const char* path)
             continue;
         char child[1400];
         snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+#ifdef D4R_NATIVE_WINDOWS
+        SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL); /* _unlink refuses read-only copies */
+#endif
         unlink(child);
     }
     closedir(directory);
@@ -609,12 +620,17 @@ static void prepare_native_kernels(const char* cache_home)
 {
     const char* configured = getenv("D4R_ZLUDA_NATIVE_DIR");
     if (configured == NULL || configured[0] == '\0')
+    {
+        tracef("native kernels: off (no D4R_ZLUDA_NATIVE_DIR); ZLUDA compiles every DLSS kernel");
         return;
+    }
     /* a release directory holds one manifest and set of code objects per GPU target */
     char architecture[32], source[1024], path[1200];
     gpu_architecture(architecture, sizeof(architecture));
     if (!architecture[0])
     {
+        tracef("native kernels: disabled, the rendering GPU's target is unknown (see the GPU target line); "
+               "ZLUDA compiles every DLSS kernel");
         unsetenv("D4R_ZLUDA_NATIVE_DIR");
         return;
     }
@@ -649,9 +665,18 @@ static void prepare_native_kernels(const char* cache_home)
         return;
     }
     snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-    manifest = cache_home != NULL ? fopen(path, "r") : NULL; /* a manifest set is served from the cache */
+    if (cache_home == NULL) /* a manifest set is served from the cache */
+    {
+        tracef("native kernels: disabled, no cache folder to serve %s from (set D4R_ZLUDA_CACHE_HOME, "
+               "d4r.ini [Paths] CacheDir); ZLUDA compiles every DLSS kernel", source);
+        unsetenv("D4R_ZLUDA_NATIVE_DIR");
+        return;
+    }
+    manifest = fopen(path, "r");
     if (manifest == NULL)
     {
+        tracef("native kernels: disabled, cannot read %s (%s); ZLUDA compiles every DLSS kernel", path,
+               strerror(errno));
         unsetenv("D4R_ZLUDA_NATIVE_DIR");
         return;
     }

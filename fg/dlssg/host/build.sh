@@ -24,6 +24,6 @@ for dir in vulkan vk_video; do
 done
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Wno-cast-function-type -Wno-missing-field-initializers -Wno-unused-parameter \
   -Ibuild/vulkan-include -shared -static -static-libgcc -static-libstdc++ -o build/nvngx.dll_dlssg_host.dll \
-  dlssg_host.cpp cubin_d3d12.cpp ../nvxrt/util.cpp -ldxguid -luuid
+  dlssg_host.cpp cubin_d3d12.cpp ../nvxrt/util.cpp -ldxguid -luuid -lsetupapi
 "$CXX" -O2 -std=c++17 -Wall -static -o build/nvxrt-scan.exe ../nvxrt/scan.cpp ../nvxrt/util.cpp
 echo "built build/nvngx.dll_dlssg_host.dll"

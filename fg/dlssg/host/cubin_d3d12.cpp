@@ -1770,8 +1770,24 @@ bool copyOrShader(D3D12_RESOURCE_STATES s)
 {
     return shaderOnly(s) || s == D3D12_RESOURCE_STATE_COPY_SOURCE || s == D3D12_RESOURCE_STATE_COPY_DEST;
 }
+// Each resource's state after the last transition recorded on a hooked list (trackResourceStates: test captures only,
+// so the game's barriers cost nothing extra otherwise). Recording order, not execution order, but the inputs of an
+// evaluate were transitioned for it just before.
+std::atomic<bool> g_trackStates{false};
+std::mutex g_stateLock;
+std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_states;
+void noteStates(UINT n, const D3D12_RESOURCE_BARRIER* b)
+{
+    std::lock_guard<std::mutex> l(g_stateLock);
+    for (UINT i = 0; i < n; i++)
+        if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && b[i].Transition.pResource &&
+            (b[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || b[i].Transition.Subresource == 0) &&
+            !(b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY))
+            g_states[b[i].Transition.pResource] = b[i].Transition.StateAfter;
+}
 void STDMETHODCALLTYPE sResourceBarrier(List* self, UINT n, const D3D12_RESOURCE_BARRIER* b)
 {
+    if (g_trackStates.load(std::memory_order_relaxed)) noteStates(n, b);
     List* t;
     if (Chain* c = stateChain(self, t)) {
         c->slotCalls[26]++;
@@ -3958,6 +3974,16 @@ FgScope::~FgScope()
 }
 
 void newFeature() { markNewFeature(); }
+
+void trackResourceStates(bool on) { g_trackStates.store(on && g_listHooks, std::memory_order_relaxed); }
+bool resourceState(void* resource, unsigned* state)
+{
+    std::lock_guard<std::mutex> l(g_stateLock);
+    auto it = g_states.find(static_cast<ID3D12Resource*>(resource));
+    if (it == g_states.end()) return false;
+    *state = (unsigned)it->second;
+    return true;
+}
 
 std::string summary()
 {

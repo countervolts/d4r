@@ -19,6 +19,29 @@ spec.loader.exec_module(model_tools)
 
 
 class ModelBuildTests(unittest.TestCase):
+    def test_vkhip_kernels_use_the_detected_architecture(self):
+        """A release holds every gfx110x folder: K's HIP layers must come from the GPU hip_device_only() detected."""
+        spec = importlib.util.spec_from_file_location('build_engine_models', ROOT / 'packaging/build_engine_models.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            for arch in ('gfx1100', 'gfx1101', 'gfx1102', 'gfx1201'):
+                (runtime / 'kernels' / arch).mkdir(parents=True)
+                (runtime / 'kernels' / arch / 'dltss_pwin_enc0_layer.hsaco').write_bytes(b'fixture')
+            saved = os.environ.pop('D4R_GPU_ARCH', None)
+            try:
+                self.assertIsNone(builder.vkhip_kernels(runtime))  # ambiguous without the detected target
+                self.assertEqual(builder.vkhip_kernels(runtime, 'gfx1101'), runtime / 'kernels' / 'gfx1101')
+                self.assertIsNone(builder.vkhip_kernels(runtime, 'gfx1201'))  # RDNA4 has no vkhip
+                self.assertIsNone(builder.vkhip_kernels(runtime, 'gfx1103'))  # no folder for it
+                os.environ['D4R_GPU_ARCH'] = 'gfx1102'
+                self.assertEqual(builder.vkhip_kernels(runtime), runtime / 'kernels' / 'gfx1102')
+            finally:
+                os.environ.pop('D4R_GPU_ARCH', None)
+                if saved is not None:
+                    os.environ['D4R_GPU_ARCH'] = saved
+
     def test_model_install_preserves_native_kernel_subdirectories(self):
         text = (ROOT / 'packaging/build_engine_models.sh').read_text()
         start = text.index('place() {')

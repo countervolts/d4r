@@ -64,11 +64,14 @@ def sha256(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def vkhip_kernels(runtime):
-    """The release's native K layers for vkhip (RDNA3; RDNA2 unofficially, on AMD's driver only): kernels/D4R_GPU_ARCH,
-    or the one gfx110x / gfx103x folder a single-GPU release holds. Windows has no KFD topology to read the GPU's
-    target from; None when it is unknown."""
-    candidates = [runtime / 'kernels' / os.environ['D4R_GPU_ARCH']] if os.environ.get('D4R_GPU_ARCH') else \
+def vkhip_kernels(runtime, arch=''):
+    """The release's native K layers for vkhip (RDNA3; RDNA2 unofficially, on AMD's driver only): kernels/<ARCH>, the
+    target hip_device_only() read from HIP (D4R_GPU_ARCH overrides it there), or, when that is unknown, the one
+    gfx110x / gfx103x folder the release holds. A release ships every gfx110x folder, so without ARCH this found none
+    and K was packaged without its HIP layers (7800 XT / 7900 XT: "k has no HIP layers (hipnet.bin)"). None when no
+    folder fits."""
+    arch = arch or os.environ.get('D4R_GPU_ARCH', '')
+    candidates = [runtime / 'kernels' / arch] if arch else \
         sorted((runtime / 'kernels').glob('gfx110[0-3]')) + sorted((runtime / 'kernels').glob('gfx103[0-6]'))
     candidates = [c for c in candidates if c.name.startswith(('gfx110', 'gfx103')) and
                   (c / 'dltss_pwin_enc0_layer.hsaco').is_file()]
@@ -375,7 +378,7 @@ def main():
                 # RDNA3 vkhip (games on d4r's vkd3d-proton) uses these same captured weights and the release's native
                 # layers, as build_engine_models.sh packages them on Linux
                 hip_args = []
-                kernels = vkhip_kernels(runtime)
+                kernels = vkhip_kernels(runtime, arch)
                 if kernels is not None:
                     hip_args = ['--hip', kernels, '--capture', work / 'k']
                     accuracy = runtime / 'kernels' / 'accuracy' / kernels.name

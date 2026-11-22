@@ -1041,6 +1041,20 @@ static NgxResult native_optimal_settings(void* parameters)
     return NGX_SUCCESS;
 }
 
+// Ray Reconstruction diagnostics (#74: a game that ran Super Resolution only, with RR on offer and nothing in the log):
+// how often a caller asked this DLL what it offers, what the answer was, and whether a RR feature was ever created
+static std::atomic<unsigned> g_rrCapabilityQueries{0};
+static std::atomic<int> g_rrCapabilityAnswer{-1};
+static std::atomic<bool> g_rrCreated{false};
+
+static void note_rr_capability(bool offered, const char* route)
+{
+    g_rrCapabilityQueries.fetch_add(1, std::memory_order_relaxed);
+    if (g_rrCapabilityAnswer.exchange(offered ? 1 : 0) != (offered ? 1 : 0))
+        logf("Ray Reconstruction capability (%s): SuperSamplingDenoising.Available=%d (%s)", route, offered ? 1 : 0,
+             rr_denial_reason());
+}
+
 static NgxResult fill_capabilities(void* parameters)
 {
     if (g.nativeD3d12Only)
@@ -1052,6 +1066,12 @@ static NgxResult fill_capabilities(void* parameters)
         d4r_ngx_set_int(parameters, "SuperSamplingDenoising.Available", rr ? 1 : 0);
         d4r_ngx_set_int(parameters, "SuperSamplingDenoising.FeatureInitResult", rr ? NGX_SUCCESS : NGX_FAIL_FEATURE_NOT_SUPPORTED);
         d4r_ngx_set_int(parameters, "SuperSamplingDenoising.NeedsUpdatedDriver", 0);
+        // as the core reports them for a supported GPU (the SDK's helpers and engine plugins read them beside Available)
+        d4r_ngx_set_uint(parameters, "SuperSamplingDenoising.MinDriverVersionMajor", 0);
+        d4r_ngx_set_uint(parameters, "SuperSamplingDenoising.MinDriverVersionMinor", 0);
+        d4r_ngx_set_uint(parameters, "SuperSampling.MinDriverVersionMajor", 0);
+        d4r_ngx_set_uint(parameters, "SuperSampling.MinDriverVersionMinor", 0);
+        note_rr_capability(rr, "native D3D12");
         d4r_ngx_set_void(parameters, "DLSSDOptimalSettingsCallback",
                          rr ? reinterpret_cast<void*>(&native_optimal_settings) : nullptr);
         d4r_ngx_set_void(parameters, "DLSSOptimalSettingsCallback", reinterpret_cast<void*>(&native_optimal_settings));
@@ -1156,6 +1176,11 @@ static NgxResult fill_capabilities(void* parameters)
                             static_cast<int>(NGX_FAIL_FEATURE_NOT_SUPPORTED));
             d4r_ngx_set_void(parameters, "DLSSDOptimalSettingsCallback", nullptr);
             d4r_ngx_set_void(parameters, "DLSSDGetStatsCallback", nullptr);
+        }
+        {
+            int offered = 0;
+            d4r_ngx_get_int(parameters, "SuperSamplingDenoising.Available", &offered);
+            note_rr_capability(offered != 0, g.nativeVulkan ? "native Vulkan" : "NGX core");
         }
         const DenoiserCapability capability = denoiser_capability();
         if (rr_backend() == RrBackend::Fsr)
@@ -1642,6 +1667,28 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
     }
     // NGX runs the preset of the feature's quality mode.
     feature->preset = presets[d4r_preset_slot(quality)];
+    // A GPU older than RDNA 3 on native Windows (g_engineGpuOff: no engine, no M/L packages) runs M and L on ZLUDA's
+    // translation of NVIDIA's kernels with emulated matrix math: an RX 6650 XT took 8-12 s a frame on L and then lost
+    // its device. Such a request runs K instead; D4R_ALLOW_SLOW_PRESETS=1 ([Env]) keeps it, for testing.
+    if (!rayReconstruction && g_engineGpuOff.load() && env_uint("D4R_ALLOW_SLOW_PRESETS", 0) == 0)
+    {
+        bool replaced = false;
+        for (unsigned int& preset : presets)
+            if (preset == 12 || preset == 13)
+            {
+                preset = 11;
+                replaced = true;
+            }
+        if (feature->preset == 12 || feature->preset == 13)
+        {
+            logf("DLSS model: preset %c is not supported on this GPU (older than RDNA 3: its M and L run on translated "
+                 "kernels at seconds per frame and can crash the game); the feature runs K. "
+                 "D4R_ALLOW_SLOW_PRESETS=1 keeps %c", feature->preset == 12 ? 'L' : 'M', feature->preset == 12 ? 'L' : 'M');
+            feature->preset = 11;
+        }
+        else if (replaced)
+            logf("DLSS model: presets L/M in the other quality modes run K on this GPU (older than RDNA 3)");
+    }
     // the preset the engine's model slot runs (rr_engine_slot: F for every hint but D and E when F is installed)
     if (rayReconstruction && nativeVulkan)
     {
@@ -1719,6 +1766,26 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
     logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u%s): %ux%u -> %ux%u quality=%d flags=0x%x subrects=%d preset=%u",
          featureId, rayReconstruction ? ", Ray Reconstruction" : "", feature->width, feature->height,
          feature->outWidth, feature->outHeight, quality, flags, subrects, feature->preset);
+    if (rayReconstruction)
+        g_rrCreated = true;
+    else if (!g_rrCreated.load() && ray_reconstruction_available())
+    {
+        // Once per process: the game chose Super Resolution while Ray Reconstruction is installed. The choice is the
+        // game's (its RR setting, and on Unreal Engine r.NGX.DLSS.DenoiserMode) or OptiScaler's, which can answer the
+        // capability query itself; this says which, so a missing RR is not a silent no-op.
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true))
+        {
+            const unsigned queries = g_rrCapabilityQueries.load();
+            const int answer = g_rrCapabilityAnswer.load();
+            logf("Ray Reconstruction: installed and available, but the game created Super Resolution; %s",
+                 queries == 0 ? "no caller asked this DLL for its capabilities, so the game's RR availability came from "
+                                "elsewhere (OptiScaler's own answer: check its log for DLSSD / SuperSamplingDenoising)"
+                 : answer == 1 ? "RR was reported available (SuperSamplingDenoising.Available=1), so the game or "
+                                 "OptiScaler chose not to use it (enable RR in the game; UE: r.NGX.DLSS.DenoiserMode=1)"
+                               : "RR was last reported unavailable to the caller (see the capability line above)");
+        }
+    }
 
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());

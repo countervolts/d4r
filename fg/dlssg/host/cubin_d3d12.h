@@ -46,6 +46,11 @@ struct FgScope {
 // Before nvngx_dlssg.dll creates a frame generation feature: its buffers start a pointer heap of their own (the DXIL
 // route then finds all of one launch's buffers in one heap while the previous feature is still alive)
 void newFeature();
+// Test captures: keep the state each resource was last transitioned to on a hooked command list (off by default; needs
+// the list hooks), so a copy out of a game resource names its real StateBefore instead of a guess.
+void trackResourceStates(bool on);
+// The tracked D3D12_RESOURCE_STATES of an ID3D12Resource; false when no transition of it was seen.
+bool resourceState(void* resource, unsigned* state);
 // A one-line state summary for the host log
 std::string summary();
 } // namespace cux

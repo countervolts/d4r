@@ -199,6 +199,11 @@ foreach ($name in @('d3d12.dll', 'd3d12core.dll')) {
     }
 }
 if (!$proxyFound) { Ok 'no vkd3d/Wine d3d12.dll in the game folder' }
+# An _nvngx.dll beside the game's .exe (another DLSS mod, an NVIDIA install copy) is loaded instead of d4r's NGX core
+# and breaks DLSS (Palworld)
+if (Test-Path -LiteralPath (Join-Path $game '_nvngx.dll') -PathType Leaf) {
+    Bad '_nvngx.dll in the game folder (left by another DLSS mod?) is loaded instead of d4r''s; move it out'
+} else { Ok 'no stray _nvngx.dll in the game folder' }
 
 # --- d4r.ini ---------------------------------------------------------------------------------------
 $iniPath = Join-Path $d4r 'd4r.ini'

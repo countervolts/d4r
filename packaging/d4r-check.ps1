@@ -65,18 +65,17 @@ $dlssd = Join-Path $D4r 'nvngx_dlssd.dll'
 if (Test-Path -LiteralPath $dlssd) { Ok "d4r\nvngx_dlssd.dll (DLSS Ray Reconstruction $(FileVersion $dlssd))" }
 else { Bad 'd4r\nvngx_dlssd.dll (Ray Reconstruction; run install.cmd)' }
 Present 'd4r\ngx\_nvngx.dll' 'd4r\ngx\_nvngx.dll (NVIDIA NGX runtime)' 'run install.cmd'
-
-# The engine's models, which install.cmd builds
-$engine = Join-Path $D4r 'engine'
-$models = @('rr-d', 'rr-e', 'rr-f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
-$have = @($models | Where-Object { Test-Path -LiteralPath (Join-Path $engine $_) })
-if ($have.Count -eq $models.Count) { Ok "engine models: $($have -join ', ')" }
-elseif ($have.Count) {
-    Bad "engine models: only $($have -join ', ') (run install.cmd -EngineOnly; the rest run on ZLUDA, much slower)"
-} else { Bad 'engine models in d4r\engine (run install.cmd -EngineOnly; until then DLSS runs on ZLUDA, much slower)' }
+# An _nvngx.dll beside the game's .exe (left by another DLSS mod or an NVIDIA install copy) is loaded instead of d4r's
+# NGX core and breaks DLSS (Palworld)
+$stray = Join-Path $Game '_nvngx.dll'
+if (Test-Path -LiteralPath $stray) {
+    $version = (Get-Item -LiteralPath $stray).VersionInfo.FileVersion
+    Misconfigured "stray _nvngx.dll in the game folder$(if ($version) { " ($version)" }): move it out; d4r uses d4r\ngx\_nvngx.dll"
+} else { Ok 'no stray _nvngx.dll in the game folder' }
 
 # The CUDA path (ZLUDA) for what the engine does not cover runs on HIP, which AMD's driver installs
 $hip = Join-Path $env:SystemRoot 'System32\amdhip64_7.dll'
+$script:gpuArchs = @()
 if (Test-Path -LiteralPath $hip) { Ok "AMD HIP runtime ($hip, $((Get-Item -LiteralPath $hip).VersionInfo.FileVersion))" }
 else { Bad 'AMD HIP runtime (amdhip64_7.dll): install AMD''s current Adrenalin driver' }
 if (Test-Path -LiteralPath $hip) {
@@ -92,12 +91,39 @@ if (Test-Path -LiteralPath $hip) {
             if ([D4r.Hip]::hipGetDevicePropertiesR0600($props, $i) -ne 0) { continue }
             $name = [Text.Encoding]::ASCII.GetString($props, 0, 256).Split([char]0)[0]
             $arch = [Text.Encoding]::ASCII.GetString($props, 1160, 256).Split([char]0)[0].Split(':')[0]
+            $script:gpuArchs += $arch
             # RDNA4 also has <target>-fp8, which d4r.ini's [Kernels] NativeFp8 (on by default) selects
             $folders = @("kernels\$arch", "kernels\$arch-fp8") | Where-Object { Test-Path -LiteralPath (Join-Path $D4r $_) }
             if ($folders) { Ok "GPU $name ($arch): native kernels for the CUDA path present ($($folders -join ', '))" }
             else { Note "GPU $name ($arch): no native kernels for it in this release (the CUDA path runs, slower)" }
         }
     } else { Note 'HIP lists no GPU' }
+}
+# RDNA2 (gfx103x): the native engine needs RDNA 3 or later, so no models are built and DLSS runs on ZLUDA
+$rdna2Only = $script:gpuArchs.Count -gt 0 -and -not ($script:gpuArchs | Where-Object { $_ -notlike 'gfx103*' })
+
+# The engine's models, which install.cmd builds
+$engine = Join-Path $D4r 'engine'
+$models = @('rr-d', 'rr-e', 'rr-f', 'k', 'k-ldr', 'm', 'm-ldr', 'l', 'l-ldr')
+$have = @($models | Where-Object { Test-Path -LiteralPath (Join-Path $engine $_) })
+if ($rdna2Only) { Ok 'engine models: none needed (RDNA2 runs DLSS through ZLUDA and the native kernels)' }
+elseif ($have.Count -eq $models.Count) { Ok "engine models: $($have -join ', ')" }
+elseif ($have.Count) {
+    Bad "engine models: only $($have -join ', ') (run install.cmd -EngineOnly; the rest run on ZLUDA, much slower)"
+} else { Bad 'engine models in d4r\engine (run install.cmd -EngineOnly; until then DLSS runs on ZLUDA, much slower)' }
+
+# d4r.ini [DLSS] Model on RDNA2: M and L would run on translated kernels at seconds per frame; d4r runs K instead
+$d4rIni = Join-Path $D4r 'd4r.ini'
+if ($rdna2Only -and (Test-Path -LiteralPath $d4rIni)) {
+    $section = ''; $model = ''
+    foreach ($line in Get-Content -LiteralPath $d4rIni) {
+        $line = ($line -replace '[;#].*$', '').Trim()
+        if ($line.StartsWith('[')) { $section = $line; continue }
+        if ($section -ieq '[DLSS]' -and $line -match '^(?i)Model\s*=\s*(.*)$') { $model = $Matches[1].Trim().ToUpperInvariant() }
+    }
+    if ($model -in @('M', 'L', '12', '13', 'DLSS4.5')) {
+        Misconfigured "d4r.ini [DLSS] Model = $model is not supported on RDNA2 (seconds per frame, then a crash); d4r runs K instead. Set Model = K"
+    }
 }
 
 if ($script:problems -eq 0) {

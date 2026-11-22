@@ -52,6 +52,9 @@ Settings
 --------
 Edit d4r\d4r.ini (it is commented) and restart the game. Each game has its own copy.
 - Model: E (preset 5), K (11, DLSS 4), L (12) or M (13, DLSS 4.5). E and L set NGX hints only; the standalone engine and L texture kernels are not integrated. Select quality mode in the game.
+  Pair the model with the quality mode: K for DLAA, Quality and Balanced; M for Performance; L for
+  Ultra Performance (especially at 4K). Other pairings work but cost more for little gain. RDNA2
+  (RX 6000) runs K only: M and L there run K instead, since they take seconds per frame on that GPU.
 - Kernels/NativeFp8: experimental RDNA4 setting. Requires a matching gfx12 native-FP8 M bundle; keep false with the standard FP16 release. Token-lane and hardware-pack builds remain unvalidated on GPU.
 - AsyncInterop, ValidateOutput, Log: for testing and bug reports; the defaults are the tested setting.
 - RayReconstruction/Backend: off by default. native selects experimental native D3D12/Vulkan RR;

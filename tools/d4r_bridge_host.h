@@ -87,7 +87,12 @@ static char* realpath(const char* path, char* resolved) { return _fullpath(resol
 static int symlink(const char* target, const char* path)
 {
     if (CopyFileA(target, path, TRUE))
+    {
+        /* a copy keeps a read-only source's attribute, and _unlink refuses read-only files: the per-process
+           directory could then never be removed */
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
         return 0;
+    }
     errno = GetLastError() == ERROR_FILE_EXISTS ? EEXIST : EIO;
     return -1;
 }

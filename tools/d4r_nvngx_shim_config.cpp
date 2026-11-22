@@ -245,6 +245,26 @@ void load_portable_config()
         char path[MAX_PATH * 3] = {};
         WideCharToMultiByte(CP_ACP, 0, (zludaDir + L"\\nvcuda.dll").c_str(), -1, path, sizeof(path), nullptr, nullptr);
         portable_set_unix("D4R_ZLUDA_LIBCUDA", path);
+        // The bridge serves native kernels from a per-process folder under this cache root. Windows has no
+        // XDG_CACHE_HOME or HOME, so without it the bridge had no root and dropped every native kernel silently
+        // (RDNA2: K fully translated, about 77 ms a frame). [Paths] CacheDir, else %LOCALAPPDATA%\d4r.
+        const std::string cache = ini_value(ini, "paths", "CacheDir");
+        std::wstring cacheDir;
+        if (!cache.empty())
+            cacheDir = portable_path(cache);
+        else
+        {
+            wchar_t local[MAX_PATH] = {};
+            const DWORD localLength = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+            cacheDir = localLength > 0 && localLength < MAX_PATH ? std::wstring(local) + L"\\d4r" : dir + L"\\cache";
+        }
+        char cachePath[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_ACP, 0, cacheDir.c_str(), -1, cachePath, sizeof(cachePath), nullptr, nullptr);
+        portable_set_unix("D4R_ZLUDA_CACHE_HOME", cachePath);
+        // An explicit CacheDir also moves ZLUDA's compiled-kernel database (patch 0012's ZLUDA_CACHE_DIR, absolute);
+        // auto keeps ZLUDA's own %LOCALAPPDATA%\zluda\ComputeCache, so existing installs do not recompile.
+        if (!cache.empty())
+            portable_set(L"ZLUDA_CACHE_DIR", cacheDir + L"\\zluda");
     }
     else
     {
