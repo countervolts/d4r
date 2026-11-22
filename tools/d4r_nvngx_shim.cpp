@@ -61,7 +61,9 @@
 //                       or AMD's FSR Ray Regeneration 1.2 followed by Super Sampling (fsr; see
 //                       d4r_fsr_rr_backend.inl). D4R_FSR_RR_DLL: the AMD denoiser DLL (default:
 //                       amd_fidelityfx_denoiser_dx12.dll in the d4r folder).
-//   D4R_RR_PRESET        Force the Ray Reconstruction render preset
+//   D4R_RR_SWITCHABLE=1  Prepare both backends at NGX init; D4R_RR_BACKEND is read again at every
+//                       feature creation, so a host can switch between them while the game runs.
+//   D4R_RR_PRESET       Force the Ray Reconstruction render preset
 //                       (NVSDK_NGX_RayReconstruction_Hint_Render_Preset: 4 = D, 5 = E, 6 = F).
 //                       Independent of D4R_DLSS_PRESET, which only affects Super Sampling.
 
@@ -886,7 +888,19 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     // anything; this only looks for the library and checks it is a build that can serve
     // Ray Reconstruction. Its own NVSDK_NGX_CUDA_Init is a stub that always fails, so
     // calling it would report "unavailable" for a denoiser that is in fact working.
-    if (rr_enabled() && rr_backend() == RrBackend::Fsr)
+    // D4R_RR_SWITCHABLE=1 (set by a host that switches the backend while the game runs, e.g. m4r's OptiScaler menu
+    // through D4R_RR_BACKEND before it recreates the feature): both backends are prepared now, since each one's
+    // runtime is only looked for here.
+    const bool rrSwitchable = env_string("D4R_RR_SWITCHABLE") == "1";
+    if (rr_enabled() && rrSwitchable)
+    {
+        if (result == NGX_SUCCESS)
+            fsr_rr_prepare_runtime();
+        load_denoiser_library();
+        logf("Ray Reconstruction: switchable backends, now %s: %s", rr_backend() == RrBackend::Fsr ? "fsr" : "dlss",
+             rr_denial_reason());
+    }
+    else if (rr_enabled() && rr_backend() == RrBackend::Fsr)
     {
         // nvngx_dlssd.dll plays no part: the denoiser is AMD's, then Super Sampling upscales.
         if (result == NGX_SUCCESS)

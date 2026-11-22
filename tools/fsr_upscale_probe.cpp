@@ -13,6 +13,8 @@
 #include "d4r_fsr_rr.h"
 #include "d4r_fsr_rr_identity.h"
 #include <algorithm>
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -156,6 +158,41 @@ void readback(ID3D12GraphicsCommandList *list, Texture &texture, ID3D12Resource 
 
 } // namespace
 
+// m4r capture replay (env D4R_FSR_PROBE_CAPTURE=<dir>, D4R_FSR_PROBE_FIRST=<id>, D4R_FSR_PROBE_COUNT=<n>, cycled): frames
+// recorded by m4r's M4R_DUMP_RR (rr-N.txt + rr-N-<name>.raw); colour must be RGBA16F (format 97), depth R32F, motion RG16F (UV,
+// scaled by mvscale), an optional R32G32 exposure (x = exposure). The last 6 outputs are written as out-NNN.rgba16f.
+struct CapFrame { std::string dir; uint32_t id = 0; float jx = 0, jy = 0, msx = 1, msy = 1, pre = 1; int rev = 0; bool exposure = false; };
+static bool cap_read(const std::string& dir, uint32_t id, CapFrame& m, uint32_t& rw, uint32_t& rh, uint32_t& ow, uint32_t& oh)
+{
+    FILE* f = fopen((dir + "/rr-" + std::to_string(id) + ".txt").c_str(), "r");
+    if (!f) return false;
+    char line[512];
+    m.dir = dir; m.id = id;
+    while (fgets(line, sizeof line, f))
+    {
+        unsigned a, b; float x, y; int i; char name[64];
+        if (sscanf(line, "content %u %u", &a, &b) == 2) { rw = a; rh = b; }
+        else if (sscanf(line, "output %u %u", &a, &b) == 2) { ow = a; oh = b; }
+        else if (sscanf(line, "jitter %f %f", &x, &y) == 2) { m.jx = x; m.jy = y; }
+        else if (sscanf(line, "mvscale %f %f", &x, &y) == 2) { m.msx = x; m.msy = y; }
+        else if (sscanf(line, "preexposure %f", &x) == 1) m.pre = x > 0 ? x : 1;
+        else if (sscanf(line, "depth_reversed %d", &i) == 1) m.rev = i;
+        else if (sscanf(line, "image %63s format", name) == 1 && std::string(name) == "exposure") m.exposure = true;
+    }
+    fclose(f);
+    return true;
+}
+static std::vector<uint8_t> cap_plane(const CapFrame& m, const char* name)
+{
+    std::vector<uint8_t> v;
+    FILE* f = fopen((m.dir + "/rr-" + std::to_string(m.id) + "-" + name + ".raw").c_str(), "rb");
+    if (!f) return v;
+    fseek(f, 0, SEEK_END); v.resize(ftell(f)); fseek(f, 0, SEEK_SET);
+    if (fread(v.data(), 1, v.size(), f) != v.size()) v.clear();
+    fclose(f);
+    return v;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     if (argc < 3)
@@ -167,6 +204,15 @@ int wmain(int argc, wchar_t **argv)
     uint32_t rw = argc > 3 ? wcstoul(argv[3], 0, 10) : 1920, rh = argc > 4 ? wcstoul(argv[4], 0, 10) : 1080;
     uint32_t ow = argc > 5 ? wcstoul(argv[5], 0, 10) : 3840, oh = argc > 6 ? wcstoul(argv[6], 0, 10) : 2160;
     int frames = argc > 7 ? wcstol(argv[7], 0, 10) : 140;
+    const char* capDir = getenv("D4R_FSR_PROBE_CAPTURE");
+    const uint32_t capFirst = getenv("D4R_FSR_PROBE_FIRST") ? strtoul(getenv("D4R_FSR_PROBE_FIRST"), 0, 10) : 0;
+    const uint32_t capCount = getenv("D4R_FSR_PROBE_COUNT") ? strtoul(getenv("D4R_FSR_PROBE_COUNT"), 0, 10) : 6;
+    CapFrame cap0;
+    if (capDir && !cap_read(capDir, capFirst, cap0, rw, rh, ow, oh))
+    {
+        printf("capture: cannot read %s/rr-%u.txt\n", capDir, capFirst);
+        return 2;
+    }
     if (!rw || !rh || !ow || !oh || frames < 0)
         return 2;
     std::string out = narrow(argv[2]);
@@ -223,7 +269,9 @@ int wmain(int argc, wchar_t **argv)
         return 0;
     ffxCreateContextDescUpscale create = {};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
+                   (capDir && cap0.exposure ? 0u : (uint32_t)FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) |
+                   (capDir && cap0.rev ? (uint32_t)(FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_DEPTH_INFINITE) : 0u);
     create.maxRenderSize = {rw, rh};
     create.maxUpscaleSize = {ow, oh};
     create.fpMessage = ffx_message;
@@ -280,7 +328,9 @@ int wmain(int argc, wchar_t **argv)
         fence->SetEventOnCompletion(seq, event);
         WaitForSingleObject(event, INFINITE);
     };
-    Texture color, depth, motion, output;
+    Texture color, depth, motion, output, expo;
+    if (capDir && cap0.exposure && !make_texture(expo, 1, 1, DXGI_FORMAT_R32G32_FLOAT, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+        return 10;
     auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (!make_texture(color, rw, rh, DXGI_FORMAT_R16G16B16A16_FLOAT, false, read) ||
         !make_texture(depth, rw, rh, DXGI_FORMAT_R32_FLOAT, false, read) ||
@@ -329,6 +379,28 @@ int wmain(int argc, wchar_t **argv)
     {
         alloc->Reset();
         cmd->Reset(alloc, nullptr);
+        CapFrame cf = cap0;
+        if (capDir)
+        {
+            uint32_t a, b, c2, d2;
+            cap_read(capDir, capFirst + (uint32_t)f % std::max(1u, capCount), cf, a, b, c2, d2);
+            const std::vector<uint8_t> pc = cap_plane(cf, "color"), pd = cap_plane(cf, "depth"), pm = cap_plane(cf, "motion");
+            if (pc.size() < (size_t)rw * rh * 8 || pd.size() < (size_t)rw * rh * 4 || pm.size() < (size_t)rw * rh * 4)
+            {
+                printf("capture: frame %u planes missing or not RGBA16F/R32F/RG16F\n", cf.id);
+                return 2;
+            }
+            UINT64 at2 = 0;
+            upload(cmd, color, stage, sp, at2, pc.data(), 8);
+            upload(cmd, depth, stage, sp, at2, pd.data(), 4);
+            upload(cmd, motion, stage, sp, at2, pm.data(), 4);
+            barrier(cmd, color, read); barrier(cmd, depth, read); barrier(cmd, motion, read);
+            if (cf.exposure)
+            {
+                const std::vector<uint8_t> pe = cap_plane(cf, "exposure");
+                if (pe.size() >= 8) { upload(cmd, expo, stage, sp, at2, pe.data(), 8); barrier(cmd, expo, read); }
+            }
+        }
         barrier(cmd, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ffxDispatchDescUpscale d = {};
         d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -343,10 +415,18 @@ int wmain(int argc, wchar_t **argv)
                                   FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         d.jitterOffset = {jitter[f % 4][0], jitter[f % 4][1]};
         d.motionVectorScale = {(float)rw, (float)rh};
+        if (capDir)
+        {
+            d.jitterOffset = {cf.jx, cf.jy};
+            d.motionVectorScale = {cf.msx, cf.msy};
+            d.preExposure = cf.pre;
+            if (cf.exposure)
+                d.exposure = fsr_rr_texture(expo.resource, expo.desc, FFX_API_SURFACE_FORMAT_R32G32_FLOAT, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        }
         d.renderSize = {rw, rh};
         d.upscaleSize = {ow, oh};
         d.frameTimeDelta = 16.6667f;
-        d.preExposure = 1;
+        if (!capDir) d.preExposure = 1;
         d.reset = f == 0;
         d.cameraNear = .1f;
         d.cameraFar = 1000;
@@ -361,14 +441,24 @@ int wmain(int argc, wchar_t **argv)
         }
         cmd->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
         cmd->ResolveQueryData(queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, trb, 0);
-        if (f == frames - 1)
+        const bool keep = capDir && f + 6 >= frames;
+        if (f == frames - 1 || keep)
             readback(cmd, output, rb, 0);
         submit();
+        if (keep)
+        {
+            char nm[64]; snprintf(nm, sizeof nm, "/out-%03d.rgba16f", f);
+            if (FILE* o = fopen((out + nm).c_str(), "wb"))
+            {
+                for (uint32_t y = 0; y < oh; ++y) fwrite(rp + y * output.footprint.Footprint.RowPitch, 8, ow, o);
+                fclose(o);
+            }
+        }
         UINT64 t[2];
         memcpy(t, tp, 16);
         double us = double(t[1] - t[0]) * 1e6 / hz;
         printf("frame=%d gpu_us=%.3f\n", f, us);
-        if (f >= 40)
+        if (f >= (capDir ? 6 : 40))
             times.push_back(us);
     }
     FILE *raw = fopen((out + "/output.rgba16f").c_str(), "wb");

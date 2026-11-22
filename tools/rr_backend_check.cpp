@@ -22,6 +22,11 @@
 #include <dxgi1_4.h>
 
 #include <algorithm>
+#include <array>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <sstream>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -312,6 +317,72 @@ void write_ppm(const std::string& path, uint32_t width, uint32_t height, const s
     std::fclose(file);
 }
 
+// m4r capture replay (--capture DIR): frames recorded by m4r's M4R_DUMP_RR (rr-N.txt + rr-N-<name>.raw, tightly packed planes
+// in the game's own formats) fed to the backend instead of the synthetic scene; every output is written as out-NNN.rgba16f.
+struct CaptureMeta
+{
+    std::map<std::string, std::array<uint32_t, 4>> images; // name -> {vk format, width, height, bytes per texel}
+    uint32_t ow = 0, oh = 0, cw = 0, ch = 0;
+    float jitter[2] = {}, mvScale[2] = {1, 1}, preExposure = 1;
+    int reset = 0, depthReversed = 0, hardwareDepth = 1, roughnessInNormalsW = 0;
+    float worldToView[16] = {}, viewToClip[16] = {};
+    bool ok = false;
+};
+CaptureMeta read_capture_meta(const std::string& path)
+{
+    CaptureMeta m;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line))
+    {
+        std::istringstream s(line);
+        std::string key;
+        s >> key;
+        if (key == "image")
+        {
+            std::string name, w1, w2, w3;
+            uint32_t fmt = 0, w = 0, h = 0, bpp = 0;
+            s >> name >> w1 >> fmt >> w2 >> w >> h >> w3 >> bpp;
+            m.images[name] = {fmt, w, h, bpp};
+        }
+        else if (key == "output") s >> m.ow >> m.oh;
+        else if (key == "content") s >> m.cw >> m.ch;
+        else if (key == "jitter") s >> m.jitter[0] >> m.jitter[1];
+        else if (key == "mvscale") s >> m.mvScale[0] >> m.mvScale[1];
+        else if (key == "preexposure") s >> m.preExposure;
+        else if (key == "reset") s >> m.reset;
+        else if (key == "depth_reversed") s >> m.depthReversed;
+        else if (key == "hardware_depth") s >> m.hardwareDepth;
+        else if (key == "roughness_in_normals_w") s >> m.roughnessInNormalsW;
+        else if (key == "world_to_view") for (float& v : m.worldToView) s >> v;
+        else if (key == "view_to_clip") for (float& v : m.viewToClip) s >> v;
+    }
+    m.ok = m.ow && m.cw && m.images.count("color");
+    return m;
+}
+std::vector<uint8_t> read_all(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+DXGI_FORMAT dxgi_of_vk(uint32_t vk)
+{
+    switch (vk)
+    {
+    case 122: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case 97: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 109: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case 126: case 100: return DXGI_FORMAT_R32_FLOAT;
+    case 76: return DXGI_FORMAT_R16_FLOAT;
+    case 83: return DXGI_FORMAT_R16G16_FLOAT;
+    case 37: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 38: return DXGI_FORMAT_R8G8B8A8_SNORM;
+    case 64: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case 103: return DXGI_FORMAT_R32G32_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -325,6 +396,8 @@ int main(int argc, char** argv)
     const std::string outDir = argv[2];
     UINT rw = 960, rh = 540, ow = 1920, oh = 1080, frames = 48, featureId = 13;
     bool hwDepth = false, separateRoughness = false, specularHit = false, diffuseHit = false, separateEvalParams = false, measureAll = false;
+    std::string captureDir;
+    UINT captureFirst = 0, captureCount = 6;
     for (int i = 3; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -350,6 +423,25 @@ int main(int argc, char** argv)
             fsr_scene::g_water = true;
         else if (arg == "--measure-all")
             measureAll = true;
+        else if (arg == "--capture" && i + 1 < argc)
+            captureDir = argv[++i];
+        else if (arg == "--first" && i + 1 < argc)
+            captureFirst = static_cast<UINT>(std::atoi(argv[++i]));
+        else if (arg == "--count" && i + 1 < argc)
+            captureCount = static_cast<UINT>(std::atoi(argv[++i]));
+    }
+    CaptureMeta capMeta;
+    if (!captureDir.empty())
+    {
+        capMeta = read_capture_meta(format("%s\\rr-%u.txt", captureDir.c_str(), captureFirst));
+        if (!capMeta.ok)
+        {
+            std::printf("capture: cannot read %s\\rr-%u.txt\n", captureDir.c_str(), captureFirst);
+            return 2;
+        }
+        rw = capMeta.cw; rh = capMeta.ch; ow = capMeta.ow; oh = capMeta.oh;
+        hwDepth = capMeta.hardwareDepth != 0;
+        separateRoughness = !capMeta.roughnessInNormalsW;
     }
     const bool rr = featureId == 13;
     CreateDirectoryA(outDir.c_str(), nullptr);
@@ -482,6 +574,28 @@ int main(int argc, char** argv)
         return finish(1);
     }
 
+    ID3D12Resource* exposureTex = nullptr;
+    if (capMeta.ok)
+    {
+        auto fmt = [&](const char* n, DXGI_FORMAT dflt) {
+            auto it = capMeta.images.find(n);
+            return it == capMeta.images.end() ? dflt : dxgi_of_vk(it->second[0]);
+        };
+        color = create_texture(rw, rh, fmt("color", DXGI_FORMAT_R16G16B16A16_FLOAT), D3D12_RESOURCE_FLAG_NONE, srv);
+        normals = create_texture(rw, rh, fmt("normals", DXGI_FORMAT_R16G16B16A16_FLOAT), D3D12_RESOURCE_FLAG_NONE, srv);
+        diffuse = create_texture(rw, rh, fmt("diffuse_albedo", DXGI_FORMAT_R8G8B8A8_UNORM), D3D12_RESOURCE_FLAG_NONE, srv);
+        specular = create_texture(rw, rh, fmt("specular_albedo", DXGI_FORMAT_R8G8B8A8_UNORM), D3D12_RESOURCE_FLAG_NONE, srv);
+        motion = create_texture(rw, rh, fmt("motion", DXGI_FORMAT_R16G16_FLOAT), D3D12_RESOURCE_FLAG_NONE, srv);
+        depth = create_texture(rw, rh, fmt("depth", DXGI_FORMAT_R32_FLOAT), D3D12_RESOURCE_FLAG_NONE, srv);
+        if (capMeta.images.count("exposure"))
+            exposureTex = create_texture(1, 1, fmt("exposure", DXGI_FORMAT_R32G32_FLOAT), D3D12_RESOURCE_FLAG_NONE, srv);
+        if (!color || !normals || !diffuse || !specular || !motion || !depth)
+        {
+            check("resources", false, "capture texture creation (format)");
+            return finish(1);
+        }
+    }
+
     void* parameters = nullptr;
     allocate(&parameters);
     d4r_ngx_set_uint(parameters, "Width", rw);
@@ -489,7 +603,9 @@ int main(int argc, char** argv)
     d4r_ngx_set_uint(parameters, "OutWidth", ow);
     d4r_ngx_set_uint(parameters, "OutHeight", oh);
     d4r_ngx_set_int(parameters, "PerfQualityValue", 2);
-    d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", 1 | 2); // HDR | MVLowRes
+    // HDR | MVLowRes (+ DepthInverted for a reversed-depth capture, AutoExposure when it has no exposure texture)
+    d4r_ngx_set_int(parameters, "DLSS.Feature.Create.Flags", 1 | 2 | (capMeta.ok && capMeta.depthReversed ? 8 : 0) |
+                                                             (capMeta.ok && !capMeta.images.count("exposure") ? 64 : 0));
     if (rr)
     {
         d4r_ngx_set_int(parameters, "DLSS.Denoise.Mode", 1);
@@ -528,6 +644,89 @@ int main(int argc, char** argv)
     std::vector<float> view(16), clip(16);
     for (uint32_t f = 0; f < frames; ++f)
     {
+        if (capMeta.ok)
+        {
+            const UINT id = captureFirst + f % std::max(1u, captureCount);
+            const CaptureMeta m = read_capture_meta(format("%s\\rr-%u.txt", captureDir.c_str(), id));
+            uploader.offset = 0;
+            auto up = [&](ID3D12Resource* t, const char* name) {
+                auto it = m.images.find(name);
+                if (it == m.images.end() || it->second[3] == 0)
+                    return false;
+                const std::vector<uint8_t> data = read_all(format("%s\\rr-%u-%s.raw", captureDir.c_str(), id, name));
+                const auto& im = it->second;
+                if (data.size() < size_t(im[1]) * im[2] * im[3])
+                    return false;
+                uploader.upload(t, im[1], im[2], dxgi_of_vk(im[0]), data.data(), im[3], srv);
+                return true;
+            };
+            const bool got = up(color, "color") && up(depth, "depth") && up(motion, "motion") &&
+                             (!rr || (up(normals, "normals") && up(diffuse, "diffuse_albedo") && up(specular, "specular_albedo")));
+            if (!got)
+            {
+                check("capture", false, format("frame %u: missing or short planes", id));
+                return finish(1);
+            }
+            if (exposureTex)
+                up(exposureTex, "exposure");
+            d4r_ngx_set_d3d12_resource(parameters, "Color", color);
+            d4r_ngx_set_d3d12_resource(parameters, "Depth", depth);
+            d4r_ngx_set_d3d12_resource(parameters, "MotionVectors", motion);
+            d4r_ngx_set_d3d12_resource(parameters, "Output", output);
+            if (exposureTex)
+                d4r_ngx_set_d3d12_resource(parameters, "ExposureTexture", exposureTex);
+            d4r_ngx_set_float(parameters, "DLSS.Pre.Exposure", m.preExposure > 0 ? m.preExposure : 1.0f);
+            d4r_ngx_set_float(parameters, "Jitter.Offset.X", m.jitter[0]);
+            d4r_ngx_set_float(parameters, "Jitter.Offset.Y", m.jitter[1]);
+            d4r_ngx_set_float(parameters, "MV.Scale.X", m.mvScale[0]);
+            d4r_ngx_set_float(parameters, "MV.Scale.Y", m.mvScale[1]);
+            d4r_ngx_set_int(parameters, "Reset", f == 0 ? 1 : 0);
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", rw);
+            d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", rh);
+            if (rr)
+            {
+                d4r_ngx_set_d3d12_resource(parameters, "GBuffer.Normals", normals);
+                d4r_ngx_set_d3d12_resource(parameters, "GBuffer.Roughness", nullptr);
+                d4r_ngx_set_d3d12_resource(parameters, "GBuffer.DiffuseAlbedo", diffuse);
+                d4r_ngx_set_d3d12_resource(parameters, "GBuffer.SpecularAlbedo", specular);
+                d4r_ngx_set_d3d12_resource(parameters, "DLSSD.SpecularHitDistance", nullptr);
+                d4r_ngx_set_d3d12_resource(parameters, "DLSSD.DiffuseHitDistance", nullptr);
+                std::memcpy(view.data(), m.worldToView, 64);
+                std::memcpy(clip.data(), m.viewToClip, 64);
+                d4r_ngx_set_void(parameters, "WorldToViewMatrix", view.data());
+                d4r_ngx_set_void(parameters, "ViewToClipMatrix", clip.data());
+            }
+            const auto start = std::chrono::steady_clock::now();
+            const NgxResult evaluated = evaluate(g_list, feature, parameters, nullptr);
+            transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = {};
+            dst.pResource = readback;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = outputFootprint;
+            D3D12_TEXTURE_COPY_LOCATION src = {};
+            src.pResource = output;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            const bool submitted = submit_and_wait();
+            totalUs.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+            callUs.push_back(totalUs.back());
+            if (evaluated != NGX_SUCCESS || !submitted)
+            {
+                allEvaluated = false;
+                std::printf("frame %u: EvaluateFeature 0x%08x, submit %s\n", f, evaluated, submitted ? "ok" : "FAILED");
+                if (!submitted)
+                    break;
+            }
+            FILE* fo = std::fopen(format("%s\\out-%03u.rgba16f", outDir.c_str(), f).c_str(), "wb");
+            if (fo)
+            {
+                for (UINT y = 0; y < oh; ++y)
+                    std::fwrite(readMapped + outputFootprint.Offset + y * outputFootprint.Footprint.RowPitch, 1, size_t(ow) * 8, fo);
+                std::fclose(fo);
+            }
+            continue;
+        }
         const Camera camera = camera_at(f);
         const bool reset = f == 0 || f == cutFrame;
         const uint32_t phase = f % 16 + 1;
