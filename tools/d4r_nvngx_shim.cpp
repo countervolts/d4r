@@ -68,6 +68,9 @@
 //                       Independent of D4R_DLSS_PRESET, which only affects Super Sampling.
 
 #include "d4r_nvngx_shim_internal.h"
+#include "optiscaler_plugin.h"
+
+bool d4r_plugin_rr_fallback();
 
 // --- logging -----------------------------------------------------------------
 
@@ -748,6 +751,15 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         g.nativeD3d12Only = g.ngxInitialized = true;
         logf("native D3D12 initialized on game device %p; K HDR=%d LDR=%d, M HDR=%d LDR=%d, L HDR=%d LDR=%d, RR D=%d E=%d F=%d; no CUDA/NGX runtime",
              device, hdr, ldr, presetML[0][0], presetML[0][1], presetML[1][0], presetML[1][1], native_engine_rr(4)!=nullptr, native_engine_rr(5)!=nullptr, native_engine_rr(6)!=nullptr);
+        // FSR RR (Backend = fsr, or D4R_RR_SWITCHABLE=1 from OptiScaler's denoiser switch): its runtime is only looked for
+        // here, and this route returns before the CUDA route's preparation below
+        if (rr_enabled() && (env_string("D4R_RR_SWITCHABLE") == "1" || rr_backend() == RrBackend::Fsr))
+        {
+            fsr_rr_prepare_runtime();
+            logf("Ray Reconstruction (native D3D12): %s, now %s: %s",
+                 env_string("D4R_RR_SWITCHABLE") == "1" ? "switchable backends" : "requested backend fsr",
+                 rr_backend() == RrBackend::Fsr ? "fsr" : "dlss", rr_denial_reason());
+        }
         return NGX_SUCCESS;
     }
     if (g_portable.active && !g.core)
@@ -1555,6 +1567,9 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
         logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unsupported", featureId);
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
     }
+    // The plugin's FSR RR choice that cannot start falls back to DLSS RR here (d4r_plugin_rr_fallback)
+    if (rayReconstruction && rr_enabled())
+        d4r_plugin_rr_fallback();
     if (rayReconstruction && rr_backend() == RrBackend::Dlss)
     {
         // A game may create feature 13 without ever asking for capabilities, so the core's
@@ -2904,6 +2919,130 @@ D4R_EXPORT void InitializeASI()
         else
             logf("InitializeASI: automatic setup could not start (%lu); extract the complete ASI archive", GetLastError());
     });
+}
+
+// --- OptiScaler plugin API (optiscaler_plugin.h, OptiScaler nightly-20261121 and later) ---------------------------
+// As an ASI in OptiScaler's plugins folder, d4r registers itself as the "d4r" upscaler (DLSS: K, M, L), the "d4r" ray
+// reconstruction upscaler and, when its DLSS-G host is installed, the "d4r" DLSS-G provider, all answered by this
+// module's NGX exports (the host's for DLSS-G). Its tab switches Ray Reconstruction between DLSS RR and FSR RR while
+// the game runs: D4R_RR_BACKEND is read at every feature creation, and D4R_RR_SWITCHABLE=1 prepares both backends at
+// NGX init. Older OptiScaler builds never call OptiPluginInit; NvngxPath keeps working as before.
+
+namespace
+{
+const OptiPluginApi* g_opti = nullptr;
+OptiPlugin* g_optiPlugin = nullptr;
+std::atomic<bool> g_rrFellBack {false};   // FSR RR was picked but did not start; d4r went back to DLSS RR
+
+std::wstring asi_directory()
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(g_selfModule, path, MAX_PATH))
+        return {};
+    std::wstring directory(path);
+    directory.resize(directory.find_last_of(L"\\/"));
+    return directory;
+}
+
+std::wstring dlssg_host_path() { return asi_directory() + L"\\d4r\\fg\\dlssg\\nvngx.dll_dlssg_host.dll"; }
+
+void* plugin_ngx_proc(void*, const char* name) { return reinterpret_cast<void*>(GetProcAddress(g_selfModule, name)); }
+
+// The DLSS-G host is loaded the first time OptiScaler asks for one of its functions (never under the loader lock:
+// OptiPluginInit may run inside OptiScaler's DllMain)
+void* plugin_dlssg_proc(void*, const char* name)
+{
+    static HMODULE host = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        host = LoadLibraryW(dlssg_host_path().c_str());
+        if (host == nullptr)
+            logf("OptiScaler plugin: the DLSS-G host %ls did not load (%lu)", dlssg_host_path().c_str(), GetLastError());
+    });
+    return host != nullptr ? reinterpret_cast<void*>(GetProcAddress(host, name)) : nullptr;
+}
+
+void plugin_log(OptiLogLevel level, const std::string& message)
+{
+    logf("OptiScaler plugin: %s", message.c_str());
+    if (g_opti != nullptr && g_opti->Log != nullptr)
+        g_opti->Log(g_optiPlugin, level, message.c_str());
+}
+
+void plugin_draw_tab(void*)
+{
+    const OptiPluginApi& api = *g_opti;
+    api.Section("Ray Reconstruction");
+    static const char* names[] = {"DLSS RR", "FSR RR"};
+    static const char* codes[] = {"dlss", "fsr"};
+    int32_t current = rr_backend() == RrBackend::Fsr ? 1 : 0;
+    if (api.Combo("Denoiser", &current, names, 2, nullptr) && current != (rr_backend() == RrBackend::Fsr ? 1 : 0))
+    {
+        g_rrFellBack = false;
+        SetEnvironmentVariableA("D4R_RR_BACKEND", codes[current]);
+        api.SetString(g_optiPlugin, "Denoiser", codes[current]);
+        plugin_log(OptiLog_Info, std::string("Ray Reconstruction denoiser: ") + codes[current]);
+        if (OPTI_API_HAS(&api, ReInitUpscalers))
+            api.ReInitUpscalers(g_optiPlugin);
+    }
+    api.ItemTooltip("Which denoiser d4r runs for the game's Ray Reconstruction.\n\n"
+                    "DLSS RR: NVIDIA's denoiser, which also upscales.\n"
+                    "FSR RR: AMD's FSR Ray Regeneration, then DLSS Super Resolution ([DLSS] Model in d4r.ini).\n"
+                    "Needs amd_fidelityfx_denoiser_dx12.dll in the d4r folder.\n\n"
+                    "Applies at once; Save INI keeps it ([Plugin.d4r] Denoiser).");
+    if (g_rrFellBack)
+        api.TextColored(1.0f, 0.75f, 0.2f, 1.0f, "FSR RR did not start, so d4r uses DLSS RR. See d4r_nvngx.log.");
+    else if (rr_backend() == RrBackend::Fsr && g.ngxInitialized && !fsr_rr_ready())
+        api.TextColored(1.0f, 0.75f, 0.2f, 1.0f, fsr_rr_denial_reason());
+
+    api.Section("About");
+    api.TextDisabled((std::string("d4r runtime ") + D4R_RUNTIME_BUILD_ID).c_str());
+}
+} // namespace
+
+// FSR RR picked with the plugin (D4R_RR_SWITCHABLE=1) but not ready: Ray Reconstruction goes back to DLSS RR instead
+// of failing every feature creation. Returns true when it fell back.
+bool d4r_plugin_rr_fallback()
+{
+    if (env_string("D4R_RR_SWITCHABLE") != "1" || rr_backend() != RrBackend::Fsr || fsr_rr_ready())
+        return false;
+    logf("Ray Reconstruction: FSR RR is not ready (%s); using DLSS RR", fsr_rr_denial_reason());
+    SetEnvironmentVariableA("D4R_RR_BACKEND", "dlss");
+    g_rrFellBack = true;
+    return true;
+}
+
+D4R_EXPORT bool OptiPluginInit(const OptiPluginApi* api, OptiPlugin* plugin)
+{
+    if (api == nullptr || api->RegisterTab == nullptr)
+        return false;
+    g_opti = api;
+    g_optiPlugin = plugin;
+
+    // Both RR backends are prepared at NGX init; the saved choice wins over d4r.ini (whose values only fill unset
+    // variables). Nothing here may load a library: OptiScaler can call this from its DllMain.
+    if (GetEnvironmentVariableA("D4R_RR_SWITCHABLE", nullptr, 0) == 0)
+        SetEnvironmentVariableA("D4R_RR_SWITCHABLE", "1");
+    char saved[16] = {};
+    api->GetString(plugin, "Denoiser", saved, sizeof(saved), "auto");
+    if (_stricmp(saved, "dlss") == 0 || _stricmp(saved, "fsr") == 0)
+        SetEnvironmentVariableA("D4R_RR_BACKEND", _stricmp(saved, "fsr") == 0 ? "fsr" : "dlss");
+
+    std::string registered;
+    if (OPTI_API_HAS(api, RegisterProvider))
+    {
+        if (api->RegisterProvider(plugin, "d4r", OptiProvider_Dlss, &plugin_ngx_proc, nullptr))
+            registered += " upscaler";
+        if (api->RegisterProvider(plugin, "d4r", OptiProvider_Dlssd, &plugin_ngx_proc, nullptr))
+            registered += " ray-reconstruction";
+        if (GetFileAttributesW(dlssg_host_path().c_str()) != INVALID_FILE_ATTRIBUTES &&
+            api->RegisterProvider(plugin, "d4r", OptiProvider_Dlssg, &plugin_dlssg_proc, nullptr))
+            registered += " dlss-g";
+    }
+    api->RegisterTab(plugin, "d4r", "DLSS on Radeon: Ray Reconstruction denoiser", &plugin_draw_tab, nullptr);
+    plugin_log(OptiLog_Info, "plugin API " + std::to_string(api->version) + ", providers:" +
+                                 (registered.empty() ? std::string(" none (OptiScaler too old)") : registered));
+    return true;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)

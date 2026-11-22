@@ -1,0 +1,225 @@
+From 0ff65d654096979a12db3fa342f48a4a0e2202c4 Mon Sep 17 00:00:00 2001
+From: d4r <d4r@localhost>
+Date: Sun, 22 Nov 2026 00:13:36 -0500
+Subject: [PATCH] d4r: switch Ray Reconstruction between DLSS RR and FSR RR in
+ the menu
+
+d4r serves Ray Reconstruction with NVIDIA's denoiser (DLSS RR) or AMD's FSR Ray Regeneration followed by DLSS
+Super Resolution (FSR RR), picked by D4R_RR_BACKEND, which d4r reads at every feature creation once
+D4R_RR_SWITCHABLE=1 has made it prepare both backends at NGX init.
+
+- At startup OptiScaler sets D4R_RR_SWITCHABLE=1 (unless already set), and D4R_RR_BACKEND from the new
+  [DLSSD] D4RDenoiser (auto keeps d4r.ini's [RayReconstruction] Backend).
+- With a DLSSD feature active and d4r's shim loaded (it exports d4r_WindowsBackendVersion), the Upscalers
+  section shows a Denoiser combo (DLSS RR / FSR RR) with Apply, which sets D4R_RR_BACKEND and recreates the
+  feature like an upscaler change.
+- If FSR RR fails to initialise, OptiScaler goes back to DLSS RR with a toast instead of retrying FSR RR
+  every frame.
+
+Ported from m4r's 0004-rr-denoiser-switch without its MetalFX parts.
+---
+ OptiScaler.ini                                |  5 ++
+ OptiScaler/Config.cpp                         |  2 +
+ OptiScaler/Config.h                           | 10 +++
+ OptiScaler/dllmain.cpp                        | 10 +++
+ OptiScaler/menu/menu_common.cpp               | 67 +++++++++++++++++++
+ OptiScaler/upscalers/FeatureProvider_Dx12.cpp | 13 ++++
+ 6 files changed, 107 insertions(+)
+
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index fcd9f649..618f02d6 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -743,6 +743,11 @@ UseGenericAppIdWithDlss=auto
+ ; -------------------------------------------------------
+ [DLSSD]
+ ; -------------------------------------------------------
++; d4r only: the denoiser d4r runs for Ray Reconstruction, also switchable in the menu while the game runs
++; auto (d4r.ini's [RayReconstruction] Backend), dlss (DLSS RR) or fsr (AMD FSR Ray Regeneration, then DLSS SR)
++; Default (auto) is auto
++D4RDenoiser=auto
++
+ ; Set this to true to enable custom render preset overrides
+ ; true or false - Default (auto) is false
+ RenderPresetOverride=auto
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 21d360b9..6da9e150 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -377,6 +377,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         {
+             // Don't enable again if set false because of no nvngx found
+             DLSSDRenderPresetOverride.set_from_config(readBool("DLSSD", "RenderPresetOverride"));
++            DLSSDD4RDenoiser.set_from_config(readString("DLSSD", "D4RDenoiser", true));
+ 
+             constexpr size_t presetCount = 7;
+ 
+@@ -1630,6 +1631,7 @@ bool Config::SaveIni()
+ 
+     // DLSSD
+     {
++        ini.SetValue("DLSSD", "D4RDenoiser", Instance()->DLSSDD4RDenoiser.value_for_config_or("auto").c_str());
+         ini.SetValue("DLSSD", "RenderPresetOverride",
+                      GetBoolValue(Instance()->DLSSDRenderPresetOverride.value_for_config()).c_str());
+         ini.SetValue("DLSSD", "RenderPresetForAll",
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index b9af1936..71615eed 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -312,6 +312,16 @@ class Config
+     CustomOptional<uint32_t> RenderPresetUltraPerformance { 0 };
+ 
+     // DLSSD
++    // d4r: the denoiser d4r runs for Ray Reconstruction (auto = d4r.ini's [RayReconstruction] Backend, dlss = DLSS RR,
++    // fsr = AMD FSR Ray Regeneration then DLSS Super Resolution); switchable in the menu while the game runs
++    CustomOptional<std::string> DLSSDD4RDenoiser { "auto" };
++    std::string DLSSDD4RDenoiserName() const
++    {
++        std::string v = DLSSDD4RDenoiser.value_or_default();
++        for (auto& c : v)
++            c = (char) std::tolower((unsigned char) c);
++        return v == "dlss" || v == "fsr" ? v : "auto";
++    }
+     CustomOptional<bool> DLSSDRenderPresetOverride { false };
+     CustomOptional<uint32_t> DLSSDRenderPresetForAll { 0 };
+     CustomOptional<uint32_t> DLSSDRenderPresetDLAA { 0 };
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index 663f0cce..055553dc 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1643,6 +1643,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+         Config::Instance()->CheckForUpdate.set_volatile_value(false);
+ #endif
+ 
++        // d4r: prepare both of d4r's Ray Reconstruction backends at NGX init, so the menu can switch between DLSS RR and
++        // FSR RR while the game runs (d4r reads D4R_RR_BACKEND at every feature creation). A value already set wins.
++        if (GetEnvironmentVariableA("D4R_RR_SWITCHABLE", nullptr, 0) == 0)
++            SetEnvironmentVariableA("D4R_RR_SWITCHABLE", "1");
++        if (const std::string rr = Config::Instance()->DLSSDD4RDenoiserName(); rr != "auto")
++        {
++            SetEnvironmentVariableA("D4R_RR_BACKEND", rr.c_str());
++            spdlog::info("d4r Ray Reconstruction denoiser: {}", rr);
++        }
++
+         // Initial state of FG
+         State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
+         State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+index 526d471b..97bdea41 100644
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -15,6 +15,7 @@
+ #include <fsr4/FSR4Presets.h>
+ #include <fsr4/FSR4DriverProviderVk.h>
+ #include <proxies/Streamline_Proxy.h>
++#include <proxies/NVNGX_Proxy.h>
+ 
+ #include <framegen/nvngx/Nvngx_FG.h>
+ #include <framegen/reprojection/Reprojection_Dx12.h>
+@@ -3602,6 +3603,30 @@ void MenuCommon::RenderUpscalerStateMessage(RenderMenuContext& ctx)
+ 
+ static const char* ApiName(API api);
+ 
++// d4r: its NGX shim is loaded (the module exports d4r_WindowsBackendVersion), so Ray Reconstruction can be switched
++// between d4r's DLSS RR and FSR RR backends
++static bool D4RLoaded()
++{
++    static bool found = false;
++    if (!found)
++    {
++        for (HMODULE module : { NVNGXProxy::NVNGXModule(), GetModuleHandleW(L"nvngx.dll"), GetModuleHandleW(L"_nvngx.dll") })
++            found = found || (module != nullptr && GetProcAddress(module, "d4r_WindowsBackendVersion") != nullptr);
++    }
++    return found;
++}
++
++// D4R_RR_BACKEND as d4r reads it: "fsr" or "dlss" (unset, auto or anything else)
++static std::string D4RRrBackend()
++{
++    char value[16] = {};
++    const DWORD length = GetEnvironmentVariableA("D4R_RR_BACKEND", value, sizeof(value));
++    std::string v = length > 0 && length < sizeof(value) ? std::string(value, length) : std::string();
++    for (auto& c : v)
++        c = (char) std::tolower((unsigned char) c);
++    return v == "fsr" ? "fsr" : "dlss";
++}
++
+ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
+ {
+     auto& state = ctx.state;
+@@ -3655,6 +3680,48 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
+         ImGui::TextDisabled("(DRS)");
+     }
+ 
++    // d4r: which denoiser answers Ray Reconstruction. d4r reads D4R_RR_BACKEND at every feature creation (both backends
++    // are prepared at NGX init, D4R_RR_SWITCHABLE); Apply recreates the feature like an upscaler change.
++    if (usesDlssd && D4RLoaded())
++    {
++        static const char* rrNames[] = { "DLSS RR", "FSR RR" };
++        static const char* rrCodes[] = { "dlss", "fsr" };
++        static int rrPick = -1;
++        const int rrNow = D4RRrBackend() == "fsr" ? 1 : 0;
++        if (rrPick < 0)
++            rrPick = rrNow;
++
++        ImGui::Spacing();
++        ImGui::PushItemWidth(150.0f * menuResScale);
++        ImGui::Combo("Denoiser##d4r", &rrPick, rrNames, IM_ARRAYSIZE(rrNames));
++        ShowTooltip("Which denoiser d4r runs for the game's Ray Reconstruction.\n\n"
++                    "DLSS RR: NVIDIA's denoiser, which also upscales\n"
++                    "FSR RR: AMD's FSR Ray Regeneration, then DLSS Super Resolution ([DLSS] Model in d4r.ini).\n"
++                    "Needs amd_fidelityfx_denoiser_dx12.dll in the d4r folder.\n\n"
++                    "Press Apply to switch. If FSR RR does not start, d4r goes back to DLSS RR.\n"
++                    "Save Settings keeps the choice (OptiScaler.ini [DLSSD] D4RDenoiser).");
++        ImGui::PopItemWidth();
++
++        bool switching = false; // a feature change is already pending
++        for (auto& cb : state.changeBackend)
++            switching = switching || cb.second;
++        const bool changed = rrPick != rrNow;
++        ImGui::SameLine(0.0f, 6.0f);
++        ImGui::BeginDisabled(!changed || switching);
++        if (ImGui::Button("Apply##d4rdenoiser"))
++        {
++            LOG_INFO("d4r Ray Reconstruction denoiser: {} -> {}", rrCodes[rrNow], rrCodes[rrPick]);
++            SetEnvironmentVariableA("D4R_RR_BACKEND", rrCodes[rrPick]);
++            config->DLSSDD4RDenoiser = std::string(rrCodes[rrPick]);
++            state.newBackend = Upscaler::DLSSD;
++            MARK_ALL_BACKENDS_CHANGED();
++        }
++        ImGui::EndDisabled();
++
++        if (!changed)
++            rrPick = -1; // follow the backend again (also after a fallback)
++    }
++
+     if (!usesDlssd)
+     {
+         if (state.newBackend != Upscaler::Reset && state.newBackend != currentBackend)
+diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+index 5cdb7377..339ab6e1 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+@@ -220,6 +220,19 @@ bool FeatureProvider_Dx12::ChangeFeature(Upscaler upscaler, ID3D12Device* device
+             }
+             else
+             {
++                // d4r: FSR RR picked in the menu (or [DLSSD] D4RDenoiser) did not start: back to DLSS RR instead of
++                // retrying the same backend every frame
++                char backend[16] = {};
++                const DWORD length = GetEnvironmentVariableA("D4R_RR_BACKEND", backend, sizeof(backend));
++                if (length > 0 && length < sizeof(backend) && _stricmp(backend, "fsr") == 0)
++                {
++                    LOG_WARN("d4r Ray Reconstruction denoiser fsr failed to start, back to dlss");
++                    SetEnvironmentVariableA("D4R_RR_BACKEND", "dlss");
++                    cfg.DLSSDD4RDenoiser = std::string("dlss");
++                    ImGui::InsertNotification(
++                        { ImGuiToastType::Warning, 10000, "FSR RR did not start, back to DLSS RR" });
++                }
++
+                 // Retry DLSSD
+                 state.newBackend = Upscaler::DLSSD;
+             }
+-- 
+2.56.1
+
