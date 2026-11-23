@@ -26,13 +26,21 @@ constexpr UINT AgsSpace = 0x7fff0ade;
 // recording, read by the stages as structured views (and the exposure pass writes its fields into the first two).
 // Structured views use multiples of their block size. CBV layers instead use
 // 256-byte-aligned addresses and a 512-byte stride for their 448-byte blocks.
-constexpr UINT64 InputOffset = 0, OutputOffset = 188, ExposureOffset = 392, LayerOffset = 448;
-constexpr UINT64 CbvLayerOffset = 512, CbvLayerStride = 512;
+constexpr UINT64 alignParamOffset(UINT64 minOffset, UINT64 elementSize, UINT64 align = 16) {
+    UINT64 step = elementSize;
+    while (step % align != 0) step += elementSize;
+    return ((minOffset + step - 1) / step) * step;
+}
+constexpr UINT64 InputOffset = 0;
+constexpr UINT64 OutputOffset = alignParamOffset(sizeof(InputParams), sizeof(OutputParams));
+constexpr UINT64 ExposureOffset = alignParamOffset(OutputOffset + sizeof(OutputParams), sizeof(ExposureParams));
+constexpr UINT64 LayerOffset = alignParamOffset(ExposureOffset + sizeof(ExposureParams), sizeof(KLayerParams));
+constexpr UINT64 CbvLayerOffset = ((LayerOffset + 255) / 256) * 256, CbvLayerStride = 512;
 constexpr UINT64 ParamsBytes = CbvLayerOffset + uint64_t(KLayers) * CbvLayerStride;
 static_assert(CbvLayerOffset % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0 &&
               CbvLayerStride % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0 && CbvLayerStride >= sizeof(KLayerParams));
-static_assert(OutputOffset % sizeof(OutputParams) == 0 && OutputOffset >= sizeof(InputParams));
-static_assert(ExposureOffset % sizeof(ExposureParams) == 0 && ExposureOffset >= OutputOffset + sizeof(OutputParams));
+static_assert(OutputOffset % 16 == 0 && OutputOffset % sizeof(OutputParams) == 0 && OutputOffset >= sizeof(InputParams));
+static_assert(ExposureOffset % 16 == 0 && ExposureOffset % sizeof(ExposureParams) == 0 && ExposureOffset >= OutputOffset + sizeof(OutputParams));
 static_assert(LayerOffset % sizeof(KLayerParams) == 0 && LayerOffset >= ExposureOffset + sizeof(ExposureParams));
 
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
@@ -63,9 +71,10 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     return barrier;
 }
-void uavBarrier(ID3D12GraphicsCommandList* list) {
+void uavBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource = nullptr) {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = resource;
     list->ResourceBarrier(1, &barrier);
 }
 // The shader-readable format of a game texture
@@ -158,14 +167,22 @@ struct Pipeline {
 };
 const Binding T{Bind::Texture}, TL{Bind::Texture, 0, true}, N{};
 Binding rw(UINT stride) { return {Bind::RwStructured, stride}; }
-std::vector<Binding> layerBindings(bool cbv = false) { return {cbv ? N : rw(sizeof(KLayerParams)), {Bind::Raw}, rw(8), rw(8), rw(8), rw(8)}; }
-std::vector<Binding> inputBindings() { return {rw(sizeof(InputParams)), T, TL, T, T, TL, rw(8)}; }
-std::vector<Binding> outputBindings() {
+std::vector<Binding> layerBindings(bool cbv = false, bool srvInputs = false, bool headTokOut = false) {
+    const Binding sr{Bind::Structured, 8};
+    return {cbv ? N : rw(sizeof(KLayerParams)), {Bind::Raw}, srvInputs ? sr : rw(8), srvInputs ? sr : rw(8), rw(8), headTokOut ? Binding{Bind::RwTexture} : rw(8)};
+}
+std::vector<Binding> inputBindings(bool srvParams = false, bool cbvParams = false) {
+    return {cbvParams ? Binding{Bind::None} : (srvParams ? Binding{Bind::Raw} : rw(sizeof(InputParams))), T, TL, T, T, TL, rw(8)};
+}
+std::vector<Binding> outputBindings(bool srvParamsHead = false, bool cbvParams = false) {
     const Binding image{Bind::RwTexture};
-    return {rw(sizeof(OutputParams)), T, TL, TL, T, T, image, image, image, image, {Bind::RwRaw}, {Bind::Structured, 16}};
+    return {cbvParams ? Binding{Bind::None} : (srvParamsHead ? Binding{Bind::Raw} : rw(sizeof(OutputParams))), T, TL, TL, T, T, image, image, image, image,
+            srvParamsHead ? Binding{Bind::Raw} : Binding{Bind::RwRaw}, {Bind::Structured, 16}};
 }
 std::vector<Binding> exposure0Bindings() { return {rw(sizeof(ExposureParams)), T, rw(4)}; }
 std::vector<Binding> exposure1Bindings() { return {rw(sizeof(ExposureParams)), rw(4), rw(8), rw(4), rw(4), T}; }
+
+constexpr D3D12_RESOURCE_STATES ParamsReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 
 const char* const Stages[] = {"input_k", "output_k", "exposure_k0", "exposure_k1"};
 } // namespace
@@ -192,9 +209,9 @@ struct Model::Impl {
     ComPtr<ID3D12Resource> weights, lut, upload;
     KModelData data;
     std::array<Pipeline, KLayers> network;
-    Pipeline input, output, outputRgb10;
+    Pipeline input, output, outputRgb10, tok;
     std::array<Pipeline, 2> exposure;
-    bool uploaded = false, hasExposure = false, layerCbv = false;
+    bool uploaded = false, hasExposure = false, layerCbv = false, srvParamsHead = false, srvLayerInputs = false, cbvParams = false, dec0TokOut = false;
     UINT64 layerParamOffset(UINT i) const { return layerCbv ? CbvLayerOffset + i * CbvLayerStride : LayerOffset + i * sizeof(KLayerParams); }
     std::mutex setup; // execute: one setup list at a time
 };
@@ -227,9 +244,15 @@ Model::Model(ID3D12Device* device, const std::string& directory) : impl(std::mak
     bool tiledWeights = false;
     if (m.layerCbv) {
         const auto marker = readFile(directory + "/d3d12_layer_cbv.bin");
-        if (marker.size() != 8 || (std::memcmp(marker.data(), "D4RCBV01", 8) && std::memcmp(marker.data(), "D4RCBV02", 8)))
+        if (marker.size() != 8 || (std::memcmp(marker.data(), "D4RCBV01", 8) && std::memcmp(marker.data(), "D4RCBV02", 8) &&
+                                    std::memcmp(marker.data(), "D4RCBV03", 8) && std::memcmp(marker.data(), "D4RCBV04", 8) &&
+                                    std::memcmp(marker.data(), "D4RCBV05", 8) && std::memcmp(marker.data(), "D4RCBV06", 8)))
             throw std::runtime_error("incompatible D3D12 layer constant-buffer marker");
-        tiledWeights = !std::memcmp(marker.data(), "D4RCBV02", 8);
+        tiledWeights = std::memcmp(marker.data(), "D4RCBV01", 8) != 0;
+        m.srvParamsHead = !std::memcmp(marker.data(), "D4RCBV03", 8) || !std::memcmp(marker.data(), "D4RCBV04", 8) || !std::memcmp(marker.data(), "D4RCBV05", 8) || !std::memcmp(marker.data(), "D4RCBV06", 8);
+        m.srvLayerInputs = !std::memcmp(marker.data(), "D4RCBV04", 8);
+        m.cbvParams = !std::memcmp(marker.data(), "D4RCBV05", 8);
+        m.dec0TokOut = !std::memcmp(marker.data(), "D4RCBV06", 8);
     }
     const std::string packedPath = directory + "/weights_d3d12.bin";
     if (tiledWeights) {
@@ -245,12 +268,13 @@ Model::Model(ID3D12Device* device, const std::string& directory) : impl(std::mak
     auto shader = [&](const std::string& name) { return readFile(directory + "/" + name + ".dxil"); };
     // Pipeline creation fails on a driver without AGS's WMMA: the network then cannot run on this device.
     for (unsigned i = 0; i < KLayers; ++i) {
-        try { m.network[i].create(device, shader(KLayerNames[i]), layerBindings(m.layerCbv), true, m.layerCbv, KLayerNames[i]); }
+        try { m.network[i].create(device, shader(KLayerNames[i]), layerBindings(m.layerCbv, m.srvLayerInputs, i == KLayers - 1 && m.dec0TokOut), true, m.layerCbv, KLayerNames[i]); }
         catch (const std::exception& e) { throw std::runtime_error(std::string(KLayerNames[i]) + " (AMD WMMA): " + e.what()); }
     }
-    m.input.create(device, shader("input_k"), inputBindings(), false, false, "input_k");
-    m.output.create(device, shader("output_k"), outputBindings(), false, false, "output_k");
-    if (fileExists(directory + "/output_k_rgb10.dxil")) m.outputRgb10.create(device, shader("output_k_rgb10"), outputBindings(), false, false, "output_k_rgb10");
+    m.input.create(device, shader("input_k"), inputBindings(m.srvParamsHead, m.cbvParams), false, m.cbvParams, "input_k");
+    m.output.create(device, shader("output_k"), outputBindings(m.srvParamsHead, m.cbvParams), true, m.cbvParams, "output_k");
+    if (fileExists(directory + "/output_k_rgb10.dxil")) m.outputRgb10.create(device, shader("output_k_rgb10"), outputBindings(m.srvParamsHead, m.cbvParams), true, m.cbvParams, "output_k_rgb10");
+    if (fileExists(directory + "/tok_k.dxil")) m.tok.create(device, shader("tok_k"), outputBindings(m.srvParamsHead, m.cbvParams), false, m.cbvParams, "tok_k");
     if (fileExists(directory + "/exposure_k0.dxil") && fileExists(directory + "/exposure_k1.dxil")) {
         m.exposure[0].create(device, shader("exposure_k0"), exposure0Bindings(), false, false, "exposure_k0");
         m.exposure[1].create(device, shader("exposure_k1"), exposure1Bindings(), false, false, "exposure_k1");
@@ -319,15 +343,15 @@ struct Engine::Impl {
     Model::Impl& model;
     Shape shape;
     ID3D12Device* device;
-    ComPtr<ID3D12Resource> params, dummy, exposureSums, exposureState;
+    ComPtr<ID3D12Resource> params, dummy, dummySrv, exposureSums, exposureState;
     std::array<ComPtr<ID3D12Resource>, 2> main;
     std::array<ComPtr<ID3D12Resource>, 5> skip;
     struct History { ComPtr<ID3D12Resource> color, luma, feature; };
     std::array<History, 2> history;
     ComPtr<ID3D12Resource> final;           // the engine's own output, created on first use
     Heap heap;
-    // Static descriptors: the layers' tables, then the six history UAVs and the own output's UAV (for clears).
-    static constexpr UINT LayerSlots = 6, ClearBase = KLayers * LayerSlots, ClearCount = 7, BindingBase = ClearBase + ClearCount;
+    // Static descriptors: the layers' tables (plus an alternate parity table for dec0 tokOut), then history clear UAVs.
+    static constexpr UINT LayerSlots = 6, Dec0AltSlot = KLayers * LayerSlots, ClearBase = (KLayers + 1) * LayerSlots, ClearCount = 7, BindingBase = ClearBase + ClearCount;
     // One block per distinct set of borrowed resources (the Vulkan runtime's cached descriptor sets): exposure
     // passes 0 and 1, then input and output for each history parity.
     static constexpr UINT BlockSlots = 64, ExposureSlot0 = 0, ExposureSlot1 = 8, InputSlot = 16, OutputSlot = 40, Blocks = 32;
@@ -394,12 +418,15 @@ struct Engine::Impl {
         device->CreateUnorderedAccessView(resource, nullptr, &v, handle);
     }
     void writeBindings(Bindings& b);
-    void dispatch(ID3D12GraphicsCommandList* list, const Pipeline& p, UINT table, UINT x, UINT y) {
+    void dispatch(ID3D12GraphicsCommandList* list, const Pipeline& p, UINT table, UINT x, UINT y, UINT64 cbvOffset = UINT64_MAX) {
         list->SetComputeRootSignature(p.root.Get());
         list->SetPipelineState(p.state.Get());
         list->SetComputeRootDescriptorTable(0, heap.gpuHandle(table));
         if (p.ags) list->SetComputeRootUnorderedAccessView(1, dummy->GetGPUVirtualAddress());
-        if (p.layerCbv) list->SetComputeRootConstantBufferView(2, params->GetGPUVirtualAddress() + model.layerParamOffset(table / LayerSlots));
+        if (p.layerCbv) {
+            const UINT64 off = cbvOffset != UINT64_MAX ? cbvOffset : model.layerParamOffset(table == Dec0AltSlot ? (KLayers - 1) : (table / LayerSlots));
+            list->SetComputeRootConstantBufferView(p.ags ? 2 : 1, params->GetGPUVirtualAddress() + off);
+        }
         list->Dispatch(x, y, 1);
     }
     // A host that cannot name a fence (submitted(nullptr)) gets its frames retired this many frames later.
@@ -444,18 +471,18 @@ void Engine::Impl::writeBindings(Bindings& b) {
         if (t.exposure.resource) textureView(base + ExposureSlot1 + 5, t.exposure.resource, textureFormat(t.exposure));
         else textureView(base + ExposureSlot1 + 5, t.color.resource, color);
     }
-    const auto in = inputBindings(), ou = outputBindings();
+    const auto in = inputBindings(model.srvParamsHead, model.cbvParams), ou = outputBindings(model.srvParamsHead, model.cbvParams);
     for (unsigned i = 0; i < 2; ++i) {
         const UINT si = base + InputSlot + i * 12, so = base + OutputSlot + i * 12;
         auto& h = history[i]; auto& dest = history[1 - i];
-        bufferView(si + 0, params.Get(), in[0], InputOffset, sizeof(InputParams));
+        if (!model.cbvParams) bufferView(si + 0, params.Get(), in[0], InputOffset, sizeof(InputParams));
         textureView(si + 1, t.color.resource, color);
         textureView(si + 2, h.color.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
         textureView(si + 3, t.motion.resource, motion);
         textureView(si + 4, t.depth.resource, depth);
         textureView(si + 5, h.feature.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
         bufferView(si + 6, external ? externalTokens : main[0].Get(), in[6]);
-        bufferView(so + 0, params.Get(), ou[0], OutputOffset, sizeof(OutputParams));
+        if (!model.cbvParams) bufferView(so + 0, params.Get(), ou[0], OutputOffset, sizeof(OutputParams));
         textureView(so + 1, t.color.resource, color);
         textureView(so + 2, h.color.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
         textureView(so + 3, h.luma.Get(), DXGI_FORMAT_R16_FLOAT);
@@ -484,6 +511,8 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetworkDx* extern
     const auto base = shape.layers[0];
     e.params = buffer(d, ParamsBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     e.dummy = buffer(d, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (e.model.srvLayerInputs)
+        e.dummySrv = buffer(d, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const auto capacity = kActivationBytes(shape);
     if (!e.external) {
         for (unsigned i = 0; i < 2; ++i)
@@ -502,16 +531,27 @@ Engine::Engine(Model& model, const Shape& shape, const ExternalNetworkDx* extern
         e.exposureState = buffer(d, 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     }
     e.heap.create(d, Impl::BindingBase + Impl::Blocks * Impl::BlockSlots);
-    const auto lb = layerBindings(e.model.layerCbv);
+    const auto lb = layerBindings(e.model.layerCbv, e.model.srvLayerInputs);
     if (!e.external)     // an external network runs the layers itself: their tables would have no buffers
     for (unsigned i = 0; i < KLayers; ++i) {
         const UINT s = i * Impl::LayerSlots;
         if (!e.model.layerCbv) e.bufferView(s + 0, e.params.Get(), lb[0], e.model.layerParamOffset(i), sizeof(KLayerParams));
         e.bufferView(s + 1, e.model.weights.Get(), lb[1]);
         e.bufferView(s + 2, e.main[i % 2].Get(), lb[2]);
-        e.bufferView(s + 3, i >= 6 ? e.skip[10 - i].Get() : e.dummy.Get(), lb[3]);
+        e.bufferView(s + 3, i >= 6 ? e.skip[10 - i].Get() : (e.model.srvLayerInputs ? e.dummySrv.Get() : e.dummy.Get()), lb[3]);
         e.bufferView(s + 4, e.main[(i + 1) % 2].Get(), lb[4]);
-        e.bufferView(s + 5, i < 5 ? e.skip[i].Get() : e.dummy.Get(), lb[5]);
+        if (i == KLayers - 1 && e.model.dec0TokOut) {
+            e.imageView(e.heap.cpuHandle(s + 5), e.history[1].feature.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+            const UINT a = Impl::Dec0AltSlot;
+            if (!e.model.layerCbv) e.bufferView(a + 0, e.params.Get(), lb[0], e.model.layerParamOffset(i), sizeof(KLayerParams));
+            e.bufferView(a + 1, e.model.weights.Get(), lb[1]);
+            e.bufferView(a + 2, e.main[i % 2].Get(), lb[2]);
+            e.bufferView(a + 3, e.skip[10 - i].Get(), lb[3]);
+            e.bufferView(a + 4, e.main[(i + 1) % 2].Get(), lb[4]);
+            e.imageView(e.heap.cpuHandle(a + 5), e.history[0].feature.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        } else {
+            e.bufferView(s + 5, i < 5 ? e.skip[i].Get() : e.dummy.Get(), lb[5]);
+        }
     }
     for (unsigned i = 0; i < 2; ++i) {
         auto& h = e.history[i];
@@ -668,8 +708,10 @@ void Engine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& p
         put(e.model.layerParamOffset(i), &e.shape.layers[i], sizeof(LayerShape));
     }
     list2->WriteBufferImmediate(UINT(values.size()), values.data(), nullptr);
-    D3D12_RESOURCE_BARRIER written = transition(e.params.Get(), D3D12_RESOURCE_STATE_COPY_DEST, uav);
+    const bool readParamsAfterWrite = e.model.srvParamsHead && !e.exposureOn;
+    D3D12_RESOURCE_BARRIER written = transition(e.params.Get(), D3D12_RESOURCE_STATE_COPY_DEST, readParamsAfterWrite ? ParamsReadState : uav);
     list->ResourceBarrier(1, &written);
+    if (e.model.srvParamsHead) exit.push_back(transition(e.params.Get(), ParamsReadState, uav));
     if (e.reset) {
         const float zero[4] = {}; const UINT zeroes[4] = {};
         for (UINT i = 0; i < 6; ++i) {
@@ -692,7 +734,12 @@ void Engine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& p
             uavBarrier(list);
         }
         e.dispatch(list, e.model.exposure[1], base + Impl::ExposureSlot1, 1, 1);
-        uavBarrier(list);
+        if (e.model.srvParamsHead) {
+            const D3D12_RESOURCE_BARRIER b = transition(e.params.Get(), uav, ParamsReadState);
+            list->ResourceBarrier(1, &b);
+        } else {
+            uavBarrier(list);
+        }
     }
     mark(2);
     std::string capturePath;
@@ -708,7 +755,7 @@ void Engine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& p
         auto add = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES state, const char* name) {
             e.recordingCapture->add(e.device, list, resource, state, capturePath + "/" + name);
         };
-        add(e.params.Get(), uav, "params.bin");
+        add(e.model.srvParamsHead ? e.params.Get() : e.params.Get(), e.model.srvParamsHead ? ParamsReadState : uav, "params.bin");
         add(e.model.lut.Get(), srv, "lut.bin");
         add(b.textures.color.resource, srv, "color.bin");
         add(b.textures.motion.resource, srv, "motion.bin");
@@ -725,30 +772,75 @@ void Engine::recordFrame(ID3D12GraphicsCommandList* list, const FrameProfiler& p
         }
     }
     const auto lb = e.shape.layers[0];
-    e.dispatch(list, e.model.input, base + Impl::InputSlot + e.previous * 12, UINT(lb.w) / 8, UINT(lb.h) / 8);
+    e.dispatch(list, e.model.input, base + Impl::InputSlot + e.previous * 12, UINT(lb.w) / 8, UINT(lb.h) / 8,
+               e.model.cbvParams ? InputOffset : UINT64_MAX);
     mark(3);
-    if (e.model.layerCbv) {
+    if (e.model.layerCbv && !e.model.srvParamsHead) {
         auto readable = transition(e.params.Get(), uav, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         list->ResourceBarrier(1, &readable);
     }
     const auto groups = kLayerGroups(e.shape, e.trim);
     const unsigned layers = kRecordedLayers();
-    for (unsigned i = 0; i < layers; ++i) {
-        uavBarrier(list);
-        e.dispatch(list, e.model.network[i], i * Impl::LayerSlots, groups[i][0], groups[i][1]);
-        mark(4 + i);
+    if (e.model.srvLayerInputs) {
+        for (unsigned i = 0; i < layers; ++i) {
+            std::vector<D3D12_RESOURCE_BARRIER> lb;
+            lb.push_back(transition(e.main[i % 2].Get(), uav, srv));
+            if (i > 0) lb.push_back(transition(e.main[(i + 1) % 2].Get(), srv, uav));
+            if (i >= 6) lb.push_back(transition(e.skip[10 - i].Get(), uav, srv));
+            list->ResourceBarrier(UINT(lb.size()), lb.data());
+            const UINT table = (i == KLayers - 1 && e.model.dec0TokOut && e.previous) ? Impl::Dec0AltSlot : (i * Impl::LayerSlots);
+            e.dispatch(list, e.model.network[i], table, groups[i][0], groups[i][1]);
+            mark(4 + i);
+        }
+    } else {
+        for (unsigned i = 0; i < layers; ++i) {
+            D3D12_RESOURCE_BARRIER ub[2]{};
+            ub[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            ub[0].UAV.pResource = e.main[i % 2].Get();
+            if (i >= 6) {
+                ub[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                ub[1].UAV.pResource = e.skip[10 - i].Get();
+            }
+            list->ResourceBarrier(i >= 6 ? 2u : 1u, ub);
+            const UINT table = (i == KLayers - 1 && e.model.dec0TokOut && e.previous) ? Impl::Dec0AltSlot : (i * Impl::LayerSlots);
+            e.dispatch(list, e.model.network[i], table, groups[i][0], groups[i][1]);
+            mark(4 + i);
+        }
     }
-    if (e.model.layerCbv) {
+    if (e.model.layerCbv && !e.model.srvParamsHead) {
         auto writable = transition(e.params.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, uav);
         list->ResourceBarrier(1, &writable);
     }
-    uavBarrier(list);
+    if (e.model.srvParamsHead) {
+        const D3D12_RESOURCE_BARRIER hb = transition(e.main[1].Get(), uav, srv);
+        list->ResourceBarrier(1, &hb);
+        exit.push_back(transition(e.main[1].Get(), srv, uav));
+        if (e.model.srvLayerInputs) {
+            exit.push_back(transition(e.main[0].Get(), srv, uav));
+            for (unsigned i = 0; i < 5; ++i) exit.push_back(transition(e.skip[i].Get(), srv, uav));
+        }
+    } else {
+        uavBarrier(list);
+    }
+    if (e.model.tok.state) {
+        const auto lb = e.shape.layers[0];
+        e.dispatch(list, e.model.tok, base + Impl::OutputSlot + e.previous * 12, (UINT(lb.w) + 7) / 8, (UINT(lb.h) + 7) / 8,
+                   e.model.cbvParams ? OutputOffset : UINT64_MAX);
+    }
     e.dispatch(list, e.rgb10 ? e.model.outputRgb10 : e.model.output, base + Impl::OutputSlot + e.previous * 12,
-               (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+               (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16,
+               e.model.cbvParams ? OutputOffset : UINT64_MAX);
     mark(4 + KLayers);
-    uavBarrier(list);
+    if (!e.recordingCapture && e.borrowedOutput) {
+        D3D12_RESOURCE_BARRIER ob{};
+        ob.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ob.UAV.pResource = b.output.resource;
+        list->ResourceBarrier(1, &ob);
+    } else {
+        uavBarrier(list);
+    }
     if (e.recordingCapture) {
-        e.recordingCapture->add(e.device, list, e.main[1].Get(), uav, capturePath + "/head.bin");
+        e.recordingCapture->add(e.device, list, e.main[1].Get(), e.model.srvParamsHead ? srv : uav, capturePath + "/head.bin");
         e.recordingCapture->add(e.device, list, b.output.resource ? b.output.resource : e.final.Get(), uav, capturePath + "/output.bin");
         e.recordingCapture->add(e.device, list, dest.color.Get(), uav, capturePath + "/next-color.bin");
         e.recordingCapture->add(e.device, list, dest.luma.Get(), uav, capturePath + "/next-luma.bin");
@@ -796,8 +888,10 @@ void Engine::recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& p
     put(OutputOffset, &e.output, sizeof(OutputParams));
     if (e.exposureOn) put(ExposureOffset, &e.exposure, sizeof(ExposureParams));
     list2->WriteBufferImmediate(UINT(values.size()), values.data(), nullptr);
-    D3D12_RESOURCE_BARRIER written = transition(e.params.Get(), D3D12_RESOURCE_STATE_COPY_DEST, uav);
+    const bool readParamsAfterWrite = e.model.srvParamsHead && !e.exposureOn;
+    D3D12_RESOURCE_BARRIER written = transition(e.params.Get(), D3D12_RESOURCE_STATE_COPY_DEST, readParamsAfterWrite ? ParamsReadState : uav);
     list->ResourceBarrier(1, &written);
+    if (e.model.srvParamsHead) exit.push_back(transition(e.params.Get(), ParamsReadState, uav));
     if (e.reset) {
         const float zero[4] = {}; const UINT zeroes[4] = {};
         for (UINT i = 0; i < 6; ++i) {
@@ -820,11 +914,17 @@ void Engine::recordFront(ID3D12GraphicsCommandList* list, const FrameProfiler& p
             uavBarrier(list);
         }
         e.dispatch(list, e.model.exposure[1], base + Impl::ExposureSlot1, 1, 1);
-        uavBarrier(list);
+        if (e.model.srvParamsHead) {
+            const D3D12_RESOURCE_BARRIER b = transition(e.params.Get(), uav, ParamsReadState);
+            list->ResourceBarrier(1, &b);
+        } else {
+            uavBarrier(list);
+        }
     }
     mark(2);
     const auto lb = e.shape.layers[0];
-    e.dispatch(list, e.model.input, base + Impl::InputSlot + e.previous * 12, UINT(lb.w) / 8, UINT(lb.h) / 8);
+    e.dispatch(list, e.model.input, base + Impl::InputSlot + e.previous * 12, UINT(lb.w) / 8, UINT(lb.h) / 8,
+               e.model.cbvParams ? InputOffset : UINT64_MAX);
     uavBarrier(list);
     list->ResourceBarrier(UINT(exit.size()), exit.data());
     mark(3);
@@ -848,12 +948,19 @@ void Engine::recordBack(ID3D12GraphicsCommandList* list, const FrameProfiler& pr
     std::vector<D3D12_RESOURCE_BARRIER> entry, exit;
     for (auto* r : {dest.color.Get(), dest.luma.Get(), dest.feature.Get()}) { entry.push_back(transition(r, srv, uav)); exit.push_back(transition(r, uav, srv)); }
     if (!e.borrowedOutput) { entry.push_back(transition(e.final.Get(), srv, uav)); exit.push_back(transition(e.final.Get(), uav, srv)); }
+    if (e.model.srvParamsHead) { entry.push_back(transition(e.params.Get(), uav, ParamsReadState)); exit.push_back(transition(e.params.Get(), ParamsReadState, uav)); }
     list->ResourceBarrier(UINT(entry.size()), entry.data());
     // the external network wrote the head after the front retired on the CPU: this UAV barrier invalidates the caches
     // the final store reads it through
     uavBarrier(list);
+    if (e.model.tok.state) {
+        const auto lb = e.shape.layers[0];
+        e.dispatch(list, e.model.tok, base + Impl::OutputSlot + e.previous * 12, (UINT(lb.w) + 7) / 8, (UINT(lb.h) + 7) / 8,
+                   e.model.cbvParams ? OutputOffset : UINT64_MAX);
+    }
     e.dispatch(list, e.rgb10 ? e.model.outputRgb10 : e.model.output, base + Impl::OutputSlot + e.previous * 12,
-               (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16);
+               (e.shape.outputWidth + 15) / 16, (e.shape.outputHeight + 15) / 16,
+               e.model.cbvParams ? OutputOffset : UINT64_MAX);
     mark(1);
     uavBarrier(list);
     list->ResourceBarrier(UINT(exit.size()), exit.data());

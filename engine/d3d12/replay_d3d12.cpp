@@ -4,6 +4,16 @@
 #include "runtime_d3d12.h"
 #ifdef D4R_ENGINE_D3DHIP
 #include "hip_net_d3d12.h"
+#else
+namespace d4r::dx {
+struct HipNetworkDx {
+    void useFence(ID3D12Fence*) {}
+    void launchAfter(uint64_t, uint64_t) {}
+    void run() {}
+    void finish() {}
+    double lastMilliseconds() const { return 0.0; }
+};
+} // namespace d4r::dx
 #endif
 #include <dxgi1_6.h>
 #include <algorithm>
@@ -90,7 +100,17 @@ struct Context {
         queue->ExecuteCommandLists(1, lists);
         CK(queue->Signal(fence.Get(), ++value));
         wait();
-        if (FAILED(device->GetDeviceRemovedReason())) check(device->GetDeviceRemovedReason(), "device removed");
+        if (FAILED(device->GetDeviceRemovedReason())) {
+            ComPtr<ID3D12InfoQueue> iq;
+            if (SUCCEEDED(device.As(&iq))) {
+                for (UINT64 i = 0, n = iq->GetNumStoredMessages(); i < n; ++i) {
+                    SIZE_T sz = 0; iq->GetMessage(i, nullptr, &sz);
+                    std::vector<char> buf(sz); auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                    if (SUCCEEDED(iq->GetMessage(i, m, &sz))) std::fprintf(stderr, "D3D12[%llu]: %s\n", i, m->pDescription);
+                }
+            }
+            check(device->GetDeviceRemovedReason(), "device removed");
+        }
         CK(allocator->Reset()); CK(list->Reset(allocator.Get(), nullptr));
     }
     void stamp(uint32_t index) { list->EndQuery(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index); }
@@ -518,6 +538,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
             context.stamp(0);
             for (int i = 0; i < repeats; ++i) {
                 setFrame(kcase.frames.back()); phaseOf[i] = evaluation - 1;
+                if (profile) marks.first = 2 + uint32_t(i) * boundaries;
                 if (phases) context.stamp(2 + 4 * i);
                 engine.recordFrame(list, profile ? profiler : d4r::dx::FrameProfiler{});
                 if (phases) context.stamp(2 + 4 * i + 3);

@@ -615,7 +615,7 @@ static bool native_vk_rr_package()
 static bool ray_reconstruction_available()
 {
     const RrBackend backend = rr_backend();
-    if (g.nativeD3d12Only && backend == RrBackend::Dlss) return rr_enabled() && (native_engine_rr(6) || native_engine_rr(4) || native_engine_rr(5));
+    if (g.nativeD3d12Only && backend == RrBackend::Dlss) return rr_enabled() && (native_engine_rr_present(6) || native_engine_rr_present(4) || native_engine_rr_present(5));
     if (g.nativeVulkan && backend == RrBackend::Dlss) return rr_enabled() && native_vk_rr_package();
     if (backend == RrBackend::Fsr)
         return rr_enabled() && g.ngxInitialized && fsr_rr_ready();
@@ -735,22 +735,23 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     {
         device->AddRef();
         g.device = device;
-        // Provisioned K packages contain everything inference needs. Do not
-        // load NGX/CUDA merely to initialize an ordinary Windows D3D12 device.
-        const bool hdr = native_engine_available(false), ldr = native_engine_available(true);
-        // presets M and L alone suffice too (CreateFeature refuses the presets without a package)
+        // Provisioned K/M/L/RR packages are checked lazily on disk at Init_Ext and
+        // compiled/loaded on demand in CreateFeature to avoid inflating host RAM/commit
+        // with unused shaders.
+        const bool hdr = native_engine_package_present(false), ldr = native_engine_package_present(true);
         bool presetML[2][2] = {};
         for (int l = 0; l < 2; ++l)
             for (int d = 0; d < 2; ++d)
-                presetML[l][d] = native_engine_m(d != 0, l != 0) != nullptr || native_engine_m_rdna3(d != 0, l != 0) != nullptr;
-        if (!hdr && !ldr && !presetML[0][0] && !presetML[0][1] && !presetML[1][0] && !presetML[1][1] && !native_engine_rr(4) && !native_engine_rr(5) && !native_engine_rr(6))
+                presetML[l][d] = native_engine_m_present(d != 0, l != 0);
+        const bool rrD = native_engine_rr_present(4), rrE = native_engine_rr_present(5), rrF = native_engine_rr_present(6);
+        if (!hdr && !ldr && !presetML[0][0] && !presetML[0][1] && !presetML[1][0] && !presetML[1][1] && !rrD && !rrE && !rrF)
         {
             g.device->Release(); g.device = nullptr;
             return NGX_FAIL_FEATURE_NOT_SUPPORTED;
         }
         g.nativeD3d12Only = g.ngxInitialized = true;
-        logf("native D3D12 initialized on game device %p; K HDR=%d LDR=%d, M HDR=%d LDR=%d, L HDR=%d LDR=%d, RR D=%d E=%d F=%d; no CUDA/NGX runtime",
-             device, hdr, ldr, presetML[0][0], presetML[0][1], presetML[1][0], presetML[1][1], native_engine_rr(4)!=nullptr, native_engine_rr(5)!=nullptr, native_engine_rr(6)!=nullptr);
+        logf("native D3D12 initialized on game device %p (lazy load); K HDR=%d LDR=%d, M HDR=%d LDR=%d, L HDR=%d LDR=%d, RR D=%d E=%d F=%d; no CUDA/NGX runtime",
+             device, hdr, ldr, presetML[0][0], presetML[0][1], presetML[1][0], presetML[1][1], rrD, rrE, rrF);
         // FSR RR (Backend = fsr, or D4R_RR_SWITCHABLE=1 from OptiScaler's denoiser switch): its runtime is only looked for
         // here, and this route returns before the CUDA route's preparation below
         if (rr_enabled() && (env_string("D4R_RR_SWITCHABLE") == "1" || rr_backend() == RrBackend::Fsr))

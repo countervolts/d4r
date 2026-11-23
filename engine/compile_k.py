@@ -204,11 +204,12 @@ def d3d12_weight_tiles(index, weights, llpc=False):
 
 
 def build_dxil(index, output, ldr, target='windows'):
-    """Package K's native D3D12 kernels alongside Vulkan's SPIR-V. D3D12 uses
-    native half rounding, f16 WMMA accumulation, prefetched column-major weight
-    tiles and root CBVs. Network waves are wave32 (one token tile on Windows);
-    output waves remain wave64. These backend choices do not change Vulkan's
-    kernels or canonical weights.
+    """Package K's native D3D12 kernels alongside Vulkan's SPIR-V. Windows
+    D3D12 keeps native half on the network and input stages (with 4-half shared
+    padding where LDS fits and wave64 input), uses f32 Gaussian reconstruction
+    for AMD game-profile stability, and applies exact software RNE16 rounding
+    in output_k. These backend choices do not change Vulkan's kernels or
+    canonical weights.
 
     Both targets filter every subpixel as Vulkan does. The centre Gaussian
     estimate the 'windows' target used to share between the four subpixels of
@@ -234,7 +235,9 @@ def build_dxil(index, output, ldr, target='windows'):
         raise ValueError('D3D12 target must be windows or vkd3d')
     vkd3d = target == 'vkd3d'
     rounding = ['-DD4R_NATIVE_HALF=1']
+    output_rounding = rounding if vkd3d else ['-DD4R_RNE16_EXTERNAL=1', '-DD4R_RNE16_AGS_SCALAR=1']
     ldr_define = (['-DLDR=1'] if ldr else []) + rounding
+    out_ldr_define = (['-DLDR=1'] if ldr else []) + output_rounding
     stage_profile = 'cs_6_9' if vkd3d else 'cs_6_6'
     # AMD's Cyberpunk application profile changes native half accumulation.
     # Keep Gaussian sums in f32 on Windows and round only the filter result;
@@ -243,31 +246,42 @@ def build_dxil(index, output, ldr, target='windows'):
     reconstruction = [] if vkd3d else ['-DD4R_FILTER_ACCUM_F32=1', '-DD4R_FILTER_F32=1']
     for name, e in index.items():
         tpw = 2 if vkd3d and e['C'] == 32 and e['kind'] != 'dec0' else 1
-        extra = ['-DCOLUMN_MAJOR_ENC0=0', f'-DTPW={tpw}'] + (['-DPADX=0', '-DPAD4=0'] if e['C'] == 128 else [])
+        if e['C'] == 128:
+            pad_defs = ['-DPADX=0', '-DPAD4=0']
+        elif vkd3d:
+            pad_defs = []
+        else:
+            pad_defs = ['-DPADX=4', '-DPAD4=4']
+        extra = ['-DCOLUMN_MAJOR_ENC0=0', f'-DTPW={tpw}'] + pad_defs + ([] if vkd3d else ['-DPADT=4'])
         extra += ['-DD4R_LAYER_CBV=1', '-DD4R_WEIGHT_TILES_COLMAJOR=1']
         extra += rounding + ['-DD4R_ACCUMULATE_F16=1',
                              f'-DPREFETCH_K={e["C"] // 16}', f'-DPREFETCH_N={e["C"] // 16}']
+        extra += ['-DD4R_DEC0_TOKOUT=1'] if name == 'dec0' and not vkd3d else []
         extra += ['-DD4R_AGS_ELEMENTWISE_ADD=1'] if vkd3d else []
         extra += os.environ.get('K_DEFS_' + name.upper(), '').split()
         hlsl_build.build(HERE / 'layer.comp', output / (name + '.dxil'), defines(e, extra), wave=32, unroll=True)
     for name in ('input_k', 'output_k'):
-        output_schedule = ((reconstruction + (['-DD4R_OUTPUT_WAVE_BRIGHT=1'] if vkd3d else []))
+        output_schedule = ((reconstruction + (['-DD4R_NO_TOKOUT=1', '-DD4R_OUT_SWZ_W=32', '-DD4R_OUT_SWZ_REV=1']
+                                              if not vkd3d else ['-DD4R_OUTPUT_WAVE_BRIGHT=1']))
                            if name == 'output_k' else ['-DD4R_INPUT_SUBBLOCK=1'])
-        # Four lanes share each token's input feature reduction. On RADV the
-        # wave64 SM6.6 build avoids DXC's SM6.9 failure for this schedule and
-        # halves input-stage time on GFX1201. Reconstruction keeps SM6.9.
-        hlsl_build.build(HERE / (name + '.comp'), output / (name + '.dxil'), ldr_define + output_schedule +
+        # Four lanes share each token's input feature reduction. On RADV and
+        # RDNA4 Windows D3D12, wave64 SM6.6 cuts input-stage latency cleanly.
+        hlsl_build.build(HERE / (name + '.comp'), output / (name + '.dxil'),
+                         (out_ldr_define if name == 'output_k' else ldr_define) + output_schedule +
                          os.environ.get('K_DEFS_' + name.upper(), '').split(),
-                         wave=64 if vkd3d or name == 'output_k' else 32,
+                         wave=64 if vkd3d or name in ('input_k', 'output_k') else 32,
                          profile='cs_6_6' if name == 'input_k' else stage_profile)
-    hlsl_build.build(HERE / 'output_k.comp', output / 'output_k_rgb10.dxil', ['-DOUTPUT_RGB10=1'] + ldr_define +
-                     reconstruction + (['-DD4R_OUTPUT_WAVE_BRIGHT=1'] if vkd3d else []), profile=stage_profile)
+    hlsl_build.build(HERE / 'output_k.comp', output / 'output_k_rgb10.dxil', ['-DOUTPUT_RGB10=1'] + out_ldr_define +
+                     reconstruction + (['-DD4R_NO_TOKOUT=1', '-DD4R_OUT_SWZ_W=32', '-DD4R_OUT_SWZ_REV=1']
+                                       if not vkd3d else ['-DD4R_OUTPUT_WAVE_BRIGHT=1']),
+                     wave=64, profile=stage_profile)
     for stage in '01':
-        hlsl_build.build(HERE / 'exposure_k.comp', output / f'exposure_k{stage}.dxil', ['-DPASS=' + stage] + rounding)
+        hlsl_build.build(HERE / 'exposure_k.comp', output / f'exposure_k{stage}.dxil', ['-DPASS=' + stage] + rounding,
+                         wave=64 if vkd3d else 32)
     marker = output / 'd3d12_layer_cbv.bin'
     packed_weights = output / 'weights_d3d12.bin'
     packed_weights.write_bytes(b'D4RWTB01' + d3d12_weight_tiles(index, (output / 'weights.bin').read_bytes()))
-    marker.write_bytes(b'D4RCBV02')
+    marker.write_bytes(b'D4RCBV02' if vkd3d else b'D4RCBV06')
 # layer_dot2_split.comp: the deep layers as up to seven dispatches over many small workgroups (the runtime takes
 # <layer>_dot2_s<k>.spv and <layer>_dot2_split.bin, each phase's z group count, 0 for none; the output is the same bit
 # for bit). Narrow column blocks win (latency-bound), narrower still for the layers with the fewest windows. RDNA2
@@ -443,7 +457,7 @@ def main():
     if dxil:
         manifest['d3d12_target'] = a.d3d12_target
         manifest['d3d12_input_schedule'] = 'four-threads-per-token'
-        manifest['d3d12_input_wave_size'] = 64 if a.d3d12_target == 'vkd3d' else 32
+        manifest['d3d12_input_wave_size'] = 64
         manifest['d3d12_input_shader_model'] = '6.6'
         manifest['d3d12_highlight_quad'] = 'wave-shuffle' if a.d3d12_target == 'vkd3d' else 'shared-memory'
         manifest['d3d12_reconstruction'] = 'exact'

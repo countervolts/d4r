@@ -200,6 +200,18 @@ struct Pipeline
         if (FAILED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&state))))
             throw std::runtime_error("cannot create the pipeline of " + path +
                                      " (AMD WMMA through AGS needs an AMD driver)");
+        if (const char *directory = std::getenv("D4R_D3D12_DUMP_DIR"); directory && *directory)
+        {
+            std::filesystem::create_directories(directory);
+            const std::string stem = std::filesystem::path(path).stem().string();
+            auto save = [&](const char *suffix, const void *data, size_t bytes) {
+                const auto outPath = std::filesystem::path(directory) / (stem + suffix);
+                std::ofstream file(outPath, std::ios::binary);
+                file.write(static_cast<const char *>(data), std::streamsize(bytes));
+            };
+            save(".dxil", dxil.data(), dxil.size());
+            save(".rootsig", blob->GetBufferPointer(), blob->GetBufferSize());
+        }
     }
     explicit operator bool() const
     {

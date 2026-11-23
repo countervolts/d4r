@@ -94,8 +94,8 @@ void d4r_store(D4rAcc m, uint s, uint off, uint stride, uint layout)
 float16_t4 d4rLdsRead4(uint word)
 {
     const uint a = matrixShared[word], b = matrixShared[word + 1u];
-    return float16_t4(asfloat16(uint16_t(a & 0xffffu)), asfloat16(uint16_t(a >> 16)),
-                      asfloat16(uint16_t(b & 0xffffu)), asfloat16(uint16_t(b >> 16)));
+    return float16_t4(asfloat16(uint16_t(a)), asfloat16(uint16_t(a >> 16)),
+                      asfloat16(uint16_t(b)), asfloat16(uint16_t(b >> 16)));
 }
 void d4rLdsWrite4(uint word, float16_t4 v)
 {

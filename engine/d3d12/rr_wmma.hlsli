@@ -79,7 +79,7 @@ float rrDecode(uint c) {
 float2 rrDecode2(uint2 c) {
   const uint word = (c.x & 255u) | ((c.y & 255u) << 8u);
   const Matrix16 r = convert(MatrixB8, MatrixAcc16, 0, m16(uint2(word, 0u)));
-  return float2(f16tof32(r.reg[0] & 0xffffu), f16tof32(r.reg[0] >> 16u));
+  return float2(f16tof32(r.reg[0]), f16tof32(r.reg[0] >> 16u));
 }
 // unpack8(w): the four bytes of w as FP8 codes, low pair then high pair
 struct RRBytes8 { uint2 xy, zw; };
@@ -133,7 +133,7 @@ uint rrCode(float x) {
 #endif
 float16_t rrDecodeH(uint c) {
   const Matrix16 r = convert(MatrixB8, MatrixAcc16, 0, m16(uint2(c & 255u, 0u)));
-  return asfloat16(uint16_t(r.reg[0] & 0xffffu));
+  return asfloat16(uint16_t(r.reg[0]));
 }
 // Byte b of w (rr_hlsl.py's translation of e4(w, b)). vkd3d-proton: the
 // conversion of the whole word to f32, element b in register b, so the four
@@ -215,10 +215,12 @@ RRByte rrQuantSetH(RRHalf v) {
   return uint2(r.reg[0], r.reg[1]);
 }
 // The driver moves an AGS conversion used only in divergent code into that
-// branch, where its lowering reads inactive lanes. An unconditional store of
-// the result keeps the conversion in uniform flow (one VALU, one LDS write).
-groupshared uint rrPinned[D4R_WAVE_SIZE];
-void rrPin(RRByte v) { rrPinned[WaveGetLaneIndex()] = v.x | v.y; }
+// branch, where its lowering reads inactive lanes. A wave-wide reduction masked
+// by an opaque runtime zero keeps the conversion in uniform flow without LDS.
+void rrPin(inout RRByte v) {
+  const uint z = 0u - (gl_WorkGroupID.x >> 31u);
+  v.x |= WaveActiveBitOr(v.x | v.y) & z;
+}
 uint rrPack4(float16_t a, float16_t b, float16_t c, float16_t d) {
   RRHalf v = {a, b, c, d, 0.0h, 0.0h, 0.0h, 0.0h};
   return rrQuantSetH(v).x;
@@ -300,7 +302,9 @@ RRFloat rrMma(RRHalf16 a, RRHalf16 b, RRFloat c) {
 #define subgroupBarrier() AllMemoryBarrier()
 #endif
 #define subgroupAny WaveActiveAnyTrue
+#ifndef subgroupAll
 #define subgroupAll WaveActiveAllTrue
+#endif
 #define subgroupBallot WaveActiveBallot
 #define subgroupShuffle(x, l) WaveReadLaneAt(x, l)
 #define subgroupBroadcast(x, l) WaveReadLaneAt(x, l)

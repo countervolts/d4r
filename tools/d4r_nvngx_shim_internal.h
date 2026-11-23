@@ -1146,6 +1146,7 @@ bool fsr_rr_present();
 const char* fsr_rr_denial_reason();
 void fsr_rr_prepare_runtime();
 d4r::dx::RModel* native_engine_rr(unsigned preset);
+bool native_engine_rr_present(unsigned preset);
 std::string rr_model_directory(int slot);
 bool engine_requested();
 // The render GPU cannot run the engine's shaders (initialize: older than RDNA 3 on native Windows): the CUDA route
@@ -1161,6 +1162,8 @@ struct ProjectIdentity
 };
 void start_engine_preload();
 bool native_engine_available(bool ldr);
+bool native_engine_package_present(bool ldr);
+bool native_engine_m_present(bool ldr, bool presetL = false);
 enum class AmdGeneration { Unknown, Older, Rdna3, Rdna4 }; // ordered: newer compares greater
 // The render GPU's driver version as four 16-bit fields (a.b.c.d), 0 when unknown; set by amd_render_generation.
 inline uint64_t g_renderDriverVersion = 0;

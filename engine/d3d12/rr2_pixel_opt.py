@@ -268,6 +268,7 @@ def _codec(source):
     return _replace_calls(source, 'floate4m3BitsToUintEXT', rewrite)
 
 
+_H2U_HELPER = 'uint rrH2U(vector<float16_t, 2> v) { return uint(asuint16(v.x)) | (uint(asuint16(v.y)) << 16u); }\n'
 _E4_HELPERS = '''uint rrE4H(uint h)
 {
     const uint a = h & 0x7fffu;
@@ -294,6 +295,45 @@ uint rrE4x2W(uint w)
     uint c = convert(MatrixAcc16, MatrixB8, 0, m16(h)).reg[0] & 0xffffu;
     c = (w & 0x7fffu) > 0x7c00u ? (c & 0xff00u) | 0x7fu : c;
     c = ((w >> 16u) & 0x7fffu) > 0x7c00u ? (c & 0x00ffu) | 0x7f00u : c;
+    return c;
+}
+#endif
+'''
+_E4_UNIFORM4 = '''#if D4R_VKD3D
+uint2 rrE4x2W4(uint4 w)
+{
+    return uint2(rrE4x2(w.x) | (rrE4x2(w.y) << 16u),
+                 rrE4x2(w.z) | (rrE4x2(w.w) << 16u));
+}
+#else
+uint2 rrE4x2W4(uint4 w)
+{
+    const vector<float16_t, 2> v0 = clamp(vector<float16_t, 2>(asfloat16(uint16_t(w.x & 0xffffu)),
+                                                               asfloat16(uint16_t(w.x >> 16u))),
+                                          float16_t(-448.0), float16_t(448.0));
+    const vector<float16_t, 2> v1 = clamp(vector<float16_t, 2>(asfloat16(uint16_t(w.y & 0xffffu)),
+                                                               asfloat16(uint16_t(w.y >> 16u))),
+                                          float16_t(-448.0), float16_t(448.0));
+    const vector<float16_t, 2> v2 = clamp(vector<float16_t, 2>(asfloat16(uint16_t(w.z & 0xffffu)),
+                                                               asfloat16(uint16_t(w.z >> 16u))),
+                                          float16_t(-448.0), float16_t(448.0));
+    const vector<float16_t, 2> v3 = clamp(vector<float16_t, 2>(asfloat16(uint16_t(w.w & 0xffffu)),
+                                                               asfloat16(uint16_t(w.w >> 16u))),
+                                          float16_t(-448.0), float16_t(448.0));
+    const uint4 h = uint4(uint(asuint16(v0.x)) | (uint(asuint16(v0.y)) << 16),
+                          uint(asuint16(v1.x)) | (uint(asuint16(v1.y)) << 16),
+                          uint(asuint16(v2.x)) | (uint(asuint16(v2.y)) << 16),
+                          uint(asuint16(v3.x)) | (uint(asuint16(v3.y)) << 16));
+    const uint r[8] = convert(MatrixAcc16, MatrixB8, 0, m16(h)).reg;
+    uint2 c = uint2(r[0], r[1]);
+    c.x = (w.x & 0x7fffu) > 0x7c00u ? (c.x & 0xffffff00u) | 0x0000007fu : c.x;
+    c.x = ((w.x >> 16u) & 0x7fffu) > 0x7c00u ? (c.x & 0xffff00ffu) | 0x00007f00u : c.x;
+    c.x = (w.y & 0x7fffu) > 0x7c00u ? (c.x & 0xff00ffffu) | 0x007f0000u : c.x;
+    c.x = ((w.y >> 16u) & 0x7fffu) > 0x7c00u ? (c.x & 0x00ffffffu) | 0x7f000000u : c.x;
+    c.y = (w.z & 0x7fffu) > 0x7c00u ? (c.y & 0xffffff00u) | 0x0000007fu : c.y;
+    c.y = ((w.z >> 16u) & 0x7fffu) > 0x7c00u ? (c.y & 0xffff00ffu) | 0x00007f00u : c.y;
+    c.y = (w.w & 0x7fffu) > 0x7c00u ? (c.y & 0xff00ffffu) | 0x007f0000u : c.y;
+    c.y = ((w.w >> 16u) & 0x7fffu) > 0x7c00u ? (c.y & 0x00ffffffu) | 0x7f000000u : c.y;
     return c;
 }
 #endif
@@ -339,12 +379,13 @@ def _uniform_flow(source, at):
 
 
 def _packed_encode(source):
-    """`f16x2_to_e4m3x2(H2(w), false)` encodes w's two halves; rrE4x2(w) does.
+    """`f16x2_to_e4m3x2(H2(w) | var, false)` encodes two halves via rrE4x2(W).
 
     H2 splits w into two binary16 values and the codec raises them to f32; the
-    helper takes the stored half bits directly.  Same codes (NaN -> 0x7f,
-    saturating round to nearest even), one pack/unpack less per pair. In
-    wave-uniform flow it is rrE4x2W, the hardware conversion (_E4_UNIFORM).
+    helper takes the stored half bits directly.  When passed a f16vec2 variable
+    directly, rrH2U packs its two halves without upconverting to f32.  Same codes
+    (NaN -> 0x7f, saturating round to nearest even). In wave-uniform flow it is
+    rrE4x2W, the hardware conversion (_E4_UNIFORM).
     """
     edits = []
     for _, start, op in _calls(source, ('f16x2_to_e4m3x2',)):
@@ -352,24 +393,214 @@ def _packed_encode(source):
         args = _arguments(source[op + 1:close])
         if len(args) != 2 or args[1].strip() != 'false':
             continue
-        call = _sole_call(args[0])
-        if not call or call[0] != 'H2' or call[2].strip():
-            continue
-        word = _arguments(call[1])
-        if len(word) != 1 or not re.fullmatch(r'\s*[A-Za-z_]\w*\s*', word[0]):
+        arg0 = args[0].strip()
+        call = _sole_call(arg0)
+        if call and call[0] == 'H2' and not call[2].strip():
+            word = _arguments(call[1])
+            if len(word) != 1 or not re.fullmatch(r'\s*[A-Za-z_]\w*\s*', word[0]):
+                continue
+            enc_arg = word[0].strip()
+        elif re.fullmatch(r'[A-Za-z_]\w*', arg0):
+            enc_arg = 'rrH2U(' + arg0 + ')'
+        else:
             continue
         name = 'rrE4x2W' if _uniform_flow(source, start) else 'rrE4x2'
-        edits.append((start, close + 1, name + '(' + word[0].strip() + ')'))
-    if not edits:
-        return source
+        edits.append((start, close + 1, name + '(' + enc_arg + ')'))
+    if edits:
+        source = _apply(source, edits)
     uniform = any(e[2].startswith('rrE4x2W(') for e in edits)
-    source = _apply(source, edits)
+    need_h2u = 'rrH2U(' in source and 'uint rrH2U(' not in source
+    need_e4 = edits and 'uint rrE4H(' not in source
+    need_e4w = uniform and 'uint rrE4x2W(' not in source
+    inject = ((_H2U_HELPER if need_h2u else '') +
+              (_E4_HELPERS if need_e4 else '') +
+              (_E4_UNIFORM if need_e4w else ''))
+    if not inject:
+        return source
     if re.search(r'(?m)^void main\(\)', source):
         at = re.search(r'(?m)^void main\(\)', source).start()
     else:
         at = source.find('#include "rr_wmma.hlsli"')
         at = source.find('\n', at) + 1
-    return source[:at] + _E4_HELPERS + (_E4_UNIFORM if uniform else '') + source[at:]
+    return source[:at] + inject + source[at:]
+
+
+_E4W_STMT = re.compile(
+    r'^(\s*)([A-Za-z_]\w*)\s*=\s*(?:\(\s*)?(rrE4x2W\(([^;{}]+?)\))'
+    r'(?:\s*&\s*0x[fF]{4}u)?(?:\s*\))?\s*;\s*$'
+)
+_E4W_PACK = re.compile(
+    r'^(\s*)([A-Za-z_]\w*)\s*=\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\|\s*'
+    r'\(\s*([A-Za-z_]\w*)\s*<<\s*16u?\s*\)\s*;\s*$'
+)
+_IDENT = re.compile(r'\b([A-Za-z_]\w*)\b')
+_DECL_LINE = re.compile(
+    r'^\s*(?:uint|int|float|float16_t|f16vec2|bool)\s+[A-Za-z_]\w*\s*=\s*(?:0u?|0\.0h?|false)\b'
+)
+
+
+def _batch_e4_uniform(source):
+    """Deduplicate and 4-way batch straight-line rrE4x2W runs into rrE4x2W4."""
+    if 'rrE4x2W(' not in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    # Count identifier occurrences outside pure initializer declaration lines.
+    all_uses = {}
+    for idx, line in enumerate(lines):
+        if _DECL_LINE.match(line):
+            continue
+        for tok in _IDENT.findall(line):
+            all_uses[tok] = all_uses.get(tok, 0) + 1
+
+    out = []
+    batch_seq = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _E4W_STMT.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        # Grow maximal straight-line run without aliasing LHS -> RHS or overwriting LHS.
+        run_items = []
+        run_assigned = set()
+        j = i
+        while j < n:
+            me = _E4W_STMT.match(lines[j])
+            if me:
+                lhs, arg = me.group(2), me.group(4).strip()
+                reads = set(_IDENT.findall(arg))
+                if lhs in run_assigned or (reads & run_assigned):
+                    break
+                run_assigned.add(lhs)
+                run_items.append(('enc', me.group(1), lhs, arg, lines[j]))
+                j += 1
+                continue
+            mp = _E4W_PACK.match(lines[j])
+            if mp:
+                dst, lo, hi = mp.group(2), mp.group(3), mp.group(4)
+                if dst in run_assigned or lo not in run_assigned or hi not in run_assigned:
+                    break
+                run_assigned.add(dst)
+                run_items.append(('pack', mp.group(1), dst, lo, hi, lines[j]))
+                j += 1
+                continue
+            break
+
+        enc_count = sum(1 for x in run_items if x[0] == 'enc')
+        if enc_count < 2:
+            out.extend(lines[i:j])
+            i = j
+            continue
+
+        # Count uses of scalars within this run and outside it.
+        run_lhs_uses = {}
+        run_toks = {}
+        for item in run_items:
+            for tok in _IDENT.findall(item[-1]):
+                run_toks[tok] = run_toks.get(tok, 0) + 1
+            if item[0] == 'pack':
+                run_lhs_uses[item[3]] = run_lhs_uses.get(item[3], 0) + 1
+                run_lhs_uses[item[4]] = run_lhs_uses.get(item[4], 0) + 1
+
+        lhs_to_arg = {item[2]: ' '.join(item[3].split()) for item in run_items if item[0] == 'enc'}
+        ext_live = {
+            lhs for lhs in lhs_to_arg
+            if (all_uses.get(lhs, 0) - run_toks.get(lhs, 0)) > 0
+        }
+
+        indent = run_items[0][1]
+        packs = [x for x in run_items if x[0] == 'pack']
+        # Count how many times each encode arg expression is needed across packs & external uses.
+        arg_freq = {}
+        for p in packs:
+            for s in (p[3], p[4]):
+                a = lhs_to_arg[s]
+                arg_freq[a] = arg_freq.get(a, 0) + 1
+        for lhs in ext_live:
+            a = lhs_to_arg[lhs]
+            arg_freq[a] = arg_freq.get(a, 0) + 1
+
+        # Greedy direct 2-pack (= 4-word) emission when all 4 args are unique & not ext_live.
+        emitted_packs = set()
+        rebuilt = []
+        idx_p = 0
+        while idx_p + 1 < len(packs):
+            p0, p1 = packs[idx_p], packs[idx_p + 1]
+            s4 = (p0[3], p0[4], p1[3], p1[4])
+            a4 = [lhs_to_arg[s] for s in s4]
+            if (not any(s in ext_live for s in s4)
+                    and len(set(a4)) == 4
+                    and all(arg_freq.get(a, 0) == 1 for a in a4)):
+                qvar = f'rr4_q{batch_seq}'
+                batch_seq += 1
+                rebuilt.append(f'{indent}const uint2 {qvar} = rrE4x2W4(uint4({a4[0]}, {a4[1]}, {a4[2]}, {a4[3]}));\n')
+                rebuilt.append(f'{p0[1]}{p0[2]} = {qvar}.x;\n')
+                rebuilt.append(f'{p1[1]}{p1[2]} = {qvar}.y;\n')
+                emitted_packs.add(id(p0))
+                emitted_packs.add(id(p1))
+                idx_p += 2
+            else:
+                idx_p += 1
+
+        # Gather remaining unique expressions needed (preserving appearance order).
+        rem_args = []
+        rem_seen = set()
+        for item in run_items:
+            if item[0] == 'enc':
+                lhs = item[2]
+                a = lhs_to_arg[lhs]
+                if a in rem_seen:
+                    continue
+                used_by_rem_pack = any(
+                    id(p) not in emitted_packs and lhs in (p[3], p[4])
+                    for p in packs
+                )
+                if lhs in ext_live or used_by_rem_pack:
+                    rem_seen.add(a)
+                    rem_args.append(a)
+
+        arg_to_var = {}
+        for off in range(0, len(rem_args), 4):
+            chunk = rem_args[off:off + 4]
+            if len(chunk) == 1:
+                vname = f'rr4_e{batch_seq}'
+                batch_seq += 1
+                rebuilt.append(f'{indent}const uint {vname} = rrE4x2W({chunk[0]});\n')
+                arg_to_var[chunk[0]] = vname
+            else:
+                padded = chunk + ['0u'] * (4 - len(chunk))
+                qvar = f'rr4_q{batch_seq}'
+                batch_seq += 1
+                rebuilt.append(
+                    f'{indent}const uint2 {qvar} = rrE4x2W4(uint4({padded[0]}, {padded[1]}, {padded[2]}, {padded[3]}));\n'
+                )
+                lanes = (f'{qvar}.x & 0xffffu', f'{qvar}.x >> 16u',
+                         f'{qvar}.y & 0xffffu', f'{qvar}.y >> 16u')
+                for k, a in enumerate(chunk):
+                    vname = f'rr4_e{batch_seq}'
+                    batch_seq += 1
+                    rebuilt.append(f'{indent}const uint {vname} = {lanes[k]};\n')
+                    arg_to_var[a] = vname
+
+        for lhs in lhs_to_arg:
+            if lhs in ext_live:
+                rebuilt.append(f'{indent}{lhs} = {arg_to_var[lhs_to_arg[lhs]]};\n')
+        for p in packs:
+            if id(p) not in emitted_packs:
+                vlo = arg_to_var[lhs_to_arg[p[3]]]
+                vhi = arg_to_var[lhs_to_arg[p[4]]]
+                rebuilt.append(f'{p[1]}{p[2]} = ({vlo}) | ({vhi} << 16u);\n')
+
+        out.extend(rebuilt)
+        i = j
+    result = ''.join(out)
+    if 'rrE4x2W4(' in result and 'uint2 rrE4x2W4(' not in result:
+        m_main = re.search(r'(?m)^void main\(\)', result)
+        at = m_main.start() if m_main else (result.find('\n', result.find('#include "rr_wmma.hlsli"')) + 1)
+        result = result[:at] + _E4_UNIFORM4 + result[at:]
+    return result
 
 
 # --------------------------------------------------------------------------- pair accessors
@@ -869,6 +1100,224 @@ def _truncating_masks(source):
                   r'uint16_t(\1)', source)
 
 
+_GA16_LOAD = re.compile(
+    r'^(\s*)([A-Za-z_]\w*)\s*=\s*\(\s*([A-Za-z_]\w*)16\(\s*([^;{}()]+(?:\([^;{}()]*\))?)\s*\+\s*(\d+)u\s*\)\s*\)\s*;\s*$'
+)
+
+
+def _ga16_pairs(source):
+    """Coalesce adjacent 16-bit buffer loads `A16(base + off)` / `A16(base + off+2)` into `A32`."""
+    lines = source.splitlines(keepends=True)
+    out = []
+    seq = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        if i + 1 < n:
+            m0 = _GA16_LOAD.match(lines[i])
+            m1 = _GA16_LOAD.match(lines[i + 1]) if m0 else None
+            if (m0 and m1
+                    and m0.group(3) == m1.group(3)
+                    and m0.group(4).strip() == m1.group(4).strip()
+                    and int(m1.group(5)) == int(m0.group(5)) + 2
+                    and m0.group(2) != m1.group(2)
+                    and not re.search(rf'\b{re.escape(m0.group(2))}\b', m0.group(4))
+                    and f'uint {m0.group(3)}32(' in source):
+                indent, v0, v1 = m0.group(1), m0.group(2), m1.group(2)
+                pfx, base, off = m0.group(3), m0.group(4).strip(), m0.group(5)
+                tmp = f'rrGa{seq}_'
+                seq += 1
+                out.append(f'{indent}const uint {tmp} = {pfx}32({base} + {off}u);\n')
+                out.append(f'{indent}{v0} = {tmp} & 0xffffu;\n')
+                out.append(f'{indent}{v1} = {tmp} >> 16u;\n')
+                i += 2
+                continue
+        out.append(lines[i])
+        i += 1
+    return ''.join(out)
+
+
+_GA32_PAIR = re.compile(
+    r'^([ \t]*)([A-Za-z_]\w*)\s*=\s*GA32\(([^;]+?)\s*\+\s*0u\);\r?\n'
+    r'\1([A-Za-z_]\w*)\s*=\s*GA32\(\3\s*\+\s*4u\);\r?\n',
+    re.M,
+)
+
+
+def _ga32_direct_pairs(source):
+    """Coalesce adjacent `GA32(base + 0u)` / `GA32(base + 4u)` pairs into `GA64(base)`."""
+    if 'GA64(' in source or 'rrGa64_' in source:
+        return source
+    anchor = re.search(r'^uint GA32\(uint a\)[^\n]*\n', source, re.M)
+    if not anchor:
+        return source
+    seq = 0
+
+    def repl(m):
+        nonlocal seq
+        indent, v0, addr, v1 = m.group(1), m.group(2), m.group(3).strip(), m.group(4)
+        if v0 == v1 or re.search(rf'\b{re.escape(v0)}\b', addr):
+            return m.group(0)
+        tmp = f'rrGa64_{seq}_'
+        seq += 1
+        return f'{indent}const uint2 {tmp} = GA64({addr});\n{indent}{v0} = {tmp}.x;\n{indent}{v1} = {tmp}.y;\n'
+
+    out = _GA32_PAIR.sub(repl, source)
+    if seq == 0:
+        return source
+    anchor = re.search(r'^uint GA32\(uint a\)[^\n]*\n', out, re.M)
+    return out[:anchor.end()] + 'uint2 GA64(uint a) { return rrB2.Load2(a); }\n' + out[anchor.end():]
+
+
+_G32_DECL = re.compile(
+    r'^(uint\s+(G[A-Za-z0-9_]*?)32\s*\(\s*uint\s+a\s*\)\s*\{[^\n]*?\b(rrB\d+)\.Load<[^\n]+\}\r?\n)',
+    re.M,
+)
+_G32_QUAD = re.compile(
+    r'^([ \t]*)([A-Za-z_]\w*)\s*=\s*(?P<u2f>uintBitsToFloat\s*\(\s*)?(?P<fn>[A-Za-z_]\w*?32)\((?P<addr>[^;]+?)\s*\+\s*0u\)\s*(?(u2f)\)|);\r?\n'
+    r'\1([A-Za-z_]\w*)\s*=\s*(?(u2f)uintBitsToFloat\s*\(\s*|)(?P=fn)\((?P=addr)\s*\+\s*4u\)\s*(?(u2f)\)|);\r?\n'
+    r'\1([A-Za-z_]\w*)\s*=\s*(?(u2f)uintBitsToFloat\s*\(\s*|)(?P=fn)\((?P=addr)\s*\+\s*8u\)\s*(?(u2f)\)|);\r?\n'
+    r'\1([A-Za-z_]\w*)\s*=\s*(?(u2f)uintBitsToFloat\s*\(\s*|)(?P=fn)\((?P=addr)\s*\+\s*12u\)\s*(?(u2f)\)|);\r?\n',
+    re.M,
+)
+_S16_PAIR = re.compile(
+    r'^([ \t]*)(?P<spfx>[A-Za-z_]\w*?)16\(\s*(?P<addr>[^,;]+?)\s*\+\s*0u\s*,\s*([^;]+?)\s*\)\s*;\r?\n'
+    r'\1(?P=spfx)16\(\s*(?P=addr)\s*\+\s*2u\s*,\s*([^;]+?)\s*\)\s*;\r?\n',
+    re.M,
+)
+_S32_DECL = re.compile(
+    r'^(void\s+(S[A-Za-z0-9_]*?)32\s*\(\s*uint\s+a\s*,\s*uint\s+v\s*\)\s*\{[^\n]*?\b(rrB\d+)\.Store<[^\n]+\}\r?\n)',
+    re.M,
+)
+_S32_PAIR = re.compile(
+    r'^([ \t]*)(?P<spfx>S[A-Za-z0-9_]*?)32\(\s*(?P<addr>[^,;]+?)\s*\+\s*0u\s*,\s*([^;]+?)\s*\)\s*;\r?\n'
+    r'\1(?P=spfx)32\(\s*(?P=addr)\s*\+\s*4u\s*,\s*([^;]+?)\s*\)\s*;\r?\n',
+    re.M,
+)
+
+
+def _quad_32_loads(source):
+    """Coalesce four consecutive `*32(base + 0/4/8/12)` loads into one `Load4`."""
+    decls = {m.group(2) + '32': (m.group(2), m.group(3)) for m in _G32_DECL.finditer(source)}
+    if not decls:
+        return source
+    seq = 0
+    needed = {}
+
+    def repl(m):
+        nonlocal seq
+        indent = m.group(1)
+        f2u = bool(m.group('u2f'))
+        fn = m.group('fn')
+        if fn not in decls or (f'{decls[fn][0]}128(' in source):
+            return m.group(0)
+        addr = m.group('addr').strip()
+        vs = (m.group(2), m.group(6), m.group(7), m.group(8))
+        if len(set(vs)) != 4 or any(re.search(rf'\b{re.escape(v)}\b', addr) for v in vs[:3]):
+            return m.group(0)
+        pfx, buf = decls[fn]
+        fn128 = f'{pfx}128'
+        needed[fn] = (fn128, buf)
+        tmp = f'rrLd4_{seq}_'
+        seq += 1
+        wrap = (lambda c: f'uintBitsToFloat({c})') if f2u else (lambda c: c)
+        return (f'{indent}const uint4 {tmp} = {fn128}({addr});\n'
+                f'{indent}{vs[0]} = {wrap(tmp + ".x")};\n'
+                f'{indent}{vs[1]} = {wrap(tmp + ".y")};\n'
+                f'{indent}{vs[2]} = {wrap(tmp + ".z")};\n'
+                f'{indent}{vs[3]} = {wrap(tmp + ".w")};\n')
+
+    out = _G32_QUAD.sub(repl, source)
+    if not needed:
+        return source
+    edits = []
+    for m in _G32_DECL.finditer(out):
+        full = m.group(2) + '32'
+        if full in needed:
+            fn128, buf = needed[full]
+            if f'uint4 {fn128}(' not in out:
+                edits.append((m.end(), m.end(), f'uint4 {fn128}(uint a) {{ return {buf}.Load4((a >> 2) * 4u); }}\n'))
+    return _apply(out, edits) if edits else out
+
+
+def _store_pairs(source):
+    """Coalesce adjacent `*16(+0/+2)` -> `*32` and `*32(+0/+4)` -> `*64` stores."""
+    def repl16(m):
+        indent, pfx, addr = m.group(1), m.group('spfx'), m.group('addr').strip()
+        lo, hi = m.group(4).strip(), m.group(5).strip()
+        if f'void {pfx}32(' not in source:
+            return m.group(0)
+        return f'{indent}{pfx}32({addr}, (({lo}) & 0xffffu) | (({hi}) << 16u));\n'
+
+    out = _S16_PAIR.sub(repl16, source)
+    sdecls = {m.group(2) + '32': (m.group(2), m.group(3)) for m in _S32_DECL.finditer(out)}
+    if not sdecls:
+        return out
+    needed = {}
+
+    def repl32(m):
+        indent, pfx, addr = m.group(1), m.group('spfx'), m.group('addr').strip()
+        v0, v1 = m.group(4).strip(), m.group(5).strip()
+        fn = pfx + '32'
+        if fn not in sdecls or f'{pfx}64(' in out:
+            return m.group(0)
+        fn64 = f'{pfx}64'
+        needed[fn] = (fn64, sdecls[fn][1])
+        return f'{indent}{fn64}({addr}, uint2({v0}, {v1}));\n'
+
+    out2 = _S32_PAIR.sub(repl32, out)
+    if not needed:
+        return out2
+    edits = []
+    for m in _S32_DECL.finditer(out2):
+        full = m.group(2) + '32'
+        if full in needed:
+            fn64, buf = needed[full]
+            if f'void {fn64}(' not in out2:
+                edits.append((m.end(), m.end(),
+                              f'void {fn64}(uint a, uint2 v) {{ {buf}.Store<vector<uint16_t, 4> >((a >> 1) * 2u, '
+                              'vector<uint16_t, 4>(uint16_t(v.x), uint16_t(v.x >> 16), '
+                              'uint16_t(v.y), uint16_t(v.y >> 16))); }\n'))
+    return _apply(out2, edits) if edits else out2
+
+
+_DIV28_PTX = re.compile(
+    r'^([ \t]*)(\w+)\s*=\s*uint\(int\(\s*\(int64_t\(int\((\w+)\)\)\s*\*\s*int64_t\(int\(0x92492493u\)\)\)\s*>>\s*32\)\);\r?\n'
+    r'\1(\w+)\s*=\s*\2\s*\+\s*\3;\r?\n'
+    r'\1(\w+)\s*=\s*\(\4\)\s*>>\s*\(31u\);\r?\n'
+    r'\1(\w+)\s*=\s*uint\(\s*\(int\(\4\)\)\s*>>\s*4u\);\r?\n'
+    r'\1(\w+)\s*=\s*\6\s*\+\s*\5;',
+    re.M,
+)
+_DIV12_PTX = re.compile(
+    r'^([ \t]*)(\w+)\s*=\s*uint\(int\(\s*\(int64_t\(int\((\w+)\)\)\s*\*\s*int64_t\(715827883\)\)\s*>>\s*32\)\);\r?\n'
+    r'\1(\w+)\s*=\s*\(\2\)\s*>>\s*\(31u\);\r?\n'
+    r'\1(\w+)\s*=\s*uint\(\s*\(int\(\2\)\)\s*>>\s*1u\);\r?\n'
+    r'\1(\w+)\s*=\s*\5\s*\+\s*\4;',
+    re.M,
+)
+
+
+def _fast_div_and_m24(source):
+    """Replace small-range PTX 64-bit magic div28/div12 and mask quotient stride muls to u24."""
+    qs = set()
+
+    def repl28(m):
+        qs.add(m.group(7))
+        return f'{m.group(1)}{m.group(7)} = (({m.group(3)} & 0xffffffu) * 2341u) >> 16u;'
+
+    def repl12(m):
+        qs.add(m.group(6))
+        return f'{m.group(1)}{m.group(6)} = (({m.group(3)} & 0xffffffu) * 5462u) >> 16u;'
+
+    out = _DIV28_PTX.sub(repl28, source)
+    out = _DIV12_PTX.sub(repl12, out)
+    if not qs:
+        return source
+    pat = re.compile(r'\b(' + '|'.join(re.escape(q) for q in sorted(qs)) + r')\s*\*\s*(12u|28u|48u|96u|224u)\b')
+    return pat.sub(r'(\1 & 0xffffffu) * \2', out)
+
+
 def optimize(source, stage):
     """Peephole-optimize translated F reconstruction HLSL (bindings unchanged).
 
@@ -884,7 +1333,14 @@ def optimize(source, stage):
     source = _half_roundtrips(source)
     source = _codec(source)
     source = _packed_encode(source)
+    source = _batch_e4_uniform(source)
     source = _pair_accessors(source)
+    source = _ga16_pairs(source)
+    source = _ga32_direct_pairs(source)
+    if stage != 'post':
+        source = _quad_32_loads(source)
+    source = _store_pairs(source)
+    source = _fast_div_and_m24(source)
     types = _declarations(source)
     source = _drop_redundant_casts(source, types)
     source = _rewrite_assignments(source, types)

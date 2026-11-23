@@ -302,8 +302,9 @@ void stage_plane(Plane plane, const Staging& staging, HostPlane& host, FrameTimi
 {
     const size_t texelBytes = (plane_format(plane) == CUDA_FORMAT_HALF ? 2 : 4) * plane_channels(plane);
     const size_t packedRowBytes = texelBytes * staging.width;
-    host.rowBytes = std::max(rowPitch, packedRowBytes);
-    reserve_host(host, host.rowBytes * staging.height);
+    const size_t desiredRowBytes = std::max(rowPitch, packedRowBytes);
+    reserve_host(host, desiredRowBytes * staging.height);
+    host.rowBytes = desiredRowBytes;
     host.width = staging.width;
     host.height = staging.height;
     uint8_t* rows = host.bytes;

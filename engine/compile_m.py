@@ -91,7 +91,8 @@ def build_dxil(output, ldr, preset_l=False, target='windows'):
     for name, out, wpw in builds:
         C, heads, NPM, CIN = mm.LAYERS[name]
         kind = {'enc0l': 3, 'dec0l': 4}.get(name, 1 if NPM else 2 if CIN else 0)
-        schedule = ([f'-DWPW={wpw or (1 if name == "enc3_tube" else 2)}'] + ([] if name == 'enc3_tube' else ['-DM_ACC32=1'])) if tuned else []
+        schedule = (([f'-DWPW={wpw or (1 if name == "enc3_tube" else 2)}'] if tuned else []) +
+                    (['-DM_ACC32=1'] if (not EXACT and name != 'enc3_tube') else []))
         args = [dxc, '-nologo', '-T', 'cs_6_6', '-E', 'main', '-HV', '2021', '-enable-16bit-types',
                 '-O1' if tuned else '-O3',
                 '-I', str(HERE / 'd3d12'), f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}',
@@ -130,10 +131,11 @@ def build_dxil(output, ldr, preset_l=False, target='windows'):
     # each for 2-4 us: their values become FP8 network inputs), as does M_EXACT
     # vkd3d: the plain casts, which round to nearest even there (RX 9070 XT, M reconstruction 657 -> 597 us, Vulkan 565)
     native = ['-DD4R_VKD3D=1'] if target == 'vkd3d' else [] if EXACT else ['-DD4R_NATIVE_HALF=1']
+    rne_ags = ['-DD4R_RNE16_EXTERNAL=1', '-DD4R_RNE16_AGS_SCALAR=1'] if (target == 'windows' and EXACT) else []
     if preset_l:
         marker = output / 'l_display_mv.bin'
         marker.unlink(missing_ok=True)
-        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_lf.dxil', ['-DL_FEATURES=1'] + ldr_define + ags, wave=32)
+        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_lf.dxil', ['-DL_FEATURES=1'] + ldr_define + ags + rne_ags, wave=32)
         # the reconstruction one render texel wider per tier than M's (compile_l). DISPLAY_MV: the game's
         # display-resolution motion (binding 12) when mvSize is set, as post_l_dot2 and the RDNA 3 stages take it; the
         # input stage (enc0_lf, enc0_lx) reads it through enc0_features.glsl. l_display_mv.bin tells the runtime
@@ -141,20 +143,21 @@ def build_dxil(output, ldr, preset_l=False, target='windows'):
         tiers = (('post_l', 11), ('post_l_q', 16), ('post_l_c', 12))
         for out, tile in tiers:
             hlsl_build.build(HERE / 'post_m.comp', output / (out + '.dxil'),
-                             ['-DPRESET_L=1', '-DDISPLAY_MV=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr_define + exact + native, wave=64)
+                             ['-DPRESET_L=1', '-DDISPLAY_MV=1', f'-DTILE_W={tile}', f'-DTILE_H={tile}'] + ldr_define + exact + native + rne_ags, wave=64)
         marker.write_bytes(b'D4RLDMV1')
     else:
-        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_m.dxil', ldr_define + ags, wave=32)
-        hlsl_build.build(HERE / 'dec0_m.comp', output / 'dec0_m.dxil', ags, wave=32)
+        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_m.dxil', ldr_define + ags + rne_ags, wave=32)
+        hlsl_build.build(HERE / 'dec0_m.comp', output / 'dec0_m.dxil', ags + rne_ags, wave=32)
         # the same stages with the token buffers in NGX's plane layout, for the native HIP network (runtime_m_d3d12.cpp)
-        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_m_planes.dxil', ['-DPLANES=1'] + ldr_define + ags, wave=32)
-        hlsl_build.build(HERE / 'dec0_m.comp', output / 'dec0_m_planes.dxil', ['-DPLANES=1'] + ags, wave=32)
+        hlsl_build.build(HERE / 'enc0_m.comp', output / 'enc0_m_planes.dxil', ['-DPLANES=1'] + ldr_define + ags + rne_ags, wave=32)
+        hlsl_build.build(HERE / 'dec0_m.comp', output / 'dec0_m_planes.dxil', ['-DPLANES=1'] + ags + rne_ags, wave=32)
         for out, flags in (('post_m', []), ('post_m_q', ['-DTILE_W=15', '-DTILE_H=15']), ('post_m_c', ['-DTILE_W=11', '-DTILE_H=11'])):
-            hlsl_build.build(HERE / 'post_m.comp', output / (out + '.dxil'), flags + ldr_define + exact + native, wave=64)
+            hlsl_build.build(HERE / 'post_m.comp', output / (out + '.dxil'), flags + ldr_define + exact + native + rne_ags, wave=64)
     for out, flags in (('down_m', []), ('down_m_rgb10', ['-DOUTPUT_RGB10=1'])):
-        hlsl_build.build(HERE / 'down_m.comp', output / (out + '.dxil'), flags + ldr_define + native, wave=64)
+        hlsl_build.build(HERE / 'down_m.comp', output / (out + '.dxil'), flags + ldr_define + native + rne_ags, wave=64)
     for p in '01':
-        hlsl_build.build(HERE / 'exposure_k.comp', output / f'exposure_m{p}.dxil', ['-DMODE=1', '-DPASS=' + p], wave=64)
+        hlsl_build.build(HERE / 'exposure_k.comp', output / f'exposure_m{p}.dxil', ['-DMODE=1', '-DPASS=' + p] + rne_ags,
+                         wave=32 if target == 'windows' else 64)
 
 
 def blob_of(directory, ptr_offset=0):

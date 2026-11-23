@@ -340,14 +340,14 @@ def build_f(model, output, lines, compiler):
         # intrinsic; dialect_hlsl.h's software d4rRne16 rounds to nearest even
         # as the Vulkan build does (no truncating D3D12 cast).
         hlsl.write_text(translate(exposure_f_source(model,p),0,speed=False,precise=True))
-        compile_dxil(hlsl,output,compiler,64)
+        compile_dxil(hlsl,output,compiler,64 if '-DD4R_VKD3D=1' in _TARGET_DEFINES else 32)
         exposure.append(f'exposure_f{p}.dxil')
     if '-DD4R_VKD3D=1' in _TARGET_DEFINES:
         # vkd3d-proton: both passes in one with 64-bit atomics, the last block finishing, as the Vulkan build's
         # exposure_f2.spv; the second pass's single workgroup cost as much as the first pass's grid
         hlsl=output/'exposure_f2.hlsl'
         hlsl.write_text(exposure_one_pass(translate(exposure_f_source(model,2),0,speed=False,precise=True)))
-        compile_dxil(hlsl,output,compiler,64)
+        compile_dxil(hlsl,output,compiler,64 if '-DD4R_VKD3D=1' in _TARGET_DEFINES else 32)
         exposure.append('exposure_f2.dxil')
     (output/'rr-d3d12.txt').write_text('D4RRDX01\n'+'\n'.join(scratch)+'\n',newline='\n')
     (output/'rr-d3d12.json').write_text(json.dumps({'preset':6,'format':'D4RR0002','arithmetic':'gfx12 relaxed',

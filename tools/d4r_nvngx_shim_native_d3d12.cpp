@@ -330,6 +330,47 @@ d4r::dx::rdna3::MModel* native_engine_m_rdna3(bool ldr, bool presetL)
     return g_engineDx.modelMRdna3[presetL][ldr].get();
 }
 
+bool native_engine_package_present(bool ldr)
+{
+    const std::string directory = ldr ? engine_model_directory("D4R_ENGINE_MODEL_LDR_DIR", L"\\engine\\k-ldr")
+                                      : engine_model_directory("D4R_ENGINE_MODEL_DIR", L"\\engine\\k");
+    return GetFileAttributesA((directory + "/output_k.dxil").c_str()) != INVALID_FILE_ATTRIBUTES &&
+           GetFileAttributesA((directory + "/weights.bin").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool native_engine_m_present(bool ldr, bool presetL)
+{
+    const std::string directory = engine_m_directory(ldr, presetL);
+    if (GetFileAttributesA((directory + "/offsets.bin").c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false;
+    const std::string backend = env_string("D4R_ENGINE_M_BACKEND");
+    if (backend == "fp8" || (backend != "rdna3" && rdna4_installed()))
+        return GetFileAttributesA((directory + "/d3d12_ml.bin").c_str()) != INVALID_FILE_ATTRIBUTES ||
+               GetFileAttributesA((directory + (presetL ? "/enc0_lf.dxil" : "/enc0_m.dxil")).c_str()) != INVALID_FILE_ATTRIBUTES;
+    return GetFileAttributesA((directory + "/rdna3/d3d12_ml.bin").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool native_engine_rr_present(unsigned preset)
+{
+    if (preset < 4 || preset > 6) return false;
+    const unsigned i = preset - 4;
+    static const char* variables[] = {"D4R_ENGINE_MODEL_RR_D_DIR", "D4R_ENGINE_MODEL_RR_E_DIR", "D4R_ENGINE_MODEL_RR_F_DIR"};
+    static const wchar_t* folders[] = {L"\\engine\\rr-d", L"\\engine\\rr-e", L"\\engine\\rr-f"};
+    static const char* gfx11Variables[] = {"D4R_ENGINE_MODEL_RR_D_GFX11_DIR", "D4R_ENGINE_MODEL_RR_E_GFX11_DIR"};
+    static const wchar_t* gfx11Folders[] = {L"\\engine\\rr-d-gfx11", L"\\engine\\rr-e-gfx11"};
+    const bool fp8 = rdna4_installed() || env_string("D4R_ENGINE_M_BACKEND") == "fp8";
+    const bool gfx11 = !fp8 && i < 2 && amd_render_generation(g.device) == AmdGeneration::Rdna3 &&
+                       env_uint("D4R_D3D12_RR_GFX11", 1) != 0;
+    const auto directory = gfx11 ? engine_model_directory(gfx11Variables[i], gfx11Folders[i])
+                                 : engine_model_directory(variables[i], folders[i]);
+    if (GetFileAttributesA((directory + "/rr-d3d12.txt").c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false;
+    std::string metadata;
+    const bool packageGfx11 = read_whole_file(widen(directory + "\\rr.txt"), metadata) &&
+                              metadata.find("\narithmetic gfx11") != std::string::npos;
+    return fp8 ? !packageGfx11 : packageGfx11;
+}
+
 bool native_engine_available(bool ldr)
 {
     if (ldr)

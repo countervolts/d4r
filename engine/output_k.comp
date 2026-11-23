@@ -54,9 +54,9 @@ layout(set = 0, binding = 0, std430) readonly buffer Params
 }
 #ifdef D4R_HLSL
 ;
-RWStructuredBuffer<Params> p_buf : register(u0);
+ByteAddressBuffer p_buf : register(t0);
 static Params p;
-#define D4R_HLSL_INIT_CALL p = p_buf[0];
+#define D4R_HLSL_INIT_CALL p = p_buf.Load<Params>(0);
 D4R_SAMPLER(colorTex, t1, s1)
 D4R_SAMPLER(histTex, t2, s2)
 D4R_SAMPLER(hiresTex, t3, s3)
@@ -66,9 +66,9 @@ RWTexture2D<float4> histOut : register(u6);
 RWTexture2D<uint> hiresOut : register(u7);
 RWTexture2D<float4> tokOut : register(u8);
 RWTexture2D<FINAL_OUTPUT_TYPE> finalOut : register(u9);
-RWByteAddressBuffer head_b : register(u10);
+ByteAddressBuffer head_b : register(t10);
 StructuredBuffer<uint4> lut_e : register(t11);
-struct HeadWords { RWByteAddressBuffer b; float16_t operator[](uint i) { return b.Load<float16_t>(i * 2u); } };
+struct HeadWords { ByteAddressBuffer b; float16_t operator[](uint i) { return b.Load<float16_t>(i * 2u); } };
 struct Head { HeadWords h; };
 struct Lut { StructuredBuffer<uint4> e; };
 static const Head head = { { head_b } };    // from the resource itself: see coopmat_ags.hlsli
@@ -87,11 +87,18 @@ layout(set = 0, binding = 9, FINAL_OUTPUT_FORMAT) uniform writeonly FINAL_OUTPUT
 layout(set = 0, binding = 10, std430) readonly buffer Head { float16_t h[]; } head;       // 40 values per token: 4 sub-blocks x 10
 layout(set = 0, binding = 11, std430) readonly buffer Lut { uvec4 e[]; } lut;
 #endif
-shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
-shared float tileD[576];
 #ifdef D4R_HLSL
-shared uint brightQuad[256];  // one flag per pixel of the 16x16 group (see "bright" below)
+shared uvec2 tileC_p[576];
+f16vec4 loadTileC(int idx) { const uvec2 p_ = tileC_p[idx]; return f16vec4(unpackFloat2x16(p_.x), unpackFloat2x16(p_.y)); }
+float loadTileCY(int idx) { return f16tof32(tileC_p[idx].x); }
+void storeTileC(int idx, f16vec4 v) { tileC_p[idx] = uvec2(packFloat2x16(v.xy), packFloat2x16(v.zw)); }
+#else
+shared f16vec4 tileC[576];     // compressed Y, Co, Cg and alpha of the footprint, 24 texels per row
+#define loadTileC(i) tileC[i]
+#define loadTileCY(i) float(tileC[i].x)
+#define storeTileC(i, v) (tileC[i] = (v))
 #endif
+shared float tileD[576];
 // The Windows D3D12 reconstruction (compile_k.py's D4R_FILTER_F32 build; not vkd3d, which builds this file without
 // it) takes a few paths of its own, noted where they appear: AMD's D3D12 compiler compiles this stage to ~3.2k
 // scalar instructions with six waves per SIMD, so it wants fewer of them and fewer live registers. Vulkan, vkd3d
@@ -266,26 +273,31 @@ float crPass(float t0, float t1, float t2, float t3, CrAxis c)
 // there). 0/0 would then zero the whole pixel through the finiteness check below (the black speckles the half
 // filter had); that check's branch instead gives such a sub-pixel the pixel's bilinear current luma, so the hot
 // path carries no guard at all. (RGA gfx1201, the whole stage: 106 VGPRs and 2876 instructions, from 112 and 3121.)
-void gaussPair(vec2 fA, vec2 fB, float fline0, float f0, float f1, float f2, float fs, int a0, int stepA, int stepB,
-               out vec2 sumY, out vec2 sumW)
+// The 12-tap anisotropic Gaussian for all four sub-pixels sharing the 12 tile taps and tap coordinates.
+void gaussQuad(vec2 pA, vec2 pB, float fline0, float f0, float f1, float f2, float fs, int a0, int stepA, int stepB,
+               out vec4 sumY, out vec4 sumW)
 {
-    sumY = vec2(0.0); sumW = vec2(0.0);
+    sumY = vec4(0.0); sumW = vec4(0.0);
     float fline = fline0;
     for (int r = 0; r < 4; ++r)
     {
         const int bs = int(roundEven(fline)) - 1;
-        const vec2 dA = float(a0 + r) - fA;
-        vec2 db = float(bs) - fB;
+        const vec2 dA = float(a0 + r) - pA;
+        vec2 db = float(bs) - pB;
+        const vec2 a2 = (dA * dA) * f0;
         const vec2 cross = dA * f2;
-        vec2 lin = fma(db, cross, (dA * dA) * f0);
-        const int ti = (a0 + r) * stepA + bs * stepB;
+        vec4 lin = fma(vec4(db.xy, db.xy), vec4(cross.xx, cross.yy), vec4(a2.xx, a2.yy));
+        const vec4 cr4 = vec4(cross.xx, cross.yy);
+        int ti = int((uint(a0 + r) & 63u) * uint(stepA) + (uint(bs) & 63u) * uint(stepB));
         for (int j = 0; j < 3; ++j)
         {
-            const vec2 E = fma(db * db, vec2(f1), lin);
-            const vec2 w = exp2(E), Y = vec2(float(tileC[ti + j * stepB].x));
-            sumY = fma(w, Y, sumY);
-            sumW += w;
-            db += 1.0; lin += cross;
+            const vec2 db2f1 = (db * db) * f1;
+            const vec4 E = vec4(db2f1.xy, db2f1.xy) + lin;
+            const vec4 w = exp2(E);
+            const float Y = loadTileCY(ti);
+            if (r == 0 && j == 0) { sumY = w * Y; sumW = w; }
+            else { sumY = fma(w, vec4(Y), sumY); sumW += w; }
+            db += 1.0; lin += cr4; ti += stepB;
         }
         fline += fs;
     }
@@ -301,12 +313,46 @@ void gaussPair(vec2 fA, vec2 fB, float fline0, float f0, float f1, float f2, flo
 #endif
 void main()
 {
+#if defined(D4R_HLSL) && defined(D4R_OUT_SWZ_W) && D4R_OUT_SWZ_W > 0
+    const uint nwgX = (uint(p.outSize.x) + 15u) >> 4u;
+    const uint nwgY = (uint(p.outSize.y) + 15u) >> 4u;
+    const uint swzW = uint(D4R_OUT_SWZ_W);
+    const uint idx = gl_WorkGroupID.y * nwgX + gl_WorkGroupID.x;
+    const uint fullW = (nwgX / swzW) * swzW;
+    const uint fullN = fullW * nwgY;
+    uvec2 wg;
+    if (idx < fullN)
+    {
+        const uint stripeN = swzW * nwgY;
+        const uint stripe = idx / stripeN;
+        const uint rem = idx - stripe * stripeN;
+        uint wy = rem / swzW;
+        const uint wx = stripe * swzW + (rem - wy * swzW);
+#if !defined(D4R_OUT_SWZ_NOSERP) || !D4R_OUT_SWZ_NOSERP
+        if ((stripe & 1u) != 0u) wy = nwgY - 1u - wy;
+#endif
+        wg = uvec2(wx, wy);
+    }
+    else
+    {
+        const uint remW = nwgX - fullW;
+        const uint rem = idx - fullN;
+        const uint wy = rem / remW;
+        wg = uvec2(fullW + (rem - wy * remW), wy);
+    }
+#if defined(D4R_OUT_SWZ_REV) && D4R_OUT_SWZ_REV
+    wg = uvec2(nwgX - 1u - wg.x, nwgY - 1u - wg.y);
+#endif
+    const ivec2 pix = ivec2(wg * 16u + gl_LocalInvocationID.xy);
+#else
+    const uvec2 wg = gl_WorkGroupID.xy;
     const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+#endif
     const vec2 pc = vec2(pix) + 0.5;
     const bool displayMv = (p.flags & 4u) != 0u;
     // ---------------------------------------------------------------- 1. footprint of the block
-    const vec2 b0 = (vec2(gl_WorkGroupID.xy * 16u) + 0.5) * p.out2rnd + p.rndOffs;
-    const vec2 b1 = (vec2(gl_WorkGroupID.xy * 16u + 15u) + 0.5) * p.out2rnd + p.rndOffs;
+    const vec2 b0 = (vec2(wg * 16u) + 0.5) * p.out2rnd + p.rndOffs;
+    const vec2 b1 = (vec2(wg * 16u + 15u) + 0.5) * p.out2rnd + p.rndOffs;
     const ivec2 t0 = ivec2(vec2(roundHalfAway(b0.x), roundHalfAway(b0.y)) - 4.0);
     const ivec2 t1 = ivec2(vec2(roundHalfAway(b1.x), roundHalfAway(b1.y)) + 4.0);
     const int tw = t1.x - t0.x + 1, th = t1.y - t0.y + 1;
@@ -342,7 +388,7 @@ void main()
 #if K_LIN_FILTER
         tileL[TI(t.y, t.x)] = L;
 #endif
-        tileC[TI(t.y, t.x)] = f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a);
+        storeTileC(TI(t.y, t.x), f16vec4(L * k, p.expo * (0.5 * rgb.r - 0.5 * rgb.b) * k, p.expo * (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) * k, c.a));
         // larger = nearer: regular depth is negated, which turns its "nearest" comparisons into the inverted ones
         if (!displayMv)
         {
@@ -361,7 +407,11 @@ void main()
     const uint hbase = (((tku.y >> 1u) & 0x7ffu) * (uint(p.tokW) & 0x3fffu) + (tku.x >> 1u)) * 40u + ((tku.y & 1u) * 2u + (tku.x & 1u)) * 10u;
 #endif
     // sigmoid of a head word (the reference's fma chain: y = x * (x^2 + 27) / fma(x^2, 9, 27), sat(0.5*y + 0.5))
+#ifdef D4R_HLSL
+    const float x = 0.5 * f16tof32(head_b.Load((hbase + 8u) * 2u) >> 16u);
+#else
     const float x = 0.5 * float(head.h[hbase + 9u]);
+#endif
     precise const float x2 = x * x;
     const float sig = clamp(x < -3.0 ? 0.0 : x > 3.0 ? 1.0
                           : fma((x * (x2 + 27.0)) / fma(x2, 9.0, 27.0), 0.5, 0.5), 0.0, 1.0);
@@ -440,7 +490,13 @@ void main()
         // stored luma at 0.99 and above is an encoding of [0.99, 1): rare enough to branch on
         if (!(gm < 0.99))
         {
+#ifdef D4R_HLSL
+            [[unroll]]
+#endif
             for (int r = 0; r < 5; ++r)
+#ifdef D4R_HLSL
+                [[unroll]]
+#endif
                 for (int c = 0; c < 5; ++c)
                     T[r][c] = softIn(vec4(T[r][c])).x;
         }
@@ -474,14 +530,26 @@ void main()
         // sharpened taps do nothing here; the column pass below keeps them (rows can overshoot).
         const CrAxis cx = crAxis(x0, x1, x2, x3, mx), cy = crAxis(y0, y1, y2, y3, my);
         float R[5][2];
+#ifdef D4R_HLSL
+        [[unroll]]
+#endif
         for (int r = 0; r < 5; ++r)
+#ifdef D4R_HLSL
+            [[unroll]]
+#endif
             for (int c = 0; c < 2; ++c)
 #if D4R_WIN_OUTPUT
                 R[r][c] = crPassRow(T[r][c], T[r][c + 1], T[r][c + 2], T[r][c + 3], cx);
 #else
                 R[r][c] = crPass(T[r][c], T[r][c + 1], T[r][c + 2], T[r][c + 3], cx);
 #endif
+#ifdef D4R_HLSL
+        [[unroll]]
+#endif
         for (int sy = 0; sy < 2; ++sy)
+#ifdef D4R_HLSL
+            [[unroll]]
+#endif
             for (int sx = 0; sx < 2; ++sx)
             {
                 const float v = crPass(R[sy][sx], R[sy + 1][sx], R[sy + 2][sx], R[sy + 3][sx], cy);
@@ -503,13 +571,19 @@ void main()
         }
         else
         {
-            for (int s = 0; s < 4; ++s)
+    #ifdef D4R_HLSL
+        [[unroll]]
+#endif
+        for (int s = 0; s < 4; ++s)
             {
                 const float L = p.expoRatio * (Hq[s] * expandK(Hq[s]));
                 Hq[s] = L * compressK(L);
             }
         }
 #else
+#ifdef D4R_HLSL
+        [[unroll]]
+#endif
         for (int s = 0; s < 4; ++s)
         {
             const float L = p.expoRatio * (Hq[s] * expandK(Hq[s]));
@@ -535,16 +609,18 @@ void main()
     precise const vec2 currentPos = fma(pc, p.out2rnd, p.rndOffs);
     precise const vec2 currentLocal = currentPos - vec2(t0);
     const f16vec2 u = f16vec2(currentLocal);
+#elif defined(D4R_HLSL) && D4R_RNE16_EXACT && !D4R_RNE16_EXTERNAL
+    const f16vec2 u = float16_t2(d4rRne16PosFinite(pc * p.out2rnd + p.rndOffs - vec2(t0)));
 #else
     const f16vec2 u = f16vec2(pc * p.out2rnd + p.rndOffs - vec2(t0));
 #endif
     const ivec2 ui = ivec2(floor(vec2(u)));
     const f16vec2 uf = clamp(u - f16vec2(ui), float16_t(0.0), float16_t(1.0)), ug = float16_t(1.0) - uf;
     const int ci = TI(ui.y, ui.x);
-    f16vec4 curh = tileC[ci] * (ug.x * ug.y);
-    curh = fma(tileC[ci + 1], f16vec4(uf.x * ug.y), curh);
-    curh = fma(tileC[ci + 24], f16vec4(ug.x * uf.y), curh);
-    curh = fma(tileC[ci + 25], f16vec4(uf.x * uf.y), curh);
+    f16vec4 curh = loadTileC(ci) * (ug.x * ug.y);
+    curh = fma(loadTileC(ci + 1), f16vec4(uf.x * ug.y), curh);
+    curh = fma(loadTileC(ci + 24), f16vec4(ug.x * uf.y), curh);
+    curh = fma(loadTileC(ci + 25), f16vec4(uf.x * uf.y), curh);
     vec4 cur = vec4(curh);
     // "bright" over the 2x2 pixel quad: the lanes of a subgroup are the pixels of two rows, x + 16 * (y & 1)
     uint bright = cur.x > 0.8 ? 1u : 0u;
@@ -552,37 +628,39 @@ void main()
     // The builder enables its wave exchange explicitly; the Windows driver
     // retains the shared-memory exchange below.
 #if defined(D4R_HLSL) && !D4R_OUTPUT_WAVE_BRIGHT
-    // Through shared memory instead: AMD's D3D12 compiler does not give WaveReadLaneAt with a per-lane index
-    // (subgroupShuffleXor in dialect_hlsl.h) the quad's lanes here, which left bright highlights on the
-    // non-bright reconstruction table (about twice as bright as NGX at HDR highlights, RX 9070 XT, 2026-10-23).
-    // Not re-tested on 2026-11-05: neither the harness's scenes nor five captured game frames have a quad of mixed
-    // brightness (removing the exchange leaves them byte-identical), so they cannot show whether the shuffle works
-    // now. With the Windows build's changes below this exchange costs nothing measurable, so it stays.
-    brightQuad[gl_LocalInvocationIndex] = bright;
-    barrier();
-    const uint qx = gl_LocalInvocationID.x, qy = gl_LocalInvocationID.y;
-    bright |= brightQuad[qy * 16u + (qx ^ 1u)] | brightQuad[(qy ^ 1u) * 16u + qx] | brightQuad[(qy ^ 1u) * 16u + (qx ^ 1u)];
+    // QuadReadAcrossX/Y operate strictly on the driver's 2x2 pixel quad (verified bit-identical on mixed-bright quads,
+    // unlike WaveReadLaneAt(..., ^ 16u) which assumed linear lane numbering), eliminating shared memory and a barrier.
+    bright |= QuadReadAcrossX(bright);
+    bright |= QuadReadAcrossY(bright);
 #else
     bright |= subgroupShuffleXor(bright, 16u);
     bright |= subgroupShuffleXor(bright, 1u);
 #endif
     // ---------------------------------------------------------------- 4. kernel-predicted luma filter
+#ifdef D4R_HLSL
+    const f16vec2 hm = unpackFloat2x16(head_b.Load(hbase * 2u));
+#else
     const f16vec2 hm = f16vec2(head.h[hbase], head.h[hbase + 1u]);
+#endif
     const f16vec2 m = f16vec2(vec2(hm) / vec2(float16_t(1.0) + abs(hm)));
     const ivec2 mi = clamp(ivec2(roundEven(vec2(m * float16_t(p.lutScale)))) + 8, 0, 15);
     const uint fl = (bright << 2) | ((sig < 0.25 && f343 < 0.25) ? 2u : 0u) | (p.alphaThr > f343 ? 1u : 0u);
     const uvec4 le = lut.e[(((p.flags >> 8) & 15u) << 11) | (fl << 8) | uint(mi.x << 4) | uint(mi.y)];
-    const float16_t e0 = uint16BitsToFloat16(uint16_t(le.x & 0xffffu)), e1 = uint16BitsToFloat16(uint16_t(le.x >> 16));
-    const float16_t e2 = uint16BitsToFloat16(uint16_t(le.y & 0xffffu)), slope = uint16BitsToFloat16(uint16_t(le.y >> 16));
+    const float16_t e0 = uint16BitsToFloat16(uint16_t(le.x)), e1 = uint16BitsToFloat16(uint16_t(le.x >> 16));
+    const float16_t e2 = uint16BitsToFloat16(uint16_t(le.y)), slope = uint16BitsToFloat16(uint16_t(le.y >> 16));
     const bool alongX = (le.z & 0xffffu) == 0u;          // rows of taps step in y, taps within a row step in x
-    const float16_t e5 = uint16BitsToFloat16(uint16_t(le.z >> 16)), e6 = uint16BitsToFloat16(uint16_t(le.w & 0xffffu));
+    const float16_t e5 = uint16BitsToFloat16(uint16_t(le.z >> 16)), e6 = uint16BitsToFloat16(uint16_t(le.w));
     // sub-pixel positions in tile coordinates: s = sy * 2 + sx
     // The reference fuses the scale and the offset and subtracts the tile origin afterwards. The order matters
     // where a position falls on a half-float rounding tie (a whole output column at some size ratios): any other
     // order moves those samples by one half-float step, which the recurrent history then spreads over the frame.
     precise const vec2 sa0 = fma(vec2(pix * 2) + 0.5, p.sub2rnd, p.rndOffs), sa1 = fma(vec2(pix * 2 + 1) + 0.5, p.sub2rnd, p.rndOffs);
     precise const vec2 sq0 = sa0 - vec2(t0), sq1 = sa1 - vec2(t0);
+#if defined(D4R_HLSL) && D4R_RNE16_EXACT && !D4R_RNE16_EXTERNAL
+    const f16vec2 sp0 = float16_t2(d4rRne16PosFinite(sq0)), sp1 = float16_t2(d4rRne16PosFinite(sq1));
+#else
     const f16vec2 sp0 = f16vec2(sq0), sp1 = f16vec2(sq1);
+#endif
     const f16vec4 subX = f16vec4(sp0.x, sp1.x, sp0.x, sp1.x), subY = f16vec4(sp0.y, sp0.y, sp1.y, sp1.y);
     const f16vec4 subA = alongX ? subY : subX, subB = alongX ? subX : subY;
     const float16_t cA = alongX ? u.y : u.x, cB = alongX ? u.x : u.y;
@@ -615,7 +693,7 @@ void main()
         {
             // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
             const float16_t E = fma(db * db, float16_t(e1), lin);
-            const float16_t w = exp2(E), Y = float16_t(tileC[ti + j * stepB].x);
+            const float16_t w = exp2(E), Y = float16_t(loadTileCY(ti + j * stepB));
             sumY = fma(w, Y, sumY); sumW += w;
             const bool gt = !(eMax > E);      // a later tap wins ties
             eMax = mix(eMax, E, gt); yMax = mix(yMax, Y, gt);
@@ -637,15 +715,15 @@ void main()
     // and the replay agree byte for byte, 83-89 dB from the half filter on one frame, 67 dB after 30 frames.
     vec4 F;
     {
-        // Two sub-pixel pairs one after the other rather than four lanes at once: the same operations in the same
-        // order per lane, but half the live registers in the loop.
-        const vec4 fA = vec4(subA), fB = vec4(subB);
+        // Compute all four sub-pixels in one shared pass: 12 tile loads instead of 24 and 2 unique coordinate pairs.
+        const vec2 pA = alongX ? vec2(sp0.y, sp1.y) : vec2(sp0.x, sp1.x);
+        const vec2 pB = alongX ? vec2(sp0.x, sp1.x) : vec2(sp0.y, sp1.y);
         const float f0 = float(e0), f1 = float(e1), f2 = float(e2), fs = float(slope);
         const float fline0 = float(cB) + (float(a0) - float(cA)) * fs;
-        vec2 sY[2], sW[2];
-        gaussPair(fA.xy, fB.xy, fline0, f0, f1, f2, fs, a0, stepA, stepB, sY[0], sW[0]);
-        gaussPair(fA.zw, fB.zw, fline0, f0, f1, f2, fs, a0, stepA, stepB, sY[1], sW[1]);
-        F = vec4(sY[0] / sW[0], sY[1] / sW[1]);
+        vec4 sY, sW;
+        gaussQuad(pA, pB, fline0, f0, f1, f2, fs, a0, stepA, stepB, sY, sW);
+        const vec4 qF = sY / sW;
+        F = alongX ? qF : qF.xzyw;
     }
 #else
 #if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
@@ -678,7 +756,7 @@ void main()
         {
             // Keep the rounded exponent in f16 through exp2; avoids f16/f32 conversions.
             const f16vec4 E = fma(db * db, f16vec4(e1), lin);
-            const f16vec4 w = exp2(E), Y = f16vec4(tileC[ti + TJ(j, stepB)].x);
+            const f16vec4 w = exp2(E), Y = f16vec4(loadTileCY(ti + TJ(j, stepB)));
 #if defined(D4R_HLSL) && D4R_FILTER_ACCUM_F32
             sumY = fma(vec4(w), vec4(Y), sumY);
             sumW += vec4(w);
@@ -722,7 +800,11 @@ void main()
     // `fma bl, F - Hq, Hq` that forms N), and the normalisation and the low-exponent fallback also produce
     // halves. Keeping it f32 pulls N a fraction of a half code towards the current luma wherever the history
     // and the current frame differ, which the recurrent history then carries into the next frames.
+#if defined(D4R_HLSL) && D4R_RNE16_EXACT
+    F = d4rRne16(F);
+#else
     F = roundHalfValue(F);
+#endif
     // ---------------------------------------------------------------- 5. blend
     f16vec4 conf;
     {
@@ -758,8 +840,14 @@ void main()
     vec4 NL;                       // linear blend, for the resolve below
     {
         vec4 HL, FL, Nl;
+#ifdef D4R_HLSL
+        [[unroll]]
+#endif
         for (int s = 0; s < 4; ++s) { HL[s] = linExpand(Hq[s]); FL[s] = linExpand(F[s]); }
         NL = max(fma(bl, FL - HL, HL), 0.0);
+#ifdef D4R_HLSL
+        [[unroll]]
+#endif
         for (int s = 0; s < 4; ++s) Nl[s] = linCompress(NL[s]);
         if (LIN_BLEND < 1.0)
             NL = mix(vec4(linExpand(N.x), linExpand(N.y), linExpand(N.z), linExpand(N.w)), NL, LIN_BLEND);
@@ -810,6 +898,7 @@ void main()
         precise const vec3 rgb = vec3((ycc.x + ycc.y) - ycc.z, ycc.z + fma(ycc.y, 0.0, ycc.x), (ycc.x - ycc.y) - ycc.z);
         imageStore(finalOut, p.outOrigin + pix, finalOutputValue(vec4(rgb, cur.a)));
     }
+#if !defined(D4R_HLSL) || !D4R_NO_TOKOUT
     // ---------------------------------------------------------------- per-token feature for the next frame's input stage
     if (pix.x < p.tokW && pix.y < p.tokH)
     {
@@ -828,4 +917,5 @@ void main()
         precise const vec4 feature = ms * inversesqrt(norm);
         imageStore(tokOut, pix, feature);
     }
+#endif
 }

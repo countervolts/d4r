@@ -139,6 +139,9 @@ int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 
 // ---------------------------------------------------------------- matrices
 #include "m_wmma.hlsli"
+#if !defined(D4R_VKD3D)
+#include "rne16_ags_scalar.hlsli"
+#endif
 // the packed fixed-16 FP8 weight tiles (test_m.pack8): tile (ks, moff) of W[K][N] read as the A operand
 uint2 lda8(uint base, uint ks, uint stride, uint moff)
 {
@@ -202,15 +205,22 @@ uint4 accHalf(uint4 m) { return m; }
 
 // ---------------------------------------------------------------- scalars
 // v rounded to the nearest binary16 (ties to even), as dialect_hlsl.h d4rRne16; the conversion is then exact
+#if !defined(D4R_VKD3D)
+float16_t rne16(float v) { return asfloat16(uint16_t(d4rRne16Bits(v))); }
+// binary16 arithmetic through f32 and rne16, packed (the conversion of a rounded value is exact)
+float2 r16(float2 v) { return float2(rne16(v.x), rne16(v.y)); }
+uint pk16(float2 v) { return d4rRne16Bits(v.x) | (d4rRne16Bits(v.y) << 16); }
+#else
 float16_t rne16(float v)
 {
     const uint bits = asuint(v);
-    precise float subnormal = (v + 0.75) - 0.75;
+    precise float subnormal = round(v * 16777216.0) * 5.9604644775390625e-08;
     return (float16_t)(abs(v) < 6.103515625e-05 ? subnormal : asfloat((bits + 4095u + ((bits >> 13u) & 1u)) & 0xffffe000u));
 }
 // binary16 arithmetic through f32 and rne16, packed (the conversion of a rounded value is exact)
 float2 r16(float2 v) { return float2(rne16(v.x), rne16(v.y)); }
 uint pk16(float2 v) { return f32tof16(float(rne16(v.x))) | (f32tof16(float(rne16(v.y))) << 16); }
+#endif
 half2 h2(uint u) { return asfloat16(uint16_t2(uint16_t(u & 0xffffu), uint16_t(u >> 16))); }
 uint u2(half2 h) { const uint16_t2 b = asuint16(h); return uint(b.x) | (uint(b.y) << 16); }
 uint sh16(uint u) { return WaveReadLaneAt(u, WaveGetLaneIndex() ^ 16u); }
@@ -499,7 +509,12 @@ void main(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 #ifndef NHRUN
 #define NHRUN NH
 #endif
+#if M_EXACT
+    // Keep attention heads as a real loop on AMD D3D12 (runtime KEEP_ZERO prevents static unroll past 32 KB L0 I$)
+    [loop] for (uint hd = NH0; hd < NHRUN + KEEP_ZERO; ++hd)
+#else
     [loop] for (uint hd = NH0; hd < NHRUN; ++hd)
+#endif
     {
         const uint oq = po(4u + 4u * hd), ov = po(5u + 4u * hd), ob = po(6u + 4u * hd), ow = po(7u + 4u * hd);
         // Q of every window, then V of every window: each weight tile is loaded once for the wave's windows
@@ -622,7 +637,12 @@ void main(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID)
         Matrix16 rf[WPW][NT];
         FORW { [unroll] for (uint n = 0; n < NT; ++n) rf[w][n] = f32of(res[w][n]); }
 #endif
+#if M_EXACT
+        // Keep MLP chunks as a real loop on AMD D3D12 to prevent straight-line ISA bloat past 32 KB L0 I$
+        [loop] for (uint c = 0; c < (C / 8u) + KEEP_ZERO; ++c)
+#else
         [loop] for (uint c = 0; c < C / 8u; ++c)
+#endif
         {
             const uint ow1 = po(20u + 3u * c), ob1 = po(21u + 3u * c), ow2 = po(22u + 3u * c);
             ACC_MLP hm[WPW][2];

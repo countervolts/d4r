@@ -676,6 +676,179 @@ def branch_pin(source: str) -> tuple[str, int]:
     return source[:loop.end()] + pin + source[loop.end():], 1
 
 
+def reverse_grid(source: str, stage: str = '') -> tuple[str, int]:
+    """Invert ``gl_WorkGroupID.xy`` on ``dec2_1``/``dec1_1``/``dec0_1`` for L2 reuse."""
+    if stage.removesuffix('_m') not in ('dec2_1', 'dec1_1', 'dec0_1') or 'rrGx_' in source:
+        return source, 0
+    matches = list(re.finditer(r'^#define\s+D4R_HLSL_INIT_CALL\b[^\r\n]*', source, re.M))
+    if not matches:
+        return source, 0
+    m = matches[-1]
+    snippet = (' { const uint rrGx_ = (rrB0.Load(0u) + (rrB0.Load(80u) & 65535u) + 7u) / 8u, '
+               'rrGy_ = (rrB0.Load(4u) + (rrB0.Load(80u) >> 16u) + 7u) / 8u; '
+               'gl_WorkGroupID.x = rrGx_ - 1u - gl_WorkGroupID.x; '
+               'gl_WorkGroupID.y = rrGy_ - 1u - gl_WorkGroupID.y; }')
+    return source[:m.end()] + snippet + source[m.end():], 1
+
+
+def coord_m24(source: str, stage: str = '') -> tuple[str, int]:
+    """Use 24-bit unsigned coordinate products on stages where RGA keeps VGPRs <= base."""
+    if stage not in ('dec0_0_m', 'enc3_m'):
+        return source, 0
+    rules = (
+        (re.compile(r'uint\((ex|hx) \* (ey|hy)\)'),
+         lambda m: f'((uint({m[1]}) & 0xffffffu) * (uint({m[2]}) & 0xffffffu))'),
+        (re.compile(r'uint\(\s*(mirror\([^;]+?\))\s*\*\s*(ex|hx)\s*\+\s*(mirror\([^;]+?\))\s*\)'),
+         lambda m: f'(((uint({m[1]}) & 0xffffffu) * (uint({m[2]}) & 0xffffffu)) + uint({m[3]}))'),
+        (re.compile(r'uint\(\s*(yy)\s*\*\s*(ex|hx)\s*\+\s*(xx)\s*\)'),
+         lambda m: f'(((uint({m[1]}) & 0xffffffu) * (uint({m[2]}) & 0xffffffu)) + uint({m[3]}))'),
+    )
+    total = 0
+    text = source
+    for pat, fn in rules:
+        text, n = pat.subn(fn, text)
+        total += n
+    return text, total
+
+
+_DECODE8_HELPER = '''RRFloat rrDecode8(RRByte v) {
+    const Matrix16 r = convert(MatrixB8, MatrixAcc32, 0, m16(v));
+    RRFloat o;
+    [unroll] for (uint i = 0u; i < 8u; ++i) o[i] = asfloat(r.reg[i]);
+    return o;
+}
+'''
+
+_ENC0_QX_SITE = re.compile(
+    r'\[unroll\] for \(int i = 0; i < 8; \+\+ i\) \{\s*'
+    r'const float xb = float\(rrGet\((rr_byte_qx_\d+)\[wv\]\[m\], i\)\);'
+)
+
+
+def enc0_qx_decode8(source: str, stage: str = '') -> tuple[str, int]:
+    """Decode enc0's FP8 residual via one AGS B8->Acc32 conversion, reloaded from XT."""
+    if stage != 'enc0' or 'rrDecode8(' in source or 'shared uint XT[16 * 32];' not in source:
+        return source, 0
+    m = _ENC0_QX_SITE.search(source)
+    if not m:
+        return source, 0
+    # Ensure XT is untouched after the attention loop (never written again before this read)
+    if 'XT[' in source[m.start():]:
+        return source, 0
+    repl = (
+        'const uint qxIdx_ = (wv * 4u * 32u + 4u * m) + (WaveGetLaneIndex() & 15u) * (32u / 4u) + '
+        '((8u * (WaveGetLaneIndex() >> 4u)) >> 2u);\n'
+        '            const RRFloat xb8_ = rrDecode8(uint2(XT[qxIdx_], XT[qxIdx_ + 1u]));\n'
+        '            [unroll] for (int i = 0; i < 8; ++ i) {\n'
+        '                const float xb = xb8_[i];'
+    )
+    text = source[:m.start()] + repl + source[m.end():]
+    m_inc = re.search(r'#include\s+"rr_wmma\.hlsl[^"]*"\s*\n', text)
+    at = m_inc.end() if m_inc else _body_start(text)
+    text = text[:at] + _DECODE8_HELPER + text[at:]
+    return text, 1
+
+
+_SOFTMAX_PACK_1W = re.compile(
+    r'float16_t e\[4\]\[8\];\s*'
+    r'\[unroll\] for \(uint kt = 0u; kt < 4u; \+\+ kt\) \{\s*'
+    r'if \(wv >= 2u && kt < 2u\) \{\s*'
+    r'RRHalf cached;\s*'
+    r'\{ \[unroll\] for\(uint ri_=0;ri_<8;\+\+ri_\) \{ \(cached\)\[ri_\] = asfloat16\(uint16_t\(\(\((KVS|SM)\[.*?\};\s*'
+    r'\[unroll\] for \(int i = 0; i < 8; \+\+ i\) e\[kt\]\[i\] = cached\[i\];\s*'
+    r'\} else \{\s*'
+    r'(RRFloat c;\s*'
+    r'\{ \[unroll\] for\(uint ri_=0;ri_<8;\+\+ri_\).*?\};\s*'
+    r'RRFloat p_ = .*?;\s*)'
+    r'\{ const RRHalf rrHb_ = rrHalfRne8\(p_\); \[unroll\] for \(int i = 0; i < 8; \+\+ i\) e\[kt\]\[i\] = hb\(uint\(rrB1\.Load<uint16_t>\(\((\d+u) / 2u \+ bh\(rrHb_\[i\]\)\) \* 2u\)\)\); \}\s*'
+    r'if \(wv < 2u && kt >= 2u\) \{\s*'
+    r'RRHalf cached;\s*'
+    r'\[unroll\] for \(int i = 0; i < 8; \+\+ i\) cached\[i\] = e\[kt\]\[i\];\s*'
+    r'\{ \[unroll\] for\(uint ri_=0;ri_<8;\+\+ri_\).*?\};\s*'
+    r'\}\s*'
+    r'\}\s*'
+    r'\}\s*'
+    r'f16vec2 ep\[4\]\[4\];\s*'
+    r'\[unroll\] for \(uint kt = 0u; kt < 4u; \+\+ kt\)\s*'
+    r'\[unroll\] for \(uint q = 0u; q < 4u; \+\+ q\) ep\[kt\]\[q\] = f16vec2\(e\[kt\]\[2u \* q\], e\[kt\]\[2u \* q \+ 1u\]\);',
+    re.S,
+)
+
+def softmax_pack_e(source: str) -> tuple[str, int]:
+    """Pack 1-wave attention softmax exp LUT values in uint epu[4][4] (16 VGPRs vs 32)
+    and use direct 32-bit LDS reads/writes (halving LDS traffic and removing f32tof16 roundtrips)."""
+    if 'uint epu[4][4];' in source or 'float16_t e[4][8];' not in source:
+        return source, 0
+
+    def repl_1w(m: re.Match) -> str:
+        sm, pre, lut = m.group(1), m.group(2), m.group(3)
+        return (
+            f'uint epu[4][4];\n'
+            f'                [unroll] for (uint kt = 0u; kt < 4u; ++ kt) {{\n'
+            f'                    if (wv >= 2u && kt < 2u) {{\n'
+            f'                        const uint rBase = ((wv - 2u) * 256u + kt * 8u) + (WaveGetLaneIndex() & 15u) * 16u + 4u * (WaveGetLaneIndex() >> 4u);\n'
+            f'                        [unroll] for (uint q = 0u; q < 4u; ++ q) epu[kt][q] = {sm}[rBase + q];\n'
+            f'                    }} else {{\n'
+            f'                        {pre}'
+            f'                        const RRHalf rrHb_ = rrHalfRne8(p_);\n'
+            f'                        [unroll] for (uint q = 0u; q < 4u; ++ q) {{\n'
+            f'                            uint h0 = uint(rrB1.Load<uint16_t>(({lut} / 2u + bh(rrHb_[2u * q])) * 2u));\n'
+            f'                            uint h1 = uint(rrB1.Load<uint16_t>(({lut} / 2u + bh(rrHb_[2u * q + 1u])) * 2u));\n'
+            f'                            epu[kt][q] = h0 | (h1 << 16u);\n'
+            f'                        }}\n'
+            f'                        if (wv < 2u && kt >= 2u) {{\n'
+            f'                            const uint ln = WaveGetLaneIndex();\n'
+            f'                            const uint odd = ln & 1u;\n'
+            f'                            const uint wBase = (kt - 2u) * 256u + wv * 8u + ((ln & 15u) >> 1u) + ((odd + 8u * (ln >> 4u)) * 16u);\n'
+            f'                            [unroll] for (uint q = 0u; q < 4u; ++ q) {{\n'
+            f'                                uint uq = epu[kt][q];\n'
+            f'                                uint mine = odd != 0u ? (uq >> 16u) : (uq & 0xffffu);\n'
+            f'                                uint peer = WaveReadLaneAt(odd != 0u ? (uq & 0xffffu) : (uq >> 16u), ln ^ 1u);\n'
+            f'                                {sm}[wBase + 32u * q] = odd != 0u ? (peer | (mine << 16u)) : (mine | (peer << 16u));\n'
+            f'                            }}\n'
+            f'                        }}\n'
+            f'                    }}\n'
+            f'                }}'
+        )
+
+    text, n = _SOFTMAX_PACK_1W.subn(repl_1w, source, count=1)
+    if n:
+        text = re.sub(r'\bep\[([^\]]+)\]\[([^\]]+)\]', r'unpackFloat2x16(epu[\1][\2])', text)
+    return text, n
+
+
+_ENC0_HD_DECL = 'shared float16_t HD[64 * 4];'
+_ENC0_HD_WR = re.compile(
+    r'if \(hl == 0u\)\[unroll\] for \(uint c = 0u; c < 4u; \+\+ c\) HD\[t \* 4u \+ c\] = float16_t\(hv\[c\]\);'
+)
+_ENC0_HD_RD = re.compile(
+    r'uint HDV\(uint row, uint col\) \{ return col < 4u \? uint\(float16BitsToUint16\(HD\[gl_SubgroupID \* 256u \+ row \* 4u \+ col\]\)\) : 0u; \}'
+)
+
+
+def enc0_hd_kvs(source: str, stage: str = '') -> tuple[str, int]:
+    """Alias enc0's 512-byte HD[64*4] LDS array into dead KVS[0..127] (4608->4096 B LDS,
+    unlocking 8 waves/SIMD LDS capacity) and vectorize hv RNE16 with rrHalfRne8."""
+    if stage != 'enc0' or _ENC0_HD_DECL not in source or 'shared uint KVS[512];' not in source:
+        return source, 0
+    if not (_ENC0_HD_WR.search(source) and _ENC0_HD_RD.search(source)):
+        return source, 0
+    text = source.replace(_ENC0_HD_DECL, '// HD aliased into KVS[0..127]', 1)
+    text = _ENC0_HD_WR.sub(
+        'if (hl == 0u) { const RRHalf rrHh_ = rrHalfRne8(hv); '
+        'KVS[t * 2u] = uint(asuint16(rrHh_[0])) | (uint(asuint16(rrHh_[1])) << 16u); '
+        'KVS[t * 2u + 1u] = uint(asuint16(rrHh_[2])) | (uint(asuint16(rrHh_[3])) << 16u); }',
+        text, count=1,
+    )
+    text = _ENC0_HD_RD.sub(
+        'uint HDV(uint row, uint col) { if (col >= 4u) return 0u; '
+        'uint w = KVS[(gl_SubgroupID * 64u + row) * 2u + (col >> 1u)]; '
+        'return (w >> ((col & 1u) * 16u)) & 0xffffu; }',
+        text, count=1,
+    )
+    return text, 1
+
+
 # --------------------------------------------------------------------------- driver
 
 PASSES = {
@@ -687,12 +860,18 @@ PASSES = {
     'inf_select': inf_select,
     'residual_pack': residual_pack,
     'branch_pin': branch_pin,
+    'reverse_grid': reverse_grid,
+    'coord_m24': coord_m24,
+    'enc0_qx_decode8': enc0_qx_decode8,
+    'softmax_pack_e': softmax_pack_e,
+    'enc0_hd_kvs': enc0_hd_kvs,
 }
 # Only one ordering constraint: quant_fusion exposes the raw values that
 # pack4_quantset then encodes once.
 ORDER = ('quant_fusion', 'half_bits_roundtrip', 'e4pair_native_half',
          'pack4_quantset', 'half_rne8', 'inf_select', 'residual_pack',
-         'branch_pin')
+         'branch_pin', 'reverse_grid', 'coord_m24', 'enc0_qx_decode8',
+         'softmax_pack_e', 'enc0_hd_kvs')
 
 
 def optimize_with_report(source: str, stage: str = '',
@@ -707,7 +886,7 @@ def optimize_with_report(source: str, stage: str = '',
         except KeyError:
             raise KeyError('unknown pass %r (known: %s)'
                            % (name, ', '.join(PASSES))) from None
-        text, n = fn(text)
+        text, n = fn(text, stage) if name in ('reverse_grid', 'coord_m24', 'enc0_qx_decode8', 'enc0_hd_kvs') else fn(text)
         report.append((name, n))
     return text, report
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 
 namespace vkhip {
 namespace {

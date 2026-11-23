@@ -35,12 +35,6 @@
 #ifndef PAD4
 #define PAD4 8
 #endif
-#ifndef ABL_HEADS
-#define ABL_HEADS uint(NH)
-#endif
-#ifndef ABL_CHUNKS
-#define ABL_CHUNKS (UC / 8u)
-#endif
 // TPW: 16-token tiles of the 8x8 window per wave (1, 2 or 4). With TPW > 1 a wave walks TPW tiles and loads every
 // weight tile once for all of them (four waves per window each read the whole layer's weights otherwise, about a
 // fifth of the network's time). The arithmetic and its order per tile do not change.
@@ -71,10 +65,14 @@ RWStructuredBuffer<Pb> p_buf : register(u0);
 #define p p_buf[0]
 #endif
 ByteAddressBuffer wb_w : register(t1);
-RWStructuredBuffer<float16_t4> inb_a : register(u2);
-RWStructuredBuffer<float16_t4> skb_a : register(u3);
-RWStructuredBuffer<float16_t4> out0_a : register(u4);
-RWStructuredBuffer<float16_t4> out1_a : register(u5);
+RWStructuredBuffer<uint2> inb_a : register(u2);
+RWStructuredBuffer<uint2> skb_a : register(u3);
+RWStructuredBuffer<uint2> out0_a : register(u4);
+#if D4R_DEC0_TOKOUT && HEAD
+RWTexture2D<float4> tokOut : register(u5);
+#else
+RWStructuredBuffer<uint2> out1_a : register(u5);
+#endif
 #define RM 0u
 #define CMJ 1u
 #else
@@ -178,11 +176,18 @@ void writeTRaw(uint off,f16vec4 v) {TT[off]=v.x;TT[off+1u]=v.y;TT[off+2u]=v.z;TT
 #include "coopmat_ags.hlsli"
 static const D4rLds4 BF = { 0u }, TT = { uint(BF_WORDS) };
 struct Wb { D4rBuf4 w; };
-struct Ib { RWStructuredBuffer<float16_t4> a; };
-struct Ob { RWStructuredBuffer<float16_t4> a; };
 static const Wb wb = { { wb_w } };     // from the resource itself: see coopmat_ags.hlsli
-static const Ib inb = { inb_a }, skb = { skb_a };
-static const Ob out0 = { out0_a }, out1 = { out1_a };
+f16vec4 d4rReadSk4(uint i) { const uint2 p_ = skb_a[i]; return f16vec4(unpackFloat2x16(p_.x), unpackFloat2x16(p_.y)); }
+void d4rLdsWriteU2(uint word, uint2 p_) { matrixShared[word] = p_.x; matrixShared[word + 1u] = p_.y; }
+uint2 d4rLdsReadU2(uint word) { return uint2(matrixShared[word], matrixShared[word + 1u]); }
+#define COPY_IN_TO_TRAW(off, idx) d4rLdsWriteU2(TT.b + (off) / 2u, inb_a[idx])
+#define COPY_IN_TO_BTOKEN(r, c, idx) d4rLdsWriteU2(BF.b + ((r) * SX + (c)) / 2u, inb_a[idx])
+#define COPY_TTOKEN_TO_OUT0(idx, r, c, stride) (out0_a[idx] = d4rLdsReadU2(TT.b + ((r) * (stride) + (c)) / 2u))
+#define COPY_BTOKEN_TO_OUT1(idx, r, c) (out1_a[idx] = d4rLdsReadU2(BF.b + ((r) * SX + (c)) / 2u))
+#define COPY_BTOKEN_TO_OUT0(idx, r, c) (out0_a[idx] = d4rLdsReadU2(BF.b + ((r) * SX + (c)) / 2u))
+#define COPY_BPATCH_TO_OUT0(idx, r, c, stride) (out0_a[idx] = d4rLdsReadU2(BF.b + ((r) * (stride) + (c)) / 2u))
+#define COPY_BTOKEN_TO_TRAW(off, sr, sc) d4rLdsWriteU2(TT.b + (off) / 2u, d4rLdsReadU2(BF.b + ((sr) * SX + (sc)) / 2u))
+#define READ_SKB(i) d4rReadSk4(i)
 typedef D4rAcc ACC;
 typedef D4rAcc HACC;
 typedef D4rMatA MA;
@@ -217,6 +222,16 @@ void writeBToken(uint r,uint c,f16vec4 v) {BF[(r*SX+c)/4u]=v;}
 void writeTToken(uint r,uint c,uint stride,f16vec4 v) {TT[(r*stride+c)/4u]=v;}
 void writeTRaw(uint off,f16vec4 v) {TT[off/4u]=v;}
 #endif
+#ifndef D4R_HLSL
+#define COPY_IN_TO_TRAW(off, idx) writeTRaw(off, inb.a[idx])
+#define COPY_IN_TO_BTOKEN(r, c, idx) writeBToken(r, c, inb.a[idx])
+#define COPY_TTOKEN_TO_OUT0(idx, r, c, stride) (out0.a[idx] = readTToken(r, c, stride))
+#define COPY_BTOKEN_TO_OUT1(idx, r, c) (out1.a[idx] = readBToken(r, c))
+#define COPY_BTOKEN_TO_OUT0(idx, r, c) (out0.a[idx] = readBToken(r, c))
+#define COPY_BPATCH_TO_OUT0(idx, r, c, stride) (out0.a[idx] = readBPatch(r, c, stride))
+#define COPY_BTOKEN_TO_TRAW(off, sr, sc) writeTRaw(off, readBToken(sr, sc))
+#define READ_SKB(i) skb.a[i]
+#endif
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 int tdiv2(int v) { return v < 0 ? -((-v) / 2) : v / 2; }
 ACC bias_tile(uint off, uint stride) { HACC b; LD(b, wb.w, off, BIAS_STRIDE(stride)); return ACC(b); }   // vectors are stored as 16 equal rows
@@ -224,7 +239,11 @@ f16vec4 softmax_exp(f16vec4 s)
 {
     const f16vec4 t = clamp(s, f16vec4(uint16BitsToFloat16(uint16_t(0xCD69))), f16vec4(uint16BitsToFloat16(uint16_t(0x4D69))));
     const f16vec4 v = fma(t * t, f16vec4(uint16BitsToFloat16(uint16_t(0x91D5))), f16vec4(1.0));
+#if defined(D4R_HLSL) && D4R_RNE16_EXACT && !D4R_RNE16_EXTERNAL
+    return float16_t4(d4rRne16PosFinite(exp2(vec4(fma(t, v, f16vec4(uint16BitsToFloat16(uint16_t(0xC50D))))))));
+#else
     return f16vec4(exp2(vec4(fma(t, v, f16vec4(uint16BitsToFloat16(uint16_t(0xC50D)))))));
+#endif
 }
 f16vec4 gelu(f16vec4 x)
 {
@@ -267,7 +286,7 @@ void main()
         FORW {
             WINV
             const uint c0 = (mt * 2u + hf) * part;
-            for (uint c = c0; c < c0 + part; c += 4u) writeTRaw(row*SLO+c,inb.a[(src+c)/4u]);   // rolled
+            for (uint c = c0; c < c0 + part; c += 4u) COPY_IN_TO_TRAW(row * SLO + c, (src + c) / 4u);   // rolled
         }
         SYNC
         // expand: tile mt computes quarter mt of the 4C columns
@@ -289,7 +308,7 @@ void main()
             WINV
             const uint ly = (tok >> 3) >> 1, lx = (tok & 7u) >> 1, q = ((tok >> 3) & 1u) * 2u + (tok & 1u);
             const uint sk = uint(mirror(ty, p.Hh) * p.W + mirror(tx, p.W)) * UC + ch0;
-            for (uint c = 0u; c < HC; c += 4u) writeTToken(tok,ch0+c,SX,readBPatch(ly*4u+lx,q*UC+ch0+c,S4)+skb.a[(sk+c)/4u]);
+            for (uint c = 0u; c < HC; c += 4u) writeTToken(tok,ch0+c,SX,readBPatch(ly*4u+lx,q*UC+ch0+c,S4)+READ_SKB((sk+c)/4u));
         }
         SYNC      // BF (the expanded tokens) is free
     }
@@ -301,7 +320,7 @@ void main()
         FORW {
             WINV
             const uint src = uint(mirror(ty, p.Hh) * p.W + mirror(tx, p.W)) * 16u + hf * 8u;
-            for (uint c = 0u; c < 8u; c += 4u) writeTRaw(tok*SEM+hf*8u+c,inb.a[(src+c)/4u]);
+            for (uint c = 0u; c < 8u; c += 4u) COPY_IN_TO_TRAW(tok * SEM + hf * 8u + c, (src + c) / 4u);
             LOAD_T_RAW(EA_ TILE,mt*16u*SEM,SEM);
         }
         for (uint nt = 0u; nt < NT; ++nt)
@@ -318,7 +337,7 @@ void main()
     FORW {
         WINV
         const uint src = uint(mirror(ty, p.Hh) * p.W + mirror(tx, p.W)) * UC + ch0;
-        for (uint c = 0u; c < HC; c += 4u) writeBToken(tok,ch0+c,inb.a[(src+c)/4u]);
+        for (uint c = 0u; c < HC; c += 4u) COPY_IN_TO_BTOKEN(tok, ch0 + c, (src + c) / 4u);
     }
 #define LOAD_X0(m,c) LOAD_B_TOKEN(m,mt*16u,c)
 #define READ_X0(r,c) readBToken(r,c)
@@ -359,7 +378,10 @@ void main()
 #define xn XN_ TILE
     FORW { WINV for (uint kt = 0u; kt < NT; ++kt) LOAD_B_TOKEN(xn[kt],mt*16u,kt*16u); }
     // ------------------------------------------------------------ attention, one head at a time
-    for (uint h = 0u; h < ABL_HEADS; ++h)   // rolled
+#if defined(D4R_HLSL) && C <= 32
+    [[unroll]]
+#endif
+    for (uint h = 0u; h < uint(NH); ++h)   // rolled except C <= 32 (enc0/dec0) where unrolling cuts allocas 14 -> 7
     {
         const uint otab = WEIGHT_OFFSET(7u + 5u * h), owo = WEIGHT_OFFSET(8u + 5u * h);
         // Q, K, V of every tile, two K steps at a time: their weight tiles are requested before the first product,
@@ -458,7 +480,10 @@ void main()
             acc[nt] = ACC(HACC(acc[nt]) + HACC(bias_tile(WEIGHT_OFFSET(3) + nt * 16u, UC)));
         }
         }
-        for (uint ch = 0u; ch < ABL_CHUNKS; ++ch)   // rolled
+#if defined(D4R_HLSL) && C <= 32
+        [[unroll]]
+#endif
+        for (uint ch = 0u; ch < (UC / 8u); ++ch)   // rolled except C <= 32 (enc0/dec0)
         {
             const uint ow1 = WEIGHT_OFFSET(44u + 3u * ch), ob1 = WEIGHT_OFFSET(45u + 3u * ch), ow2 = WEIGHT_OFFSET(46u + 3u * ch);
             ACC H0_ TILES, H1_ TILES;
@@ -509,21 +534,40 @@ void main()
         FORW {
             WINV OUTV
             for (uint nt = 0u; nt < 3u; ++nt) STORE_T_TOKEN(HO_ TILE[nt],mt*16u,nt*16u,SHD);
-            if (inside)
-                for (uint c = hf * 20u; c < hf * 20u + 20u; c += 4u) out0.a[(dst * 40u + c) / 4u] = readTToken(tok,c,SHD);   // rolled
+            if (inside) {
+                for (uint c = hf * 20u; c < hf * 20u + 20u; c += 4u) COPY_TTOKEN_TO_OUT0((dst * 40u + c) / 4u, tok, c, SHD);   // rolled
+#if D4R_DEC0_TOKOUT && HEAD
+                if (hf == 0u) {
+                    const f16vec4 r0 = readTToken(tok, 0u, SHD), r1 = readTToken(tok, 4u, SHD);
+                    const f16vec4 r3 = readTToken(tok, 12u, SHD), r4 = readTToken(tok, 16u, SHD);
+                    const f16vec4 r5 = readTToken(tok, 20u, SHD), r6 = readTToken(tok, 24u, SHD);
+                    const f16vec4 r8 = readTToken(tok, 32u, SHD), r9 = readTToken(tok, 36u, SHD);
+                    const float m0 = 0.2 * (float(r0.w) + float(r1.x) + float(r1.y) + float(r1.z) + float(r1.w));
+                    const float m1 = 0.2 * (float(r3.y) + float(r3.z) + float(r3.w) + float(r4.x) + float(r4.y));
+                    const float m2 = 0.2 * (float(r5.w) + float(r6.x) + float(r6.y) + float(r6.z) + float(r6.w));
+                    const float m3 = 0.2 * (float(r8.y) + float(r8.z) + float(r8.w) + float(r9.x) + float(r9.y));
+                    precise const vec4 ms = vec4(m0, m1, m2, m3);
+                    precise float norm = fma(ms.x, ms.x, ms.y * ms.y);
+                    norm = fma(ms.z, ms.z, norm);
+                    norm = fma(ms.w, ms.w, norm);
+                    norm += 1.0;
+                    tokOut[ivec2(tx, ty)] = ms * inversesqrt(norm);
+                }
+#endif
+            }
         }
     }
 #elif KIND == 1
     FORW {
         WINV OUTV
         if (inside)
-            for (uint c = 0u; c < HC; c += 4u) out1.a[(dst * UC + ch0 + c) / 4u] = readBToken(tok,ch0+c);
+            for (uint c = 0u; c < HC; c += 4u) COPY_BTOKEN_TO_OUT1((dst * UC + ch0 + c) / 4u, tok, ch0 + c);
     }
 #else
     FORW {
         WINV OUTV
         if (inside)
-            for (uint c = 0u; c < HC; c += 4u) out0.a[(dst * UC + ch0 + c) / 4u] = readBToken(tok,ch0+c);
+            for (uint c = 0u; c < HC; c += 4u) COPY_BTOKEN_TO_OUT0((dst * UC + ch0 + c) / 4u, tok, ch0 + c);
     }
 #endif
 #if KIND == 1
@@ -534,7 +578,7 @@ void main()
             WINV
             const uint sourceToken = 8u * (2u * (row >> 2) + (mt >> 1)) + 2u * (row & 3u) + (mt & 1u);
             for (uint c = 0u; c < HC; c += 4u)
-                writeTRaw(row * S4 + mt * UC + ch0 + c, readBToken(sourceToken, ch0 + c));
+                COPY_BTOKEN_TO_TRAW(row * S4 + mt * UC + ch0 + c, sourceToken, ch0 + c);
         }
         SYNC
         const uint MN = uint(MERGE_N), NI = (MN / 16u + 3u) / 4u;
@@ -569,7 +613,7 @@ void main()
             WINV
             const uint c0 = (mt * 2u + hf) * part;
             if (ym >= 0 && ym < p.Hh / 2 && xm >= 0 && xm < p.W / 2)
-                for (uint c = c0; c < c0 + part; c += 4u) out0.a[(uint(ym * (p.W / 2) + xm) * uint(XC) + c) / 4u] = readBPatch(row,c,SMG);   // rolled
+                for (uint c = c0; c < c0 + part; c += 4u) COPY_BPATCH_TO_OUT0((uint(ym * (p.W / 2) + xm) * uint(XC) + c) / 4u, row, c, SMG);   // rolled
         }
     }
 #endif

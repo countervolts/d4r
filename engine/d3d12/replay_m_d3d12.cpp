@@ -29,6 +29,16 @@
 #include <vector>
 #ifdef D4R_ENGINE_D3DHIP
 #include "hip_net_d3d12.h"
+#else
+namespace d4r::dx {
+struct HipNetworkDx {
+    ID3D12Resource* tokens() const { return nullptr; }
+    ID3D12Resource* head() const { return nullptr; }
+    void run() {}
+    double lastMilliseconds() const { return 0.0; }
+    unsigned launches() const { return 0; }
+};
+}
 #endif
 using Microsoft::WRL::ComPtr;
 #define CK(x) do { HRESULT h_ = (x); if (FAILED(h_)) { char b_[256]; std::snprintf(b_, sizeof(b_), "%s: 0x%08lx", #x, (unsigned long)h_); throw std::runtime_error(b_); } } while (0)

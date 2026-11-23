@@ -37,6 +37,10 @@
 // Not for vkd3d-proton, whose casts already round to nearest even (below).
 #if D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_GFX11 && !D4R_VKD3D
 #include "d3d12/rne16_ags.hlsli"
+#elif D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_SCALAR && !D4R_VKD3D
+uint d4rRne16Bits(float v);
+float d4rRne16(float v);
+float2 d4rRne16(float2 v);
 #elif D4R_RNE16_EXTERNAL && !D4R_VKD3D
 float d4rRne16(float v);
 float2 d4rRne16(float2 v);
@@ -60,7 +64,7 @@ float d4rRne16(float v)
     const float subnormal = round(v * 16777216.0) * 5.9604644775390625e-08;
     const float normal = asfloat((bits + 4095u + ((bits >> 13u) & 1u)) & 0xffffe000u);
     const float r = abs(v) < 6.103515625e-05 ? subnormal : normal;
-    return abs(r) > 65504.0 && !isnan(r) ? asfloat((bits & 0x80000000u) | 0x7f800000u) : r;
+    return ((asuint(r) & 0x7fffffffu) - 0x477fe001u) < 0x38002000u ? asfloat((bits & 0x80000000u) | 0x7f800000u) : r;
 #else
     const uint bits = asuint(v);
     precise float subnormal = (v + 0.75) - 0.75;
@@ -71,6 +75,30 @@ float2 d4rRne16(float2 v) { return float2(d4rRne16(v.x), d4rRne16(v.y)); }
 #endif
 float3 d4rRne16(float3 v) { return float3(d4rRne16(v.xy), d4rRne16(v.z)); }
 float4 d4rRne16(float4 v) { return float4(d4rRne16(v.xy), d4rRne16(v.zw)); }
+#if D4R_RNE16_EXACT && !D4R_RNE16_EXTERNAL
+float d4rRne16Int(float v)
+{
+    const uint b = asuint(v);
+    const uint nb = (b + 4095u + ((b >> 13u) & 1u)) & 0xffffe000u;
+    return (b & 0x7fffffffu) >= 0x477ff000u ? asfloat((b & 0x80000000u) | 0x7f800000u) : asfloat(nb);
+}
+float2 d4rRne16Int(float2 v) { return float2(d4rRne16Int(v.x), d4rRne16Int(v.y)); }
+float3 d4rRne16Int(float3 v) { return float3(d4rRne16Int(v.xy), d4rRne16Int(v.z)); }
+float4 d4rRne16Int(float4 v) { return float4(d4rRne16Int(v.xy), d4rRne16Int(v.zw)); }
+float d4rRne16PosFinite(float v)
+{
+    const uint bits = asuint(v);
+    const float subnormal = round(v * 16777216.0) * 5.9604644775390625e-08;
+    const float normal = asfloat((bits + 4095u + ((bits >> 13u) & 1u)) & 0xffffe000u);
+    return v < 6.103515625e-05 ? subnormal : normal;
+}
+float2 d4rRne16PosFinite(float2 v) { return float2(d4rRne16PosFinite(v.x), d4rRne16PosFinite(v.y)); }
+float3 d4rRne16PosFinite(float3 v) { return float3(d4rRne16PosFinite(v.xy), d4rRne16PosFinite(v.z)); }
+float4 d4rRne16PosFinite(float4 v) { return float4(d4rRne16PosFinite(v.xy), d4rRne16PosFinite(v.zw)); }
+#else
+#define d4rRne16Int d4rRne16
+#define d4rRne16PosFinite d4rRne16
+#endif
 D4R_TYPE(vec2, float2) D4R_TYPE(vec3, float3) D4R_TYPE(vec4, float4)
 D4R_TYPE(ivec2, int2) D4R_TYPE(ivec3, int3) D4R_TYPE(ivec4, int4)
 D4R_TYPE(uvec2, uint2) D4R_TYPE(uvec3, uint3) D4R_TYPE(uvec4, uint4)
@@ -100,15 +128,36 @@ template <typename T> T d4rL(T v) { return v; }
     H d4rH(H v) { return v; } \
     H d4rH(I v) { return (H)(F)v; } \
     H d4rH(U v) { return (H)(F)v; }
+#elif D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_SCALAR && !D4R_VKD3D
+#define D4R_H(H, F, I, U) \
+    H d4rH(F v) { return asfloat16(uint16_t(d4rRne16Bits(v))); } \
+    H d4rH(H v) { return v; } \
+    H d4rH(I v) { return asfloat16(uint16_t(d4rRne16Bits((F)v))); } \
+    H d4rH(U v) { return asfloat16(uint16_t(d4rRne16Bits((F)v))); }
+D4R_H(float16_t, float, int, uint)
+float16_t2 d4rH(float2 v) { return float16_t2(d4rH(v.x), d4rH(v.y)); }
+float16_t2 d4rH(float16_t2 v) { return v; }
+float16_t2 d4rH(int2 v) { return float16_t2(d4rH(v.x), d4rH(v.y)); }
+float16_t2 d4rH(uint2 v) { return float16_t2(d4rH(v.x), d4rH(v.y)); }
+float16_t3 d4rH(float3 v) { return float16_t3(d4rH(v.x), d4rH(v.y), d4rH(v.z)); }
+float16_t3 d4rH(float16_t3 v) { return v; }
+float16_t3 d4rH(int3 v) { return float16_t3(d4rH(v.x), d4rH(v.y), d4rH(v.z)); }
+float16_t3 d4rH(uint3 v) { return float16_t3(d4rH(v.x), d4rH(v.y), d4rH(v.z)); }
+float16_t4 d4rH(float4 v) { return float16_t4(d4rH(v.x), d4rH(v.y), d4rH(v.z), d4rH(v.w)); }
+float16_t4 d4rH(float16_t4 v) { return v; }
+float16_t4 d4rH(int4 v) { return float16_t4(d4rH(v.x), d4rH(v.y), d4rH(v.z), d4rH(v.w)); }
+float16_t4 d4rH(uint4 v) { return float16_t4(d4rH(v.x), d4rH(v.y), d4rH(v.z), d4rH(v.w)); }
 #else
 #define D4R_H(H, F, I, U) \
     H d4rH(F v) { return (H)d4rRne16(v); } \
     H d4rH(H v) { return v; } \
-    H d4rH(I v) { return (H)d4rRne16((F)v); } \
-    H d4rH(U v) { return (H)d4rRne16((F)v); }
+    H d4rH(I v) { return (H)d4rRne16Int((F)v); } \
+    H d4rH(U v) { return (H)d4rRne16Int((F)v); }
 #endif
+#if !(D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_SCALAR && !D4R_VKD3D)
 D4R_H(float16_t, float, int, uint) D4R_H(float16_t2, float2, int2, uint2)
 D4R_H(float16_t3, float3, int3, uint3) D4R_H(float16_t4, float4, int4, uint4)
+#endif
 #define D4R_NUM(...) D4R_NUM_(__VA_ARGS__, 4, 3, 2, 1, 0)
 #define D4R_NUM_(_1, _2, _3, _4, N, ...) N
 #define D4R_HV(T, ...) D4R_CAT(D4R_HV_, D4R_NUM(__VA_ARGS__))(T, __VA_ARGS__)
@@ -144,10 +193,12 @@ D4R_H(float16_t3, float3, int3, uint3) D4R_H(float16_t4, float4, int4, uint4)
 #define float16BitsToUint16 asuint16
 #if D4R_VKD3D
 uint packHalf2x16(float2 v) { const uint16_t2 b = asuint16((float16_t2)v); return uint(b.x) | (uint(b.y) << 16); }
+#elif D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_SCALAR
+uint packHalf2x16(float2 v) { return d4rRne16Bits(v.x) | (d4rRne16Bits(v.y) << 16); }
 #else
 uint packHalf2x16(float2 v) { v = d4rRne16(v); return f32tof16(v.x) | (f32tof16(v.y) << 16); }
 #endif
-float2 unpackHalf2x16(uint v) { return float2(f16tof32(v & 0xffffu), f16tof32(v >> 16)); }
+float2 unpackHalf2x16(uint v) { return float2(f16tof32(v), f16tof32(v >> 16)); }
 uint packFloat2x16(float16_t2 v) { const uint16_t2 b = asuint16(v); return uint(b.x) | (uint(b.y) << 16); }
 float16_t2 unpackFloat2x16(uint v) { return asfloat16(uint16_t2(uint16_t(v & 0xffffu), uint16_t(v >> 16))); }
 uint16_t2 unpack16(uint v) { return uint16_t2(uint16_t(v & 0xffffu), uint16_t(v >> 16)); }
@@ -179,6 +230,9 @@ int2 d4rTextureSize(Texture2D<float4> t) { uint w, h; t.GetDimensions(w, h); ret
 // ---------------------------------------------------------------- the GLSL built-in inputs and the entry point
 static uint3 gl_GlobalInvocationID, gl_LocalInvocationID, gl_WorkGroupID;
 static uint gl_LocalInvocationIndex;
+#if D4R_RNE16_EXTERNAL && D4R_RNE16_AGS_SCALAR && !D4R_VKD3D
+#include "d3d12/rne16_ags_scalar.hlsli"
+#endif
 // hlsl_build.py appends D4R_ENTRY(x, y, z) with the shader's workgroup size; D4R_HLSL_INIT (optional, defined by
 // the shader) loads the parameter blocks.
 #ifndef D4R_WAVE_SIZE
