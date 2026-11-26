@@ -57,6 +57,9 @@ Thumbs.db
 /windows/
 test-results/
 docs/archive
+/d4r-build/
+/d4r-optiscaler-sdk/
+/d4r-discord-mcp/
 
 # Local agent configuration, instructions, and conversation state (any directory)
 .agents/
