@@ -94,7 +94,7 @@ The Windows and Linux runs used different benchmark runs and probably different 
 | RX 7700 XT, RX 7800 XT, RX 7700, Radeon PRO W7700 | gfx1101 | K, M, L (WMMA) |
 | RX 7900 GRE / XT / XTX, Radeon PRO W7800 / W7900 | gfx1100 | K, M, L (WMMA) |
 | RX 7600 / 7600 XT, RX 7650 GRE, RDNA3 integrated GPUs | gfx1102, gfx1103 | K, M, L (WMMA) |
-| RDNA 3.5 integrated GPUs | gfx1150–gfx1154 | K, M (Windows HIP/ZLUDA build) |
+| RDNA 3.5 integrated GPUs | gfx1150–gfx1154 | K, M L (WMMA) |
 | RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700 | gfx1201 | K, M, L (WMMA, native FP8) |
 | RX 9060 XT / 9060 | gfx1200 | K, M, L (WMMA, native FP8) |
 | RX 6000 series, Steam Deck, RDNA2 integrated GPUs | gfx1030–gfx1036 | K (software matrix products) |
