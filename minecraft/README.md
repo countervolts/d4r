@@ -4,7 +4,7 @@ A Fabric client mod that runs NVIDIA's **DLSS-G Lite** multi frame generation (2
 RDNA3 + Mesa RADV, using d4r's engine: the real DLSS-G kernels, translated to SPIR-V and launched through d4r's `nvxrt` Vulkan layer.
 No Wine, no D3D12 and no NVIDIA driver at run time.
 
-Status, measurements and what is not verified: [STATUS.md](STATUS.md). Design: [docs/architecture.md](docs/architecture.md),
+Design/Docs: [docs/architecture.md](docs/architecture.md),
 [docs/presentation.md](docs/presentation.md), [docs/rendering-pipeline.md](docs/rendering-pipeline.md),
 [docs/vulkan-requirements.md](docs/vulkan-requirements.md), [docs/testing.md](docs/testing.md), [docs/mfg-feasibility.md](docs/mfg-feasibility.md).
 
