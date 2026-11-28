@@ -1,0 +1,22 @@
+{
+	"required": true,
+	"package": "dev.d4r.minecraft.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"VulkanFeatureSetsMixin",
+		"VulkanDeviceAccessor",
+		"FrontendGpuDeviceAccessor",
+		"GameRendererAccessor",
+		"GameRendererMixin",
+		"VulkanGpuSurfaceAccessor",
+		"VulkanGpuSurfaceMixin",
+		"VulkanQueueMixin",
+		"VulkanQueueWaitMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

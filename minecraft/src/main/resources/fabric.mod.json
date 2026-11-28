@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"id": "d4r",
+	"version": "${version}",
+	"name": "D4R Frame Generation",
+	"description": "NVIDIA DLSS multi frame generation (Lite model) on AMD RDNA3 through D4R, on Minecraft's own Vulkan device.",
+	"authors": ["D4R"],
+	"license": "Apache-2.0",
+	"environment": "client",
+	"entrypoints": {
+		"preLaunch": ["dev.d4r.minecraft.D4rPreLaunch"],
+		"client": ["dev.d4r.minecraft.D4rClient"]
+	},
+	"mixins": [
+		{
+			"config": "d4r.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.18.0",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

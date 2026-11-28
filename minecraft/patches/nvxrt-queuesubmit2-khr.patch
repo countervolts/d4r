@@ -1,0 +1,11 @@
+--- nvxrt.cpp.orig	2026-11-28 01:16:43.592318270 -0500
++++ nvxrt.cpp	2026-11-28 01:16:43.602593607 -0500
+@@ -3273,6 +3273,8 @@
+ #undef X
+     dev->d.GetDeviceProcAddr = gdpa;
+     dev->d.GetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)gdpa(*out, "vkGetBufferDeviceAddressKHR");
++    // Vulkan 1.2 devices (Minecraft) expose synchronization2 only through the KHR names
++    if (!dev->d.QueueSubmit2) dev->d.QueueSubmit2 = (PFN_vkQueueSubmit2)gdpa(*out, "vkQueueSubmit2KHR");
+     dev->d.GetBufferDeviceAddressEXT = (PFN_vkGetBufferDeviceAddressEXT)gdpa(*out, "vkGetBufferDeviceAddressEXT");
+     if (getenv("NVXRT_QUEUE_LOG") && atoi(getenv("NVXRT_QUEUE_LOG")) != 0 && dev->d.GetDeviceQueue)
+         for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++)

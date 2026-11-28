@@ -1,0 +1,110 @@
+--- nvxrt.cpp.orig	2026-11-28 00:42:00.791974311 -0500
++++ nvxrt.cpp	2026-11-28 00:46:34.398102723 -0500
+@@ -2502,7 +2502,7 @@
+         snprintf(buf, sizeof buf, "%s%u%s%u:fmt%d:%ux%u", desc_type_name(info->descriptorType), slot, sslot ? "/s" : "",
+                  sslot, vi != dev->views.end() ? (int)vi->second.format : -1, ew, eh);
+         dev->handle_desc[h] = buf;
+-        logf("ImageViewHandle view %p %s -> 0x%x", (void *)info->imageView, buf, h);
++        logf("ImageViewHandle view %p %s -> 0x%x type %d smp %p", (void *)info->imageView, buf, h, (int)info->descriptorType, (void *)info->sampler);
+     }
+     return h;
+ }
+@@ -2556,6 +2556,8 @@
+             }
+         }
+         dev->views[*out] = v;
++        if (g_trace) logf("RES view %p image %p fmt %d type %d base %u/%u layers %u/%u", (void *)*out, (void *)ci->image, (int)ci->format,
++                          (int)ci->viewType, v.range.baseMipLevel, v.range.levelCount, v.range.baseArrayLayer, v.range.layerCount);
+     }
+     return r;
+ }
+@@ -2584,6 +2586,8 @@
+         ii.layers = ci->arrayLayers;
+         ii.samples = ci->samples;
+         dev->images[*out] = ii;
++        if (g_trace) logf("RES image %p fmt %d %ux%ux%u layers %u mips %u usage 0x%x type %d flags 0x%x tiling %d samples %d", (void *)*out, (int)ci->format,
++                          ci->extent.width, ci->extent.height, ci->extent.depth, ci->arrayLayers, ci->mipLevels, (unsigned)ci->usage, (int)ci->imageType, (unsigned)ci->flags, (int)ci->tiling, (int)ci->samples);
+     }
+     return r;
+ }
+@@ -2702,6 +2706,7 @@
+     if (r == VK_SUCCESS && (ci->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) && (g_trace || !g_dump_dir.empty())) {
+         std::lock_guard<std::mutex> lk(dev->mutex);
+         dev->buffer_sizes[*out] = ci->size;
++        if (g_trace) logf("RES buffer %p size %" PRIu64, (void *)*out, (uint64_t)ci->size);
+     }
+     return r;
+ }
+@@ -2730,6 +2735,7 @@
+         auto it = dev.buffer_sizes.find(info->buffer);
+         if (it != dev.buffer_sizes.end())
+             dev.buffer_ranges[a] = {info->buffer, it->second};
++        if (g_trace && it != dev.buffer_sizes.end()) logf("RES bda %p addr %" PRIx64 " size %" PRIu64, (void *)info->buffer, (uint64_t)a, (uint64_t)it->second);
+     }
+     return a;
+ }
+@@ -3489,6 +3495,7 @@
+     {
+         Device *dev = device_fast(cmd);
+         group_break(*dev, cmd, Name);
++        if (g_trace) logf("CMD %s cmd %p", Name, (void *)cmd);
+         (dev->d.*M)(cmd, a...);
+     }
+ };
+@@ -3532,14 +3539,56 @@
+     return nullptr;
+ }
+ 
++
++// ---- resource-trace wrappers (minecraft/patches/nvxrt-resource-trace.patch): ordered non-launch commands
++#define TRC_PRE(cmd) Device *dev = device_fast(cmd); group_break(*dev, cmd, "trace")
++static VKAPI_ATTR void VKAPI_CALL T_CmdFillBuffer(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkDeviceSize n, uint32_t d)
++{ TRC_PRE(cmd); if (g_trace) logf("EV fill buf %p off %" PRIu64 " size %" PRIu64 " data %u", (void *)b, (uint64_t)o, (uint64_t)n, d);
++  dev->d.CmdFillBuffer(cmd, b, o, n, d); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdUpdateBuffer(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkDeviceSize n, const void *d)
++{ TRC_PRE(cmd); if (g_trace) logf("EV update buf %p off %" PRIu64 " size %" PRIu64 " hex %s", (void *)b, (uint64_t)o, (uint64_t)n, hex((const uint8_t *)d, (size_t)n).c_str());
++  dev->d.CmdUpdateBuffer(cmd, b, o, n, d); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdClearColorImage(VkCommandBuffer cmd, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *r)
++{ TRC_PRE(cmd); if (g_trace) logf("EV clear img %p color %08x %08x %08x %08x ranges %u", (void *)i, c->uint32[0], c->uint32[1], c->uint32[2], c->uint32[3], n);
++  dev->d.CmdClearColorImage(cmd, i, l, c, n, r); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyBuffer(VkCommandBuffer cmd, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *r)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < n; k++) logf("EV copybuf src %p dst %p soff %" PRIu64 " doff %" PRIu64 " size %" PRIu64, (void *)s, (void *)d, (uint64_t)r[k].srcOffset, (uint64_t)r[k].dstOffset, (uint64_t)r[k].size);
++  dev->d.CmdCopyBuffer(cmd, s, d, n, r); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyBuffer2(VkCommandBuffer cmd, const VkCopyBufferInfo2 *i)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < i->regionCount; k++) logf("EV copybuf src %p dst %p soff %" PRIu64 " doff %" PRIu64 " size %" PRIu64, (void *)i->srcBuffer, (void *)i->dstBuffer, (uint64_t)i->pRegions[k].srcOffset, (uint64_t)i->pRegions[k].dstOffset, (uint64_t)i->pRegions[k].size);
++  dev->d.CmdCopyBuffer2(cmd, i); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyBufferToImage(VkCommandBuffer cmd, VkBuffer s, VkImage d, VkImageLayout l, uint32_t n, const VkBufferImageCopy *r)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < n; k++) logf("EV buf2img buf %p img %p boff %" PRIu64 " rowlen %u imgh %u asp %u mip %u layer %u/%u off %d,%d,%d ext %ux%ux%u", (void *)s, (void *)d, (uint64_t)r[k].bufferOffset, r[k].bufferRowLength, r[k].bufferImageHeight, r[k].imageSubresource.aspectMask, r[k].imageSubresource.mipLevel, r[k].imageSubresource.baseArrayLayer, r[k].imageSubresource.layerCount, r[k].imageOffset.x, r[k].imageOffset.y, r[k].imageOffset.z, r[k].imageExtent.width, r[k].imageExtent.height, r[k].imageExtent.depth);
++  dev->d.CmdCopyBufferToImage(cmd, s, d, l, n, r); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyBufferToImage2(VkCommandBuffer cmd, const VkCopyBufferToImageInfo2 *i)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < i->regionCount; k++) { auto &r = i->pRegions[k]; logf("EV buf2img buf %p img %p boff %" PRIu64 " rowlen %u imgh %u asp %u mip %u layer %u/%u off %d,%d,%d ext %ux%ux%u", (void *)i->srcBuffer, (void *)i->dstImage, (uint64_t)r.bufferOffset, r.bufferRowLength, r.bufferImageHeight, r.imageSubresource.aspectMask, r.imageSubresource.mipLevel, r.imageSubresource.baseArrayLayer, r.imageSubresource.layerCount, r.imageOffset.x, r.imageOffset.y, r.imageOffset.z, r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth); }
++  dev->d.CmdCopyBufferToImage2(cmd, i); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyImageToBuffer(VkCommandBuffer cmd, VkImage s, VkImageLayout l, VkBuffer d, uint32_t n, const VkBufferImageCopy *r)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < n; k++) logf("EV img2buf img %p buf %p boff %" PRIu64 " rowlen %u imgh %u asp %u mip %u layer %u/%u off %d,%d,%d ext %ux%ux%u", (void *)s, (void *)d, (uint64_t)r[k].bufferOffset, r[k].bufferRowLength, r[k].bufferImageHeight, r[k].imageSubresource.aspectMask, r[k].imageSubresource.mipLevel, r[k].imageSubresource.baseArrayLayer, r[k].imageSubresource.layerCount, r[k].imageOffset.x, r[k].imageOffset.y, r[k].imageOffset.z, r[k].imageExtent.width, r[k].imageExtent.height, r[k].imageExtent.depth);
++  dev->d.CmdCopyImageToBuffer(cmd, s, l, d, n, r); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyImageToBuffer2(VkCommandBuffer cmd, const VkCopyImageToBufferInfo2 *i)
++{ TRC_PRE(cmd); if (g_trace) for (uint32_t k = 0; k < i->regionCount; k++) { auto &r = i->pRegions[k]; logf("EV img2buf img %p buf %p boff %" PRIu64 " rowlen %u imgh %u asp %u mip %u layer %u/%u off %d,%d,%d ext %ux%ux%u", (void *)i->srcImage, (void *)i->dstBuffer, (uint64_t)r.bufferOffset, r.bufferRowLength, r.bufferImageHeight, r.imageSubresource.aspectMask, r.imageSubresource.mipLevel, r.imageSubresource.baseArrayLayer, r.imageSubresource.layerCount, r.imageOffset.x, r.imageOffset.y, r.imageOffset.z, r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth); }
++  dev->d.CmdCopyImageToBuffer2(cmd, i); }
++static VKAPI_ATTR void VKAPI_CALL T_CmdCopyImage2(VkCommandBuffer cmd, const VkCopyImageInfo2 *i)
++{ TRC_PRE(cmd); if (g_trace) logf("EV copyimg src %p dst %p regions %u", (void *)i->srcImage, (void *)i->dstImage, i->regionCount);
++  dev->d.CmdCopyImage2(cmd, i); }
++
+ // ---------------------------------------------------------------------------------------------- proc addr
+ static PFN_vkVoidFunction device_func(const char *name)
+ {
++#define FT(n, f) if (!strcmp(name, n)) return (PFN_vkVoidFunction)f;
+ #define F(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)n;
+     F(CreateCuModuleNVX) F(CreateCuFunctionNVX) F(DestroyCuModuleNVX) F(DestroyCuFunctionNVX) F(CmdCuLaunchKernelNVX)
+     F(GetImageViewHandleNVX) F(GetImageViewHandle64NVX) F(GetImageViewAddressNVX)
+     F(GetDeviceCombinedImageSamplerIndexNVX) F(CreateImageView) F(DestroyImageView) F(CreateSampler) F(DestroySampler)
+     F(CreateBuffer) F(DestroyBuffer) F(GetBufferDeviceAddress) F(GetBufferDeviceAddressKHR) F(GetBufferDeviceAddressEXT)
++    if (!g_shadow) {
++        FT("vkCmdFillBuffer", T_CmdFillBuffer) FT("vkCmdUpdateBuffer", T_CmdUpdateBuffer) FT("vkCmdClearColorImage", T_CmdClearColorImage)
++        FT("vkCmdCopyBuffer", T_CmdCopyBuffer) FT("vkCmdCopyBuffer2", T_CmdCopyBuffer2) FT("vkCmdCopyBuffer2KHR", T_CmdCopyBuffer2)
++        FT("vkCmdCopyBufferToImage", T_CmdCopyBufferToImage) FT("vkCmdCopyBufferToImage2", T_CmdCopyBufferToImage2) FT("vkCmdCopyBufferToImage2KHR", T_CmdCopyBufferToImage2)
++        FT("vkCmdCopyImageToBuffer", T_CmdCopyImageToBuffer) FT("vkCmdCopyImageToBuffer2", T_CmdCopyImageToBuffer2) FT("vkCmdCopyImageToBuffer2KHR", T_CmdCopyImageToBuffer2)
++        FT("vkCmdCopyImage2", T_CmdCopyImage2) FT("vkCmdCopyImage2KHR", T_CmdCopyImage2)
++    }
+     F(DestroyDevice) F(QueueSubmit) F(QueueSubmit2) F(WaitForFences) F(CreateImage) F(DestroyImage)
+ #undef F
+     if (!strcmp(name, "vkQueueSubmit2KHR"))

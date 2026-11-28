@@ -1,0 +1,26 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+// Frame-generation inputs from Minecraft's world depth (reversed-Z D32, zero-to-one) and the two camera matrices:
+//  - depthOut: the depth copied to the engine's R32F image
+//  - mvOut:    camera-motion vectors, RG16F pixels, previous = current + mv (what the recorded DLSS-G script expects)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D depthTex;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D depthOut;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D mvOut;
+layout(push_constant) uniform PC {
+    mat4 prevFromCur;   // previous clip = prevFromCur * current clip (camera-relative, double precision on the CPU)
+    ivec2 size;
+    float sign;
+    float pad;
+} pc;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    float d = texelFetch(depthTex, p, 0).r;
+    imageStore(depthOut, p, vec4(d, 0.0, 0.0, 0.0));
+    vec2 ndc = (vec2(p) + 0.5) / vec2(pc.size) * 2.0 - 1.0;
+    vec4 prev = pc.prevFromCur * vec4(ndc, d, 1.0);
+    vec2 prevNdc = prev.xy / prev.w;
+    vec2 mvPixels = (prevNdc - ndc) * 0.5 * vec2(pc.size);
+    imageStore(mvOut, p, vec4(mvPixels * pc.sign, 0.0, 0.0));
+}
